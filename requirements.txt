@@ -1,0 +1,9 @@
+# 传统方法（默认路径）只需要这三个，环境里已经有了：
+numpy>=1.24
+opencv-contrib-python>=4.8
+matplotlib>=3.7
+
+# 说明：opencv-contrib-python 已包含 cv2.cuda / 各种 tracker / HoughCircles 等，
+# 不要再去装 opencv-python（两者会互相覆盖）。
+#
+# AI 后端（YOLO / SAM）见 requirements-ai.txt，需要额外装 PyTorch。

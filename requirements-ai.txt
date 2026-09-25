@@ -1,0 +1,34 @@
+# AI 后端（可选）安装说明
+#
+# 传统方法（color / hough / motion / fusion）不需要装任何东西。
+# 只有要用 --method yolo / yolo_sam 时才需要下面这些。
+#
+# 本机环境：Windows 11 + RTX 5060 Laptop 8GB (sm_120) + 驱动 577.05
+#           conda env myenv (Python 3.14.7)
+#
+# ★ 一定按顺序来，且必须显式指定 python 路径（裸 python 可能解析到 msys64 的 3.12）
+#
+#   $PY = "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+#
+# 1) PyTorch —— 必须用 cu128：
+#    - cu129 索引里没有 cp314/win 的 torchvision（最高只到 cp313）
+#    - cu130 需要驱动 >= 580，而本机是 577.05，不满足
+#
+#    & $PY -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+#    & $PY -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_capability())"
+#    # 期望：True (12, 0)
+#
+# 2) ultralytics —— 必须 --no-deps，否则它会装 opencv-python，
+#    和已经装好的 opencv-contrib-python 冲突（两者都提供 cv2 模块）
+#
+#    & $PY -m pip install ultralytics --no-deps
+#    & $PY -m pip install pyyaml psutil polars timm lap
+#
+# 3) 验证
+#
+#    python apps/selftest_synthetic.py --check-ai
+#
+# 备注：
+#   - boxmot 要求 Python < 3.14，本环境装不了，别尝试
+#   - PyPI 上的 sam2==1.1.0 不是 Meta 官方包；想用 SAM 请走 ultralytics 的 SAM("sam2.1_t.pt")
+#   - conda 的 pytorch 是 CPU 版且滞后，一律用 pip + --index-url

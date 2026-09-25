@@ -137,5 +137,12 @@ bin/
 *.out
 # vendor/ 按项目决定是否忽略
 
+# ---------- 本项目的运行产物 ----------
+# outputs/ 里全是可再生的东西：标注视频、逐帧 PNG、轨迹 CSV、调试掩膜。
+# 跑一次 selftest / run_video / run_realtime 就会重新生成，不必进版本库。
+# （历史上 output_edges.avi 曾误提交，单文件 141 MB，把 .git 撑到 119 MB，
+#   所以这里明确忽略。）
+outputs/
+
 # Rust
 target/
