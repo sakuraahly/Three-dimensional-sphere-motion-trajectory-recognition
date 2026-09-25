@@ -56,13 +56,13 @@ edges = cv2.Canny(blurred, 50, 150)
 
 **1. 检测：不要只用一个特征**
 
-| 后端 | 原理 | 适用 | 本项目实测速度 |
-|---|---|---|---|
-| `color` | HSV 阈值 + 形态学 + 轮廓圆度筛选 | 球与背景颜色可分（**首选**） | 120-180 FPS |
-| `hough` | 霍夫圆 + 梯度方向/符号双向校验 | 球与背景同色，但边缘清晰 | 30-45 FPS |
-| `motion` | MOG2 背景建模差分 | 摄像头固定不动 | 240 FPS |
-| `fusion` | 上面几种投票融合（**默认**） | 通用，最稳 | 27-35 FPS |
-| `yolo` / `yolo_sam` | AI 检测 / 分割（可选依赖） | 复杂背景、遮挡、多球 | 见第六节 |
+| 后端                | 原理                             | 适用                         | 本项目实测速度 |
+| ------------------- | -------------------------------- | ---------------------------- | -------------- |
+| `color`             | HSV 阈值 + 形态学 + 轮廓圆度筛选 | 球与背景颜色可分（**首选**） | 120-180 FPS    |
+| `hough`             | 霍夫圆 + 梯度方向/符号双向校验   | 球与背景同色，但边缘清晰     | 30-45 FPS      |
+| `motion`            | MOG2 背景建模差分                | 摄像头固定不动               | 240 FPS        |
+| `fusion`            | 上面几种投票融合（**默认**）     | 通用，最稳                   | 27-35 FPS      |
+| `yolo` / `yolo_sam` | AI 检测 / 分割（可选依赖）       | 复杂背景、遮挡、多球         | 见第六节       |
 
 **筛选"是不是球"靠四个几何指标**，缺一不可（`sphere_tracker/detect.py`）：
 
@@ -79,9 +79,9 @@ edges = cv2.Canny(blurred, 50, 150)
 阈值分割得到的圆边界有 0.3-0.5 px 误差。本项目从粗略圆心向 72 个方向发射射线，
 在梯度幅值图上找峰值并用抛物线插值求亚像素位置，得到 72 个精确边缘点后重新拟合圆：
 
-| | 半径 RMSE | 深度误差 | 三维 RMSE |
-|---|---|---|---|
-| 只用阈值轮廓 | 0.35-0.5 px | ~1.4% | 67-100 mm |
+|                  | 半径 RMSE        | 深度误差     | 三维 RMSE    |
+| ---------------- | ---------------- | ------------ | ------------ |
+| 只用阈值轮廓     | 0.35-0.5 px      | ~1.4%        | 67-100 mm    |
 | **+ 亚像素细化** | **0.06-0.16 px** | **0.3-0.6%** | **15-42 mm** |
 
 **3. 跟踪：卡尔曼滤波 + 机动检测**
@@ -127,14 +127,14 @@ g_px = fy · g / Z        （Z 由球的像素半径反推：Z = f·R/r）
 python apps/selftest_synthetic.py
 ```
 
-| 场景 | 方法 | 检出率 | 检测RMSE | 跟踪中位 | 半径RMSE | 三维RMSE | 深度误差 | 0.1s预测 | 0.2s预测 | 0.3s预测 | 速度 |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| clean | **color** | 100% | 0.54 px | 0.65 px | 0.06 px | 15.1 mm | 0.31% | 0.81 px | 1.20 px | 1.98 px | ~160 fps |
-| clean | fusion | 100% | 0.54 px | 0.65 px | 0.06 px | 15.1 mm | 0.31% | 0.81 px | 1.20 px | 1.98 px | ~29 fps |
-| clean | motion | 85% | 0.54 px | 0.70 px | 0.06 px | 13.5 mm | 0.28% | 0.81 px | 1.10 px | 1.60 px | ~238 fps |
-| clean | hough | 100% | 41 px | 0.87 px | 2.79 px | 345 mm | 3.53% | 8.67 px | 9.54 px | 15.4 px | ~37 fps |
-| realistic | **color** | 100% | 0.87 px | 0.68 px | 0.16 px | 42.1 mm | 0.58% | 1.33 px | 2.49 px | 4.43 px | ~160 fps |
-| realistic | fusion | 100% | 0.87 px | 0.68 px | 0.16 px | 42.1 mm | 0.58% | 1.33 px | 2.49 px | 4.43 px | ~29 fps |
+| 场景      | 方法      | 检出率 | 检测RMSE | 跟踪中位 | 半径RMSE | 三维RMSE | 深度误差 | 0.1s预测 | 0.2s预测 | 0.3s预测 | 速度     |
+| --------- | --------- | ------ | -------- | -------- | -------- | -------- | -------- | -------- | -------- | -------- | -------- |
+| clean     | **color** | 100%   | 0.54 px  | 0.65 px  | 0.06 px  | 15.1 mm  | 0.31%    | 0.81 px  | 1.20 px  | 1.98 px  | ~160 fps |
+| clean     | fusion    | 100%   | 0.54 px  | 0.65 px  | 0.06 px  | 15.1 mm  | 0.31%    | 0.81 px  | 1.20 px  | 1.98 px  | ~29 fps  |
+| clean     | motion    | 85%    | 0.54 px  | 0.70 px  | 0.06 px  | 13.5 mm  | 0.28%    | 0.81 px  | 1.10 px  | 1.60 px  | ~238 fps |
+| clean     | hough     | 100%   | 41 px    | 0.87 px  | 2.79 px  | 345 mm   | 3.53%    | 8.67 px  | 9.54 px  | 15.4 px  | ~37 fps  |
+| realistic | **color** | 100%   | 0.87 px  | 0.68 px  | 0.16 px  | 42.1 mm  | 0.58%    | 1.33 px  | 2.49 px  | 4.43 px  | ~160 fps |
+| realistic | fusion    | 100%   | 0.87 px  | 0.68 px  | 0.16 px  | 42.1 mm  | 0.58%    | 1.33 px  | 2.49 px  | 4.43 px  | ~29 fps  |
 
 （速度是 960×540 下单线程纯 CPU 的处理帧率，随机器负载浮动；分辨率提高会等比例变慢。）
 
@@ -170,6 +170,20 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 > 注意：直接敲 `python` 可能解析到 msys64 的 Python 而不是 myenv。
 > 保险写法：`C:\Users\<USER>\miniforge3\envs\myenv\python.exe apps\run_realtime.py`
 
+> **`CAP_PROP_FPS` 是假的，别信它。** 实测这两台摄像头：
+>
+> | 摄像头 | 分辨率 | 上报 fps | **实测采集 fps** |
+> |---|---|---|---|
+> | cam 0 | 1280x720 (MJPG) | 60 | **10.0** |
+> | cam 1 | 1920x1080 (MJPG) | 60 | **30.0** |
+>
+> 也就是说 `--fps 60` 这个参数只是"请求值"，摄像头不一定给。
+> cam 0 在 720p 下实际只有 10 fps，抓快速运动的球会严重拖尾；
+> 换成 640x480 通常能明显提升实际帧率。想知道真实帧率，看 HUD 上的 `FPS`，
+> 或用 `--width/--height` 换一档再对比。
+> 时间戳走的是 `perf_counter` 而不是帧号/fps，所以**即使实际帧率低于请求值，
+> 速度和预测的时间轴仍然是对的**。
+
 ### 跑起来
 
 ```powershell
@@ -191,30 +205,30 @@ python apps/run_video.py material_videos/ball.mp4 --out outputs/videos/annotated
 
 **实时窗口的快捷键**
 
-| 键 | 功能 |
-|---|---|
-| `q` / `ESC` | 退出 |
-| `r` | 重置轨迹（球飞出去后重新开始） |
-| `c` | 切换检测方法（fusion → color → hough → motion → yolo → yolo_sam） |
-| `m` | 显示/隐藏分割掩膜小窗（调阈值必备） |
-| `p` | 开/关轨迹预测 |
-| `3` | 开/关三维视图小面板（俯视 X-Z + 侧视 Y-Z） |
-| `s` | 保存快照 + 当前配置 |
-| `v` | 开始/停止录制 |
-| `空格` | 暂停 |
+| 键          | 功能                                                              |
+| ----------- | ----------------------------------------------------------------- |
+| `q` / `ESC` | 退出                                                              |
+| `r`         | 重置轨迹（球飞出去后重新开始）                                    |
+| `c`         | 切换检测方法（fusion → color → hough → motion → yolo → yolo_sam） |
+| `m`         | 显示/隐藏分割掩膜小窗（调阈值必备）                               |
+| `p`         | 开/关轨迹预测                                                     |
+| `3`         | 开/关三维视图小面板（俯视 X-Z + 侧视 Y-Z）                        |
+| `s`         | 保存快照 + 当前配置                                               |
+| `v`         | 开始/停止录制                                                     |
+| `空格`      | 暂停                                                              |
 
 ### 参数速查（`apps/run_realtime.py`）
 
-| 参数 | 说明 |
-|---|---|
-| `--method` | `color` / `hough` / `motion` / `fusion` / `yolo` / `yolo_sam` |
-| `--preset` | `white_ball` / `orange_ball` / `green_ball` / `blue_ball` / `red_ball` / `yellow_ball` |
-| `--ball-diameter` | **球的真实直径（米）**。三维测距必需，而且必须准 —— 填错多少，深度就错多少 |
-| `--focal` | 相机像素焦距 fx。不填就按水平视场角估算（配置项 `camera.hfov_deg`，默认 60°） |
-| `--horizon` | 预测未来多少秒（默认 0.6，建议 0.3-0.6） |
-| `--predict` | `quadratic`（默认，推荐）/ `kalman` |
-| `--gravity-fit` | 三维预测时用已知重力约束（更准，需要标定） |
-| `--config` | 读取标定好的 JSON 配置 |
+| 参数              | 说明                                                                                   |
+| ----------------- | -------------------------------------------------------------------------------------- |
+| `--method`        | `color` / `hough` / `motion` / `fusion` / `yolo` / `yolo_sam`                          |
+| `--preset`        | `white_ball` / `orange_ball` / `green_ball` / `blue_ball` / `red_ball` / `yellow_ball` |
+| `--ball-diameter` | **球的真实直径（米）**。三维测距必需，而且必须准 —— 填错多少，深度就错多少             |
+| `--focal`         | 相机像素焦距 fx。不填就按水平视场角估算（配置项 `camera.hfov_deg`，默认 60°）          |
+| `--horizon`       | 预测未来多少秒（默认 0.6，建议 0.3-0.6）                                               |
+| `--predict`       | `quadratic`（默认，推荐）/ `kalman`                                                    |
+| `--gravity-fit`   | 三维预测时用已知重力约束（更准，需要标定）                                             |
+| `--config`        | 读取标定好的 JSON 配置                                                                 |
 
 ---
 
@@ -247,12 +261,12 @@ python apps/run_video.py material_videos/ball.mp4 --out outputs/videos/annotated
 **结论先说：这个任务上，传统方法在"球颜色可分 + 摄像头固定"的常见场景里
 更快、更准、更好调；AI 的价值在于处理传统方法搞不定的情况。**
 
-| 场景 | 建议 |
-|---|---|
-| 球颜色和背景能分开 | **传统 `color`/`fusion`**，别再折腾模型 |
-| 背景杂乱、球会变色/反光、多球、要区分球的种类 | YOLO / YOLOE 零样本检测 |
-| 需要像素级精确轮廓（遮挡、形变、深度） | SAM2 分割 |
-| 想要"这一个球"而不是"任何球" | YOLOE 文本提示，或自己标 200-500 张微调 |
+| 场景                                          | 建议                                    |
+| --------------------------------------------- | --------------------------------------- |
+| 球颜色和背景能分开                            | **传统 `color`/`fusion`**，别再折腾模型 |
+| 背景杂乱、球会变色/反光、多球、要区分球的种类 | YOLO / YOLOE 零样本检测                 |
+| 需要像素级精确轮廓（遮挡、形变、深度）        | SAM2 分割                               |
+| 想要"这一个球"而不是"任何球"                  | YOLOE 文本提示，或自己标 200-500 张微调 |
 
 ### 环境是能装上的（已实测确认）
 
@@ -261,17 +275,40 @@ myenv Python 3.14.7。经过实测的可用组合：
 
 ```powershell
 $PY = "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+$WHL = "$env:TEMP\whl"; New-Item -ItemType Directory -Force -Path $WHL | Out-Null
 
 # 1) PyTorch：必须走 cu128（cu129 缺 cp314 的 torchvision；cu130 需要驱动 >= 580，你的 577 不够）
-& $PY -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+#
+#    【重要】别用官方 index-url https://download.pytorch.org/whl/cu128 ——
+#    实测这个源在本机只有 ~0.9 MB/s 而且会中途卡死（连接建着、吞吐为 0），
+#    2.6 GB 的 torch 根本下不完；也别直接 pip install torch，PyPI 上的
+#    Windows 轮子现在是 +cpu 版，torch.cuda.is_available() 会是 False。
+#    用阿里云镜像 + curl 先把 wheel 拉到本地，再离线安装，10 秒级完成：
+& curl.exe -s -L -o "$WHL\torch-2.11.0+cu128-cp314-cp314-win_amd64.whl" `
+    "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.11.0%2Bcu128-cp314-cp314-win_amd64.whl"
+& curl.exe -s -L -o "$WHL\torchvision-0.26.0+cu128-cp314-cp314-win_amd64.whl" `
+    "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.26.0%2Bcu128-cp314-cp314-win_amd64.whl"
+& $PY -m pip install --force-reinstall --no-deps "$WHL\torch-2.11.0+cu128-cp314-cp314-win_amd64.whl" "$WHL\torchvision-0.26.0+cu128-cp314-cp314-win_amd64.whl"
 
-# 2) ultralytics：用 --no-deps，否则它会装 opencv-python 和你已有的 opencv-contrib-python 打架
-& $PY -m pip install ultralytics --no-deps
-& $PY -m pip install pyyaml psutil polars timm lap
+# 2) ultralytics：用 --no-deps，否则它会装 opencv-python 和你的 opencv-contrib-python 打架
+& $PY -m pip install -i https://mirrors.aliyun.com/pypi/simple/ ultralytics --no-deps
+& $PY -m pip install -i https://mirrors.aliyun.com/pypi/simple/ `
+    pyyaml psutil polars timm lap requests scipy pandas ultralytics-thop py-cpuinfo nvidia-ml-py
 
-# 3) 验证
-& $PY -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_capability())"
-# 期望输出：True (12, 0)
+# 3) 权重：GitHub 直连拿不到，走 gh 代理（或从别的机器拷过来放项目根目录）
+& curl.exe -s -L -o yolo11n.pt `
+    "https://ghfast.top/https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt"
+
+# 4) 验证
+& $PY -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_capability())"
+# 实测输出：2.11.0+cu128 True (12, 0)
+```
+
+**跑之前必须设这个环境变量**，否则 conda 的 `libiomp5md.dll` 和 torch 自带的
+`libomp.dll` 会冲突，进程直接以 `OMP: Error #15` 退出：
+
+```powershell
+$env:KMP_DUPLICATE_LIB_OK = "TRUE"
 ```
 
 ### 装上之后怎么用
@@ -289,15 +326,32 @@ python apps/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就
 
 ### 已知的坑（都是实测过的）
 
-- **COCO 的 "sports ball" 对乒乓球不友好**：该类样本以足/篮/网球为主，
-  乒乓球在 640 输入下只有几个像素 → 漏检。对策：`--imgsz 1280`、降低 `conf` 到 0.05-0.15、先框 ROI 再检测。
+- **COCO 的 "sports ball" 对小目标不友好**：该类样本以足/篮/网球为主，
+  小球在 640 输入下只有几个像素 → 漏检。
+  实测（`yolo11n.pt` + 合成球，球半径约 25 px，80 帧）：
+
+  | imgsz    | conf | 检出率    | 耗时             |
+  | -------- | ---- | --------- | ---------------- |
+  | 640      | 0.25 | 76.2%     | 7.7 ms (131 FPS) |
+  | 640      | 0.10 | 92.5%     | 7.9 ms (126 FPS) |
+  | **1280** | 0.25 | **97.5%** | 9.7 ms (103 FPS) |
+  | 1280     | 0.10 | 97.5%     | 9.9 ms (101 FPS) |
+
+  **结论：直接把 `yolo_imgsz` 设成 1280，几乎不花时间（103 FPS 仍然远超摄像头帧率），
+  检出率从 76% 涨到 97.5%。** 640 分辨率下把 conf 降到 0.10 也行，但不如直接提分辨率。
+- **COCO 词表是硬限制**：拿一个橘子（橙黄色球状水果）实测，`yolo_classes=[32]`
+  一帧都检不出来，改成全类别能检出 7 个目标、其中就有那个橘子。
+  也就是说"球"长什么样不是问题，**它是不是 COCO 里的 "sports ball" 才是问题**。
+  对策：放宽 `yolo_classes`，或改用下面的 YOLOE 开放词汇。
 - **更推荐 YOLOE-26 开放词汇模型**（ultralytics ≥ 8.4.0）：
   `YOLOE("yoloe-26n-seg.pt").set_classes(["ping pong ball"])` 直接出框 + 实例 mask，
   不受 COCO 词表限制，还能给一张参考图做视觉提示（比文字稳）。
 - **SAM2 官方包只写了支持 Linux**，Windows 建议直接用 ultralytics 的 `SAM("sam2.1_t.pt")`。
   PyPI 上的 `sam2==1.1.0` **不是** Meta 官方包，别装错。
-- **速度参考**（官方 CPU 数据 + A100 数据折算）：SAM2.1-tiny 在你的 5060 上估计 30-45 FPS，
-  YOLO26n-seg / YOLOE-26n-seg 更快（60+ FPS）。真要 100+ FPS 还是传统方法。
+- **速度参考**：实测 `yolo11n @640` 在你的 5060 上是 **7.6 ms/帧 = 132 FPS**
+  （`@1280` 是 9.7 ms = 103 FPS，含 `yolo_refine` 还要再花约 3 ms 做颜色/霍夫细化）。
+  SAM2.1-tiny 按官方数据折算大约 30-45 FPS。真要 100+ FPS 且球与背景可分，还是传统 `color` 更划算
+  （实测约 1 ms/帧）。
 - **学习式轨迹预测（LSTM/Transformer）在这个任务上不划算**：
   单目 + 短历史（<1 s）时，物理模型（重力 + 滤波）明显优于黑盒学习模型，
   而学习模型需要海量标注轨迹。文献（Achterhold et al., L4DC 2023, arXiv:2305.15189）也是这个结论：
@@ -380,12 +434,12 @@ while True:
 
 ## 九、已修复的问题（原脚本）
 
-| 文件 | 问题 | 修复 |
-|---|---|---|
+| 文件                   | 问题                                                                                                            | 修复                                         |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
 | `video_edge_detect.py` | `OUTPUT_PATH = "../outputs/videos/..."` 会写到**项目上一级目录**，那里没有 outputs 文件夹，VideoWriter 直接失败 | 改成项目内的 `outputs/videos/`，并自动建目录 |
-| `video_edge_detect.py` | XVID 编码器 + `isColor=False` 写单通道灰度图，多数机器上写出来是坏文件 | 转成 BGR 三通道写入 |
-| `test.py` | `cv2.imread("test.jpg")` 路径错误（图片实际在 `material_images/`），读不到会直接崩 | 修路径并加 None 检查 |
-| `test.py` | 保存结果到当前目录，和 `outputs/` 的约定不一致 | 统一存到 `outputs/images/` |
+| `video_edge_detect.py` | XVID 编码器 + `isColor=False` 写单通道灰度图，多数机器上写出来是坏文件                                          | 转成 BGR 三通道写入                          |
+| `test.py`              | `cv2.imread("test.jpg")` 路径错误（图片实际在 `material_images/`），读不到会直接崩                              | 修路径并加 None 检查                         |
+| `test.py`              | 保存结果到当前目录，和 `outputs/` 的约定不一致                                                                  | 统一存到 `outputs/images/`                   |
 
 > 另外提醒：`material_images/test.jpg` 的**真实格式是 PNG**（含 alpha 通道），
 > 只是扩展名写成了 .jpg。OpenCV 能读，但某些工具会报格式错误，建议改名。

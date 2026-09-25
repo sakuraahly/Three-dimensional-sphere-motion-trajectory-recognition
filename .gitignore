@@ -144,5 +144,13 @@ bin/
 #   所以这里明确忽略。）
 outputs/
 
+# ---------- 模型权重 ----------
+# 推理权重（yolo11n.pt / sam2.1_t.pt / *.onnx…）都是可下载的二进制，
+# 动辄几 MB 到几 GB，不进版本库；首次运行时由 ultralytics 自动下载，
+# 或用 README 第八节的镜像命令手动放到项目根目录。
+*.pt
+*.pth
+*.onnx
+
 # Rust
 target/
