@@ -60,14 +60,27 @@ class PairSource:
 
         if args.left is not None and args.right is not None:
             self.kind = "camera"
+            if args.left == args.right:
+                raise RuntimeError(f"左右相机不能是同一个索引（都是 {args.left}）")
+
+            def _open(role: str, idx: int) -> LatestFrameCamera:
+                try:
+                    return LatestFrameCamera(CameraSource(
+                        index=idx, width=args.width, height=args.height, fps=args.fps))
+                except RuntimeError:
+                    if args.backup_camera is None or args.backup_camera == idx:
+                        raise
+                    print(f"[警告] {role}相机 {idx} 打不开，改用备用相机 "
+                          f"{args.backup_camera}")
+                    print("       注意：备用相机与被替换的那台型号/视野都不同，"
+                          "标定结果只对当前这个组合有效")
+                    return LatestFrameCamera(CameraSource(
+                        index=args.backup_camera, width=args.width,
+                        height=args.height, fps=args.fps))
+
             # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
             # 处理得慢就自动丢帧，永远处理最新画面
-            self.cam = [
-                LatestFrameCamera(CameraSource(index=args.left, width=args.width,
-                                               height=args.height, fps=args.fps)),
-                LatestFrameCamera(CameraSource(index=args.right, width=args.width,
-                                               height=args.height, fps=args.fps)),
-            ]
+            self.cam = [_open("左", args.left), _open("右", args.right)]
             self._primed = False
             print(f"相机 {args.left}: {self.cam[0].info.width}x{self.cam[0].info.height} @ {self.cam[0].info.fps:.1f} fps")
             print(f"相机 {args.right}: {self.cam[1].info.width}x{self.cam[1].info.height} @ {self.cam[1].info.fps:.1f} fps")
@@ -172,6 +185,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="自动双目标定")
     ap.add_argument("--left", type=int, default=None, help="左相机索引")
     ap.add_argument("--right", type=int, default=None, help="右相机索引")
+    ap.add_argument("--backup-camera", type=int, default=None,
+                    help="备用相机索引：左右任一路打不开时自动顶上"
+                         "（例如笔记本自带摄像头；注意它与被替换的相机不同型号，"
+                         "标定只对当前组合有效）")
     ap.add_argument("--left-video", default=None)
     ap.add_argument("--right-video", default=None)
     ap.add_argument("--left-dir", default=None)

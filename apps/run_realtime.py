@@ -19,6 +19,7 @@
     v        开始/停止录制
     空格     暂停/继续
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,17 +51,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--fps", type=int, default=60)
-    p.add_argument("--method", default=None,
-                   help="检测方法：fusion / color / hough / motion / yolo / yolo_sam")
-    p.add_argument("--preset", default=None,
-                   help="颜色预设：white_ball / orange_ball / green_ball / blue_ball / red_ball / yellow_ball")
+    p.add_argument(
+        "--method",
+        default=None,
+        help="检测方法：fusion / color / hough / motion / yolo / yolo_sam",
+    )
+    p.add_argument(
+        "--preset",
+        default=None,
+        help="颜色预设：white_ball / orange_ball / green_ball / blue_ball / red_ball / yellow_ball",
+    )
     p.add_argument("--config", default=None, help="读取 JSON 配置（标定结果）")
-    p.add_argument("--save-config", default="config/sphere_config.json", help="配置保存路径")
-    p.add_argument("--ball-diameter", type=float, default=None, help="球直径，单位米（用于三维测距）")
-    p.add_argument("--focal", type=float, default=None, help="相机像素焦距 fx（标定过就填）")
+    p.add_argument(
+        "--save-config", default="config/sphere_config.json", help="配   置保存路径"
+    )
+    p.add_argument(
+        "--ball-diameter",
+        type=float,
+        default=None,
+        help="球直径，单位米（用于三维测距）",
+    )
+    p.add_argument(
+        "--focal", type=float, default=None, help="相机像素焦距 fx（标定过就填）"
+    )
     p.add_argument("--horizon", type=float, default=None, help="预测未来多少秒")
-    p.add_argument("--predict", default=None, choices=["kalman", "quadratic"], help="预测方法")
-    p.add_argument("--gravity-fit", action="store_true", help="三维预测时使用已知重力约束")
+    p.add_argument(
+        "--predict", default=None, choices=["kalman", "quadratic"], help="预测方法"
+    )
+    p.add_argument(
+        "--gravity-fit", action="store_true", help="三维预测时使用已知重力约束"
+    )
     p.add_argument("--no-3d", action="store_true", help="关闭三维估计")
     p.add_argument("--record", default=None, help="把标注后的画面录制成 mp4")
     p.add_argument("--scale", type=float, default=1.0, help="显示缩放")
@@ -94,14 +114,20 @@ def main() -> int:
     cfg = build_config(args)
 
     try:
-        src = CameraSource(index=args.camera, width=args.width, height=args.height, fps=args.fps)
+        src = CameraSource(
+            index=args.camera, width=args.width, height=args.height, fps=args.fps
+        )
     except RuntimeError as exc:
         print(f"[错误] {exc}")
         return 1
 
     info = src.info
-    print(f"摄像头 {args.camera} 已打开：{info.width}x{info.height} @ {info.fps:.1f} fps（后端 {info.backend}）")
-    print(f"检测方法：{cfg.detector.method}    预测：{cfg.predict.method}  视野 {cfg.predict.horizon_s}s")
+    print(
+        f"摄像头 {args.camera} 已打开：{info.width}x{info.height} @ {info.fps:.1f} fps（后端 {info.backend}）"
+    )
+    print(
+        f"检测方法：{cfg.detector.method}    预测：{cfg.predict.method}  视野 {cfg.predict.horizon_s}s"
+    )
     print("提示：按 c 切换检测方法，按 m 看掩膜，按 s 存快照，按 q 退出。")
 
     pipe = SpherePipeline(cfg)
@@ -134,7 +160,11 @@ def main() -> int:
                 if recording and writer is not None:
                     writer.write(vis)
             else:
-                vis = last_vis if last_vis is not None else np.zeros((480, 640, 3), np.uint8)
+                vis = (
+                    last_vis
+                    if last_vis is not None
+                    else np.zeros((480, 640, 3), np.uint8)
+                )
 
             cv2.imshow(WINDOW, vis)
             key = cv2.waitKey(1) & 0xFF
@@ -155,7 +185,11 @@ def main() -> int:
             elif key == ord("3"):
                 cfg.viz.show_axes_3d = not cfg.viz.show_axes_3d
             elif key == ord("c"):
-                i = METHOD_CYCLE.index(cfg.detector.method) if cfg.detector.method in METHOD_CYCLE else 0
+                i = (
+                    METHOD_CYCLE.index(cfg.detector.method)
+                    if cfg.detector.method in METHOD_CYCLE
+                    else 0
+                )
                 cfg.detector.method = METHOD_CYCLE[(i + 1) % len(METHOD_CYCLE)]
                 pipe.detector = build_detector(cfg.detector)
                 print(f"检测方法切换为：{cfg.detector.method}")
@@ -171,13 +205,24 @@ def main() -> int:
                 print(f"配置已保存：{args.save_config}")
             elif key == ord("v"):
                 if not recording:
-                    path = args.record or str(ROOT / "outputs" / "videos" / f"session_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
+                    path = args.record or str(
+                        ROOT
+                        / "outputs"
+                        / "videos"
+                        / f"session_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+                    )
                     Path(path).parent.mkdir(parents=True, exist_ok=True)
                     h, w = vis.shape[:2]
-                    rec_fps = src.info.fps if (src.info.fps and src.info.fps > 1.0) else 30.0
-                    writer = cv2.VideoWriter(path, cv2.VideoWriter.fourcc(*"mp4v"), rec_fps, (w, h))
+                    rec_fps = (
+                        src.info.fps if (src.info.fps and src.info.fps > 1.0) else 30.0
+                    )
+                    writer = cv2.VideoWriter(
+                        path, cv2.VideoWriter.fourcc(*"mp4v"), rec_fps, (w, h)
+                    )
                     recording = writer.isOpened()
-                    print(f"{'开始录制：' + path if recording else '录制失败（编码器不可用）'}")
+                    print(
+                        f"{'开始录制：' + path if recording else '录制失败（编码器不可用）'}"
+                    )
                 else:
                     recording = False
                     if writer is not None:
@@ -191,7 +236,9 @@ def main() -> int:
         cv2.destroyAllWindows()
         if frame_times:
             avg = sum(frame_times) / len(frame_times)
-            print(f"平均每帧处理耗时 {avg * 1000:.1f} ms（约 {1.0 / avg:.1f} FPS 的处理能力）")
+            print(
+                f"平均每帧处理耗时 {avg * 1000:.1f} ms（约 {1.0 / avg:.1f} FPS 的处理能力）"
+            )
     return 0
 
 

@@ -174,7 +174,8 @@ class CameraSource(VideoSource):
         # 省掉整个后端/分辨率搜索（MSMF 每次打开要 7 秒，不能白白重开）
         if optimize:
             cached = _load_mode_cache().get(str(index))
-            if cached and cached.get("backend"):
+            # v2 之前的缓存存的是"实际分辨率"而不是"请求分辨率"，会导致重开掉速，一律作废
+            if cached and cached.get("backend") and cached.get("v") == 2:
                 api = getattr(cv2, f"CAP_{cached['backend']}", None)
                 if api is not None:
                     cap = self._raw_open(api, int(cached.get("width", width)),
@@ -382,7 +383,7 @@ class CameraSource(VideoSource):
         if cur_rate >= target_fps * 0.9:
             self.mode_fps = cur_rate
             self.mode_probed = True
-            cache[key] = {"backend": name, "width": cw, "height": ch,
+            cache[key] = {"v": 2, "backend": name, "width": cw, "height": ch,
                           "actual_width": cw, "actual_height": ch, "fps": round(cur_rate, 2)}
             _save_mode_cache(cache)
             return
@@ -391,7 +392,10 @@ class CameraSource(VideoSource):
         self.cap = None
         print(f"[相机 {self._index}] 当前 {cw}x{ch} 只有 {cur_rate:.1f} fps，"
               f"正在寻找更合适的模式（约 10-40 秒，只需一次）…", flush=True)
-        best = (name, api, cw, ch, cur_rate)
+        # best 里存的是**请求值**（rw, rh）—— 必须用它重开。
+        # 真实例：请求 1024x768 能得到 1280x720@29fps，
+        # 但按"实际值 1280x720"重开只有 10 fps（DSHOW 选了不同的内部模式）。
+        best = (name, api, cw, ch, cw, ch, cur_rate)
         # 同一后端下逐个分辨率试。DSHOW 打开只要 0.7 秒，试几个可以接受；
         # MSMF 打开要 7 秒且每次 set 都要重协商，所以**不做后端对比**
         # （实测那样启动要 30-60 秒，比卡顿更难受）。
@@ -407,10 +411,10 @@ class CameraSource(VideoSource):
             cap.release()
             print(f"    请求 {rw}x{rh} -> 实际 {gw}x{gh} @ {rate:.1f} fps", flush=True)
             # 评分 = 像素数 x min(帧率, 目标)：既不牺牲流畅度，也不白白降分辨率
-            if (gw * gh * min(rate, target_fps)) > (best[2] * best[3] * min(best[4], target_fps)):
-                best = (name, api, gw, gh, rate)
+            if (gw * gh * min(rate, target_fps)) > (best[4] * best[5] * min(best[6], target_fps)):
+                best = (name, api, rw, rh, gw, gh, rate)
 
-        name, api, bw, bh, brate = best
+        name, api, bw, bh, aw, ah, brate = best
         self.cap = self._open_attempt(bw, bh, api=api)
         if self.cap is None:
             self.cap = self._open_attempt(cw, ch, api=api)
@@ -418,16 +422,23 @@ class CameraSource(VideoSource):
                 raise RuntimeError(f"摄像头 {self._index} 重新打开失败")
             return
         self.mode_probed = True
-        self.mode_report = [best]
         self.mode_fps = brate
         self.backend_name = name
         self._api = api
         gw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         gh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # 重开之后必须复测一次：请求值 → 实际模式 的映射不是一一对应的，
+        # 不复测就可能"报告 29 fps、实际 10 fps"
+        verify = self._measure_rate(self.cap, budget)
+        if verify < brate * 0.6:
+            print(f"[相机 {self._index}] 警告：重开后实测只有 {verify:.1f} fps"
+                  f"（探测时 {brate:.1f}），已按实测值记录", flush=True)
+            brate = verify
+        self.mode_fps = brate
         if (gw, gh) != (cw, ch) or brate > cur_rate * 1.3:
-            print(f"[相机 {self._index}] 自动改到 {gw}x{gh} @ {brate:.1f} fps"
-                  f"（原 {cw}x{ch} @ {cur_rate:.1f} fps）")
-        cache[key] = {"backend": name, "width": bw, "height": bh,
+            print(f"[相机 {self._index}] 自动改到 请求{bw}x{bh} -> 实际 {gw}x{gh} "
+                  f"@ {brate:.1f} fps（原 {cw}x{ch} @ {cur_rate:.1f} fps）")
+        cache[key] = {"v": 2, "backend": name, "width": bw, "height": bh,
                       "actual_width": gw, "actual_height": gh, "fps": round(brate, 2)}
         _save_mode_cache(cache)
 

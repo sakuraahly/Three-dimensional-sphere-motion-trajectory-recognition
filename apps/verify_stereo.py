@@ -40,6 +40,8 @@ def main() -> int:
                     help="标定文件前缀（不带扩展名）")
     ap.add_argument("--left", type=int, default=None)
     ap.add_argument("--right", type=int, default=None)
+    ap.add_argument("--backup-camera", type=int, default=None,
+                    help="备用相机索引（左右任一路打不开时顶上）")
     ap.add_argument("--left-video", default=None)
     ap.add_argument("--right-video", default=None)
     ap.add_argument("--left-dir", default=None)
