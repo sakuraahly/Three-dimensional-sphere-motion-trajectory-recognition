@@ -376,8 +376,15 @@ class CameraSource(VideoSource):
         ch = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cur_rate = self._measure_rate(self.cap, budget)
 
-        # 快路径：已经够快就什么都不做（内置摄像头 1080p 有 29 fps，走这条）
+        # 快路径：已经够快就什么都不做（内置摄像头 1080p 有 29 fps，走这条）。
+        # 但仍要把实测帧率记下来 —— CAP_PROP_FPS 会返回"请求值 60"，
+        # 拿它去写录像会让播放速度错一倍。
         if cur_rate >= target_fps * 0.9:
+            self.mode_fps = cur_rate
+            self.mode_probed = True
+            cache[key] = {"backend": name, "width": cw, "height": ch,
+                          "actual_width": cw, "actual_height": ch, "fps": round(cur_rate, 2)}
+            _save_mode_cache(cache)
             return
 
         self.cap.release()

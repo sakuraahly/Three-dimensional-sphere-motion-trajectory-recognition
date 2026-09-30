@@ -100,9 +100,16 @@ class PairSource:
         """返回 (ok, left_bgr, right_bgr)。"""
         if self.kind == "camera":
             if not self._primed:
-                for c in self.cam:
-                    c.wait_first()
+                first = [c.wait_first() for c in self.cam]
                 self._primed = True
+                # 报告的分辨率和实际帧尺寸可能不一致（实测内置相机
+                # 报告 1920x1080、实际给 1280x1080），所以按真实帧再说一次
+                for i, f in enumerate(first):
+                    if f is not None:
+                        real = f"{f.shape[1]}x{f.shape[0]}"
+                        rep = f"{self.cam[i].info.width}x{self.cam[i].info.height}"
+                        if real != rep:
+                            print(f"  （相机 {i} 实际输出 {real}，与报告的 {rep} 不一致，已按实际情况处理）")
             _s1, a = self.cam[0].latest()
             _s2, b = self.cam[1].latest()
             return (a is not None and b is not None), a, b
@@ -237,17 +244,32 @@ def main() -> int:
             if not args.no_show:
                 # 直接复用粗检结果画框 —— 之前这里又检测了一遍，
                 # 每帧 4 次全图精确检测（约 1.2 秒）就是卡顿的根源。
-                scale = PREVIEW_W / float(left.shape[1])
-                a = cv2.resize(left, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-                b = cv2.resize(right, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-                for img, obs in ((a, collector.last_obs[0]), (b, collector.last_obs[1])):
+                #
+                # 注意两路分辨率可能不同（实测外置 1280x720、内置实际给 1280x1080），
+                # 所以每路按自己的宽度独立缩放，再补齐到同一高度 ——
+                # 按"统一宽度"缩放会因为宽高比不同而得到不同高度，hstack 直接报错。
+                def _prep(img):
+                    s = PREVIEW_W / float(img.shape[1])
+                    out = cv2.resize(img, (PREVIEW_W, max(1, int(round(img.shape[0] * s)))),
+                                     interpolation=cv2.INTER_LINEAR)
+                    return out, s
+
+                a, scale_l = _prep(left)
+                b, scale_r = _prep(right)
+                hh = max(a.shape[0], b.shape[0])
+                if a.shape[0] != hh:
+                    a = np.vstack([a, np.zeros((hh - a.shape[0], a.shape[1], 3), np.uint8)])
+                if b.shape[0] != hh:
+                    b = np.vstack([b, np.zeros((hh - b.shape[0], b.shape[1], 3), np.uint8)])
+                for img, obs, sc in ((a, collector.last_obs[0], scale_l),
+                                     (b, collector.last_obs[1], scale_r)):
                     if obs is None or not obs.found or obs.corners is None:
                         continue
                     colour = (0, 220, 0) if collector.last_accepted else (0, 140, 255)
                     quad = obs.quad()
                     if quad is not None:
-                        cv2.polylines(img, [(quad * scale).astype(np.int32)], True, colour, 2)
-                    pts = obs.corners.reshape(-1, 2) * scale
+                        cv2.polylines(img, [(quad * sc).astype(np.int32)], True, colour, 2)
+                    pts = obs.corners.reshape(-1, 2) * sc
                     for x, y in pts:
                         cv2.circle(img, (int(x), int(y)), 2, (0, 255, 255), -1)
                 top = np.hstack([a, b])
