@@ -3,8 +3,8 @@
 用法::
 
     python apps/calibrate_color.py --camera 0
-    python apps/calibrate_color.py --image material_images/ball.png
-    python apps/calibrate_color.py --video material_videos/ball.mp4
+    python apps/calibrate_color.py --image assets/images/ball.png
+    python apps/calibrate_color.py --video assets/videos/ball.mp4
 
 按键：
     1-6    套用颜色预设（白/橙/绿/蓝/红/黄）

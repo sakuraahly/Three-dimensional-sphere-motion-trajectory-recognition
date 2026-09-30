@@ -2,9 +2,9 @@
 
 用法::
 
-    python apps/run_video.py material_videos/ball.mp4
-    python apps/run_video.py material_videos/ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv
-    python apps/run_video.py material_images/ --frames-dir        # 整个文件夹当序列
+    python apps/run_video.py assets/videos/ball.mp4
+    python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv
+    python apps/run_video.py assets/images/ --frames-dir          # 整个文件夹当序列
 """
 from __future__ import annotations
 
@@ -72,8 +72,10 @@ def main() -> int:
     writer = None
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.out, fourcc, src.info.fps or 30.0, (src.info.width, src.info.height))
+        fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+        # fps 可能是 -1（某些摄像头/异常文件），必须是正数才能写出可播放的视频
+        out_fps = src.info.fps if (src.info.fps and src.info.fps > 1.0) else 30.0
+        writer = cv2.VideoWriter(args.out, fourcc, out_fps, (src.info.width, src.info.height))
         if not writer.isOpened():
             print(f"[警告] 无法创建输出视频 {args.out}")
             writer = None

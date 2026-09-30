@@ -163,7 +163,7 @@ def main() -> int:
                 stamp = time.strftime("%Y%m%d_%H%M%S")
                 out_dir = ROOT / "outputs" / "images"
                 out_dir.mkdir(parents=True, exist_ok=True)
-                if last_frame is not None:
+                if last_frame is not None and last_vis is not None:
                     cv2.imwrite(str(out_dir / f"snapshot_{stamp}.png"), last_vis)
                     cv2.imwrite(str(out_dir / f"raw_{stamp}.png"), last_frame)
                     print(f"已保存快照：outputs/images/snapshot_{stamp}.png")
@@ -174,7 +174,8 @@ def main() -> int:
                     path = args.record or str(ROOT / "outputs" / "videos" / f"session_{time.strftime('%Y%m%d_%H%M%S')}.mp4")
                     Path(path).parent.mkdir(parents=True, exist_ok=True)
                     h, w = vis.shape[:2]
-                    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), max(15.0, src.info.fps or 30.0), (w, h))
+                    rec_fps = src.info.fps if (src.info.fps and src.info.fps > 1.0) else 30.0
+                    writer = cv2.VideoWriter(path, cv2.VideoWriter.fourcc(*"mp4v"), rec_fps, (w, h))
                     recording = writer.isOpened()
                     print(f"{'开始录制：' + path if recording else '录制失败（编码器不可用）'}")
                 else:

@@ -9,6 +9,7 @@ Windows 上打开摄像头的坑都在这里处理掉了：
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,47 +61,109 @@ class CameraSource(VideoSource):
     ) -> None:
         self.cap = None
         self.backend_name = ""
+        self.resolution_fallback = False
         candidates = (
             [("given", backend)] if backend is not None else [(n, b) for n, b in WINDOWS_BACKENDS]
         )
+        # 分辨率候选：先试用户要的，失败再降级。
+        # 为什么必须降级：不少 USB 摄像头对不支持的分辨率不会报错，
+        # 而是"打开成功但每帧都返回全黑"，代码不检查就会一直拿到黑屏。
+        res_candidates: list[tuple[int, int]] = []
+        for cand in ((width, height), (1280, 720), (640, 480), (0, 0)):
+            if cand not in res_candidates:
+                res_candidates.append(cand)
+
         errors: list[str] = []
         for name, api in candidates:
-            cap = cv2.VideoCapture(index, api)
-            if not cap.isOpened():
-                cap.release()
-                errors.append(f"{name}: 打不开")
-                continue
-            if fourcc:
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_FPS, fps)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok = False
-            for _ in range(10):
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    ok = True
+            for rw, rh in res_candidates:
+                cap = cv2.VideoCapture(index, api)
+                if not cap.isOpened():
+                    cap.release()
+                    errors.append(f"{name}: 打不开")
+                    break                      # 该后端整体不可用，换下一个后端
+                if fourcc:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*fourcc))
+                if rw and rh:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, rw)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, rh)
+                cap.set(cv2.CAP_PROP_FPS, fps)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                frame = None
+                for _ in range(12):
+                    ret, f = cap.read()
+                    if ret and f is not None:
+                        frame = f
+                        # 真实传感器一定有噪声：整帧完全不变 = 这条流是假的
+                        if float(f.std()) > 1.0:
+                            break
+                    else:
+                        time.sleep(0.05)
+                if frame is not None and float(frame.std()) > 1.0:
+                    self.cap = cap
+                    self.backend_name = name
+                    self.resolution_fallback = bool(rw and (rw, rh) != (width, height))
+                    if self.resolution_fallback:
+                        got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        print(
+                            f"[提示] 摄像头 {index} 不支持 {width}x{height}（该分辨率下输出全黑），"
+                            f"已自动降到 {got_w}x{got_h}。"
+                        )
                     break
-                time.sleep(0.05)
-            if ok:
-                self.cap = cap
-                self.backend_name = name
+                cap.release()
+                errors.append(
+                    f"{name} @ {rw or '默认'}x{rh or ''}: "
+                    + ("读不到画面" if frame is None else "输出全黑（分辨率不支持）")
+                )
+            if self.cap is not None:
                 break
-            cap.release()
-            errors.append(f"{name}: 打开但读不到画面")
         if self.cap is None:
             raise RuntimeError(
-                f"无法打开摄像头 {index}。\n  " + "\n  ".join(errors) +
-                "\n提示：确认没有别的程序（QQ/微信/腾讯会议/浏览器）正在占用摄像头。"
+                f"无法打开摄像头 {index}，已尝试全部后端与分辨率。\n  " + "\n  ".join(errors) +
+                "\n可能原因：\n"
+                "  1) 被别的程序占用（QQ / 微信 / 腾讯会议 / 浏览器 / Windows Hello）；\n"
+                "  2) 是红外摄像头（IR，无彩色输出）；\n"
+                "  3) 镜头上有物理遮挡（隐私滑块 / 盖子合上）；\n"
+                "  4) USB 供电或带宽不足（换一个直接插在机身上的 USB 口试试）。"
             )
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         real_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
+        self.fps_measured = False
+        if not real_fps or real_fps <= 1.0 or real_fps != real_fps:
+            # 很多 USB 摄像头（尤其是走 DSHOW 的）CAP_PROP_FPS 会返回 -1 或 0，
+            # 直接拿这个值会让录像文件帧率变成 -1 -> 写出来是坏文件。
+            # 这里实测一段时间的真实帧率兜底。
+            real_fps = self.measure_fps(duration=1.0, warmup=3)
+            self.fps_measured = True
         self.info = SourceInfo("camera", w, h, real_fps, self.backend_name, str(index))
         self._interval = 1.0 / real_fps if real_fps and real_fps > 1 else 0.0
         self._emit_interval = 0.0
         self._next_t = 0.0
+
+    def measure_fps(self, duration: float = 1.0, warmup: int = 3) -> float:
+        """实测摄像头真实帧率（读若干帧计时）。
+
+        注意：暗光下摄像头会自动拉长曝光时间，帧率可能掉到个位数 ——
+        这时的低帧率是光照问题，不是代码问题。
+        """
+        if self.cap is None:
+            return 30.0
+        for _ in range(warmup):
+            self.cap.read()
+        count = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < duration:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                count += 1
+            else:
+                break
+        elapsed = time.perf_counter() - t0
+        if count < 2 or elapsed <= 0:
+            return 30.0
+        fps = count / elapsed
+        return float(fps) if fps > 1.0 else 30.0
 
     def read(self) -> tuple[bool, np.ndarray | None, float]:
         assert self.cap is not None
@@ -152,7 +215,7 @@ class FileSource(VideoSource):
 class ImageSource(VideoSource):
     """单张图片（可以喂一个文件夹，当序列处理）。"""
 
-    def __init__(self, paths: list[str | Path], fps: float = 30.0) -> None:
+    def __init__(self, paths: Sequence[str | Path], fps: float = 30.0) -> None:
         self.paths = [Path(p) for p in paths]
         if not self.paths:
             raise ValueError("没有可用的图片")

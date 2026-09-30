@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -32,6 +33,27 @@ from .geometry import (
     refine_circle_subpixel,
 )
 from .types import Detection
+
+
+def resolve_weights(weights: str) -> str:
+    """把权重路径解析成实际可用的路径。
+
+    规则：
+      1. 绝对路径 -> 原样返回（不存在就退回文件名，交给 ultralytics 处理）；
+      2. 相对路径 -> 相对**项目根目录**解析（而不是当前工作目录），
+         这样在 apps/ 或任意目录下运行都能找到 models/yolo11n.pt；
+      3. 项目里找不到 -> 只返回文件名，让 ultralytics 自己去缓存目录找或下载。
+    """
+    if not weights:
+        return weights
+    p = Path(weights)
+    if p.is_absolute():
+        return str(p) if p.exists() else p.name
+    root = Path(__file__).resolve().parents[1]
+    candidate = root / p
+    if candidate.exists():
+        return str(candidate)
+    return p.name
 
 
 class BaseDetector:
@@ -416,7 +438,7 @@ class YoloDetector(BaseDetector):
             )
             return None
         try:
-            self._model = YOLO(self.cfg.yolo_weights)
+            self._model = YOLO(resolve_weights(self.cfg.yolo_weights))
         except Exception as exc:  # pragma: no cover
             self._load_error = f"加载 YOLO 权重 {self.cfg.yolo_weights!r} 失败：{exc}"
         return self._model
@@ -491,7 +513,7 @@ class YoloSamDetector(BaseDetector):
             )
             return None
         try:
-            self._sam = SAM(self.cfg.sam_model)
+            self._sam = SAM(resolve_weights(self.cfg.sam_model))
         except Exception as exc:  # pragma: no cover
             self._load_error = f"加载 SAM 权重 {self.cfg.sam_model!r} 失败：{exc}"
             return None

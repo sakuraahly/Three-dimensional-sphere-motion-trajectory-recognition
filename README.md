@@ -6,6 +6,76 @@
 
 ---
 
+## 〇、当前进度与快速开始
+
+### 做到了什么（全部实测，可复现）
+
+| 环节 | 状态 | 实测结果 |
+|---|---|---|
+| 球体 2D 检测（颜色 / 梯度几何 / 背景差分 / 投票融合） | ✅ 完成 | 检出率 **100%**，圆心误差 **0.54 px** |
+| 亚像素边缘细化 | ✅ 完成 | 半径误差 **0.06 px**（细化前 0.4–0.5 px） |
+| 卡尔曼跟踪（含机动检测 / 反弹重初始化） | ✅ 完成 | 跟踪中位误差 **0.65 px** |
+| 单目三维估计（球直径先验 `Z = fR/r`） | ✅ 完成 | 深度误差 **0.31%**，3D RMSE **15.1 mm** |
+| 轨迹预测（自适应窗口 + 已知重力约束） | ✅ 完成 | 0.1 / 0.2 / 0.3 s 分别 **0.81 / 1.20 / 1.98 px** |
+| 可视化（拖尾 / 圆 / 预测虚线 / HUD / 3D 小视图） | ✅ 完成 | 见 `outputs/videos/annotated.mp4` |
+| 实时程序 + 离线批处理 + CSV 导出 | ✅ 完成 | 单路 **~160 fps**（960×540，纯 CPU 单线程） |
+| 合成真值自测（可直接当回归测试） | ✅ 完成 | `python apps/selftest_synthetic.py` |
+| AI 分支环境（YOLO / SAM 后端） | ⚙️ 环境就绪 | torch 2.11.0+cu128、ultralytics 8.4.159、CUDA 可用（sm_120） |
+| **双目标定 + 三角测量 + 3D 轨迹** | ⬜ 待做 | 本课题主体（见开题报告八阶段表） |
+| **两路视频同步** | ⬜ 待做 | — |
+| Savitzky-Golay / 3D 轨迹平滑 | ⬜ 待做 | scipy 1.18.1 已装 |
+| 三维可视化（Plotly / Unity） | ⬜ 待做 | 需 `pip install plotly` |
+
+一句话：**单路视频的"检测 → 跟踪 → 单目三维 → 预测 → 可视化"整条链路已经跑通并量化，
+可直接复用到双目方案的每一路视频上；缺的是双目标定、同步、三角测量与三维可视化。**
+
+### 三步开始使用
+
+```powershell
+conda activate myenv
+cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
+
+# 1) 自测：确认环境与代码正常（不需要摄像头，约 1 分钟）
+python apps/selftest_synthetic.py
+
+# 2) 看一遍离线效果（用已生成的合成视频，有真值可对照）
+python apps/run_video.py outputs/videos/synthetic_ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv --ball-diameter 0.22 --focal 831
+#    处理完打开 outputs/videos/annotated.mp4，就能看到轨迹拖尾与预测虚线
+
+# 3) 接真实摄像头（0 = 外置 aoni，1 = 笔记本内置，两路都可用）
+python apps/run_realtime.py --camera 0 --method fusion
+```
+
+实时窗口快捷键：`q` 退出、`c` 切检测方法、`m` 看掩膜、`s` 存快照与配置、`v` 录制、`r` 重置轨迹、`3` 开关三维小视图。
+
+**对准真实小球时的顺序**：先跑 `python apps/calibrate_color.py --camera 0` 拖滑块
+（按 `1`–`6` 可套预设），直到掩膜窗口里只有球是白的，按 `s` 保存；再用
+`python apps/run_realtime.py --camera 0 --config config/sphere_config.json --ball-diameter <球直径米>` 运行。
+
+### 摄像头现状（实测：两路彩色都能用）
+
+| 编号 | 设备 | 状态 |
+|---|---|---|
+| `--camera 0` | **aoni webcam A25**（外置 USB） | ✅ 1920×1080 @ 60 fps，成像正常 |
+| `--camera 1` | **Integrated Camera**（笔记本内置） | ✅ 1920×1080 @ 60 fps，成像正常 |
+| `--camera 2` | Integrated IR Camera（红外，Windows Hello） | ❌ OpenCV 打不开；且红外**无彩色**，不能用于本课题 |
+
+> **踩过的坑（已修复）**：这颗外置摄像头开机后的**前几帧是全黑的**，而旧代码
+> "读到第一帧非空就收工"，于是把黑帧当成了正常画面，表现为"这个摄像头是坏的"。
+> 现在 `CameraSource` 会等到帧内出现真实内容（std > 1）才接受，
+> 并且遇到不支持的分辨率会自动降级重试 —— 这类问题以后不会再骗到你。
+
+**要把这两路变成双目，还差两件事**：
+
+1. **对准同一区域**。现在两台相机一个拍桌面、一个拍人，视野几乎不重叠；
+   双目要求小球同时落在两个视角里。
+2. **刚性固定并量基线**。两台都上三脚架/横梁，锁死后不要再动；量出两镜头中心的距离（建议 60–150 mm）。
+
+两台**不同型号**是可以做的（标定时各自得到自己的内参 `K` 与畸变 `D`），
+但同型号会更省事（畸变特性接近、视场角一致）。
+
+---
+
 ## 一、先说你原来那套为什么不行
 
 原来的做法是：
@@ -199,8 +269,8 @@ python apps/run_realtime.py                       # 默认摄像头 + 融合检�
 python apps/run_realtime.py --method color --preset white_ball   # 更快
 python apps/run_realtime.py --camera 1 --width 1920 --height 1080 --fps 60
 
-# 4) 处理已有视频 / 图片
-python apps/run_video.py material_videos/ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv
+# 4) 处理已有视频 / 图片（把自己的视频放到 assets/videos/）
+python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv
 ```
 
 **实时窗口的快捷键**
@@ -295,8 +365,8 @@ $WHL = "$env:TEMP\whl"; New-Item -ItemType Directory -Force -Path $WHL | Out-Nul
 & $PY -m pip install -i https://mirrors.aliyun.com/pypi/simple/ `
     pyyaml psutil polars timm lap requests scipy pandas ultralytics-thop py-cpuinfo nvidia-ml-py
 
-# 3) 权重：GitHub 直连拿不到，走 gh 代理（或从别的机器拷过来放项目根目录）
-& curl.exe -s -L -o yolo11n.pt `
+# 3) 权重：GitHub 直连拿不到，走 gh 代理（或从别的机器拷过来放 models/ 目录）
+& curl.exe -s -L -o models\yolo11n.pt `
     "https://ghfast.top/https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt"
 
 # 4) 验证
@@ -321,7 +391,7 @@ python apps/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就
 
 代码里已经写好这两个后端（`sphere_tracker/detect.py` 的 `YoloDetector` / `YoloSamDetector`），
 未安装时会打印清晰的安装提示而不是崩掉。相关参数在 `DetectorConfig`：
-`yolo_weights`（默认 `yolo11n.pt`，可换 `yolo26n-seg.pt`）、`yolo_conf`、`yolo_imgsz`、
+`yolo_weights`（默认 `models/yolo11n.pt`，可换 `models/yolo26n-seg.pt`）、`yolo_conf`、`yolo_imgsz`、
 `yolo_classes`（默认 `[32]` = sports ball）、`sam_model`（默认 `sam2.1_t.pt`）。
 
 ### 已知的坑（都是实测过的）
@@ -364,24 +434,42 @@ python apps/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就
 
 ## 七、代码结构
 
-```
-sphere_tracker/
-  config.py     所有可调参数（dataclass，可存取 JSON）
-  types.py      Detection / TrackState / FrameResult / TrailPoint
-  geometry.py   亚像素圆拟合、径向一致性、梯度校验、相机模型、单目测深
-  detect.py     检测后端：color / hough / motion / fusion / yolo / yolo_sam
-  track.py      卡尔曼滤波（含机动检测与重初始化）+ 轨迹管理
-  predict.py    轨迹预测：最长有效后缀拟合 + 已知重力约束
-  viz.py        拖尾、圆、预测虚线、HUD、三维小面板
-  sources.py    摄像头 / 视频文件 / 图片序列
-  pipeline.py   单帧总流程编排
+```text
+sphere_tracker/          核心库（可被任意脚本 import）
+  config.py              所有可调参数（dataclass，可存取 JSON）
+  types.py               Detection / TrackState / FrameResult / TrailPoint
+  geometry.py            亚像素圆拟合、径向一致性、梯度校验、相机模型、单目测深
+  detect.py              检测后端：color / hough / motion / fusion / yolo / yolo_sam
+  track.py               卡尔曼滤波（含机动检测与重初始化）+ 轨迹管理
+  predict.py             轨迹预测：最长有效后缀拟合 + 已知重力约束
+  viz.py                 拖尾、圆、预测虚线、HUD、三维小面板
+  sources.py             摄像头 / 视频文件 / 图片序列
+  pipeline.py            单帧总流程编排
 
-apps/
-  run_realtime.py       实时摄像头主程序
-  run_video.py          离线处理视频/图片，导出 CSV
-  calibrate_color.py    HSV 阈值交互标定
-  calibrate_focal.py    单点焦距标定（三维必需）
-  selftest_synthetic.py 合成数据自测（真值已知，可直接当回归测试）
+apps/                    可直接运行的程序
+  run_realtime.py        实时摄像头主程序
+  run_video.py           离线处理视频/图片，导出 CSV
+  calibrate_color.py     HSV 阈值交互标定
+  calibrate_focal.py     单点焦距标定（三维必需）
+  selftest_synthetic.py  合成数据自测（真值已知，可直接当回归测试）
+
+docs/                    文档
+  开题报告_PPT逐页文稿.md
+  refs/                  两篇参考文献 PDF
+
+legacy/                  早期草稿（保留可运行，仅供对照，见其中 README.md）
+  01_canny_single_image.py     原 test.py
+  02_canny_realtime_edges.py   原 video_edge_detect.py
+
+assets/                  项目素材
+  images/test.jpg        示例图片（单图调试用）
+  videos/                放你要处理的视频（体积大，不入库，见其中 README.md）
+
+models/                  推理权重（*.pt 不入库，见其中 README.md）
+  yolo11n.pt             --method yolo 用的 COCO 权重
+
+outputs/                 运行产物（全部可重新生成，不入库）
+  images/  videos/  *.csv
 ```
 
 在你自己代码里调用：
@@ -434,14 +522,17 @@ while True:
 
 ## 九、已修复的问题（原脚本）
 
-| 文件                   | 问题                                                                                                            | 修复                                         |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| `video_edge_detect.py` | `OUTPUT_PATH = "../outputs/videos/..."` 会写到**项目上一级目录**，那里没有 outputs 文件夹，VideoWriter 直接失败 | 改成项目内的 `outputs/videos/`，并自动建目录 |
-| `video_edge_detect.py` | XVID 编码器 + `isColor=False` 写单通道灰度图，多数机器上写出来是坏文件                                          | 转成 BGR 三通道写入                          |
-| `test.py`              | `cv2.imread("test.jpg")` 路径错误（图片实际在 `material_images/`），读不到会直接崩                              | 修路径并加 None 检查                         |
-| `test.py`              | 保存结果到当前目录，和 `outputs/` 的约定不一致                                                                  | 统一存到 `outputs/images/`                   |
+这两个早期脚本现在归档在 `legacy/`（保留可运行，见 `legacy/README.md`），
+文件也改成了能表明用途的名字：
 
-> 另外提醒：`material_images/test.jpg` 的**真实格式是 PNG**（含 alpha 通道），
+| 现文件 | 原文件名 | 问题 | 修复 |
+|---|---|---|---|
+| `legacy/02_canny_realtime_edges.py` | `video_edge_detect.py` | `OUTPUT_PATH = "../outputs/videos/..."` 会写到**项目上一级目录**，那里没有 outputs 文件夹，VideoWriter 直接失败 | 改成项目内的 `outputs/videos/`，并自动建目录 |
+| `legacy/02_canny_realtime_edges.py` | `video_edge_detect.py` | XVID 编码器 + `isColor=False` 写单通道灰度图，多数机器上写出来是坏文件 | 转成 BGR 三通道写入 |
+| `legacy/01_canny_single_image.py` | `test.py` | `cv2.imread("test.jpg")` 路径错误（图片实际在 `assets/images/`），读不到会直接崩 | 修路径并加 None 检查 |
+| `legacy/01_canny_single_image.py` | `test.py` | 保存结果到当前目录，和 `outputs/` 的约定不一致 | 统一存到 `outputs/images/` |
+
+> 另外提醒：`assets/images/test.jpg` 的**真实格式是 PNG**（含 alpha 通道），
 > 只是扩展名写成了 .jpg。OpenCV 能读，但某些工具会报格式错误，建议改名。
 
 ---

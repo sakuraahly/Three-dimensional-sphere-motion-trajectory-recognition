@@ -1,3 +1,14 @@
+"""【早期草稿 · 保留备查】实时摄像头 Canny 边缘检测（原文件名 video_edge_detect.py）。
+
+这是本课题最开始的实时尝试：扫描并选择摄像头、逐帧 Canny、可录制边缘视频。
+其中"实测摄像头真实帧率"的思路后来被吸收进了 sphere_tracker/sources.py。
+结论是 Canny 得不到"球心 + 半径"，因此主流程已被 apps/run_realtime.py 取代。
+
+运行（在项目根目录下）::
+
+    python legacy/02_canny_realtime_edges.py     # 按 q 退出
+"""
+
 from __future__ import annotations
 import cv2
 import sys
@@ -11,7 +22,8 @@ SAVE_OUTPUT = True
 # 那是"项目的上一级目录"，那里并没有 outputs 文件夹，VideoWriter 会创建失败，
 # 而且失败时只打印一句警告就静默跳过，很容易以为在录、其实什么都没存。
 # 改成相对本文件所在的项目根目录，并在写入前自动建目录。
-_PROJECT_ROOT = Path(__file__).resolve().parent
+# 本脚本在 legacy/ 下，所以项目根目录要往上退一级
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_PATH = str(_PROJECT_ROOT / "outputs" / "videos" / "output_edges.mp4")
 
 # 【说明】Canny 边缘图只是"所有边缘"，并不是"球"。
@@ -185,7 +197,7 @@ def main():
     out = None
     if SAVE_OUTPUT:
         Path(OUTPUT_PATH).parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        fourcc = cv2.VideoWriter.fourcc(*"XVID")
         # 【已修复】XVID 编码器不支持单通道灰度，用 isColor=False 写出来的
         # 多半是坏文件。这里统一按三通道写入（灰度图转成 BGR 即可）。
         out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (width, height), isColor=True)

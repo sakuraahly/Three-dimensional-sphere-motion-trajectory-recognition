@@ -300,7 +300,7 @@ def run_case(
     if write_video:
         out_dir = ROOT / "outputs" / "videos"
         out_dir.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        fourcc = cv2.VideoWriter.fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(out_dir / "synthetic_ball.mp4"), fourcc, scene.fps,
                                  (scene.width, scene.height))
         writer_ann = cv2.VideoWriter(str(out_dir / "synthetic_ball_annotated.mp4"), fourcc, scene.fps,

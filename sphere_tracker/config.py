@@ -112,13 +112,15 @@ class DetectorConfig:
     min_score: float = 0.30            # 低于此分数不输出
 
     # ---- AI 后端 ----
-    yolo_weights: str = "yolo11n.pt"   # 官方 COCO 权重含 "sports ball" 类
+    # 权重统一放在项目的 models/ 目录。路径相对项目根解析（不依赖当前工作目录）；
+    # 如果文件不存在，会自动退回裸文件名，让 ultralytics 自己去找或下载。
+    yolo_weights: str = "models/yolo11n.pt"   # 官方 COCO 权重含 "sports ball" 类
     yolo_conf: float = 0.25
     yolo_imgsz: int = 640
     yolo_device: str = "0"             # "0" = 第一块 GPU，"cpu" = CPU
     yolo_classes: list[int] | None = field(default_factory=lambda: [32])  # 32 = sports ball
     yolo_refine: bool = True           # 用框内颜色/霍夫把框细化成圆
-    sam_model: str = "sam2.1_t.pt"     # ultralytics 的 SAM2 tiny
+    sam_model: str = "models/sam2.1_t.pt"   # ultralytics 的 SAM2 tiny（首次运行自动下载）
     sam_refine_from: str = "yolo"      # "yolo" | "hough" | "color"：用什么给 SAM 提示框
 
 

@@ -10,7 +10,7 @@
     python apps/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.04
 
     # 用一张照片
-    python apps/calibrate_focal.py --image material_images/ball_at_1m.png --distance 1.0
+    python apps/calibrate_focal.py --image assets/images/ball_at_1m.png --distance 1.0
 """
 from __future__ import annotations
 

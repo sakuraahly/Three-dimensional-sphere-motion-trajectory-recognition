@@ -145,12 +145,22 @@ bin/
 outputs/
 
 # ---------- 模型权重 ----------
-# 推理权重（yolo11n.pt / sam2.1_t.pt / *.onnx…）都是可下载的二进制，
+# 推理权重（models/yolo11n.pt、models/sam2.1_t.pt、*.onnx…）都是可下载的二进制，
 # 动辄几 MB 到几 GB，不进版本库；首次运行时由 ultralytics 自动下载，
-# 或用 README 第八节的镜像命令手动放到项目根目录。
+# 或用 README 第六节的镜像命令手动放到 models/ 目录。
 *.pt
 *.pth
 *.onnx
+
+# ---------- 自己录制的素材 ----------
+# assets/videos/ 放的是待处理视频（几百 MB 起步），不入库，只保留目录说明。
+assets/videos/*
+!assets/videos/README.md
+
+# ---------- 本机标定结果 ----------
+# config/*.json 是"你这台相机 + 这个机位"的标定参数，换机器/挪动相机就要重标，
+# 所以默认不入库。如果你希望把标定结果一起存档，删掉下面这行即可。
+config/*.json
 
 # Rust
 target/
