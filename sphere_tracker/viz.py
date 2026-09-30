@@ -248,6 +248,19 @@ def hud_lines(
     if result.position_3d is not None:
         p = result.position_3d
         lines.append(f"3D  X {p[0]:+0.3f}  Y {p[1]:+0.3f}  Z {p[2]:0.3f} m")
+    # 相机自运动：手持/云台拍摄时必须让用户看见，否则会把"画面在动"
+    # 误当成"球在动"，预测也会跟着错。
+    mot = getattr(result, "camera_motion", None)
+    if mot is not None and getattr(mot, "method", "none") != "none":
+        tag = "MOVING" if getattr(result, "camera_moving", False) else "static"
+        lines.append(
+            f"cam {tag}  shift ({mot.dx:+6.2f},{mot.dy:+6.2f}) px  |d| {mot.magnitude:5.2f}"
+        )
     if result.prediction is not None:
-        lines.append(f"predict {cfg.predict.method} +{cfg.predict.horizon_s:0.2f}s")
+        method = cfg.predict.method
+        if (method == "quadratic" and cfg.predict.use_pixel_gravity
+                and getattr(result, "camera_moving", False)
+                and not getattr(result, "camera_steady", False)):
+            method += " (no g_px)"
+        lines.append(f"predict {method} +{cfg.predict.horizon_s:0.2f}s")
     return lines

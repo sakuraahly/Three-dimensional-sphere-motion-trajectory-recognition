@@ -105,6 +105,18 @@ class DetectorConfig:
     motion_var_threshold: float = 24.0
     motion_detect_shadows: bool = True
 
+    # ---- 相机自运动补偿（手持 / 云台 / 平移拍摄）----
+    # 背景差分假设背景静止；相机一平移，整幅画面都变成"前景"，误检会爆炸。
+    #   auto  = 检测到相机在动时自动切换成"对齐后再差分"，静止时仍用 MOG2
+    #   off   = 永远只做普通背景差分（相机固定的老场景）
+    #   force = 永远走补偿差分（相机持续移动时更稳）
+    motion_diff_min_threshold: float = 12.0    # 帧差的最低阈值（低于此的差异视为噪声）
+    motion_contrast_min: float = 12.0          # 判定"物体真的在这里"所需的最小内外反差
+    motion_compensation: str = "auto"
+    camera_motion_threshold_px: float = 0.8    # 每帧全局位移超过多少像素判定"相机在动"
+    motion_work_width: int = 320               # 估计相机运动时的缩放宽度（越小越快）
+    motion_feature_fallback: bool = True       # 平移过大时改用特征点法（可含旋转/缩放）
+
     # ---- 融合 ----
     # 两个检测中心相距小于 max(agree_px, agree_ratio*半径) 视为"同意"
     agree_px: float = 6.0

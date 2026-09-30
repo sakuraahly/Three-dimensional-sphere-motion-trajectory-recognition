@@ -66,8 +66,13 @@ class Scene:
         motion_blur: bool = True,
         noise: bool = True,
         distractors: bool = True,
+        pan_speed: float = 0.0,
     ) -> None:
         self.width, self.height = width, height
+        # 相机平移速度（像素/秒，全分辨率）。>0 表示相机在匀速横移，
+        # 用来检验"相机不固定"时检测是否还成立。
+        self.pan_speed = float(pan_speed)
+        self.pan_max = abs(pan_speed) * (duration + 0.5) + 40.0
         self.fps = fps
         self.duration = duration
         self.ball_diameter_m = ball_diameter_m
@@ -129,12 +134,16 @@ class Scene:
     def center3d(self, t: float) -> np.ndarray:
         return self.pos[self._idx(t)].astype(np.float64)
 
+    def pan_offset(self, t: float) -> float:
+        """相机横移量（像素）。相机向右移 -> 画面内容向左移。"""
+        return self.pan_speed * t
+
     def project(self, t: float) -> tuple[float, float, float]:
-        """三维真值 -> 像素 (u, v, r)。"""
+        """三维真值 -> 像素 (u, v, r)。含相机自运动带来的偏移。"""
         p = self.center3d(t)
         z = float(p[2])
         r = self.f * (self.ball_diameter_m / 2.0) / z
-        u = self.cx + self.f * float(p[0]) / z
+        u = self.cx + self.f * float(p[0]) / z - self.pan_offset(t)
         v = self.cy + self.f * float(p[1]) / z
         return u, v, r
 
@@ -172,15 +181,18 @@ def make_background(scene: Scene, rng: np.random.Generator) -> np.ndarray:
     两个陷阱都躲过去，才说明检测器真的有判别力，而不是"恰好看对了"。
     """
     w, h = scene.width, scene.height
+    # 相机平移时背景要画得比画面宽，后面从里面滑窗取景；
+    # 不平移时必须严格等于画面宽，否则整个场景就变了（干扰物位置、相机内参全跟着变）。
+    ww = int(w + scene.pan_max) if scene.pan_speed else w
     grad = np.linspace(38, 118, h, dtype=np.float32)[:, None]
-    img = np.dstack([grad, grad, grad]).repeat(1, axis=0).astype(np.uint8)
-    img = np.dstack([np.repeat(grad, w, axis=1)] * 3).astype(np.uint8)
+    img = np.dstack([np.repeat(grad, ww, axis=1)] * 3).astype(np.uint8)
     if scene.distractors:
+        # 坐标按"画面宽 w"放，保证不平移时与原来完全一致；平移时靠滑窗自然进出画面
         cv2.rectangle(img, (int(w * 0.70), int(h * 0.10)), (int(w * 0.88), int(h * 0.30)), (238, 238, 238), -1)
         cv2.circle(img, (int(w * 0.83), int(h * 0.78)), 36, (40, 130, 240), -1, cv2.LINE_AA)
         for i in range(7):
             y = int(h * (0.08 + 0.13 * i))
-            cv2.line(img, (0, y), (w, y), (int(58 + 9 * i), int(54 + 7 * i), int(50 + 5 * i)), 2)
+            cv2.line(img, (0, y), (ww, y), (int(58 + 9 * i), int(54 + 7 * i), int(50 + 5 * i)), 2)
     img = cv2.GaussianBlur(img, (3, 3), 0)
     if not scene.noise:
         return img
@@ -213,8 +225,27 @@ def _ball_coverage(
 
 
 def render_frame(scene: Scene, bg: np.ndarray, t: float, rng: np.random.Generator) -> np.ndarray:
-    """渲染一帧。运动模糊按"曝光时间 x 速度"积分，和真实相机一致。"""
-    img = bg.copy()
+    """渲染一帧。运动模糊按"曝光时间 x 速度"积分，和真实相机一致。
+
+    相机平移时，从加宽的背景里滑窗取景 —— 取景窗右移等价于画面内容左移，
+    与 Scene.project() 里的 -pan_offset 保持一致。
+    """
+    if scene.pan_speed:
+        W0 = scene.width
+        off = scene.pan_offset(t)
+        x0 = max(0, min(int(math.floor(off)), bg.shape[1] - W0 - 1))
+        img = bg[:, x0:x0 + W0].copy()
+        # 亚像素平移：先按整数取窗，再把小数部分用 warpAffine 补上。
+        # 只按整数取窗会让相机运动变成"阶梯"，给球的位置凭空加上 ±0.5 px 抖动，
+        # 那会污染预测精度的测量（看起来像"相机运动让预测变差"）。
+        frac = off - x0
+        if abs(frac) > 1e-6:
+            img = cv2.warpAffine(
+                img, np.float32([[1, 0, -frac], [0, 1, 0]]), (W0, scene.height),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            )
+    else:
+        img = bg.copy()
     u, v, r = scene.project(t)
     u_prev, v_prev, _ = scene.project(t - scene.dt)
     speed = math.hypot(u - u_prev, v - v_prev) * scene.fps
@@ -269,13 +300,21 @@ def run_case(
     scenario: str = "realistic",
     verbose: bool = False,
 ) -> dict:
-    realistic = scenario == "realistic"
-    scene = Scene(motion_blur=realistic, noise=realistic, distractors=True)
+    realistic = scenario in ("realistic", "panning")
+    panning = scenario == "panning"
+    scene = Scene(
+        motion_blur=realistic, noise=realistic, distractors=True,
+        # 相机匀速横移 90 px/s（1080p 下相当于手持慢摇/云台慢速平移）
+        pan_speed=90.0 if panning else 0.0,
+    )
     rng = np.random.default_rng(20240925)
     bg = make_background(scene, rng)
 
     cfg = AppConfig()
-    cfg.detector.method = method
+    # motion_raw = 背景差分但不做相机运动补偿，用来对照"补偿到底有没有用"
+    cfg.detector.method = "motion" if method == "motion_raw" else method
+    if method == "motion_raw":
+        cfg.detector.motion_compensation = "off"
     cfg.detector.color = ColorConfig.preset(preset)
     cfg.predict.method = predict
     cfg.predict.use_gravity = gravity_fit
@@ -340,7 +379,10 @@ def run_case(
         if result.track is not None and not result.track.coasting:
             err_trk.append(float(np.linalg.norm(np.array([result.track.x, result.track.y]) - gt_uv)))
             err_r.append(abs(result.track.radius - gt_r))
-            if result.position_3d is not None:
+            # 三维指标只在相机不动时统计：本场景的"平移"是纯图像平移，
+            # 不对应一致的相机三维运动，此时重建出的三维坐标是在"当前相机系"下，
+            # 与固定世界系的真值没有可比性 —— 报出来只会误导。
+            if result.position_3d is not None and not panning:
                 gt3 = scene.center3d(t)
                 err_3d.append(float(np.linalg.norm(result.position_3d - gt3)))
                 err_z_rel.append(abs(result.position_3d[2] - gt3[2]) / gt3[2])
@@ -431,7 +473,9 @@ def main() -> int:
     p.add_argument("--gravity-fit", action="store_true", help="三维预测时用已知重力约束")
     p.add_argument("--write-video", action="store_true")
     p.add_argument("--check-ai", action="store_true")
-    p.add_argument("--scenario", default="all", choices=["clean", "realistic", "all"])
+    p.add_argument("--scenario", default="all",
+                   choices=["clean", "realistic", "panning", "all"],
+                   help="panning = 相机匀速横移（检验相机不固定时是否还成立）")
     p.add_argument("--gate", default="color,fusion", help="必须达标的方法（逗号分隔）")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
@@ -440,8 +484,19 @@ def main() -> int:
         check_ai()
         return 0
 
-    methods = [args.method] if args.method else ["color", "hough", "motion", "fusion"]
-    scenarios = ["clean", "realistic"] if args.scenario == "all" else [args.scenario]
+    scenarios = ["clean", "realistic", "panning"] if args.scenario == "all" else [args.scenario]
+    # 平移场景额外加一个"不补偿"的对照组，直接看出补偿值不值
+    methods_by_scenario = {
+        "clean": ["color", "hough", "motion", "fusion"],
+        "realistic": ["color", "hough", "motion", "fusion"],
+        "panning": ["color", "motion_raw", "motion", "fusion"],
+    }
+    def methods_for(scenario: str) -> list[str]:
+        if args.method:
+            return [args.method]
+        if args.scenario != "all":
+            return methods_by_scenario.get(scenario, ["color", "fusion"])
+        return methods_by_scenario.get(scenario, ["color", "fusion"])
     gate = {s.strip() for s in args.gate.split(",") if s.strip()}
     probe = Scene()
     print(f"合成场景：{probe.width}x{probe.height} @ {probe.fps:.0f} fps, {probe.n} 帧, "
@@ -477,10 +532,11 @@ def main() -> int:
               f"{'0.1s':>8}{'0.2s':>8}{'0.3s':>8}{'0.2s中':>8}{'恢复0.2s':>10}{'速度':>9}")
         print("   （预测误差单位 px；'0.x s' 为稳定段均值；'恢复0.2s' 为反弹后 0.15 s 内的均值）")
         print("-" * 135)
-        for m in methods:
+        scenario_methods = methods_for(scenario)
+        for m in scenario_methods:
             r = run_case(
                 m, args.preset, args.predict, args.gravity_fit, verbose=args.verbose,
-                write_video=args.write_video and m == methods[-1] and scenario == scenarios[-1],
+                write_video=args.write_video and m == scenario_methods[-1] and scenario == scenarios[-1],
                 scenario=scenario,
             )
             print(f"{r['method']:<9}{r['detect_rate'] * 100:7.1f}%{r['det_rmse_px']:9.2f}px"

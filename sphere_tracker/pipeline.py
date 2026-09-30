@@ -22,12 +22,13 @@ from collections import deque
 import cv2
 import numpy as np
 
+from .camera_motion import GlobalMotionEstimator
 from .config import AppConfig
 from .detect import build_detector
 from .geometry import CameraModel
 from .predict import TrajectoryPredictor
 from .track import BallTracker
-from .types import FrameResult, TrailPoint
+from .types import FrameContext, FrameResult, TrailPoint
 from .viz import (
     draw_3d_panel,
     draw_detection,
@@ -54,6 +55,14 @@ class SpherePipeline:
         self._fps_ema = 0.0
         self._t0: float | None = None
         self._detector_error: str | None = None
+        # 相机自运动估计（手持/云台/平移拍摄时用它区分"画面在动"与"球在动"）
+        self.motion_estimator = GlobalMotionEstimator(
+            work_width=self.cfg.detector.motion_work_width,
+            threshold_px=self.cfg.detector.camera_motion_threshold_px,
+            feature_fallback=self.cfg.detector.motion_feature_fallback,
+        )
+        self._prev_gray: np.ndarray | None = None
+        self._motion_recent: deque[float] = deque(maxlen=6)   # 最近几帧的全局位移幅值
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -61,6 +70,8 @@ class SpherePipeline:
         self.tracker.reset()
         self.history3d.clear()
         self.detector.reset()
+        self.motion_estimator.reset()
+        self._prev_gray = None
         self._frame_index = 0
         self._prev_t = None
 
@@ -90,9 +101,30 @@ class SpherePipeline:
 
         self._ensure_camera(frame)
 
+        # ---- 每帧只算一次：灰度图 + 相机自运动 ----
+        # 灰度图给 color/hough/亚像素细化共用；相机自运动用来区分
+        # "画面在动"到底是因为相机在动，还是因为球在动。
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        motion = self.motion_estimator.estimate(self._prev_gray, gray)
+        camera_moving = self.motion_estimator.is_moving(motion)
+        self._prev_gray = gray
+        self._motion_recent.append(float(motion.magnitude))
+        # 区分"匀速移动"和"抖动/加速"：
+        #   匀速平移只是给图像叠加一个常数速度，不引入额外的表观加速度，
+        #   所以"已知像素重力"这一招依然成立；
+        #   而抖动/加减速会污染加速度项，必须退回自由二次拟合。
+        steady = False
+        if camera_moving and len(self._motion_recent) >= 3:
+            recent = list(self._motion_recent)[-5:]
+            lo, hi = min(recent), max(recent)
+            # 容差要能容忍"亚像素位移被取整"造成的 1 px 跳动，
+            # 又要能把真正的抖动/加减速区分出来
+            steady = (hi - lo) <= max(1.0, 0.5 * hi)
+        ctx = FrameContext(t=t, gray=gray, motion=motion, camera_moving=camera_moving)
+
         t_det = time.perf_counter()
         try:
-            detections = self.detector.detect(frame)
+            detections = self.detector.detect(frame, ctx)
         except RuntimeError as exc:  # AI 后端未安装时给出清晰提示
             detections = []
             if self._detector_error is None:
@@ -107,6 +139,8 @@ class SpherePipeline:
         result = FrameResult(
             t=t, frame_index=self._frame_index, detection=best, track=state,
             fps=self._fps_ema, detect_ms=detect_ms,
+            camera_motion=motion, camera_moving=camera_moving,
+            camera_steady=steady,
         )
         self._frame_index += 1
 
@@ -163,6 +197,10 @@ class SpherePipeline:
                     self.cfg.predict.use_pixel_gravity
                     and self.camera is not None
                     and state.z is not None
+                    # 相机在动时不能用"像素重力"：球在图像里的表观加速度 =
+                    # 球的重力 + 相机自身的运动加速度，两者混在一起没法分离，
+                    # 硬套 g_px 反而会给出错误的抛物线。此时退回自由二次拟合。
+                    and (not camera_moving or steady)
                 ):
                     g_px = self.camera.fy * self.cfg.predict.gravity / max(state.z, 1e-6)
                 result.prediction = self.predictor.predict(

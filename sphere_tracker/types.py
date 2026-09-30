@@ -9,6 +9,22 @@ import numpy as np
 
 
 @dataclass
+class FrameContext:
+    """一帧的共享上下文。
+
+    由 pipeline 每帧构造一次，传给所有检测后端，避免：
+      - 每个后端各自 cvtColor 一遍灰度图（color/hough/亚像素细化都要灰度）；
+      - 相机自运动被重复估计。
+    检测器可以忽略它（默认 None），需要时再取。
+    """
+
+    t: float = 0.0
+    gray: np.ndarray | None = None
+    motion: Any = None            # camera_motion.MotionEstimate
+    camera_moving: bool = False
+
+
+@dataclass
 class Detection:
     """单帧检测结果（像素坐标）。"""
 
@@ -86,3 +102,6 @@ class FrameResult:
     position_3d: np.ndarray | None = None     # (3,) 米
     fps: float = 0.0
     detect_ms: float = 0.0
+    camera_motion: Any = None     # camera_motion.MotionEstimate
+    camera_moving: bool = False   # 本帧相机是否在动（幅值超过阈值）
+    camera_steady: bool = False   # 相机是否在"匀速"移动（匀速不破坏像素重力约束）
