@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,9 +38,10 @@ import numpy as np
 
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
 from calib.board import detect_board
-from sphere_tracker.sources import CameraSource
+from sphere_tracker.sources import CameraSource, LatestFrameCamera
 
 WINDOW = "stereo calibration"
+PREVIEW_W = 720          # 单路预览宽度（两路并排 + 覆盖率图，正好放得下）
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
 
@@ -58,10 +60,15 @@ class PairSource:
 
         if args.left is not None and args.right is not None:
             self.kind = "camera"
+            # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
+            # 处理得慢就自动丢帧，永远处理最新画面
             self.cam = [
-                CameraSource(index=args.left, width=args.width, height=args.height, fps=args.fps),
-                CameraSource(index=args.right, width=args.width, height=args.height, fps=args.fps),
+                LatestFrameCamera(CameraSource(index=args.left, width=args.width,
+                                               height=args.height, fps=args.fps)),
+                LatestFrameCamera(CameraSource(index=args.right, width=args.width,
+                                               height=args.height, fps=args.fps)),
             ]
+            self._primed = False
             print(f"相机 {args.left}: {self.cam[0].info.width}x{self.cam[0].info.height} @ {self.cam[0].info.fps:.1f} fps")
             print(f"相机 {args.right}: {self.cam[1].info.width}x{self.cam[1].info.height} @ {self.cam[1].info.fps:.1f} fps")
         elif args.left_video and args.right_video:
@@ -92,9 +99,13 @@ class PairSource:
     def read(self):
         """返回 (ok, left_bgr, right_bgr)。"""
         if self.kind == "camera":
-            ok1, a, _ = self.cam[0].read()
-            ok2, b, _ = self.cam[1].read()
-            return (ok1 and ok2), a, b
+            if not self._primed:
+                for c in self.cam:
+                    c.wait_first()
+                self._primed = True
+            _s1, a = self.cam[0].latest()
+            _s2, b = self.cam[1].latest()
+            return (a is not None and b is not None), a, b
         if self.kind == "video":
             ok1, a = self.caps[0].read()
             ok2, b = self.caps[1].read()
@@ -109,7 +120,7 @@ class PairSource:
 
     def release(self) -> None:
         for c in self.cam:
-            c.release()
+            c.stop()
         for c in self.caps:
             c.release()
 
@@ -189,6 +200,11 @@ def main() -> int:
     )
     collector = AutoPairCollector(spec, cap_cfg)
 
+    cov_cache = None
+    cov_cache_n = -1
+    det_ms = 0.0
+    t_prev = time.perf_counter()
+    fps_frames = 0
     pairs_dir: Path | None = Path(args.save_pairs) if args.save_pairs else None
     if pairs_dir:
         (pairs_dir / "left").mkdir(parents=True, exist_ok=True)
@@ -206,9 +222,12 @@ def main() -> int:
             if args.max_frames and frames > args.max_frames:
                 break
 
+            t0 = time.perf_counter()
             gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
             gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
             accepted, reason = collector.offer(gl, gr)
+            det_ms = 0.9 * det_ms + 0.1 * (time.perf_counter() - t0) * 1000.0
+            fps_frames += 1
 
             if accepted and pairs_dir:
                 i = collector.count
@@ -216,24 +235,43 @@ def main() -> int:
                 cv2.imwrite(str(pairs_dir / "right" / f"{i:03d}.png"), right)
 
             if not args.no_show:
-                vis_l, vis_r = left.copy(), right.copy()
-                for img, g in ((vis_l, gl), (vis_r, gr)):
-                    obs = detect_board(g, spec)
-                    if obs.found and obs.corners is not None:
-                        colour = (0, 220, 0) if accepted else (0, 140, 255)
-                        cv2.drawChessboardCorners(img, spec.pattern_size, obs.corners, True)
-                        cv2.polylines(img, [obs.quad().astype(np.int32)], True, colour, 2)
-                scale = 700.0 / vis_l.shape[1]
-                a = cv2.resize(vis_l, None, fx=scale, fy=scale)
-                b = cv2.resize(vis_r, None, fx=scale, fy=scale)
+                # 直接复用粗检结果画框 —— 之前这里又检测了一遍，
+                # 每帧 4 次全图精确检测（约 1.2 秒）就是卡顿的根源。
+                scale = PREVIEW_W / float(left.shape[1])
+                a = cv2.resize(left, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                b = cv2.resize(right, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                for img, obs in ((a, collector.last_obs[0]), (b, collector.last_obs[1])):
+                    if obs is None or not obs.found or obs.corners is None:
+                        continue
+                    colour = (0, 220, 0) if collector.last_accepted else (0, 140, 255)
+                    quad = obs.quad()
+                    if quad is not None:
+                        cv2.polylines(img, [(quad * scale).astype(np.int32)], True, colour, 2)
+                    pts = obs.corners.reshape(-1, 2) * scale
+                    for x, y in pts:
+                        cv2.circle(img, (int(x), int(y)), 2, (0, 255, 255), -1)
                 top = np.hstack([a, b])
-                cov = collector.coverage_image(scale=1.0)
+
+                # 覆盖率图只在收帧数变化时重画（原来每帧都重建一次画布）
+                if collector.count != cov_cache_n:
+                    if collector.image_size:
+                        # 缩放到约 200 px 高，宽度按原比例跟着走
+                        cov_scale = 200.0 / collector.image_size[1]
+                    else:
+                        cov_scale = 0.2
+                    cov_cache = collector.coverage_image(scale=cov_scale)
+                    cov_cache_n = collector.count
+                cov = cov_cache
+                if cov is None:
+                    cov = np.zeros((top.shape[0], 180, 3), np.uint8)
                 if cov.shape[0] < top.shape[0]:
-                    pad = np.zeros((top.shape[0] - cov.shape[0], cov.shape[1], 3), np.uint8)
-                    cov = np.vstack([cov, pad])
+                    cov = np.vstack([cov, np.zeros((top.shape[0] - cov.shape[0], cov.shape[1], 3), np.uint8)])
                 panel = np.hstack([top, cov[: top.shape[0]]])
-                for i, line in enumerate(collector.status_lines()):
-                    cv2.putText(panel, line, (8, panel.shape[0] - 60 + i * 18),
+
+                lines = collector.status_lines()
+                lines.append(f"detect {det_ms:.0f} ms/frame  ({1000.0 / max(det_ms, 1e-3):.0f} fps)")
+                for i, line in enumerate(lines):
+                    cv2.putText(panel, line, (8, panel.shape[0] - 78 + i * 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.imshow(WINDOW, panel)
                 key = cv2.waitKey(1) & 0xFF
@@ -247,7 +285,12 @@ def main() -> int:
                 print(f"已收满 {collector.count} 对，开始标定…")
                 break
             if src.is_live and frames % 60 == 0:
-                print(f"  已收 {collector.count}/{args.target}  ({collector.last_reason})")
+                now = time.perf_counter()
+                fps = fps_frames / max(now - t_prev, 1e-6)
+                t_prev = now
+                fps_frames = 0
+                print(f"  已收 {collector.count}/{args.target}  {fps:5.1f} fps  "
+                      f"检测 {det_ms:.0f} ms/帧  ({collector.last_reason})")
     finally:
         src.release()
         if not args.no_show:

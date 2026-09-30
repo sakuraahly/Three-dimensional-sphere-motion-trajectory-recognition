@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from .board import BoardObservation, BoardSpec, detect_board, pose_distance
+from .board import BoardObservation, BoardSpec, detect_board, detect_board_in_roi, pose_distance
 
 
 @dataclass
@@ -38,6 +38,10 @@ class CaptureConfig:
     diversity_min: float = 0.055    # 与已收位姿的最小差异（占图像对角线比例）
     region_grid: int = 3            # 画面分几宫格
     max_per_region: int = 5         # 每宫格最多收几对，强制覆盖全画面
+    # 每帧做判断用的"粗检"分辨率。全图精确检测要 300 ms，撑不住实时；
+    # 粗检 640 宽只要约 12 ms，足够判断"值不值得收"。真正收帧时再在棋盘
+    # 附近做全分辨率精确检测（裁剪不损失分辨率）。
+    gate_work_width: int = 640
 
 
 @dataclass
@@ -68,6 +72,9 @@ class AutoPairCollector:
         self.rejected: dict[str, int] = {}
         self.last_reason = ""
         self.image_size: tuple[int, int] | None = None  # (w, h)
+        # 本帧的粗检结果，供界面直接画框（避免重复检测 —— 那是主要的卡顿来源）
+        self.last_obs: tuple[BoardObservation | None, BoardObservation | None] = (None, None)
+        self.last_accepted = False
 
     # ------------------------------------------------------------------
     @property
@@ -87,6 +94,8 @@ class AutoPairCollector:
         self._prev_h = {"left": None, "right": None}
         self._region_count.clear()
         self.rejected.clear()
+        self.last_obs = (None, None)
+        self.last_accepted = False
 
     def _reject(self, reason: str) -> tuple[bool, str]:
         self.rejected[reason] = self.rejected.get(reason, 0) + 1
@@ -107,8 +116,11 @@ class AutoPairCollector:
         self.image_size = (w, h)
         diag = math.hypot(w, h)
 
-        obs_l = detect_board(left_gray, spec)
-        obs_r = detect_board(right_gray, spec)
+        # 每帧只做"粗检"：降分辨率 + 不开 EXHAUSTIVE，约 12 ms/路
+        obs_l = detect_board(left_gray, spec, work_width=cfg.gate_work_width, exhaustive=False)
+        obs_r = detect_board(right_gray, spec, work_width=cfg.gate_work_width, exhaustive=False)
+        self.last_obs = (obs_l, obs_r)
+        self.last_accepted = False
 
         # 1) 两路都要检测到
         if not obs_l.found or not obs_r.found:
@@ -158,20 +170,36 @@ class AutoPairCollector:
         if self._region_count.get((gx, gy), 0) >= cfg.max_per_region:
             return self._reject("该区域已收够，请换个位置")
 
+        # 7) 全部通过 -> 在棋盘附近做全分辨率精确检测（只在这一帧做，约 40 ms/路）
+        acc_l = detect_board_in_roi(left_gray, spec, obs_l.corners)
+        acc_r = detect_board_in_roi(right_gray, spec, obs_r.corners)
+        if acc_l is None or acc_r is None:
+            return self._reject("精确复核失败（板太靠边或被遮挡）")
+        # 用精确角点复核关键指标，避免粗检的近似把不合格的帧放进来
+        for name, acc in (("左", acc_l), ("右", acc_r)):
+            if acc.sharpness < cfg.min_sharpness:
+                return self._reject(f"{name}图模糊(精确复核)")
+            if acc.margin_px < cfg.min_margin_px:
+                return self._reject(f"{name}图棋盘贴边(精确复核)")
+            if acc.area_ratio < cfg.min_area_ratio:
+                return self._reject(f"{name}图棋盘太小(精确复核)")
+
         self._region_count[(gx, gy)] = self._region_count.get((gx, gy), 0) + 1
         self.pairs.append(
             CapturedPair(
-                corners_left=obs_l.corners.copy(),
-                corners_right=obs_r.corners.copy(),
-                homography_left=obs_l.homography.copy(),
-                homography_right=obs_r.homography.copy(),
+                corners_left=acc_l.corners.copy(),
+                corners_right=acc_r.corners.copy(),
+                homography_left=acc_l.homography.copy(),
+                homography_right=acc_r.homography.copy(),
                 center_left=(cx, cy),
                 quality={
-                    "sharpness_l": obs_l.sharpness, "sharpness_r": obs_r.sharpness,
-                    "area_l": obs_l.area_ratio, "area_r": obs_r.area_ratio,
+                    "sharpness_l": acc_l.sharpness, "sharpness_r": acc_r.sharpness,
+                    "area_l": acc_l.area_ratio, "area_r": acc_r.area_ratio,
                 },
             )
         )
+        self.last_obs = (acc_l, acc_r)
+        self.last_accepted = True
         self.last_reason = f"已收 {self.count}/{cfg.target_pairs}"
         return True, self.last_reason
 

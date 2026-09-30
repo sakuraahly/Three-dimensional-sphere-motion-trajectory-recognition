@@ -8,6 +8,8 @@ Windows 上打开摄像头的坑都在这里处理掉了：
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,6 +51,95 @@ class VideoSource:
         return False
 
 
+# 自动模式探测用的候选分辨率。
+# 为什么需要这个：USB 摄像头的"支持分辨率列表"和"实际帧率"关系很反直觉 ——
+# 实测 aoni webcam A25：请求 1280x720 只有 10 fps，请求 1024x768 反而拿到
+# 1280x720@30fps（DSHOW 在不同请求下选了不同的内部模式）；
+# 1920x1080 更是只有 4.3 fps（YUY2 未压缩，USB 带宽不够）。
+# 不探测就只能靠猜。
+CANDIDATE_MODES: tuple[tuple[int, int], ...] = (
+    (1920, 1080), (1280, 720), (1024, 768), (960, 540), (800, 600), (640, 480),
+)
+_MODE_CACHE = Path(__file__).resolve().parents[1] / "config" / "camera_modes.json"
+
+
+def _load_mode_cache() -> dict:
+    try:
+        return json.loads(_MODE_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_mode_cache(cache: dict) -> None:
+    try:
+        _MODE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _MODE_CACHE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+class LatestFrameCamera:
+    """后台线程持续采集，主循环永远拿"最新一帧"。
+
+    为什么必须这样：在一个线程里顺序读两路摄像头，每读一路都要**等**它的下一帧
+    （1080p30 就是 33 ms），两路串起来 66 ms —— 主循环再快也被拖到 15 fps。
+    更要命的是，如果处理速度跟不上采集，帧会在驱动缓冲里越积越多，
+    你看到的是几百毫秒前的画面（标定时表现为"明明停稳了却总说在移动"）。
+
+    这里让采集在自己的线程里跑，主循环用 latest() 取当前帧：
+    处理得完就一帧不落，处理不完就自动丢掉旧帧 —— 永远看最新画面。
+    """
+
+    def __init__(self, source: CameraSource) -> None:
+        self.source = source
+        self._lock = threading.Lock()
+        self._frame = None
+        self._seq = 0
+        self._stop = False
+        self.dropped = 0
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="camera-reader")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop:
+            try:
+                ok, frame, _t = self.source.read()
+            except Exception:
+                time.sleep(0.05)
+                continue
+            if not ok or frame is None:
+                time.sleep(0.005)
+                continue
+            with self._lock:
+                self._frame = frame
+                self._seq += 1
+
+    def latest(self, last_seq: int = -1):
+        """返回 (seq, frame)。frame 可能和上次相同（采集还没出新帧）。"""
+        with self._lock:
+            return self._seq, self._frame
+
+    @property
+    def info(self):
+        return self.source.info
+
+    def wait_first(self, timeout: float = 10.0):
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout:
+            seq, frame = self.latest()
+            if frame is not None:
+                return frame
+            time.sleep(0.02)
+        return None
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self.source.release()
+
+
 class CameraSource(VideoSource):
     def __init__(
         self,
@@ -58,10 +149,15 @@ class CameraSource(VideoSource):
         fps: int = 60,
         fourcc: str = "MJPG",
         backend: int | None = None,
+        optimize: bool = True,
+        target_fps: float = 25.0,
     ) -> None:
         self.cap = None
         self.backend_name = ""
         self.resolution_fallback = False
+        self._index, self._api = index, backend
+        self._fps_req, self._fourcc = fps, fourcc
+        self.mode_probed = False
         candidates = (
             [("given", backend)] if backend is not None else [(n, b) for n, b in WINDOWS_BACKENDS]
         )
@@ -73,8 +169,24 @@ class CameraSource(VideoSource):
             if cand not in res_candidates:
                 res_candidates.append(cand)
 
+        self._cached_hit = False
+        # 先看缓存：上次探测出的"后端 + 分辨率"直接拿来打开，
+        # 省掉整个后端/分辨率搜索（MSMF 每次打开要 7 秒，不能白白重开）
+        if optimize:
+            cached = _load_mode_cache().get(str(index))
+            if cached and cached.get("backend"):
+                api = getattr(cv2, f"CAP_{cached['backend']}", None)
+                if api is not None:
+                    cap = self._raw_open(api, int(cached.get("width", width)),
+                                         int(cached.get("height", height)))
+                    if cap is not None:
+                        self.cap = cap
+                        self.backend_name = str(cached["backend"])
+                        self._api = api
+                        self._cached_hit = True
+
         errors: list[str] = []
-        for name, api in candidates:
+        for name, api in ([] if self.cap is not None else candidates):
             for rw, rh in res_candidates:
                 cap = cv2.VideoCapture(index, api)
                 if not cap.isOpened():
@@ -126,10 +238,23 @@ class CameraSource(VideoSource):
                 "  3) 镜头上有物理遮挡（隐私滑块 / 盖子合上）；\n"
                 "  4) USB 供电或带宽不足（换一个直接插在机身上的 USB 口试试）。"
             )
+        if optimize and not self._cached_hit:
+            self.optimize_mode(target_fps=target_fps)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         real_fps = float(self.cap.get(cv2.CAP_PROP_FPS))
         self.fps_measured = False
+        # CAP_PROP_FPS 在很多摄像头上返回的是"你请求的值"而不是真实帧率
+        # （实测请求 60、实际 29.8）。用它去写录像会让播放速度错一倍，
+        # 所以优先用探测/缓存里实测到的值。
+        if getattr(self, "mode_fps", None):
+            real_fps = float(self.mode_fps)
+            self.fps_measured = True
+        elif self._cached_hit:
+            _c = _load_mode_cache().get(str(index), {})
+            if _c.get("fps"):
+                real_fps = float(_c["fps"])
+                self.fps_measured = True
         if not real_fps or real_fps <= 1.0 or real_fps != real_fps:
             # 很多 USB 摄像头（尤其是走 DSHOW 的）CAP_PROP_FPS 会返回 -1 或 0，
             # 直接拿这个值会让录像文件帧率变成 -1 -> 写出来是坏文件。
@@ -172,6 +297,132 @@ class CameraSource(VideoSource):
         if not ret or frame is None:
             return False, None, t
         return True, frame, t
+
+    # ------------------------------------------------------------------
+    def _open_attempt(self, width: int, height: int, api: int | None = None):
+        """按给定分辨率重开一次，返回可用的 cap（画面非全黑）或 None。"""
+        use_api = api if api is not None else (self._api if self._api is not None else cv2.CAP_ANY)
+        cap = cv2.VideoCapture(self._index, use_api)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        if self._fourcc:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*self._fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, self._fps_req)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        frame = None
+        for _ in range(12):
+            ret, f = cap.read()
+            if ret and f is not None:
+                frame = f
+                if float(f.std()) > 1.0:
+                    break
+            else:
+                time.sleep(0.03)
+        if frame is None or float(frame.std()) <= 1.0:
+            cap.release()
+            return None
+        return cap
+
+    @staticmethod
+    def _measure_rate(cap, budget: float = 0.25, warmup: int = 2) -> float:
+        for _ in range(warmup):
+            cap.read()
+        n = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < budget:
+            ok, _f = cap.read()
+            if ok:
+                n += 1
+        dt = max(time.perf_counter() - t0, 1e-6)
+        return n / dt
+
+    def _raw_open(self, api: int, width: int, height: int):
+        """探测用的快速打开：只等首帧，不做全黑多帧检查。"""
+        cap = cv2.VideoCapture(self._index, api)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        if self._fourcc:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*self._fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, self._fps_req)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        for _ in range(3):
+            ret, f = cap.read()
+            if ret and f is not None and float(f.std()) > 1.0:
+                return cap
+        cap.release()
+        return None
+
+    def optimize_mode(self, target_fps: float = 25.0, budget: float = 0.25) -> None:
+        """自动挑出"这个摄像头跑得最顺"的后端与分辨率，并缓存结果。
+
+        为什么要挑后端：实测同一台 USB 摄像头
+            DSHOW  打开 0.7 s，1080p 只有 4.3 fps
+            MSMF   打开 6.8 s，1080p 有 32.5 fps
+        差别是 7 倍。但 MSMF 打开很慢，所以绝不能每个分辨率都开一次 ——
+        **先只比后端（2 次打开），只有最好的后端还达不到目标帧率时才去试分辨率。**
+        结果缓存到 config/camera_modes.json，之后启动直接用它打开。
+        """
+        cache = _load_mode_cache()
+        key = str(self._index)
+        api = self._api if self._api is not None else cv2.CAP_DSHOW
+        name = self.backend_name or "DSHOW"
+        cw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        ch = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cur_rate = self._measure_rate(self.cap, budget)
+
+        # 快路径：已经够快就什么都不做（内置摄像头 1080p 有 29 fps，走这条）
+        if cur_rate >= target_fps * 0.9:
+            return
+
+        self.cap.release()
+        self.cap = None
+        print(f"[相机 {self._index}] 当前 {cw}x{ch} 只有 {cur_rate:.1f} fps，"
+              f"正在寻找更合适的模式（约 10-40 秒，只需一次）…", flush=True)
+        best = (name, api, cw, ch, cur_rate)
+        # 同一后端下逐个分辨率试。DSHOW 打开只要 0.7 秒，试几个可以接受；
+        # MSMF 打开要 7 秒且每次 set 都要重协商，所以**不做后端对比**
+        # （实测那样启动要 30-60 秒，比卡顿更难受）。
+        for (rw, rh) in CANDIDATE_MODES:
+            if (rw, rh) == (cw, ch):
+                continue
+            cap = self._raw_open(api, rw, rh)
+            if cap is None:
+                continue
+            gw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            gh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            rate = self._measure_rate(cap, budget)
+            cap.release()
+            print(f"    请求 {rw}x{rh} -> 实际 {gw}x{gh} @ {rate:.1f} fps", flush=True)
+            # 评分 = 像素数 x min(帧率, 目标)：既不牺牲流畅度，也不白白降分辨率
+            if (gw * gh * min(rate, target_fps)) > (best[2] * best[3] * min(best[4], target_fps)):
+                best = (name, api, gw, gh, rate)
+
+        name, api, bw, bh, brate = best
+        self.cap = self._open_attempt(bw, bh, api=api)
+        if self.cap is None:
+            self.cap = self._open_attempt(cw, ch, api=api)
+            if self.cap is None:
+                raise RuntimeError(f"摄像头 {self._index} 重新打开失败")
+            return
+        self.mode_probed = True
+        self.mode_report = [best]
+        self.mode_fps = brate
+        self.backend_name = name
+        self._api = api
+        gw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        gh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if (gw, gh) != (cw, ch) or brate > cur_rate * 1.3:
+            print(f"[相机 {self._index}] 自动改到 {gw}x{gh} @ {brate:.1f} fps"
+                  f"（原 {cw}x{ch} @ {cur_rate:.1f} fps）")
+        cache[key] = {"backend": name, "width": bw, "height": bh,
+                      "actual_width": gw, "actual_height": gh, "fps": round(brate, 2)}
+        _save_mode_cache(cache)
 
     def release(self) -> None:
         if self.cap is not None:
