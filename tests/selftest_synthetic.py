@@ -70,6 +70,8 @@ class Scene:
         noise: bool = True,
         distractors: bool = True,
         pan_speed: float = 0.0,
+        z_range: tuple[float, float] = (2.4, 6.4),
+        velocity: tuple[float, float, float] | None = None,
     ) -> None:
         self.width, self.height = width, height
         # 相机平移速度（像素/秒，全分辨率）。>0 表示相机在匀速横移，
@@ -93,11 +95,12 @@ class Scene:
 
         # 三维初值（米）：从左上方向右下抛出，同时在远离相机
         pos = np.array([-1.05, -0.12, 3.7], dtype=np.float64)
-        vel = np.array([0.95, -2.0, 0.14], dtype=np.float64)
+        vel = np.array([0.95, -2.0, 0.14] if velocity is None else velocity,
+                       dtype=np.float64)
         R = ball_diameter_m / 2.0
         floor_y = 0.82            # 地面平面（相机下方 0.82 m）
         wall_x = 1.30             # 左右"墙"，只为把球留在画面里
-        z_min, z_max = 2.4, 6.4
+        z_min, z_max = z_range
 
         sub = 0.001
         # 多仿真 2 秒"视频之后"的时间：评估 t+horizon 处的预测精度时要用到
@@ -150,6 +153,53 @@ class Scene:
         v = self.cy + self.f * float(p[1]) / z
         return u, v, r
 
+    def camera_params(
+        self, side: str = "left", K: np.ndarray | None = None, D: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """取某一路的内参/畸变；不给就退化成"本场景的针孔相机、无畸变"。
+
+        K=None 时用 scene.f / cx / cy 拼一个标准针孔内参 —— 这样老的调用方
+        （单目自测）行为完全不变，而双目自测可以把自己的真实内参传进来。
+        """
+        if K is not None:
+            return np.asarray(K, np.float64), (None if D is None else np.asarray(D, np.float64))
+        K_std = np.array([[self.f, 0.0, self.cx], [0.0, self.f, self.cy], [0.0, 0.0, 1.0]])
+        return K_std, (None if D is None else np.asarray(D, np.float64))
+
+    def project(
+        self,
+        t: float,
+        side: str = "left",
+        R: np.ndarray | None = None,
+        T: np.ndarray | None = None,
+        K: np.ndarray | None = None,
+        D: np.ndarray | None = None,
+    ) -> tuple[float, float, float]:
+        """三维真值 -> 某一路的像素 (u, v, r)。
+
+        坐标系约定（与 calib.StereoRig 一致）：
+          - 世界系 = 左相机系（原点在左光心，Z 向前，Y 向下，与图像 v 同向）；
+          - R, T 描述**右相机相对左相机**的位姿（X_right = R @ X_left + T）。
+        所以 side="right" 时先换算到右相机系再投影。
+
+        u 里含相机自运动带来的偏移（-pan_offset），r 是针孔下的 f*R/Z
+        （小孔成像下球轮廓的角半径，忽略透视椭圆化 —— 见 _ball_coverage 的说明）。
+        """
+        p = self.center3d(t)
+        if side == "right":
+            if R is None or T is None:
+                raise ValueError('side="right" 必须给 R 和 T')
+            p = np.asarray(R, np.float64) @ p + np.asarray(T, np.float64).ravel()
+        K_use, D_use = self.camera_params(side, K, D)
+        r = float(K_use[0, 0]) * (self.ball_diameter_m / 2.0) / float(p[2])
+        if D_use is not None and np.any(np.abs(D_use) > 1e-12):
+            obj = np.asarray(p, np.float64).reshape(1, 1, 3)
+            u, v = cv2.projectPoints(obj, np.zeros(3), np.zeros(3), K_use, D_use)[0].reshape(2)
+        else:
+            u = float(K_use[0, 2]) + float(K_use[0, 0]) * float(p[0]) / float(p[2])
+            v = float(K_use[1, 2]) + float(K_use[1, 1]) * float(p[1]) / float(p[2])
+        return float(u) - self.pan_offset(t), float(v), r
+
     def center(self, t: float) -> tuple[float, float]:
         u, v, _ = self.project(t)
         return u, v
@@ -160,13 +210,16 @@ class Scene:
     def bounce_near(self, t0: float, t1: float) -> bool:
         return any(t0 <= b <= t1 for b in self.bounces)
 
-    def fully_visible(self, t: float, margin: float = 1.0) -> bool:
+    def fully_visible(self, t: float, margin: float = 1.0, **cam) -> bool:
         """球的整个圆是否都在画面内。
 
         半个球在画面外时，轮廓被裁掉、圆拟合必然失准，
         这时候检测不到是"正确行为"，不该算进检出率里。
+
+        `**cam` 透传给 project()，双目里可以传真值内参（`K=` / `D=` / `side=`），
+        否则"可见性"判定用的内参和渲染用的内参不是同一个，边界帧会算错。
         """
-        u, v, r = self.project(t)
+        u, v, r = self.project(t, **cam)
         return (
             u - r > margin and v - r > margin
             and u + r < self.width - margin and v + r < self.height - margin
@@ -227,12 +280,28 @@ def _ball_coverage(
     return cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
 
 
-def render_frame(scene: Scene, bg: np.ndarray, t: float, rng: np.random.Generator) -> np.ndarray:
+def render_frame(
+    scene: Scene,
+    bg: np.ndarray,
+    t: float,
+    rng: np.random.Generator | None = None,
+    K: np.ndarray | None = None,
+    D: np.ndarray | None = None,
+    cam: dict | None = None,
+) -> np.ndarray:
     """渲染一帧。运动模糊按"曝光时间 x 速度"积分，和真实相机一致。
 
     相机平移时，从加宽的背景里滑窗取景 —— 取景窗右移等价于画面内容左移，
     与 Scene.project() 里的 -pan_offset 保持一致。
+
+    `K` / `D` / `cam` 是给双目用的：把"哪一路相机"的参数透传给 project()，
+    于是同一套渲染代码能画出左路和右路的画面（`cam` 里放 side/R/T）。
     """
+    cam = dict(cam or {})
+    if K is not None:
+        cam["K"] = K
+    if D is not None:
+        cam["D"] = D
     if scene.pan_speed:
         W0 = scene.width
         off = scene.pan_offset(t)
@@ -249,8 +318,8 @@ def render_frame(scene: Scene, bg: np.ndarray, t: float, rng: np.random.Generato
             )
     else:
         img = bg.copy()
-    u, v, r = scene.project(t)
-    u_prev, v_prev, _ = scene.project(t - scene.dt)
+    u, v, r = scene.project(t, **cam)
+    u_prev, v_prev, _ = scene.project(t - scene.dt, **cam)
     speed = math.hypot(u - u_prev, v - v_prev) * scene.fps
     exposure = 1.0 / (2.0 * scene.fps)      # 假设快门时间是帧间隔的一半
     smear = speed * exposure
@@ -261,7 +330,7 @@ def render_frame(scene: Scene, bg: np.ndarray, t: float, rng: np.random.Generato
     samples = []
     for k in range(steps):
         tk = t - exposure + 2.0 * exposure * (k + 0.5) / steps
-        samples.append(scene.project(tk))
+        samples.append(scene.project(tk, **cam))
 
     H, W = img.shape[:2]
     pad = 3.0
@@ -285,6 +354,8 @@ def render_frame(scene: Scene, bg: np.ndarray, t: float, rng: np.random.Generato
     cv2.circle(img, hb, int(round(hl_r)), (255, 255, 255), -1, cv2.LINE_AA)
     if not scene.noise:
         return img
+    if rng is None:
+        rng = np.random.default_rng(0)
     return np.clip(img.astype(np.float32) + rng.normal(0, 2.0, img.shape), 0, 255).astype(np.uint8)
 
 

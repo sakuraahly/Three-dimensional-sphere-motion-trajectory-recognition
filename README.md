@@ -488,6 +488,7 @@ tests/                   回归测试（改动代码后必跑）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
   selftest_pair_source.py      成对取帧 + 同步偏移语义（含 find_offset 串联）
+  selftest_stereo_branch.py    双目整条链路（真渲染 + 两路检测 + 三角测量）
 
 docs/                    文档
   文件结构.md            目录职责与放置规则

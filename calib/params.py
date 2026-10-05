@@ -63,6 +63,12 @@ class StereoRig:
             lines.append(f"  标定板 {self.meta['board']}")
         if self.meta.get("created"):
             lines.append(f"  标定时间 {self.meta['created']}")
+        if self.baseline_side() == "left":
+            # 装反了指标一样好看，但视差整体反号；不提醒的话问题会在
+            # "配对率 0%" 那里才暴露，而且报错指不到原因。
+            lines.append("  [警告] T[0] < 0：标定时 --left/--right 可能接反了"
+                         "（右相机其实在左边）。三角测量仍然正确，"
+                         "但请核对 L/R 标签，见 apps/verify_stereo.py。")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -118,6 +124,42 @@ class StereoRig:
             return float("nan")
         dy = p1[:n, 1] - p2[:n, 1]
         return float(np.sqrt(np.mean(dy * dy)))
+
+    # ------------------------------------------------------------------
+    def baseline_side(self) -> str:
+        """判断右相机到底在左相机的哪一侧 —— 决定校正后视差的正负号。
+
+        为什么必须能查这个：本项目的 `T` 是"右光心在左相机系里的位置"
+        （`X_right = R @ X_left + T`），所以 `T[0] > 0` 表示右相机确实在右边。
+
+        如果左右装反了（同型号相机重新插拔后索引互换，而画面完全正常、
+        标定指标也好看），`T[0]` 变号，**校正后的视差整体反号**。这时：
+          - 三角测量**仍然正确**（P1/P2 本身自洽，三维点没错）；
+          - 但任何"假设视差为正"的匹配逻辑会**一个点都配不上**（0%），
+            报错只有"配不上"，完全指不到原因。
+        所以给出这个能一眼看出来的判定，供加载标定后自检。
+        """
+        t = np.asarray(self.T, np.float64).ravel()
+        if t.size < 1 or abs(float(t[0])) < 1e-9:
+            return "unknown"
+        return "right" if float(t[0]) > 0 else "left"
+
+    def disparity_sign(self) -> int:
+        """校正后正常视差的符号：右相机在右边 -> -1，装反了 -> +1。
+
+        **注意是反的**，别凭直觉填：`cv2.stereoRectify` 的 `P2` 第 4 列
+        实测等于 `-f * T[0]`（数值验证见 tests/selftest_stereo_branch.py
+        的 test_baseline_sign）。于是 T[0] > 0（右相机在右）时，
+        同一个物点在右图里落在**更右边**，视差 x1-x2 为负。
+
+        这个符号不需要调用方记 —— `StereoReconstructor` 会自动从 rig 取。
+        """
+        side = self.baseline_side()
+        if side == "right":
+            return -1
+        if side == "left":
+            return 1
+        return 0
 
     # ------------------------------------------------------------------
     def save(self, path: str | Path) -> tuple[Path, Path]:

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import cv2
@@ -37,6 +38,10 @@ class MatchConfig:
     max_disparity_px: float = 600.0
     require_radius_ratio: bool = False  # 是否要求左右半径接近（同型号相机才合理）
     radius_ratio_tol: float = 0.35
+    # 视差符号。0 = 不检查（按 |视差| 判范围，两边都接受）；
+    # 一般不用手填 —— StereoReconstructor 会用 rig.disparity_sign() 自动定，
+    # 见下面 match_epipolar 的说明。
+    disparity_sign: int = 0
 
 
 @dataclass
@@ -96,8 +101,18 @@ def match_epipolar(
         dy = abs(y1 - y2)
         if dy > cfg.max_epipolar_px:
             continue
+        # 视差用**绝对值**判范围，符号另判。
+        #
+        # 为什么不能直接写 `if not (min <= disparity <= max): continue`：
+        # 那等于把"视差必须为正"这个假设藏进了范围检查里。一旦左右装反
+        # （同型号相机插拔后索引互换，画面完全正常、标定也能过），
+        # 视差整体反号，于是**每一个点都被静默拒绝**，配对率 0%，
+        # 而报错信息只有"配不上"，根本指不到原因。
+        # 三角测量本身不受影响（P1/P2 是自洽的），所以这个坑特别隐蔽。
         disparity = x1 - x2
-        if not (cfg.min_disparity_px <= disparity <= cfg.max_disparity_px):
+        if not (cfg.min_disparity_px <= abs(disparity) <= cfg.max_disparity_px):
+            continue
+        if cfg.disparity_sign and math.copysign(1.0, disparity) != cfg.disparity_sign:
             continue
         if cfg.require_radius_ratio and det_left.radius > 0 and cand.radius > 0:
             ratio = abs(cand.radius - det_left.radius) / det_left.radius
@@ -157,6 +172,17 @@ class StereoReconstructor:
     # 统计
     n_frames: int = 0
     n_matched: int = 0
+    n_no_left: int = 0          # 左路没检测
+    n_no_right: int = 0         # 右路没有候选
+    n_rejected: int = 0         # 有候选但全被极线/视差条件拒掉
+
+    def __post_init__(self) -> None:
+        # 视差符号按装置实际朝向自动定：右相机在右边 -> +1，装反了 -> -1。
+        # 不这么做的话，装反时配对率是 0%，而报错只有"配不上"。
+        if not self.cfg.disparity_sign:
+            sign = self.rig.disparity_sign() if self.rig is not None else 0
+            if sign:
+                self.cfg.disparity_sign = sign
 
     def update(
         self,
@@ -166,10 +192,15 @@ class StereoReconstructor:
     ) -> StereoPoint | None:
         """喂一帧的左右检测，返回三维点（配不上则返回 None）。"""
         self.n_frames += 1
-        if left is None or not right_dets:
+        if left is None:
+            self.n_no_left += 1
+            return None
+        if not right_dets:
+            self.n_no_right += 1
             return None
         matched, dy = match_epipolar(self.rig, left, right_dets, self.cfg)
         if matched is None:
+            self.n_rejected += 1
             return None
         pt = triangulate_one(self.rig, left, matched, t, dy)
         self.n_matched += 1
@@ -188,7 +219,9 @@ class StereoReconstructor:
 
     def summary(self) -> str:
         if not self.trajectory:
-            return "没有任何配对成功的三维点"
+            return (f"没有任何配对成功的三维点"
+                    f"（左路缺 {self.n_no_left} 帧 / 右路无候选 {self.n_no_right} 帧 / "
+                    f"被条件拒掉 {self.n_rejected} 帧）")
         res = np.array([p.residual_px for p in self.trajectory], np.float64)
         res = res[np.isfinite(res)]
         z = np.array([p.xyz[2] for p in self.trajectory], np.float64)
