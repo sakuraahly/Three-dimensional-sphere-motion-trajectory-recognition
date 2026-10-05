@@ -37,6 +37,11 @@ Thumbs.db
 desktop.ini
 $RECYCLE.BIN/
 
+# ---------- Office 锁文件 ----------
+# 打开 .pptx / .docx / .xlsx 时 Office 会在同目录生成 ~$ 开头的隐藏锁文件，
+# 关闭文档后自动消失（异常退出会残留）。它不属于内容，也会挡住 git add。
+~$*
+
 # ---------- 运行产物 ----------
 # outputs/ 里全是可再生的东西：标注视频、逐帧 PNG、轨迹 CSV、调试掩膜、临时脚本。
 # 跑一次 tests/selftest_*.py 或 apps/run_video.py 就会重新生成。
