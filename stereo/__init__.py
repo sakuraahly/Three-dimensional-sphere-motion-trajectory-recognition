@@ -1,9 +1,10 @@
-"""双目：同步、极线配对、三角测量。
+"""双目：同步、成对取帧、极线配对、三角测量。
 
 本包里"能算的"都已经能跑了（同步、配对、三角测量），
 "还没接"的是把它们串进实时主流程 —— 见 docs/计划书.md 的 M3。
 
-    sync.py         双路视频同步（闪光/拍手对齐）
+    sync.py         双路视频同步（闪光/拍手对齐），算出帧偏移
+    pair_source.py  成对帧源：按 sync_offset 取到"同一时刻"的左右两帧
     triangulate.py  极线约束配对 + 三角测量 + 三维轨迹
 
 分工说明：
@@ -14,6 +15,7 @@
 
 from __future__ import annotations
 
+from .pair_source import PairSource, from_args
 from .sync import SyncConfig, SyncResult, apply_offset, brightness_series, find_offset
 from .triangulate import (
     MatchConfig,
@@ -24,6 +26,8 @@ from .triangulate import (
 )
 
 __all__ = [
+    "PairSource",
+    "from_args",
     "SyncConfig",
     "SyncResult",
     "find_offset",

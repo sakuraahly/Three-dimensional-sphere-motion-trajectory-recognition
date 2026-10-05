@@ -468,7 +468,8 @@ calib/                   双目标定（离线、一次）
   params.py              StereoRig：保存/加载/校正/三角测量/极线误差
 
 stereo/                  双目（逐帧把两路合成三维）
-  sync.py                双路视频同步（闪光/拍手对齐）
+  sync.py                双路视频同步（闪光/拍手对齐），算出帧偏移
+  pair_source.py         成对帧源：按 sync_offset 取到"同一时刻"的左右两帧
   triangulate.py         极线约束配对 + 三角测量 + 三维轨迹
 
 apps/                    可直接运行的程序
@@ -486,6 +487,7 @@ tests/                   回归测试（改动代码后必跑）
   selftest_synthetic.py        单目全链路（clean / realistic / panning）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
+  selftest_pair_source.py      成对取帧 + 同步偏移语义（含 find_offset 串联）
 
 docs/                    文档
   文件结构.md            目录职责与放置规则

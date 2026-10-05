@@ -20,6 +20,9 @@
 关于同步：**标定时不需要左右视频同步**。程序只收"板停稳"的帧，
 静止目标在任意时刻看起来都一样，所以时间偏移不影响标定。
 （真正需要同步的是后续"拍运动的小球"，那是另一回事。）
+
+帧源（摄像头 / 两段视频 / 两个图片文件夹）统一由 `stereo.PairSource` 提供 ——
+复检工具与以后的双目实时流程共用同一份取帧逻辑，不再各写一份。
 """
 
 from __future__ import annotations
@@ -40,112 +43,10 @@ import cv2
 import numpy as np
 
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
-from calib.board import detect_board
-from sphere_tracker.sources import CameraSource, LatestFrameCamera
+from stereo import from_args
 
 WINDOW = "stereo calibration"
 PREVIEW_W = 720          # 单路预览宽度（两路并排 + 覆盖率图，正好放得下）
-IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-
-
-# --------------------------------------------------------------------------
-# 帧源：摄像头 / 两个视频 / 两个图片文件夹
-# --------------------------------------------------------------------------
-class PairSource:
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.kind = ""
-        self.caps: list[cv2.VideoCapture] = []
-        self.files: list[Path] = []
-        self.files_r: list[Path] = []
-        self.cam: list[CameraSource] = []
-        self.index = 0
-        self.total = 0
-
-        if args.left is not None and args.right is not None:
-            self.kind = "camera"
-            if args.left == args.right:
-                raise RuntimeError(f"左右相机不能是同一个索引（都是 {args.left}）")
-
-            def _open(role: str, idx: int) -> LatestFrameCamera:
-                try:
-                    return LatestFrameCamera(CameraSource(
-                        index=idx, width=args.width, height=args.height, fps=args.fps))
-                except RuntimeError:
-                    if args.backup_camera is None or args.backup_camera == idx:
-                        raise
-                    print(f"[警告] {role}相机 {idx} 打不开，改用备用相机 "
-                          f"{args.backup_camera}")
-                    print("       注意：备用相机与被替换的那台型号/视野都不同，"
-                          "标定结果只对当前这个组合有效")
-                    return LatestFrameCamera(CameraSource(
-                        index=args.backup_camera, width=args.width,
-                        height=args.height, fps=args.fps))
-
-            # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
-            # 处理得慢就自动丢帧，永远处理最新画面
-            self.cam = [_open("左", args.left), _open("右", args.right)]
-            self._primed = False
-            print(f"相机 {args.left}: {self.cam[0].info.width}x{self.cam[0].info.height} @ {self.cam[0].info.fps:.1f} fps")
-            print(f"相机 {args.right}: {self.cam[1].info.width}x{self.cam[1].info.height} @ {self.cam[1].info.fps:.1f} fps")
-        elif args.left_video and args.right_video:
-            self.kind = "video"
-            self.caps = [cv2.VideoCapture(args.left_video), cv2.VideoCapture(args.right_video)]
-            if not all(c.isOpened() for c in self.caps):
-                raise RuntimeError("视频打不开，检查路径")
-            self.total = min(int(c.get(cv2.CAP_PROP_FRAME_COUNT)) for c in self.caps)
-            print(f"视频：{args.left_video} + {args.right_video}，各 {self.total} 帧")
-        elif args.left_dir and args.right_dir:
-            self.kind = "dir"
-            ld, rd = Path(args.left_dir), Path(args.right_dir)
-            self.files = sorted(p for p in ld.iterdir() if p.suffix.lower() in IMG_EXT)
-            self.files_r = sorted(p for p in rd.iterdir() if p.suffix.lower() in IMG_EXT)
-            if len(self.files) != len(self.files_r):
-                raise RuntimeError(f"两个文件夹图片数不一致：{len(self.files)} vs {len(self.files_r)}")
-            if not self.files:
-                raise RuntimeError("文件夹里没有图片")
-            self.total = len(self.files)
-            print(f"图片：左右各 {self.total} 张（按文件名排序一一对应）")
-        else:
-            raise RuntimeError("请指定 --left/--right 或 --left-video/--right-video 或 --left-dir/--right-dir")
-
-    @property
-    def is_live(self) -> bool:
-        return self.kind == "camera"
-
-    def read(self):
-        """返回 (ok, left_bgr, right_bgr)。"""
-        if self.kind == "camera":
-            if not self._primed:
-                first = [c.wait_first() for c in self.cam]
-                self._primed = True
-                # 报告的分辨率和实际帧尺寸可能不一致（实测内置相机
-                # 报告 1920x1080、实际给 1280x1080），所以按真实帧再说一次
-                for i, f in enumerate(first):
-                    if f is not None:
-                        real = f"{f.shape[1]}x{f.shape[0]}"
-                        rep = f"{self.cam[i].info.width}x{self.cam[i].info.height}"
-                        if real != rep:
-                            print(f"  （相机 {i} 实际输出 {real}，与报告的 {rep} 不一致，已按实际情况处理）")
-            _s1, a = self.cam[0].latest()
-            _s2, b = self.cam[1].latest()
-            return (a is not None and b is not None), a, b
-        if self.kind == "video":
-            ok1, a = self.caps[0].read()
-            ok2, b = self.caps[1].read()
-            self.index += 1
-            return (ok1 and ok2), a, b
-        if self.index >= len(self.files):
-            return False, None, None
-        a = cv2.imread(str(self.files[self.index]))
-        b = cv2.imread(str(self.files_r[self.index]))
-        self.index += 1
-        return (a is not None and b is not None), a, b
-
-    def release(self) -> None:
-        for c in self.cam:
-            c.stop()
-        for c in self.caps:
-            c.release()
 
 
 # --------------------------------------------------------------------------
@@ -217,7 +118,9 @@ def main() -> int:
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
     print()
 
-    src = PairSource(args)
+    src = from_args(args)
+    print(src.describe())
+    src.report_warnings()
     from calib import CaptureConfig
     cap_cfg = CaptureConfig(
         target_pairs=args.target,

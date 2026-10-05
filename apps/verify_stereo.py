@@ -24,17 +24,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
     ROOT = ROOT.parent
-APPS = Path(__file__).resolve().parent
-for p in (str(ROOT), str(APPS)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import cv2
 import numpy as np
 
 from calib import BoardSpec, StereoRig
 from calib.board import detect_board
-from calibrate_stereo import PairSource
+from stereo import PairSource, from_args
 
 
 def main() -> int:
@@ -73,7 +71,7 @@ def main() -> int:
         print(f"[提示] 标定时用的是「{board_desc}」，"
               f"现在按 {args.cols}x{args.rows} 检测，请确认参数一致")
 
-    src = PairSource(args)
+    src = from_args(args)
     errs: list[float] = []
     frames = 0
     try:
