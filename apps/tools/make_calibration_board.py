@@ -2,8 +2,8 @@
 
 用法::
 
-    python apps/make_calibration_board.py
-    python apps/make_calibration_board.py --cols 8 --rows 5 --square 25 --page a4-landscape
+    python apps/tools/make_calibration_board.py
+    python apps/tools/make_calibration_board.py --cols 8 --rows 5 --square 25 --page a4-landscape
 
 生成到 assets/boards/。**打印时必须选"实际大小 / 100%"，不要选"适应页面"**，
 打印完用尺子量一下方格边长 —— 量出来是多少，标定时 --square 就填多少。
@@ -15,7 +15,10 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# --- 让脚本在任意目录深度都能找到项目根 ---
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

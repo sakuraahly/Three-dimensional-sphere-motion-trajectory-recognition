@@ -915,7 +915,7 @@ pred = kf.predict()                  # 下一帧位置预测
 | 亚像素边缘细化 | `sphere_tracker/geometry.py`：`refine_circle_subpixel` | ✔ 已完成 |
 | 2D 卡尔曼跟踪（含机动检测） | `sphere_tracker/track.py` | ✔ 已完成 |
 | 单路视频处理与 CSV 导出 | `apps/run_video.py` | ✔ 已完成 |
-| 合成真值自测 | `apps/selftest_synthetic.py` | ✔ 已完成 |
+| 合成真值自测 | `tests/selftest_synthetic.py` | ✔ 已完成 |
 | 双目标定与立体校正 | `calib/calibrate_stereo.py` | 待实现 |
 | 两路视频同步 | `sync/sync_videos.py` | 待实现 |
 | 极线配对与三角测量 | `stereo/` | 待实现 |

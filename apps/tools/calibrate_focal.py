@@ -7,10 +7,10 @@
 用法::
 
     # 用实时画面：把球放在尺子量好的 1 米处，等检测框稳定后按 s
-    python apps/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.04
+    python apps/tools/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.04
 
     # 用一张照片
-    python apps/calibrate_focal.py --image assets/images/ball_at_1m.png --distance 1.0
+    python apps/tools/calibrate_focal.py --image assets/images/ball_at_1m.png --distance 1.0
 """
 from __future__ import annotations
 
@@ -18,7 +18,10 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# --- 让脚本在任意目录深度都能找到项目根 ---
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

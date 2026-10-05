@@ -20,7 +20,10 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# --- 让脚本在任意目录深度都能找到项目根 ---
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
 APPS = Path(__file__).resolve().parent
 for p in (str(ROOT), str(APPS)):
     if p not in sys.path:

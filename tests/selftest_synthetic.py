@@ -14,11 +14,11 @@
 
 用法::
 
-    python apps/selftest_synthetic.py                 # 全部用例
-    python apps/selftest_synthetic.py --method color
-    python apps/selftest_synthetic.py --predict kalman
-    python apps/selftest_synthetic.py --write-video    # 顺便导出 mp4
-    python apps/selftest_synthetic.py --check-ai       # 检查 AI 依赖是否就绪
+    python tests/selftest_synthetic.py                 # 全部用例
+    python tests/selftest_synthetic.py --method color
+    python tests/selftest_synthetic.py --predict kalman
+    python tests/selftest_synthetic.py --write-video    # 顺便导出 mp4
+    python tests/selftest_synthetic.py --check-ai       # 检查 AI 依赖是否就绪
 """
 
 from __future__ import annotations
@@ -29,7 +29,10 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# --- 让脚本在任意目录深度都能找到项目根 ---
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

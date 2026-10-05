@@ -1,148 +1,57 @@
+# ==========================================================================
+# 球形物体三维运动轨迹识别 —— 忽略规则
+#
+# 原则：只忽略"能重新生成的"和"体积大的二进制"。
+# 源码、文档、标定板、参考论文一律入库。
+# ==========================================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# ---------- 编辑器 / IDE ----------
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
 # ---------- 操作系统 ----------
 .DS_Store
 Thumbs.db
 desktop.ini
 $RECYCLE.BIN/
 
-# ---------- 编辑器 / IDE ----------
-.idea/
-.vscode/*
-!.vscode/extensions.json
-!.vscode/settings.json
-*.iml
-*.swp
-*.swo
-*~
-.vs/
-.project
-.classpath
-.settings/
-
-# ---------- 依赖 ----------
-node_modules/
-bower_components/
-.pnpm-store/
-.venv/
-venv/
-env/
-__pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-
-# ---------- 构建产物 ----------
-dist/
-build/
-out/
-target/
-bin/
-obj/
-*.class
-*.o
-*.obj
-*.so
-*.dll
-*.exe
-.next/
-.nuxt/
-.svelte-kit/
-.parcel-cache/
-.cache/
-
-# ---------- 日志 / 缓存 / 测试覆盖率 ----------
-*.log
-logs/
-tmp/
-temp/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-coverage/
-.nyc_output/
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.tox/
-
-# ---------- 环境变量 / 密钥 ----------
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-secrets.yml
-config/master.key
-
-# ---------- 数据库 / 本地文件 ----------
-*.sqlite
-*.sqlite3
-*.db
-
-# Node / 前端
-node_modules/
-dist/
-.next/
-.nuxt/
-.svelte-kit/
-.vercel/
-.netlify/
-coverage/
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-dist/
-build/
-*.egg-info/
-
-# Java / Maven / Gradle
-target/
-build/
-.gradle/
-*.class
-*.jar
-*.war
-out/
-
-# PHP / Laravel
-/vendor/
-/node_modules/
-/public/hot
-/public/storage
-/storage/*.key
-.env
-.phpunit.result.cache
-
-# Ruby / Rails
-.bundle/
-log/
-tmp/
-storage/
-vendor/bundle
-config/master.key
-
-# Go
-bin/
-*.exe
-*.test
-*.out
-# vendor/ 按项目决定是否忽略
-
-# ---------- 本项目的运行产物 ----------
-# outputs/ 里全是可再生的东西：标注视频、逐帧 PNG、轨迹 CSV、调试掩膜。
-# 跑一次 selftest / run_video / run_realtime 就会重新生成，不必进版本库。
+# ---------- 运行产物 ----------
+# outputs/ 里全是可再生的东西：标注视频、逐帧 PNG、轨迹 CSV、调试掩膜、临时脚本。
+# 跑一次 tests/selftest_*.py 或 apps/run_video.py 就会重新生成。
 # （历史上 output_edges.avi 曾误提交，单文件 141 MB，把 .git 撑到 119 MB，
 #   所以这里明确忽略。）
 outputs/
+
+# ---------- 本机标定结果 ----------
+# config/ 里是"这台相机 + 这个机位"相关的参数：
+#   camera_modes.json        相机模式探测缓存（换相机/换 USB 口就失效）
+#   stereo_calibration.*     双目标定结果（挪动相机就要重标）
+# 换机器就得重标，所以默认不入库。
+# 如果你希望把某次标定结果一起存档（比如答辩要复现），删掉下面两行即可。
+config/*.json
+config/*.npz
 
 # ---------- 模型权重 ----------
 # 推理权重（models/yolo11n.pt、models/sam2.1_t.pt、*.onnx…）都是可下载的二进制，
@@ -156,11 +65,3 @@ outputs/
 # assets/videos/ 放的是待处理视频（几百 MB 起步），不入库，只保留目录说明。
 assets/videos/*
 !assets/videos/README.md
-
-# ---------- 本机标定结果 ----------
-# config/*.json 是"你这台相机 + 这个机位"的标定参数，换机器/挪动相机就要重标，
-# 所以默认不入库。如果你希望把标定结果一起存档，删掉下面这行即可。
-config/*.json
-
-# Rust
-target/

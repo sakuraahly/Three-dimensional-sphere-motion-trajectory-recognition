@@ -14,8 +14,8 @@
 
 用法::
 
-    python apps/selftest_stereo_calib.py
-    python apps/selftest_stereo_calib.py --views 25 --noise 0.3 --distortion
+    python tests/selftest_stereo_calib.py
+    python tests/selftest_stereo_calib.py --views 25 --noise 0.3 --distortion
 """
 
 from __future__ import annotations
@@ -25,7 +25,10 @@ import math
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# --- 让脚本在任意目录深度都能找到项目根 ---
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -62,10 +65,14 @@ def _forward_distort_map(K, D, size, iters: int = 12):
         fy_ = py * radial + p1 * (r2 + 2 * py * py) + 2 * p2 * px * py
         px += qx - fx_
         py += qy - fy_
-    return (px * K[0, 0] + K[0, 2]).astype(np.float32), (py * K[1, 1] + K[1, 2]).astype(np.float32)
+    return (px * K[0, 0] + K[0, 2]).astype(np.float32), (py * K[1, 1] + K[1, 2]).astype(
+        np.float32
+    )
 
 
-def make_board_image(spec: BoardSpec, px_per_m: float = 900.0) -> tuple[np.ndarray, float]:
+def make_board_image(
+    spec: BoardSpec, px_per_m: float = 900.0
+) -> tuple[np.ndarray, float]:
     """画一张标准棋盘格图像（作为贴图源）。
 
     注意棋盘格的方格数 = 内角点 + 1。黑色方格画成黑，白色画成白，
@@ -80,13 +87,25 @@ def make_board_image(spec: BoardSpec, px_per_m: float = 900.0) -> tuple[np.ndarr
     for i in range(cols):
         for j in range(rows):
             if (i + j) % 2 == 0:
-                x0 = int(pad + i * sq); y0 = int(pad + j * sq)
+                x0 = int(pad + i * sq)
+                y0 = int(pad + j * sq)
                 cv2.rectangle(img, (x0, y0), (int(x0 + sq), int(y0 + sq)), 0, -1)
     return img, pad
 
 
-def render_view(board_img, pad, spec: BoardSpec, px_per_m: float,
-                rvec, tvec, K, D, size, noise: float, blur: float) -> np.ndarray:
+def render_view(
+    board_img,
+    pad,
+    spec: BoardSpec,
+    px_per_m: float,
+    rvec,
+    tvec,
+    K,
+    D,
+    size,
+    noise: float,
+    blur: float,
+) -> np.ndarray:
     """把棋盘按给定位姿渲染到该相机视角（平面 -> 图像 是精确单应）。"""
     R, _ = cv2.Rodrigues(rvec)
     sq_m = spec.square_mm / 1000.0
@@ -98,19 +117,37 @@ def render_view(board_img, pad, spec: BoardSpec, px_per_m: float,
     Hm = K @ np.column_stack([r1, r2, R @ origin + t])
     S = np.diag([1.0 / px_per_m, 1.0 / px_per_m, 1.0])
     H = Hm @ S
-    und = cv2.warpPerspective(board_img, H, size, flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    und = cv2.warpPerspective(
+        board_img,
+        H,
+        size,
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
     und = cv2.cvtColor(und, cv2.COLOR_GRAY2BGR)
     # 板上黑格之外是"背景"，warp 之后边界外是 0（黑），会把棋盘外的区域也变成黑，
     # 这里用亮的背景填充，更接近真实拍摄
-    mask = cv2.warpPerspective(np.full_like(board_img, 255), H, size,
-                               flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask = cv2.warpPerspective(
+        np.full_like(board_img, 255),
+        H,
+        size,
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
     bg = 150
     und[mask == 0] = bg
     if D is not None and np.any(np.abs(D) > 1e-12):
         mx, my = _forward_distort_map(K, D, size)
-        und = cv2.remap(und, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
-                        borderValue=(bg, bg, bg))
+        und = cv2.remap(
+            und,
+            mx,
+            my,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(bg, bg, bg),
+        )
     img = und.astype(np.float32)
     if blur > 0:
         img = cv2.GaussianBlur(img, (0, 0), blur)
@@ -129,34 +166,43 @@ def make_poses(n: int, rng) -> list[tuple[np.ndarray, np.ndarray]]:
         y = -0.10 + 0.20 * (((i // 15) % 2))
         tvec = np.array([x, y, z], np.float64) + rng.normal(0, 0.008, 3)
         # 倾斜：绕 x/y 各 ±22 度，绕 z 旋转 ±25 度
-        ang = np.radians([
-            rng.uniform(-22, 22),
-            rng.uniform(-22, 22),
-            rng.uniform(-25, 25),
-        ])
+        ang = np.radians(
+            [
+                rng.uniform(-22, 22),
+                rng.uniform(-22, 22),
+                rng.uniform(-25, 25),
+            ]
+        )
         poses.append((ang, tvec))
     rng.shuffle(poses)
     return poses
 
 
 # --------------------------------------------------------------------------
-def run_case(views: int, noise: float, use_distortion: bool, blur: float,
-             verbose: bool, stills: bool = False) -> bool:
+def run_case(
+    views: int,
+    noise: float,
+    use_distortion: bool,
+    blur: float,
+    verbose: bool,
+    stills: bool = False,
+) -> bool:
     rng = np.random.default_rng(20240930)
     size = (1280, 720)
     spec = BoardSpec(cols=8, rows=5, square_mm=25.0)
 
     # ---- 真值 ----
     fx1, fy1 = 900.0, 900.0
-    fx2, fy2 = 880.0, 882.0          # 两台相机故意不同（不同型号更接近现实）
+    fx2, fy2 = 880.0, 882.0  # 两台相机故意不同（不同型号更接近现实）
     K1 = _K(fx1, fy1, 655.0, 372.0)
     K2 = _K(fx2, fy2, 628.0, 365.0)
     if use_distortion:
         D1 = np.array([-0.11, 0.045, 0.0012, -0.0009, 0.0])
         D2 = np.array([-0.09, 0.030, -0.0010, 0.0011, 0.0])
     else:
-        D1 = np.zeros(5); D2 = np.zeros(5)
-    baseline = 0.100                 # 100 mm
+        D1 = np.zeros(5)
+        D2 = np.zeros(5)
+    baseline = 0.100  # 100 mm
     R_true, _ = cv2.Rodrigues(np.radians([0.8, -1.2, 0.5]))
     T_true = np.array([-baseline, 0.0015, 0.002], np.float64).reshape(3, 1)
 
@@ -165,6 +211,7 @@ def run_case(views: int, noise: float, use_distortion: bool, blur: float,
 
     # ---- 渲染 + 自动挑帧 ----
     from calib import CaptureConfig
+
     # 独立静帧：帧间本来就是不同位姿，不该要求"静止"；
     # 视频：模拟"手持板走一段、停一下"，让静止门限去挑停稳的那几帧。
     cfg_cap = CaptureConfig(require_stationary=not stills)
@@ -185,7 +232,9 @@ def run_case(views: int, noise: float, use_distortion: bool, blur: float,
 
     for i, (ang, tvec, _settled) in enumerate(seq):
         rvec1 = ang.reshape(3, 1)
-        img1 = render_view(board_img, pad, spec, 900.0, rvec1, tvec, K1, D1, size, noise, blur)
+        img1 = render_view(
+            board_img, pad, spec, 900.0, rvec1, tvec, K1, D1, size, noise, blur
+        )
         # 同一个板在相机 2 里的位姿：X2 = R X1 + T
         R_b1, _ = cv2.Rodrigues(rvec1)
         R_b2 = R_true @ R_b1
@@ -194,15 +243,27 @@ def run_case(views: int, noise: float, use_distortion: bool, blur: float,
         # 注意：px_per_m 是"棋盘贴图的分辨率"，两台相机必须用同一个值，
         # 它决定的是贴图比例而不是成像大小（成像大小由 K 和位姿决定）。
         # 写错会让另一台相机看到一个"尺寸不对"的板，导致焦距/基线系统性偏移。
-        img2 = render_view(board_img, pad, spec, 900.0, rvec2, t_b2, K2, D2, size, noise, blur)
+        img2 = render_view(
+            board_img, pad, spec, 900.0, rvec2, t_b2, K2, D2, size, noise, blur
+        )
 
-        collector.offer(cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY),
-                        cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY))
+        collector.offer(
+            cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY),
+            cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY),
+        )
         if verbose:
-            print(f"    帧 {i + 1:3d}: 已收 {collector.count}  ({collector.last_reason})")
+            print(
+                f"    帧 {i + 1:3d}: 已收 {collector.count}  ({collector.last_reason})"
+            )
 
-    print(f"  自动挑帧：收下 {collector.count}/{views} 对"
-          + (f"，主要剔除原因：{max(collector.rejected.items(), key=lambda kv: kv[1])[0]}" if collector.rejected else ""))
+    print(
+        f"  自动挑帧：收下 {collector.count}/{views} 对"
+        + (
+            f"，主要剔除原因：{max(collector.rejected.items(), key=lambda kv: kv[1])[0]}"
+            if collector.rejected
+            else ""
+        )
+    )
     if collector.count < 8:
         print("  [失败] 自动挑帧收得太少，无法标定")
         return False
@@ -230,24 +291,39 @@ def run_case(views: int, noise: float, use_distortion: bool, blur: float,
     print(f"  焦距 fx1 {res.K1[0, 0]:8.2f} (真值 {fx1:.2f}, 误差 {fx1_err:.3f}%)")
     print(f"  焦距 fy1 {res.K1[1, 1]:8.2f} (真值 {fy1:.2f}, 误差 {fy1_err:.3f}%)")
     print(f"  焦距 fx2 {res.K2[0, 0]:8.2f} (真值 {fx2:.2f}, 误差 {fx2_err:.3f}%)")
-    print(f"  基线     {res.baseline_mm:8.3f} mm (真值 {baseline * 1000:.3f} mm, 误差 {base_err:.3f}%)")
+    print(
+        f"  基线     {res.baseline_mm:8.3f} mm (真值 {baseline * 1000:.3f} mm, 误差 {base_err:.3f}%)"
+    )
     print(f"  相对旋转误差 {R_err:.4f} 度")
 
     # ---- 端到端三维精度（最关键的一项）----
     # 用真值装置把一组已知三维点投影到两路，加检测噪声，
     # 再用【标定出来的】参数三角测量，看恢复出的三维误差。
-    pts3d = np.array([
-        [0.00, 0.00, 0.60], [0.06, 0.02, 0.55], [-0.05, 0.03, 0.70],
-        [0.02, -0.04, 0.50], [-0.07, -0.02, 0.65], [0.04, 0.05, 0.75],
-    ], np.float64)
+    pts3d = np.array(
+        [
+            [0.00, 0.00, 0.60],
+            [0.06, 0.02, 0.55],
+            [-0.05, 0.03, 0.70],
+            [0.02, -0.04, 0.50],
+            [-0.07, -0.02, 0.65],
+            [0.04, 0.05, 0.75],
+        ],
+        np.float64,
+    )
     rng2 = np.random.default_rng(11)
     uv1 = cv2.projectPoints(pts3d, np.zeros(3), np.zeros(3), K1, D1)[0].reshape(-1, 2)
-    uv2 = cv2.projectPoints(pts3d, cv2.Rodrigues(R_true)[0], T_true, K2, D2)[0].reshape(-1, 2)
+    uv2 = cv2.projectPoints(pts3d, cv2.Rodrigues(R_true)[0], T_true, K2, D2)[0].reshape(
+        -1, 2
+    )
     uv1 += rng2.normal(0, 0.2, uv1.shape)
     uv2 += rng2.normal(0, 0.2, uv2.shape)
 
-    a = cv2.undistortPoints(uv1.reshape(-1, 1, 2), K1, D1, R=res.R1, P=res.P1).reshape(-1, 2)
-    b = cv2.undistortPoints(uv2.reshape(-1, 1, 2), K2, D2, R=res.R2, P=res.P2).reshape(-1, 2)
+    a = cv2.undistortPoints(uv1.reshape(-1, 1, 2), K1, D1, R=res.R1, P=res.P1).reshape(
+        -1, 2
+    )
+    b = cv2.undistortPoints(uv2.reshape(-1, 1, 2), K2, D2, R=res.R2, P=res.P2).reshape(
+        -1, 2
+    )
     pts4d = cv2.triangulatePoints(res.P1, res.P2, a.T, b.T)
     got = (pts4d[:3] / pts4d[3]).T
     # 关键：三角测量得到的点在【校正后】的左相机坐标系里，
@@ -256,8 +332,10 @@ def run_case(views: int, noise: float, use_distortion: bool, blur: float,
     truth_rect = (res.R1 @ pts3d.T).T
     err = np.linalg.norm(got - truth_rect, axis=1)
     dist = np.linalg.norm(pts3d, axis=1)
-    print(f"  端到端三维误差：均值 {err.mean() * 1000:.3f} mm，最大 {err.max() * 1000:.3f} mm "
-          f"（目标距离 {dist.min():.2f}-{dist.max():.2f} m）")
+    print(
+        f"  端到端三维误差：均值 {err.mean() * 1000:.3f} mm，最大 {err.max() * 1000:.3f} mm "
+        f"（目标距离 {dist.min():.2f}-{dist.max():.2f} m）"
+    )
 
     # ---- 判定 ----
     checks = [
@@ -278,12 +356,16 @@ def run_case(views: int, noise: float, use_distortion: bool, blur: float,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目标定自测（合成真值）")
-    ap.add_argument("--views", type=int, default=25, help="渲染多少个位姿")
+    ap.add_argument("--views", type=int, default=25,
+                    help="渲染多少个位姿（少于 min_pairs=10 对无法标定）")
     ap.add_argument("--noise", type=float, default=0.6, help="图像噪声标准差")
     ap.add_argument("--blur", type=float, default=0.8, help="高斯模糊 sigma")
     ap.add_argument("--distortion", action="store_true", help="带镜头畸变")
-    ap.add_argument("--stills", action="store_true",
-                    help="按独立静帧测试（不要求板静止）；默认按视频测试")
+    ap.add_argument(
+        "--stills",
+        action="store_true",
+        help="按独立静帧测试（不要求板静止）；默认按视频测试",
+    )
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -292,15 +374,24 @@ def main() -> int:
     print("=" * 62)
     cases = [
         ("理想：无畸变无噪声", dict(noise=0.0, use_distortion=False, blur=0.0)),
-        ("现实：有畸变 + 噪声 + 轻微模糊", dict(noise=args.noise, use_distortion=True, blur=args.blur)),
+        (
+            "现实：有畸变 + 噪声 + 轻微模糊",
+            dict(noise=args.noise, use_distortion=True, blur=args.blur),
+        ),
     ]
     if args.distortion:
         cases = [cases[1]]
     all_ok = True
     for name, kw in cases:
         print(f"\n----- {name} -----")
-        ok = run_case(args.views, kw["noise"], kw["use_distortion"], kw["blur"],
-                      args.verbose, stills=args.stills)
+        ok = run_case(
+            args.views,
+            kw["noise"],
+            kw["use_distortion"],
+            kw["blur"],
+            args.verbose,
+            stills=args.stills,
+        )
         all_ok = all_ok and ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))

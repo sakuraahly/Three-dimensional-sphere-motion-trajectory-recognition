@@ -19,11 +19,11 @@
 | 轨迹预测（自适应窗口 + 已知重力约束） | ✅ 完成 | 0.1 / 0.2 / 0.3 s 分别 **0.81 / 1.20 / 1.98 px** |
 | 可视化（拖尾 / 圆 / 预测虚线 / HUD / 3D 小视图） | ✅ 完成 | 见 `outputs/videos/annotated.mp4` |
 | 实时程序 + 离线批处理 + CSV 导出 | ✅ 完成 | 单路 **~160 fps**（960×540，纯 CPU 单线程） |
-| 合成真值自测（可直接当回归测试） | ✅ 完成 | `python apps/selftest_synthetic.py` |
+| 合成真值自测（可直接当回归测试） | ✅ 完成 | `python tests/selftest_synthetic.py` |
 | **相机运动适配**（手持/云台/平移拍摄） | ✅ 完成 | 平移下半径误差 0.23 px（不补偿 1.58 px），见第十一节 |
 | **双目自动标定** | ✅ 完成 | 合成真值验证：基线误差 0.006%、端到端三维误差 3.4 mm，见第十二节 |
 | 双目标定复检（装置是否被碰动） | ✅ 完成 | 未动 0.08 px / 碰动 2° 后 27.9 px，可明确判定 |
-| 多相机/换相机适配 | ✅ 完成 | `apps/list_cameras.py` 自动探测后端、分辨率、帧率与画面有效性 |
+| 多相机/换相机适配 | ✅ 完成 | `apps/tools/list_cameras.py` 自动探测后端、分辨率、帧率与画面有效性 |
 | AI 分支环境（YOLO / SAM 后端） | ⚙️ 环境就绪 | torch 2.11.0+cu128、ultralytics 8.4.159、CUDA 可用（sm_120） |
 | **双目标定 + 三角测量 + 3D 轨迹** | ⬜ 待做 | 本课题主体（见开题报告八阶段表） |
 | **两路视频同步** | ⬜ 待做 | — |
@@ -40,7 +40,7 @@ conda activate myenv
 cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 
 # 1) 自测：确认环境与代码正常（不需要摄像头，约 1 分钟）
-python apps/selftest_synthetic.py
+python tests/selftest_synthetic.py
 
 # 2) 看一遍离线效果（用已生成的合成视频，有真值可对照）
 python apps/run_video.py outputs/videos/synthetic_ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv --ball-diameter 0.22 --focal 831
@@ -52,7 +52,7 @@ python apps/run_realtime.py --camera 0 --method fusion
 
 实时窗口快捷键：`q` 退出、`c` 切检测方法、`m` 看掩膜、`s` 存快照与配置、`v` 录制、`r` 重置轨迹、`3` 开关三维小视图。
 
-**对准真实小球时的顺序**：先跑 `python apps/calibrate_color.py --camera 0` 拖滑块
+**对准真实小球时的顺序**：先跑 `python apps/tools/calibrate_color.py --camera 0` 拖滑块
 （按 `1`–`6` 可套预设），直到掩膜窗口里只有球是白的，按 `s` 保存；再用
 `python apps/run_realtime.py --camera 0 --config config/sphere_config.json --ball-diameter <球直径米>` 运行。
 
@@ -198,7 +198,7 @@ g_px = fy · g / Z        （Z 由球的像素半径反推：Z = f·R/r）
 + 前后左右碰壁 + 深度变化 3.7-4.4 m，透视投影，含同色方块 + 同形橙色圆两个陷阱干扰物。
 
 ```
-python apps/selftest_synthetic.py
+python tests/selftest_synthetic.py
 ```
 
 | 场景      | 方法      | 检出率 | 检测RMSE | 跟踪中位 | 半径RMSE | 三维RMSE | 深度误差 | 0.1s预测 | 0.2s预测 | 0.3s预测 | 速度     |
@@ -262,10 +262,10 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 
 ```powershell
 # 1) 先自测，确认代码在你机器上正常（不需要摄像头）
-python apps/selftest_synthetic.py
+python tests/selftest_synthetic.py
 
 # 2) 标定颜色阈值（第一次用必做，1 分钟）
-python apps/calibrate_color.py --camera 0
+python apps/tools/calibrate_color.py --camera 0
 #    拖动滑块直到球是白色、背景是黑色；按 1-6 套用预设；按 f 冻结画面；按 s 保存
 
 # 3) 实时运行
@@ -310,10 +310,10 @@ python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.m
 
 单目相机靠"球在图像里多大"来推距离：`Z = f · R / r`。
 
-1. **焦距 fx**（`apps/calibrate_focal.py`）
+1. **焦距 fx**（`apps/tools/calibrate_focal.py`）
    把球放在**量好**的距离上（比如 1.000 m），跑：
    ```powershell
-   python apps/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.04
+   python apps/tools/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.04
    ```
    等绿圈稳定后按 `s`，会自动算出 fx 并存进 `config/sphere_config.json`。
 2. **球直径**：用卡尺量，填 `--ball-diameter`。这是三维的绝对尺度来源。
@@ -390,7 +390,7 @@ $env:KMP_DUPLICATE_LIB_OK = "TRUE"
 ```powershell
 python apps/run_realtime.py --method yolo        # 零样本检测（COCO 的 sports ball 类）
 python apps/run_realtime.py --method yolo_sam    # YOLO 给框 + SAM 分割出像素级边缘
-python apps/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就绪
+python tests/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就绪
 ```
 
 代码里已经写好这两个后端（`sphere_tracker/detect.py` 的 `YoloDetector` / `YoloSamDetector`），
@@ -438,37 +438,59 @@ python apps/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就
 
 ## 七、代码结构
 
+> 详细的目录职责、放置规则、依赖方向见 **[docs/文件结构.md](docs/文件结构.md)**。
+
 ```text
-sphere_tracker/          核心库（可被任意脚本 import）
+sphere_tracker/          单目核心库（可被任意脚本 import）
   config.py              所有可调参数（dataclass，可存取 JSON）
   types.py               Detection / TrackState / FrameResult / TrailPoint
   geometry.py            亚像素圆拟合、径向一致性、梯度校验、相机模型、单目测深
-  detect.py              检测后端：color / hough / motion / fusion / yolo / yolo_sam
+  camera_motion.py       相机自运动估计（手持/云台/平移拍摄的运动补偿基础）
   track.py               卡尔曼滤波（含机动检测与重初始化）+ 轨迹管理
   predict.py             轨迹预测：最长有效后缀拟合 + 已知重力约束
   viz.py                 拖尾、圆、预测虚线、HUD、三维小面板
-  sources.py             摄像头 / 视频文件 / 图片序列
-  camera_motion.py       相机自运动估计（手持/云台/平移拍摄时的运动补偿基础）
+  sources.py             摄像头 / 视频文件 / 图片序列（含相机模式自动探测、线程化采集）
   pipeline.py            单帧总流程编排
+  detectors/             检测后端，按"线索来源"分文件
+    base.py              基类 + 轮廓打分等公共工具
+    factory.py           按名字造单个检测器（避开循环导入）
+    color.py             颜色分割（主力）
+    hough.py             霍夫圆（几何补充）
+    motion.py            背景差分（含相机运动补偿）
+    fusion.py            多线索投票融合
+    neural.py            YOLO / SAM（可选，需要 torch）
+  detect.py              兼容垫片：旧导入路径仍可用，新代码请用 detectors/
 
-apps/                    可直接运行的程序
-  run_realtime.py        实时摄像头主程序
-  run_video.py           离线处理视频/图片，导出 CSV
-  calibrate_color.py     HSV 阈值交互标定
-  calibrate_focal.py     单点焦距标定（三维必需）
-  selftest_synthetic.py  合成数据自测（真值已知，可直接当回归测试）
-  list_cameras.py        列出本机摄像头（换相机/换机器第一步先跑这个）
-  calibrate_stereo.py    自动双目标定（相机 / 两段视频 / 两个图片文件夹）
-  verify_stereo.py       复检标定：装置是否被碰动
-  selftest_stereo_calib.py  用合成真值验证整条标定链路
-
-calib/                   双目标定
+calib/                   双目标定（离线、一次）
   board.py               标定板检测与质量指标（清晰度/大小/贴边/曝光）
   capture.py             自动挑帧（含位姿多样性与画面覆盖控制）
   stereo_calib.py        标定核心（离群剔除 + 整体精化 + 质量判定）
   params.py              StereoRig：保存/加载/校正/三角测量/极线误差
 
+stereo/                  双目（逐帧把两路合成三维）
+  sync.py                双路视频同步（闪光/拍手对齐）
+  triangulate.py         极线约束配对 + 三角测量 + 三维轨迹
+
+apps/                    可直接运行的程序
+  run_realtime.py        实时摄像头主程序
+  run_video.py           离线处理视频/图片，导出 CSV
+  calibrate_stereo.py    自动双目标定（相机 / 两段视频 / 两个图片文件夹）
+  verify_stereo.py       复检标定：装置是否被碰动
+  tools/                 一次性设置与诊断工具
+    list_cameras.py        列出本机摄像头（换相机/换机器第一步先跑这个）
+    make_calibration_board.py  生成可打印棋盘格
+    calibrate_color.py     HSV 阈值交互标定
+    calibrate_focal.py     单点焦距标定（三维必需）
+
+tests/                   回归测试（改动代码后必跑）
+  selftest_synthetic.py        单目全链路（clean / realistic / panning）
+  selftest_stereo_calib.py     双目标定（合成真值）
+  selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
+
 docs/                    文档
+  文件结构.md            目录职责与放置规则
+  交接文档.md            现状 / 代码地图 / 踩坑记录
+  计划书.md              目标 / 里程碑 / 风险
   开题报告_PPT逐页文稿.md
   refs/                  两篇参考文献 PDF
 
@@ -477,14 +499,15 @@ legacy/                  早期草稿（保留可运行，仅供对照，见其�
   02_canny_realtime_edges.py   原 video_edge_detect.py
 
 assets/                  项目素材
+  boards/                可打印标定板 PDF/PNG
   images/test.jpg        示例图片（单图调试用）
   videos/                放你要处理的视频（体积大，不入库，见其中 README.md）
 
 models/                  推理权重（*.pt 不入库，见其中 README.md）
   yolo11n.pt             --method yolo 用的 COCO 权重
 
+config/                  本机运行期参数（标定结果、相机模式缓存，不入库）
 outputs/                 运行产物（全部可重新生成，不入库）
-  images/  videos/  *.csv
 ```
 
 在你自己代码里调用：
@@ -520,7 +543,7 @@ while True:
 
 ## 八、调参顺序（遇到问题按这个顺序查）
 
-1. **完全检测不到** → 跑 `apps/calibrate_color.py`，先看掩膜窗口里球是不是白的。
+1. **完全检测不到** → 跑 `apps/tools/calibrate_color.py`，先看掩膜窗口里球是不是白的。
    不是就调 HSV，或者按 `1`-`6` 换预设。
 2. **检测到乱七八糟的东西** → 用 `--method color` 单独看；
    提高 `detector.min_radius`（把小球噪声排除）、提高 `min_fill_ratio` / `min_radial_consistency`。
@@ -629,7 +652,7 @@ while True:
 
 ```powershell
 # 1) 先看本机有哪些相机、哪几路能出画面（换设备第一步就跑这个）
-python apps/list_cameras.py
+python apps/tools/list_cameras.py
 
 # 2) 输出示例
 #   DirectShow 索引 -> 设备名（顺序通常一致，供参考）：
@@ -647,7 +670,7 @@ python apps/list_cameras.py
   （真实传感器一定有噪声：整帧标准差恰好为 0 说明这条流是假的）。
 - 不支持的分辨率会**自动降级重试**；`CAP_PROP_FPS` 返回 -1 时会**实测帧率**兜底。
 - 不同相机的**色彩响应不同**，每台可能要用各自的 HSV 预设
-  （`apps/calibrate_color.py --camera N` 分别标定）。
+  （`apps/tools/calibrate_color.py --camera N` 分别标定）。
 - 拍摄时**锁定曝光/对焦/白平衡**，否则球在画面里移动会让自动参数来回变，颜色阈值跟着失效。
 
 ### 11.5 实测：相机匀速平移时的表现
@@ -669,8 +692,8 @@ python apps/list_cameras.py
 复现命令：
 
 ```powershell
-python apps/selftest_synthetic.py --scenario panning      # 只看平移场景
-python apps/selftest_synthetic.py --scenario panning --method motion_raw   # 看不补偿的对照
+python tests/selftest_synthetic.py --scenario panning      # 只看平移场景
+python tests/selftest_synthetic.py --scenario panning --method motion_raw   # 看不补偿的对照
 ```
 
 ### 11.6 相关配置项（`DetectorConfig`）
@@ -758,7 +781,7 @@ python apps/calibrate_stereo.py --left-dir imgs/left --right-dir imgs/right
 | 相对旋转误差 | 0.005° | 0.039° |
 | **端到端三维误差** | **1.03 mm** | **3.44 mm**（0.5–0.75 m 处） |
 
-复现：`python apps/selftest_stereo_calib.py`
+复现：`python tests/selftest_stereo_calib.py`
 
 > 最后一行才是"能不能投入生产"的真正判据：
 > 用**标定出来的参数**去三角测量已知的三维点，看恢复得准不准。

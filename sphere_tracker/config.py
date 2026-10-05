@@ -13,7 +13,7 @@ class ColorConfig:
     """HSV 颜色分割参数。OpenCV 的色相 H 范围是 0-179，S/V 是 0-255。
 
     默认预设面向"白色 / 高亮小球"（例如乒乓球、白色橡胶球）：
-    亮度高、饱和度低。若你的球是彩色的，请用 apps/calibrate_color.py 标定，
+    亮度高、饱和度低。若你的球是彩色的，请用 apps/tools/calibrate_color.py 标定，
     或直接改成对应的 HSV 范围。
     """
 

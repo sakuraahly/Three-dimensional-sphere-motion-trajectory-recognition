@@ -2,9 +2,9 @@
 
 用法::
 
-    python apps/calibrate_color.py --camera 0
-    python apps/calibrate_color.py --image assets/images/ball.png
-    python apps/calibrate_color.py --video assets/videos/ball.mp4
+    python apps/tools/calibrate_color.py --camera 0
+    python apps/tools/calibrate_color.py --image assets/images/ball.png
+    python apps/tools/calibrate_color.py --video assets/videos/ball.mp4
 
 按键：
     1-6    套用颜色预设（白/橙/绿/蓝/红/黄）
@@ -18,7 +18,10 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# --- 让脚本在任意目录深度都能找到项目根 ---
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
