@@ -1,11 +1,36 @@
 # 开题报告 PPT 逐页文稿
 
+> ## ⚠️ 阅读须知：本稿的页码与现状
+>
+> **1. 页码对应旧版。** 本文按**旧版**开题报告编写；之后报告被重排并拆页，
+> **现为 34 页**。本文里的 slide 号**不要照抄**，需要按内容找页：
+>
+> | 本文的节 | 现在的位置 |
+> |---|---|
+> | 目录分节页 | slide 2 / 3 / 9 / 16 |
+> | 课题背景（文献概述 / 选题意义） | slide 4–7 |
+> | 课题目标 | slide 8 |
+> | 理论分析 | slide 10–12 |
+> | 实验方法 | slide 13–15 |
+> | **研究思路**（装置 / 软件 / 数据 / 精度） | **slide 17–26** |
+> | 时间规划 | slide 28–29 |
+> | 参考文献 | slide 30–32 |
+>
+> **2. 代码侧状态已大幅推进。** 本文写作时双目还只是"计划"；
+> 现在**标定 / 同步 / 成对取帧 / 极线配对 / 三角测量**都已代码完成并通过回归测试
+> （仍是**合成真值**，真机未验证）。文中说"未做/待做"的地方请以
+> `README.md` 状态表与 `docs/交接文档.md` §1 为准。
+>
+> **3. 生成方式**见 `docs/PPT生成流程.md`。
+>
+> ---
+>
 > **使用说明（不用放进 PPT）**
 > 1. 第 1 页有 **5 处 XXX** 需要替换：答辩小组 / 指导教师 / 专业班级 / 姓名学号 / 日期。其余页面无需再改。
 > 2. 主线已按指导思路确定为 **双目立体视觉**：两台固定摄像机 → 2D 检测 / 跟踪 → 三角测量 → 3D 轨迹 → 平滑 → 可视化。
 > 3. 检测目标统一表述为 **任意球形物体**（不同颜色 / 材质 / 尺寸）；橙色球体只是已验证的一个样例。
 > 4. 标 **【讲稿】** 的段落是口头补充，不要打在幻灯片上 —— 这些是评委最容易追问的地方。
-> 5. 第 15 页是本稿重点：**2D 检测 + 跟踪这两个环节已经跑通并量化**，正好是双目方案里最容易出问题的一环。
+> 5. **2D 检测 + 跟踪这两个环节已经跑通并量化**，正好是双目方案里最容易出问题的一环。
 
 ---
 
@@ -910,18 +935,22 @@ pred = kf.predict()                  # 下一帧位置预测
 
 | 技术路线阶段 | 对应代码 | 状态 |
 |---|---|---|
-| 多线索检测（颜色 / 梯度几何 / 背景差分 / 融合） | `sphere_tracker/detect.py` | ✔ 已完成 |
+| 多线索检测（颜色 / 梯度几何 / 背景差分 / 融合） | `sphere_tracker/detect.py`（垫片）→ 实体在 `sphere_tracker/detectors/` | ✔ 已完成 |
 | **与颜色无关的几何判据**（泛化核心） | `sphere_tracker/geometry.py`：`radial_consistency`、`circle_radial_gradient_stats` | ✔ 已完成 |
 | 亚像素边缘细化 | `sphere_tracker/geometry.py`：`refine_circle_subpixel` | ✔ 已完成 |
 | 2D 卡尔曼跟踪（含机动检测） | `sphere_tracker/track.py` | ✔ 已完成 |
 | 单路视频处理与 CSV 导出 | `apps/run_video.py` | ✔ 已完成 |
 | 合成真值自测 | `tests/selftest_synthetic.py` | ✔ 已完成 |
-| 双目标定与立体校正 | `calib/calibrate_stereo.py` | 待实现 |
-| 两路视频同步 | `sync/sync_videos.py` | 待实现 |
-| 极线配对与三角测量 | `stereo/` | 待实现 |
-| Savitzky-Golay / 3D 卡尔曼平滑 | `filter/` | 待实现 |
-| 三维可视化（Plotly / Matplotlib） | `viz/` | 待实现 |
-| PID 云台控制 | `control/pid_gimbal.py` | 待实现（可选） |
+| 双目标定与立体校正 | `apps/calibrate_stereo.py` + `calib/`（4 文件） | ✔ **代码完成**（合成真值，⏳ 真机未验证） |
+| 两路视频同步 | `stereo/sync.py` + `stereo/pair_source.py` | ✔ **代码完成**（合成真值，⏳ 真机未验证） |
+| 极线配对与三角测量 | `stereo/triangulate.py`（`match_epipolar` 在这里，**没有** `stereo/match.py`） | ✔ **代码完成**（合成真值，⏳ 真机未验证） |
+| Savitzky-Golay / 3D 卡尔曼平滑 | `sphere_tracker/`（尚未新建模块） | ⬜ 未开始（对应 `计划书.md` M4） |
+| 三维可视化（Plotly / Matplotlib） | `sphere_tracker/viz.py`（3D 部分未做） | ⬜ 未开始（M6；plotly 未装） |
+| PID 云台控制 | 尚未新建模块 | ⬜ 未开始（可选） |
+
+> 本表已按**当前实际路径与状态**更新（原表写的是计划中的路径，
+> 如 `sync/sync_videos.py`、`stereo/match.py`、`filter/`，这些目录**从未存在过**）。
+> 权威状态见 `README.md` 状态表与 `docs/交接文档.md` §1。
 
 ---
 

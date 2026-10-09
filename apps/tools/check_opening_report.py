@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from pptx import Presentation
 from pptx.util import Emu
@@ -55,6 +56,13 @@ def n_lines(p, width_in: float) -> int:
 
 def main() -> int:
     path = sys.argv[1] if len(sys.argv) > 1 else "outputs/开题报告_最终.pptx"
+    if not Path(path).exists():
+        print(f"[失败] 找不到要检查的文件：{path}")
+        print("       请先用 build_opening_report.py 生成，例如：")
+        print("         python apps/tools/build_opening_report.py "
+              "--src <你的开题报告.pptx> --out outputs/开题报告_最终.pptx")
+        print("       （生成方式见 docs/PPT生成流程.md）")
+        return 2
     prs = Presentation(path)
 
     def is_content(i: int) -> bool:
