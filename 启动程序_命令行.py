@@ -111,7 +111,7 @@ def menu() -> str:
         ("3", "标定前置检查（两路是否都看到棋盘）", C.MAGENTA),
         ("4", "双目标定（两台相机 + 棋盘格）", C.MAGENTA),
         ("5", "标定复检（装置是否被碰动）", C.MAGENTA),
-        ("6", "相机设备管理（识别 / 固定 / 检查漂移）", C.BLUE),
+        ("6", "相机设备管理（识别 / 固定 / 无关 / 检查漂移）", C.BLUE),
         ("7", "修改参数", C.YELLOW),
         ("8", "相机探测（核对两路参数是否一致）", C.BLUE),
         ("9", "环境自测（无需摄像头）", C.BLUE),
@@ -137,7 +137,7 @@ def common_args() -> list[str]:
     return args
 
 
-def run(cmd: list[str], title: str) -> None:
+def run(cmd: list[str], title: str, pause: str = "按回车返回主菜单…") -> None:
     print()
     print(f"{C.CYAN}▶ {title}{C.RESET}")
     print(f"{C.DIM}> " + " ".join(cmd) + C.RESET)
@@ -151,7 +151,7 @@ def run(cmd: list[str], title: str) -> None:
         print(f"\n{C.GREEN}✔ 完成（返回码 0）{C.RESET}")
     else:
         print(f"\n{C.RED}✘ 结束（返回码 {code}）{C.RESET}")
-    input(f"{C.DIM}按回车返回主菜单…{C.RESET}")
+    input(f"{C.DIM}{pause}{C.RESET}")
 
 
 # --------------------------------------------------------------------------
@@ -291,10 +291,19 @@ def action_cameras() -> None:
     print(f"{C.BOLD}相机设备管理{C.RESET}  {C.DIM}（索引会漂移，身份不会）{C.RESET}\n")
     print(f"  {C.CYAN}[1]{C.RESET} 列出设备（不开相机，任何机器都能跑）")
     print(f"  {C.CYAN}[2]{C.RESET} 列出设备 + 逐个试开（看真实分辨率 / 是否全黑）")
-    print(f"  {C.CYAN}[3]{C.RESET} 识别并固定：逐个显示画面，确认哪台是左 / 右 / 主")
+    print(f"  {C.CYAN}[3]{C.RESET} 识别并固定：逐个显示画面，确认哪台是"
+          f"{C.WHITE}左 / 右 / 无关{C.RESET} / 主")
     print(f"  {C.CYAN}[4]{C.RESET} 检查映射：重插相机后比对有没有漂移 / 被占用")
+    print(f"  {C.CYAN}[5]{C.RESET} 把某台标为「无关」（自动挑相机时跳过它）")
+    print(f"  {C.CYAN}[6]{C.RESET} 查看 / 清除「无关」标记")
     print()
     pick = input(f"{C.CYAN}输入编号并回车 > {C.RESET}").strip()
+    if pick == "5":
+        action_ignore_one()
+        return
+    if pick == "6":
+        action_ignored_manage()
+        return
     cmds = {
         "1": (["list"], "列出相机设备"),
         "2": (["list", "--probe"], "列出相机设备（含实测分辨率）"),
@@ -305,6 +314,51 @@ def action_cameras() -> None:
         return
     sub, title = cmds[pick]
     run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), *sub], title)
+
+
+def _cameras_cmd(*args: str) -> list[str]:
+    return [PY, str(ROOT / "apps" / "tools" / "cameras.py"), *args]
+
+
+def action_ignore_one() -> None:
+    """把某台相机标为「无关」：先列出来，再让你输编号。"""
+    clear()
+    banner()
+    print(f"{C.BOLD}标为「无关」{C.RESET}  "
+          f"{C.DIM}（自动挑相机时会跳过它；典型用途：笔记本内置 / 红外相机）{C.RESET}\n")
+    run(_cameras_cmd("list"), "先看一眼当前设备（记下要排除的编号）", pause="按回车继续…")
+    idx = input(f"{C.CYAN}要把哪个编号标为「无关」？(直接回车=取消) > {C.RESET}").strip()
+    if not idx:
+        return
+    if not idx.isdigit():
+        print(f"{C.RED}请输入纯数字编号，如 3{C.RESET}")
+        input(f"{C.DIM}按回车返回…{C.RESET}")
+        return
+    run(_cameras_cmd("ignore", idx), f"把 #{idx} 标为「无关」")
+
+
+def action_ignored_manage() -> None:
+    """查看 / 清除「无关」清单。"""
+    clear()
+    banner()
+    print(f"{C.BOLD}「无关」清单{C.RESET}\n")
+    run(_cameras_cmd("ignored"), "当前「无关」清单", pause="按回车继续…")
+    print(f"  {C.CYAN}[1]{C.RESET} 取消某一台的「无关」标记（按编号）")
+    print(f"  {C.CYAN}[2]{C.RESET} 全部取消（清空清单）")
+    print(f"  {C.CYAN}[3]{C.RESET} 什么都不做")
+    print()
+    pick = input(f"{C.CYAN}输入编号并回车 > {C.RESET}").strip()
+    if pick == "1":
+        idx = input(f"{C.CYAN}取消哪个编号的「无关」标记？ > {C.RESET}").strip()
+        if not idx.isdigit():
+            print(f"{C.RED}请输入纯数字编号{C.RESET}")
+            input(f"{C.DIM}按回车返回…{C.RESET}")
+            return
+        run(_cameras_cmd("unignore", idx), f"取消 #{idx} 的「无关」标记")
+    elif pick == "2":
+        run(_cameras_cmd("unignore", "--all"), "清空「无关」清单")
+    else:
+        return
 
 
 def action_selftest() -> None:

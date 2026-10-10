@@ -35,9 +35,22 @@
                   "port": "Port_#0001.Hub_#0003", "name": "aoni webcam A25",
                   "index": 0, "verified": true}
       },
+      "ignored": [
+        {"identity": "USB\\VID_30C9&PID_00EC&MI_00\\...", "port": "...",
+         "name": "Integrated Camera", "index": 2, "verified": true}
+      ],
       "settings": {"prefer_external": true, "avoid_names": ["Integrated Camera"],
                    "min_width": 1280, "min_height": 720, "min_fps": 15.0, "max_index": 6}
     }
+
+`ignored` 是**「无关」清单**：用户明确标记"这台不要用"（典型是笔记本内置相机与红外相机）。
+它和 `roles` 一样**记身份而不是编号**，所以重插 USB 之后依然有效。语义：
+
+- `select_cameras()` / `rank_candidates()` 把标了「无关」的相机排到最后，
+  只有"其它相机都不够用"时才动用，并且**一定会打印警告**（静默用错相机比报错更糟）；
+- 一台相机不能**既**是左/右/主**又**是「无关」：`mark_ignored()` 会顺手把它从角色里摘掉，
+  反过来 `set_role()` 之后旧的无关联记录也要清（由调用方 `cameras.py` 负责）；
+- `format_device_table(..., reg=reg)` 会打出 `[无关]` 标记，选相机时看得见。
 """
 
 from __future__ import annotations
@@ -99,6 +112,10 @@ class RoleSpec:
 class Registry:
     v: int = 1
     roles: dict[str, RoleSpec] = field(default_factory=dict)
+    # 「无关」清单：明确标记"这台不要用"。内置 / 红外相机标一次就再也不用管，
+    # 自动挑相机（select_cameras）会跳过它们，避免标定/实时偷偷用到错的设备。
+    # 结构与 roles 一样（记身份而不是编号），所以重插 USB 也不会失效。
+    ignored: list[RoleSpec] = field(default_factory=list)
     settings: dict = field(default_factory=dict)
 
 
@@ -456,7 +473,11 @@ def rank_candidates(
     reg: Registry | None = None,
     settings: dict | None = None,
 ) -> list[DeviceEntry]:
-    """按"更可能是我们要的那台"排序：配置里 pin 过的 > 外接 > 其它；内置/红外降权。"""
+    """按"更可能是我们要的那台"排序：配置里 pin 过的 > 外接 > 其它；内置/红外降权。
+
+    标了「无关」的一律沉到最后（比"内置/红外"的降权还狠），
+    这样自动挑相机永远先挑别人 —— 用户明确说过不要的，就别再自作聪明。
+    """
     merged = {**DEFAULT_SETTINGS, **(settings or {})}
     reg = reg or Registry()
     pinned_ids: set[str] = set()
@@ -482,8 +503,9 @@ def rank_candidates(
             s += 20.0
         if is_avoided(d.name, merged):
             s -= 200.0
+        if is_device_ignored(d, reg):
+            s -= 1000.0
         return s
-
     return sorted(devices, key=lambda d: (-score(d), d.order))
 
 
@@ -517,6 +539,17 @@ def select_cameras(
             if i not in known
         ]
 
+    # 标了「无关」的排到最后：只有"其它相机都不够用"时才轮到它们，
+    # 并且要显式告警 —— 用户明确说过不要的相机，静默用上比报错更糟。
+    ignored_used: list[DeviceEntry] = []
+    if indices is None and cands:
+        keep, drop = [], []
+        for d in cands:
+            (drop if is_device_ignored(d, reg) else keep).append(d)
+        if drop:
+            cands = keep + drop
+            ignored_used = drop
+
     min_w = int(merged["min_width"])
     min_h = int(merged["min_height"])
     limit = 1 if need <= 1 else need + 2
@@ -537,12 +570,29 @@ def select_cameras(
             break
 
     if need <= 1:
-        return picked[:max(need, 0)]
-    for i in range(len(picked)):
-        for j in range(i + 1, len(picked)):
-            if (picked[i].width, picked[i].height) == (picked[j].width, picked[j].height):
-                return [picked[i], picked[j]][:need]
-    return picked[:need]
+        result = picked[:max(need, 0)]
+    else:
+        result = None
+        for i in range(len(picked)):
+            for j in range(i + 1, len(picked)):
+                if (picked[i].width, picked[i].height) == (picked[j].width, picked[j].height):
+                    result = [picked[i], picked[j]][:need]
+                    break
+            if result is not None:
+                break
+        if result is None:
+            result = picked[:need]
+
+    # 真挑到了「无关」的相机 -> 说清楚，别让它静默混进来
+    used_ignored = [r for r in result if r.entry is not None
+                    and is_device_ignored(r.entry, reg)]
+    if used_ignored:
+        names = "、".join(f"#{r.index} {r.entry.name or '未知名'}"
+                          for r in used_ignored if r.entry)
+        print(f"[警告] 可用的相机不够，只能动用被标为「无关」的相机：{names}\n"
+              f"        如果这是误标，跑 python apps/tools/cameras.py unignore --all 清掉；"
+              f"如果想换一台，检查相机是不是没插好。")
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -573,7 +623,30 @@ def load_registry(path: str | Path | None = None) -> Registry:
                 verified=bool(spec.get("verified", False)),
             )
     settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
-    return Registry(v=int(data.get("v") or 1), roles=roles, settings=dict(settings))
+    return Registry(v=int(data.get("v") or 1), roles=roles,
+                   ignored=_parse_spec_list(data.get("ignored")), settings=dict(settings))
+
+
+def _parse_spec_list(raw) -> list[RoleSpec]:
+    """把配置里的 `ignored`（以及将来的同类列表）解析成 RoleSpec 列表。
+
+    容错优先：非列表 / 元素不是 dict / 字段类型不对都跳过，绝不让配置把程序弄崩。
+    """
+    out: list[RoleSpec] = []
+    if not isinstance(raw, list):
+        return out
+    for spec in raw:
+        if not isinstance(spec, dict):
+            continue
+        idx = spec.get("index")
+        out.append(RoleSpec(
+            identity=str(spec.get("identity") or ""),
+            port=str(spec.get("port") or ""),
+            name=str(spec.get("name") or ""),
+            index=int(idx) if isinstance(idx, (int, float)) else None,
+            verified=bool(spec.get("verified", False)),
+        ))
+    return out
 
 
 def save_registry(reg: Registry, path: str | Path | None = None) -> Path:
@@ -583,6 +656,7 @@ def save_registry(reg: Registry, path: str | Path | None = None) -> Path:
     payload = {
         "v": reg.v,
         "roles": {k: asdict(v) for k, v in reg.roles.items()},
+        "ignored": [asdict(s) for s in reg.ignored],
         "settings": reg.settings,
     }
     p.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -610,14 +684,134 @@ def set_role(
 
 
 # --------------------------------------------------------------------------- #
+# 「无关」清单：明确标记"这台不要用"
+# --------------------------------------------------------------------------- #
+def _spec_matches_device(spec: RoleSpec, d: DeviceEntry) -> bool:
+    """这份记录描述的是这台设备吗？
+
+    **只认 identity / port，绝不退到按名字匹配。** 这一点与 `_match_entry()` 不同，
+    是故意的：两台同型号相机的名字**一模一样**（本项目两台 aoni 都叫
+    "aoni webcam A25"），按名字匹配会把"我只想排除这一台"变成"两台一起排除"。
+    角色解析可以容忍这个（最终只取一台，且 identity/port 优先），
+    但「无关」清单不行 —— 静默多标一台，用户下次就找不到相机了。
+
+    真拿不到身份时（非 Windows / 枚举不可用）退到编号，并且只认
+    `verified=False` 的记录 —— 与 `resolve_role()` 的兜底口径一致：
+    **没被目视确认过的记录才允许按编号走。**
+    """
+    if spec.identity and d.identity:
+        return spec.identity.upper() == d.identity.upper()
+    if spec.port and d.port:
+        return spec.port.lower() in d.port.lower()
+    if spec.identity or spec.port:
+        # 有身份/端口却没对上 -> 就是另一台，不要再看名字
+        return False
+    return (not spec.verified and spec.index is not None and spec.index == d.order)
+
+
+def is_device_ignored(d: DeviceEntry, reg: Registry | None = None) -> bool:
+    """这台设备在「无关」清单里吗？"""
+    reg = reg if reg is not None else load_registry()
+    return any(_spec_matches_device(s, d) for s in reg.ignored)
+
+
+def find_ignored_device(
+    spec: RoleSpec, devices: list[DeviceEntry]
+) -> DeviceEntry | None:
+    """在设备列表里找这份「无关」记录指向的那台（严格匹配，不因重名误伤）。"""
+    for d in devices:
+        if _spec_matches_device(spec, d):
+            return d
+    return None
+
+
+def ignored_orders(reg: Registry, devices: list[DeviceEntry]) -> set[int]:
+    """把「无关」清单解析成"当前这些设备里，哪些编号是无关的"。"""
+    out: set[int] = set()
+    for d in devices:
+        if is_device_ignored(d, reg):
+            out.add(d.order)
+    return out
+
+
+def role_of_device(reg: Registry, d: DeviceEntry) -> str | None:
+    """这台设备当前挂在哪个角色上（没有就 None）。标记「无关」时用来摘掉旧角色。"""
+    for role, spec in reg.roles.items():
+        if _spec_matches_device(spec, d):
+            return role
+    return None
+
+
+def mark_ignored(
+    reg: Registry,
+    *,
+    entry: DeviceEntry | None = None,
+    index: int | None = None,
+    verified: bool = False,
+) -> RoleSpec:
+    """把一台设备标成「无关」。
+
+    同时把"它曾经是左/右/主"这件事摘掉 —— 一台相机不能既是左相机又是无关，
+    否则下次自动挑相机时两边打架（谁是真理说不清）。返回值就是新的记录。
+    """
+    order = index if index is not None else (entry.order if entry else None)
+    if entry is not None:
+        old_role = role_of_device(reg, entry)
+        if old_role:
+            reg.roles.pop(old_role, None)
+    # 先去掉同一台设备的旧记录，避免重复堆叠
+    if entry is not None:
+        reg.ignored = [s for s in reg.ignored if not _spec_matches_device(s, entry)]
+    elif order is not None:
+        reg.ignored = [s for s in reg.ignored
+                       if not (not s.verified and s.index == order)]
+    spec = RoleSpec(
+        identity=entry.identity if entry else "",
+        port=entry.port if entry else "",
+        name=entry.name if entry else "",
+        index=order,
+        verified=verified,
+    )
+    reg.ignored.append(spec)
+    return spec
+
+
+def unmark_ignored(
+    reg: Registry,
+    *,
+    entry: DeviceEntry | None = None,
+    index: int | None = None,
+) -> int:
+    """取消一台设备的「无关」标记，返回摘掉了几条记录。"""
+    before = len(reg.ignored)
+    if entry is not None:
+        reg.ignored = [s for s in reg.ignored if not _spec_matches_device(s, entry)]
+    elif index is not None:
+        reg.ignored = [s for s in reg.ignored if s.index != index]
+    return before - len(reg.ignored)
+
+
+def clear_ignored(reg: Registry) -> int:
+    """清空整份「无关」清单，返回清掉了几条。"""
+    n = len(reg.ignored)
+    reg.ignored = []
+    return n
+
+
+# --------------------------------------------------------------------------- #
 # 解析：角色 -> 当前索引
 # --------------------------------------------------------------------------- #
 def format_device_table(
     devices: list[DeviceEntry],
     probes: dict[int, ProbeResult] | None = None,
     settings: dict | None = None,
+    reg: Registry | None = None,
 ) -> str:
-    """打印用设备清单（工具与交互提示共用）。"""
+    """打印用设备清单（工具与交互提示共用）。
+
+    传 `reg` 时会把「无关」标记也打出来 —— 选相机时看得见"这台我已经标过不用了"，
+    比事后纳闷"为什么自动挑相机不选它"要好。
+    """
     if not devices:
         return "  （没有检测到任何摄像头设备；非 Windows 或系统枚举不可用）"
     probes = probes or {}
@@ -628,7 +822,11 @@ def format_device_table(
         if probe is not None:
             tail = (f"  实测 {probe.width}x{probe.height}@{probe.fps:.1f}"
                     if probe.ok else f"  实测失败({probe.error})")
-        mark = "  [内置/红外,不推荐]" if is_avoided(d.name, settings) else ""
+        mark = ""
+        if reg is not None and is_device_ignored(d, reg):
+            mark = "  [无关]"
+        elif is_avoided(d.name, settings):
+            mark = "  [内置/红外,不推荐]"
         lines.append(
             f"  #{d.order}  {d.name or '(无名字)':<20} "
             f"端口 {d.port or '-':<24} id {d.identity or '-'}{tail}{mark}"
@@ -713,7 +911,12 @@ def resolve_role(
 
     entry, how = _match_entry(spec, devices)
     if entry is not None:
-        return ResolvedCamera(role=str(role), index=entry.order, how=how, entry=entry)
+        warns = ()
+        if is_device_ignored(entry, reg):
+            warns = (f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
+                     f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。",)
+        return ResolvedCamera(role=str(role), index=entry.order, how=how, entry=entry,
+                              warnings=warns)
 
     expected = []
     if spec.identity:

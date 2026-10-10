@@ -204,7 +204,7 @@ CANDIDATE_MODES: tuple[tuple[int, int], ...]     # 自动探测用的候选分�
 @dataclass(frozen=True) DeviceEntry:  order: int     # 我们【当作】cv2 索引的枚举位次（启发式）
     name=""; identity=""; port=""; present=True; source="index"     # source: system/registry/index
 @dataclass RoleSpec:  identity=""; port=""; name=""; index: int | None = None; verified=False
-@dataclass Registry:  v=1; roles: dict[str, RoleSpec]; settings: dict
+@dataclass Registry:  v=1; roles: dict[str, RoleSpec]; ignored: list[RoleSpec]; settings: dict
 @dataclass(frozen=True) ProbeResult:  index; ok; width=0; height=0; fps=0.0; std=0.0; error=""; entry=None
 @dataclass(frozen=True) ResolvedCamera:  role; index; how; entry=None; warnings=()
     # how: "identity" | "port" | "name" | "manual" | "index-fallback"
@@ -216,18 +216,45 @@ def probe_index(index, *, width=1280, height=720, fps=30, opener=None) -> ProbeR
 def is_avoided(name: str, settings: dict | None = None) -> bool;  def rank_candidates(devices, *, reg=None, settings=None) -> list[DeviceEntry]
 def select_cameras(*, need=1, devices=None, probe=probe_index, reg=None, settings=None, indices: list[int] | None = None) -> list[ProbeResult]
 def load_registry(path=None) -> Registry;  def save_registry(reg, path=None) -> Path    # 坏文件 -> 空 Registry（不抛）；写不进去抛
-def set_role(reg, role, *, entry=None, index=None, verified=False) -> RoleSpec;  def format_device_table(devices, probes=None, settings=None) -> str
+def set_role(reg, role, *, entry=None, index=None, verified=False) -> RoleSpec;  def format_device_table(devices, probes=None, settings=None, reg=None) -> str
 def resolve_role(role, reg=None, devices=None, *, interactive=True, probe=None) -> ResolvedCamera
 def resolve_camera_arg(value, *, reg=None, devices=None, interactive=True) -> int | None
+# ---- 「无关」清单（2026-10 新增）----
+def is_device_ignored(d: DeviceEntry, reg: Registry | None = None) -> bool
+def find_ignored_device(spec: RoleSpec, devices: list[DeviceEntry]) -> DeviceEntry | None   # 严格匹配，不按名字
+def ignored_orders(reg: Registry, devices: list[DeviceEntry]) -> set[int]
+def role_of_device(reg: Registry, d: DeviceEntry) -> str | None
+def mark_ignored(reg, *, entry=None, index=None, verified=False) -> RoleSpec   # 顺手把它从 roles 里摘掉
+def unmark_ignored(reg, *, entry=None, index=None) -> int      # 返回摘掉几条
+def clear_ignored(reg: Registry) -> int
 AUTO_TOKEN = "auto";  DEFAULT_SETTINGS = {...}   # prefer_external / min_width / min_height / min_fps / avoid_names / max_index
 ```
 `resolve_camera_arg` 规则：`None`/`""` → `None`；`int` → 原样；`"0"` → `0`；`"port:xx"`/`"id:xx"`/`"name:xx"` → 匹配设备；**其它字符串当角色名**（查 `config/cameras.json`）。
+
+**`Registry.ignored` = 「无关」清单**：用户明确标记"这台不要用"（笔记本内置 / 红外）。
+与 `roles` 同样记**身份**而非编号，所以重插 USB 后仍有效。语义：
+`rank_candidates()` 给它 `-1000` 分（比"内置/红外"的 `-200` 还重），`select_cameras()`
+把它排到最后、只在其它相机都不够用时才动用**并打印警告**；`mark_ignored()` 会把它
+从 `roles` 里摘掉（一台相机不能既是左相机又是「无关」）。
+`format_device_table(..., reg=reg)` 会打出 `[无关]` 标记。
+
+**为什么 `_spec_matches_device()` 不按名字匹配**（与 `_match_entry()` 不同）：
+两台同型号相机的名字**一模一样**（本项目两台 aoni 都叫 `aoni webcam A25`），
+按名字匹配会把"只排除这一台"变成"两台一起排除"。所以「无关」只认 identity → port，
+拿不到身份时才退到编号（且只认 `verified=False` 的记录）。
+`_match_entry()` 保留"identity → port → name"是给**角色解析**用的（最终只取一台，且前两级优先），
+两者刻意不同。
 
 **坑**：① **`DeviceEntry.order` 是启发式**：OpenCV 不提供"索引 N 是哪个物理设备"的查询接口，这里把枚举位次**当作** cv2 索引 —— 所以有 `cameras.py identify`（目视确认后写死身份）与 `check`（查漂移）兜底；非 Windows 时 `list_devices()` 返回 `[]`，整套功能**退化为"按索引"且不报错**。
 ② **`verified=True` 的角色不允许索引兜底**：身份/端口/名字都对不上时直接抛 `RuntimeError`（或交互让用户选），绝不用配置里的旧索引 —— 这正是"左边外接、右边却成了内置"的成因。
 ③ `resolve_role(..., probe=...)` 这个参数**在函数体里没被使用**；`resolve_camera_arg("auto")` **抛 `RuntimeError`**（`auto` 只能用 `--auto-cameras` 表达）。
 ④ `select_cameras()` 挑不满**不抛**，返回实际挑到的几台（调用方自己判 `len`）。
 ⑤ `probe_index()` 会**真开一次相机**；`_default_opener` 里的 `from .sources import CameraSource` 是**惰性 import**（`camera_registry.py:397`），不探测就不需要开设备。设备清单默认走 `pnputil`（本机实测 ~0.1 s），`Get-PnpDevice` 兜底要 ~10 s。
+⑥ **显式编号会绕过「无关」**：`--camera 3` 直接返回 `3`（`resolve_camera_arg` 对纯数字原样返回），
+只有 `--auto-cameras` / `--camera auto`（走 `select_cameras`）才跳过「无关」。这是有意的 ——
+用户显式点名一台相机时，优先级最高。
+⑦ 「无关」清单若在 JSON 里被手改成"同一台既是角色又是无关"，`resolve_role()`
+会带一条 `warnings` 提示（不会静默）；`cameras.py check` 把它算作 `[危险]`、退出码 2。
 ## 10. `sphere_tracker/viz.py` —— 绘制
 ```python
 def draw_trail(frame, trail: list[TrailPoint], fade=True, thickness=2, base_color=(0, 255, 255)) -> None

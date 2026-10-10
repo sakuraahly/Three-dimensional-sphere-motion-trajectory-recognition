@@ -122,7 +122,9 @@ class Launcher(tk.Tk):
             "第 1 步 · 相机标定",
             "左右约定：人面对镜头时，左手边那台为“左”。第一次用请先点"
             "『相机设备管理（识别/固定）』，程序会逐个显示画面让你确认哪台是左、哪台是右；"
-            "确认后左右下拉选 left / right 就行，不用再管编号（编号会随插口漂移）。")
+            "笔记本内置 / 红外这类**不打算用**的相机，就在那个画面里按 n 标成「无关」"
+            "（自动挑相机会跳过它）。确认后左右下拉选 left / right 就行，不用再管编号"
+            "（编号会随插口漂移）。")
         self.calib_mode = tk.StringVar(value="skip")
         ttk.Radiobutton(box, text="跳过标定（我已完成标定 / 先快速体验）",
                         variable=self.calib_mode, value="skip").grid(
@@ -161,11 +163,16 @@ class Launcher(tk.Tk):
         ttk.Button(box, text="相机探测（核对两路参数是否一致）",
                    command=self._run_probe).grid(
             row=6, column=0, columnspan=3, sticky="w", pady=(2, 2))
-        ttk.Button(box, text="相机设备管理（识别 / 固定）",
+        ttk.Button(box, text="相机设备管理（识别 / 固定 / 标无关）",
                    command=self._run_cameras_identify).grid(
             row=6, column=3, columnspan=2, sticky="w", pady=(2, 2))
         ttk.Button(box, text="检查相机映射", command=self._run_cameras_check).grid(
             row=6, column=5, columnspan=2, sticky="w", pady=(2, 2))
+        ttk.Button(box, text="「无关」相机清单（自动挑选会跳过）",
+                   command=self._run_cameras_ignored).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(2, 2))
+        ttk.Button(box, text="清空「无关」标记", command=self._run_cameras_unignore_all).grid(
+            row=7, column=3, columnspan=2, sticky="w", pady=(2, 2))
 
     # ---------- 第 2 步：参数 ----------
     def _build_step2(self) -> None:
@@ -357,11 +364,17 @@ class Launcher(tk.Tk):
         try:
             from sphere_tracker import camera_registry as cr
             devices = cr.list_devices()
+            reg = cr.load_registry()
         except Exception as exc:                             # noqa: BLE001
             self._append(f"[错误] 读取设备列表失败：{exc}")
             return
 
-        items = [f"{d.order} | {d.name or '(无名字)'} | {d.port or '-'}" for d in devices]
+        def label(d) -> str:
+            # 标了「无关」的在名字后面挂个记号，免得用户纳闷"自动挑相机为什么不选它"
+            mark = "  [无关]" if cr.is_device_ignored(d, reg) else ""
+            return f"{d.order} | {d.name or '(无名字)'} | {d.port or '-'}{mark}"
+
+        items = [label(d) for d in devices]
         stereo_values = ["left", "right", "auto"] + items
         mono_values = ["auto", "main"] + items
         if not devices:                                      # 非 Windows / 枚举不可用
@@ -374,20 +387,42 @@ class Launcher(tk.Tk):
 
         if devices:
             self._append(f"已刷新设备列表（{len(devices)} 台）：")
-            self._append(cr.format_device_table(devices))
+            self._append(cr.format_device_table(devices, reg=reg))
             self._append("左/右可直接选 left / right（按设备身份，换 USB 口也不漂）；"
                          "也可选具体编号应急。")
+            if reg.ignored:
+                names = "、".join((s.name or f"#{s.index}") for s in reg.ignored)
+                self._append(f"已标为「无关」（自动挑相机会跳过）：{names}")
+            else:
+                self._append("提示：不打算用的相机（笔记本内置 / 红外）可以在"
+                             "『相机设备管理』的画面里按 n 标成「无关」。")
         else:
             self._append("没有枚举到设备（非 Windows 或系统枚举不可用），"
                          "只能按编号使用。")
 
     def _run_cameras_identify(self) -> None:
         self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "identify"],
-                  "相机设备管理（逐个画面确认哪台是左/右，结果写入 config/cameras.json）")
+                  "相机设备管理（逐个画面确认：l=左 / r=右 / n=无关 / m=主，"
+                  "结果写入 config/cameras.json）")
 
     def _run_cameras_check(self) -> None:
         self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "check"],
                   "检查相机映射（重插相机后看看有没有漂移）")
+
+    def _run_cameras_ignored(self) -> None:
+        self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "ignored"],
+                  "「无关」相机清单（自动挑相机会跳过它们）")
+
+    def _run_cameras_unignore_all(self) -> None:
+        if not messagebox.askyesno(
+                "清空「无关」标记",
+                "确定要清空整份「无关」清单吗？\n\n"
+                "清空后这些相机（笔记本内置 / 红外等）又会被自动挑选选中。\n"
+                "如果只是想换一台，建议改用『相机设备管理』重新确认。"):
+            return
+        self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"),
+                   "unignore", "--all"],
+                  "清空「无关」清单（全部恢复可被自动挑选）")
 
     def _run_selftest(self) -> None:
         self._run([PY, str(ROOT / "tests" / "selftest_synthetic.py")],

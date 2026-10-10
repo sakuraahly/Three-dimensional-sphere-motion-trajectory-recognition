@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -34,15 +35,21 @@ from sphere_tracker.camera_registry import (  # noqa: E402
     Registry,
     RoleSpec,
     _parse_pnputil,
+    clear_ignored,
     format_device_table,
+    ignored_orders,
+    is_device_ignored,
     load_registry,
+    mark_ignored,
     parse_windows_instance,
     rank_candidates,
     resolve_camera_arg,
     resolve_role,
+    role_of_device,
     save_registry,
     select_cameras,
     set_role,
+    unmark_ignored,
     windows_devices,
 )
 
@@ -508,6 +515,121 @@ def test_from_args_compat() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 11. 「无关」清单：标记 / 解除 / 影响自动挑选 / 与角色互斥 / 读写往返
+# --------------------------------------------------------------------------- #
+def test_ignored(tmp: Path) -> bool:
+    print("----- 11. 「无关」清单（左/右/无关 三选一，自动挑选跳过无关） -----")
+    devs = sample_devices()          # 0=内置, 1=外接A, 2=外接B
+    settings = {"max_index": 2, "min_width": 1280, "min_height": 720}
+
+    def probe_from(mapping):
+        def probe(index, **kw):
+            return mapping.get(index, ProbeResult(index=index, ok=False, error="打不开"))
+        return probe
+
+    all_good = {i: ProbeResult(i, True, 1280, 720, 30.0, std=20.0) for i in (0, 1, 2)}
+    checks: list[tuple[str, bool]] = []
+
+    # --- 标记 / 识别 ---
+    reg = Registry()
+    mark_ignored(reg, entry=devs[2], index=2, verified=True)
+    checks.append(("标记后进入清单", len(reg.ignored) == 1))
+    checks.append(("该台被认作无关", is_device_ignored(devs[2], reg)))
+    checks.append(("别的台不受影响", not is_device_ignored(devs[1], reg)))
+    checks.append(("ignored_orders 正确", ignored_orders(reg, devs) == {2}))
+
+    # --- 核心价值：按**身份**记，换编号之后依然认得出 ---
+    moved = [dev(0, "Integrated Camera", "USB\\INT", ""),
+             dev(1, "aoni webcam A25", "USB\\B", "Port_#0002.Hub_#0003"),   # 漂到 1
+             dev(2, "aoni webcam A25", "USB\\A", "Port_#0001.Hub_#0003")]
+    checks.append(("身份匹配：换编号后仍认作无关",
+                   is_device_ignored(moved[1], reg) and not is_device_ignored(moved[2], reg)))
+
+    # --- 与角色互斥：标无关要把它从 left/right 摘掉 ---
+    reg2 = Registry()
+    set_role(reg2, "left", entry=devs[1], index=1, verified=True)
+    mark_ignored(reg2, entry=devs[1], index=1, verified=True)
+    checks.append(("标无关会自动摘掉它的旧角色", "left" not in reg2.roles))
+    checks.append(("role_of_device 不再报它", role_of_device(reg2, devs[1]) is None))
+
+    # --- 解除 / 清空 ---
+    checks.append(("unmark_ignored 摘掉 1 条", unmark_ignored(reg2, entry=devs[1]) == 1))
+    checks.append(("摘掉后不再是无关", not is_device_ignored(devs[1], reg2)))
+    mark_ignored(reg2, entry=devs[0], index=0, verified=True)
+    mark_ignored(reg2, entry=devs[2], index=2, verified=True)
+    checks.append(("clear_ignored 清空", clear_ignored(reg2) == 2 and not reg2.ignored))
+
+    # --- 排序：即使"外接 vs 内置"，无关也一律沉到最后 ---
+    reg3 = Registry()
+    mark_ignored(reg3, entry=devs[1], index=1, verified=True)      # 把一台外接标成无关
+    order = [d.order for d in rank_candidates(devs, reg=reg3,
+                                             settings={"prefer_external": True})]
+    checks.append(("无关沉到内置之后（rank）", order[-1] == 1))
+
+    # --- 自动挑选：有别的可用时绝不碰无关的 ---
+    picks = select_cameras(need=1, devices=devs, probe=probe_from(all_good),
+                           reg=reg3, settings=settings)
+    checks.append(("自动挑选跳过无关（need=1）", len(picks) == 1 and picks[0].index != 1))
+    picks2 = select_cameras(need=2, devices=devs, probe=probe_from(all_good),
+                            reg=reg3, settings=settings)
+    checks.append(("自动挑选跳过无关（need=2，两台都不含 #1）",
+                   {p.index for p in picks2} == {0, 2}))
+
+    # --- 兜底：只剩无关的能用时才动用（并会打印警告）---
+    reg4 = Registry()
+    for d in devs:
+        mark_ignored(reg4, entry=d, index=d.order, verified=True)
+    picks3 = select_cameras(need=1, devices=devs, probe=probe_from(all_good),
+                            reg=reg4, settings=settings)
+    checks.append(("全都无关时仍兜底返回（不空手）", len(picks3) == 1))
+
+    # --- 读写往返（含"老配置没有 ignored 键"的向后兼容）---
+    path = tmp / "ignored.json"
+    reg5 = Registry()
+    set_role(reg5, "left", entry=devs[1], index=1, verified=True)
+    mark_ignored(reg5, entry=devs[2], index=2, verified=True)
+    save_registry(reg5, path)
+    back = load_registry(path)
+    checks.append(("ignored 往返一致",
+                   len(back.ignored) == 1 and back.ignored[0].identity == "USB\\B"
+                   and back.ignored[0].verified))
+    checks.append(("roles 与 ignored 并存", set(back.roles) == {"left"}))
+
+    legacy = tmp / "legacy.json"
+    legacy.write_text(json.dumps({"v": 1, "roles": {"left": {"identity": "USB\\A",
+                                                             "index": 1, "verified": True}},
+                                  "settings": {}}), encoding="utf-8")
+    checks.append(("老配置（没有 ignored 键）能读，清单为空",
+                   load_registry(legacy).ignored == []))
+    weird = tmp / "weird.json"
+    weird.write_text(json.dumps({"ignored": ["不是字典", 42, {"index": 1}]}),
+                     encoding="utf-8")
+    checks.append(("ignored 里混进垃圾项不崩，只取合法项",
+                   len(load_registry(weird).ignored) == 1))
+
+    # --- 角色指向无关设备 -> 必须给出警告（配置自相矛盾）---
+    # 注意：这个状态**没法用 API 造出来**（mark_ignored 会把角色摘掉，上一段已验证），
+    # 只可能来自手改 JSON。这里直接手搓一份，验证程序遇到它不会装看不见。
+    both = role(identity="USB\\B", index=2, verified=True)
+    reg6 = Registry(roles={"left": both}, ignored=[role(identity="USB\\B", index=2,
+                                                        verified=True)])
+    res = resolve_role("left", reg6, devs, interactive=False)
+    checks.append(("角色与无关冲突时给出警告", len(res.warnings) == 1
+                   and "无关" in res.warnings[0]))
+
+    # --- 清单上看得见 ---
+    table = format_device_table(devs, reg=reg3)
+    checks.append(("format_device_table 打出 [无关]", "[无关]" in table))
+    checks.append(("未标记的台没有 [无关]", table.count("[无关]") == 1))
+
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 def test_real_probe() -> bool:
     """有相机时额外验证真机枚举（无相机则跳过，不算不达标）。"""
     print("----- 附加：真机枚举（有相机才验证） -----")
@@ -567,6 +689,7 @@ def main() -> int:
             test_config_roundtrip(tmp),
             test_select_cameras(),
             test_from_args_compat(),
+            test_ignored(tmp),
         ]
         print()
         if args.probe:
