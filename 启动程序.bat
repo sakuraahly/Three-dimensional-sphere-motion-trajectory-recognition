@@ -16,6 +16,7 @@ rem    precheck   直接做标定前置检查
 rem    calibrate  直接做双目标定
 rem    verify     直接做标定复检
 rem    run        直接开始实时检测
+rem    diag       相机画质 / 链路诊断（"某一路不清晰"先跑这个）
 rem    test       跑回归测试
 rem
 rem  正文是 UTF-8，所以开头必须 chcp 65001 —— cmd.exe 按当前代码页解析
@@ -135,6 +136,7 @@ if /i "%MODE%"=="precheck"  goto :do_precheck
 if /i "%MODE%"=="calibrate" goto :do_calibrate
 if /i "%MODE%"=="verify"    goto :do_verify
 if /i "%MODE%"=="run"       goto :do_run
+if /i "%MODE%"=="diag"      goto :do_diag
 if /i "%MODE%"=="test"      goto :do_test
 echo       不认识的参数「%MODE%」，改用图形界面。
 goto :ui_gui
@@ -196,6 +198,11 @@ goto :direct
 :do_run
 set "DIRECT=apps\run_realtime.py --camera auto --method fusion --ball-diameter 0.22"
 set "DTITLE=实时检测（窗口里按 q 或 ESC 结束）"
+goto :direct
+
+:do_diag
+set "DIRECT=apps\tools\camera_quality.py %CAM% --together"
+set "DTITLE=相机画质 / 链路诊断（先分清是带宽不足还是光学/曝光问题）"
 goto :direct
 
 :do_test

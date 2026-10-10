@@ -54,6 +54,59 @@ class CapturedPair:
     quality: dict = field(default_factory=dict)
 
 
+def diagnose_frame(gray: np.ndarray, work_width: int = 640) -> str:
+    """棋盘没检测到时，用**整幅画面**的统计量给一句人话会诊。
+
+    为什么需要：`findChessboardCornersSB` 返回"没找到"是一个黑盒 ——
+    画面蒙雾、过曝、太暗、跑焦、板错了(行列数/方格数不符)都会得到同一个结果。
+    在标定窗口前反复调整却没有任何反馈，是最耗时间的一种卡住。
+    这里只用几个极便宜的统计量（缩到 320 宽算），把最常见的原因指出来。
+
+    返回空字符串表示"画面本身看不出毛病"（那多半是板不对或没在画面里）。
+    """
+    try:
+        h, w = gray.shape[:2]
+        if h < 8 or w < 8:
+            return ""
+        scale = 320.0 / float(w)
+        small = cv2.resize(gray, (320, max(8, int(round(h * scale)))),
+                           interpolation=cv2.INTER_AREA)
+    except cv2.error:
+        return ""
+
+    mean = float(small.mean())
+    white = float((small > 245).mean())      # 过曝比例
+    black = float((small < 12).mean())       # 死黑比例
+    sharp = float(cv2.Laplacian(small, cv2.CV_64F).var())
+    # 实际用到的动态范围。**"蒙雾"的指纹在这里，不在整幅标准差上**：
+    # 蒙雾/脏镜头/起雾会把黑压不到底、白提不到顶，直方图挤成很窄一条；
+    # 而画面里有大块纯色（白墙、木桌）也会让标准差偏大，用标准差判会漏判。
+    p5, p95 = (float(v) for v in np.percentile(small, (5.0, 95.0)))
+    spread = p95 - p5
+
+    if mean < 12:
+        return "整幅几乎全黑 —— 镜头被挡住了，或者这条流根本没打开"
+    if black > 0.6:
+        return f"画面 {black * 100:.0f}% 是死黑 —— 镜头被挡住或没打开"
+    if mean < 30:
+        return f"画面过暗（均值 {mean:.0f}）—— 补光或调高曝光"
+    if white > 0.45 or mean > 240:
+        return (f"画面 {white * 100:.0f}% 过曝（均值 {mean:.0f}）——"
+                f"多半是逆光/正对强光源，或自动曝光被拉满；"
+                f"挪开强光或关掉自动曝光再试")
+    if spread < 70.0 and mean > 110:
+        return (f"画面动态范围被压到只剩 {spread:.0f} 级（均值 {mean:.0f}）——"
+                f"像蒙了一层雾：先擦镜头、撕掉保护膜，检查有没有起雾/结露、"
+                f"或有没有东西紧贴镜头")
+    if sharp < 25.0:
+        return (f"画面细节很少（清晰度 {sharp:.1f}）——"
+                f"跑焦或严重运动模糊；对准远处有细节的地方看能不能合焦")
+    if white > 0.12:
+        return (f"画面有 {white * 100:.0f}% 过曝区 ——"
+                f"强光直射会把棋盘对比吃掉，转个方向或降低曝光")
+    return ""
+
+
 class AutoPairCollector:
     """自动收集标定图像对。
 
@@ -123,8 +176,25 @@ class AutoPairCollector:
         self.last_accepted = False
 
         # 1) 两路都要检测到
+        #    这里**必须说清是哪一路**没找到：两路画面质量差很多时（比如一路蒙雾、
+        #    一路正常），只说"两路未同时检测到"会让人以为是标定板的问题，
+        #    在窗口前反复调整却查不到真正的原因。顺手给一句画面会诊。
         if not obs_l.found or not obs_r.found:
-            return self._reject("两路未同时检测到棋盘")
+            if not obs_l.found and not obs_r.found:
+                why = "两路都未检测到棋盘"
+            elif not obs_l.found:
+                why = "左路未检测到棋盘（右路正常）"
+            else:
+                why = "右路未检测到棋盘（左路正常）"
+            notes = []
+            for name, obs, gray in (("左", obs_l, left_gray), ("右", obs_r, right_gray)):
+                if not obs.found:
+                    note = diagnose_frame(gray, cfg.gate_work_width)
+                    if note:
+                        notes.append(f"{name}：{note}")
+            if notes:
+                why += "｜" + "；".join(notes)
+            return self._reject(why)
         assert obs_l.corners is not None and obs_r.corners is not None
 
         # 2) 清晰度
@@ -243,3 +313,22 @@ class AutoPairCollector:
         else:
             lines.append("last: " + self.last_reason)
         return lines
+
+    def side_lines(self) -> list[str]:
+        """**逐路**状态：哪一路找到板、清晰度多少。
+
+        为什么单独要这一行：两路画质差很多时（一路蒙雾一路正常），
+        只有合并后的"未同时检测到"完全看不出是哪一路的问题，
+        人会一直在窗口前挪板子。把这行打在画面上，一眼就知道该修哪路。
+        """
+        out = []
+        for name, obs in (("左", self.last_obs[0]), ("右", self.last_obs[1])):
+            if obs is None:
+                out.append(f"{name}: -")
+                continue
+            if not obs.found:
+                out.append(f"{name}: 未找到板")
+                continue
+            out.append(f"{name}: 清晰度{obs.sharpness:5.0f} 面积{obs.area_ratio * 100:4.1f}%"
+                       f" 曝光{obs.brightness:3.0f}")
+        return out

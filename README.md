@@ -52,7 +52,7 @@
 > 双目的 **15.6 mm** 来自 `tests/selftest_stereo_branch.py`（另一套合成场景、双目三角测量）。
 > 两者基准不同，**不可直接比较大小**。
 
-> ✅ **2026-10-10 全量复核**：`tests/` 下**八个**回归测试全部输出"全部通过"，
+> ✅ **2026-10-10 全量复核**：`tests/` 下**九个**回归测试全部输出"全部通过"，
 > 且上表的每一项精度指标都与本文档记录**逐位一致**。
 > 复核时另修掉 3 个 bug（相机自运动的迟滞失效、位移换算差 `s²`、
 > PPT 预览的连线静默不画）。其中位移换算那个一直被合成场景盖住 ——
@@ -617,7 +617,7 @@ apps/                    可直接运行的程序
     calibrate_color.py     HSV 阈值交互标定
     calibrate_focal.py     单点焦距标定（三维必需）
 
-tests/                   回归测试（改动代码后必跑，共八个）
+tests/                   回归测试（改动代码后必跑，共九个）
   selftest_synthetic.py        单目全链路（clean / realistic / panning）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
@@ -627,6 +627,7 @@ tests/                   回归测试（改动代码后必跑，共八个）
   selftest_camera_motion.py    相机自运动：迟滞状态机 + 位移换算方向
   selftest_preview_lib.py      PPT 预览渲染：连线是否画出来
                                （缺 python-pptx/Pillow 时整体跳过算通过）
+  selftest_camera_quality.py   相机画质会诊：蒙雾/过曝/残帧判据（全合成图）
 
 docs/                    文档
   项目总纲.md            ★ 入口：项目是什么 + 文档怎么读

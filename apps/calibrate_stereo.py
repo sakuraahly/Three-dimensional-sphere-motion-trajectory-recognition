@@ -98,6 +98,15 @@ def main() -> int:
     ap.add_argument("--report-png", default=None, help="输出验证图路径")
     ap.add_argument("--no-show", action="store_true", help="不弹窗（批处理）")
     ap.add_argument("--max-frames", type=int, default=0, help=">0 时最多处理这么多帧")
+    ap.add_argument("--stationary-px", type=float, default=None,
+                    help="判定'板停稳'的帧间位移上限（像素，默认 3）。"
+                         "手持板够不着就调大，但别超过 ~12：这条门限同时替代了左右同步，"
+                         "放太松会让两路拍到不同位姿，解出的 R/T 会系统性偏")
+    ap.add_argument("--min-sharpness", type=float, default=None,
+                    help="棋盘区域清晰度下限（Laplacian 方差，默认 55）。调低会收进更糊的帧")
+    ap.add_argument("--relaxed", action="store_true",
+                    help="手持拍摄的宽松预设：停稳上限 10 px、清晰度下限 28、"
+                         "允许更小的板。**换来过检风险**，精度不满意就退回默认值重标")
     args = ap.parse_args()
 
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
@@ -111,12 +120,31 @@ def main() -> int:
     print(src.describe())
     src.report_warnings()
     from calib import CaptureConfig
-    cap_cfg = CaptureConfig(
+    cap_kw: dict = dict(
         target_pairs=args.target,
         min_pairs=args.min_pairs,
         # 独立静帧场景不要求"板静止"（帧间本来就是不同位姿）
         require_stationary=(src.kind != "dir"),
     )
+    if args.relaxed:
+        # 手持预设。**每一条都是"用精度换成功率"**，所以逐条说清代价：
+        cap_kw.update(
+            stationary_max_px=10.0,   # 允许手更抖；代价=两路位姿差变大
+            min_sharpness=28.0,       # 允许更糊；代价=角点定位变差
+            min_area_ratio=0.008,     # 允许板更远；代价=单像素误差占比变大
+            min_margin_px=6.0,        # 允许更贴边；代价=边缘畸变没被约束住
+            min_brightness=25.0,
+            max_brightness=245.0,
+        )
+        print("⚠ 已启用 --relaxed（手持预设）：门限都放松了，**这是用精度换成功率**。")
+        print("   如果标定完 极线误差 > 0.3 px，或者代进去三维抖得厉害，")
+        print("   请处理好光照与支撑、去掉 --relaxed 重标一次。")
+        print()
+    if args.stationary_px is not None:
+        cap_kw["stationary_max_px"] = float(args.stationary_px)
+    if args.min_sharpness is not None:
+        cap_kw["min_sharpness"] = float(args.min_sharpness)
+    cap_cfg = CaptureConfig(**cap_kw)
     collector = AutoPairCollector(spec, cap_cfg)
 
     cov_cache = None
@@ -207,6 +235,11 @@ def main() -> int:
                 for i, line in enumerate(lines):
                     cv2.putText(panel, line, (8, panel.shape[0] - 78 + i * 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                # 逐路状态打在右上角：一眼看出是哪一路没找到板、差在哪
+                for i, line in enumerate(collector.side_lines()):
+                    (tw, _th), _b = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.putText(panel, line, (panel.shape[1] - tw - 8, 20 + i * 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
                 cv2.imshow(WINDOW, panel)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
