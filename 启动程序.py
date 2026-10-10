@@ -47,8 +47,11 @@ PRESETS = ["不使用", "white_ball", "orange_ball", "green_ball",
 # 左右下拉的默认项：直接给**角色名**（left/right），绑定的设备身份不随 USB 口漂移。
 # 数字编号仍可手选，但换一次接口就可能指向别的相机。
 CAMERAS = ["left", "right", "auto", "0", "1", "2"]
-# 单目相机：默认 auto（启动时自动挑最优），也可选 main 角色名或具体编号。
-MONO_CAMERAS = ["auto", "main", "0", "1", "2"]
+# 单目相机：默认 auto（启动时自动挑最优），也可选具体编号。
+# 注：曾经还有 "main"（笔记本内置）这一项，已移除 —— 内置相机被标进
+# config/cameras.json 的「无关」清单，角色 main 也不再存在；留着这个选项
+# 只会让用户选到一个必定报错的项。
+MONO_CAMERAS = ["auto", "0", "1", "2"]
 RESOLUTIONS = ["1920x1080", "1280x720", "960x540", "640x480"]
 
 
@@ -376,7 +379,7 @@ class Launcher(tk.Tk):
 
         items = [label(d) for d in devices]
         stereo_values = ["left", "right", "auto"] + items
-        mono_values = ["auto", "main"] + items
+        mono_values = ["auto"] + items
         if not devices:                                      # 非 Windows / 枚举不可用
             stereo_values += ["0", "1", "2"]
             mono_values += ["0", "1", "2"]
