@@ -333,7 +333,9 @@ class Launcher(tk.Tk):
             cmd = [PY, str(ROOT / "apps" / "calibrate_stereo.py"),
                    "--left", left, "--right", right,
                    "--cols", "8", "--rows", "5", "--square", "25",
-                   "--width", width, "--height", height, "--fps", fps]
+                   "--width", width, "--height", height, "--fps", fps,
+                   # 序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致（见 pair_source）
+                   "--backend", "msmf"]
             self._run(cmd, f"双目标定（左{left} / 右{right}，收满约 25 对后自动标定）")
         else:
             calib = ROOT / "config" / "stereo_calibration"
@@ -343,7 +345,9 @@ class Launcher(tk.Tk):
                 return
             cmd = [PY, str(ROOT / "apps" / "verify_stereo.py"),
                    "--calib", str(calib), "--left", left, "--right", right,
-                   "--width", width, "--height", height, "--fps", fps]
+                   "--width", width, "--height", height, "--fps", fps,
+                   # 序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致（见 pair_source）
+                   "--backend", "msmf"]
             self._run(cmd, "标定复检（判断装置是否被碰动）")
 
     def _run_probe(self) -> None:

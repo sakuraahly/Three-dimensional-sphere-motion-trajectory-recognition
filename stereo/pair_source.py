@@ -571,10 +571,32 @@ def from_args(args) -> PairSource:
                 f"    - 开跑后先目视确认：两路必须是**同一场景的左右两个视角**。"
             )
 
+        # 相机源默认固定 **MSMF**。
+        #
+        # 为什么必须是 MSMF：`list_devices()` 的序号来自 Windows PnP 枚举，
+        # 而 `cv2.VideoCapture(index, backend)` 用的是各后端自己的枚举顺序。
+        # 本机实测（同一时刻、同一批设备）：
+        #
+        #     PnP    : 0=aoni  1=aoni  2=内置  3=内置红外
+        #     DSHOW  : 0=aoni  1=内置  2=aoni  3=打不开     ← 错位
+        #     MSMF   : 0=aoni  1=aoni  2=内置  3=打不开     ← 与 PnP 一致
+        #
+        # 判据：用户盖住了内置相机，它在哪一路全黑，那一路就是内置。
+        # 用 DSHOW 时序号 1 会开到内置（黑屏，看起来像相机坏了）；
+        # 用 MSMF 则序号与 PnP 对齐，解析结果可以直接拿去开。
+        #
+        # 顺带：MSMF 在 1080p 下能跑 30fps，DSHOW 会协商成 YUY2 未压缩掉到
+        # 4.3fps（见 sources.py 里 optimize_mode 的注释），所以 MSMF 两边都更优。
+        backend_arg = getattr(args, "backend", None)
+        api = resolve_backend(backend_arg)
+        if api is None:
+            api = resolve_backend("msmf")
+            print("[后端] 未指定 --backend，相机源默认用 MSMF"
+                  "（序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致）")
         return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,
                           backup_camera=getattr(args, "backup_camera", None),
-                          backend=resolve_backend(getattr(args, "backend", None)))
+                          backend=api)
     if getattr(args, "left_video", None) and getattr(args, "right_video", None):
         return PairSource(video=(args.left_video, args.right_video))
     if getattr(args, "left_dir", None) and getattr(args, "right_dir", None):
