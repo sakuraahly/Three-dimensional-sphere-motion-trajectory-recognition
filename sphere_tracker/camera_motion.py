@@ -185,11 +185,22 @@ class GlobalMotionEstimator:
         if n_in < self.min_inliers:
             return None
 
-        # 小图尺度 -> 全分辨率尺度
+        # 小图尺度 -> 全分辨率尺度。
+        # 换算方向必须是 M_full = Si @ M_small @ S（"全分辨率 -> 小图 -> 应用 -> 回全分辨率"），
+        # 不能写成 S @ M_small @ Si —— 那是反方向。
+        # 注意旋转/缩放项不受影响（S 是各向同性的纯缩放，线性部分怎么夹都一样），
+        # **只有平移项会被算错，差一个 s^2**：
+        #   写成 S@M@Si 时平移 = s * t_small（应为 t_small / s）。
+        # 实测（640 宽、真值平移 16 px）：work_width 160/320/640 分别报出
+        # 1.00 / 4.00 / 15.99 px —— 报出值/真值 恰好等于 s^2，s=1 时才碰巧正确。
+        # 默认 work_width=320 配 1920 宽的画面 s=1/6，位移被缩小 36 倍，
+        # 于是 is_moving() 几乎永不判"在动"，MOG2 的相机补偿永远不会启用。
+        # 另外两个估计方法（_estimate_grid / _estimate_phase）换算都是对的，
+        # 只有这个主力方法错 —— 这种"三个里错一个"最容易蒙混过关。
         s = max(self._scale, 1e-6)
         S = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float64)
         Si = np.array([[1 / s, 0, 0], [0, 1 / s, 0], [0, 0, 1]], dtype=np.float64)
-        M_full = (S @ np.vstack([M_small, [0.0, 0.0, 1.0]]) @ Si)[:2]
+        M_full = (Si @ np.vstack([M_small, [0.0, 0.0, 1.0]]) @ S)[:2]
 
         dx, dy = float(M_full[0, 2]), float(M_full[1, 2])
         rot = math.degrees(math.atan2(float(M_full[1, 0]), float(M_full[0, 0])))

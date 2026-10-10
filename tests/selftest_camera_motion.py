@@ -1,4 +1,4 @@
-"""相机自运动估计自测：迟滞状态机。
+"""相机自运动估计自测：迟滞状态机 + 位移换算方向。
 
 为什么需要它
 ------------
@@ -10,9 +10,19 @@
 
 两件事都不希望逐帧翻转，所以这个方法**必须带迟滞并把状态写回 `self._moving`**。
 
-守着的真实 bug（迟滞失效）：`is_moving()` 里 `return` 之后还留着 8 行状态更新代码，
+这里守着 `camera_motion.py` 的两个真实 bug：
+
+**bug 1（迟滞失效）**：`is_moving()` 里 `return` 之后还留着 8 行状态更新代码，
 **永远执行不到**，于是 `self._moving` 永远是初始的 `False` —— 迟滞完全失效，
 判定退化成"逐帧比较瞬时位移"，在阈值附近来回抖。
+
+**bug 2（换算方向写反）**：`_estimate_features()` 把"小图上解出的相似变换"
+换回全分辨率时写成 `M_full = S @ M_small @ Si`，而正确方向是 `Si @ M_small @ S`。
+旋转/缩放项不受影响（S 是各向同性的纯缩放），**只有平移项差一个 `s^2`**：
+默认 `work_width=320` 配 1920 宽的画面时 s=1/6，报出的位移被缩小 **36 倍**，
+于是 `is_moving()` 几乎永不判"在动"，MOG2 的相机补偿（坑 10）永远不会启用。
+`_estimate_grid()` / `_estimate_phase()` 两处换算都是对的，**只有主力方法错**，
+所以只看"合成场景跑通了"发现不了 —— panning 场景恰好走的是 grid 分支。
 
 用法::
 
@@ -30,7 +40,8 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import numpy as np  # noqa: F401  (保留：后续用例会用到)
+import cv2
+import numpy as np
 
 from sphere_tracker.camera_motion import GlobalMotionEstimator, MotionEstimate
 
@@ -129,12 +140,82 @@ def test_hysteresis() -> bool:
     return all(p for _n, p in checks)
 
 
+def _textured(width: int = 640, height: int = 360, seed: int = 3) -> np.ndarray:
+    """造一张"有角点、有纹理"的灰度图 —— 特征点法要抓得到点才会走 features 分支。"""
+    rng = np.random.default_rng(seed)
+    img = rng.integers(0, 255, (height, width), dtype=np.uint8)
+    img = cv2.GaussianBlur(img, (5, 5), 0)
+    for (x, y, s) in ((60, 40, 70), (240, 120, 90), (430, 60, 60), (150, 240, 80)):
+        cv2.rectangle(img, (x, y), (x + s, y + s), 235, -1)
+        cv2.rectangle(img, (x + 10, y + 10), (x + s - 10, y + s - 10), 20, -1)
+    return img
+
+
+def test_estimate() -> bool:
+    """真跑一遍 estimate()：静止判静止、平移判在动且位移估得准、换算不随缩放变。"""
+    print("----- 真实估计（纹理图平移）-----")
+    W, H = 640, 360
+    base = _textured(W, H)
+    checks: list[tuple[str, bool]] = []
+
+    def shifted(px: float) -> np.ndarray:
+        M = np.array([[1.0, 0.0, px], [0.0, 1.0, 0.0]], np.float32)
+        return cv2.warpAffine(base, M, (W, H), flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_REPLICATE)
+
+    def run(px: float, work_width: int = 320):
+        """返回 (估计结果, 是否判在动)。第一帧只做初始化，第二次才出结果。"""
+        e = GlobalMotionEstimator(work_width=work_width)
+        e.estimate(None, base)
+        m = e.estimate(base, shifted(px))
+        return m, e.is_moving(m)
+
+    # --- 静止 ---
+    e = GlobalMotionEstimator()
+    e.estimate(None, base)
+    m_still = e.estimate(base, base)
+    moving_still = e.is_moving(m_still)
+    ok_still = (m_still.magnitude < 0.5) and (moving_still is False)
+    print(f"  静止（同帧）：方法 {m_still.method:<8} 位移 {m_still.magnitude:.3f} px "
+          f"-> 在动={moving_still}  {'通过' if ok_still else '不达标'}")
+    checks.append(("静止判静止", ok_still))
+
+    # --- 平移：既要判对"在动"，位移也要估得准 ---
+    for px in (6.0, 12.0):
+        m, moving = run(px)
+        err = abs(m.magnitude - px)
+        ok = (m.method != "none") and moving and err <= 1.0
+        print(f"  平移 {px:5.1f} px：方法 {m.method:<8} 实测 {m.magnitude:6.2f} px "
+              f"（误差 {err:.2f} px）-> 在动={moving}  {'通过' if ok else '不达标'}")
+        checks.append((f"平移 {px:.0f}px 判在动且估得准", ok))
+
+    # --- bug 2 的判据：真值不变，报出的位移就不许随 work_width 变 ---
+    # 换算写反时（S@M@Si）报出值/真值 恰好等于 s^2：
+    # work_width 160/320/640 -> 1.00 / 4.00 / 15.99 px，越缩越小。
+    true_px = 16.0
+    print(f"  换算方向检查（真值平移固定 {true_px:.0f} px，只改 work_width）：")
+    for ww in (160, 320, 640):
+        m = GlobalMotionEstimator(work_width=ww)
+        m.estimate(None, base)
+        r = m.estimate(base, shifted(true_px))
+        err = abs(r.magnitude - true_px)
+        ok = err <= 1.0
+        print(f"    work_width={ww:>3}（s={ww / W:.2f}）：实测 {r.magnitude:6.2f} px "
+              f"（报出/真值 {r.magnitude / true_px:.3f}）  {'通过' if ok else '不达标'}")
+        checks.append((f"work_width={ww} 位移换算不随缩放变化", ok))
+
+    return all(p for _n, p in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("相机自运动估计自测")
     print("=" * 62)
-    ok = test_hysteresis()
+    a = test_hysteresis()
     print()
+    b = test_estimate()
+    print()
+    ok = a and b
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 
