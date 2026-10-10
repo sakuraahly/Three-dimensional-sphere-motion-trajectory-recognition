@@ -79,7 +79,7 @@ sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）
 calib/            双目标定（离线一次）
 stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角测量）
 apps/             可执行程序；tools/ 放一次性设置与诊断
-tests/            回归测试（17 个，改动后必跑）
+tests/            回归测试（18 个，改动后必跑）
 docs/             文档
 assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
 ```
@@ -88,7 +88,7 @@ assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
-2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 17 个回归测试必须能一键复跑。
+2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 18 个回归测试必须能一键复跑。
 3. **能重新生成的东西不进版本库**（`outputs/`、`config/`、权重、视频素材）。
 4. **交付物不放 `outputs/`**。`outputs/` 的语义是"删了也能重新生成"，
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
@@ -101,7 +101,7 @@ assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
 | -- | ---- | ---- |
 | **相机 / 标定**（7） | `cameras.py` `list_cameras.py` `camera_quality.py` `check_stereo_setup.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` | 课题主线 |
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
-| **文档与事实**（2） | `sync_facts.py` `check_standards.py` | 校验派生事实（计数 / 清单）与规范落差（引用 / 来源）；`启动程序.bat standards` 调用后者 |
+| **文档与事实**（3） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落） |
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。
@@ -198,11 +198,11 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 7. 质量底线：17 个回归测试
+## 7. 质量底线：18 个回归测试
 
 ```powershell
 启动程序.bat test              # fast 档：跳过两个慢测试，十几秒~1 分钟
-启动程序.bat test full         # 全套 17 个（改代码后必跑，约 6 分钟）
+启动程序.bat test full         # 全套 18 个（改代码后必跑，约 6 分钟）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
 
@@ -228,6 +228,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_calib_provenance.py` | 角点出身：检测器可辨识 + 回退必须显式 + 一对之内禁止混用（两道守卫） |
 | `selftest_entrypoints.py` | 三个启动入口（`.bat` / 图形 / 命令行）都调**同一个**测试运行器与规范检查器 |
 | `selftest_viz_scale.py` | `viz.scale`：整张图的**所有叠加**都随画布一起缩放（不只是预测线） |
+| `selftest_capture_health.py` | 采集健康度：**「相机没了」必须与「球没动」分得开**（`read_errors` / `stalled()`） |
 
 **判定口径**：每个都打印 `判定结果：全部通过`，且退出码 `0`。
 `[跳过]` 也算通过（缺可选依赖 / 无相机时），但**跳过 ≠ 验证过**。

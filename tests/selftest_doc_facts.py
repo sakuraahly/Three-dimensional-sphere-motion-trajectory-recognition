@@ -58,7 +58,7 @@ CHECKER = ROOT / "apps" / "tools" / "check_standards.py"
 SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 
 # 本测试自己也是测试，也要被数进去
-REAL_TEST_COUNT = 17
+REAL_TEST_COUNT = 18
 # 测试命名规范（AGENTS.md §4）
 TEST_NAME_RE = re.compile(r"^selftest_[a-z0-9_]+\.py$")
 # 临时探针用的假路径（造一处新漂移用；用完即删）

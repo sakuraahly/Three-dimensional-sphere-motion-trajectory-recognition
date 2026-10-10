@@ -24,6 +24,16 @@ WINDOWS_BACKENDS = [
     ("ANY", cv2.CAP_ANY),
 ]
 
+# 「这一帧是不是全黑/全平」的判据 —— **全项目唯一的答案在这里**。
+#
+# 语义：帧的灰度标准差 ≤ 这个数，就认为它没有可用信息（拔线、驱动刚起来、
+# 曝光还没稳定时会是这种帧），此时**不当作有效帧**。
+#
+# 为什么要有这个常量：这个 `1.0` 原本在**两个层、6 处**各写了一遍
+# （`sources.py` 5 处 + `apps/tools/camera_quality.py` 1 处）。
+# 改一处忘一处不会有任何提示，而它决定了"这帧算不算数"。
+BLACK_FRAME_STD = 1.0
+
 # ---------------------------------------------------------------------------
 # 「用编号开相机」必须配哪个后端 —— 全项目唯一的答案在这里
 # ---------------------------------------------------------------------------
@@ -128,6 +138,21 @@ class LatestFrameCamera:
         self._seq = 0
         self._stop = False
         self.dropped = 0
+        # ── 采集健康度：为什么必须有这两个计数器 ──────────────────────────
+        #
+        # 改之前这里是个**纯静默重试**：`except Exception: sleep(0.05); continue`。
+        # 后果（2026-10-10 审查定性，本文件最严重的一条）：
+        # 相机被拔掉 / USB 掉带宽 / 驱动崩掉之后，采集线程**每 50 ms 静默重试到进程结束**，
+        # `self._seq` 不再增长，而主循环照常从 `latest()` 拿到**冻结的旧帧**继续跑 ——
+        # 跟踪、预测、HUD 全都在动，操作员只看到画面卡住，**程序不报错、不退出、日志无一行**。
+        # 输出的三维位置是静止的，而人会以为"球没动"。
+        #
+        # 现在这两个计数器把"采集出问题了"变成**可观测**的：
+        #   `read_errors`  连续读失败次数（成功一次就清零）
+        #   `last_ok_t`    最后一次成功取到帧的时刻（time.monotonic）
+        # 调用方拿 `stalled()` 一问就知道：**是"球没动"还是"相机没了"**。
+        self.read_errors = 0
+        self.last_ok_t = time.monotonic()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="camera-reader")
         self._thread.start()
@@ -137,19 +162,32 @@ class LatestFrameCamera:
             try:
                 ok, frame, _t = self.source.read()
             except Exception:
+                self.read_errors += 1
                 time.sleep(0.05)
                 continue
             if not ok or frame is None:
+                # 读「成功但没帧」也算一次失败：拔线之后 `read()` 往往返回 (False, None)
+                # 而不是抛异常，两条路径都要计入，否则拔线仍然看不出来。
+                self.read_errors += 1
                 time.sleep(0.005)
                 continue
             with self._lock:
                 self._frame = frame
                 self._seq += 1
+                self.read_errors = 0
+                self.last_ok_t = time.monotonic()
 
     def latest(self, last_seq: int = -1):
         """返回 (seq, frame)。frame 可能和上次相同（采集还没出新帧）。"""
         with self._lock:
             return self._seq, self._frame
+
+    def stalled(self, timeout: float = 1.0) -> bool:
+        """采集是否已经"停住"：连续读失败、或超过 `timeout` 秒没有新帧。
+
+        调用方用这个区分**"球没动"与"相机没了"** —— 在改之前这两者长得一模一样。
+        """
+        return self.read_errors > 0 and (time.monotonic() - self.last_ok_t) > timeout
 
     @property
     def info(self):
@@ -243,11 +281,11 @@ class CameraSource(VideoSource):
                     if ret and f is not None:
                         frame = f
                         # 真实传感器一定有噪声：整帧完全不变 = 这条流是假的
-                        if float(f.std()) > 1.0:
+                        if float(f.std()) > BLACK_FRAME_STD:
                             break
                     else:
                         time.sleep(0.05)
-                if frame is not None and float(frame.std()) > 1.0:
+                if frame is not None and float(frame.std()) > BLACK_FRAME_STD:
                     self.cap = cap
                     self.backend_name = name
                     self.resolution_fallback = bool(rw and (rw, rh) != (width, height))
@@ -354,11 +392,11 @@ class CameraSource(VideoSource):
             ret, f = cap.read()
             if ret and f is not None:
                 frame = f
-                if float(f.std()) > 1.0:
+                if float(f.std()) > BLACK_FRAME_STD:
                     break
             else:
                 time.sleep(0.03)
-        if frame is None or float(frame.std()) <= 1.0:
+        if frame is None or float(frame.std()) <= BLACK_FRAME_STD:
             cap.release()
             return None
         return cap
@@ -390,7 +428,7 @@ class CameraSource(VideoSource):
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         for _ in range(3):
             ret, f = cap.read()
-            if ret and f is not None and float(f.std()) > 1.0:
+            if ret and f is not None and float(f.std()) > BLACK_FRAME_STD:
                 return cap
         cap.release()
         return None

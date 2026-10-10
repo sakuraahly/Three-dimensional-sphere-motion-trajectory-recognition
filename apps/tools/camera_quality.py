@@ -53,7 +53,7 @@ import numpy as np  # noqa: E402
 
 from _common import add_stereo_source_args  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
-from sphere_tracker.sources import CameraSource  # noqa: E402
+from sphere_tracker.sources import BLACK_FRAME_STD, CameraSource  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -123,7 +123,7 @@ def measure(index: int, *, seconds: float = 2.0, width: int = 1920,
             ok, frame, _t = src.read()
             if not ok or frame is None:
                 continue
-            if float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).std()) > 1.0:
+            if float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).std()) > BLACK_FRAME_STD:
                 got += 1
                 if got >= warmup:
                     break
