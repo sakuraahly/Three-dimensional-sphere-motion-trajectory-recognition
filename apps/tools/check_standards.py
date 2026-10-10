@@ -1,0 +1,278 @@
+"""规范落差自查：文档 / 代码 / 规范之间"说的"与"实际"是否一致。
+
+为什么需要它
+------------
+这个项目的头号反复问题是**漂移**：文档里写着一条规则或一个路径，
+实际却早就不成立了。而在此之前，**没有任何东西守着它** ——
+全靠某次审查时有人想起来去看一眼。已经抓到的实例：
+
+- `AGENTS.md` 五处引用 `STC/...`，其中一个脚本
+  （`STC\\scripts\\Check-Standards.ps1`）**在磁盘上根本不存在**；
+- `AGENTS.md` 声明"基于 STC v0.3"，而 `..\\STC\\` 里的标准版本对不上；
+- `用户手册.md` 承诺标定会存 `config/stereo_calibration.npz`，
+  而标定判定不通过时**按设计就不保存**，失败路径文档里没写。
+
+本工具把这些做成**可执行的三类检查**：
+
+| 类别 | 查什么 |
+| ---- | ------ |
+| **A 引用** | 文档里反引号引用的仓库路径是否存在（**区分「引用」与「谈及」**） |
+| **B 计数** | `AGENTS.md` §3/§7 的计数断言是否与磁盘一致（委托 `sync_facts.py`） |
+| **C 来源** | `AGENTS.md` 引用的规范文件（`STC/...`）是否真的存在 |
+
+分工（刻意如此，避免"同一个逻辑实现两遍"）
+----------------------------------------
+- **A 的权威实现在这里**；`tests/selftest_doc_facts.py` 改为调用本模块。
+- **B 委托给 `apps/tools/sync_facts.py`** —— 那是计数的权威实现，不在这里重写一遍。
+- `启动程序.bat standards` → 本模块。
+
+边界
+----
+本工具**只读**，不改任何文件（计划书 §5.1 定死的职能）。
+
+用法::
+
+    python apps/tools/check_standards.py
+    python apps/tools/check_standards.py --quiet     # 只出结论与失败项
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker").is_dir())
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# 放置规则里的顶层目录：只有落在这些下面的反引号路径才算"仓库路径引用"
+KNOWN_TOP = {"sphere_tracker", "calib", "stereo", "apps", "tests", "docs", "assets",
+             "config", "outputs", "models", "legacy", "STC"}
+PATH_RE = re.compile(
+    r"`([A-Za-z_][\w./\\-]*\.(?:py|md|json|npz|bat|txt|yml|ps1|pptx|jpg|png))"
+    r"(?::(\d+)(?:-(\d+))?)?`")
+
+# 本计划书引用的都是"将要新建"的文件（属计划，不算漂移）
+SELF_DOCS = {
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md",
+}
+
+# --------------------------------------------------------------------------
+# 失效引用的白名单。键 = "<文档相对路径>:<引用的原文>"，**刻意不带行号**
+#（行号随任何编辑漂移，用它做键会让白名单变成噪声源 —— 实测踩过，
+#  13 条白名单里 4 条一改文档就失配、工具开始误报）。
+# --------------------------------------------------------------------------
+KNOWN_MENTIONS: dict[str, str] = {
+    "AGENTS.md:_overflow_lib.py":
+        "在讲「它曾经叫这个名字、后来改名了」—— 历史说明，不是引用",
+    "docs/交接文档.md:apps/calibrate_camera.py":
+        "在「原来写的 / 实际」表格里指认旧路径不存在",
+    "docs/交接文档.md:rements.txt":
+        "引述 cmd 行同步错乱时的实际报错碎词，不是路径",
+    "docs/交接文档.md:_overflow_lib.py":
+        "记录改名前后（`_overflow_lib.py` -> `check_overflow.py`）",
+    "docs/开题报告_PPT逐页文稿.md:stereo/match.py":
+        "代码表里明写「**没有** `stereo/match.py`」，是在澄清旧文稿",
+    "docs/项目总纲.md:stereo/match.py":
+        "同上，指认规划中的路径从未落地",
+    "docs/开发指南.md:apps/calibrate_camera.py":
+        "在「原来写的 / 实际」表格里（表内提及）",
+    "README.md:video_edge_detect.py": "在「历史遗留脚本」说明表格里",
+    "README.md:test.py": "同上",
+    "docs/开题报告_研究思路四页文稿.md:calib/calibrate_stereo.py":
+        "在路径对照表里（旧路径 vs 实际路径）",
+    "docs/开题报告_研究思路四页文稿.md:stereo/match.py":
+        "同表的旧路径列（模块路径 -> 实际为 apps/...）",
+}
+
+# --------------------------------------------------------------------------
+# 已知**真漂移**：文档承诺了却没发生。单独列出并断言它们仍然存在 ——
+# 修好之后应当变空，而不是被悄悄从白名单里删掉。
+# --------------------------------------------------------------------------
+KNOWN_DRIFT: dict[str, str] = {
+    r"docs/用户手册.md:config\stereo_calibration.npz":
+        "标定失败时按设计不保存（见 selftest_calib_facts.py），"
+        "而用户手册只写了成功路径 —— 失败路径该看到什么、下一步做什么，文档里没有",
+    r"docs/用户手册.md:config\stereo_calibration.json": "同上",
+}
+
+# 指向**仓库外**（`..\STC\`，属用户的其他资产）：文件在磁盘上确实存在，
+# 只是不在本仓库内 —— 单独归类、如实计数。这是 `AGENTS.md` §6 规范第 3 层的边界。
+OUTSIDE_REPO_MARK = "STC"
+
+
+def doc_files() -> list[Path]:
+    return [ROOT / "AGENTS.md", ROOT / "README.md",
+            *sorted((ROOT / "docs").rglob("*.md"))]
+
+
+def _src_literals() -> set[str]:
+    """仓库里作为字符串字面量出现过的路径（运行时生成的，如 config/sphere_config.json）。
+
+    ⚠️ **必须排除 `outputs/`**（以及 `__pycache__` / `.git`）：
+    `outputs/` 是"删了能再生"的临时目录，里面全是调试脚本与探针。
+    第一版扫了它，结果**我自己写在 `outputs/` 里的一行调试代码，
+    就让检查器把那个假路径当成"合法运行时路径"放行了** —— 反向自证因此静默失效。
+    **临时产物不能当事实来源。**
+    """
+    out: set[str] = set()
+    for py in ROOT.rglob("*.py"):
+        parts = set(py.parts)
+        if parts & {".git", "__pycache__", "outputs", "legacy"}:
+            continue
+        for m in re.finditer(
+                r"""["']([^"'\n]{3,120}\.(?:py|md|json|npz|bat|txt|yml|ps1|pptx|jpg|png))["']""",
+                py.read_text(encoding="utf-8", errors="replace")):
+            out.add(m.group(1).replace("\\", "/").lstrip("./"))
+    return out
+
+
+def collect_stale_refs() -> dict[str, str]:
+    """扫全库文档，返回 {「文档:引用原文」: 「L行号: 该行」}。"""
+    literals = _src_literals()
+    found: dict[str, str] = {}
+    for doc in doc_files():
+        rel = doc.relative_to(ROOT).as_posix()
+        if rel in SELF_DOCS:
+            continue
+        for lineno, line in enumerate(
+                doc.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            for m in PATH_RE.finditer(line):
+                raw = m.group(1)
+                cand = raw.replace("\\", "/").lstrip("./")
+                parts = cand.split("/")
+                if len(parts) > 1 and parts[0] not in KNOWN_TOP:
+                    continue
+                if (ROOT / cand).exists() or cand in literals:
+                    continue
+                if len(parts) == 1:
+                    hits = [p for p in ROOT.rglob(parts[0])
+                            if p.is_file() and ".git" not in p.parts
+                            and "__pycache__" not in p.parts]
+                    if hits:
+                        continue
+                found[f"{rel}:{raw}"] = f"L{lineno}: {line.strip()[:100]}"
+    return found
+
+
+# --------------------------------------------------------------------------
+def check_refs(verbose: bool) -> list[str]:
+    """A 类：引用 vs 谈及。"""
+    print("----- A. 文档里的仓库路径引用 -----")
+    found = collect_stale_refs()
+    outside = {k: v for k, v in found.items() if OUTSIDE_REPO_MARK in k.split(":")[1]}
+    inside = {k: v for k, v in found.items() if k not in outside}
+    known = set(KNOWN_MENTIONS) | set(KNOWN_DRIFT)
+    unexpected = {k: v for k, v in inside.items() if k not in known}
+
+    print(f"  扫到 {len(found)} 处失效引用 = 仓库外 {len(outside)} + 仓库内 {len(inside)}")
+    if verbose:
+        for k in sorted(outside):
+            print(f"    [仓库外] {k}")
+    print(f"  仓库内 {len(inside)} 处：白名单（有意保留的历史信息）"
+          f"{len(KNOWN_MENTIONS)} 条、已知真漂移 {len(KNOWN_DRIFT)} 条")
+    for k in sorted(KNOWN_DRIFT):
+        print(f"    [真漂移，待修] {k}")
+
+    problems: list[str] = []
+    if unexpected:
+        problems.append(f"白名单之外出现 {len(unexpected)} 处新失效引用：")
+        for k, v in sorted(unexpected.items()):
+            problems.append(f"    · {k}\n        {v}")
+    vanished = [k for k in KNOWN_DRIFT if k not in found]
+    if vanished:
+        # 修好了是好消息，但必须**把白名单同步删掉**，否则它变成"永久豁免"
+        problems.append("已知真漂移里有条目已不再出现（修好了？）——"
+                        "请从 check_standards.py 的 KNOWN_DRIFT 里删掉，"
+                        "否则它会变成永久豁免：\n"
+                        + "\n".join(f"    · {k}" for k in vanished))
+    return problems
+
+
+def check_sources(verbose: bool) -> list[str]:
+    """C 类：`AGENTS.md` 引用的规范文件是否真的存在。"""
+    print("----- C. 规范来源是否存在 -----")
+    text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    stc_refs = sorted(set(re.findall(r"`(STC[/\\][^`]+)`", text)))
+    problems: list[str] = []
+    # `STC/` 在仓库外（`..\STC\`），所以按**父目录**去找
+    outside_root = ROOT.parent
+    for ref in stc_refs:
+        cand = outside_root / ref.replace("\\", "/")
+        ok = cand.exists()
+        print(f"  [{'存在' if ok else '**不存在**'}] {ref}"
+              f"   -> {cand.relative_to(outside_root.parent).as_posix()}")
+        if not ok:
+            problems.append(
+                f"AGENTS.md 引用了不存在的规范文件：`{ref}`\n"
+                f"        期望位置：{cand}\n"
+                f"        修法：删掉这处引用，或把 STC 补上（STC 在仓库外，属用户其他资产）")
+    if not stc_refs:
+        print("  （AGENTS.md 里没有 STC/ 引用）")
+    return problems
+
+
+def check_facts(verbose: bool) -> list[str]:
+    """B 类：计数与清单 —— **委托给权威实现**，不在这里重写一遍。"""
+    print("----- B. 派生事实（计数 / 清单） -----")
+    script = ROOT / "apps" / "tools" / "sync_facts.py"
+    if not script.exists():
+        return [f"找不到 {script.relative_to(ROOT).as_posix()} —— "
+                f"计数检查没有权威实现可委托"]
+    proc = subprocess.run([sys.executable, str(script), "--check"],
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", cwd=str(ROOT))
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if verbose or proc.returncode != 0:
+        for ln in out.splitlines():
+            print(f"    {ln}")
+    else:
+        for ln in out.splitlines():
+            if ln.startswith("✅") or "判定结果" in ln:
+                print(f"    {ln}")
+    if proc.returncode == 0:
+        return []
+    fails = [ln.strip() for ln in out.splitlines()
+             if ln.strip().startswith(("1)", "2)", "3)", "4)", "5)"))]
+    return ["派生事实检查未通过（详见上面 sync_facts.py 的输出）"
+            + ("：\n" + "\n".join(f"    {x}" for x in fails) if fails else "")]
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="规范落差自查（只读）")
+    ap.add_argument("--quiet", action="store_true", help="少打细节")
+    args = ap.parse_args(argv)
+    verbose = not args.quiet
+
+    print("=" * 78)
+    print("规范落差自查（文档 / 代码 / 规范 三者是否自洽）")
+    print("=" * 78)
+    print(f"仓库：{ROOT.name}")
+    print()
+
+    problems: list[str] = []
+    problems += check_refs(verbose)
+    print()
+    problems += check_sources(verbose)
+    print()
+    problems += check_facts(verbose)
+    print()
+
+    print("=" * 78)
+    if problems:
+        print(f"发现 {len(problems)} 类问题：")
+        for i, msg in enumerate(problems, 1):
+            print(f"  {i}) {msg}")
+        print()
+        print("判定结果：有不达标项")
+        return 1
+    print("三类检查全部通过：引用、来源、计数都与磁盘一致。")
+    print("判定结果：全部通过")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
