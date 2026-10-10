@@ -3,7 +3,13 @@
 用法::
 
     # 1) 两台实时相机（推荐：能实时看到收帧进度）
-    python apps/calibrate_stereo.py --left 0 --right 2 --cols 8 --rows 5 --square 25
+    #    用**角色名**最省心：绑定的是设备身份，插拔 USB 口也不受影响。
+    python apps/calibrate_stereo.py --left left --right right --cols 8 --rows 5 --square 25
+
+    #    要用编号也行，但**编号的含义随后端变化**：解析用的设备顺序是 PnP 枚举，
+    #    而 cv2 各后端的顺序不一样（本机实测 DSHOW 的 #1 是笔记本内置，
+    #    MSMF 的 #2 才是）。本程序默认固定 MSMF，所以这里给的是 MSMF 口径的编号。
+    #    不确定就先用角色名，或跑 python apps/tools/cameras.py list 看当前设备。
 
     # 2) 两段视频（指导文档里的流程：先分别录，再拿来标定）
     python apps/calibrate_stereo.py --left-video cam1.mp4 --right-video cam2.mp4 \
@@ -213,6 +219,16 @@ def main() -> int:
                     for x, y in pts:
                         cv2.circle(img, (int(x), int(y)), 2, (0, 255, 255), -1)
                 top = np.hstack([a, b])
+
+                # 在两半上各打一个 LEFT / RIGHT 标记（含指定的相机编号/角色名）。
+                # 为什么要标：这个窗口是用户**判断左右有没有接反**的唯一现场依据 ——
+                # 他会在某台摄像头前晃手，看哪一半跟着动。没有标记就只能靠猜
+                # "左半边到底是不是 left"。
+                for img, tag in ((a, f"LEFT  ({args.left})"), (b, f"RIGHT ({args.right})")):
+                    (tw, th), _base = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+                    cv2.rectangle(img, (0, 0), (tw + 16, th + 16), (0, 0, 0), -1)
+                    cv2.putText(img, tag, (8, th + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                                (0, 255, 0), 2, cv2.LINE_AA)
 
                 # 覆盖率图只在收帧数变化时重画（原来每帧都重建一次画布）
                 if collector.count != cov_cache_n:
