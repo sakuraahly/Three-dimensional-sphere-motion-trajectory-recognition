@@ -29,12 +29,15 @@ class KalmanFilter:
         order: int = 2,
         process_noise: float = 1.5e2,
         measurement_noise: float = 2.0,
+        max_q_scale: float = 64.0,
     ) -> None:
         self.order = int(order)
         self.dim = 4 if self.order == 1 else 6
         self.q_base = float(process_noise)
         self.q = self.q_base
-        self.q_max = self.q_base * 64.0
+        # 自适应过程噪声的上限倍数，来自 TrackerConfig.max_q_scale。
+        # 此前这里硬编码 64.0，导致改配置不生效（死配置）；默认值保持 64.0 以免改变行为。
+        self.q_max = self.q_base * float(max_q_scale)
         self.r = float(measurement_noise) ** 2
         self.x = np.zeros(self.dim, dtype=np.float64)
         self.P = np.eye(self.dim, dtype=np.float64) * 1e4
@@ -183,7 +186,8 @@ class Track:
     def __init__(self, track_id: int, cfg: TrackerConfig, t: float, det: Detection) -> None:
         self.id = track_id
         self.cfg = cfg
-        self.kf = KalmanFilter(cfg.order, cfg.process_noise, cfg.measurement_noise)
+        self.kf = KalmanFilter(cfg.order, cfg.process_noise, cfg.measurement_noise,
+                               max_q_scale=cfg.max_q_scale)
         self.kf.initialize(np.array([det.x, det.y], dtype=np.float64))
         self.t = t
         self.radius = float(det.radius)

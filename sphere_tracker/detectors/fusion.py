@@ -18,7 +18,7 @@ class FusionDetector(BaseDetector):
       1. 依次跑各个子检测器，各取最好的一个候选；
       2. 任意两个候选中心距离 < max(agree_px, agree_ratio * 半径)，算"同意"；
       3. 得票最高的候选胜出，每多一票加 0.12 分；
-      4. 只有一票且分数低于 vote_single_min 时判为不可信（返回空）。
+      4. 只有一票、且总分低于 `DetectorConfig.min_score` 时判为不可信（返回空）。
     这样既能用颜色拿精度、用霍夫拿鲁棒性，又能靠"多方一致"压掉误检。
     """
 
@@ -70,7 +70,9 @@ class FusionDetector(BaseDetector):
         scored.sort(key=lambda item: item[0], reverse=True)
 
         total, name, best = scored[0]
-        if votes[name] == 0 and total < 0.55:
+        # 阈值读 DetectorConfig.min_score，不再硬编码 0.55
+        # （此前硬编码导致改配置不生效：改 min_score 没有任何效果）
+        if votes[name] == 0 and total < self.cfg.min_score:
             return []  # 孤证且置信度不高 -> 宁可不报
         best = Detection(
             x=best.x, y=best.y, radius=best.radius, score=total,

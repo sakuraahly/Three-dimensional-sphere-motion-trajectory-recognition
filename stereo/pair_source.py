@@ -549,6 +549,28 @@ def from_args(args) -> PairSource:
         else:
             left_i = resolve_camera_arg(left_raw)
             right_i = resolve_camera_arg(right_raw)
+
+        # 左右必须落在**两台不同的相机**上。此前没有这道检查，于是
+        # "两个角色解析到同一个索引"会静默继续：标定窗口里两路其实是同一台相机，
+        # 用户要到一对有效图像都收不到时才发现，白白浪费一轮。
+        if left_i == right_i:
+            raise RuntimeError(
+                f"左右两路解析到了**同一个相机**（索引 #{left_i}）—— 标定无法进行。\n"
+                f"  常见原因：\n"
+                f"    1) 角色绑定的那台相机不在线（换过 USB 口 / 重插过），"
+                f"解析退化到了同一个索引；\n"
+                f"    2) 显式给了同一个索引（如 --left 0 --right 0）；\n"
+                f"    3) **后端枚举错位**：list_devices() 的 order 来自 PnP 枚举，"
+                f"而 cv2.VideoCapture(index) 用的是 OpenCV 各后端自己的枚举，"
+                f"两者不保证一致；DSHOW 与 MSMF 之间还会整体错位。\n"
+                f"  怎么办：\n"
+                f"    - python apps/tools/cameras.py check    看角色有没有漂移\n"
+                f"    - python apps/tools/cameras.py list     看当前设备与索引\n"
+                f"    - 明确给索引 + 固定同一个后端："
+                f"--left 0 --right 1 --backend dshow\n"
+                f"    - 开跑后先目视确认：两路必须是**同一场景的左右两个视角**。"
+            )
+
         return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,
                           backup_camera=getattr(args, "backup_camera", None),
