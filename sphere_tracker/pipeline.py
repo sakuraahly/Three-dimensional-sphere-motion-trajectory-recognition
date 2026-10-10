@@ -221,22 +221,25 @@ class SpherePipeline:
             img = frame.copy()
 
         if viz.trail_enabled and result.trail:
-            draw_trail(img, result.trail, fade=viz.trail_fade, thickness=max(1, int(2 * scale)))
+            draw_trail(img, result.trail, fade=viz.trail_fade,
+                       thickness=max(1, int(2 * scale)), scale=scale)
 
         if viz.show_circle and result.detection is not None:
             label = f"r={result.detection.radius:.1f}"
-            draw_detection(img, result.detection, color=(0, 255, 0), label=label, contour=True)
+            draw_detection(img, result.detection, color=(0, 255, 0), label=label,
+                           contour=True, scale=scale)
 
         if viz.show_prediction and result.prediction is not None and len(result.prediction) > 1:
-            pts = result.prediction * scale if abs(scale - 1.0) > 1e-6 else result.prediction
             tag = "pred 3D+g" if result.prediction_3d is not None else "pred 2D"
-            draw_prediction(img, pts, color=(0, 140, 255), label=tag, thickness=max(1, int(2 * scale)))
+            # 不在这里预乘 scale —— 交给 draw_prediction，让"画布缩放"只有一个负责处
+            draw_prediction(img, result.prediction, color=(0, 140, 255), label=tag,
+                            thickness=max(1, int(2 * scale)), scale=scale)
 
         if viz.show_mask and result.detection is not None and result.detection.mask is not None:
             paste_mask_preview(img, result.detection.mask, width=int(200 * scale))
 
         if viz.show_hud:
-            draw_hud(img, hud_lines(result, self.cfg))
+            draw_hud(img, hud_lines(result, self.cfg), scale=scale)
 
         if viz.show_axes_3d:
             hist = np.array([[p.x, p.y, p.z] for p in self.history3d if p.z is not None], dtype=np.float64)

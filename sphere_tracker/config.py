@@ -226,7 +226,7 @@ class VizConfig:
     show_hud: bool = True
     show_mask: bool = False            # 显示分割掩膜小窗
     show_axes_3d: bool = False         # 显示三维坐标轴/地面网格
-    scale: float = 1.0                 # 显示缩放（小窗口时用）
+    scale: float = 1.0                 # 显示缩放：整张图（含所有叠加）按此倍率放大
 
 
 @dataclass

@@ -27,8 +27,13 @@ def draw_trail(
     fade: bool = True,
     thickness: int = 2,
     base_color: tuple[int, int, int] = (0, 255, 255),
+    scale: float = 1.0,
 ) -> None:
-    """把历史轨迹画成折线。轨迹上每个点画一个小圆点，便于看出采样密度。"""
+    """把历史轨迹画成折线。轨迹上每个点画一个小圆点，便于看出采样密度。
+
+    `scale`：**画布相对原始帧的缩放倍率**。轨迹点存的是**原始帧坐标**，
+    画布被放大过就必须一起放大，否则会画到画面外（见 `viz.scale` 的语义说明）。
+    """
     n = len(trail)
     if n < 2:
         return
@@ -42,9 +47,12 @@ def draw_trail(
             th = max(1, thickness - 1)
         else:
             th = thickness
-        cv2.line(frame, (int(round(p0.x)), int(round(p0.y))), (int(round(p1.x)), int(round(p1.y))), color, th, cv2.LINE_AA)
+        cv2.line(frame, (int(round(p0.x * scale)), int(round(p0.y * scale))),
+                 (int(round(p1.x * scale)), int(round(p1.y * scale))),
+                 color, th, cv2.LINE_AA)
     for p in trail[:: max(1, n // 60)]:
-        cv2.circle(frame, (int(round(p.x)), int(round(p.y))), 1, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, (int(round(p.x * scale)), int(round(p.y * scale))),
+                   max(1, int(round(1 * scale))), (255, 255, 255), -1, cv2.LINE_AA)
 
 
 def draw_detection(
@@ -53,15 +61,26 @@ def draw_detection(
     color: tuple[int, int, int] = (0, 255, 0),
     label: str | None = None,
     contour: bool = True,
+    scale: float = 1.0,
 ) -> None:
-    """画检测到的圆 + 圆心 + 可选的真实轮廓。"""
-    cx, cy, r = int(round(det.x)), int(round(det.y)), int(round(det.radius))
-    cv2.circle(frame, (cx, cy), r, color, 2, cv2.LINE_AA)
-    cv2.drawMarker(frame, (cx, cy), color, cv2.MARKER_CROSS, 12, 1, cv2.LINE_AA)
+    """画检测到的圆 + 圆心 + 可选的真实轮廓。
+
+    `scale` 的语义同 `draw_trail` —— 检测坐标与轮廓都是**原始帧坐标**。
+    """
+    cx = int(round(det.x * scale))
+    cy = int(round(det.y * scale))
+    r = max(1, int(round(det.radius * scale)))
+    cv2.circle(frame, (cx, cy), r, color, max(1, int(round(2 * scale))), cv2.LINE_AA)
+    cv2.drawMarker(frame, (cx, cy), color, cv2.MARKER_CROSS,
+                   max(3, int(round(12 * scale))), max(1, int(round(1 * scale))), cv2.LINE_AA)
     if contour and det.contour is not None and len(det.contour) > 2:
-        cv2.drawContours(frame, [det.contour.astype(np.int32).reshape(-1, 1, 2)], -1, (255, 0, 255), 1, cv2.LINE_AA)
+        c = (det.contour.reshape(-1, 2).astype(np.float32) * scale).astype(np.int32)
+        cv2.drawContours(frame, [c.reshape(-1, 1, 2)], -1, (255, 0, 255),
+                         max(1, int(round(1 * scale))), cv2.LINE_AA)
     if label:
-        cv2.putText(frame, label, (cx + r + 6, cy - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, label, (cx + r + int(round(6 * scale)), cy - int(round(6 * scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * scale, color,
+                    max(1, int(round(1 * scale))), cv2.LINE_AA)
 
 
 def draw_prediction(
@@ -72,8 +91,14 @@ def draw_prediction(
     thickness: int = 2,
     label: str | None = None,
     dots: int = 10,
+    scale: float = 1.0,
 ) -> None:
-    """把预测轨迹画成虚线（和实线的历史轨迹区分开）。"""
+    """把预测轨迹画成虚线（和实线的历史轨迹区分开）。
+
+    `scale` 的语义同 `draw_trail`。**注意**：这里的 `points` 由调用方决定是否
+    已经乘过 scale —— 为了统一，`render()` 现在**不预乘**，把 scale 交给本函数，
+    这样"画布缩放"这件事只有一个地方负责。
+    """
     if points is None or len(points) < 2:
         return
     n = len(points)
@@ -84,35 +109,48 @@ def draw_prediction(
         p1 = points[i]
         cv2.line(
             frame,
-            (int(round(p0[0])), int(round(p0[1]))),
-            (int(round(p1[0])), int(round(p1[1]))),
+            (int(round(p0[0] * scale)), int(round(p0[1] * scale))),
+            (int(round(p1[0] * scale)), int(round(p1[1] * scale))),
             color, thickness, cv2.LINE_AA,
         )
     step = max(1, n // max(1, dots))
     for p in points[::step]:
-        cv2.circle(frame, (int(round(p[0])), int(round(p[1]))), 3, color, 1, cv2.LINE_AA)
+        cv2.circle(frame, (int(round(p[0] * scale)), int(round(p[1] * scale))),
+                   max(1, int(round(3 * scale))), color,
+                   max(1, int(round(1 * scale))), cv2.LINE_AA)
     if label:
         last = points[-1]
-        cv2.putText(frame, label, (int(last[0]) + 8, int(last[1]) + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        cv2.putText(frame, label,
+                    (int(round(last[0] * scale)) + int(round(8 * scale)),
+                     int(round(last[1] * scale)) + int(round(4 * scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * scale, color,
+                    max(1, int(round(1 * scale))), cv2.LINE_AA)
 
 
-def draw_hud(frame: np.ndarray, lines: list[str], origin: tuple[int, int] = (10, 10)) -> None:
-    """左上角半透明信息面板。"""
+def draw_hud(frame: np.ndarray, lines: list[str], origin: tuple[int, int] = (10, 10),
+             scale: float = 1.0) -> None:
+    """左上角半透明信息面板。
+
+    `scale` 的语义同 `draw_trail`：面板位置、字号、行高一起按倍率走
+    —— 这样 `viz.scale=2` 出来的图就是"整张原图的 2 倍"，**所有元素都成比例**。
+    """
     if not lines:
         return
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale, thick, pad, lh = 0.52, 1, 8, 20
-    widths = [cv2.getTextSize(t, font, scale, thick)[0][0] for t in lines]
+    fscale, thick = 0.52 * scale, max(1, int(round(1 * scale)))
+    pad = int(round(8 * scale))
+    lh = int(round(20 * scale))
+    widths = [cv2.getTextSize(t, font, fscale, thick)[0][0] for t in lines]
     w = max(widths) + 2 * pad
     h = lh * len(lines) + pad
-    x, y = origin
+    x, y = int(round(origin[0] * scale)), int(round(origin[1] * scale))
     x2, y2 = min(x + w, frame.shape[1]), min(y + h, frame.shape[0])
     overlay = frame.copy()
     cv2.rectangle(overlay, (x, y), (x2, y2), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
     for i, text in enumerate(lines):
-        cv2.putText(frame, text, (x + pad, y + pad + lh * (i + 1) - 6), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+        cv2.putText(frame, text, (x + pad, y + pad + lh * (i + 1) - int(round(6 * scale))),
+                    font, fscale, (255, 255, 255), thick, cv2.LINE_AA)
 
 
 def paste_mask_preview(
