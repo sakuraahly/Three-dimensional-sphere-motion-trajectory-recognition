@@ -4,26 +4,10 @@
 > 它是本项目的**唯一权威**：目录、命名、放置、依赖方向、提交、质量底线都只在这里定义。
 > 其他文档只提供**细节**；与本文冲突时**以本文为准，并顺手把冲突的那份改掉**。
 >
-> **基于 STC（2026-10-10）生成。**
-> ⚠️ **原话曾写"基于 STC v0.3"，并说 STC 里的 Check-Standards.ps1 靠这一行判断
-> 本项目是否落后于当前标准 —— 两处都不成立**（2026-10-10 核对）：
-> - 那个脚本**在磁盘上不存在**。STC 的当前分支**刻意不带检查器**
->   （它自己的 `AGENTS.md` 写着"不做检查器 / 不校验 / 不追踪版本落差"，
->   完整版在 `master` 分支的 `v0.10-full` 标签上）；
-> - 版本号也与磁盘上的标准对不上（提到的是 `v0.9` / `v0.10`）。
->
-> （上面刻意**不把它写成反引号路径** —— 本文里反引号代表"真实存在的引用"，
-> 而 `apps/tools/check_standards.py` 会把每一个反引号路径拿去核对存在性。）
->
-> **所以落差检测改由本项目自己承担**（项目内自足，不依赖仓库外的资产）：
->
-> ```powershell
-> 启动程序.bat standards      :: apps\tools\check_standards.py
-> ```
->
-> 它查三类：文档里的路径引用是否存在、引用的规范来源是否存在、
-> 计数与清单是否与磁盘一致。`STC/standards/` 仍然**是**通用规范的来源，
-> 只是它不再（也无法）替本项目做自查。
+> **基于 STC 生成（2026-10-10）。**
+> STC 的当前分支**不带检查器**，所以落差检测由本项目自己做：
+> `启动程序.bat standards` → `apps/tools/check_standards.py`（引用 / 来源 / 计数 三类）。
+> 经过与原因见 `docs/交接文档.md` §12。
 
 ---
 
@@ -78,7 +62,8 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 | `verify` | 标定复检 |
 | `run` | 实时检测 |
 | `diag` | 相机画质 / 链路诊断 |
-| `test` | 回归测试 |
+| `test [full]` | 回归测试（默认 fast 档；`test full` 跑全套） |
+| `standards` | 规范落差自查（引用 / 来源 / 计数） |
 
 **Python 必须用绝对路径**：`%USERPROFILE%\miniforge3\envs\myenv\python.exe`。
 裸 `python` 会解析到 msys64 那个没装 opencv 的解释器 —— 但 `启动程序.bat` 已经
@@ -118,10 +103,8 @@ assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
 | **文档与事实**（2） | `sync_facts.py` `check_standards.py` | 校验派生事实（计数 / 清单）与规范落差（引用 / 来源）；`启动程序.bat standards` 调用后者 |
 
-> 第三组是 2026-10-10 新增的。它**必须在这里登记**：`sync_facts.py` 自己会检查
-> "`apps/tools/` 里有没有文件没被本表归类" —— 它第一次跑就把自己报了出来；
-> 加进 `check_standards.py` 时，`启动程序.bat standards` 又当场报了第二次。
-> **这条检查确实在干活。**
+> 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
+> （`sync_facts.py` 会检查这一条）。
 
 > **为什么不拆成 `apps/tools/ppt/`**：这 8 个文件的路径在 7 份文档里被引用
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
@@ -218,9 +201,13 @@ apps / tests                        （只调用，不被调用）
 ## 7. 质量底线：16 个回归测试
 
 ```powershell
-启动程序.bat test                                  # 最快的一个（环境自测）
-# 全套（改代码后必跑）：逐条 & $PY tests\selftest_*.py
+启动程序.bat test              # fast 档：跳过两个慢测试，十几秒~1 分钟
+启动程序.bat test full         # 全套 16 个（改代码后必跑，约 6 分钟）
+启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
+
+分层依据是**实测耗时**（`outputs/test_results/timings.json` 的中位数），不是写死的名单；
+细节见 `apps/run_tests.py` 的文档串。
 
 | 测试 | 守什么 |
 | ---- | ------ |
@@ -236,7 +223,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_config_wiring.py` | 配置接线（每个配置项都必须真的被读） |
 | `selftest_board_corner_order.py` | SB/经典检测器的角点顺序（= `rot180`）+ 标定守卫该盯物理量而非 RMS |
 | `selftest_calib_facts.py` | 真机标定日志口径（拒收分布 / 基线 199.67 mm）+ 不可用不得保存 |
-| `selftest_doc_facts.py` | 文档事实（测试清单与数量 / 本文的计数断言 / 引用漂移） |
+| `selftest_doc_facts.py` | 测试清单与登记不退化；并跑一遍 `check_standards.py`（引用 / 来源 / 计数） |
 | `selftest_health_stats.py` | 运行健康度指标：采集 / 主循环 / 检测三个帧率分得开，`dropped` / `frame_age_ms` 语义 |
 | `selftest_calib_provenance.py` | 角点出身：检测器可辨识 + 回退必须显式 + 一对之内禁止混用（两道守卫） |
 | `selftest_entrypoints.py` | 三个启动入口（`.bat` / 图形 / 命令行）都调**同一个**测试运行器与规范检查器 |

@@ -59,7 +59,6 @@ PATH_RE = re.compile(
 SELF_DOCS = {
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md",
 }
-
 # --------------------------------------------------------------------------
 # 失效引用的白名单。键 = "<文档相对路径>:<引用的原文>"，**刻意不带行号**
 #（行号随任何编辑漂移，用它做键会让白名单变成噪声源 —— 实测踩过，
@@ -80,6 +79,8 @@ KNOWN_MENTIONS: dict[str, str] = {
         "同上，指认规划中的路径从未落地",
     "docs/开发指南.md:apps/calibrate_camera.py":
         "在「原来写的 / 实际」表格里（表内提及）",
+    "docs/交接文档.md:session.json":
+        "§12.6 在讲**计划中**的会话目录字段（P0-4 还没做），不是已存在的文件",
     "README.md:video_edge_detect.py": "在「历史遗留脚本」说明表格里",
     "README.md:test.py": "同上",
     "docs/开题报告_研究思路四页文稿.md:calib/calibrate_stereo.py":
