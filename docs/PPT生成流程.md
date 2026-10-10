@@ -113,7 +113,7 @@ PNG 落在 `outputs/final_preview/`。这是**近似**渲染（python-pptx + PIL
 粗略查"有没有文字顶到页面底边"：
 
 ```powershell
-& $PY apps\tools\_overflow_lib.py outputs\开题报告_最终.pptx
+& $PY apps\tools\check_overflow.py outputs\开题报告_最终.pptx
 ```
 
 ### 3.5 交付
@@ -199,7 +199,7 @@ PPT 在 PowerPoint / WPS 里打开时，同目录会有 `~$开题报告.pptx`。
 | `check_opening_report.py` | **主**：上面那份的合规自检 |
 | `preview_pptx.py` | 任意 pptx 渲染成 PNG（排版检查） |
 | `_preview_lib.py` | 上者的渲染实现（含连接线 off/ext + flip 处理） |
-| `_overflow_lib.py` | 底部溢出扫描 |
+| `check_overflow.py` | 底部溢出扫描 |
 | `build_opening_ppt.py` | 早期：只生成四页 |
 | `check_opening_ppt.py` | 早期：四页的几何自检 |
 | `preview_opening_ppt.py` | 早期：四页的预览 |

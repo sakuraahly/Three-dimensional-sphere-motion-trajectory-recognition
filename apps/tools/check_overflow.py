@@ -1,5 +1,17 @@
-"""底部溢出扫描（较保守的 1.45 系数，宁可报多不放过）。"""
+"""底部溢出扫描（较保守的 1.45 系数，宁可报多不放过）。
+
+用法::
+
+    python apps/tools/check_overflow.py outputs/开题报告_最终.pptx
+
+> 名字里的 `check_` 是有意的：本文件**不是库** —— 它 import 时就执行、直接读
+> `sys.argv`。以前叫 `_overflow_lib.py`（`_lib` 前缀按约定表示"只被 import 的
+> 私有模块"），名字与实质相反，维护时得先查一遍它到底是不是死代码。
+> 命名约定见根目录 `agent.md` §4。
+"""
 import sys
+from pathlib import Path
+
 from pptx import Presentation
 from pptx.util import Emu
 from PIL import ImageFont
@@ -34,7 +46,17 @@ def nl(t, pt, w):
 
 
 P = sys.argv[1] if len(sys.argv) > 1 else "outputs/开题报告_最终.pptx"
-prs = Presentation(P)
+if not Path(P).exists():
+    print(f"[错误] 找不到文件：{P}")
+    print("       用法：python apps/tools/check_overflow.py <你的开题报告.pptx>")
+    print("       开题报告本身不在本仓库里（在你的课程目录），所以必须显式给路径。")
+    raise SystemExit(2)
+try:
+    prs = Presentation(P)
+except Exception as exc:                                  # noqa: BLE001
+    print(f"[错误] 打不开这个 pptx：{type(exc).__name__}: {exc}")
+    print("       确认它是 .pptx（不是 .ppt），并且没有被 PowerPoint 占用。")
+    raise SystemExit(2)
 bad = 0
 for i in range(1, len(prs.slides._sldIdLst) + 1):
     for sh in prs.slides[i - 1].shapes:

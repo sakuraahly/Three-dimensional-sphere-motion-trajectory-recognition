@@ -449,23 +449,18 @@ pt = rec.update(t, left=det_left, right_dets=dets_right)    # left 是【单个�
 **坑**：① `update()` 的 `left` 是**单个 Detection 或 `None`**，`right_dets` 才是列表；返回 `None` 的三种原因分别计入 `n_no_left`/`n_no_right`/`n_rejected`（`summary()` 会报出来）。
 ② `match_epipolar` 选的是极线偏差 `dy` **最小**的候选（`cost = dy`），不是"最像球"的那个；`require_radius_ratio=False` 时不比较左右半径（同型号相机才该开）；`triangulate_one` 的 `epipolar_px` 默认 `nan`（想要值就传 `match_epipolar` 的第二个返回值）。
 ③ `as_array()` 无配对点时返回 `(0,4)` 零数组 —— 形状和内容都要判。
-## 14. 依赖方向（与 `文件结构.md` 一致，这里补上 `camera_registry`）
-```
-config / types / geometry        （最底层，不依赖任何本项目模块）
-    ↑
-detectors/  camera_motion/       （检测与运动估计）
-    ↑
-track / predict / sources / viz / camera_registry
-    ↑
-pipeline                         （编排；不碰 sources，取帧交给调用方）
-    ↑
-calib  →  stereo                 （双目：依赖库，但不被库依赖）
-    ↑
-apps / tests                     （只调用，不被调用）
-```
-**为什么 `camera_registry` 和 `sources` 同层**：它只**惰性** import 一次 `sources`（`camera_registry.py:397` 的 `from .sources import CameraSource`，在 `_default_opener` 内部），其余只用标准库（`json`/`re`/`subprocess`/`sys`/`pathlib`）—— 不探测相机时连 cv2 都不需要；它既不依赖也不被 `pipeline` 依赖。`stereo/` 则在模块顶层同时 import `sphere_tracker.camera_registry`、`sphere_tracker.sources`、`sphere_tracker.types`，方向仍然向上。
+## 14. 依赖方向
 
-> 反向依赖（比如 `geometry.py` 去 import `pipeline`）会立刻把项目变成一团乱麻；放置规则见 `文件结构.md`。
+> **图与规则在根目录 `agent.md` §5（唯一权威），这里不复制。**
+> 只补一条 API 视角的说明 —— **为什么 `camera_registry` 和 `sources` 同层**：
+> 它只**惰性** import 一次 `sources`（`camera_registry.py:397` 的
+> `from .sources import CameraSource`，在 `_default_opener` 内部），
+> 其余只用标准库（`json`/`re`/`subprocess`/`sys`/`pathlib`）——
+> 不探测相机时连 cv2 都不需要；它既不依赖也不被 `pipeline` 依赖。
+> `stereo/` 则在模块顶层同时 import `sphere_tracker.camera_registry`、
+> `sphere_tracker.sources`、`sphere_tracker.types`，方向仍然向上。
+>
+> 反向依赖（比如 `geometry.py` 去 import `pipeline`）会立刻把项目变成一团乱麻。
 ## 15. 核对记录与本文边界
 **已用 `inspect.signature` 复核的 36 个签名**：`geometry` 的 `refine_circle_subpixel`/`fit_circle_robust`/`circle_radial_gradient_stats`/`CameraModel.__init__`/`estimate_focal_from_known_ball`；`camera_motion` 的 `GlobalMotionEstimator.__init__`/`.estimate`/`warp_to_current`；`detectors.base._score_candidate`；`track` 的 `KalmanFilter.__init__`/`Track.__init__`；`predict` 的 `predict_quadratic`/`TrajectoryPredictor.predict`；`sources` 的 `CameraSource.__init__`/`open_source`/`LatestFrameCamera.latest`；`viz` 的 `draw_prediction`/`draw_3d_panel`/`hud_lines`；`pipeline` 的 `SpherePipeline.process`/`.render`；`calib` 的 `detect_board`/`detect_board_in_roi`/`pose_distance`/`AutoPairCollector.offer`/`calibrate_stereo`/`StereoRig.rectify_maps`/`StereoRig.triangulate`；`stereo` 的 `find_offset`/`brightness_series`/`match_epipolar`/`triangulate_one`/`StereoReconstructor.update`/`PairSource.__init__`/`from_args`/`resolve_backend`。
 
