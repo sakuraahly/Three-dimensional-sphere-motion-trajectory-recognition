@@ -109,7 +109,24 @@ def _finish(obs: BoardObservation, corners: np.ndarray, gray: np.ndarray,
     h, w = gray.shape[:2]
 
     obj_xy = spec.object_points()[:, :2].astype(np.float32)
-    obj_xy = obj_xy / np.array([spec.cols - 1, spec.rows - 1], dtype=np.float32)
+    # 归一化到**真正的单位正方形**：减最小值、除以跨度。
+    #
+    # 原来写的是 `obj_xy / np.array([cols - 1, rows - 1])`，那是错的：
+    # `object_points()` 返回的已经是米制坐标（本机标定板 0..0.175 × 0..0.1），
+    # 除以 (7, 4) 之后只剩 0..0.025；而目标点是像素坐标（600..900）。
+    # 源点与目标点差 4~5 个数量级，DLT 严重病态 —— 角点 0.07 px 的检测噪声
+    # 被放大成 14~86 px 的单应跳变。
+    #
+    # 后果有两个，都在真机上踩到了：
+    #   1. `pose_distance()` 量到的其实是数值噪声：板明明静止，
+    #      "停稳"门限（默认 3 px）却永远过不去 —— 实测 419 次误拒。
+    #   2. `quad()` 用同一个单应画棋盘轮廓，会飞出画面几千像素
+    #      （预览窗口里那条横贯画面的橙线）。
+    #
+    # 修好后 pose_distance 与角点位移几乎相等（实测 0.02~0.44 px），与门限量级一致。
+    obj_min = obj_xy.min(axis=0)
+    obj_span = obj_xy.max(axis=0) - obj_min
+    obj_xy = (obj_xy - obj_min) / obj_span
     H, _ = cv2.findHomography(obj_xy, obs.corners.reshape(-1, 2), 0)
     obs.homography = H
 
