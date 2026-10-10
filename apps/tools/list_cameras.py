@@ -7,10 +7,15 @@
 
     python apps/tools/cameras.py list          # 更推荐：列出设备身份/端口（不开相机）
 
-它会逐个打开 DirectShow 索引 0..N，报告实际拿到的分辨率与实测帧率，
+它会逐个打开索引 0..N，报告实际拿到的分辨率与实测帧率，
 并检查画面是不是"全黑常量流"（真实传感器一定有噪声，
 整帧标准差恰好为 0 说明这条流是假的 —— 红外摄像头、隐私挡板、
 或者不支持的分辨率都会这样）。
+
+**后端固定 MSMF**，不跟随 auto：索引的含义随后端变化（实测 DSHOW #1 是笔记本内置，
+MSMF 的枚举才与 Windows 设备枚举一致）。上面那份"设备名"按注册表顺序猜，
+只在 MSMF 口径下才对得上 —— 完整实测对照见 `sphere_tracker/sources.py` 的
+``INDEX_BACKEND`` 注释。
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sphere_tracker.sources import CameraSource
+from sphere_tracker.sources import INDEX_BACKEND, CameraSource
 
 
 def device_names_in_order() -> list[str]:
@@ -94,7 +99,8 @@ def main() -> int:
     usable: list[int] = []
     for idx in range(args.max_index + 1):
         try:
-            src = CameraSource(index=idx, width=args.width, height=args.height, fps=args.fps)
+            src = CameraSource(index=idx, width=args.width, height=args.height, fps=args.fps,
+                               backend=INDEX_BACKEND)
         except RuntimeError:
             print(f"{idx:<5}{'-':<12}{'-':<10}{'-':>8}{'-':>9}  打不开（无此设备或已被占用）")
             continue

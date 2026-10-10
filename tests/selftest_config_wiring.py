@@ -230,6 +230,62 @@ def test_wiring_is_functional() -> bool:
     return all(p for _n, p in checks)
 
 
+def test_camera_index_backend_is_explicit() -> bool:
+    """用编号开相机的地方，必须**显式**给出后端。
+
+    这条规则是被同一个 bug 咬了两次之后加的：
+
+        `list_devices()` 的编号来自 Windows PnP 枚举，而
+        `cv2.VideoCapture(index, backend)` 用的是各后端自己的枚举 —— 两者不同。
+        本机实测 PnP 是 [aoni, aoni, 内置, 内置红外]，DSHOW 却是
+        [aoni, 内置, aoni, -]。于是"用编号 1 开相机"在 DSHOW 下开到的是**内置**。
+
+    实际踩到的两次：
+      1. 双目标定把 `right` 开成了笔记本内置（画面全黑，看起来像相机坏了）；
+      2. `cameras.py identify` 里用户看着 A 的画面按 r，配置却记到了 B 上 ——
+         因为预览用 auto 后端、标签用 PnP 名字，两者不是同一台。
+
+    所以：`CameraSource(index=...)` 必须带 `backend=`；
+    只有把 backend 透传下去的工厂（形如 `**kwargs`）可以豁免 —— 它自己没有决策权。
+
+    这是**静态检查**，不开相机、不需要硬件，所以能进无人值守的回归。
+    """
+    print("[检查] CameraSource(index=...) 是否显式指定后端")
+    print("       （编号跨后端不通用，不指定就会开到另一台相机）")
+
+    bad: list[str] = []
+    ok_count = 0
+    for path, text in _repo_sources():
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "CameraSource"):
+                continue
+            kw = {k.arg for k in node.keywords}
+            if None in kw:          # **kwargs：后端由调用方决定，工厂本身不决策
+                continue
+            if "index" not in kw:   # 走默认 index=0，不属于"编号跨枚举"的场景
+                continue
+            if "backend" in kw:
+                ok_count += 1
+                continue
+            rel = path.relative_to(ROOT)
+            bad.append(f"{rel}:{node.lineno}")
+
+    if bad:
+        print("  [不达标] 以下调用用编号开相机却没给后端：")
+        for b in bad:
+            print(f"           {b}")
+        print("           应传 backend=sphere_tracker.sources.INDEX_BACKEND"
+              "（或明确的 cv2.CAP_*）")
+    else:
+        print(f"  [通过] {ok_count} 处用编号开相机的地方都显式给了后端")
+    return not bad
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -240,7 +296,9 @@ def main() -> int:
     print()
     c = test_wiring_is_functional()
     print()
-    ok = a and b and c
+    d = test_camera_index_backend_is_explicit()
+    print()
+    ok = a and b and c and d
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 

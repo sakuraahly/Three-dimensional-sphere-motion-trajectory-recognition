@@ -590,8 +590,12 @@ def from_args(args) -> PairSource:
         backend_arg = getattr(args, "backend", None)
         api = resolve_backend(backend_arg)
         if api is None:
-            api = resolve_backend("msmf")
-            print("[后端] 未指定 --backend，相机源默认用 MSMF"
+            # 默认后端取自 sources.INDEX_BACKEND —— 全项目只此一份答案，
+            # 免得这里写 MSMF、别处写 DSHOW 又漂移成两种行为。
+            from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME
+
+            api = INDEX_BACKEND
+            print(f"[后端] 未指定 --backend，相机源默认用 {INDEX_BACKEND_NAME}"
                   "（序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致）")
         return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,

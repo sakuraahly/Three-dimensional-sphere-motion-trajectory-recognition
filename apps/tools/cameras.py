@@ -119,7 +119,14 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。"""
     label = f"#{index}  {entry.name or '(无名字)'}  端口 {entry.port or '-'}"
     try:
-        src = CameraSource(index=index, width=640, height=480)
+        # **必须固定 MSMF**：`entry` 是按 PnP 枚举行的名字，而 `index` 交给 cv2 之后
+        # 走的是**后端自己的枚举**。DSHOW 的枚举与 PnP 错位（实测 DSHOW #1 是笔记本
+        # 内置、#2 才是外接），于是会出现"画面是 A、标签写着 B"——
+        # 人看着 A 的画面按 r，配置却记到了 B 上。MSMF 的枚举与 PnP 一致，标签才是真的。
+        # 见 sphere_tracker/sources.py 的 INDEX_BACKEND 注释（那里有完整实测表）。
+        from sphere_tracker.sources import INDEX_BACKEND
+
+        src = CameraSource(index=index, width=640, height=480, backend=INDEX_BACKEND)
     except RuntimeError as exc:
         print(f"  #{index} 打不开：{_first_line(exc)}")
         return None

@@ -411,9 +411,14 @@ def list_devices() -> list[DeviceEntry]:
 # 探测与自动选择
 # --------------------------------------------------------------------------- #
 def _default_opener(index: int, width: int, height: int, fps: int):
-    from .sources import CameraSource  # 惰性导入：不探测就用不到 cv2
+    from .sources import INDEX_BACKEND, CameraSource  # 惰性导入：不探测就用不到 cv2
 
-    return CameraSource(index=index, width=width, height=height, fps=fps, optimize=False)
+    # **必须固定后端**：传进来的 index 是 PnP 枚举的位次（`DeviceEntry.order`），
+    # 而 cv2 各后端有自己的枚举顺序 —— 用 auto 会读到"另一台相机"的属性，
+    # 于是自动挑相机、画质会诊、identify 全都在评错对象。
+    # 完整实测对照见 sources.py 的 INDEX_BACKEND 注释。
+    return CameraSource(index=index, width=width, height=height, fps=fps,
+                        backend=INDEX_BACKEND, optimize=False)
 
 
 def probe_index(
@@ -671,7 +676,19 @@ def set_role(
     index: int | None = None,
     verified: bool = False,
 ) -> RoleSpec:
-    """把一个角色固定到某台设备（`cameras.py pin/identify` 共用）。"""
+    """把一个角色固定到某台设备（`cameras.py pin/identify` 共用）。
+
+    这里**自己**维护"角色与「无关」互斥"这条不变量，不指望调用方：
+
+    原来注释写的是"反过来 `set_role()` 之后旧的无关联记录也要清（由调用方
+    `cameras.py` 负责）"。真机上就漏了 —— 配置里出现同一台设备
+    **既是 `main` 又在「无关」清单**，而两处代码各自看都"没错"：
+    调用方以为自己调了 `unmark_ignored`，而它按 identity 匹配，
+    遇到没有身份的旧记录就匹配不上，于是那条记录活了下来。
+
+    **不变量要留在拥有数据的模块里。** 这里按 identity/port/编号三种口径
+    都清一遍，任何调用顺序都不会留下矛盾状态。
+    """
     spec = RoleSpec(
         identity=entry.identity if entry else "",
         port=entry.port if entry else "",
@@ -680,6 +697,13 @@ def set_role(
         verified=verified,
     )
     reg.roles[str(role)] = spec
+
+    # 同一台设备不能同时是角色和「无关」——三种口径都清，避免哪种匹配不上就漏。
+    dropped = 0
+    if entry is not None:
+        dropped = unmark_ignored(reg, entry=entry)
+    if dropped == 0 and spec.index is not None:
+        dropped = unmark_ignored(reg, index=spec.index)
     return spec
 
 

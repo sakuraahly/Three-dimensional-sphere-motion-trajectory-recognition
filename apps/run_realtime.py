@@ -43,7 +43,7 @@ from sphere_tracker import camera_registry as cr
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detect import build_detector
 from sphere_tracker.pipeline import SpherePipeline
-from sphere_tracker.sources import CameraSource
+from sphere_tracker.sources import INDEX_BACKEND, CameraSource
 
 WINDOW = "sphere tracker (real-time)"
 METHOD_CYCLE = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]
@@ -137,8 +137,12 @@ def main() -> int:
         print(f"[自动选择] 使用摄像头 #{index}")
 
     try:
+        # 固定 MSMF：上面的 index 可能来自 select_cameras()（PnP 位次）或角色解析，
+        # 两者都按 PnP 枚举编号；用 auto 后端会让编号指向另一台相机。
+        # 见 sphere_tracker/sources.py 的 INDEX_BACKEND 注释。
         src = CameraSource(
-            index=index, width=args.width, height=args.height, fps=args.fps
+            index=index, width=args.width, height=args.height, fps=args.fps,
+            backend=INDEX_BACKEND,
         )
     except RuntimeError as exc:
         print(f"[错误] {exc}")

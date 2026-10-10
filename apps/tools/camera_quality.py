@@ -181,9 +181,19 @@ def measure(index: int, *, seconds: float = 2.0, width: int = 1920,
 
 
 def _backend_const(name: str | None):
-    """把 CLI 的后端名翻成 cv2 常量；auto/None 交给 CameraSource 自己挑。"""
+    """把 CLI 的后端名翻成 cv2 常量。
+
+    ``auto`` / 没给 = **MSMF**，不是"交给 CameraSource 自己挑"。
+
+    为什么不能 auto：本工具用 `list_devices()` 的 PnP 位次当编号，还把这个位次对应的
+    **设备名字**打在报告里。若用 auto 挑到 DSHOW，编号就指向另一台相机 ——
+    报告会写着"内置相机 清晰度 812"，而那其实是外接相机的数据。
+    完整实测对照见 sphere_tracker/sources.py 的 INDEX_BACKEND 注释。
+    """
     if not name or name == "auto":
-        return None
+        from sphere_tracker.sources import INDEX_BACKEND
+
+        return INDEX_BACKEND
     table = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
     return table.get(name.lower())
 
