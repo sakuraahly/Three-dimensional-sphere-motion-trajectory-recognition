@@ -55,9 +55,14 @@ PATH_RE = re.compile(
     r"`([A-Za-z_][\w./\\-]*\.(?:py|md|json|npz|bat|txt|yml|ps1|pptx|jpg|png))"
     r"(?::(\d+)(?:-(\d+))?)?`")
 
-# 本计划书引用的都是"将要新建"的文件（属计划，不算漂移）
-SELF_DOCS = {
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md",
+# 计划书里指向"将要新建"的文件是正常的，但**不能整份豁免** ——
+# 第一版把计划书整个放进 `SELF_DOCS`，结果它自己那 9 处指向"已被删掉的临时探针"
+# 的引用**一声不响地过去了**（临时探针提升为常驻测试后就删了）。
+# 教训：**豁免范围要按"具体引用"给，不能按"整份文档"给。**
+SELF_DOC_NOTES = {
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md": (
+        "计划书会引用「将要新建」的文件（`sphere_tracker/frames.py` 等），"
+        "那是计划本身，不是漂移"),
 }
 # --------------------------------------------------------------------------
 # 失效引用的白名单。键 = "<文档相对路径>:<引用的原文>"，**刻意不带行号**
@@ -81,6 +86,32 @@ KNOWN_MENTIONS: dict[str, str] = {
         "在「原来写的 / 实际」表格里（表内提及）",
     "docs/交接文档.md:session.json":
         "§12.6 在讲**计划中**的会话目录字段（P0-4 还没做），不是已存在的文件",
+    # ---- 计划书：**按具体引用豁免，不整份放过** ----
+    # 第一版把计划书整个放进 `SELF_DOCS`，结果它自己 10 处失效引用
+    # （含指向"已被删掉的临时探针"的）**一声不响地过去了**。
+    # 教训：豁免范围要按"具体引用"给，不能按"整份文档"给。
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:sphere_tracker/frames.py":
+        "P0-1 **计划新建**的模块（时间层），尚未实现",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:frames.py":
+        "同上，§9 执行记录里的简写",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo/sessions.py":
+        "P0-4 **计划新建**的模块（会话读写），尚未实现",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:sessions.py":
+        "同上，§5.1 职能表里的简写",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:session.json":
+        "P0-4 计划中的会话元数据文件名",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:apps/tools/zzz_tmp.py":
+        "§9.5 反向自证的**注入示例**，举例说明用的假文件名",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:New-Project.ps1":
+        "§2.1 在陈述「`STC/scripts/` 里只有 New-Project.ps1」——是在讲仓库外有什么",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:STC\\scripts\\Check-Standards.ps1":
+        "§2.1 在陈述**这个脚本不存在**（这是那条发现的结论本身）",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:config/stereo_calibration.npz":
+        "§2.1 在陈述「`config/` 里**从来没有过**这两个文件」",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
+        "同上（`AGENTS.md:STC` 之外的简写形式）",
+    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":
+        "同上",
     "README.md:video_edge_detect.py": "在「历史遗留脚本」说明表格里",
     "README.md:test.py": "同上",
     "docs/开题报告_研究思路四页文稿.md:calib/calibrate_stereo.py":
@@ -137,8 +168,6 @@ def collect_stale_refs() -> dict[str, str]:
     found: dict[str, str] = {}
     for doc in doc_files():
         rel = doc.relative_to(ROOT).as_posix()
-        if rel in SELF_DOCS:
-            continue
         for lineno, line in enumerate(
                 doc.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             for m in PATH_RE.finditer(line):
