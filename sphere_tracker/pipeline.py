@@ -248,6 +248,8 @@ class SpherePipeline:
                 size=(int(320 * scale), int(240 * scale)),
                 history=hist if len(hist) else None,
                 prediction=pred3d,
+                # 面板内部的字号/线宽也要跟 scale，否则放大后 3D 内容相对变小
+                scale=scale,
             )
             ph, pw = panel.shape[:2]
             h, w = img.shape[:2]

@@ -78,6 +78,7 @@ import numpy as np
 from sphere_tracker.config import AppConfig
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.types import Detection, FrameResult, TrailPoint
+from sphere_tracker.viz import draw_3d_panel
 
 W, H = 320, 240
 BG = np.array([40, 40, 40], np.int16)
@@ -276,6 +277,47 @@ def test_hud_scales_too() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_3d_panel_text_scales() -> bool:
+    """3D 面板内部的**文字**也要跟 scale。
+
+    面板的画布由调用方按 `scale` 给尺寸（`pipeline.py` 传 `size=(320*k, 240*k)`），
+    但**字号不会因为画布变大而自动变大** —— `draw_3d_panel` 里原来写死 `0.42/0.38`，
+    所以 `viz.scale=2` 时面板里的一切实测比外面小一半。2026-10-10 修。
+
+    判据用**标题文字的高度**：它是干净的一维量，且正是被改的那个。
+    不整块量面板，因为面板里还叠着**数据投影**（坐标跟着 `size` 走，是另一回事，
+    放大后相对观感本来就不同）——混在一起量会得到一条抓不住 bug 的判据。
+    """
+    print("----- 5. 3D 面板的标题文字随 scale 变 -----")
+
+    def title_ink_height(scale: float) -> int:
+        hist = np.array([[10 + i, 20 + i * 2, 300 + i * 5] for i in range(12)], dtype=np.float64)
+        pred = np.array([[30 + i, 40 + i, 350 + i * 5] for i in range(6)], dtype=np.float64)
+        panel = draw_3d_panel(size=(int(320 * scale), int(240 * scale)),
+                              history=hist, prediction=pred, scale=scale)
+        # ⚠️ 量程必须**只圈住标题那一行**。
+        # 第一版取"上面 1/4 且靠左 3/4"，把 y=30*scale 处的 "top view" 标签也圈了进去
+        # —— 那行的位置也乘了 scale，于是变异后比值仍有 1.81，判据抓不住。
+        # 标题的基线在 16*scale、字号 0.42*scale（≈10*scale 高），所以 [0, 22*scale) 够。
+        band = panel[: max(2, int(round(22 * scale))), :]
+        m = np.abs(band.astype(np.int16) - np.array([28, 28, 28], np.int16)).max(axis=2) > 25
+        ys, _xs = np.nonzero(m)
+        return 0 if len(ys) == 0 else int(ys.max() - ys.min()) + 1
+
+    h1, h2 = title_ink_height(1.0), title_ink_height(SCALE)
+    ratio = h2 / max(h1, 1)
+    print(f"  标题文字高度：scale=1 -> {h1}px；{SCALE:g} -> {h2}px；比值 {ratio:.2f}"
+          f"（字号×k 时应约 {SCALE:g}）")
+    checks = [
+        ("两种缩放下标题都画出来了", h1 > 2 and h2 > 2),
+        (f"文字高度比 ≈ k（{0.9 * SCALE:.1f}~{1.25 * SCALE:.1f}）"
+         f"—— 抓「面板字号没跟 scale」", 0.9 * SCALE < ratio < 1.25 * SCALE),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_content_area_grows_with_k_squared() -> bool:
     """内容**面积**应随 k² 增长（线宽/半径/字号都乘了 k）。"""
     print("----- 5. 内容面积随 k² 增长 -----")
@@ -303,6 +345,7 @@ def main() -> int:
                test_everything_stays_inside_the_canvas,
                test_scale_one_is_unchanged,
                test_hud_scales_too,
+               test_3d_panel_text_scales,
                test_content_area_grows_with_k_squared):
         results.append(fn())
         print()

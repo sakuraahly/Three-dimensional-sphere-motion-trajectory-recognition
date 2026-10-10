@@ -205,24 +205,35 @@ def draw_3d_panel(
     history: np.ndarray | None = None,
     prediction: np.ndarray | None = None,
     title: str = "3D (Z = depth from ball size)",
+    scale: float = 1.0,
 ) -> np.ndarray:
     """画一个二维的小面板：俯视图 (X-Z) + 侧视图 (Y-Z)。
 
     单目相机拿不到真正的三维，这里显示的是"像素位置 + 由球半径反推的深度"。
+
+    `scale` 的语义同 `draw_trail`：**文字与线宽也要跟着面板尺寸走**。
+    `size` 只是画布，字号/线宽/内边距不会因为画布变大而自动变大 ——
+    不乘 scale 的话，`viz.scale=2` 时面板里的一切实测会显得比外面小一半。
     """
     w, h = size
     panel = np.zeros((h, w, 3), dtype=np.uint8)
     panel[:] = (28, 28, 28)
-    cv2.putText(panel, title, (8, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
+    # 字号与线宽统一由 scale 决定（画布尺寸由调用方按 scale 给）
+    fs_title, fs_label, fs_hint = 0.42 * scale, 0.38 * scale, 0.45 * scale
+    th = max(1, int(round(1 * scale)))
+    margin = int(round(8 * scale))
+    cv2.putText(panel, title, (margin, int(round(16 * scale))), cv2.FONT_HERSHEY_SIMPLEX,
+                fs_title, (200, 200, 200), th, cv2.LINE_AA)
     split = h // 2
-    cv2.line(panel, (0, split), (w, split), (70, 70, 70), 1)
+    cv2.line(panel, (0, split), (w, split), (70, 70, 70), max(1, int(round(1 * scale))), cv2.LINE_AA)
 
     allpts = []
     for arr in (history, prediction):
         if arr is not None and len(arr):
             allpts.append(np.asarray(arr, dtype=np.float64))
     if not allpts:
-        cv2.putText(panel, "no 3D data", (10, split + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1, cv2.LINE_AA)
+        cv2.putText(panel, "no 3D data", (int(round(10 * scale)), split + int(round(24 * scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs_hint, (140, 140, 140), th, cv2.LINE_AA)
         return panel
     merged = np.vstack(allpts)
     x_min, x_max = float(merged[:, 0].min()), float(merged[:, 0].max())
@@ -240,7 +251,8 @@ def draw_3d_panel(
     ):
         y_off = 0 if idx == 0 else split
         sub_h = split if idx == 0 else h - split
-        cv2.putText(panel, label, (8, y_off + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 220, 160), 1, cv2.LINE_AA)
+        cv2.putText(panel, label, (margin, y_off + int(round(30 * scale))),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs_label, (160, 220, 160), th, cv2.LINE_AA)
         if history is not None and len(history) > 1:
             pts = _project_2d(np.asarray(history, dtype=np.float64), w, sub_h, view, bounds)
             for i in range(1, len(pts)):
@@ -248,7 +260,7 @@ def draw_3d_panel(
                     panel,
                     (int(pts[i - 1][0]), int(pts[i - 1][1]) + y_off),
                     (int(pts[i][0]), int(pts[i][1]) + y_off),
-                    (0, 255, 255), 2, cv2.LINE_AA,
+                    (0, 255, 255), max(1, int(round(2 * scale))), cv2.LINE_AA,
                 )
         if prediction is not None and len(prediction) > 1:
             pts = _project_2d(np.asarray(prediction, dtype=np.float64), w, sub_h, view, bounds)
@@ -259,7 +271,7 @@ def draw_3d_panel(
                     panel,
                     (int(pts[i - 1][0]), int(pts[i - 1][1]) + y_off),
                     (int(pts[i][0]), int(pts[i][1]) + y_off),
-                    (0, 140, 255), 2, cv2.LINE_AA,
+                    (0, 140, 255), max(1, int(round(2 * scale))), cv2.LINE_AA,
                 )
     return panel
 
