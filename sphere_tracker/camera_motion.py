@@ -223,22 +223,29 @@ class GlobalMotionEstimator:
 
     # ------------------------------------------------------------------
     def is_moving(self, motion: MotionEstimate | None) -> bool:
-        """带迟滞的"相机是否在动"判定，避免在阈值附近来回抖动。"""
+        """带迟滞的"相机是否在动"判定，避免在阈值附近来回抖动。
+
+        进入"移动"的门限是 `threshold_px`，退出要等位移掉到
+        `threshold_px * hysteresis`（默认 0.5 倍）以下 —— 两个门限分开，
+        位移在门限附近抖动时状态才不会一帧一变。
+
+        **这里必须把状态写回 `self._moving`**：判定结果同时决定
+        "要不要用补偿差分"（`detectors/motion.py`）和
+        "像素重力约束还成不成立"（`pipeline.py`），都不希望逐帧翻转。
+        估计失败（`method == "none"`）时沿用上一帧状态，不要凭空复位。
+        """
         if motion is None or motion.method == "none":
             return self._moving
         # 相位相关会被运动物体带偏，判"在动"时对它要求更高的位移，
         # 宁可漏判（退回 MOG2）也不要误判（用错模型补偿）。
         scale = 2.0 if motion.method == "phase" else 1.0
+        enter_px = self.threshold_px * scale
+        exit_px = self.threshold_px * self.hysteresis * scale
         if self._moving:
-            return motion.magnitude >= self.threshold_px * self.hysteresis * scale
-        return motion.magnitude > self.threshold_px * scale
-        mag = motion.magnitude
-        if self._moving:
-            if mag < self.threshold_px * self.hysteresis:
+            if motion.magnitude < exit_px:
                 self._moving = False
-        else:
-            if mag > self.threshold_px:
-                self._moving = True
+        elif motion.magnitude > enter_px:
+            self._moving = True
         return self._moving
 
 
