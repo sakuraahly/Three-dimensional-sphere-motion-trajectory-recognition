@@ -114,7 +114,9 @@ def menu() -> str:
         ("6", "相机设备管理（识别 / 固定 / 无关 / 检查漂移）", C.BLUE),
         ("7", "修改参数", C.YELLOW),
         ("8", "相机探测（核对两路参数是否一致）", C.BLUE),
-        ("9", "环境自测（无需摄像头）", C.BLUE),
+        ("9", "快测回归（跳过已知慢的，十几秒）", C.BLUE),
+        ("f", "全套回归（15 个全跑，约 7 分钟）", C.BLUE),
+        ("s", "规范落差自查（引用 / 来源 / 计数）", C.BLUE),
         ("0", "退出", C.RED),
     ]
     print(f"{C.BOLD}请选择操作：{C.RESET}")
@@ -362,8 +364,26 @@ def action_ignored_manage() -> None:
 
 
 def action_selftest() -> None:
-    run([PY, str(ROOT / "tests" / "selftest_synthetic.py")],
-        "环境自测（无需摄像头，约 1 分钟）")
+    """快测：走 apps/run_tests.py fast（与 `.bat` 和图形界面同一个运行器）。
+
+    这里**不自己拼测试清单** —— 以前硬编码只跑 `selftest_synthetic.py` 一个，
+    同一个缺陷在三个入口各有一份（`.bat` / 图形界面 / 这里），
+    改一处不算修好。现在三处都调同一个运行器。
+    """
+    run([PY, str(ROOT / "apps" / "run_tests.py"), "fast"],
+        "回归测试 · fast（跳过已知慢的，十几秒）")
+
+
+def action_selftest_full() -> None:
+    """全套回归：15 个都跑，约 7 分钟。改代码后必跑这个。"""
+    run([PY, str(ROOT / "apps" / "run_tests.py"), "full"],
+        "回归测试 · full（15 个全跑，约 7 分钟）")
+
+
+def action_standards() -> None:
+    """规范落差自查：引用 / 来源 / 计数 是否与磁盘一致。"""
+    run([PY, str(ROOT / "apps" / "tools" / "check_standards.py")],
+        "规范落差自查（引用 / 来源 / 计数）")
 
 
 ACTIONS = {
@@ -375,6 +395,8 @@ ACTIONS = {
     "6": action_cameras,
     "8": action_probe,
     "9": action_selftest,
+    "f": action_selftest_full,
+    "s": action_standards,
 }
 
 

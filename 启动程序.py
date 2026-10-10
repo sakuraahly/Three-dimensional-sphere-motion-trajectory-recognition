@@ -223,10 +223,14 @@ class Launcher(tk.Tk):
                    command=self._start_realtime).grid(row=1, column=0, padx=(0, 12), pady=4)
         ttk.Button(box, text="打开离线视频", style="Go.TButton",
                    command=self._start_video).grid(row=1, column=1, padx=(0, 12), pady=4)
-        ttk.Button(box, text="一键自测环境", command=self._run_selftest).grid(
-            row=1, column=2, pady=4)
+        ttk.Button(box, text="快测（十几秒）", command=self._run_tests_fast).grid(
+            row=1, column=2, padx=(0, 6), pady=4)
+        ttk.Button(box, text="全套回归（7 分钟）", command=self._run_tests_full).grid(
+            row=1, column=3, padx=(0, 6), pady=4)
+        ttk.Button(box, text="规范自查", command=self._run_standards).grid(
+            row=1, column=4, pady=4)
         self.status = ttk.Label(box, text="就绪", style="Hint.TLabel")
-        self.status.grid(row=1, column=3, sticky="e", padx=10)
+        self.status.grid(row=2, column=0, columnspan=5, sticky="w", padx=2)
 
     # ---------- 运行日志 ----------
     def _build_log(self) -> None:
@@ -431,9 +435,26 @@ class Launcher(tk.Tk):
                    "unignore", "--all"],
                   "清空「无关」清单（全部恢复可被自动挑选）")
 
-    def _run_selftest(self) -> None:
-        self._run([PY, str(ROOT / "tests" / "selftest_synthetic.py")],
-                  "环境自测（无需摄像头，约 1 分钟）")
+    def _run_tests_fast(self) -> None:
+        """快测：走 apps/run_tests.py fast（与 `启动程序.bat test` 同一个运行器）。
+
+        ⚠️ 这里**不自己拼测试清单**。以前这个按钮硬编码只跑
+        `selftest_synthetic.py` 一个，而 `AGENTS.md` §7 要求跑 15 个 ——
+        同一个缺陷在 `.bat` 和 GUI 两处各有一份，改一处不算修好。
+        现在两个入口都调同一个运行器，分层依据是实测耗时。
+        """
+        self._run([PY, str(ROOT / "apps" / "run_tests.py"), "fast"],
+                  "回归测试 · fast（跳过已知慢的，十几秒）")
+
+    def _run_tests_full(self) -> None:
+        """全套回归：15 个都跑，约 7 分钟。改代码后必跑这个。"""
+        self._run([PY, str(ROOT / "apps" / "run_tests.py"), "full"],
+                  "回归测试 · full（15 个全跑，约 7 分钟）")
+
+    def _run_standards(self) -> None:
+        """规范落差自查：引用 / 来源 / 计数 是否与磁盘一致。"""
+        self._run([PY, str(ROOT / "apps" / "tools" / "check_standards.py")],
+                  "规范落差自查（引用 / 来源 / 计数）")
 
     # ---------- 子进程与日志 ----------
     def _run(self, cmd: list[str], title: str) -> None:

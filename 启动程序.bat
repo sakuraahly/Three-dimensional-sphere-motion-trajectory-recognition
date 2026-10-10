@@ -138,6 +138,7 @@ if /i "%MODE%"=="verify"    goto :do_verify
 if /i "%MODE%"=="run"       goto :do_run
 if /i "%MODE%"=="diag"      goto :do_diag
 if /i "%MODE%"=="test"      goto :do_test
+if /i "%MODE%"=="standards" goto :do_standards
 echo       不认识的参数「%MODE%」，改用图形界面。
 goto :ui_gui
 
@@ -206,8 +207,25 @@ set "DTITLE=相机画质 / 链路诊断（先分清是带宽不足还是光学/�
 goto :direct
 
 :do_test
-set "DIRECT=tests\selftest_synthetic.py"
-set "DTITLE=环境自测（不需要摄像头，约 1 分钟）"
+rem 回归测试统一走 apps\run_tests.py（项目里**唯一**跑全套测试的地方）。
+rem   默认 fast：跳过两个慢测试（stereo_calib ~236s、synthetic ~90s），十几秒出结果。
+rem   要全套：启动程序.bat test full
+rem 分层依据是 outputs\test_results\timings.json 里的**实测中位数**，不写死名单。
+set "TIER=%~2"
+if "%TIER%"=="" set "TIER=fast"
+if /i "%TIER%"=="full" (
+    set "DIRECT=apps\run_tests.py full"
+    set "DTITLE=回归测试 · full（15 个全跑，约 7 分钟）"
+) else (
+    set "DIRECT=apps\run_tests.py fast"
+    set "DTITLE=回归测试 · fast（跳过已知慢的，十几秒）"
+)
+goto :direct
+
+:do_standards
+rem 规范落差自查：文档引用 / 规范来源 / 派生事实计数 是否与磁盘一致。
+set "DIRECT=apps\tools\check_standards.py"
+set "DTITLE=规范落差自查（引用 / 来源 / 计数）"
 goto :direct
 
 :direct
