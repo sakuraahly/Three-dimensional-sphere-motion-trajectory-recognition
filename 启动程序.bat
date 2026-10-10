@@ -46,7 +46,7 @@ rem ---------- 1) 找一台真的能 import cv2 的 Python ----------
 rem 光看路径不算数：msys64 那个 python 在 PATH 里但没装 opencv，
 rem 所以每个候选都必须真跑一次 import 才算通过。
 set "PY="
-call :probe "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+call :probe "%USERPROFILE%\miniforge3\envs\myenv\python.exe"
 call :probe "%LOCALAPPDATA%\miniforge3\envs\myenv\python.exe"
 call :probe "%USERPROFILE%\miniforge3\envs\myenv\python.exe"
 call :probe "%ProgramData%\miniforge3\envs\myenv\python.exe"
@@ -70,7 +70,7 @@ echo [2/3] 安装依赖 ...
 echo.
 
 set "BASE="
-call :probe_base "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+call :probe_base "%USERPROFILE%\miniforge3\envs\myenv\python.exe"
 call :probe_base "%LOCALAPPDATA%\miniforge3\envs\myenv\python.exe"
 call :probe_base "%USERPROFILE%\miniforge3\envs\myenv\python.exe"
 call :probe_base "%ProgramData%\miniforge3\envs\myenv\python.exe"

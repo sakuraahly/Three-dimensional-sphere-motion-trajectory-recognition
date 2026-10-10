@@ -369,7 +369,7 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 ```
 
 > 注意：直接敲 `python` 可能解析到 msys64 的 Python 而不是 myenv。
-> 保险写法：`C:\Users\<USER>\miniforge3\envs\myenv\python.exe apps\run_realtime.py`
+> 保险写法：`%USERPROFILE%\miniforge3\envs\myenv\python.exe apps\run_realtime.py`
 
 > **`CAP_PROP_FPS` 是假的，别信它。** 实测这两台摄像头：
 >
@@ -477,7 +477,7 @@ python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.m
 myenv Python 3.14.7。经过实测的可用组合：
 
 ```powershell
-$PY = "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+$PY = "$env:USERPROFILE\miniforge3\envs\myenv\python.exe"
 $WHL = "$env:TEMP\whl"; New-Item -ItemType Directory -Force -Path $WHL | Out-Null
 
 # 1) PyTorch：必须走 cu128（cu129 缺 cp314 的 torchvision；cu130 需要驱动 >= 580，你的 577 不够）

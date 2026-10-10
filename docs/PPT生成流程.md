@@ -42,7 +42,7 @@
 ### 3.1 前置
 
 ```powershell
-$PY = "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+$PY = "$env:USERPROFILE\miniforge3\envs\myenv\python.exe"
 cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 ```
 

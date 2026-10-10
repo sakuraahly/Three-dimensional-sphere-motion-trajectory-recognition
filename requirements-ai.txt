@@ -8,7 +8,7 @@
 #
 # ★ 一定按顺序来，且必须显式指定 python 路径（裸 python 可能解析到 msys64 的 3.12）
 #
-#   $PY = "C:\Users\<USER>\miniforge3\envs\myenv\python.exe"
+#   $PY = "$env:USERPROFILE\miniforge3\envs\myenv\python.exe"
 #
 # 1) PyTorch —— 必须用 cu128：
 #    - cu129 索引里没有 cp314/win 的 torchvision（最高只到 cp313）

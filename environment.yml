@@ -92,4 +92,3 @@ dependencies:
   - zstd=1.5.7=h534d264_7
   - pip:
       - opencv-contrib-python==5.0.0.93
-prefix: C:\Users\<USER>\miniforge3\envs\myenv
