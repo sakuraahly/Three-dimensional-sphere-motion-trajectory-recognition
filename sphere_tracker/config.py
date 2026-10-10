@@ -170,7 +170,7 @@ class TrackerConfig:
 class CameraConfig:
     """相机与三维重建参数。
 
-    fx/fy/cx/cy 为内参。没有做棋盘格标定时，可用 apps/calibrate_camera.py
+    fx/fy/cx/cy 为内参。没有做棋盘格标定时，可用 apps/tools/calibrate_focal.py
     或者下面的简易方式估算：把已知直径的球放在已知距离处，量出像素半径即可。
     """
 

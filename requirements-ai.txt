@@ -26,7 +26,7 @@
 #
 # 3) 验证
 #
-#    python apps/selftest_synthetic.py --check-ai
+#    & $PY tests/selftest_synthetic.py --check-ai
 #
 # 备注：
 #   - boxmot 要求 Python < 3.14，本环境装不了，别尝试

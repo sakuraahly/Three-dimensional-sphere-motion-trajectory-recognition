@@ -25,6 +25,7 @@
 | 实时程序 + 离线批处理 + CSV 导出                      | ✅ 完成       | 单路 **~160 fps**（960×540，纯 CPU 单线程）                                                             |
 | 合成真值自测（可直接当回归测试）                      | ✅ 完成       | `python tests/selftest_synthetic.py`                                                                    |
 | **相机运动适配**（手持/云台/平移拍摄）                | ✅ 完成       | 平移下半径误差 0.23 px（不补偿 1.58 px），见第十一节                                                    |
+| 相机自运动估计（迟滞判定 + 位移换算）                 | ✅ 完成       | 位移误差 ≤ 0.01 px 且**不随缩放比例变化**（原先差 `s²`，1080p 下 36 倍，见 `docs/交接文档.md` 坑 20）    |
 | **双目自动标定**                                      | ✅ 完成       | 合成真值验证：基线误差 0.006%、端到端三维误差 3.4 mm，见第十二节                                        |
 | 双目标定复检（装置是否被碰动）                        | ✅ 完成       | 未动 0.08 px / 碰动 2° 后 27.9 px，可明确判定                                                           |
 | 多相机/换相机适配                                     | ✅ 完成       | `apps/tools/list_cameras.py` 探测后端/分辨率/帧率；`cameras.py` 按**设备身份/端口**固定角色，免索引漂移 |
@@ -49,6 +50,12 @@
 > `tests/selftest_synthetic.py`（球径 22 cm、距离 3.7–4.4 m 的单目场景）；
 > 双目的 **15.6 mm** 来自 `tests/selftest_stereo_branch.py`（另一套合成场景、双目三角测量）。
 > 两者基准不同，**不可直接比较大小**。
+
+> ✅ **2026-10-10 全量复核**：`tests/` 下**八个**回归测试全部输出"全部通过"，
+> 且上表的每一项精度指标都与本文档记录**逐位一致**。
+> 复核时另修掉 3 个 bug（相机自运动的迟滞失效、位移换算差 `s²`、
+> PPT 预览的连线静默不画）。其中位移换算那个一直被合成场景盖住 ——
+> **这是"合成真值漂亮 ≠ 真机可用"的活例子**，详见 `docs/交接文档.md` §10.3 与坑 20。
 
 ### 三步开始使用
 
@@ -583,18 +590,26 @@ apps/                    可直接运行的程序
     calibrate_color.py     HSV 阈值交互标定
     calibrate_focal.py     单点焦距标定（三维必需）
 
-tests/                   回归测试（改动代码后必跑）
+tests/                   回归测试（改动代码后必跑，共八个）
   selftest_synthetic.py        单目全链路（clean / realistic / panning）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
   selftest_pair_source.py      成对取帧 + 同步偏移语义（含 find_offset 串联）
   selftest_stereo_branch.py    双目整条链路（真渲染 + 两路检测 + 三角测量）
   selftest_camera_registry.py  摄像头设备管理（全注入假数据，不开相机）
+  selftest_camera_motion.py    相机自运动：迟滞状态机 + 位移换算方向
+  selftest_preview_lib.py      PPT 预览渲染：连线是否画出来
+                               （缺 python-pptx/Pillow 时整体跳过算通过）
 
 docs/                    文档
+  项目总纲.md            ★ 入口：项目是什么 + 文档怎么读
   文件结构.md            目录职责与放置规则
   交接文档.md            现状 / 代码地图 / 踩坑记录
   计划书.md              目标 / 里程碑 / 风险
+  API.md                 库 API 参考
+  开发指南.md            环境 / 约定 / 怎么加东西 / 方法论
+  用户手册.md            面向使用者的操作手册
+  PPT生成流程.md         开题报告 PPT 怎么生成 / 校验 / 预览
   开题报告_PPT逐页文稿.md
   refs/                  两篇参考文献 PDF
 
