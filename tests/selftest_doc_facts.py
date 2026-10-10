@@ -58,7 +58,7 @@ if str(ROOT) not in sys.path:
 AGENTS_MD = ROOT / "AGENTS.md"
 
 # 本测试自己也是测试，也要被数进去
-REAL_TEST_COUNT = 14
+REAL_TEST_COUNT = 15
 # `AGENTS.md` §3 里写死的两个计数。原文形如：
 #   `| **相机 / 标定**（7） | ...` / `| **开题报告 PPT**（8） | ...`
 # 注意：**全角括号**、标题里带 `**`、斜杠两侧有空格 —— 正则要容忍这些排版差异。

@@ -69,6 +69,7 @@ class BoardObservation:
     margin_px: float = 0.0                  # 角点到图像边界的最小距离
     brightness: float = 0.0
     precise: bool = True                    # 角点是否来自全分辨率精确检测
+    detector: str = ""                      # 角点来自谁：""（没找到）/ "sb" / "classic"
     note: str = ""                          # 未通过时的原因
 
     def quad(self) -> np.ndarray | None:
@@ -101,10 +102,15 @@ def _sharpness(gray: np.ndarray, corners: np.ndarray | None) -> float:
 
 
 def _finish(obs: BoardObservation, corners: np.ndarray, gray: np.ndarray,
-            spec: BoardSpec, precise: bool) -> BoardObservation:
-    """由角点补齐单应、面积、边距、清晰度、亮度等指标。"""
+            spec: BoardSpec, precise: bool, detector: str) -> BoardObservation:
+    """由角点补齐单应、面积、边距、清晰度、亮度等指标。
+
+    `detector` 必须由调用方显式给出（`"sb"` / `"classic"`）——
+    角点的**出身**不能丢，原因见 `detect_board()` 的文档串。
+    """
     obs.found = True
     obs.precise = precise
+    obs.detector = detector
     obs.corners = np.asarray(corners, np.float32).reshape(-1, 1, 2)
     h, w = gray.shape[:2]
 
@@ -149,6 +155,7 @@ def detect_board(
     normalize: bool = True,
     work_width: int | None = None,
     exhaustive: bool = True,
+    allow_classic_fallback: bool = False,
 ) -> BoardObservation:
     """检测标定板并给出质量指标。
 
@@ -160,6 +167,27 @@ def detect_board(
     要每帧跑就用 work_width 降分辨率 + exhaustive=False，拿到粗位姿做判断，
     真正收帧时再用 detect_board_in_roi() 在棋盘附近做精确检测
     （裁剪不损失分辨率，只是缩小搜索范围）。
+
+    ⚠️ 关于 `allow_classic_fallback`（默认 **False**，别随手打开）
+    ------------------------------------------------------------
+    经典检测器 `findChessboardCorners` 与 SB **返回的角点顺序恰好整体反序**
+    （实测：直接对应 RMS 323.112 px，整份反序后 0.020 px；分类正好落在 8x5 点阵的
+    `rot180` 自同构上）。后果：
+
+    - **单目标定对它免疫**（顺序反序仍是一组自洽对应，RMS -0.0066 vs 0.0704 px），
+      所以"每路各自看起来都正常"；
+    - **双目标定不免疫**：左右两路若一路 SB、一路经典，同名下标不是同一个物理角点
+      → 错配点对 → R/T 垃圾。合成复现：整体 RMS 21~42 px、极线误差上万像素、
+      基线被吹到真值的 8~15 倍。
+
+    这个 bug 在真机上极难查，因为**没有报错、单目指标也好看**。所以：
+
+    1. 默认**不许回退**（`False`）—— "从不回退"是可预测且安全的；
+    2. 真要开，也只能在**单路诊断**里开，**绝不能**让它出现在标定收帧路径上；
+    3. 一旦开了，`obs.detector` 会如实记成 `"classic"`，调用方**必须**核对
+       （`AutoPairCollector.offer()` 会拒绝一对之内混用检测器）。
+
+    这组判据钉在 `tests/selftest_board_corner_order.py` 里。
     """
     obs = BoardObservation()
     if gray.ndim == 3:
@@ -172,6 +200,7 @@ def detect_board(
                           interpolation=cv2.INTER_AREA)
 
     corners = None
+    detector = ""
     if use_sb and hasattr(cv2, "findChessboardCornersSB"):
         flags = cv2.CALIB_CB_NORMALIZE_IMAGE if normalize else 0
         if exhaustive:
@@ -179,8 +208,11 @@ def detect_board(
         ok, c = cv2.findChessboardCornersSB(gray, spec.pattern_size, flags=flags)
         if ok:
             corners = np.asarray(c, np.float32)
+            detector = "sb"
 
-    if corners is None and exhaustive:
+    # 经典回退：**必须显式允许**。理由见上面的文档串 —— 它与 SB 的角点顺序整体反序，
+    # 混进双目标定会静默产出垃圾解。不做成"SB 失败就自动试"。
+    if corners is None and exhaustive and allow_classic_fallback:
         flags2 = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_FAST_CHECK
         if normalize:
             flags2 |= cv2.CALIB_CB_NORMALIZE_IMAGE
@@ -190,6 +222,7 @@ def detect_board(
             return obs
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
         corners = cv2.cornerSubPix(gray, c, (5, 5), (-1, -1), criteria)
+        detector = "classic"
 
     if corners is None:
         obs.note = "未检测到棋盘"
@@ -197,7 +230,8 @@ def detect_board(
     if scale != 1.0:
         corners = corners / scale          # 换算回全分辨率坐标
     # 指标要在全分辨率图上算（清晰度、亮度才可比）
-    return _finish(obs, corners, full, spec, precise=(scale == 1.0 and exhaustive))
+    return _finish(obs, corners, full, spec, precise=(scale == 1.0 and exhaustive),
+                   detector=detector)
 
 
 def detect_board_in_roi(
@@ -206,6 +240,7 @@ def detect_board_in_roi(
     hint: np.ndarray,
     margin_ratio: float = 0.5,
     margin_px: int = 28,
+    allow_classic_fallback: bool = False,
 ) -> BoardObservation | None:
     """在"粗检到的棋盘"附近裁剪出一小块，做全分辨率精确检测。
 
@@ -213,6 +248,9 @@ def detect_board_in_roi(
     但直接拿降分辨率粗检的角点去标定，精度又差 3 倍（640 宽下 0.5 px
     ≈ 全分辨率 1.5 px）。裁剪既不损失分辨率，又把搜索范围缩小到棋盘附近，
     实测一次约 40 ms —— 只在"真要收这一帧"时做，完全感觉不到。
+
+    `allow_classic_fallback` 默认 **False**，理由同 `detect_board()`。
+    返回的 `BoardObservation.detector` 会如实标出用的是哪一个。
     """
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
@@ -227,12 +265,14 @@ def detect_board_in_roi(
     crop = gray[gy0:gy1, gx0:gx1]
     if crop.size < 4000:
         return None
-    obs = detect_board(crop, spec, exhaustive=True)
+    obs = detect_board(crop, spec, exhaustive=True,
+                       allow_classic_fallback=allow_classic_fallback)
     if not obs.found or obs.corners is None:
         return None
     obs.corners = (obs.corners.reshape(-1, 2) + np.array([gx0, gy0], np.float32)).reshape(-1, 1, 2)
-    # 指标换成在全分辨率整图上算
-    return _finish(BoardObservation(), obs.corners, gray, spec, precise=True)
+    # 指标换成在全分辨率整图上算（detector 出身照原样带过来）
+    return _finish(BoardObservation(), obs.corners, gray, spec, precise=True,
+                   detector=obs.detector)
 
 
 def pose_distance(h1: np.ndarray | None, h2: np.ndarray | None, image_diag: float) -> float:

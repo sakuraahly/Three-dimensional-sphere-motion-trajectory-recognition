@@ -203,10 +203,28 @@ class AutoPairCollector:
         diag = math.hypot(w, h)
 
         # 每帧只做"粗检"：降分辨率 + 不开 EXHAUSTIVE，约 12 ms/路
-        obs_l = detect_board(left_gray, spec, work_width=cfg.gate_work_width, exhaustive=False)
-        obs_r = detect_board(right_gray, spec, work_width=cfg.gate_work_width, exhaustive=False)
+        #
+        # ⚠️ 这里**显式打开**经典回退，是有意的，理由有实测依据：
+        # 强行模糊对照（outputs/_probe_detector_coverage.py）显示，高斯模糊 k=15 时
+        # **SB 失败而经典成功** —— 真机上"左路偏糊"正是已知现象，关掉回退会真的少收帧。
+        # 但回退有代价：经典与 SB 的角点顺序**整体反序**。所以策略是
+        # "**允许回退，但绝不允许一对之内混用**" —— 见下面 0) 与 7b) 两道守卫。
+        obs_l = detect_board(left_gray, spec, work_width=cfg.gate_work_width,
+                             exhaustive=False, allow_classic_fallback=True)
+        obs_r = detect_board(right_gray, spec, work_width=cfg.gate_work_width,
+                             exhaustive=False, allow_classic_fallback=True)
         self.last_obs = (obs_l, obs_r)
         self.last_accepted = False
+
+        # 0) **角点出身必须两路一致**
+        #    经典与 SB 的角点顺序整体反序（实测直接对应 RMS 323.112 px、整份反序
+        #    0.020 px），单目标定免疫、双目标定不免疫。所以"两路出身不同"这一帧
+        #    必须当场丢掉，而不是留到标定结果里去猜。
+        #    放在最前面：这一步花钱最少、后果最严重。
+        if obs_l.found and obs_r.found and obs_l.detector != obs_r.detector:
+            return self._reject(
+                f"两路角点出身不同（左 {obs_l.detector} / 右 {obs_r.detector}）"
+                f"：顺序相反，标定会解出垃圾 R/T")
 
         # 1) 两路都要检测到
         #    这里**必须说清是哪一路**没找到：两路画面质量差很多时（比如一路蒙雾、
@@ -273,10 +291,19 @@ class AutoPairCollector:
             return self._reject("该区域已收够，请换个位置")
 
         # 7) 全部通过 -> 在棋盘附近做全分辨率精确检测（只在这一帧做，约 40 ms/路）
-        acc_l = detect_board_in_roi(left_gray, spec, obs_l.corners)
-        acc_r = detect_board_in_roi(right_gray, spec, obs_r.corners)
+        #    同样显式允许回退（理由见粗检那一段），并紧跟着核对出身
+        acc_l = detect_board_in_roi(left_gray, spec, obs_l.corners, allow_classic_fallback=True)
+        acc_r = detect_board_in_roi(right_gray, spec, obs_r.corners, allow_classic_fallback=True)
         if acc_l is None or acc_r is None:
             return self._reject("精确复核失败（板太靠边或被遮挡）")
+
+        # 7b) 再核一次出身 —— 粗检一致、精确复核仍可能不一致
+        #（粗检在 640 宽上跑、精确复核在全分辨率裁剪上跑，两者成败可以不同）
+        if acc_l.detector != acc_r.detector:
+            return self._reject(
+                f"两路角点出身不同（左 {acc_l.detector or '?'} / 右 {acc_r.detector or '?'}）"
+                f"：顺序相反，标定会解出垃圾 R/T")
+
         # 用精确角点复核关键指标，避免粗检的近似把不合格的帧放进来
         for name, acc in (("左", acc_l), ("右", acc_r)):
             if acc.sharpness < cfg.min_sharpness:
