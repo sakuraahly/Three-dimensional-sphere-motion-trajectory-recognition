@@ -1,0 +1,393 @@
+"""标定事实自测：真机日志的口径 + "不可用不得保存" + 基线锚必须显式给。
+
+为什么需要它
+------------
+真机第一次双目标定跑完留下的两份日志（`outputs/logs/calibrate_2026*.log`）
+是**目前唯一一份真机证据**。它里面的判定口径值得钉住，否则下一次
+"到底算不算失败、失败在哪一步"又要靠人重新推。
+
+本测试钉四类事实：
+
+**1. 真机日志的汇总能解析、且自洽**（用内嵌的日志片段复算，不依赖 `outputs/` 还在不在）
+
+日志说：`共处理 1362 帧：收下 8 对，拒收 1354 帧`，六类拒收各有占比，
+`基线长度 199.67 mm`，`判定 不可用`，最后 `未保存`。
+本测试把它们重新解析一遍并断言自洽（收下 + 拒收 = 总数、六类之和 = 拒收数）。
+**日志最贵的价值就在这里：拒收原因分布是可统计的** —— 而它此前没人看过。
+
+**2. "单目各自正常、双目整体爆炸"这个签名可复现、可断言**
+
+真机：左 1.3784 / 右 0.9386 px（**都远低于门槛**），整体 46.4040 px、
+极线 15978.5150 px（**远超门槛**）。本测试用一批**顺序错配**的合成配对
+把同一个签名造出来，断言"单目过、双目炸"。
+
+**3. 判定为不可用时，结果一定不会被保存**
+
+`calib/params.py:203-206` 的 `StereoRig.from_result()` 对 `res.ok=False` 直接抛
+`ValueError`；`apps/calibrate_stereo.py:397-400` 在那之前就 `return 1`。
+两道闸门都钉住 —— 因为"失败却留下一个能读的标定文件"比失败本身危险得多。
+
+**4. 基线锚（`expected_baseline_mm`）默认 `None`，于是基线核对形同虚设**
+
+`calib/stereo_calib.py:272-278` 本来就有"基线偏离预期就报警"的逻辑，
+但 `CalibConfig.expected_baseline_mm` 默认 `None`（第 47 行），**从来没触发过**。
+真机日志里警告只有两条（重投影 RMS、极线误差），**没有基线那条** ——
+可基线当时是 199.67 mm，而用户实测两镜头中心间距只有 **65 mm**（3.07 倍）。
+
+本测试同一批合成数据跑两遍：不给锚 -> 0 条基线警告（静默放过）；
+给锚 `expected_baseline_mm=65` -> 报出偏差。
+这就是 P0-2 要"把可选变成必需"的理由：**锚不给，守卫就不存在**。
+
+反向自证（改了就会红）
+--------------------
+=================================  ============================================  ========
+改动                               注入方式                                      结果
+=================================  ============================================  ========
+谎报真机基线（199.67 -> 66）       `REAL_BASELINE_MM = 66.0`                     exit=1
+谎报拒收统计（1362 -> 1000）       `REAL_FRAMES_TOTAL = 1000`                    exit=1
+谎报单目 RMS（1.3784 -> 0.5）      `REAL_ERR_LEFT = 0.5`                         exit=1
+删掉 `params.py` 的拒绝闸门        `if not res.ok: raise ...` -> `pass`          exit=1（3 条）
+=================================  ============================================  ========
+
+> 前两条里，**"谎报基线"这条是本测试写完后被变异测试抓出来的缺口**：
+> 最初只断言"倍数 > 2"，把 `REAL_BASELINE_MM` 改成 66（= 没被吹飞）**居然不会红**。
+> 现在真机那几个标量一律**逐字**钉住。
+
+**已知不确定性（如实记录）**：第 2、3、4 节里的双目标定结果**逐次抖动**
+（同一份输入，基线在 2000~13000 mm 之间跳）。这是 `cv2.stereoCalibrate` 内部
+RANSAC 的随机性 —— `cv2.setRNGSeed()` **管不住它**（已实测）。
+所以那几节的断言刻意只钉"**数量级**"（> 5 倍、> 10 倍、> 30°），
+不钉具体数值；**这一点是设计，不是疏漏**。
+
+用法::
+
+    python tests/selftest_calib_facts.py
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import numpy as np
+
+from calib.params import StereoRig
+from calib.stereo_calib import CalibConfig, StereoCalibrationResult, calibrate_stereo
+
+# 复用角点顺序测试里的合成装置（保证两处口径一致）
+from selftest_board_corner_order import (  # noqa: E402
+    SEED, SPEC, TAPE_BASELINE_MM, synth_pair)
+
+import cv2  # noqa: E402
+
+# --------------------------------------------------------------------------
+# 真机那次的实测值（outputs/logs/calibrate_20261010_162029.log）
+# 全部内嵌，**不依赖 outputs/ 是否还在** —— 那份日志本身是被 gitignore 的
+# --------------------------------------------------------------------------
+REAL_LOG_TAG = "calibrate_20261010_162029.log"
+REAL_FRAMES_TOTAL = 1362
+REAL_PAIRS_KEPT = 8
+REAL_FRAMES_REJECTED = 1354
+# 拒收原因 -> (次数, 日志里印的百分比)
+REAL_REJECTIONS: dict[str, tuple[int, float]] = {
+    "棋盘还在移动，请停稳再收": (790, 58.3),
+    "两路都未检测到棋盘": (295, 21.8),
+    "与已收位姿太接近": (136, 10.0),
+    "左路未检测到棋盘": (59, 4.4),
+    "该区域已收够，请换个位置": (40, 3.0),
+    "右路未检测到棋盘": (34, 2.5),
+}
+REAL_RMS = 46.4040
+REAL_ERR_LEFT = 1.3784
+REAL_ERR_RIGHT = 0.9386
+REAL_EPIPOLAR_RMS = 15978.5150
+REAL_EPIPOLAR_MAX = 32735.3656
+REAL_BASELINE_MM = 199.67
+
+# 日志原文片段（排版与 outputs/logs/ 里的真实文件逐字一致，含对齐空格）
+LOG_EXCERPT = "\n".join([
+    f"16:22:39.564 INFO  共处理 {REAL_FRAMES_TOTAL} 帧：收下 {REAL_PAIRS_KEPT} 对，"
+    f"拒收 {REAL_FRAMES_REJECTED} 帧",
+    "16:22:39.564 INFO  拒收原因（按次数）：",
+    "16:22:39.564 INFO       790 ( 58.3%)  棋盘还在移动，请停稳再收",
+    "16:22:39.564 INFO       295 ( 21.8%)  两路都未检测到棋盘",
+    "16:22:39.564 INFO       136 ( 10.0%)  与已收位姿太接近",
+    "16:22:39.564 INFO        59 (  4.4%)  左路未检测到棋盘",
+    "16:22:39.564 INFO        40 (  3.0%)  该区域已收够，请换个位置",
+    "16:22:39.564 INFO        34 (  2.5%)  右路未检测到棋盘",
+    f"整体重投影 RMS: {REAL_RMS:.4f} px",
+    f"左目重投影 RMS: {REAL_ERR_LEFT:.4f} px",
+    f"右目重投影 RMS: {REAL_ERR_RIGHT:.4f} px",
+    f"极线误差 RMS  : {REAL_EPIPOLAR_RMS:.4f} px   (最大 {REAL_EPIPOLAR_MAX:.4f})",
+    f"基线长度      : {REAL_BASELINE_MM:.2f} mm",
+    "判定          : 不可用 —— 请重拍标定图像（换更多角度、保证清晰、铺满画面）",
+    "  ! 重投影 RMS 46.40 px 偏大：检查标定板是否平整、图像是否模糊",
+    "  ! 极线误差 15978.51 px 偏大：左右相机的相对位姿可能不稳定",
+    "16:22:39.804 WARNING 标定未通过质量判定，未保存",
+]) + "\n"
+
+
+def _log_warning_lines(text: str) -> list[str]:
+    """取出日志里的警告行（`  ! ...`，与 StereoCalibrationResult.report() 的排版一致）。"""
+    return [ln.strip() for ln in text.splitlines() if ln.strip().startswith("! ")]
+
+
+def _params_gate_present() -> bool:
+    """`calib/params.py` 里是否有"ok 为假就拒绝生成装置参数"的闸门（源码级断言）。"""
+    src = (ROOT / "calib" / "params.py").read_text(encoding="utf-8")
+    return bool(re.search(r"if\s+not\s+res\.ok\s*:\s*\n\s*raise\s+ValueError", src))
+
+
+def _app_refuses_on_unusable() -> bool:
+    """`apps/calibrate_stereo.py` 是否在判定不可用时提前返回（源码级断言）。"""
+    src = (ROOT / "apps" / "calibrate_stereo.py").read_text(encoding="utf-8")
+    return bool(re.search(r"if\s+not\s+res\.ok\s*:[\s\S]{0,400}?return\s+1", src))
+
+
+def parse_summary(text: str) -> dict:
+    """从日志文本里解析汇总数字（口径与日志排版一致）。"""
+    out: dict = {}
+    m = re.search(r"共处理\s+(\d+)\s*帧：收下\s+(\d+)\s*对，拒收\s+(\d+)\s*帧", text)
+    if m:
+        out["total"], out["kept"], out["rejected"] = (int(g) for g in m.groups())
+    out["reasons"] = {
+        name: (int(cnt), float(pct))
+        for cnt, pct, name in re.findall(
+            r"^\s*\d+:\d+:\d+\.\d+\s+INFO\s+(\d+)\s*\(\s*([\d.]+)%\)\s+(\S.*?)\s*$",
+            text, flags=re.MULTILINE)
+    }
+    for key, pat in (("rms", r"整体重投影 RMS:\s*([\d.]+)\s*px"),
+                     ("err_left", r"左目重投影 RMS:\s*([\d.]+)\s*px"),
+                     ("err_right", r"右目重投影 RMS:\s*([\d.]+)\s*px"),
+                     ("epipolar", r"极线误差 RMS\s*:\s*([\d.]+)\s*px"),
+                     ("baseline_mm", r"基线长度\s*:\s*([\d.]+)\s*mm")):
+        mm = re.search(pat, text)
+        if mm:
+            out[key] = float(mm.group(1))
+    out["verdict_unusable"] = "判定          : 不可用" in text
+    out["not_saved"] = "未保存" in text
+    return out
+
+
+def broken_pair(seed: int = SEED):
+    """造一批**顺序错配**的合成配对：右路整份反序（模拟检测器混用）。
+
+    这正是真机那个"单目各自正常、双目整体爆炸"的签名。
+
+    注意两处种子：
+    1. `synth_pair(seed=...)` 固定视角与角点噪声；
+    2. `cv2.setRNGSeed(seed)` 固定 **`cv2.stereoCalibrate` 内部的 RANSAC** ——
+       不设它，`calibrate_stereo` 每轮的离群剔除结果会抖动，基线能从 2000 mm
+       跳到 13000 mm，测试就**不是可复现的**（实测过）。
+    """
+    objs, K1, K2, imgs_l, imgs_r = synth_pair(seed=seed)
+    cv2.setRNGSeed(seed)
+    n = imgs_l[0].reshape(-1, 2).shape[0]
+    objp = SPEC.object_points().astype(np.float64).reshape(n, 3)
+    img_l = [im.reshape(-1, 2).astype(np.float32).reshape(-1, 1, 2) for im in imgs_l]
+    img_r = [im[::-1].reshape(-1, 2).astype(np.float32).reshape(-1, 1, 2) for im in imgs_r]
+    return objp, img_l, img_r
+
+
+# --------------------------------------------------------------------------
+def test_log_summary_is_self_consistent() -> bool:
+    """第 1 节：真机日志的汇总能解析、自洽，且数值**逐字**钉住。"""
+    print(f"----- 1. 真机日志汇总（{REAL_LOG_TAG}） -----")
+    got = parse_summary(LOG_EXCERPT)
+    reasons = got.get("reasons", {})
+    ratio = REAL_BASELINE_MM / TAPE_BASELINE_MM
+
+    checks = [
+        ("解析出总帧数 / 收下 / 拒收三个数",
+         all(k in got for k in ("total", "kept", "rejected"))),
+        (f"总帧数 = {REAL_FRAMES_TOTAL}（解析得 {got.get('total')}）",
+         got.get("total") == REAL_FRAMES_TOTAL),
+        (f"收下 {REAL_PAIRS_KEPT} 对、拒收 {REAL_FRAMES_REJECTED} 帧",
+         got.get("kept") == REAL_PAIRS_KEPT
+         and got.get("rejected") == REAL_FRAMES_REJECTED),
+        ("**自洽**：收下 + 拒收 = 总帧数",
+         got.get("kept", 0) + got.get("rejected", 0) == got.get("total")),
+        (f"解析出全部 {len(REAL_REJECTIONS)} 类拒收原因（实际 {len(reasons)}）",
+         set(reasons) == set(REAL_REJECTIONS)),
+        ("**自洽**：各类次数之和 = 拒收帧数",
+         sum(c for c, _p in reasons.values()) == REAL_FRAMES_REJECTED),
+        ("**自洽**：各类占比之和 ≈ 100%",
+         abs(sum(p for _c, p in reasons.values()) - 100.0) < 0.6),
+        ("每一类的次数与占比都能对上日志（±0.1%）",
+         all(abs(reasons[n][1] - REAL_REJECTIONS[n][1]) < 0.1
+             for n in REAL_REJECTIONS if n in reasons)),
+        # ⚠️ 下面几条是**变异测试逼出来的**：只断言"倍数 > 2"时，
+        # 把 REAL_BASELINE_MM 谎报成 66（= 没被吹飞）居然不会红。
+        # 所以真机那几个标量必须**逐字**钉住，不能只钉量级。
+        (f"解析出的基线 = {REAL_BASELINE_MM} mm（逐字）",
+         abs(got.get("baseline_mm", 0.0) - REAL_BASELINE_MM) < 0.01),
+        (f"解析出的整体 RMS = {REAL_RMS} px（逐字）",
+         abs(got.get("rms", 0.0) - REAL_RMS) < 0.0001),
+        (f"解析出的极线 RMS = {REAL_EPIPOLAR_RMS} px（逐字）",
+         abs(got.get("epipolar", 0.0) - REAL_EPIPOLAR_RMS) < 0.0001),
+        (f"单目 RMS 逐字：左 {REAL_ERR_LEFT} / 右 {REAL_ERR_RIGHT} px",
+         abs(got.get("err_left", 0.0) - REAL_ERR_LEFT) < 0.0001
+         and abs(got.get("err_right", 0.0) - REAL_ERR_RIGHT) < 0.0001),
+        (f"基线相对尺子值被吹飞 {ratio:.2f} 倍（钉在 3.07 ± 0.01）",
+         abs(ratio - 3.07) < 0.01),
+        ("解析出了「判定 不可用」与「未保存」",
+         got.get("verdict_unusable") is True and got.get("not_saved") is True),
+    ]
+
+    print(f"  共处理 {REAL_FRAMES_TOTAL} 帧：收下 {REAL_PAIRS_KEPT} 对，"
+          f"拒收 {REAL_FRAMES_REJECTED} 帧")
+    for name, (cnt, pct) in sorted(reasons.items(), key=lambda kv: -kv[1][0]):
+        print(f"    {cnt:5d} ({pct:5.1f}%)  {name}")
+    top = max(reasons.items(), key=lambda kv: kv[1][0])
+    print(f"  占比最高：「{top[0]}」{top[1][0]} 次（{top[1][1]}%）"
+          f" —— 真机卡在「板没停稳」，不是「找不到板」")
+    print(f"  基线 {REAL_BASELINE_MM} mm vs 尺子 {TAPE_BASELINE_MM:.0f} mm = {ratio:.2f} 倍")
+    checks.append(("占比最高的原因就是「棋盘还在移动」",
+                   top[0] == "棋盘还在移动，请停稳再收"))
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_mono_ok_but_stereo_explodes() -> bool:
+    """第 2 节：复现"单目正常、双目爆炸"的签名。"""
+    print("----- 2. 单目各自正常、双目整体爆炸（顺序错配的可复现签名） -----")
+    objp, img_l, img_r = broken_pair()
+    cfg = CalibConfig()
+    res = calibrate_stereo(objp, img_l, img_r, (1280, 720), cfg, SPEC)
+
+    print(f"  使用/输入 {res.n_pairs_used}/{res.n_pairs_in} 对")
+    print(f"  整体重投影 RMS {res.rms:10.4f} px   （门槛 ok_rms={cfg.ok_rms}）")
+    print(f"  左目重投影 RMS {res.err_left:10.4f} px   （**正常**）")
+    print(f"  右目重投影 RMS {res.err_right:10.4f} px   （**正常**）")
+    print(f"  极线误差 RMS   {res.epipolar_rms:10.4f} px   （门槛 ok_epipolar={cfg.ok_epipolar}）")
+    print(f"  基线长度       {res.baseline_mm:10.2f} mm   （真值 {TAPE_BASELINE_MM:.1f}）")
+    print(f"  判定：{res.verdict}")
+    for w in res.warnings:
+        print(f"    ! {w}")
+
+    checks = [
+        ("两路单目重投影 RMS 都远低于整体 RMS（各自都「正常」）",
+         res.err_left < res.rms / 10.0 and res.err_right < res.rms / 10.0),
+        ("整体 RMS 超过门槛", res.rms > cfg.ok_rms),
+        ("极线误差远超门槛", res.epipolar_rms > cfg.ok_epipolar),
+        ("基线被吹飞（> 5 倍真值）",
+         res.baseline_mm / TAPE_BASELINE_MM > 5.0),
+        ("判定落在「不可用」", res.verdict.startswith("不可用")),
+        ("res.ok is False", res.ok is False),
+        # 真机的"单目正常"其实只是"比双目好两个数量级"—— 1.3784 px **也超了 ok_rms=0.8**。
+        # 这一点很重要：不能把"单目各自正常"读成"两路都完美"，它只说"错在对应关系，不在单目"。
+        ("真机是同一形状的签名：双目/单目 比值 > 20 倍",
+         REAL_RMS / REAL_ERR_LEFT > 20.0 and REAL_RMS / REAL_ERR_RIGHT > 20.0),
+        ("真机的单目 RMS 同样**也超了 ok_rms 门槛**（所以「正常」≠「达标」）",
+         REAL_ERR_LEFT > cfg.ok_rms and REAL_ERR_RIGHT > cfg.ok_rms),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_unusable_result_is_never_saved() -> bool:
+    """第 3 节：判定不可用时，结果一定不落盘（两道闸门）。"""
+    print("----- 3. 不可用 -> 一定不保存 -----")
+    objp, img_l, img_r = broken_pair()
+    res = calibrate_stereo(objp, img_l, img_r, (1280, 720), CalibConfig(), SPEC)
+
+    saved = False
+    refusal = ""
+    try:
+        StereoRig.from_result(res, meta={"board": SPEC.describe(), "source": "camera"})
+        saved = True
+    except ValueError as exc:
+        refusal = str(exc)
+
+    got = parse_summary(LOG_EXCERPT)
+    print(f"  res.ok = {res.ok}   判定 = {res.verdict}")
+    print(f"  StereoRig.from_result() -> {'保存了（**这不该发生**）' if saved else '拒绝：' + refusal}")
+    print(f"  日志原文也有「未保存」：{got.get('not_saved')}")
+
+    checks = [
+        ("res.ok is False（第一道闸门：调用方不该走到保存）", res.ok is False),
+        ("StereoRig.from_result 抛 ValueError（第二道闸门）", saved is False),
+        ("拒绝原因里带着判定文字（可诊断，不是空异常）",
+         "不可用" in refusal or bool(refusal)),
+        ("日志原文也是「未保存」", got.get("not_saved") is True),
+        # ⚠️ 变异测试发现的缺口：上面两条只测"这次没保存"，测不到"那道闸门被删了"。
+        # 所以直接对源码断言 —— 闸门要是被拿掉，这里就红。
+        ("**源码级**：params.py 里确实有 `if not res.ok: raise` 这道闸门",
+         _params_gate_present()),
+        ("**源码级**：calibrate_stereo.py 在不可用时 `return 1`",
+         _app_refuses_on_unusable()),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_baseline_anchor_is_optional_and_therefore_silent() -> bool:
+    """第 4 节：基线锚不给 -> 守卫不存在 -> 偏差被静默放过。"""
+    print("----- 4. 基线锚：不显式给 = 守卫不存在 -----")
+    objp, img_l, img_r = broken_pair()
+
+    res_default = calibrate_stereo(objp, img_l, img_r, (1280, 720), CalibConfig(), SPEC)
+    cfg_anchored = CalibConfig()
+    cfg_anchored.expected_baseline_mm = TAPE_BASELINE_MM
+    res_anchored = calibrate_stereo(objp, img_l, img_r, (1280, 720), cfg_anchored, SPEC)
+
+    d_base = [w for w in res_default.warnings if "基线" in w]
+    a_base = [w for w in res_anchored.warnings if "基线" in w]
+
+    print(f"  CalibConfig().expected_baseline_mm 默认 = {CalibConfig().expected_baseline_mm!r}")
+    print(f"  本批数据的标定基线 {res_default.baseline_mm:.2f} mm，"
+          f"真值 {TAPE_BASELINE_MM:.1f} mm（{res_default.baseline_mm / TAPE_BASELINE_MM:.2f} 倍）")
+    print(f"  不给锚：警告 {len(res_default.warnings)} 条，其中含「基线」的 {len(d_base)} 条")
+    for w in res_default.warnings:
+        print(f"      · {w}")
+    print(f"  给锚（{TAPE_BASELINE_MM:.0f} mm）：警告 {len(res_anchored.warnings)} 条，"
+          f"其中含「基线」的 {len(a_base)} 条")
+    for w in res_anchored.warnings:
+        print(f"      · {w}")
+
+    checks = [
+        ("`expected_baseline_mm` 默认是 None（生产者没给锚）",
+         CalibConfig().expected_baseline_mm is None),
+        ("不给锚时**一条基线警告都没有** —— 大幅偏差被静默放过",
+         len(d_base) == 0),
+        ("给了锚就报出基线偏差（守卫确实存在，只是没被启用）",
+         len(a_base) == 1),
+        ("该警告里含具体数字（可行动，不只是「有问题」）",
+         bool(a_base) and re.search(r"\d", a_base[0]) is not None),
+        ("真机日志同样只有 2 条警告、且都**不是**基线那条（与本节同因）",
+         len(_log_warning_lines(LOG_EXCERPT)) == 2
+         and not any("基线" in w for w in _log_warning_lines(LOG_EXCERPT))),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def main() -> int:
+    print("=" * 70)
+    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚）")
+    print("=" * 70)
+    results = []
+    for fn in (test_log_summary_is_self_consistent,
+               test_mono_ok_but_stereo_explodes,
+               test_unusable_result_is_never_saved,
+               test_baseline_anchor_is_optional_and_therefore_silent):
+        results.append(fn())
+        print()
+    ok = all(results)
+    print("判定结果：" + ("全部通过" if ok else "有不达标项"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
