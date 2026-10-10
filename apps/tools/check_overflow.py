@@ -7,7 +7,7 @@
 > 名字里的 `check_` 是有意的：本文件**不是库** —— 它 import 时就执行、直接读
 > `sys.argv`。以前叫 `_overflow_lib.py`（`_lib` 前缀按约定表示"只被 import 的
 > 私有模块"），名字与实质相反，维护时得先查一遍它到底是不是死代码。
-> 命名约定见根目录 `agent.md` §4。
+> 命名约定见根目录 `AGENTS.md` §4。
 """
 import sys
 from pathlib import Path

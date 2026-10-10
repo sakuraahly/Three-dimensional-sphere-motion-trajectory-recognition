@@ -451,7 +451,7 @@ pt = rec.update(t, left=det_left, right_dets=dets_right)    # left 是【单个�
 ③ `as_array()` 无配对点时返回 `(0,4)` 零数组 —— 形状和内容都要判。
 ## 14. 依赖方向
 
-> **图与规则在根目录 `agent.md` §5（唯一权威），这里不复制。**
+> **图与规则在根目录 `AGENTS.md` §5（唯一权威），这里不复制。**
 > 只补一条 API 视角的说明 —— **为什么 `camera_registry` 和 `sources` 同层**：
 > 它只**惰性** import 一次 `sources`（`camera_registry.py:397` 的
 > `from .sources import CameraSource`，在 `_default_opener` 内部），
