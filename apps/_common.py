@@ -22,6 +22,93 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# apps/_common.py 的上一级就是项目根（apps/ 在根目录下）。
+ROOT = Path(__file__).resolve().parent.parent
+LOG_DIR = ROOT / "outputs" / "logs"
+
+_LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
+_LOG_DATEFMT = "%H:%M:%S"
+
+
+class _MillisecondFormatter(logging.Formatter):
+    """时间戳带毫秒。
+
+    为什么要毫秒：标定的价值在**帧间时序** —— "第 137 帧板停稳了、下一帧又判在动"
+    这种问题，秒级时间戳看不出来。
+    """
+
+    def formatTime(self, record, datefmt=None):  # noqa: N802 (标准库命名)
+        dt = datetime.fromtimestamp(record.created)
+        return dt.strftime("%H:%M:%S") + f".{int(record.msecs):03d}"
+
+
+def setup_logging(
+    tag: str,
+    *,
+    log_dir: Path | None = None,
+    console_level: int = logging.INFO,
+    file_level: int = logging.DEBUG,
+) -> Path:
+    """把日志**同时**写到终端和 ``outputs/logs/<tag>_<时间戳>.log``，返回文件路径。
+
+    为什么要落盘：本项目最贵的一类失败是**静默失败** —— 标定收了 8 对就不动了，
+    进程一退，拒绝原因的计数就没了，只能靠人在窗口前反复试。落盘之后，
+    "为什么没收满"变成一个可以回看、可以贴给别人、可以跨次比对的文件。
+
+    分工（照 STC 的"库不配日志、app 才配"）：
+      - **库层**（``calib/`` ``stereo/`` …）只 ``getLogger(__name__)`` 并写记录，
+        不装 handler、不决定写哪儿；
+      - **app 层**（本函数）负责装 handler、定路径、定级别。
+    这样库可以被测试直接 import 而不产生日志文件。
+
+    级别分工：文件收 ``DEBUG``（每帧判定都留），终端只显示 ``INFO`` ——
+    一帧一行打到终端会把有用信息淹掉。
+    """
+    directory = Path(log_dir) if log_dir is not None else LOG_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    root = logging.getLogger()
+    # 只配置一次：同一个进程里被调用两次（或测试里反复跑）不应重复叠加 handler。
+    if not getattr(root, "_dsh_configured", False):
+        root.setLevel(logging.DEBUG)
+
+        fh = logging.FileHandler(path, encoding="utf-8")
+        fh.setLevel(file_level)
+        fh.setFormatter(_MillisecondFormatter(_LOG_FORMAT, _LOG_DATEFMT))
+        root.addHandler(fh)
+
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setLevel(console_level)
+        sh.setFormatter(_MillisecondFormatter(_LOG_FORMAT, _LOG_DATEFMT))
+        root.addHandler(sh)
+
+        root._dsh_configured = True  # type: ignore[attr-defined]
+
+    return path
+
+
+def log_environment(log: logging.Logger) -> None:
+    """把"这次是在什么环境里跑的"记进日志开头。
+
+    为什么值得记：同一个标定失败，在 OpenCV 4.5 和 5.0 上原因可能完全不同，
+    没有版本信息就只能重跑一遍去问。
+    """
+    import platform
+
+    log.info("Python %s  (%s)", platform.python_version(), sys.executable)
+    log.info("平台 %s", platform.platform())
+    try:
+        import cv2
+
+        log.info("OpenCV %s", cv2.__version__)
+    except Exception as exc:  # 环境自检会另外报，这里不该因为它中断
+        log.warning("读不到 OpenCV 版本：%s", exc)
 
 
 def add_stereo_source_args(
@@ -74,4 +161,11 @@ def open_pair_source(args, *, exit_code: int = 1):
         return None
 
 
-__all__ = ["add_stereo_source_args", "open_pair_source"]
+__all__ = [
+    "ROOT",
+    "LOG_DIR",
+    "add_stereo_source_args",
+    "open_pair_source",
+    "setup_logging",
+    "log_environment",
+]

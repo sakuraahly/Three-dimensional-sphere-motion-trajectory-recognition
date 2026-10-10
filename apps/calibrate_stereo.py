@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -47,11 +48,38 @@ for _parent in Path(__file__).resolve().parents:
 import cv2
 import numpy as np
 
-from apps._common import add_stereo_source_args, open_pair_source
+from apps._common import (
+    add_stereo_source_args,
+    log_environment,
+    open_pair_source,
+    setup_logging,
+)
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
 
 WINDOW = "stereo calibration"
-PREVIEW_W = 720          # 单路预览宽度（两路并排 + 覆盖率图，正好放得下）
+PREVIEW_W = 720          # 单路预览宽度的**上限**（实际按屏幕与文字条带反推，见主循环）
+FOOTER_LINE_H = 19       # 文字条带每行高度（像素）
+
+
+def _screen_size() -> tuple[int, int]:
+    """当前主屏分辨率；取不到就退回 1920x1080。
+
+    为什么要它：面板比屏幕高的时候，``cv2.imshow`` 会把底部切掉 ——
+    而被切掉的恰好是"为什么收不满"的那几条统计。所以布局必须知道屏幕多大，
+    宁可把图像缩小，也不能让文字消失。
+
+    用 ctypes 直接问系统，不引入第三方依赖；非 Windows 或调用失败时退回默认值。
+    """
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        w, h = int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return 1920, 1080
 
 
 # --------------------------------------------------------------------------
@@ -115,16 +143,36 @@ def main() -> int:
                          "允许更小的板。**换来过检风险**，精度不满意就退回默认值重标")
     args = ap.parse_args()
 
+    # 日志要在**做任何事之前**起来：标定失败时最有价值的证据（拒绝了什么、
+    # 各拒了多少帧）现在只在内存里，进程一退就没了。
+    log_path = setup_logging("calibrate")
+    log = logging.getLogger("calibrate")
+    print(f"本次日志：{log_path}")
+    log.info("=== 双目标定开始 ===")
+    log.info("参数：left=%s right=%s backend=%s %dx%d@%d 目标 %d 对（最少 %d）",
+             args.left or args.left_video or args.left_dir,
+             args.right or args.right_video or args.right_dir,
+             args.backend, args.width, args.height, args.fps,
+             args.target, args.min_pairs)
+    log_environment(log)
+    if args.relaxed:
+        log.warning("启用了 --relaxed：门限放松，用精度换成功率")
+
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
     print(f"标定板：{spec.describe()}")
+    log.info("标定板：%s", spec.describe())
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
     print()
 
     src = open_pair_source(args)
     if src is None:
+        log.error("取帧源装配失败，退出")
         return 1
     print(src.describe())
+    log.info("取帧源：%s", src.describe())
     src.report_warnings()
+    for w in getattr(src, "warnings", []) or []:
+        log.warning("取帧源告警：%s", w)
     from calib import CaptureConfig
     cap_kw: dict = dict(
         target_pairs=args.target,
@@ -191,22 +239,44 @@ def main() -> int:
                 # 直接复用粗检结果画框 —— 之前这里又检测了一遍，
                 # 每帧 4 次全图精确检测（约 1.2 秒）就是卡顿的根源。
                 #
-                # 注意两路分辨率可能不同（实测外置 1280x720、内置实际给 1280x1080），
-                # 所以每路按自己的宽度独立缩放，再补齐到同一高度 ——
-                # 按"统一宽度"缩放会因为宽高比不同而得到不同高度，hstack 直接报错。
-                def _prep(img):
-                    s = PREVIEW_W / float(img.shape[1])
-                    out = cv2.resize(img, (PREVIEW_W, max(1, int(round(img.shape[0] * s)))),
-                                     interpolation=cv2.INTER_LINEAR)
+                # ---- 布局：先算文字，图像用剩下的空间 ----
+                #
+                # 为什么这么排：原来状态文字压在图像上（逐路状态在右上角、
+                # 拒绝统计在左下角），而且面板比窗口高，底部那几条**被裁掉** ——
+                # 被裁掉的恰好是"为什么收不满"的答案。
+                # 所以现在把两路图像 + 覆盖率图放上面，所有文字放**下面独立的条带**里，
+                # 并且反过来让图像去适应文字，而不是让文字去挤图像。
+                footer_lines = (
+                    collector.status_lines()
+                    + collector.side_lines()
+                    + [f"detect {det_ms:.0f} ms/frame  ({1000.0 / max(det_ms, 1e-3):.0f} fps)"
+                       f"   [q] 退出  [r] 清空重收"]
+                )
+                footer_h = len(footer_lines) * FOOTER_LINE_H + 10
+
+                sw, sh = _screen_size()
+                cov_w = 190
+                per_cam_w = max(240, (sw - 60 - cov_w) // 2)
+                # 取两路里更"瘦"的宽高比，保证两路都放得下（两路分辨率可能不同）
+                ar = min(left.shape[1] / left.shape[0], right.shape[1] / right.shape[0])
+                img_h = int(min(PREVIEW_W / ar, per_cam_w / ar, sh - 90 - footer_h))
+                img_h = max(200, img_h)
+
+                def _prep(img, target_h):
+                    s = target_h / float(img.shape[0])
+                    out = cv2.resize(
+                        img,
+                        (max(1, int(round(img.shape[1] * s))), target_h),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
                     return out, s
 
-                a, scale_l = _prep(left)
-                b, scale_r = _prep(right)
-                hh = max(a.shape[0], b.shape[0])
-                if a.shape[0] != hh:
-                    a = np.vstack([a, np.zeros((hh - a.shape[0], a.shape[1], 3), np.uint8)])
-                if b.shape[0] != hh:
-                    b = np.vstack([b, np.zeros((hh - b.shape[0], b.shape[1], 3), np.uint8)])
+                a, scale_l = _prep(left, img_h)
+                b, scale_r = _prep(right, img_h)
+                # 宽高比不同时补黑边，而不是拉伸（拉伸会让角点坐标与图上对不上）
+                for img in (a, b):
+                    if img.shape[0] != img_h:
+                        img = np.vstack([img, np.zeros((img_h - img.shape[0], img.shape[1], 3), np.uint8)])
                 for img, obs, sc in ((a, collector.last_obs[0], scale_l),
                                      (b, collector.last_obs[1], scale_r)):
                     if obs is None or not obs.found or obs.corners is None:
@@ -218,44 +288,33 @@ def main() -> int:
                     pts = obs.corners.reshape(-1, 2) * sc
                     for x, y in pts:
                         cv2.circle(img, (int(x), int(y)), 2, (0, 255, 255), -1)
-                top = np.hstack([a, b])
 
                 # 在两半上各打一个 LEFT / RIGHT 标记（含指定的相机编号/角色名）。
                 # 为什么要标：这个窗口是用户**判断左右有没有接反**的唯一现场依据 ——
                 # 他会在某台摄像头前晃手，看哪一半跟着动。没有标记就只能靠猜
                 # "左半边到底是不是 left"。
                 for img, tag in ((a, f"LEFT  ({args.left})"), (b, f"RIGHT ({args.right})")):
-                    (tw, th), _base = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-                    cv2.rectangle(img, (0, 0), (tw + 16, th + 16), (0, 0, 0), -1)
-                    cv2.putText(img, tag, (8, th + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (tw, th), _base = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+                    cv2.rectangle(img, (0, 0), (tw + 16, th + 14), (0, 0, 0), -1)
+                    cv2.putText(img, tag, (8, th + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                                 (0, 255, 0), 2, cv2.LINE_AA)
 
                 # 覆盖率图只在收帧数变化时重画（原来每帧都重建一次画布）
                 if collector.count != cov_cache_n:
-                    if collector.image_size:
-                        # 缩放到约 200 px 高，宽度按原比例跟着走
-                        cov_scale = 200.0 / collector.image_size[1]
-                    else:
-                        cov_scale = 0.2
-                    cov_cache = collector.coverage_image(scale=cov_scale)
+                    cov_cache = collector.coverage_image(
+                        size=(cov_w, img_h), scale=1.0)
                     cov_cache_n = collector.count
                 cov = cov_cache
-                if cov is None:
-                    cov = np.zeros((top.shape[0], 180, 3), np.uint8)
-                if cov.shape[0] < top.shape[0]:
-                    cov = np.vstack([cov, np.zeros((top.shape[0] - cov.shape[0], cov.shape[1], 3), np.uint8)])
-                panel = np.hstack([top, cov[: top.shape[0]]])
+                if cov is None or cov.shape[:2] != (img_h, cov_w):
+                    cov = np.zeros((img_h, cov_w, 3), np.uint8)
+                row = np.hstack([a, b, cov])
 
-                lines = collector.status_lines()
-                lines.append(f"detect {det_ms:.0f} ms/frame  ({1000.0 / max(det_ms, 1e-3):.0f} fps)")
-                for i, line in enumerate(lines):
-                    cv2.putText(panel, line, (8, panel.shape[0] - 78 + i * 18),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                # 逐路状态打在右上角：一眼看出是哪一路没找到板、差在哪
-                for i, line in enumerate(collector.side_lines()):
-                    (tw, _th), _b = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.putText(panel, line, (panel.shape[1] - tw - 8, 20 + i * 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                # 文字条带：整幅宽度，画在图像**下方**，永远不会压住画面
+                footer = np.zeros((footer_h, row.shape[1], 3), np.uint8)
+                for i, line in enumerate(footer_lines):
+                    cv2.putText(footer, line, (10, 18 + i * FOOTER_LINE_H),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (235, 235, 235), 1, cv2.LINE_AA)
+                panel = np.vstack([row, footer])
                 cv2.imshow(WINDOW, panel)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -281,14 +340,20 @@ def main() -> int:
 
     print()
     print(f"共处理 {frames} 帧，收下 {collector.count} 对")
-    if collector.rejected:
-        print("剔除原因统计：")
-        for r, n in sorted(collector.rejected.items(), key=lambda kv: -kv[1]):
-            print(f"  {n:5d}  {r}")
+    # 结束时的**完整**统计：不再只印前三条，也不再只留在内存里。
+    # 用户卡在"收了 8 对就不动"时，能看到的证据就是这里。
+    print()
+    for line in collector.summary_lines():
+        print(line)
+    collector.log_summary()
+    log.info("采集结束：%d 对（目标 %d，最少 %d）", collector.count, args.target, args.min_pairs)
 
     if not collector.enough:
+        hint = collector.next_step_hint()
         print(f"\n[失败] 只收到 {collector.count} 对，少于 {args.min_pairs} 对，无法标定。")
-        print("建议：让板更大更清晰、移动慢一点、每个姿势停稳 1 秒、覆盖画面各个区域。")
+        if hint:
+            print(f"下一步：{hint}")
+        print(f"（完整逐帧记录见日志：{log_path}）")
         return 1
 
     objp = spec.object_points()
@@ -299,6 +364,7 @@ def main() -> int:
     cfg = CalibConfig(expected_baseline_mm=args.baseline_mm)
     res = calibrate_stereo(objp, ip1, ip2, img_size, cfg, spec)
     print(res.report())
+    log.info("标定结果：\n%s", res.report())
 
     if args.report_png:
         try:
@@ -309,6 +375,7 @@ def main() -> int:
 
     if not res.ok:
         print("标定未通过质量判定，未保存结果。请按上面的提示重拍。")
+        log.warning("标定未通过质量判定，未保存")
         return 1
 
     rig = StereoRig.from_result(res, meta={
@@ -325,6 +392,8 @@ def main() -> int:
     print("下一步：")
     print("  - 三角测量时用 calib.StereoRig.load('config/stereo_calibration') 读取参数")
     print("  - 装置如果被碰动，用 apps/verify_stereo.py 复检极线误差")
+    log.info("标定成功，已保存 %s", npz)
+    print(f"（本次日志：{log_path}）")
     return 0
 
 

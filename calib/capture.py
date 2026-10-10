@@ -7,13 +7,34 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import re
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from .board import BoardObservation, BoardSpec, detect_board, detect_board_in_roi, pose_distance
+
+# 库层只取 logger、只写记录；装 handler / 定路径是 app 的事（见 apps/_common.setup_logging）。
+logger = logging.getLogger(__name__)
+
+
+def reject_category(reason: str) -> str:
+    """把一条拒绝原因归到**稳定类别**，用于计数。
+
+    为什么必须归一化：原因里嵌着每帧都不同的数字 ——
+    "左图模糊(清晰度 42)" 和 "左图模糊(清晰度 51)" 是**两个不同的字符串**。
+    直接拿字符串当 key 计数，统计会被打散成几百个只出现一次的条目，
+    聚合出来的"最常见原因"完全没有意义 —— 而这恰恰是诊断卡在哪一步的唯一线索。
+
+    规则：截到第一个括号为止，再去掉残留的数字和空白。
+    完整原因（含数字）仍然写进日志的逐帧记录，聚合与细节都不丢。
+    """
+    head = re.split(r"[（(]", reason, maxsplit=1)[0]
+    head = re.sub(r"\d+(\.\d+)?\s*(px|%|级)?", "", head)
+    return head.strip(" ：:，,。.")
 
 
 @dataclass
@@ -122,7 +143,10 @@ class AutoPairCollector:
         self.pairs: list[CapturedPair] = []
         self._prev_h: dict[str, np.ndarray | None] = {"left": None, "right": None}
         self._region_count: dict[tuple[int, int], int] = {}
+        # 计数按**稳定类别**走（原因里带数字，直接当 key 会把统计打散）
         self.rejected: dict[str, int] = {}
+        self.reject_examples: dict[str, str] = {}   # 类别 -> 最近一次完整原因
+        self.frames = 0                              # 看过的总帧数
         self.last_reason = ""
         self.image_size: tuple[int, int] | None = None  # (w, h)
         # 本帧的粗检结果，供界面直接画框（避免重复检测 —— 那是主要的卡顿来源）
@@ -151,8 +175,16 @@ class AutoPairCollector:
         self.last_accepted = False
 
     def _reject(self, reason: str) -> tuple[bool, str]:
-        self.rejected[reason] = self.rejected.get(reason, 0) + 1
+        """记一次拒绝。
+
+        计数按**归一化类别**走（见 ``reject_category``），完整原因单独留一份样本 ——
+        没有这一步，"收了 8 对就不动了"永远只能靠人在窗口前猜。
+        """
+        key = reject_category(reason) or reason
+        self.rejected[key] = self.rejected.get(key, 0) + 1
+        self.reject_examples[key] = reason
         self.last_reason = reason
+        logger.debug("拒收 #%d  %s", self.reject_total, reason)
         return False, reason
 
     # ------------------------------------------------------------------
@@ -165,6 +197,7 @@ class AutoPairCollector:
         """尝试收一帧。返回 (是否收下, 原因)。"""
         cfg = self.cfg
         spec = spec or self.spec
+        self.frames += 1
         h, w = left_gray.shape[:2]
         self.image_size = (w, h)
         diag = math.hypot(w, h)
@@ -196,7 +229,6 @@ class AutoPairCollector:
                 why += "｜" + "；".join(notes)
             return self._reject(why)
         assert obs_l.corners is not None and obs_r.corners is not None
-
         # 2) 清晰度
         for name, obs in (("左", obs_l), ("右", obs_r)):
             if obs.sharpness < cfg.min_sharpness:
@@ -271,6 +303,9 @@ class AutoPairCollector:
         self.last_obs = (acc_l, acc_r)
         self.last_accepted = True
         self.last_reason = f"已收 {self.count}/{cfg.target_pairs}"
+        logger.info("收下第 %d/%d 对（宫格 %d,%d；清晰度 左%.0f 右%.0f）",
+                    self.count, cfg.target_pairs, gx, gy,
+                    acc_l.sharpness, acc_r.sharpness)
         return True, self.last_reason
 
     # ------------------------------------------------------------------
@@ -302,24 +337,103 @@ class AutoPairCollector:
                     (255, 255, 255), 1, cv2.LINE_AA)
         return canvas
 
-    def status_lines(self) -> list[str]:
-        """给实时窗口用的状态文本。"""
-        lines = [f"collected {self.count}/{self.cfg.target_pairs}"]
+    def status_lines(self, top: int = 4) -> list[str]:
+        """给实时窗口用的状态文本（**放在画面之外的条带里**，不遮图像）。
+
+        每条带上"占已处理帧的百分比"，而不是只有绝对次数 ——
+        ``x419`` 看不出严重程度，``419 (78%)`` 一眼就知道卡在哪。
+        """
+        lines = [f"已收 {self.count}/{self.cfg.target_pairs}"
+                 f"   已看 {self.frames} 帧   已拒 {self.reject_total}"]
+        lines.append("本帧: " + (self.last_reason or "-"))
         if self.rejected:
-            top = sorted(self.rejected.items(), key=lambda kv: -kv[1])[:3]
-            lines.append("last: " + self.last_reason)
-            for r, n in top:
-                lines.append(f"  x{n}  {r}")
-        else:
-            lines.append("last: " + self.last_reason)
+            total = max(self.reject_total, 1)
+            for r, n in sorted(self.rejected.items(), key=lambda kv: -kv[1])[:top]:
+                lines.append(f"    {n:>5} ({n / total * 100:4.1f}%)  {r}")
         return lines
+
+    @property
+    def reject_total(self) -> int:
+        return sum(self.rejected.values())
+
+    def summary_lines(self, top: int | None = None) -> list[str]:
+        """**完整**的拒绝统计（默认全部，不截断）。
+
+        和 ``status_lines`` 的区别：那个给屏幕、只放得下前几条；
+        这个给日志和结束报告 —— **被截掉的那几条往往才是真因**。
+        """
+        items = sorted(self.rejected.items(), key=lambda kv: -kv[1])
+        if top is not None:
+            items = items[:top]
+        total = max(self.reject_total, 1)
+        out = [f"共处理 {self.frames} 帧：收下 {self.count} 对，拒收 {self.reject_total} 帧"]
+        if not items:
+            return out
+        out.append("拒收原因（按次数）：")
+        for r, n in items:
+            out.append(f"  {n:>6} ({n / total * 100:5.1f}%)  {r}")
+            example = self.reject_examples.get(r)
+            if example and example != r:
+                out.append(f"          例：{example}")
+        return out
+
+    def next_step_hint(self) -> str:
+        """按**占比最高**的那条拒收原因，给一句能照做的话。
+
+        为什么要它：STC/全局规则都要求"反馈引导行动"。只说"收了 8 对，
+        不够 10 对"是报告问题；告诉人"把板挪到画面其他宫格"才是解决问题。
+        没有这一句，人只能在窗口前反复试同一个动作。
+        """
+        if not self.rejected:
+            return ""
+        top = max(self.rejected.items(), key=lambda kv: kv[1])[0]
+        pct = self.rejected[top] / max(self.reject_total, 1) * 100.0
+
+        # 顺序有讲究：先匹配更具体的说法，避免被宽泛的规则先截走。
+        rules: list[tuple[tuple[str, ...], str]] = [
+            (("宫格已收满", "区域已满"),
+             "板已经在这个区域收够了 —— **把板移到画面别的宫格**（上/下/左/右/角落），"
+             "每个区域最多收 5 对（cfg.max_per_region）"),
+            (("与已收位姿太接近",),
+             "板的姿态和已收的差不多 —— **换个角度或挪个位置**再停稳；"
+             "确实需要更多近似姿态时调小 diversity_min"),
+            (("还在移动",),
+             "板没停稳 —— 每个姿势**停住约 1 秒**再移开；手抖得厉害就加 --relaxed"),
+            (("都未检测到棋盘",),
+             "两路都没看到板 —— 把板举到**两路视野重叠区**（先跑 启动程序.bat precheck 看重叠区在哪）"),
+            (("未检测到棋盘",),
+             "有一路没看到板 —— 看条带里那一侧的「清晰度 / 面积」，"
+             "多半是那一路画质或视野问题，跑 启动程序.bat diag 定位"),
+            (("模糊",),
+             "画面模糊 —— 擦镜头、撕保护膜、加光；或放宽 --min-sharpness"),
+            (("棋盘太小",),
+             "板太远 —— **把板拿近**，或换更大的板"),
+            (("棋盘贴边",),
+             "板压到画面边缘 —— 让整块板都进画面，四边留出余量"),
+            (("曝光", "过曝", "过暗"),
+             "曝光不合适 —— 调整光照角度，避开强光直射与阴影"),
+            (("太近",),
+             "板离镜头太近 —— 往后退一点"),
+        ]
+        for keys, advice in rules:
+            if any(k in top for k in keys):
+                return f"占比最高的是「{top}」（{pct:.0f}%）—— {advice}"
+        return f"占比最高的是「{top}」（{pct:.0f}%）—— 先按这条调整，再看日志里的完整统计"
+
+    def log_summary(self) -> None:
+        """把完整统计写进日志（终端 + 文件）。"""
+        for line in self.summary_lines():
+            logger.info("%s", line)
+        hint = self.next_step_hint()
+        if hint:
+            logger.info("下一步：%s", hint)
 
     def side_lines(self) -> list[str]:
         """**逐路**状态：哪一路找到板、清晰度多少。
 
         为什么单独要这一行：两路画质差很多时（一路蒙雾一路正常），
         只有合并后的"未同时检测到"完全看不出是哪一路的问题，
-        人会一直在窗口前挪板子。把这行打在画面上，一眼就知道该修哪路。
+        人会一直在窗口前挪板子。把这一行放上屏，一眼就知道该修哪路。
         """
         out = []
         for name, obs in (("左", self.last_obs[0]), ("右", self.last_obs[1])):
