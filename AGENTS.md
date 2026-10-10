@@ -76,7 +76,7 @@ sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）
 calib/            双目标定（离线一次）
 stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角测量）
 apps/             可执行程序；tools/ 放一次性设置与诊断
-tests/            回归测试（9 个，改动后必跑）
+tests/            回归测试（10 个，改动后必跑）
 docs/             文档
 assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
 ```
@@ -85,7 +85,7 @@ assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
-2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 9 个回归测试必须能一键复跑。
+2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 10 个回归测试必须能一键复跑。
 3. **能重新生成的东西不进版本库**（`outputs/`、`config/`、权重、视频素材）。
 4. **交付物不放 `outputs/`**。`outputs/` 的语义是"删了也能重新生成"，
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
@@ -160,6 +160,7 @@ apps / tests                        （只调用，不被调用）
 | `docs/API.md` | 库的签名 / 返回 / 坑 | 调库 |
 | `docs/用户手册.md` | 面向使用者的操作与排障 | 要跑起来 |
 | `docs/计划书.md` | 目标、里程碑 M0–M8、风险 | 想知道还剩什么 |
+| `docs/planbooks/` | **一次工作的计划书**（范围/优先级/验收/明确不做） | 要开工时 |
 | `docs/PPT生成流程.md` + 两份文稿 | 开题报告生成与答辩讲稿 | 要改报告 / 答辩 |
 
 **优先级分两条，不要混成一张表**（同 `STC/standards/02-文档体系.md` §3）：
@@ -190,7 +191,7 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 7. 质量底线：9 个回归测试
+## 7. 质量底线：10 个回归测试
 
 ```powershell
 启动程序.bat test                                  # 最快的一个（环境自测）
@@ -208,6 +209,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_stereo_pipeline.py` | 同步 + 配对 + 三角测量 |
 | `selftest_stereo_branch.py` | 双目整条链路 |
 | `selftest_preview_lib.py` | PPT 预览渲染 |
+| `selftest_config_wiring.py` | 配置接线（每个配置项都必须真的被读） |
 
 **判定口径**：每个都打印 `判定结果：全部通过`，且退出码 `0`。
 `[跳过]` 也算通过（缺可选依赖 / 无相机时），但**跳过 ≠ 验证过**。
