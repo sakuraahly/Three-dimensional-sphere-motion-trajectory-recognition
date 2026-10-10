@@ -279,10 +279,50 @@ def draw_3d_panel(
 def hud_lines(
     result,
     cfg,
+    health=None,
 ) -> list[str]:
-    """生成 HUD 文本（纯 ASCII）。"""
+    """生成 HUD 文本（纯 ASCII）。
+
+    ## 帧率为什么要分三个写出来（这是本函数改动的全部理由）
+
+    改之前第一行是 **`FPS {result.fps}`** —— 而 `result.fps` 量的是**主循环**
+    每秒处理多少帧（`pipeline._fps_ema`），**不是摄像头采集帧率**。
+    两件事在画面上长得一样，但含义差很远：
+
+    - 主循环 15 fps 可能是"相机 30 fps 但检测太慢"，也可能是"相机只给了 15 fps"；
+    - 光看一个数**分不出是哪一种**，于是"往哪个方向优化"纯靠猜。
+
+    这正是 §10.10 与坑清单反复引用的"走错方向的根因"。
+    现在三个口径分开写、各有唯一的名字（与 `stats.Health.summary_line` 同一套叫法）：
+
+    | 名字 | 含义 | 谁算的 |
+    | ---- | ---- | ------ |
+    | `cap` | 采集帧率（相机侧给了多少） | `Health.capture_fps` |
+    | `loop` | 主循环帧率（我们处理得过来多少） | `Health.loop_fps` |
+    | `detect` | 单帧检测耗时 | `Health.stages.detect_ms` |
+
+    拿不到 `health`（例如离线视频、或还没接线）时退化成一行明确的
+    `loop ...`，**不再出现裸的 `FPS`** —— 裸 `FPS` 正是歧义的来源。
+
+    `STALL` 是采集停住的提示：**没有它的话，"球没动"与"相机没了"在画面上完全一样**
+    （见 `sources.LatestFrameCamera.stalled`）。
+    """
     lines: list[str] = []
-    lines.append(f"FPS {result.fps:5.1f}   detect {result.detect_ms:5.1f} ms")
+    if health is not None:
+        head = (f"cap {health.capture_fps:5.1f}  loop {health.loop_fps:5.1f}  "
+                f"detect {health.stages.detect_ms:6.1f} ms")
+        if health.dropped_frames:
+            head += f"  drop {health.dropped_frames}"
+        if health.frame_age_ms > 0:
+            head += f"  age {health.frame_age_ms:5.1f} ms"
+        if health.skew_ms_valid:
+            head += f"  skew {health.skew_ms:+6.1f} ms"
+        lines.append(head)
+    else:
+        # 没有 Health 时也要说清这是哪个"帧率"
+        lines.append(f"loop {result.fps:5.1f}  detect {result.detect_ms:6.1f} ms")
+    if getattr(result, "stalled", False):
+        lines.append("** STALL: 采集停住（相机掉线/被占用？）**")
     det = result.detection
     trk: TrackState | None = result.track
     lines.append(f"method {cfg.detector.method}" + (f"  |  {det.method}" if det else "  |  no target"))

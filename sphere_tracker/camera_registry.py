@@ -514,6 +514,200 @@ def rank_candidates(
     return sorted(devices, key=lambda d: (-score(d), d.order))
 
 
+@dataclass
+class Availability:
+    """「现在能不能用相机」的集中判定结果。
+
+    ## 为什么需要它
+
+    没有相机时，四个入口给出**四种不同的失败**（2026-10-10 实测）：
+
+    | 入口 | 表现 |
+    | ---- | ---- |
+    | `run_realtime.py` | 5.1 s，先刷一堆 OpenCV 原始 `VIDEOIO` 警告，最后才说"没找到可用的摄像头" |
+    | `calibrate_stereo.py` | 只说"取帧源装配失败，退出"（**没说是相机**） |
+    | `verify_stereo.py` | 报"找不到标定文件"（真因往往正是**没有相机所以从没标定成功过**） |
+    | `check_stereo_setup.py` | 退出码 2，提示要先给 `--left/--right` |
+
+    没有任何一处**集中**回答"到底有没有相机、以及该怎么办"。
+    用户（尤其是不接相机时）会被引到错误的方向上排查。
+
+    这个类把判定集中到一个地方，并给出**可执行的下一步**。
+
+    ⚠️ 它判的是"**现在**能不能用"，不是"机器上有没有相机" ——
+    被占用、驱动刚崩、USB 掉带宽都会让一台存在的相机不可用，
+    这时 `device_count > 0` 但 `usable_count == 0`，`reason` 必须说清是这种情况。
+    """
+
+    ok: bool = False
+    device_count: int = 0        # 枚举到的设备数（含不可用的）
+    usable_count: int = 0        # 真的能开、能读到非黑帧的台数
+    need: int = 1                # 调用方需要几台（`ok` 是"够不够"，不是"有没有"）
+    probed: list[int] = field(default_factory=list)   # 试开过哪些索引
+    reason: str = ""             # 一句话说清"为什么不行"
+    remedy: str = ""             # 可执行的下一步
+
+
+def camera_availability(
+    *,
+    need: int = 1,
+    devices: list[DeviceEntry] | None = None,
+    probe=probe_index,
+    reg: Registry | None = None,
+    settings: dict | None = None,
+) -> Availability:
+    """现在能用几台相机？不能的话为什么、怎么办。
+
+    ## ⚠️ 它**委托** `select_cameras`，不自己判"合格"
+
+    第一版在这里把"能开 + 能读到帧 + 不是全黑 + 分辨率达标"**又实现了一遍**，
+    于是同一台机器上两个函数给出**相反的结论**（2026-10-10 实测）：
+
+    ```
+    select_cameras_detailed(need=1)  -> ok=True  picks=[#0 1920x1080]
+    camera_availability(need=1)      -> ok=False usable=0
+                                        "#0 画面是全黑常量流"
+    ```
+
+    两个都对，只是判据在细节上不一致（黑帧阈值的比法不同）。
+    **同一个事实实现两遍，迟早会漂移** —— 这正是本项目反复出现的头号问题，
+    所以这里只保留**一个**实现：挑选用 `select_cameras`，本函数只负责
+    "把失败翻译成人话 + 给出下一步"。
+
+    所有外部依赖（`devices` / `probe` / `reg`）可注入，
+    因此没有相机的机器上也能把每条分支走一遍（见 `selftest_camera_presence.py`）。
+    """
+    merged = {**DEFAULT_SETTINGS, **((reg.settings if reg else {}) or {})}
+    merged.update(settings or {})
+
+    devices = list_devices() if devices is None else devices
+    sel = select_cameras_detailed(need=need, devices=devices, probe=probe,
+                                  reg=reg, settings=merged)
+
+    av = Availability(ok=sel.ok, device_count=len(devices),
+                      usable_count=len(sel.picks))
+    av.probed = list(range(sel.probed))
+    av.need = int(need)
+
+    if av.ok:
+        return av
+
+    # ---- 说清是"没有相机"还是"有但都不可用"：排查方向完全不同 ----
+    if len(devices) == 0:
+        av.reason = f"没有检测到任何摄像头（试开了 {sel.probed} 个索引）"
+        if sel.probe_errors:
+            av.reason += "；" + "；".join(sel.probe_errors[:3])
+        av.remedy = (
+            "① 确认相机插好（换一个 USB 口，优先直插主板而不是扩展坞）；"
+            "② 跑 `启动程序.bat check` 看设备列表；"
+            "③ 只是想试功能的话可以喂视频："
+            "`python apps/run_video.py --source <视频文件>`"
+        )
+    elif av.usable_count == 0:
+        av.reason = (f"检测到 {len(devices)} 个设备，但能用的只有 0 个"
+                     f"（需要 {need} 个，试开了 {sel.probed} 个索引）")
+        if sel.probe_errors:
+            av.reason += "；" + "；".join(sel.probe_errors[:4])
+        av.remedy = (
+            "① 相机可能被别的程序占着（关掉相机 App / 会议软件 / 另一个本程序实例）；"
+            "② 跑 `启动程序.bat diag` 看是不是带宽不足或画面全黑；"
+            "③ 跑 `启动程序.bat setup` 确认「左 / 右 / 无关」的分配"
+        )
+    else:
+        # 挑到了一些，但**不够用** —— 这条必须与"一台都没有"分开说，
+        # 否则用户会以为相机全坏了，实际只是台数不够。
+        av.reason = (f"检测到 {len(devices)} 个设备，但能用的只有 {av.usable_count} 个"
+                     f"（需要 {need} 个，试开了 {sel.probed} 个索引）")
+        av.remedy = (
+            "① 第二台相机没插好 / 被占用 / 分辨率不达标（双目需要两台**同分辨率**的）；"
+            "② 跑 `启动程序.bat check` 逐台确认；"
+            "③ 只想试单目的话用 `启动程序.bat run`，或喂视频："
+            "`python apps/run_video.py --source <视频文件>`"
+        )
+    return av
+
+
+# --------------------------------------------------------------------------- #
+# 选相机：**唯一的判定者**
+# --------------------------------------------------------------------------- #
+@dataclass
+class Selection:
+    """一次"要几台相机"的完整结论：挑到了什么、以及要告诉用户的话。
+
+    ## 为什么要有这个结果对象（而不是让调用方自己判断）
+
+    改之前有两套判定并存，它们**对同一台机器给出相反的结论**（2026-10-10 实测）：
+
+    | 谁 | 对同一台笔记本怎么说 |
+    | -- | -------------------- |
+    | `camera_availability(need=1)` | `ok=True`（#0 确实能开、能读到帧） |
+    | `select_cameras(need=1)` | 挑到了，但**告警**：只能动用被标为「无关」的相机 |
+
+    两个都对，只是**判据不同**：后者把"用户明确标了无关"当成降级。
+    于是 `run_realtime` 报出"可用性判定通过，但挑选失败" ——
+    一句**自相矛盾**的话，因为它在拿两套判定的结果对撞。
+
+    → 修法：**只留一个判定者**。`select_cameras()` 仍然是权威，
+    但它把"挑到了什么"与"有什么话要说"一起交出来，调用方不再自己判断。
+    """
+
+    picks: list[ProbeResult] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)   # 要原样打给用户的话
+    need: int = 1
+    probed: int = 0                                  # 实际试开了几次
+    probe_errors: list[str] = field(default_factory=list)  # 每台失败的原因
+
+    @property
+    def ok(self) -> bool:
+        """**够不够用**，不是"有没有挑到"。
+
+        ⚠️ 这里曾经只看"挑到没挑到"，于是 `need=2` 只挑到 1 台时
+        `ok=True` —— 调用方（双目标定）会拿到**数量不足**的结果并继续往下跑，
+        在更远的地方以更难懂的方式失败。**"够不够"才是调用方要问的问题。**
+        （由 `selftest_camera_presence.py` 第 6/8 节的对照断言逼出来。）
+        """
+        return len(self.picks) >= max(1, int(self.need))
+
+
+def select_cameras_detailed(
+    *,
+    need: int = 1,
+    devices: list[DeviceEntry] | None = None,
+    probe=probe_index,
+    reg: Registry | None = None,
+    settings: dict | None = None,
+    indices: list[int] | None = None,
+) -> Selection:
+    """`select_cameras` 的"带说明"版本：挑到的相机 + 该说的话。
+
+    识别到的告警（原来直接 `print` 在库层，调用方既接不住也没法落盘）
+    现在随结果返回 —— 这是计划书 P1-4「库层 print 禁令」的一个真实样本。
+    """
+    import contextlib
+    import io
+
+    counter = {"n": 0}
+    errors: list[str] = []
+
+    def counting_probe(i: int):
+        counter["n"] += 1
+        return probe(i)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        picks = select_cameras(need=need, devices=devices, probe=counting_probe,
+                               reg=reg, settings=settings, indices=indices,
+                               _errors_out=errors)
+    notes = [buf.getvalue().strip()] if buf.getvalue().strip() else []
+    return Selection(picks=list(picks), notes=notes, need=int(need),
+                     probed=counter["n"], probe_errors=list(errors))
+
+
+def _failed_probe(entry: DeviceEntry, error: str) -> ProbeResult:
+    """构造一个"试开失败"的 `ProbeResult`（保住设备信息，便于报给用户）。"""
+    return ProbeResult(entry.order, False, 0, 0, 0.0, 0.0, error, entry)
+
+
 def select_cameras(
     *,
     need: int = 1,
@@ -522,11 +716,19 @@ def select_cameras(
     reg: Registry | None = None,
     settings: dict | None = None,
     indices: list[int] | None = None,
+    _errors_out: list[str] | None = None,
 ) -> list[ProbeResult]:
     """自动挑 need 台"能用"的相机。挑不满就返回实际的几台，**不抛异常**。
 
     合格 = 能打开 + 读到帧 + 不是全黑常量流 + 分辨率达到 min_width/min_height。
     双目时会优先挑两台实际分辨率一致的一对。
+
+    ⚠️ **它是"能不能用相机"的唯一判定者**。想连说明一起拿到，
+    用 `select_cameras_detailed()`（它不会再往终端打印）。
+
+    `_errors_out`：传一个 list 进来，试开失败的原因会写进去。
+    **刻意用私有名** —— 它是给 `select_cameras_detailed` 用的通道，
+    公开 API 请走那个版本。
     """
     merged = {**DEFAULT_SETTINGS, **((reg.settings if reg else {}) or {})}
     merged.update(settings or {})
@@ -560,15 +762,35 @@ def select_cameras(
     limit = 1 if need <= 1 else need + 2
 
     picked: list[ProbeResult] = []
+    probe_errors: list[str] = []
+    if _errors_out is not None:
+        _errors_out.clear()
     for entry in cands:
-        res = probe(entry.order)
+        # ⚠️ 试开必须**自己接住异常**：`probe_index` 会去开真实设备，
+        # 驱动抽风 / 设备被热拔 / USB 控制器报错都可能抛出来。
+        # 改之前这里不接，一个索引抛异常会让**整次挑选崩掉** ——
+        # 用户看到的是一个 traceback，而不是"这台不行，试下一台"。
+        # （这个缺陷是 `selftest_camera_presence.py` 的"试开抛异常"一节逼出来的：
+        #   先写测试、测试崩了，才发现是库层的锅。）
+        try:
+            res = probe(entry.order)
+        except Exception as exc:                     # noqa: BLE001
+            # ⚠️ **失败的试开不许进 `picked`**。第一版把它 append 了进去，
+            # 于是"试开抛异常"被当成"挑到了一台相机"（`ok=False` 的
+            # `ProbeResult` 也算数）—— `usable_count` 报 1、`Selection.ok` 报 True。
+            # 失败信息只进 `probe_errors`，供报错文本使用。
+            probe_errors.append(f"#{entry.order} 试开异常：{type(exc).__name__}: {exc}")
+            continue
         if not isinstance(res, ProbeResult):
             continue
         res = ProbeResult(res.index, res.ok, res.width, res.height, res.fps,
                           res.std, res.error, entry)
         if not res.ok:
+            probe_errors.append(f"#{entry.order} {res.error or '打不开'}")
             continue
         if res.width and res.height and (res.width < min_w or res.height < min_h):
+            probe_errors.append(f"#{entry.order} 分辨率 {res.width}x{res.height} "
+                                f"低于要求 {min_w}x{min_h}")
             continue
         picked.append(res)
         if len(picked) >= limit:
@@ -597,6 +819,8 @@ def select_cameras(
         print(f"[警告] 可用的相机不够，只能动用被标为「无关」的相机：{names}\n"
               f"        如果这是误标，跑 python apps/tools/cameras.py unignore --all 清掉；"
               f"如果想换一台，检查相机是不是没插好。")
+    if _errors_out is not None:
+        _errors_out.extend(probe_errors)
     return result
 
 

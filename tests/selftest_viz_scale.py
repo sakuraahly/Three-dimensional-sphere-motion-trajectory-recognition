@@ -77,8 +77,9 @@ import numpy as np
 
 from sphere_tracker.config import AppConfig
 from sphere_tracker.pipeline import SpherePipeline
+from sphere_tracker.stats import Health
 from sphere_tracker.types import Detection, FrameResult, TrailPoint
-from sphere_tracker.viz import draw_3d_panel
+from sphere_tracker.viz import draw_3d_panel, hud_lines
 
 W, H = 320, 240
 BG = np.array([40, 40, 40], np.int16)
@@ -320,7 +321,7 @@ def test_3d_panel_text_scales() -> bool:
 
 def test_content_area_grows_with_k_squared() -> bool:
     """内容**面积**应随 k² 增长（线宽/半径/字号都乘了 k）。"""
-    print("----- 5. 内容面积随 k² 增长 -----")
+    print("----- 8. 内容面积随 k² 增长 -----")
     _, n1 = bbox(render(1.0), ANY)
     _, n2 = bbox(render(SCALE), ANY)
     ratio = n2 / max(n1, 1)
@@ -330,6 +331,76 @@ def test_content_area_grows_with_k_squared() -> bool:
     checks = [
         (f"面积比值落在 k² 的 0.6~1.6 倍（{expect * 0.6:.1f}~{expect * 1.6:.1f}）",
          expect * 0.6 < ratio < expect * 1.6),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_hud_separates_the_three_frame_rates() -> bool:
+    """HUD 必须把 **cap / loop / detect** 三个口径分开写，且**永不出现裸 `FPS`**。
+
+    改之前第一行是 `FPS {result.fps}` —— 而 `result.fps` 量的是**主循环**速率，
+    **不是相机采集帧率**。两件事在画面上长得一样，但含义差很远：
+
+    - 主循环 15 fps 可能是"相机 30 fps 但检测太慢"，也可能是"相机只给了 15 fps"；
+    - 只看一个数**分不出是哪一种**，"往哪个方向优化"纯靠猜。
+
+    这正是 §10.10 与坑清单反复引用的"走错方向的根因"。
+    """
+    print("----- 6. HUD 的三个帧率口径分得开 -----")
+    cfg = make_cfg(1.0)
+    result = make_result()
+
+    # 没接 Health 时：只能说清这是"loop"，不许再叫 FPS
+    fallback = " ".join(hud_lines(result, cfg))
+    has_bare_fps = "FPS" in fallback.upper().replace("LOOP", "")
+    print(f"  未接 Health：{fallback.strip()[:76]}")
+    print(f"    含裸 FPS = {has_bare_fps}（必须 False）")
+
+    h = Health()
+    h.note_capture(capture_ms=33.3, frame_age_ms=4.0)     # -> cap ≈ 30.0
+    h.end_frame(detect_ms=12.5, process_ms=40.0)          # -> loop ≈ 25.0
+    line = " ".join(hud_lines(result, cfg, health=h))
+    print(f"  接了 Health：{line.strip()[:86]}")
+    checks = [
+        ("未接 Health 时也不出现裸 `FPS`（裸 FPS 就是歧义来源）", not has_bare_fps),
+        ("未接 Health 时明确写 `loop`", "loop" in fallback),
+        ("接了 Health 后有 `cap`", "cap" in line),
+        ("接了 Health 后有 `loop`", "loop" in line),
+        ("接了 Health 后有 `detect`", "detect" in line),
+        ("三个数都在同一行（一眼能对比）",
+         all(k in line.split("method")[0] for k in ("cap", "loop", "detect"))),
+        ("cap 与 loop 是**不同**的值（否则等于没分开）",
+         abs(h.capture_fps - h.loop_fps) > 0.5),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_hud_shows_stall() -> bool:
+    """采集停住时 HUD 必须打出来。
+
+    **没有这个提示，"球没动"与"相机没了"在画面上完全一样** ——
+    那是本项目头号成本（出事了但没人知道）最纯粹的形态。
+    """
+    print("----- 7. 采集停住时 HUD 打 STALL -----")
+    cfg = make_cfg(1.0)
+    result = make_result()
+    quiet = " ".join(hud_lines(result, cfg))
+    result.stalled = True
+    loud = " ".join(hud_lines(result, cfg))
+    print(f"  stalled=False：{'STALL' in quiet}（必须 False）")
+    print(f"  stalled=True ：{'STALL' in loud}（必须 True）")
+    line = [ln for ln in hud_lines(result, cfg) if "STALL" in ln]
+    if line:
+        print(f"    {line[0]}")
+    checks = [
+        ("正常时不打 STALL（不许误报）", "STALL" not in quiet),
+        ("停住时打 STALL", "STALL" in loud),
+        ("提示里说清了是什么问题（不只是「卡住」）",
+         any(k in loud for k in ("相机", "采集"))),
     ]
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
@@ -346,6 +417,8 @@ def main() -> int:
                test_scale_one_is_unchanged,
                test_hud_scales_too,
                test_3d_panel_text_scales,
+               test_hud_separates_the_three_frame_rates,
+               test_hud_shows_stall,
                test_content_area_grows_with_k_squared):
         results.append(fn())
         print()

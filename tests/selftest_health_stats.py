@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -54,7 +55,7 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sphere_tracker.stats import Health, StageTimes  # noqa: E402
+from sphere_tracker.stats import FramePump, Health, StageTimes  # noqa: E402
 
 STATS_PY = ROOT / "sphere_tracker" / "stats.py"
 
@@ -231,15 +232,130 @@ def _imports_standalone() -> bool:
     return hasattr(mod, "Health")
 
 
+def test_frame_pump_bookkeeping() -> bool:
+    """`FramePump`：序号跳变算丢帧、重复帧不计数、停住能报出来。
+
+    ## 为什么必须有这一节
+
+    这段算术原先**手写在 `apps/run_realtime.py` 的主循环里**：
+    比序号算跳过帧、按 `last_ok_t` 算帧年龄、按两次取帧间隔算采集间隔。
+    它**不可测** —— `run_realtime` 没有相机就跑不起来。
+
+    证据（变异测试实测）：把 `health=health` 从 `run_realtime` 的
+    `pipe.render(...)` 调用里删掉，**整套回归全绿** ——
+    因为没有任何测试经过那条路径。抽成 `FramePump` 之后，用假源就能走一遍。
+    """
+    print("----- 5. FramePump：取帧簿记 -----")
+
+    class FakeCam:
+        """假的"最新帧"源，按剧本给出 (seq, frame)，并可切换 stalled。"""
+
+        def __init__(self, steps):
+            self.steps = list(steps)
+            self.i = -1
+            self.last_ok_t = time.monotonic()
+            self._stalled = False
+
+        def latest(self, last_seq=-1):
+            if self.i + 1 < len(self.steps):
+                self.i += 1
+            return self.steps[self.i]
+
+        def stalled(self, timeout=1.0):
+            return self._stalled
+
+    def run(steps, n):
+        h = Health()
+        cam = FakeCam(steps)
+        pump = FramePump(cam, h, stalled_after_s=0.001)
+        return h, [pump.next() for _ in range(n)]
+
+    f = object()
+    checks = []
+
+    # 1) 正常逐帧推进
+    h, out = run([(0, f), (1, f), (2, f)], 3)
+    print(f"  逐帧推进：seq={[o.seq for o in out]} dropped={h.dropped_frames} "
+          f"captured={h.captured_frames}")
+    checks += [
+        ("逐帧推进时 dropped 为 0", h.dropped_frames == 0),
+        ("captured_frames 等于新帧数（3）", h.captured_frames == 3),
+        ("每帧都标成 is_new", all(o.is_new for o in out)),
+    ]
+
+    # 2) 序号跳变 = 中间的帧被覆盖了
+    h, out = run([(0, f), (5, f)], 2)
+    print(f"  seq 0 -> 5：skipped={out[1].skipped} dropped={h.dropped_frames}"
+          f"（中间 1/2/3/4 共 4 帧被盖）")
+    checks += [
+        ("序号跳变算出的 skipped 是差额减一（4）", out[1].skipped == 4),
+        ("dropped_frames 累加了它", h.dropped_frames == 4),
+    ]
+
+    # 3) 同一帧重复取：不许改任何计数（否则 capture_fps 会虚高）
+    h, out = run([(0, f), (0, f), (0, f)], 3)
+    print(f"  同一帧取三次：captured={h.captured_frames} is_new={[o.is_new for o in out]}")
+    checks += [
+        ("重复取同一帧只算一次采集", h.captured_frames == 1),
+        ("后续两次标成 is_new=False（调用方据此跳过处理）",
+         bool(out[0].is_new) and not out[1].is_new and not out[2].is_new),
+    ]
+
+    # 4) 还没有帧（相机刚打开）
+    h, out = run([(-1, None)], 1)
+    print(f"  还没有帧：frame={out[0].frame} captured={h.captured_frames}")
+    checks += [
+        ("frame 为 None 时不算采集", h.captured_frames == 0),
+        ("也不抛异常", out[0].frame is None),
+    ]
+
+    # 5) 停住要能报出来（HUD 的 STALL 靠它）
+    h = Health()
+    cam = FakeCam([(0, f)])
+    pump = FramePump(cam, h, stalled_after_s=0.001)
+    pump.next()
+    cam._stalled = True
+    got = pump.next()
+    print(f"  源报 stalled：PumpResult.stalled={got.stalled}")
+    checks += [("stalled 能透传出来", got.stalled is True)]
+
+    # 6) 源不支持 stalled 时不许谎报
+    class NoStall:
+        last_ok_t = time.monotonic()
+
+        def latest(self, last_seq=-1):
+            return 0, f
+
+    got = FramePump(NoStall(), Health()).next()
+    print(f"  源没有 stalled()：报 {got.stalled}（必须 False —— 不谎报停住）")
+    checks += [("源不支持 stalled 时报 False（不谎报）", got.stalled is False)]
+
+    checks += [("stats 仍是纯数据 + 取帧簿记（不 import 本项目其他模块）",
+                not _imports_project_modules())]
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def _imports_project_modules() -> bool:
+    """`stats.py` 有没有 import 本项目其他模块（它必须是叶子）。"""
+    import re
+    src = (ROOT / "sphere_tracker" / "stats.py").read_text(encoding="utf-8")
+    mods = set(re.findall(r"^\s*(?:from|import)\s+([\w.]+)", src, flags=re.MULTILINE))
+    return any(m.split(".")[0] in {"sphere_tracker", "calib", "stereo"} for m in mods)
+
+
 def main() -> int:
     print("=" * 70)
-    print("运行健康度指标自测（Health / StageTimes）")
+    print("运行健康度指标自测（Health / StageTimes / FramePump）")
     print("=" * 70)
     results = []
     for fn in (test_three_frame_rates_are_distinct,
                test_frame_age_and_dropped_semantics,
                test_derived_values_are_not_fields,
-               test_module_is_pure):
+               test_module_is_pure,
+               test_frame_pump_bookkeeping):
         results.append(fn())
         print()
     ok = all(results)

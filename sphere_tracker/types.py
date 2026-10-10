@@ -100,8 +100,9 @@ class FrameResult:
     prediction: np.ndarray | None = None      # (N,2) 或 (N,3) 预测点
     prediction_3d: np.ndarray | None = None   # (N,3) 米
     position_3d: np.ndarray | None = None     # (3,) 米
-    fps: float = 0.0
+    fps: float = 0.0              # ⚠️ **主循环**帧率（不是相机采集帧率）；采集侧看 Health
     detect_ms: float = 0.0
+    stalled: bool = False         # 采集是否已停住（相机掉线/被占用）—— 由调用方按 sources 判定
     camera_motion: Any = None     # camera_motion.MotionEstimate
     camera_moving: bool = False   # 本帧相机是否在动（幅值超过阈值）
     camera_steady: bool = False   # 相机是否在"匀速"移动（匀速不破坏像素重力约束）

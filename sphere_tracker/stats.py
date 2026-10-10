@@ -40,9 +40,11 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
-__all__ = ["Health", "StageTimes"]
+__all__ = ["Health", "StageTimes", "FramePump", "PumpResult"]
 
 
 @dataclass
@@ -113,7 +115,18 @@ class Health:
         self.frame_age_ms = float(frame_age_ms)
 
     def note_dropped(self, n: int = 1) -> None:
-        """本帧在被取走之前被下一帧覆盖 —— 只能在采集线程里加。"""
+        """本帧在被取走之前被下一帧覆盖 —— 采集线程或取帧方都能报。
+
+        两个合法的上报来源，**不要在同一次运行里混用**（会重复计数）：
+
+        | 来源 | 怎么算 | 谁用 |
+        | ---- | ------ | ---- |
+        | 采集线程 | "还没人取走，下一帧就来了" | 采集线程自己持有 `Health` 时 |
+        | **取帧方（`FramePump`）** | 序号从 5 跳到 9 => 中间 6/7/8 被盖了 | `run_realtime`（`Health` 归主循环） |
+
+        本项目走的是第二种：`Health` 由主循环持有，采集线程不碰它，
+        所以**没有跨线程写**。
+        """
         self.dropped_frames += max(0, int(n))
 
     # ------------------------------------------------------------------
@@ -179,3 +192,77 @@ class Health:
         known = {f for f in cls.__dataclass_fields__}   # type: ignore[attr-defined]
         kwargs = {k: v for k, v in data.items() if k in known and k != "stages"}
         return cls(stages=stages, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# 取帧簿记：把"主循环该记什么"从 app 里搬出来，好让它可以被测
+# --------------------------------------------------------------------------- #
+@dataclass
+class PumpResult:
+    """`FramePump.next()` 的结果：拿到的新帧，以及这一轮的簿记。"""
+
+    frame: Any = None
+    seq: int = -1
+    is_new: bool = False          # 相对上次调用，是不是新的一帧
+    skipped: int = 0              # 中间被覆盖掉的帧数
+    capture_ms: float = 0.0       # 两次"取到新帧"之间的间隔
+    frame_age_ms: float = 0.0     # 从采集线程抓到它，到我们取走它
+    stalled: bool = False         # 采集是否已停住
+
+
+class FramePump:
+    """从"最新帧"源取帧，并把 `Health` 该记的都记上。
+
+    ## 为什么要有这个类
+
+    这段算术原本**手写在 `apps/run_realtime.py` 的主循环里**：
+    比序号算跳过帧、按 `last_ok_t` 算帧年龄、按两次取帧的间隔算采集间隔、
+    超过阈值就报 `stalled`。它**不可测** —— `run_realtime` 没有相机就跑不起来
+    （变异测试当场证明：把 `health=health` 从 `render()` 调用里删掉，
+    整套回归**全绿**，因为没有任何测试覆盖那条路径）。
+
+    簿记不是 `Health` 的职责（它是纯数据），也不该待在 app 的主循环里。
+    抽成这一层之后，用一个假采集源就能把每种组合都走一遍。
+
+    ⚠️ **它不做节流 sleep** —— "没有新帧时要不要等"是调用方的策略，
+    塞进来会让本类带上时序行为，又变回难测。
+    """
+
+    def __init__(self, source: Any, health: Health, stalled_after_s: float = 1.0) -> None:
+        self.source = source
+        self.health = health
+        self.stalled_after_s = float(stalled_after_s)
+        self._last_seq = -1
+        self._t_last_new = time.monotonic()
+
+    def next(self) -> PumpResult:
+        """取一次。不会阻塞，也不会 sleep。"""
+        seq, frame = self.source.latest(self._last_seq)
+        now = time.monotonic()
+        stalled = self._stalled()
+        if frame is None:
+            return PumpResult(frame=None, seq=seq, stalled=stalled)
+
+        is_new = seq != self._last_seq
+        res = PumpResult(frame=frame, seq=seq, is_new=is_new, stalled=stalled)
+        if not is_new:
+            # 还是同一帧：**不改任何计数**（否则 capture_fps 会虚高）
+            return res
+
+        if self._last_seq >= 0:
+            res.skipped = max(0, seq - self._last_seq - 1)
+            if res.skipped:
+                self.health.note_dropped(res.skipped)
+            res.capture_ms = (now - self._t_last_new) * 1000.0
+        res.frame_age_ms = (now - getattr(self.source, "last_ok_t", now)) * 1000.0
+        self._last_seq = seq
+        self._t_last_new = now
+        self.health.note_capture(capture_ms=res.capture_ms, frame_age_ms=res.frame_age_ms)
+        return res
+
+    def _stalled(self) -> bool:
+        fn = getattr(self.source, "stalled", None)
+        if callable(fn):
+            return bool(fn(timeout=self.stalled_after_s))
+        # 源不支持 stalled（例如视频文件）：**明确报"未知"，不谎报停住**
+        return False

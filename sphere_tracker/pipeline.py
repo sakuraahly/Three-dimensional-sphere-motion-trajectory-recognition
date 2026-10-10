@@ -211,8 +211,20 @@ class SpherePipeline:
         return result
 
     # ------------------------------------------------------------------
-    def render(self, frame: np.ndarray, result: FrameResult) -> np.ndarray:
-        """把结果画到帧上，返回新图（不修改输入）。"""
+    def render(self, frame: np.ndarray, result: FrameResult,
+               health=None) -> np.ndarray:
+        """把结果画到帧上，返回新图（不修改输入）。
+
+        `health`：可选的 `stats.Health`。**为什么由调用方传、而不是 pipeline 自己持有** ——
+        pipeline 是编排层，不该持有一个"随运行不断变化的累加器"：
+
+        - 采集侧的数据**只有 app 拿得到**（它持有 `LatestFrameCamera`）；
+        - 同一份 `Health` 还要被序列化落盘（P1-4 的会话记录），那是 app 的事；
+        - pipeline 若自己累加，就会出现"pipeline 的和 app 的各算一遍"，
+          正是 `stats.py` 刻意消除的那种"同一个量两处各算"。
+
+        不传时 HUD 退化成一行明确的 `loop ...`（不再有裸 `FPS`）。
+        """
         viz = self.cfg.viz
         scale = viz.scale if viz.scale and viz.scale > 0 else 1.0
         if abs(scale - 1.0) > 1e-6:
@@ -239,7 +251,7 @@ class SpherePipeline:
             paste_mask_preview(img, result.detection.mask, width=int(200 * scale))
 
         if viz.show_hud:
-            draw_hud(img, hud_lines(result, self.cfg), scale=scale)
+            draw_hud(img, hud_lines(result, self.cfg, health=health), scale=scale)
 
         if viz.show_axes_3d:
             hist = np.array([[p.x, p.y, p.z] for p in self.history3d if p.z is not None], dtype=np.float64)
@@ -258,6 +270,7 @@ class SpherePipeline:
         return img
 
     # ------------------------------------------------------------------
-    def process_and_render(self, frame: np.ndarray, t: float | None = None) -> tuple[np.ndarray, FrameResult]:
+    def process_and_render(self, frame: np.ndarray, t: float | None = None,
+                           health=None) -> tuple[np.ndarray, FrameResult]:
         result = self.process(frame, t)
-        return self.render(frame, result), result
+        return self.render(frame, result, health=health), result

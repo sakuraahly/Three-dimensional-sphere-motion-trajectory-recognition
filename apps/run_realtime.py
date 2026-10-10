@@ -43,7 +43,8 @@ from sphere_tracker import camera_registry as cr
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detect import build_detector
 from sphere_tracker.pipeline import SpherePipeline
-from sphere_tracker.sources import INDEX_BACKEND, CameraSource
+from sphere_tracker.sources import INDEX_BACKEND, CameraSource, LatestFrameCamera
+from sphere_tracker.stats import FramePump, Health
 
 WINDOW = "sphere tracker (real-time)"
 METHOD_CYCLE = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]
@@ -128,12 +129,19 @@ def main() -> int:
         print(f"[错误] {exc}")
         return 1
     if index is None:
-        picks = cr.select_cameras(need=1)
-        if not picks:
-            print("[错误] 没找到可用的摄像头。请跑 "
-                  "python apps/tools/cameras.py list 看看当前设备。")
+        # **只有一个判定者**：`select_cameras_detailed()`。
+        # 改之前这里先问 `camera_availability()` 再问 `select_cameras()`，
+        # 两套判据对同一台机器结论相反（前者说 ok、后者说"只能动用无关相机"），
+        # 于是报出"可用性判定通过，但挑选失败"这种自相矛盾的话。
+        sel = cr.select_cameras_detailed(need=1)
+        for note in sel.notes:
+            print(note)
+        if not sel.ok:
+            av = cr.camera_availability(need=1)
+            print(f"[错误] {av.reason}")
+            print(f"[怎么办] {av.remedy}")
             return 1
-        index = picks[0].index
+        index = sel.picks[0].index
         print(f"[自动选择] 使用摄像头 #{index}")
 
     try:
@@ -161,28 +169,47 @@ def main() -> int:
     writer: cv2.VideoWriter | None = None
     recording = False
     paused = False
-    fails = 0
     last_frame: np.ndarray | None = None
     last_vis: np.ndarray | None = None
     frame_times: list[float] = []
 
+    # ── 采集侧：改成后台线程 + 记健康度 ────────────────────────────────────
+    #
+    # **为什么不再在主循环里直接 `src.read()`**：
+    # 直接读的话，"相机只给了 15 fps" 与 "我们处理得慢所以只跑 15 fps"
+    # 在画面上完全一样，优化方向只能靠猜；而且相机掉线时 `read()` 返回空，
+    # 主循环只是 `continue` —— **画面冻住但程序照跑**。
+    #
+    # `LatestFrameCamera` 把采集挪到自己的线程，于是能分别回答：
+    #   采集给了多少帧（cap）、我们处理了多少帧（loop）、
+    #   有没有帧被覆盖掉（dropped）、当前这帧是多久以前抓的（age）、
+    #   以及**采集是不是已经停住**（stalled）。
+    cam_thread = LatestFrameCamera(src)
+    health = Health()
+    pump = FramePump(cam_thread, health, stalled_after_s=1.0)
+    t_start = time.perf_counter()
+    print("采集已在后台线程运行（HUD 会分别显示 cap / loop / detect）")
+
     try:
         while True:
             if not paused:
-                ok, frame, t = src.read()
-                if not ok or frame is None:
-                    fails += 1
-                    if fails > 60:
-                        print("[错误] 连续读取失败，退出。")
-                        break
-                    time.sleep(0.01)
+                got = pump.next()
+                if got.frame is None or not got.is_new:
+                    # 没有新帧：睡一下让出 CPU。"等多久"是这里的策略，
+                    # `FramePump` 刻意不管（带上时序就难测了）。
+                    time.sleep(0.002)
                     continue
-                fails = 0
+                frame = got.frame
                 t0 = time.perf_counter()
-                vis, result = pipe.process_and_render(frame, t)
-                frame_times.append(time.perf_counter() - t0)
+                result = pipe.process(frame, time.perf_counter() - t_start)
+                result.stalled = got.stalled
+                vis = pipe.render(frame, result, health=health)
+                process_ms = (time.perf_counter() - t0) * 1000.0
+                frame_times.append(process_ms / 1000.0)
                 if len(frame_times) > 60:
                     frame_times.pop(0)
+                health.end_frame(detect_ms=result.detect_ms, track_ms=0.0, render_ms=0.0,
+                                 process_ms=process_ms)
                 last_frame, last_vis = frame, vis
                 if recording and writer is not None:
                     writer.write(vis)
@@ -257,6 +284,9 @@ def main() -> int:
                         writer = None
                     print("录制已停止")
     finally:
+        # 先停采集线程再放相机 —— 反了的话采集线程会在已释放的源上继续 read
+        cam_thread._stop = True
+        cam_thread._thread.join(timeout=1.0)
         if writer is not None:
             writer.release()
         src.release()
@@ -266,6 +296,11 @@ def main() -> int:
             print(
                 f"平均每帧处理耗时 {avg * 1000:.1f} ms（约 {1.0 / avg:.1f} FPS 的处理能力）"
             )
+        # 结尾把三个口径一起打出来：cap 与 loop 差得远 = 瓶颈在检测，不是相机
+        print(f"本次运行健康度：{health.summary_line()}")
+        if health.dropped_frames:
+            print(f"  其中 {health.dropped_frames} 帧在取走前被覆盖 —— "
+                  f"说明主循环跟不上采集，看的是跳帧后的画面")
     return 0
 
 
