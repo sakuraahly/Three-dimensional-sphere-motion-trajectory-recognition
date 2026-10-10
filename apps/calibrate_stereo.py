@@ -124,8 +124,19 @@ def main() -> int:
     ap.add_argument("--cols", type=int, default=8, help="棋盘格内角点列数")
     ap.add_argument("--rows", type=int, default=5, help="棋盘格内角点行数")
     ap.add_argument("--square", type=float, default=25.0, help="方格实际边长（毫米）")
-    ap.add_argument("--target", type=int, default=25, help="目标收多少对")
-    ap.add_argument("--min-pairs", type=int, default=10)
+    # 默认值 = **试标定档（8 对）**，由用户 2026-10-10 指定，用于先跑通通路。
+    #
+    # 代价必须说清：`CalibConfig` 的注释写着"默认值按 20-30 对图像调好的"，
+    # 重投影/极线门槛（good 0.35 px、ok 0.80 px）也是按那个量级定的。
+    # 8 对能解出外参（内参是固定的），但：
+    #   · 离群剔除会让剩余低于 8 时**停止剔除**（stereo_calib.py 的门槛），
+    #     所以坏数据可能留在里面，RMS 偏高；
+    #   · 姿态覆盖必然不足，边角区域的畸变约束不住 —— 三维在画面边角会偏。
+    # **拿它验证"通路能不能跑通"可以，拿它出正式三维结果不行。**
+    # 要正式标定：--target 25 --min-pairs 10
+    ap.add_argument("--target", type=int, default=8, help="目标收多少对（试标定 8；正式 25）")
+    ap.add_argument("--min-pairs", type=int, default=8,
+                    help="最少收多少对才尝试标定（试标定 8；正式 10）")
     ap.add_argument("--baseline-mm", type=float, default=None, help="预期基线（毫米），用于核对")
     ap.add_argument("--out", default="config/stereo_calibration", help="输出前缀")
     ap.add_argument("--save-pairs", default=None, help="把收下的图像对另存到这个目录（便于复查）")
@@ -160,6 +171,14 @@ def main() -> int:
 
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
     print(f"标定板：{spec.describe()}")
+    if args.target < 15:
+        # 低目标数必须**显式可见**，不能悄悄用：否则以后看到一份差标定，
+        # 没人知道是因为只收了 8 对。
+        print(f"⚠ 试标定档：只收 {args.target} 对（正式档 25 对）。")
+        print("   内参是固定的，8 对能解出外参，但姿态覆盖不足、离群剔除会被下限卡住 ——")
+        print("   **够验证通路，不够出正式三维结果**。要正式标定加：--target 25 --min-pairs 10")
+        print()
+        log.warning("试标定档：target=%d（正式档 25）", args.target)
     log.info("标定板：%s", spec.describe())
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
     print()
