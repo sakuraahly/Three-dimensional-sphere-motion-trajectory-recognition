@@ -145,7 +145,12 @@ def render_slide(prs, no: int, out_dir: Path) -> Path:
                         x0, x1 = x1, x0
                     if fv:
                         y0, y1 = y1, y0
-                    col = border or (150, 160, 175)
+                    # 连线自己没有"填充"，颜色要读它自己的 line。
+                    # 注意别写成 `border`：那个局部变量是在这个分支**之后**才赋值的，
+                    # 在这里引用会抛 UnboundLocalError，而异常被下面的 except 吞掉
+                    # -> 连线静默不画（整页只剩空白，还看不出哪里错了）。
+                    # 有回归测试钉着：tests/selftest_preview_lib.py
+                    col = _line(sh) or (150, 160, 175)
                     d.line([x0, y0, x1, y1], fill=col, width=2)
             except Exception:
                 pass
