@@ -28,7 +28,8 @@
 | 相机自运动估计（迟滞判定 + 位移换算）                 | ✅ 完成       | 位移误差 ≤ 0.01 px 且**不随缩放比例变化**（原先差 `s²`，1080p 下 36 倍，见 `docs/交接文档.md` 坑 20）    |
 | **双目自动标定**                                      | ✅ 完成       | 合成真值验证：基线误差 0.006%、端到端三维误差 3.4 mm，见第十二节                                        |
 | 双目标定复检（装置是否被碰动）                        | ✅ 完成       | 未动 0.08 px / 碰动 2° 后 27.9 px，可明确判定                                                           |
-| 多相机/换相机适配                                     | ✅ 完成       | `apps/tools/list_cameras.py` 探测后端/分辨率/帧率；`cameras.py` 按**设备身份/端口**固定角色，免索引漂移 |
+| 多相机/换相机适配                                     | ✅ 完成       | `apps/tools/list_cameras.py` 探测后端/分辨率/帧率；`cameras.py` 按**设备身份/端口**固定角色，免索引漂移；可把不用的相机标为**「无关」**（自动挑相机时跳过） |
+| 一键脚本（双击即用，不用敲 Python）                    | ✅ 完成       | 根目录 `1-相机设置.bat` … `6-实时检测.bat` 六步；自动选相机（有配置用角色名，否则 auto） |
 | AI 分支环境（YOLO / SAM 后端）                        | ⚙️ 环境就绪   | torch 2.11.0+cu128、ultralytics 8.4.159、CUDA 可用（sm_120）                                            |
 | **两路视频同步**                                      | ✅ 完成       | 合成真值验证：人为平移 0 / ±8 / -11 / +37 帧全部找回，置信度 1.000                                      |
 | **成对取帧（PairSource）**                            | ✅ 完成       | 按同步偏移取到"同一时刻"的左右帧，帧索引语义有回归测试                                                  |
@@ -59,6 +60,10 @@
 
 ### 三步开始使用
 
+> 💡 **不想敲命令？双击根目录的 `.bat` 就行**：
+> `启动程序.bat`（图形界面，全流程）或 `1-相机设置.bat` … `6-实时检测.bat`
+> （六步一键脚本，每个只做一件事）。详见 `docs/用户手册.md` §2.2。
+
 ```powershell
 conda activate myenv
 cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
@@ -70,7 +75,7 @@ python tests/selftest_synthetic.py
 python apps/run_video.py outputs/videos/synthetic_ball.mp4 --out outputs/videos/annotated.mp4 --csv outputs/traj.csv --ball-diameter 0.22 --focal 831
 #    处理完打开 outputs/videos/annotated.mp4，就能看到轨迹拖尾与预测虚线
 
-# 3) 接真实摄像头（不写编号，启动时自动挑最优：优先外接、避开内置/红外、跳过全黑流）
+# 3) 接真实摄像头（不写编号，启动时自动挑最优：优先外接、跳过标了「无关」的、跳过全黑流）
 python apps/run_realtime.py --method fusion
 #    想指定也行：--camera 0 用编号，--camera main 用角色名（需先 identify 固定）
 ```
@@ -78,8 +83,9 @@ python apps/run_realtime.py --method fusion
 ### 双目（研究思路主线）
 
 ```powershell
-# 0) 第一次用：逐个画面确认哪台是左、哪台是右，固定成"角色"（索引会漂移，身份不会）
-python apps/tools/cameras.py identify      # 窗口里 l=左 r=右 m=主 s=跳过 q=退出
+# 0) 第一次用：逐个画面确认哪台是左、哪台是右、哪台「无关」，固定成"角色"
+#    （索引会漂移，身份不会。不打算用的内置/红外相机就在这里按 n 标成「无关」）
+python apps/tools/cameras.py identify      # 窗口里 l=左 r=右 n=无关 m=主 s=跳过 q=退出
 
 # 1) 双目标定（需要两台相机 + 打印好的棋盘格，见 assets/boards/）
 python apps/calibrate_stereo.py --left left --right right --cols 8 --rows 5 --square 25
@@ -121,20 +127,34 @@ python tests/selftest_stereo_branch.py
 python apps/tools/cameras.py list
 python apps/tools/cameras.py list --probe      # 顺带逐个试开，报实际分辨率 / 是否全黑
 
-# 逐个显示画面，目视确认哪台是左/右，写入 config/cameras.json
+# 逐个显示画面，目视确认哪台是左/右/无关，写入 config/cameras.json
 python apps/tools/cameras.py identify
 
 # 非交互固定某角色到某设备
 python apps/tools/cameras.py pin left  port:Port_#0001.Hub_#0003
 python apps/tools/cameras.py pin right 0
 
+# 把不打算用的相机标成「无关」（笔记本内置 / 红外）——自动挑相机会跳过它
+python apps/tools/cameras.py ignore 3          # 也可 port:xx / id:xx / name:xx
+python apps/tools/cameras.py ignored           # 查看清单（标注在不在线）
+python apps/tools/cameras.py unignore 3        # 取消某台；--all 清空整份清单
+
 # 每次拍摄/重插相机前：比对配置与当前设备，有没有漂移 / 被别的设备占用
 python apps/tools/cameras.py check             # 有 [危险] 项时退出码为 2
 ```
 
-启动器（`启动程序.py` / `启动程序_命令行.py`）里也有一键入口：
-图形版第 1 步的『刷新设备列表』『相机设备管理』『检查相机映射』三个按钮，
-命令行版主菜单的『相机设备管理』子菜单。
+**「无关」是什么**：`identify` 的画面里，一台相机有四种去处 ——
+`l`=左、`r`=右、`n`=**「无关」**（永远不要用）、`m`=单目主相机；`s`=跳过（不改配置）。
+**左 / 右 / 无关三者互斥**：改标一个会自动摘掉旧的。它记的是**设备身份**而非编号，
+所以重插 USB 后依然有效。自动挑相机（`--auto-cameras`、`--camera auto`）会跳过它们，
+不会再出现"左边是外接、右边却挑到笔记本内置"。**显式写编号（`--camera 3`）仍然会用它** ——
+你点名的那台优先级最高。万一其它相机都不够用，程序会兜底动用并**打印警告**，不会静默用错。
+
+启动器与一键脚本里也都有入口：
+图形版第 1 步的『刷新设备列表』『相机设备管理（识别/固定/标无关）』『检查相机映射』
+『「无关」相机清单』『清空「无关」标记』五个按钮；
+命令行版主菜单的『相机设备管理』子菜单（[5] 标无关 / [6] 查看与清除）；
+以及根目录的 `1-相机设置.bat` / `2-相机检查.bat`（双击即用，不用敲命令）。
 
 **配置与实物对不上时的行为**（刻意设计）：不会替你猜。已 `identify` 确认过（`verified=true`）
 的角色若身份消失，直接**报错并附当前设备清单**，让你重新确认；未确认过的角色才会退回旧索引
@@ -546,6 +566,13 @@ python tests/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否�
 > 详细的目录职责、放置规则、依赖方向见 **[docs/文件结构.md](docs/文件结构.md)**。
 
 ```text
+启动程序.py / 启动程序.bat            根目录入口：图形界面启动器（双击 .bat）
+启动程序_命令行.py / _命令行.bat      根目录入口：命令行彩色启动器
+1-相机设置.bat … 6-实时检测.bat       根目录入口：六步一键脚本（双击即用）
+   1=相机设置(左/右/无关)  2=相机检查  3=标定前置检查
+   4=双目标定             5=标定复检  6=实时检测
+   自动选相机：有 config/cameras.json 用角色名，否则 --auto-cameras
+
 sphere_tracker/          单目核心库（可被任意脚本 import）
   config.py              所有可调参数（dataclass，可存取 JSON）
   types.py               Detection / TrackState / FrameResult / TrailPoint
@@ -555,7 +582,7 @@ sphere_tracker/          单目核心库（可被任意脚本 import）
   predict.py             轨迹预测：最长有效后缀拟合 + 已知重力约束
   viz.py                 拖尾、圆、预测虚线、HUD、三维小面板
   sources.py             摄像头 / 视频文件 / 图片序列（含相机模式自动探测、线程化采集）
-  camera_registry.py     摄像头设备管理：枚举身份/端口、固定角色、解析索引、探测与自动挑优
+  camera_registry.py     摄像头设备管理：枚举身份/端口、固定角色、标「无关」、解析索引、探测与自动挑优
   pipeline.py            单帧总流程编排
   detectors/             检测后端，按"线索来源"分文件
     base.py              基类 + 轮廓打分等公共工具
@@ -584,7 +611,7 @@ apps/                    可直接运行的程序
   calibrate_stereo.py    自动双目标定（相机 / 两段视频 / 两个图片文件夹）
   verify_stereo.py       复检标定：装置是否被碰动
   tools/                 一次性设置与诊断工具
-    cameras.py             摄像头设备管理（list / identify / pin / check，按身份固定角色）
+    cameras.py             摄像头设备管理（list / identify / pin / ignore / unignore / ignored / check）
     list_cameras.py        逐个索引试开，报分辨率/帧率/画面是否全黑
     make_calibration_board.py  生成可打印棋盘格
     calibrate_color.py     HSV 阈值交互标定
