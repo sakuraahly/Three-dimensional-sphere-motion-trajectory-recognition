@@ -309,32 +309,74 @@ class AutoPairCollector:
         return True, self.last_reason
 
     # ------------------------------------------------------------------
-    def coverage_image(self, size: tuple[int, int] | None = None, scale: float = 0.5) -> np.ndarray:
-        """画一张覆盖率示意图：已收位姿的棋盘四边形 + 宫格计数。"""
-        if self.image_size is None:
-            w, h = 640, 480
+    def coverage_image(
+        self,
+        out_size: tuple[int, int] | None = None,
+        scale: float = 0.5,
+    ) -> np.ndarray:
+        """覆盖率示意图：已收位姿的棋盘四边形 + 宫格占用数。
+
+        **参数语义（这里踩过坑，写清楚）**：
+
+          - ``out_size``：**输出画布**的 (宽, 高)。给了它就按比例缩放并**居中**，
+            已收位姿一定落在画布内。窗口布局要用特定尺寸的面板时给这个。
+          - ``scale``：不给 ``out_size`` 时，按源图尺寸乘这个比例。
+
+        原来的实现只有一个 ``size``，语义是"源图尺寸"，而内容按 ``scale`` 缩放 ——
+        调用方给了 ``size=(190, 高)`` 又给 ``scale=1.0`` 时，画布变成 190 宽，
+        但位姿仍按**全图坐标**（600~900）绘制，**整个画到画布外面去了**，
+        面板看起来是空的。用户因此"看不到已经标定的姿态和位置"。
+        所以现在明确区分"源"与"输出"，并自己算缩放。
+        """
+        src_w, src_h = self.image_size if self.image_size else (640, 480)
+
+        if out_size is not None:
+            ow, oh = max(1, int(out_size[0])), max(1, int(out_size[1]))
+            s = min(ow / src_w, oh / src_h)          # 等比，保证不裁切
         else:
-            w, h = self.image_size
-        if size is not None:
-            w, h = size
-        canvas = np.zeros((int(h * scale), int(w * scale), 3), dtype=np.uint8)
+            s = float(scale)
+            ow, oh = max(1, int(src_w * s)), max(1, int(src_h * s))
+
+        off_x = (ow - src_w * s) / 2.0               # 居中留边
+        off_y = (oh - src_h * s) / 2.0
+
+        canvas = np.zeros((oh, ow, 3), dtype=np.uint8)
         canvas[:] = (28, 28, 32)
+
+        def _to_canvas(pts: np.ndarray) -> np.ndarray:
+            return pts * s + np.array([off_x, off_y], np.float32)
+
         g = self.cfg.region_grid
         for i in range(1, g):
-            cv2.line(canvas, (int(w * scale * i / g), 0), (int(w * scale * i / g), canvas.shape[0]), (60, 60, 66), 1)
-            cv2.line(canvas, (0, int(h * scale * i / g)), (canvas.shape[1], int(h * scale * i / g)), (60, 60, 66), 1)
-        for idx, p in enumerate(self.pairs):
+            x = int(off_x + src_w * s * i / g)
+            y = int(off_y + src_h * s * i / g)
+            cv2.line(canvas, (x, 0), (x, oh), (60, 60, 66), 1)
+            cv2.line(canvas, (0, y), (ow, y), (60, 60, 66), 1)
+
+        # 宫格占用数：**直接写在格子上** —— 用户要的是"还缺哪儿"，
+        # 让他自己数四边形是"需要思考"，不符合交互原则。
+        cell_w, cell_h = src_w * s / g, src_h * s / g
+        for (gx, gy), n in sorted(self._region_count.items()):
+            cap = self.cfg.max_per_region
+            full = n >= cap
+            cx = int(off_x + (gx + 0.5) * cell_w)
+            cy = int(off_y + (gy + 0.5) * cell_h)
+            cv2.putText(canvas, f"{n}/{cap}", (cx - 12, cy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (90, 220, 120) if full else (200, 200, 90), 1, cv2.LINE_AA)
+
+        for p in self.pairs:
             quad = cv2.perspectiveTransform(
                 np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32).reshape(-1, 1, 2),
                 p.homography_left,
-            ).reshape(-1, 2) * scale
-            cv2.polylines(canvas, [quad.astype(np.int32)], True, (0, 200, 90), 1, cv2.LINE_AA)
-            c = p.center_left[0] * scale, p.center_left[1] * scale
+            ).reshape(-1, 2)
+            cv2.polylines(canvas, [_to_canvas(quad).astype(np.int32)], True,
+                          (0, 200, 90), 1, cv2.LINE_AA)
+            c = _to_canvas(np.array([p.center_left], np.float32))[0]
             cv2.circle(canvas, (int(c[0]), int(c[1])), 2, (0, 220, 255), -1)
-        done = len(self.pairs)
-        total = self.cfg.target_pairs
-        cv2.putText(canvas, f"{done}/{total}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.putText(canvas, f"{len(self.pairs)}/{self.cfg.target_pairs}", (6, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
         return canvas
 
     def status_lines(self, top: int = 4) -> list[str]:

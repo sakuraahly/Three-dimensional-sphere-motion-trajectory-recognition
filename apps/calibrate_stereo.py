@@ -274,7 +274,7 @@ def main() -> int:
                 footer_h = len(footer_lines) * FOOTER_LINE_H + 10
 
                 sw, sh = _screen_size()
-                cov_w = 190
+                cov_w = 260          # 覆盖率面板宽度：要放得下宫格占用数字与棋盘四边形
                 per_cam_w = max(240, (sw - 60 - cov_w) // 2)
                 # 取两路里更"瘦"的宽高比，保证两路都放得下（两路分辨率可能不同）
                 ar = min(left.shape[1] / left.shape[0], right.shape[1] / right.shape[0])
@@ -320,12 +320,14 @@ def main() -> int:
 
                 # 覆盖率图只在收帧数变化时重画（原来每帧都重建一次画布）
                 if collector.count != cov_cache_n:
-                    cov_cache = collector.coverage_image(
-                        size=(cov_w, img_h), scale=1.0)
+                    # **给输出画布尺寸**（不是源图尺寸）—— 这样位姿一定会被缩放并
+                    # 居中画进面板里。曾经把源尺寸当成输出尺寸传，导致姿态画到画布外，
+                    # 面板看起来是空的（用户："看不到已经标定的姿态和位置"）。
+                    cov_cache = collector.coverage_image(out_size=(cov_w, img_h))
                     cov_cache_n = collector.count
                 cov = cov_cache
                 if cov is None or cov.shape[:2] != (img_h, cov_w):
-                    cov = np.zeros((img_h, cov_w, 3), np.uint8)
+                    cov = collector.coverage_image(out_size=(cov_w, img_h))
                 row = np.hstack([a, b, cov])
 
                 # 文字条带：整幅宽度，画在图像**下方**，永远不会压住画面
