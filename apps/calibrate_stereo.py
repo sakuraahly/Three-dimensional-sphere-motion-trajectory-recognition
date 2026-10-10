@@ -3,7 +3,7 @@
 用法::
 
     # 1) 两台实时相机（推荐：能实时看到收帧进度）
-    python apps/calibrate_stereo.py --left 0 --right 1 --cols 8 --rows 5 --square 25
+    python apps/calibrate_stereo.py --left 0 --right 2 --cols 8 --rows 5 --square 25
 
     # 2) 两段视频（指导文档里的流程：先分别录，再拿来标定）
     python apps/calibrate_stereo.py --left-video cam1.mp4 --right-video cam2.mp4 \
@@ -33,17 +33,16 @@ import time
 from pathlib import Path
 
 # --- 让脚本在任意目录深度都能找到项目根 ---
-ROOT = Path(__file__).resolve().parent
-while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
-    ROOT = ROOT.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "sphere_tracker").is_dir():
+        sys.path.insert(0, str(_parent))
+        break
 
 import cv2
 import numpy as np
 
+from apps._common import add_stereo_source_args, open_pair_source
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
-from stereo import from_args
 
 WINDOW = "stereo calibration"
 PREVIEW_W = 720          # 单路预览宽度（两路并排 + 覆盖率图，正好放得下）
@@ -87,19 +86,7 @@ def build_report_figure(rig: StereoRig, pairs, spec: BoardSpec, out_path: Path) 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="自动双目标定")
-    ap.add_argument("--left", type=int, default=None, help="左相机索引")
-    ap.add_argument("--right", type=int, default=None, help="右相机索引")
-    ap.add_argument("--backup-camera", type=int, default=None,
-                    help="备用相机索引：左右任一路打不开时自动顶上"
-                         "（例如笔记本自带摄像头；注意它与被替换的相机不同型号，"
-                         "标定只对当前组合有效）")
-    ap.add_argument("--left-video", default=None)
-    ap.add_argument("--right-video", default=None)
-    ap.add_argument("--left-dir", default=None)
-    ap.add_argument("--right-dir", default=None)
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--fps", type=int, default=60)
+    add_stereo_source_args(ap)
     ap.add_argument("--cols", type=int, default=8, help="棋盘格内角点列数")
     ap.add_argument("--rows", type=int, default=5, help="棋盘格内角点行数")
     ap.add_argument("--square", type=float, default=25.0, help="方格实际边长（毫米）")
@@ -118,7 +105,9 @@ def main() -> int:
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
     print()
 
-    src = from_args(args)
+    src = open_pair_source(args)
+    if src is None:
+        return 1
     print(src.describe())
     src.report_warnings()
     from calib import CaptureConfig

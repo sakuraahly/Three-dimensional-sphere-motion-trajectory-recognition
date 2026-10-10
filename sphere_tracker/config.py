@@ -159,7 +159,6 @@ class TrackerConfig:
     max_coast_frames: int = 12         # 连续丢失多少帧后删除轨迹
     init_hits: int = 2                 # 连续命中多少帧才认为轨迹"确认"
     trail_length: int = 240            # 保存多少个历史点用于画拖尾
-    smooth_measurement: bool = True    # 用滤波后的状态作为输出（更平滑）
     # 轨迹点存"原始观测"还是"滤波结果"？
     # 预测器是拿这条轨迹去拟合的，而卡尔曼滤波在机动瞬间会有几十像素的
     # 滞后/超调，这些结构化误差会被拟合放大成"速度误差"。

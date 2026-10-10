@@ -302,24 +302,12 @@ class CameraModel:
         y = (v - self.cy) * z / self.fy
         return np.array([x, y, z], dtype=np.float64)
 
-    def to_3d(self, u: float, v: float, radius_px: float) -> np.ndarray:
-        """把检测到的球（像素圆心 + 像素半径）变成三维坐标。"""
-        z = self.depth_from_radius(radius_px)
-        return self.backproject(u, v, z)
-
     def project(self, point3d: np.ndarray) -> tuple[float, float]:
         """三维点 -> 像素坐标。"""
         x, y, z = (float(v) for v in point3d[:3])
         if abs(z) < 1e-9:
             z = 1e-9
         return self.cx + self.fx * x / z, self.cy + self.fy * y / z
-
-    def radius_from_depth(self, z: float) -> float:
-        """距离 -> 像素半径（画预测圆时用）。"""
-        if z <= 1e-6:
-            return 0.0
-        f = 0.5 * (self.fx + self.fy)
-        return f * (self.ball_diameter_m / 2.0) / z
 
 
 def estimate_focal_from_known_ball(

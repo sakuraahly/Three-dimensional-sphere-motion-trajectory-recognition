@@ -291,14 +291,3 @@ class TrajectoryPredictor:
             trail, self.cfg, dims, residual_tol=residual_tol,
             t_now=t_now, gravity_value=gravity_value, t_break=t_break,
         )
-
-
-def prediction_rmse(predicted: np.ndarray | None, actual: np.ndarray | None, dims: int = 2) -> float:
-    """两组预测点列的平均欧氏误差（自测/评估用）。"""
-    if predicted is None or actual is None:
-        return float("nan")
-    n = min(len(predicted), len(actual))
-    if n == 0:
-        return float("nan")
-    d = np.linalg.norm(predicted[:n, :dims] - actual[:n, :dims], axis=1)
-    return float(np.mean(d))

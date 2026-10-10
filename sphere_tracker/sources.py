@@ -25,6 +25,14 @@ WINDOWS_BACKENDS = [
 ]
 
 
+def backend_name(api: int | None) -> str:
+    """把 cv2 后端常量翻译成名字（打印/日志用）。"""
+    for name, value in WINDOWS_BACKENDS:
+        if value == api:
+            return name
+    return f"backend#{api}"
+
+
 @dataclass
 class SourceInfo:
     kind: str
@@ -159,7 +167,8 @@ class CameraSource(VideoSource):
         self._fps_req, self._fourcc = fps, fourcc
         self.mode_probed = False
         candidates = (
-            [("given", backend)] if backend is not None else [(n, b) for n, b in WINDOWS_BACKENDS]
+            [(backend_name(backend), backend)] if backend is not None
+            else [(n, b) for n, b in WINDOWS_BACKENDS]
         )
         # 分辨率候选：先试用户要的，失败再降级。
         # 为什么必须降级：不少 USB 摄像头对不支持的分辨率不会报错，
@@ -171,20 +180,24 @@ class CameraSource(VideoSource):
 
         self._cached_hit = False
         # 先看缓存：上次探测出的"后端 + 分辨率"直接拿来打开，
-        # 省掉整个后端/分辨率搜索（MSMF 每次打开要 7 秒，不能白白重开）
+        # 省掉整个后端/分辨率搜索（MSMF 每次打开要 7 秒，不能白白重开）。
+        # 指定后端时缓存**只在其后端一致时才用** —— 否则会把用户指定的后端
+        # 覆盖成别的（双目两路混用不同后端会直接抓不到帧）。
         if optimize:
             cached = _load_mode_cache().get(str(index))
+            cached_api = (getattr(cv2, f"CAP_{cached['backend']}", None)
+                          if cached and cached.get("backend") else None)
             # v2 之前的缓存存的是"实际分辨率"而不是"请求分辨率"，会导致重开掉速，一律作废
-            if cached and cached.get("backend") and cached.get("v") == 2:
-                api = getattr(cv2, f"CAP_{cached['backend']}", None)
-                if api is not None:
-                    cap = self._raw_open(api, int(cached.get("width", width)),
-                                         int(cached.get("height", height)))
-                    if cap is not None:
-                        self.cap = cap
-                        self.backend_name = str(cached["backend"])
-                        self._api = api
-                        self._cached_hit = True
+            if cached and cached.get("v") == 2 and cached_api is not None \
+                    and (backend is None or cached_api == backend):
+                api = cached_api
+                cap = self._raw_open(api, int(cached.get("width", width)),
+                                     int(cached.get("height", height)))
+                if cap is not None:
+                    self.cap = cap
+                    self.backend_name = str(cached["backend"])
+                    self._api = api
+                    self._cached_hit = True
 
         errors: list[str] = []
         for name, api in ([] if self.cap is not None else candidates):
@@ -506,36 +519,6 @@ class ImageSource(VideoSource):
         if frame is None:
             return False, None, t
         return True, frame, t
-
-
-def list_cameras(max_index: int = 5, warmup: int = 3) -> list[tuple[int, int, int, float]]:
-    """扫描可用摄像头，返回 [(索引, 宽, 高, fps), ...]。"""
-    found: list[tuple[int, int, int, float]] = []
-    for idx in range(max_index + 1):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap.release()
-            time.sleep(0.05)
-            continue
-        ok = False
-        for _ in range(warmup):
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                ok = True
-                break
-            time.sleep(0.05)
-        if ok:
-            found.append(
-                (
-                    idx,
-                    int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                    int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                    float(cap.get(cv2.CAP_PROP_FPS)),
-                )
-            )
-        cap.release()
-        time.sleep(0.1)
-    return found
 
 
 def open_source(path: str | None = None, camera: int | None = None, **kwargs) -> VideoSource:

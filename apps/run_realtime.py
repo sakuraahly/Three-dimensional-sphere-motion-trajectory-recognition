@@ -39,6 +39,7 @@ import time
 import cv2
 import numpy as np
 
+from sphere_tracker import camera_registry as cr
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detect import build_detector
 from sphere_tracker.pipeline import SpherePipeline
@@ -50,7 +51,9 @@ METHOD_CYCLE = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="实时球体轨迹识别与预测")
-    p.add_argument("--camera", type=int, default=0, help="摄像头编号，默认 0")
+    p.add_argument("--camera", default=None,
+                   help="摄像头：索引(0) / 角色名(main，查 config/cameras.json)；"
+                        "默认自动挑最优（优先外接、避开内置/红外、非全黑）")
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--fps", type=int, default=60)
@@ -66,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--config", default=None, help="读取 JSON 配置（标定结果）")
     p.add_argument(
-        "--save-config", default="config/sphere_config.json", help="配   置保存路径"
+        "--save-config", default="config/sphere_config.json", help="配置保存路径"
     )
     p.add_argument(
         "--ball-diameter",
@@ -116,9 +119,26 @@ def main() -> int:
     args = parse_args()
     cfg = build_config(args)
 
+    arg = args.camera
+    if arg is not None and str(arg).strip().lower() == cr.AUTO_TOKEN:
+        arg = None                      # --camera auto 等同"不指定"，走下面的自动选择
+    try:
+        index = cr.resolve_camera_arg(arg)
+    except RuntimeError as exc:
+        print(f"[错误] {exc}")
+        return 1
+    if index is None:
+        picks = cr.select_cameras(need=1)
+        if not picks:
+            print("[错误] 没找到可用的摄像头。请跑 "
+                  "python apps/tools/cameras.py list 看看当前设备。")
+            return 1
+        index = picks[0].index
+        print(f"[自动选择] 使用摄像头 #{index}")
+
     try:
         src = CameraSource(
-            index=args.camera, width=args.width, height=args.height, fps=args.fps
+            index=index, width=args.width, height=args.height, fps=args.fps
         )
     except RuntimeError as exc:
         print(f"[错误] {exc}")
@@ -126,7 +146,7 @@ def main() -> int:
 
     info = src.info
     print(
-        f"摄像头 {args.camera} 已打开：{info.width}x{info.height} @ {info.fps:.1f} fps（后端 {info.backend}）"
+        f"摄像头 {index} 已打开：{info.width}x{info.height} @ {info.fps:.1f} fps（后端 {info.backend}）"
     )
     print(
         f"检测方法：{cfg.detector.method}    预测：{cfg.predict.method}  视野 {cfg.predict.horizon_s}s"

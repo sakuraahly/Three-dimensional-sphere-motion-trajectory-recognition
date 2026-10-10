@@ -568,8 +568,6 @@ def main() -> int:
     def methods_for(scenario: str) -> list[str]:
         if args.method:
             return [args.method]
-        if args.scenario != "all":
-            return methods_by_scenario.get(scenario, ["color", "fusion"])
         return methods_by_scenario.get(scenario, ["color", "fusion"])
     gate = {s.strip() for s in args.gate.split(",") if s.strip()}
     probe = Scene()

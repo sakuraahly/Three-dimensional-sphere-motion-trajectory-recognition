@@ -8,9 +8,6 @@ import numpy as np
 from .base import BaseDetector
 from ..config import DetectorConfig
 from ..geometry import (
-    circle_edge_support,
-    circle_gradient_support,
-    circle_radial_gradient_stats,
     contour_circularity,
     fit_circle_robust,
     radial_consistency,

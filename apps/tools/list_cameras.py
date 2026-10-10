@@ -3,7 +3,9 @@
 换相机/换机器时先跑这个，避免"以为坏了其实是别的问题"：
 
     python apps/tools/list_cameras.py
-    python apps/tools/list_cameras.py --max-index 6 --probe-seconds 2
+    python apps/tools/list_cameras.py --max-index 6
+
+    python apps/tools/cameras.py list          # 更推荐：列出设备身份/端口（不开相机）
 
 它会逐个打开 DirectShow 索引 0..N，报告实际拿到的分辨率与实测帧率，
 并检查画面是不是"全黑常量流"（真实传感器一定有噪声，
@@ -18,13 +20,9 @@ import sys
 from pathlib import Path
 
 # --- 让脚本在任意目录深度都能找到项目根 ---
-ROOT = Path(__file__).resolve().parent
-while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
-    ROOT = ROOT.parent
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker").is_dir())
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-import numpy as np
 
 from sphere_tracker.sources import CameraSource
 

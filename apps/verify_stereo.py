@@ -6,7 +6,7 @@
 
 这个工具用同一块标定板拍几帧，重新算**极线误差**并与标定时记录的值比较：
 
-    python apps/verify_stereo.py --calib config/stereo_calibration --left 0 --right 1
+    python apps/verify_stereo.py --calib config/stereo_calibration --left 0 --right 2
     python apps/verify_stereo.py --calib config/stereo_calibration \
         --left-dir check/left --right-dir check/right
 
@@ -21,35 +21,24 @@ import sys
 from pathlib import Path
 
 # --- 让脚本在任意目录深度都能找到项目根 ---
-ROOT = Path(__file__).resolve().parent
-while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
-    ROOT = ROOT.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for _parent in Path(__file__).resolve().parents:
+    if (_parent / "sphere_tracker").is_dir():
+        sys.path.insert(0, str(_parent))
+        break
 
 import cv2
 import numpy as np
 
+from apps._common import add_stereo_source_args, open_pair_source
 from calib import BoardSpec, StereoRig
 from calib.board import detect_board
-from stereo import PairSource, from_args
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="复检双目标定（装置是否被碰动）")
     ap.add_argument("--calib", default="config/stereo_calibration",
                     help="标定文件前缀（不带扩展名）")
-    ap.add_argument("--left", type=int, default=None)
-    ap.add_argument("--right", type=int, default=None)
-    ap.add_argument("--backup-camera", type=int, default=None,
-                    help="备用相机索引（左右任一路打不开时顶上）")
-    ap.add_argument("--left-video", default=None)
-    ap.add_argument("--right-video", default=None)
-    ap.add_argument("--left-dir", default=None)
-    ap.add_argument("--right-dir", default=None)
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--fps", type=int, default=60)
+    add_stereo_source_args(ap)
     ap.add_argument("--cols", type=int, default=8)
     ap.add_argument("--rows", type=int, default=5)
     ap.add_argument("--square", type=float, default=25.0)
@@ -71,7 +60,9 @@ def main() -> int:
         print(f"[提示] 标定时用的是「{board_desc}」，"
               f"现在按 {args.cols}x{args.rows} 检测，请确认参数一致")
 
-    src = from_args(args)
+    src = open_pair_source(args)
+    if src is None:
+        return 1
     errs: list[float] = []
     frames = 0
     try:

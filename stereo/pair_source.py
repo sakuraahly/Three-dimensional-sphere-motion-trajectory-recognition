@@ -61,6 +61,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from sphere_tracker.camera_registry import (
+    AUTO_TOKEN,
+    resolve_camera_arg,
+    select_cameras,
+)
 from sphere_tracker.sources import CameraSource, LatestFrameCamera
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -70,6 +75,18 @@ CAMERA_POLL_INTERVAL = 0.005     # 轮询间隔，比 30 fps 的帧间隔（33 m
 # 让右路至少前进这么多帧，就认为"两路都已经刷新过"，时间差被压到一帧以内。
 # （这是减小时间差，不是消除 —— 真正的同步要靠硬件触发。）
 CAMERA_ALIGN_STEPS = 2
+
+_BACKEND_BY_CLI = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
+
+
+def resolve_backend(value: str | None) -> int | None:
+    """把命令行 `--backend` 的值翻成 cv2 后端常量；auto/空 = 自动成对挑一个。"""
+    if value in (None, "", "auto"):
+        return None
+    name = str(value).lower()
+    if name not in _BACKEND_BY_CLI:
+        raise RuntimeError(f"未知后端 {value!r}，可选：auto / dshow / msmf")
+    return _BACKEND_BY_CLI[name]
 
 
 def describe_info(info) -> str:
@@ -241,15 +258,16 @@ class CameraPairReader(FrameReader):
         height: int = 1080,
         fps: int = 60,
         backup_camera: int | None = None,
+        backend: int | None = None,
     ) -> None:
         if left_index == right_index:
             raise RuntimeError(f"左右相机不能是同一个索引（都是 {left_index}）")
         self.label = f"camera {left_index} / {right_index}"
 
-        def _open(role: str, idx: int) -> LatestFrameCamera:
+        def _open(role: str, idx: int, api: int) -> LatestFrameCamera:
             try:
                 return LatestFrameCamera(CameraSource(
-                    index=idx, width=width, height=height, fps=fps))
+                    index=idx, width=width, height=height, fps=fps, backend=api))
             except RuntimeError:
                 if backup_camera is None or backup_camera == idx:
                     raise
@@ -257,11 +275,40 @@ class CameraPairReader(FrameReader):
                 print("       注意：备用相机与被替换的那台型号/视野都不同，"
                       "标定结果只对当前这个组合有效")
                 return LatestFrameCamera(CameraSource(
-                    index=backup_camera, width=width, height=height, fps=fps))
+                    index=backup_camera, width=width, height=height, fps=fps, backend=api))
 
-        # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
-        # 处理得慢就自动丢帧，永远处理最新画面
-        self.cams = [_open("左", left_index), _open("右", right_index)]
+        # 两路必须用同一个后端，且要**成对地**挑：一个后端能同时打开两路才算数。
+        # 原因（2026-10 实测）：同一进程里混用 DSHOW + MSMF 时，MSMF 那路会
+        # "打开成功但抓不到帧"（报 can't grab frame），双目直接废掉；
+        # 而且两台相机在两种后端下的索引空间不一定一致，混用还会张冠李戴。
+        backends = ([("指定", backend)] if backend is not None
+                    else [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF)])
+        errors: list[str] = []
+        self.cams: list[LatestFrameCamera] = []
+        for name, api in backends:
+            opened: list[LatestFrameCamera] = []
+            try:
+                for role, idx in (("左", left_index), ("右", right_index)):
+                    opened.append(_open(role, idx, api))
+            except RuntimeError as exc:
+                for c in opened:
+                    c.stop()
+                first_line = (str(exc).splitlines() or ["打开失败"])[0]
+                errors.append(f"{name}: {first_line}")
+                continue
+            # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
+            # 处理得慢就自动丢帧，永远处理最新画面
+            self.cams = opened
+            break
+        if not self.cams:
+            raise RuntimeError(
+                f"左右相机（{left_index} / {right_index}）无法用同一个后端同时打开：\n  "
+                + "\n  ".join(errors) +
+                "\n最常见的原因：两台型号相同的外接相机挂在同一个 USB 集线器上，"
+                "带宽/枚举受限。\n"
+                "建议：把两台相机分别插到笔记本机身上**不同的 USB 口**"
+                "（不要走同一个集线器），然后再试。")
+
         self._primed = False
         self.width = self.cams[0].info.width
         self.height = self.cams[0].info.height
@@ -354,6 +401,7 @@ class PairSource:
         height: int = 1080,
         fps: int = 60,
         backup_camera: int | None = None,
+        backend: int | None = None,
     ) -> None:
         given = [name for name, v in
                  (("camera", camera), ("video", video), ("directory", directory)) if v]
@@ -378,7 +426,7 @@ class PairSource:
                 self.sync_offset = 0
             self._left = self._right = CameraPairReader(
                 int(camera[0]), int(camera[1]), width=width, height=height, fps=fps,
-                backup_camera=backup_camera)
+                backup_camera=backup_camera, backend=backend)
             self.kind = "camera"
         elif video is not None:
             self._left = _make_reader(video[0], "左路")
@@ -477,11 +525,34 @@ def from_args(args) -> PairSource:
     `--left-dir/--right-dir`、`--width/--height/--fps`、`--backup-camera`），
     所以映射逻辑放在库里共用，不各写一份 —— 各写一份就会出现
     "标定能用图片文件夹、复检不能用"这类不一致。
+
+    `--left/--right` 的取值可以是**索引**（`0`）、**角色名**（`left`，查
+    `config/cameras.json`）、或 `auto`；`--auto-cameras` 则两台都自动挑。
+    之所以支持角色名：相机索引会随 USB 口/连接顺序漂移，角色名绑定的是
+    **设备身份**，重插后仍能解析到正确的那台（见 `sphere_tracker/camera_registry.py`）。
     """
-    if getattr(args, "left", None) is not None and getattr(args, "right", None) is not None:
-        return PairSource(camera=(args.left, args.right), width=args.width,
+    left_raw = getattr(args, "left", None)
+    right_raw = getattr(args, "right", None)
+    auto = (bool(getattr(args, "auto_cameras", False))
+            or left_raw == AUTO_TOKEN or right_raw == AUTO_TOKEN)
+
+    if auto or (left_raw is not None and right_raw is not None):
+        if auto:
+            picks = select_cameras(need=2)
+            if len(picks) < 2:
+                raise RuntimeError(
+                    "自动选择失败：没找到两台可用的相机。请跑 "
+                    "python apps/tools/cameras.py list 看当前设备，"
+                    "或用 --left 0 --right 2 手动指定。")
+            left_i, right_i = picks[0].index, picks[1].index
+            print(f"[自动选择] 左 #{left_i}｜右 #{right_i}")
+        else:
+            left_i = resolve_camera_arg(left_raw)
+            right_i = resolve_camera_arg(right_raw)
+        return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,
-                          backup_camera=getattr(args, "backup_camera", None))
+                          backup_camera=getattr(args, "backup_camera", None),
+                          backend=resolve_backend(getattr(args, "backend", None)))
     if getattr(args, "left_video", None) and getattr(args, "right_video", None):
         return PairSource(video=(args.left_video, args.right_video))
     if getattr(args, "left_dir", None) and getattr(args, "right_dir", None):
@@ -493,6 +564,7 @@ def from_args(args) -> PairSource:
 __all__ = [
     "PairSource",
     "from_args",
+    "resolve_backend",
     "FrameReader",
     "VideoFrameReader",
     "ImageDirFrameReader",

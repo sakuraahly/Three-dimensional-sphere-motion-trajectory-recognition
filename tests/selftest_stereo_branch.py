@@ -466,12 +466,6 @@ def test_baseline_sign() -> bool:
 def T_of(tx: float) -> np.ndarray:
     return np.array([tx, 0.0, 0.0]).reshape(3, 1)
 
-    ok_all = True
-    for label, passed in checks:
-        print(f"  [{'通过' if passed else '不达标'}] {label}")
-        ok_all = ok_all and passed
-    return ok_all
-
 
 # --------------------------------------------------------------------------
 def main() -> int:
