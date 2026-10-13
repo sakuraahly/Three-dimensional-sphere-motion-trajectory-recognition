@@ -119,6 +119,124 @@ class Launcher(tk.Tk):
             row=0, column=0, columnspan=7, sticky="w", pady=(0, 8))
         return box
 
+    # ---------- 参数行的小工具 ----------
+    def _param_entry(self, parent, row: int, label: str, value: str,
+                     hint: str = "", **kw) -> ttk.Entry:
+        """一行参数：`标签 [输入框]  说明`。
+
+        说明紧跟其后而不是塞进 tooltip —— 这个界面其余部分也不用 tooltip，
+        而且标定参数**必须在动手前就被看见**（写错方格边长=整份标定白做）。
+        """
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e",
+                                           padx=(0, 6), pady=3)
+        ent = ttk.Entry(parent, width=kw.pop("width", 8), **kw)
+        ent.insert(0, value)
+        ent.grid(row=row, column=1, sticky="w", pady=3)
+        if hint:
+            ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+                row=row, column=2, columnspan=5, sticky="w", padx=(10, 0), pady=3)
+        return ent
+
+    def _param_path(self, parent, row: int, label: str, hint: str,
+                    is_dir: bool) -> ttk.Entry:
+        """路径参数：`标签 [输入框] [选择…]  说明`。留空 = 不要。"""
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e",
+                                           padx=(0, 6), pady=3)
+        ent = ttk.Entry(parent, width=26)
+        ent.grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+
+        def pick() -> None:
+            got = (filedialog.askdirectory(title=label) if is_dir
+                   else filedialog.asksaveasfilename(title=label, defaultextension=".png"))
+            if got:
+                ent.delete(0, "end")
+                ent.insert(0, got)
+
+        ttk.Button(parent, text="选择…", command=pick, width=6).grid(
+            row=row, column=3, sticky="w", padx=(6, 0), pady=3)
+        ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
+            row=row, column=4, columnspan=3, sticky="w", padx=(10, 0), pady=3)
+        return ent
+
+    def _calib_params(self) -> ttk.Frame:
+        """标定参数区：**基本设置 / 高级设置** 两个页签。
+
+        为什么分区（全局 §四「渐进式展示」）：标定有十几个可调项，
+        全铺在第一屏会让人不知道哪些真的必须改。分成两页之后：
+          · 基本 = **改错就白做**的那几项（板参数、收多少对、分辨率）；
+          · 高级 = **用精度换成功率**的开关（停稳/清晰度/放宽/基线核对）。
+        """
+        nb = ttk.Notebook(self.param_holder)
+        nb.pack(fill="x", pady=(2, 0))
+        basic = ttk.Frame(nb, padding=(10, 8))
+        adv = ttk.Frame(nb, padding=(10, 8))
+        nb.add(basic, text="  基本设置  ")
+        nb.add(adv, text="  高级设置  ")
+
+        # ---- 基本 ----
+        ttk.Label(basic, text="① 收多少对（越多越准，25 对约需举板几分钟）",
+                  style="Hint.TLabel").grid(row=0, column=0, columnspan=7,
+                                            sticky="w", pady=(0, 4))
+        self.calib_target = self._param_entry(
+            basic, 1, "目标对数", "25", "收够就自动开始标定（正式档 25）")
+        self.calib_minpairs = self._param_entry(
+            basic, 2, "最少对数", "10", "少于这么多不做标定；剔除离群后不足会直接拒绝")
+
+        ttk.Label(basic, text="② 标定板（必须和手上那张纸完全一致）",
+                  style="Hint.TLabel").grid(row=3, column=0, columnspan=7,
+                                            sticky="w", pady=(10, 4))
+        self.calib_cols = self._param_entry(
+            basic, 4, "内角点·列", "8", "**内角点**数，不是方格数：8×5 内角点 = 9×6 方格")
+        self.calib_rows = self._param_entry(basic, 5, "内角点·行", "5")
+        self.calib_square = self._param_entry(
+            basic, 6, "方格边长 mm", "25", "★ 必须用尺子量实际边长，别信打印设置")
+
+        ttk.Label(basic, text="③ 两路采集（左右必须一致）", style="Hint.TLabel").grid(
+            row=7, column=0, columnspan=7, sticky="w", pady=(10, 4))
+        ttk.Label(basic, text="分辨率").grid(row=8, column=0, sticky="e", padx=(0, 6))
+        self.calib_res = ttk.Combobox(basic, values=RESOLUTIONS, width=10,
+                                      state="readonly")
+        self.calib_res.set("1920x1080")
+        self.calib_res.grid(row=8, column=1, sticky="w", pady=3)
+        ttk.Label(basic, text="帧率").grid(row=8, column=2, sticky="e",
+                                          padx=(16, 6))
+        self.calib_fps = ttk.Entry(basic, width=6)
+        self.calib_fps.insert(0, "60")
+        self.calib_fps.grid(row=8, column=3, sticky="w", pady=3)
+        ttk.Label(basic, text="（两台相机必须同分辨率、同后端）",
+                  style="Hint.TLabel").grid(row=8, column=4, columnspan=3,
+                                            sticky="w", padx=(10, 0))
+
+        # ---- 高级 ----
+        ttk.Label(adv, text="这几项**都是拿精度换成功率**，不确定就别动",
+                  style="Hint.TLabel").grid(row=0, column=0, columnspan=7,
+                                            sticky="w", pady=(0, 4))
+        self.calib_stationary = self._param_entry(
+            adv, 1, "停稳上限 px", "", "留空=默认 3。这条**同时替代左右同步**，"
+                                       "调大到 10 以上会让两路拍到不同位姿、R/T 系统性偏")
+        self.calib_sharp = self._param_entry(
+            adv, 2, "清晰度下限", "", "留空=默认 55（Laplacian 方差）。调低会收进更糊的帧")
+        self.calib_relaxed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv, text="放宽模式（手持拍摄：一次放松 6 条门限）",
+                        variable=self.calib_relaxed).grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        ttk.Label(adv, text="用完必须复检极线误差；不达标请处理光照/支撑后关掉它重标",
+                  style="Hint.TLabel").grid(row=4, column=0, columnspan=7,
+                                            sticky="w", pady=(0, 6))
+
+        ttk.Label(adv, text="④ 核对与留证（**强烈建议都填**）",
+                  style="Hint.TLabel").grid(row=5, column=0, columnspan=7,
+                                            sticky="w", pady=(6, 4))
+        self.calib_baseline = self._param_entry(
+            adv, 6, "预期基线 mm", "", "★ 两镜头中心距。**填了才会核对基线** ——"
+                                       "不填这道护栏就是关着的")
+        self.calib_savepairs = self._param_path(
+            adv, 7, "存图像对", "存下来才能离线复查/重标（出问题时唯一能回答「哪一对错了」）",
+            is_dir=True)
+        self.calib_report = self._param_path(
+            adv, 8, "验证图", "标定后出一张可视化验证图", is_dir=False)
+        return nb
+
     # ---------- 第 1 步：标定 ----------
     def _build_step1(self) -> None:
         box = self._card(
@@ -147,35 +265,36 @@ class Launcher(tk.Tk):
         self.calib_right = ttk.Combobox(box, values=CAMERAS, width=9, state="readonly")
         self.calib_right.set("right")
         self.calib_right.grid(row=4, column=3, sticky="w", padx=(4, 12), pady=(8, 0))
-        ttk.Label(box, text="两路统一分辨率").grid(row=4, column=4, sticky="e", pady=(8, 0))
-        self.calib_res = ttk.Combobox(box, values=RESOLUTIONS, width=10, state="readonly")
-        self.calib_res.set("1920x1080")
-        self.calib_res.grid(row=4, column=5, sticky="w", padx=(4, 12), pady=(8, 0))
-        ttk.Label(box, text="帧率").grid(row=4, column=6, sticky="e", pady=(8, 0))
-        self.calib_fps = ttk.Entry(box, width=5)
-        self.calib_fps.insert(0, "60")
-        self.calib_fps.grid(row=4, column=7, sticky="w", padx=(4, 12), pady=(8, 0))
+        ttk.Label(box, text="（分辨率 / 帧率 / 板参数在下面的『基本设置』里）",
+                  style="Hint.TLabel").grid(row=4, column=4, columnspan=4,
+                                            sticky="w", pady=(8, 0))
+
+        # 参数区分两个页签。放 `param_holder` 里是为了让「运行标定」按钮
+        # 排在参数**之后** —— 按阅读顺序：选相机 → 调参数 → 点运行。
+        self.param_holder = ttk.Frame(box)
+        self.param_holder.grid(row=5, column=0, columnspan=8, sticky="we", pady=(8, 4))
+        self._calib_params()
 
         ttk.Button(box, text="运行标定 / 复检", command=self._run_calibration).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(10, 2))
+            row=6, column=0, columnspan=2, sticky="w", pady=(10, 2))
         ttk.Button(box, text="标定前置检查（两路是否都看到棋盘）",
                    command=self._run_precheck).grid(
-            row=5, column=2, columnspan=3, sticky="w", pady=(10, 2))
+            row=6, column=2, columnspan=3, sticky="w", pady=(10, 2))
         ttk.Button(box, text="刷新设备列表", command=self._refresh_cameras).grid(
-            row=5, column=5, columnspan=3, sticky="w", pady=(10, 2))
+            row=6, column=5, columnspan=3, sticky="w", pady=(10, 2))
         ttk.Button(box, text="相机探测（核对两路参数是否一致）",
                    command=self._run_probe).grid(
-            row=6, column=0, columnspan=3, sticky="w", pady=(2, 2))
+            row=7, column=0, columnspan=3, sticky="w", pady=(2, 2))
         ttk.Button(box, text="相机设备管理（识别 / 固定 / 标无关）",
                    command=self._run_cameras_identify).grid(
-            row=6, column=3, columnspan=2, sticky="w", pady=(2, 2))
+            row=7, column=3, columnspan=2, sticky="w", pady=(2, 2))
         ttk.Button(box, text="检查相机映射", command=self._run_cameras_check).grid(
-            row=6, column=5, columnspan=2, sticky="w", pady=(2, 2))
+            row=7, column=5, columnspan=2, sticky="w", pady=(2, 2))
         ttk.Button(box, text="「无关」相机清单（自动挑选会跳过）",
                    command=self._run_cameras_ignored).grid(
-            row=7, column=0, columnspan=3, sticky="w", pady=(2, 2))
+            row=8, column=0, columnspan=3, sticky="w", pady=(2, 2))
         ttk.Button(box, text="清空「无关」标记", command=self._run_cameras_unignore_all).grid(
-            row=7, column=3, columnspan=2, sticky="w", pady=(2, 2))
+            row=8, column=3, columnspan=2, sticky="w", pady=(2, 2))
 
     # ---------- 第 2 步：参数 ----------
     def _build_step2(self) -> None:
@@ -321,6 +440,106 @@ class Launcher(tk.Tk):
                     "双目请用外接相机。确定仍要继续吗？")
         return True
 
+    # ---------- 读取 / 校验参数面板 ----------
+    def _read_int(self, entry: ttk.Entry, label: str, lo: int, hi: int) -> int | None:
+        """读一个整数并校验范围。非法时弹窗并把焦点放回该输入框。"""
+        raw = entry.get().strip()
+        try:
+            val = int(raw)
+        except ValueError:
+            messagebox.showwarning("参数不对", f"「{label}」要填整数，现在是「{raw}」。")
+            entry.focus_set()
+            return None
+        if not (lo <= val <= hi):
+            messagebox.showwarning("参数不对", f"「{label}」要在 {lo}~{hi} 之间，现在是 {val}。")
+            entry.focus_set()
+            return None
+        return val
+
+    def _read_opt_float(self, entry: ttk.Entry, label: str,
+                        lo: float, hi: float) -> tuple[float | None, bool]:
+        """读一个**可留空**的浮点。返回 (值, 是否合法)；空 = (None, True)。"""
+        raw = entry.get().strip()
+        if not raw:
+            return None, True
+        try:
+            val = float(raw)
+        except ValueError:
+            messagebox.showwarning("参数不对", f"「{label}」要么留空、要么填数字，现在是「{raw}」。")
+            entry.focus_set()
+            return None, False
+        if not (lo <= val <= hi):
+            messagebox.showwarning("参数不对", f"「{label}」要在 {lo}~{hi} 之间，现在是 {val}。")
+            entry.focus_set()
+            return None, False
+        return val, True
+
+    def _calibrate_args(self) -> list[str] | None:
+        """把参数面板拼成 `calibrate_stereo.py` 的命令行。非法则返回 None。
+
+        ⚠️ **这里曾经是硬编码的**（`--cols 8 --rows 5 --square 25`，且完全没有
+        `--target`），于是从界面走**永远停在脚本默认的试标定档**，
+        而用户以为在做正式标定。现在参数由面板给，面板的默认值就是正式档。
+        """
+        target = self._read_int(self.calib_target, "目标对数", 4, 200)
+        if target is None:
+            return None
+        minp = self._read_int(self.calib_minpairs, "最少对数", 3, 200)
+        if minp is None:
+            return None
+        cols = self._read_int(self.calib_cols, "内角点·列", 3, 30)
+        if cols is None:
+            return None
+        rows = self._read_int(self.calib_rows, "内角点·行", 3, 30)
+        if rows is None:
+            return None
+        square = self._read_int(self.calib_square, "方格边长 mm", 5, 500)
+        if square is None:
+            return None
+        if minp > target:
+            messagebox.showwarning(
+                "参数矛盾",
+                f"「最少对数」({minp}) 不能大于「目标对数」({target}) ——\n"
+                f"收够 {target} 对就停了，永远达不到 {minp}。")
+            return None
+
+        stationary, ok1 = self._read_opt_float(
+            self.calib_stationary, "停稳上限 px", 0.5, 12.0)
+        if not ok1:
+            return None
+        sharp, ok2 = self._read_opt_float(self.calib_sharp, "清晰度下限", 5.0, 500.0)
+        if not ok2:
+            return None
+        baseline, ok3 = self._read_opt_float(
+            self.calib_baseline, "预期基线 mm", 5.0, 2000.0)
+        if not ok3:
+            return None
+
+        width, height = self.calib_res.get().split("x")
+        fps = self.calib_fps.get().strip() or "60"
+        args = ["--left", _cam_arg(self.calib_left.get()),
+                "--right", _cam_arg(self.calib_right.get()),
+                "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+                "--target", str(target), "--min-pairs", str(minp),
+                "--width", width, "--height", height, "--fps", fps,
+                # 序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致（见 pair_source）
+                "--backend", "msmf"]
+        if stationary is not None:
+            args += ["--stationary-px", str(stationary)]
+        if sharp is not None:
+            args += ["--min-sharpness", str(sharp)]
+        if baseline is not None:
+            args += ["--baseline-mm", str(baseline)]
+        if self.calib_relaxed.get():
+            args += ["--relaxed"]
+        save = self.calib_savepairs.get().strip()
+        if save:
+            args += ["--save-pairs", save]
+        report = self.calib_report.get().strip()
+        if report:
+            args += ["--report-png", report]
+        return args
+
     def _run_calibration(self) -> None:
         mode = self.calib_mode.get()
         if mode == "skip":
@@ -334,13 +553,16 @@ class Launcher(tk.Tk):
         width, height = self.calib_res.get().split("x")
         fps = self.calib_fps.get().strip() or "60"
         if mode == "calibrate":
-            cmd = [PY, str(ROOT / "apps" / "calibrate_stereo.py"),
-                   "--left", left, "--right", right,
-                   "--cols", "8", "--rows", "5", "--square", "25",
-                   "--width", width, "--height", height, "--fps", fps,
-                   # 序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致（见 pair_source）
-                   "--backend", "msmf"]
-            self._run(cmd, f"双目标定（左{left} / 右{right}，收满约 25 对后自动标定）")
+            extra = self._calibrate_args()
+            if extra is None:
+                return                      # 校验失败，弹窗已经说清哪里不对
+            cmd = [PY, str(ROOT / "apps" / "calibrate_stereo.py")] + extra
+            target = self.calib_target.get().strip()
+            base = self.calib_baseline.get().strip()
+            note = f"收满 {target} 对后自动标定"
+            if not base:
+                note += "；⚠ 未填预期基线，基线核对将是关着的"
+            self._run(cmd, f"双目标定（左{left} / 右{right}，{note}）")
         else:
             calib = ROOT / "config" / "stereo_calibration"
             if not calib.with_suffix(".npz").exists():
