@@ -54,19 +54,22 @@ CAMERAS = ["left", "right", "auto", "0", "1", "2"]
 MONO_CAMERAS = ["auto", "0", "1", "2"]
 RESOLUTIONS = ["1920x1080", "1280x720", "960x540", "640x480"]
 
-# ---- 换行宽度 ----
-# 这两个数是**布局能不能站住**的关键，不是审美问题：
-# 不设换行时，提示文字会按整行自然宽度把卡片撑开（实测第 1 步那张卡片
-# 自然宽度 1941 px、整窗 1973 px，而屏幕只有 1600），结果新加的参数区
-# 把原有控件全挤到窗口外。设了换行，卡片宽度就与**文字长度无关**。
-# ⚠️ **实测结论**：当前**真正卡住宽度的是 CARD_HINT_WRAP**。
-# 只把卡片说明设成 820/700/640，页面宽就跟着 873/756/704 变；
-# 到 640 之后不再变 —— 约束转移到了参数说明（page 741）。
-# 也就是说 PARAM_HINT_WRAP 现在是**护栏**（防止将来某条参数说明特别长
-# 又把卡片撑开），而**不是**当前的约束。测试能抓住前者、抓不住后者，
-# 这一点写在 selftest_launcher_params.py 里，不假装覆盖了。
-CARD_HINT_WRAP = 820      # 卡片顶部那句总说明（当前是实际约束）
-PARAM_HINT_WRAP = 520     # 每个参数下方那句说明（护栏）
+# ---- 换行宽度：**跟着视口动态算，不写死** ----
+#
+# 为什么必须动态：
+#
+# 1. 不设换行时，提示文字会按整行自然宽度把卡片撑开 —— 实测第 1 步那张卡片
+#    自然宽度 1941 px、整窗 1973 px，而屏幕只有 1600，原有控件全被挤到窗口外。
+# 2. 但**写死也不行**：写死 820 是按"窗口 900"估的；窗口改成 980 之后，
+#    卡片自宽 873 而视口 966 —— 文字在卡片那一列里被切掉，右边还空一大片。
+#    界面上"…在下面的『基本···"被截断就是这么来的。
+#
+# 所以：**每次画布尺寸变化就按实际宽度重设**（见 _reflow）。
+# 这两个常量只当"第一次布局前的初值"。
+CARD_HINT_WRAP = 820      # 初值；实际由 _reflow 按视口宽度刷新
+PARAM_HINT_WRAP = 720     # 初值；同上
+# 卡片左右各 16px 外边距 + 卡片内 14px 内边距 + 滚动条 ≈ 60px
+CHROME_PX = 64
 
 
 def _cam_arg(raw: str) -> str:
@@ -87,6 +90,8 @@ class Launcher(tk.Tk):
 
         self.proc: subprocess.Popen | None = None
         self.log_queue: queue.Queue = queue.Queue()
+        # 要跟着视口宽度重新换行的标签：(控件, "卡片说明"|"参数说明")
+        self._wrapped: list[tuple[ttk.Label, str]] = []
 
         self._init_style()
         self._build_header()
@@ -102,6 +107,9 @@ class Launcher(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._poll)
         self.after(200, self._refresh_cameras)     # 启动时就把当前设备填进下拉
+        # 首帧量出真实宽度后立刻按它换行一次（<Configure> 也会触发，
+        # 这里只是保证打开就已经是对的，不会先闪一下错的换行）。
+        self.after(0, self._reflow)
 
     # ---------- 可滚动页面 ----------
     def _build_scroll_page(self) -> None:
@@ -139,6 +147,32 @@ class Launcher(tk.Tk):
 
     def _on_canvas_configure(self, evt) -> None:
         self._canvas.itemconfigure(self._page_id, width=evt.width)
+        self._reflow(evt.width)
+
+    def _reflow(self, viewport: int | None = None) -> None:
+        """按**当前视口宽度**重设所有提示的换行宽度。
+
+        ## 为什么不能写死
+
+        写死 820 是按"窗口 900"估的。窗口改成 980 之后，卡片自宽 873 而视口 966：
+        文字在卡片那一列里被切掉（界面里"…在下面的『基本···"看着像被截断），
+        而右边又空出一大片。**写死的换行宽度一定会和实际窗口对不上。**
+
+        重设 wraplength 会触发重新布局 -> 又发一次 <Configure>；
+        但下一次算出的值相同、不再改动，所以会**收敛**，不会无限递归。
+        """
+        if viewport is None:
+            viewport = self._canvas.winfo_width()
+        if viewport <= 1:                      # 首帧还没量出来
+            return
+        avail = max(240, viewport - CHROME_PX)
+        card = max(200, avail)
+        # 参数说明在输入框右侧起，再让出标签列与内边距
+        param = max(200, avail - 150)
+        for lab, kind in self._wrapped:
+            want = card if kind == "card" else param
+            if int(lab.cget("wraplength")) != want:
+                lab.configure(wraplength=want)
 
     def _on_scrollbar(self, first: str, last: str) -> None:
         """滚动条只在**真的需要**时出现（内容不超一屏就不显示，少一点视觉噪音）。"""
@@ -223,9 +257,10 @@ class Launcher(tk.Tk):
         box.pack(fill="x", padx=16, pady=(10, 0))
         # columnspan 给足：卡片里最多用到第 8 列（0..7），再加 1 列余量，
         # 免得标题提示只跨 7 列、被挤成两行。
-        ttk.Label(box, text=hint, style="Hint.TLabel",
-                  wraplength=CARD_HINT_WRAP).grid(
-            row=0, column=0, columnspan=9, sticky="w", pady=(0, 8))
+        lab = ttk.Label(box, text=hint, style="Hint.TLabel",
+                        wraplength=CARD_HINT_WRAP)
+        lab.grid(row=0, column=0, columnspan=9, sticky="w", pady=(0, 8))
+        self._wrapped.append((lab, "card"))
         return box
 
     # ---------- 参数行的小工具 ----------
@@ -242,9 +277,11 @@ class Launcher(tk.Tk):
         ent.insert(0, value)
         ent.grid(row=row * 2, column=1, sticky="w", pady=(4, 0))
         if hint:
-            ttk.Label(parent, text=hint, style="Hint.TLabel",
-                      wraplength=PARAM_HINT_WRAP).grid(
-                row=row * 2 + 1, column=1, columnspan=4, sticky="w", pady=(0, 2))
+            lab = ttk.Label(parent, text=hint, style="Hint.TLabel",
+                            wraplength=PARAM_HINT_WRAP)
+            lab.grid(row=row * 2 + 1, column=1, columnspan=4, sticky="w",
+                     pady=(0, 2))
+            self._wrapped.append((lab, "param"))
         return ent
 
     def _param_path(self, parent, row: int, label: str, hint: str,
@@ -265,9 +302,11 @@ class Launcher(tk.Tk):
         ttk.Button(parent, text="选择…", command=pick, width=6).grid(
             row=row * 2, column=3, sticky="w", padx=(6, 0), pady=(4, 0))
         if hint:
-            ttk.Label(parent, text=hint, style="Hint.TLabel",
-                      wraplength=PARAM_HINT_WRAP).grid(
-                row=row * 2 + 1, column=1, columnspan=4, sticky="w", pady=(0, 2))
+            lab = ttk.Label(parent, text=hint, style="Hint.TLabel",
+                            wraplength=PARAM_HINT_WRAP)
+            lab.grid(row=row * 2 + 1, column=1, columnspan=4, sticky="w",
+                     pady=(0, 2))
+            self._wrapped.append((lab, "param"))
         return ent
 
     def _calib_params(self) -> ttk.Frame:

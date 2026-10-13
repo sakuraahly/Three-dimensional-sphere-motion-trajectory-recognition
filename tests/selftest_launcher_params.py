@@ -223,15 +223,23 @@ def main() -> int:
     # （整窗 1973 px），而屏幕只有 1600 —— 原有控件被挤到窗口外。
     # 两个原因：卡片顶部与参数下方的说明**没有 wraplength**（按整行文字撑开），
     # 以及日志直接挂在窗口上、用 `expand=True` 吃掉空间。
-    print("----- 9. 滚动式布局（不能被内容挤爆）-----")
+    print("----- 9. 滚动式布局（不能被内容挤爆 / 不能右边空一片）-----")
     app.update()
-    page_w = app._page.winfo_reqwidth()
-    canvas_w = app._canvas.winfo_width()
+    vw0 = app._canvas.winfo_width()
+    pw0 = app._page.winfo_reqwidth()
+    page_w, canvas_w = pw0, vw0
     page_h = app._page.winfo_reqheight()
     canvas_h = app._canvas.winfo_height()
     print(f"  页面需要 {page_w}x{page_h}；滚动区可见 {canvas_w}x{canvas_h}")
+    print(f"  视口与页面宽度差 {canvas_w - page_w} px（越小越说明卡片填满了）")
     checks_layout = [
         ("内容宽度不超过可视宽度（**没有横向截断**）", page_w <= canvas_w),
+        # 这一条是"右边空一片 / 文字被切"的回归护栏。
+        # 起因：`wraplength` 曾写死 820（按"窗口 900"估的），窗口改成 980 之后
+        # 卡片自宽 873 而视口 966 —— 文字在卡片那一列里被切掉，右边还空一大片。
+        # 现在换行宽度由 `_reflow` **按视口动态算**，所以差距应当很小。
+        ("卡片基本填满可用宽度（差距 < 30px，不是「右边空一片」）",
+         (canvas_w - page_w) < 30),
         ("内容高于视口 -> 需要竖向滚动", page_h > canvas_h),
         ("需要滚动时滚动条是显示的", bool(app._vbar.winfo_ismapped())),
         ("四张卡片（含日志）都在滚动页里，不是挂在窗口上",
@@ -239,6 +247,23 @@ def main() -> int:
         ("日志挂到滚动页下了（否则页面滚动时它纹丝不动）",
          app.log.master.master is app._page),
     ]
+    # 窗口改宽度后，换行宽度必须跟着变（这才是"动态"的证据）
+    wraps: list[tuple[int, int, int]] = []
+    for w in (980, 1180, 900):
+        app.geometry(f"{w}x780")
+        app.update()
+        cw = next((int(lab.cget("wraplength")) for lab, k in app._wrapped
+                   if k == "card"), 0)
+        wraps.append((w, app._canvas.winfo_width(), cw))
+    print("  窗口宽 -> 视口宽 / 卡片换行宽度：")
+    for w, vw, cw in wraps:
+        print(f"    {w:5} -> {vw:5} / {cw:5}")
+    grows = wraps[1][2] > wraps[0][2] > wraps[2][2]
+    checks_layout.append(
+        ("换行宽度随窗口**动态**变化（写死的话这条会红）", grows))
+    app.geometry("980x780")
+    app.update()
+
     for name, good in checks_layout:
         print(f"  [{'通过' if good else '不达标'}] {name}")
         results.append((name, good))
