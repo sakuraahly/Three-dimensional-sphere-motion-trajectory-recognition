@@ -28,7 +28,21 @@
 不校验就拼命令                          去掉 `_read_int` 的范围判断                  exit=1
 不查"最少>目标"                         去掉 `minp > target` 那段                    exit=1
 高级项接了不传                          去掉 `args += ["--baseline-mm", ...]`        exit=1
+**卡片**说明不换行                      去掉 `wraplength=CARD_HINT_WRAP`             exit=1
+日志挂回窗口（不进滚动页）              改 `LabelFrame(self._page, ...)` 为 `(self,)`  exit=1
+日志无条件滚到底                        去掉 `if at_bottom:` 判断                    exit=1
+滚动条永不显示                          把 `_vbar.pack(...)` 换成 `pass`             exit=1
 ======================================  ==========================================  ========
+
+**本测试没覆盖的（如实写明）**
+
+- **参数说明的换行**（`PARAM_HINT_WRAP`）：**不会红**。实测过 —— 当前真正卡住
+  宽度的是**卡片**说明那条换行（把它设成 820/700/640，页宽跟着 873/756/704 变；
+  到 640 之后不再变，约束才转移到参数说明）。所以参数说明的换行现在是**护栏**，
+  不是当前约束。它的作用是"将来某条参数说明特别长时别把卡片撑开"，
+  而那件事还没发生，测试自然抓不住。**不假装覆盖了。**
+- **滚轮的可用性**：绑的是 `bind_all("<MouseWheel>")`，无头环境发不了滚轮事件。
+  只断言了"滚动条在需要时出现"与 `scroll_to_bottom()` 生效。
 
 用法::
 
@@ -202,6 +216,56 @@ def main() -> int:
            contains="--width 1280 --height 720")
     app.calib_res.set("1920x1080")
     expect("两台相机必须同后端（backend 固定 msmf）", True, contains="--backend msmf")
+
+    # ---- 9. 可滚动布局（"新加的东西把原来的挤掉"是真实回归）----
+    #
+    # 加标定参数区之后，第 1 步那张卡片的自然宽度一度到 **1941 px**
+    # （整窗 1973 px），而屏幕只有 1600 —— 原有控件被挤到窗口外。
+    # 两个原因：卡片顶部与参数下方的说明**没有 wraplength**（按整行文字撑开），
+    # 以及日志直接挂在窗口上、用 `expand=True` 吃掉空间。
+    print("----- 9. 滚动式布局（不能被内容挤爆）-----")
+    app.update()
+    page_w = app._page.winfo_reqwidth()
+    canvas_w = app._canvas.winfo_width()
+    page_h = app._page.winfo_reqheight()
+    canvas_h = app._canvas.winfo_height()
+    print(f"  页面需要 {page_w}x{page_h}；滚动区可见 {canvas_w}x{canvas_h}")
+    checks_layout = [
+        ("内容宽度不超过可视宽度（**没有横向截断**）", page_w <= canvas_w),
+        ("内容高于视口 -> 需要竖向滚动", page_h > canvas_h),
+        ("需要滚动时滚动条是显示的", bool(app._vbar.winfo_ismapped())),
+        ("四张卡片（含日志）都在滚动页里，不是挂在窗口上",
+         len(app._page.winfo_children()) == 4),
+        ("日志挂到滚动页下了（否则页面滚动时它纹丝不动）",
+         app.log.master.master is app._page),
+    ]
+    for name, good in checks_layout:
+        print(f"  [{'通过' if good else '不达标'}] {name}")
+        results.append((name, good))
+
+    # ---- 10. 日志自动滚动的约定 ----
+    print("----- 10. 日志：贴底才自动滚（不许把正在读历史的用户拽走）-----")
+    app._append("第一行")
+    app._append("第二行")
+    app.update()
+    at_bottom = app.log.yview()[1] >= 0.99
+    for i in range(60):
+        app._append(f"填充 {i}")
+    app.update()
+    app.log.yview_moveto(0.0)                 # 模拟用户往上翻
+    reading_from = app.log.yview()[1] < 0.99
+    before = app.log.yview()[1]
+    app._append("读历史时来的新行")
+    app.update()
+    not_yanked = abs(app.log.yview()[1] - before) < 0.02
+    print(f"  贴底时自动滚={at_bottom}；往上翻后是否被拽回底={not not_yanked}")
+    checks_log = [
+        ("贴底时追加会自动跟到底", at_bottom),
+        ("用户往上翻之后，新行不再把他拽到底", reading_from and not_yanked),
+    ]
+    for name, good in checks_log:
+        print(f"  [{'通过' if good else '不达标'}] {name}")
+        results.append((name, good))
 
     app.destroy()
 

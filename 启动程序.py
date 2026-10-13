@@ -54,6 +54,20 @@ CAMERAS = ["left", "right", "auto", "0", "1", "2"]
 MONO_CAMERAS = ["auto", "0", "1", "2"]
 RESOLUTIONS = ["1920x1080", "1280x720", "960x540", "640x480"]
 
+# ---- 换行宽度 ----
+# 这两个数是**布局能不能站住**的关键，不是审美问题：
+# 不设换行时，提示文字会按整行自然宽度把卡片撑开（实测第 1 步那张卡片
+# 自然宽度 1941 px、整窗 1973 px，而屏幕只有 1600），结果新加的参数区
+# 把原有控件全挤到窗口外。设了换行，卡片宽度就与**文字长度无关**。
+# ⚠️ **实测结论**：当前**真正卡住宽度的是 CARD_HINT_WRAP**。
+# 只把卡片说明设成 820/700/640，页面宽就跟着 873/756/704 变；
+# 到 640 之后不再变 —— 约束转移到了参数说明（page 741）。
+# 也就是说 PARAM_HINT_WRAP 现在是**护栏**（防止将来某条参数说明特别长
+# 又把卡片撑开），而**不是**当前的约束。测试能抓住前者、抓不住后者，
+# 这一点写在 selftest_launcher_params.py 里，不假装覆盖了。
+CARD_HINT_WRAP = 820      # 卡片顶部那句总说明（当前是实际约束）
+PARAM_HINT_WRAP = 520     # 每个参数下方那句说明（护栏）
+
 
 def _cam_arg(raw: str) -> str:
     """下拉里可能是 `0 | aoni webcam A25 | 6&...`，取前面那个编号；否则原样返回角色名。"""
@@ -66,21 +80,106 @@ class Launcher(tk.Tk):
         super().__init__()
         self.title("球形物体三维运动轨迹识别 · 启动器")
         self.configure(bg=BG)
-        self.geometry("900x760")
-        self.minsize(840, 700)
+        self.geometry("980x780")
+        # 最小宽度要**保证内容不被横向截断**：卡片内容按 wraplength 换行后
+        # 实测约需 860 px，低于它就会出现横向裁切。
+        self.minsize(880, 560)
 
         self.proc: subprocess.Popen | None = None
         self.log_queue: queue.Queue = queue.Queue()
 
         self._init_style()
         self._build_header()
+        # 滚动页是**所有卡片与日志的父容器**（在 header 之后创建，
+        # 于是它在 pack 顺序里排在 header 下面）。窗口再高也只显示一屏，
+        # 其余靠滚轮 / PageUp·PageDown 浏览 —— 像浏览器一样。
+        self._build_scroll_page()
         self._build_step1()
         self._build_step2()
         self._build_step3()
         self._build_log()
+        self._bind_scroll()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._poll)
         self.after(200, self._refresh_cameras)     # 启动时就把当前设备填进下拉
+
+    # ---------- 可滚动页面 ----------
+    def _build_scroll_page(self) -> None:
+        """把内容放进"一屏装不下也能滚"的页面里。
+
+        ## 为什么必须这么做
+
+        加标定参数区之后，卡片的自然宽度一度到 **1941 px**（整窗 1973 px），
+        而屏幕只有 1600 —— 原有控件被挤到窗口外，用户看到的就是"被挤掉了"。
+
+        宽度问题由 `wraplength`（见 `CARD_HINT_WRAP`）解决；
+        而**高度**问题必须靠滚动：三步 + 参数区 + 日志，竖着放本来就不是一屏的量。
+        Tkinter 没有现成的滚动容器，标准做法就是 `Canvas` + 内嵌 `Frame`。
+        """
+        wrap = ttk.Frame(self)
+        wrap.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        self._vbar = ttk.Scrollbar(wrap, orient="vertical",
+                                   command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._on_scrollbar)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        self._vbar.pack(side="right", fill="y")
+
+        # `_page` 是真正装内容的 frame；`create_window` 把它嵌进 canvas。
+        self._page = ttk.Frame(self._canvas)
+        self._page_id = self._canvas.create_window((0, 0), window=self._page,
+                                                   anchor="nw")
+        # 内容尺寸变了 -> 更新可滚动范围
+        self._page.bind("<Configure>", self._on_page_configure)
+        # 画布宽度变了 -> 让内嵌 frame 跟着变宽（否则卡片不随窗口拉伸）
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_page_configure(self, _evt=None) -> None:
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, evt) -> None:
+        self._canvas.itemconfigure(self._page_id, width=evt.width)
+
+    def _on_scrollbar(self, first: str, last: str) -> None:
+        """滚动条只在**真的需要**时出现（内容不超一屏就不显示，少一点视觉噪音）。"""
+        self._vbar.set(first, last)
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self._vbar.pack_forget()
+        else:
+            self._vbar.pack(side="right", fill="y")
+
+    def _bind_scroll(self) -> None:
+        """滚轮 / PageUp·PageDown / Home·End 都能滚。
+
+        ⚠️ `bind_all("<MouseWheel>")` 会**全局**抢滚轮事件（连输入框里滚动都算），
+        所以先判断指针是不是在滚动区里，不在就不管。
+        """
+        def in_page(widget) -> bool:
+            while widget is not None:
+                if widget is self._canvas or widget is self._page:
+                    return True
+                widget = getattr(widget, "master", None)
+            return False
+
+        def on_wheel(evt):
+            if not in_page(evt.widget):
+                return
+            self._canvas.yview_scroll(-1 if evt.delta > 0 else 1, "units")
+
+        self.bind_all("<MouseWheel>", on_wheel)                 # Windows / macOS
+        self.bind_all("<Button-4>", lambda e: in_page(e.widget)
+                      and self._canvas.yview_scroll(-1, "units"))   # X11 上滚
+        self.bind_all("<Button-5>", lambda e: in_page(e.widget)
+                      and self._canvas.yview_scroll(1, "units"))    # X11 下滚
+        for key, amount in (("<Next>", 1), ("<Prior>", -1)):
+            self.bind(key, lambda e, a=amount: self._canvas.yview_scroll(a, "pages"))
+        self.bind("<Home>", lambda e: self._canvas.yview_moveto(0.0))
+        self.bind("<End>", lambda e: self._canvas.yview_moveto(1.0))
+
+    def scroll_to_bottom(self) -> None:
+        """滚到底（日志在长，用户多半想看最新那几行）。"""
+        self.update_idletasks()
+        self._canvas.yview_moveto(1.0)
 
     # ---------- 外观 ----------
     def _init_style(self) -> None:
@@ -113,37 +212,48 @@ class Launcher(tk.Tk):
                  font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=22, pady=(0, 14))
 
     def _card(self, title: str, hint: str) -> ttk.Frame:
-        box = ttk.LabelFrame(self, text=title, style="Card.TLabelframe", padding=(14, 8))
+        """一张卡片。**hint 必须换行**，否则它会按整行文字的自然宽度撑开整张卡片。
+
+        ⚠️ 实测过：不设 `wraplength` 时第 1 步那张卡片的自然宽度是 **1941 px**
+        （整窗 1973 px），而屏幕只有 1600 —— 于是新加的参数区把原有的控件
+        全挤到窗口外面去了。**"文字不换行"就是把布局挤爆的直接原因。**
+        """
+        box = ttk.LabelFrame(self._page, text=title, style="Card.TLabelframe",
+                             padding=(14, 8))
         box.pack(fill="x", padx=16, pady=(10, 0))
-        ttk.Label(box, text=hint, style="Hint.TLabel").grid(
-            row=0, column=0, columnspan=7, sticky="w", pady=(0, 8))
+        # columnspan 给足：卡片里最多用到第 8 列（0..7），再加 1 列余量，
+        # 免得标题提示只跨 7 列、被挤成两行。
+        ttk.Label(box, text=hint, style="Hint.TLabel",
+                  wraplength=CARD_HINT_WRAP).grid(
+            row=0, column=0, columnspan=9, sticky="w", pady=(0, 8))
         return box
 
     # ---------- 参数行的小工具 ----------
     def _param_entry(self, parent, row: int, label: str, value: str,
                      hint: str = "", **kw) -> ttk.Entry:
-        """一行参数：`标签 [输入框]  说明`。
+        """一行参数：第一行 `标签 [输入框]`，第二行说明（换行）。
 
-        说明紧跟其后而不是塞进 tooltip —— 这个界面其余部分也不用 tooltip，
-        而且标定参数**必须在动手前就被看见**（写错方格边长=整份标定白做）。
+        **为什么不把说明放在右边**：那一列会按说明文字的自然宽度撑开整张卡片
+        （实测某条说明单独就要 567 px）。放在下面并限宽，宽度就与说明长度无关。
         """
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e",
-                                           padx=(0, 6), pady=3)
+        ttk.Label(parent, text=label).grid(row=row * 2, column=0, sticky="e",
+                                           padx=(0, 6), pady=(4, 0))
         ent = ttk.Entry(parent, width=kw.pop("width", 8), **kw)
         ent.insert(0, value)
-        ent.grid(row=row, column=1, sticky="w", pady=3)
+        ent.grid(row=row * 2, column=1, sticky="w", pady=(4, 0))
         if hint:
-            ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
-                row=row, column=2, columnspan=5, sticky="w", padx=(10, 0), pady=3)
+            ttk.Label(parent, text=hint, style="Hint.TLabel",
+                      wraplength=PARAM_HINT_WRAP).grid(
+                row=row * 2 + 1, column=1, columnspan=4, sticky="w", pady=(0, 2))
         return ent
 
     def _param_path(self, parent, row: int, label: str, hint: str,
                     is_dir: bool) -> ttk.Entry:
-        """路径参数：`标签 [输入框] [选择…]  说明`。留空 = 不要。"""
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e",
-                                           padx=(0, 6), pady=3)
-        ent = ttk.Entry(parent, width=26)
-        ent.grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+        """路径参数：`标签 [输入框] [选择…]` + 第二行说明。留空 = 不要。"""
+        ttk.Label(parent, text=label).grid(row=row * 2, column=0, sticky="e",
+                                           padx=(0, 6), pady=(4, 0))
+        ent = ttk.Entry(parent, width=30)
+        ent.grid(row=row * 2, column=1, columnspan=2, sticky="w", pady=(4, 0))
 
         def pick() -> None:
             got = (filedialog.askdirectory(title=label) if is_dir
@@ -153,9 +263,11 @@ class Launcher(tk.Tk):
                 ent.insert(0, got)
 
         ttk.Button(parent, text="选择…", command=pick, width=6).grid(
-            row=row, column=3, sticky="w", padx=(6, 0), pady=3)
-        ttk.Label(parent, text=hint, style="Hint.TLabel").grid(
-            row=row, column=4, columnspan=3, sticky="w", padx=(10, 0), pady=3)
+            row=row * 2, column=3, sticky="w", padx=(6, 0), pady=(4, 0))
+        if hint:
+            ttk.Label(parent, text=hint, style="Hint.TLabel",
+                      wraplength=PARAM_HINT_WRAP).grid(
+                row=row * 2 + 1, column=1, columnspan=4, sticky="w", pady=(0, 2))
         return ent
 
     def _calib_params(self) -> ttk.Frame:
@@ -353,8 +465,19 @@ class Launcher(tk.Tk):
 
     # ---------- 运行日志 ----------
     def _build_log(self) -> None:
-        box = ttk.LabelFrame(self, text="运行日志", style="Card.TLabelframe", padding=(10, 6))
-        box.pack(fill="both", expand=True, padx=16, pady=(10, 14))
+        """日志卡片。
+
+        ⚠️ 两个"不能这么写"（滚动版布局踩到过）：
+
+        1. **父子关系**：原来 `ttk.LabelFrame(self, ...)` —— 直接用窗口当父容器，
+           于是它**不在滚动页里**，页面滚动时日志纹丝不动。必须挂到 `self._page`。
+        2. **`expand=True`**：它在滚动页里意味着"吃掉剩下的空间"，
+           而滚动页的高度由内容决定 —— 结果是日志把页面撑得更高、
+           却又不会自己长，白占一屏。改成**固定高度 + 自己内部滚动**。
+        """
+        box = ttk.LabelFrame(self._page, text="运行日志", style="Card.TLabelframe",
+                             padding=(10, 6))
+        box.pack(fill="x", padx=16, pady=(10, 14))
         self.log = tk.Text(box, height=12, bg="#0f172a", fg="#e2e8f0",
                            insertbackground="#e2e8f0", relief="flat", wrap="word",
                            font=("Consolas", 9))
@@ -712,9 +835,22 @@ class Launcher(tk.Tk):
         self.after(120, self._poll)
 
     def _append(self, text: str) -> None:
+        """往日志里追加一行，并**在合适的时候**自动滚到底。
+
+        ## 为什么要有"是不是贴底"这个判断
+
+        原来无条件 see("end")。加了页面滚动之后这变成一个**会打断用户**的行为：
+        用户往上翻日志看早先的输出，新来一行就把他拽回底部 —— 而他现在
+        还要同时跟**页面的**滚动较劲（两个滚动条）。
+
+        所以：**只在用户本来就贴着底时才自动滚**。这条约定在终端、日志查看器里
+        是通用的；用户一旦往上翻，就说明他在读历史，不该被打断。
+        """
+        at_bottom = self.log.yview()[1] >= 0.999
         self.log.configure(state="normal")
         self.log.insert("end", text + "\n")
-        self.log.see("end")
+        if at_bottom:
+            self.log.see("end")
         self.log.configure(state="disabled")
 
     def _clear_log(self) -> None:
