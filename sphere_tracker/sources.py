@@ -146,6 +146,34 @@ def _save_mode_cache(cache: dict) -> None:
         pass
 
 
+def _drop_mode_cache(index: int | str) -> bool:
+    """作废某个相机编号的模式缓存。返回是否真的删掉了。
+
+    ## 为什么缓存需要"作废"这个动作
+
+    `交接文档.md` 坑 35 记的就是这件事：**缓存没有"过期"概念**。
+    `config/camera_modes.json` 里相机 1 一度被钉在 `640x480` ——
+    那是相机坏掉那段时间的模式搜索写进去的，之后**一直用**，
+    没有任何机制发现它已经不对。
+
+    2026-10-14 又撞上同一类：缓存里相机 1 是 `MSMF @1920x1080`，
+    而那个组合**能打开、一帧都拿不到**（`_raw_open` 校验首帧失败 →
+    返回 `None`）。原来的代码只是打印一句就继续往下搜索 ——
+    **缓存不删**，于是每次启动都要先白等它一遍（实测 **34.3 s**），
+    而同一台相机用 DSHOW 是秒开、15/15 帧。
+
+    所以：**一旦确认某条缓存给不出帧，就把它删掉**，
+    让下一次启动直接重新探测。删一条缓存是零风险的
+    （它本来就只是"上次探测的备忘录"），而留着一个坏模式
+    会让人以为相机坏了。
+    """
+    cache = _load_mode_cache()
+    if not cache.pop(str(index), None):
+        return False
+    _save_mode_cache(cache)
+    return True
+
+
 class LatestFrameCamera:
     """后台线程持续采集，主循环永远拿"最新一帧"。
 
@@ -290,17 +318,39 @@ class CameraSource(VideoSource):
                 t_c = time.perf_counter()
                 cap = self._raw_open(api, int(cached.get("width", width)),
                                      int(cached.get("height", height)))
+                took_c = time.perf_counter() - t_c
                 if cap is not None:
                     self.cap = cap
                     self.backend_name = str(cached["backend"])
                     self._api = api
                     self._cached_hit = True
-                    print(f"[相机 {index}] ✔ 打开完成（{time.perf_counter() - t_c:.1f}s）",
+                    print(f"[相机 {index}] ✔ 打开完成（{took_c:.1f}s）",
                           flush=True)
                 else:
+                    # ── 缓存命中了，但**这个模式给不出帧** ──────────────────
+                    #
+                    # ⚠️ 2026-10-14 修的真缺陷：这里原来只是打印一句
+                    # "记住的模式这次打不开，改为逐个尝试"，然后照常往下走 ——
+                    # **但缓存不删**。而 `_raw_open` 已经校验过首帧
+                    # （3 次内要拿到非黑帧），所以走到这里就意味着
+                    # **这条缓存是坏的**；不删它，下次启动还会先等它一遍。
+                    #
+                    # 实测代价（本机相机 1，缓存里是 MSMF@1920x1080）：
+                    #   `probe_index(1)` = 34.3 s 才失败，然后才去重新搜索；
+                    #   而同一台相机用 DSHOW 是 15/15 帧、秒开。
+                    # 也就是说**每次启动都白等半分钟，而且看到的报错是
+                    # "MSMF 一帧都拿不到"** —— 用户会以为相机坏了。
+                    #
+                    # 坏缓存必须**自己作废**，否则 `camera_modes.json` 会一直
+                    # 把用户钉在那个后端上（`交接文档.md` 坑 35 记过同一件事：
+                    # "缓存没有过期概念"）。
+                    if _drop_mode_cache(index):
+                        print(f"[相机 {index}] ⚠ 记住的模式（{cached['backend']} "
+                              f"{cached.get('width')}x{cached.get('height')}）"
+                              f"这次给不出帧，**已作废这条缓存**"
+                              f"（下次启动会重新探测，不必再白等）", flush=True)
                     print(f"[相机 {index}] ✘ 记住的模式这次打不开"
-                          f"（{time.perf_counter() - t_c:.1f}s），改为逐个尝试",
-                          flush=True)
+                          f"（{took_c:.1f}s），改为逐个尝试", flush=True)
 
         errors: list[str] = []
         # ---- 打开过程必须**可见**（2026-10-14 修的真缺陷）----
