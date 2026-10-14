@@ -254,8 +254,6 @@ class CameraSource(VideoSource):
         self._index, self._api = index, backend
         self._fps_req, self._fourcc = fps, fourcc
         self.mode_probed = False
-        # 记录一次后端回退：(原后端名, 新后端名)。见 _try_other_backend。
-        self._backend_fallback: tuple[str, str] | None = None
         candidates = (
             [(backend_name(backend), backend)] if backend is not None
             else [(n, b) for n, b in WINDOWS_BACKENDS]
@@ -412,31 +410,36 @@ class CameraSource(VideoSource):
                     no_frame_at_all = True
             if self.cap is not None:
                 break
-            # ⚠️ **指定了单个后端、而它一帧都拿不到 -> 换别的后端试**（2026-10-14）。
+            # ⚠️ **这里刻意不做"自动换后端"**（2026-10-14 实测后撤回）。
             #
-            # 实测：MSMF 对相机 0 能打开但**一帧都读不到**（每 10 秒一条
-            # `-2147483638` = MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED），
-            # 而同一时刻 DSHOW **能**读到帧。也就是"打开了"≠"能出帧"。
+            # 第一版我让它自动换：MSMF 出不了帧就改用 DSHOW。**结果更糟** ——
+            # 换完之后 `optimize_mode` 在**混合后端的进程**里测量，
+            # 相机变成 0.0 fps，于是又去做那个几十秒的模式搜索，
+            # 最后把分辨率降到 1280x720 并写进缓存。
+            # 而**单独测同一台相机的 MSMF 是 10/10 帧全好的** —— 是这次"回退"弄坏的。
             #
-            # 不换后端的话，用户看到的就是"指定了 msmf 就永远打不开"，
-            # 而实际上这台相机此刻只有 dshow 能用。
-            if no_frame_at_all and backend is not None and len(errors) <= 2:
-                first_name = backend_name(backend)
-                alt = self._try_other_backend(index, width, height,
-                                              exclude=backend, log=_log)
-                if alt is not None:
-                    cap2, api2, name2 = alt
-                    self.cap, self._api, self.backend_name = cap2, api2, name2
-                    self._backend_fallback = (first_name, name2)
-                    print(f"\n[相机 {index}] ⚠ {first_name} **能打开但一帧都拿不到**"
-                          f"（-2147483638：设备被系统或别的程序失效，"
-                          f"或该后端与这台相机的驱动不合）\n"
-                          f"   → 已自动改用 {name2}。\n"
-                          f"   ⚠ 在双目标定里：**两路必须同后端** —— 若这一路换了，"
-                          f"请把两路都显式指定成 {name2}"
-                          f"（`--backend {name2.lower()}`）。", flush=True)
-                    no_frame_at_all = False
-                    break
+            # 根本原因在代码里早有记录（`stereo/pair_source.py`）：
+            # **同一进程里混用 DSHOW + MSMF，MSMF 那路会"打开成功但抓不到帧"**。
+            # 所以"自动换后端"是在亲手制造那个已知的坏状态。
+            #
+            # 正确做法：**说清怎么办，让人显式选**。用户可以接受一次重新指定，
+            # 而"自动换完偷偷降分辨率"他完全看不见。
+            if no_frame_at_all and backend is not None:
+                others = "、".join(n for n, a in WINDOWS_BACKENDS if a != backend)
+                raise RuntimeError(
+                    f"摄像头 {index} 用 {backend_name(backend)} 能打开，"
+                    f"但**一帧都拿不到**（读 12 次全空）。\n"
+                    f"  ⚠ 本程序**不会自动换后端** —— 同一进程里混用 DSHOW + MSMF\n"
+                    f"     会让 MSMF 那路「打开成功但抓不到帧」（本项目已实测过），\n"
+                    f"     所以自动切换会把好的一路也弄坏。\n"
+                    f"  怎么办（按顺序试）：\n"
+                    f"    ① **拔掉相机再插回** —— 报 -2147483638 时这一步最有效；\n"
+                    f"    ② 确认没有别的程序占着它（会议软件 / 浏览器 / Windows Hello）；\n"
+                    f"    ③ 换一个直接插在机身上的 USB 口；\n"
+                    f"    ④ 仍不行就换后端 —— **两路必须同后端**"
+                    f"（只换一路，双目直接取不到帧）：\n"
+                    f"       `--backend {others.split('、')[0].lower()}`"
+                )
         if self.cap is None:
             raise RuntimeError(
                 f"无法打开摄像头 {index}，已尝试全部后端与分辨率。\n  " + "\n  ".join(errors) +
@@ -446,51 +449,26 @@ class CameraSource(VideoSource):
                 "  3) 镜头上有物理遮挡（隐私滑块 / 盖子合上）；\n"
                 "  4) USB 供电或带宽不足（换一个直接插在机身上的 USB 口试试）。"
             )
-        # ---- 指定后端但一帧都拿不到 -> 换一个后端再试（2026-10-14 修）----
+        # ---- 指定后端但一帧都拿不到：**报错，不自动换后端**（2026-10-14 实测后撤回）----
         #
-        # 实测的真实现象：MSMF 对相机 0 **打开成功**（但要 60 秒才返回），
+        # 实测现象：MSMF 对相机 **打开成功**（有时要 60 秒才返回），
         # 而之后 **一帧都读不到**，只有每 10 秒一条
         # `can't grab frame. Error: -2147483638`（= MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED）。
-        # 同一时刻 DSHOW 是能读到帧的。也就是说 **"MSMF 打开了"不代表"MSMF 能出帧"**。
         #
-        # 原来的后果：一路重试到超时（用户看到的就是"点了没反应、什么都没有"），
-        # 或者在 `optimize_mode` 里把"没帧"误判成"设备慢"，
-        # 于是逐个分辨率重开 —— 每次 10~60 秒，几十秒白等还得不到结论。
+        # ⚠️ 我第一版让它**自动改用 DSHOW**，结果**更糟**：
+        #   · 换完之后 `optimize_mode` 在**混合后端的进程**里测量，读到 0.0 fps；
+        #   · 于是又去做几十秒的模式搜索，最后把分辨率降到 1280x720 写进缓存；
+        #   · 而**单独测同一台相机的 MSMF 是 10/10 帧全好的** —— 是这次回退弄坏的。
         #
-        # 所以：**"打开了但没帧"要换后端试一次**，而不是继续等。
-        # 这不是猜 —— 是处理一个已知的失败模式。
+        # 根因在 `stereo/pair_source.py` 早有记录：
+        # **同一进程里混用 DSHOW + MSMF，MSMF 那路会"打开成功但抓不到帧"**。
+        # 所以"自动换后端"是在亲手制造那个已知的坏状态。
         #
-        # ⚠️ 只在**指定了后端**时做。没指定后端时上面的循环本来就会试所有后端，
-        # 再回退一次是重复劳动。
-        opened_but_empty = any("读不到画面" in e or "输出全黑" in e for e in errors)
-        if self._backend_fallback is None and backend is not None and opened_but_empty:
-            first_name = self.backend_name or backend_name(backend)
-            alt = self._try_other_backend(index, width, height, exclude=backend,
-                                          log=_log)
-            if alt is not None:
-                cap2, api2, name2 = alt
-                self.cap = cap2
-                self._api = api2
-                self.backend_name = name2
-                self._backend_fallback = (first_name, name2)
-                print(f"\n[相机 {index}] ⚠ {first_name} **能打开但一帧都拿不到**"
-                      f"（常见原因：设备被系统/别的程序失效，报 -2147483638；"
-                      f"或该后端与这台相机的驱动不合）\n"
-                      f"   → 已自动改用 {name2}。\n"
-                      f"   ⚠ 如果这是在双目标定里：**两路必须同后端**，"
-                      f"这一路换了会让双目取帧失败 —— 那种情况下请手动把"
-                      f"两路都指定成 {name2}（--backend {name2.lower()}）。", flush=True)
-            else:
-                raise RuntimeError(
-                    f"摄像头 {index} 用 {first_name} 能打开，但**一帧都拿不到**，"
-                    f"换其它后端也不行。\n"
-                    f"  典型原因：设备被别的程序独占（会议软件 / 浏览器 / Windows Hello），"
-                    f"或 USB 掉线后没有恢复。\n"
-                    f"  怎么办：\n"
-                    f"    ① 关掉可能占用摄像头的程序；\n"
-                    f"    ② **拔掉相机再插回** —— USB 掉线后 Windows 常需要一次物理重插；\n"
-                    f"    ③ 换一个直接插在机身上的 USB 口。"
-                )
+        # 正确做法：**抛错、说清怎么办、让人显式选** —— 用户能接受一次重新指定，
+        # 而"自动换完偷偷降分辨率"他完全看不见。
+        #
+        # 真正的失败收场（跳过其余分辨率、换后端的说明）在上面的搜索循环里，
+        # 那里才有 `no_frame_at_all` 这个状态。
         if optimize and not self._cached_hit:
             self.optimize_mode(target_fps=target_fps)
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -592,65 +570,6 @@ class CameraSource(VideoSource):
         dt = max(time.perf_counter() - t0, 1e-6)
         return n / dt
 
-    def _try_other_backend(self, index: int, width: int, height: int, *,
-                           exclude: int, log=None, budget_s: float = 20.0):
-        """换一个后端试试能不能**真的出帧**。返回 `(cap, api, name)` 或 None。
-
-        ## 为什么需要"换后端"而不是"多等一会儿"
-
-        实测（2026-10-14）：同一台相机、同一时刻
-
-            MSMF    打开成功（60.0s）   读到 0 帧
-            DSHOW   打开成功（ 7.0s）   读到 6 帧
-
-        MSMF 那边**不是"慢"，是根本不工作**。继续等只是把失败拖长 ——
-        用户看到的就是"点了没反应"。换个后端立刻就知道行不行。
-
-        判据与主路径一致：**必须拿到非全黑帧**才算成功
-        （不少相机对不支持的分辨率不报错，而是每帧返回全黑）。
-
-        `budget_s`：**每个后端**的上限。实测某些后端一次打开就要 60 秒
-        （MSMF/ANY），不设上限的话"回退"本身又变成一个长等待 ——
-        那就只是把卡死换了个地方。20 秒足够正常后端打开并出首帧。
-        """
-        t_all = time.perf_counter()
-        for name, api in WINDOWS_BACKENDS:
-            if api == exclude:
-                continue
-            if time.perf_counter() - t_all > budget_s:
-                if log:
-                    log(f"⏱ 换后端已超 {budget_s:.0f}s，不再试剩下的")
-                break
-            if log:
-                log(f"换后端试 {name}…")
-            try:
-                cap = cv2.VideoCapture(index, api)
-            except cv2.error:
-                continue
-            if not cap.isOpened():
-                cap.release()
-                continue
-            try:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                cap.set(cv2.CAP_PROP_FPS, self._fps_req)
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                t_read = time.perf_counter()
-                for _ in range(6):
-                    if time.perf_counter() - t_read > 3.0:
-                        break                    # 设备不给帧，别一直等
-                    ret, f = cap.read()
-                    if ret and f is not None and float(f.std()) > BLACK_FRAME_STD:
-                        if log:
-                            log(f"✔ {name} 出帧正常")
-                        return cap, api, name
-                    time.sleep(0.05)
-            except cv2.error:
-                pass
-            cap.release()
-            if log:
-                log(f"✘ {name} 也拿不到有效帧")
-        return None
 
     def _raw_open(self, api: int, width: int, height: int):
         """探测用的快速打开：只等首帧，不做全黑多帧检查。

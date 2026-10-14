@@ -283,6 +283,51 @@ def test_availability_and_selection_agree() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_no_automatic_backend_switch() -> bool:
+    """**不许自动换后端**（2026-10-14 实测后撤回的东西）。
+
+    ## 撤回的那次尝试
+
+    第一版让 `sources.CameraSource` 在「MSMF 能打开但一帧都拿不到」时
+    **自动改用 DSHOW**。实测结果**更糟**：
+
+      · 换完之后 `optimize_mode` 在**混合后端的进程**里测量，读到 0.0 fps；
+      · 于是又去做几十秒的模式搜索，最后把分辨率降到 1280x720 并写进缓存；
+      · 而**单独测同一台相机的 MSMF 是 10/10 帧全好的** —— 是这次「回退」弄坏的。
+
+    根因在代码里早有记录（`stereo/pair_source.py`）：
+    **同一进程里混用 DSHOW + MSMF，MSMF 那路会「打开成功但抓不到帧」**。
+    所以「自动换后端」等于**亲手制造那个已知的坏状态**。
+
+    正确做法：**抛错、说清怎么办、让人显式选**。
+    用户可以接受一次重新指定；而「自动换完偷偷降分辨率」他完全看不见。
+    """
+    print("----- 「打开了但没帧」：必须报错，不许自动换后端 -----")
+    src = (ROOT / "sphere_tracker" / "sources.py").read_text(encoding="utf-8")
+    checks = [
+        ("`_try_other_backend` 已删除（留着就是给别人再踩一次的陷阱）",
+         "def _try_other_backend" not in src),
+        ("没有地方自动调用换后端", "_try_other_backend" not in src),
+        ("「打开了但一帧都拿不到」时**抛错**（不静默重试）",
+         "一帧都拿不到" in src and "raise RuntimeError" in src),
+        ("报错明确说**不会自动换后端**，并讲了为什么",
+         "不会自动换后端" in src and "混用" in src),
+        ("报错给出**拔插相机**（-2147483638 最有效的一步）",
+         "拔掉相机再插回" in src),
+        ("报错给出**两路一起换**后端的正确做法（只换一路双目会废）",
+         "两路必须同后端" in src),
+        ("一帧都读不到时**跳过其余分辨率**（设备层面问题，换分辨率没用）",
+         "no_frame_at_all" in src and "不再试其它分辨率" in src),
+        ("整个搜索有**总时间预算**（否则不响应的相机要等 8 分钟）",
+         "search_budget_s" in src),
+        ("每次读也有上限（设备不响应时单次 read 要 10 秒）",
+         "这个组合不值得再等" in src),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("相机可用性判定自测（没有相机时必须说清并指对方向）")
@@ -295,7 +340,8 @@ def main() -> int:
                test_available_camera_reports_ok,
                test_need_two_requires_two,
                test_probe_count_is_bounded,
-               test_availability_and_selection_agree):
+               test_availability_and_selection_agree,
+               test_no_automatic_backend_switch):
         results.append(fn())
         print()
     ok = all(results)
