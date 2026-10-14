@@ -30,6 +30,7 @@ import time
 import cv2
 import numpy as np
 
+from apps._window import WindowManager  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig, save_config
 from sphere_tracker.detect import ColorBlobDetector
 from sphere_tracker.sources import open_source
@@ -63,6 +64,8 @@ def main() -> int:
     def nothing(_: int) -> None:
         pass
 
+    wins = WindowManager()
+    wins.keep_size(WINDOW)      # trackbar 挂在这个窗口上，不主动改尺寸
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     c = cfg.detector.color
     bars = {
@@ -130,9 +133,14 @@ def main() -> int:
             + ("   [FROZEN]" if frozen is not None else "")
         )
         cv2.putText(combined, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
-        cv2.imshow(WINDOW, combined)
+        wins.show(WINDOW, combined)
 
         key = cv2.waitKey(1) & 0xFF
+        # ⚠️ **只留 F11，不要 f** —— 这个程序里 `f` 已经是"冻结画面"，
+        # 全屏若抢走它就会把一个既有功能弄坏（抢键比没有全屏更糟）。
+        # Esc 仍然优先"退出全屏"，只有不在全屏时才轮到下面的"退出程序"。
+        if wins.handle_key(WINDOW, key, None, toggle_keys=(122,)):
+            continue
         if key in (ord("q"), 27):
             break
         if key == ord("f"):

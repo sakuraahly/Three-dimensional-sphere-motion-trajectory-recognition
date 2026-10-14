@@ -30,6 +30,7 @@ import time
 import cv2
 import numpy as np
 
+from apps._window import WindowManager  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detect import build_detector
 from sphere_tracker.geometry import estimate_focal_from_known_ball
@@ -60,9 +61,12 @@ def main() -> int:
 
     src = open_source(args.image or args.video, camera=args.camera)
     WINDOW = "calibrate focal"
+    wins = WindowManager()
+    wins.keep_size(WINDOW)      # 这窗口只显示一路画面，不主动改尺寸
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     radii: list[float] = []
-    print("把球放在量好的距离上，画面里能看到绿圈后按 s 保存；按 q 退出。")
+    print("把球放在量好的距离上，画面里能看到绿圈后按 s 保存；"
+          "按 f 全屏（Esc 退出全屏）；按 q 退出。")
 
     while True:
         ok, frame, _ = src.read()
@@ -89,8 +93,11 @@ def main() -> int:
         else:
             cv2.putText(vis, "no ball detected - adjust --preset / --method",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.imshow(WINDOW, vis)
+        wins.show(WINDOW, vis)
         key = cv2.waitKey(1) & 0xFF
+        # 全屏键优先：Esc 在全屏时是"退出全屏"，不该顺手把程序关掉
+        if wins.handle_key(WINDOW, key, None):
+            continue
         if key in (ord("q"), 27):
             break
         if key == ord("s") and radii:

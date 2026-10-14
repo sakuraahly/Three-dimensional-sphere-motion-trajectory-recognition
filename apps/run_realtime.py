@@ -52,6 +52,7 @@ from sphere_tracker.sources import (
 )
 from sphere_tracker.stats import FramePump, Health
 from apps._common import log_environment, setup_logging
+from apps._window import WindowManager
 
 _log = logging.getLogger("realtime")
 
@@ -209,13 +210,18 @@ def main() -> int:
         return 1
 
     info = src.info
+    # 窗口管理器**要在打印提示之前就建好** —— 提示语里要用它的按键说明。
+    # （第一版把它建在下面 `pipe = ...` 旁边，于是这行提示引用了还没赋值的
+    #  `wins`，`UnboundLocalError`。冒烟跑一遍才发现，静态检查看不出来。）
+    wins = WindowManager()
     print(
         f"摄像头 {index} 已打开：{info.width}x{info.height} @ {info.fps:.1f} fps（后端 {info.backend}）"
     )
     print(
         f"检测方法：{cfg.detector.method}    预测：{cfg.predict.method}  视野 {cfg.predict.horizon_s}s"
     )
-    print("提示：按 c 切换检测方法，按 m 看掩膜，按 s 存快照，按 q 退出。")
+    print("提示：按 c 切换检测方法，按 m 看掩膜，按 s 存快照，"
+          f"{wins.fullscreen_hint()}，按 q 退出。")
 
     pipe = SpherePipeline(cfg)
     writer: cv2.VideoWriter | None = None
@@ -327,8 +333,12 @@ def main() -> int:
                     else np.zeros((480, 640, 3), np.uint8)
                 )
 
-            cv2.imshow(WINDOW, vis)
+            wins.show(WINDOW, vis)
             key = cv2.waitKey(1) & 0xFF
+            # 全屏相关的键先处理：Esc 在全屏时是退出全屏，只有不在全屏时
+            # 才轮到下面的退出程序。否则用户全屏之后一按 Esc 就把程序关了。
+            if wins.handle_key(WINDOW, key, vis):
+                continue
             _report_health()
 
             if key in (ord("q"), 27):

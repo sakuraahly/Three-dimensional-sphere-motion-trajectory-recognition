@@ -48,6 +48,7 @@ for _parent in Path(__file__).resolve().parents:
 import cv2
 import numpy as np
 
+from apps._window import WindowManager
 from apps._common import (
     add_stereo_source_args,
     log_environment,
@@ -55,6 +56,7 @@ from apps._common import (
     setup_logging,
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
+from sphere_tracker.sources import quiet_repeated_grab_warnings
 
 WINDOW = "stereo calibration"
 PREVIEW_W = 720          # 单路预览宽度的**上限**（实际按屏幕与文字条带反推，见主循环）
@@ -225,6 +227,8 @@ def main() -> int:
         cap_kw["min_sharpness"] = float(args.min_sharpness)
     cap_cfg = CaptureConfig(**cap_kw)
     collector = AutoPairCollector(spec, cap_cfg)
+    # 全屏/窗口尺寸统一由 apps/_window.py 管（各程序口径一致）
+    wins = WindowManager()
 
     cov_cache = None
     cov_cache_n = -1
@@ -304,7 +308,7 @@ def main() -> int:
                     collector.status_lines()
                     + collector.side_lines()
                     + [f"detect {det_ms:.0f} ms/frame  ({1000.0 / max(det_ms, 1e-3):.0f} fps)"
-                       f"   [q] 退出  [r] 清空重收"]
+                       f"   [q] 退出  [r] 清空重收  [f] 全屏（Esc 退出全屏）"]
                 )
                 footer_h = len(footer_lines) * FOOTER_LINE_H + 10
 
@@ -371,8 +375,10 @@ def main() -> int:
                     cv2.putText(footer, line, (10, 18 + i * FOOTER_LINE_H),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (235, 235, 235), 1, cv2.LINE_AA)
                 panel = np.vstack([row, footer])
-                cv2.imshow(WINDOW, panel)
+                wins.show(WINDOW, panel)
                 key = cv2.waitKey(1) & 0xFF
+                if wins.handle_key(WINDOW, key, panel):
+                    continue
                 if key in (ord("q"), 27):
                     break
                 if key == ord("r"):

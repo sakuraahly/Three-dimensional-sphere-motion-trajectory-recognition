@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 from apps._common import add_stereo_source_args, open_pair_source
+from apps._window import WindowManager
 from calib import BoardSpec, detect_board
 
 WINDOW = "stereo setup check"
@@ -109,10 +110,12 @@ def main() -> int:
     print(src.describe())
     src.report_warnings()
     print("提示：举起棋盘，让它同时落在两路画面里；缓慢上下左右移动以检验重叠范围。")
+    print("窗口：按 f 全屏（看得更清），Esc 退出全屏，q 提前结束。")
     if src.is_live:
         print(f"采集约 {args.seconds:.0f} 秒后自动给结论（窗口里按 q 可提前结束）。")
     print()
 
+    wins = WindowManager()
     total = n_l = n_r = n_both = 0
     area_l = area_r = 0.0
     sharp_l = sharp_r = 0.0
@@ -173,11 +176,15 @@ def main() -> int:
                 cv2.putText(panel, f"{lbl_r}  board:{'YES' if obs_r.found else 'no'}",
                             (PREVIEW_W + 10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 220, 0) if obs_r.found else (0, 120, 255), 2, cv2.LINE_AA)
-                cv2.putText(panel, f"frames {total}  both {n_both}  (q to finish)",
+                cv2.putText(panel, f"frames {total}  both {n_both}  (q to finish / f fullscreen)",
                             (10, hh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (230, 230, 230), 1, cv2.LINE_AA)
-                cv2.imshow(WINDOW, panel)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                wins.show(WINDOW, panel)
+                key = cv2.waitKey(1) & 0xFF
+                # 全屏键优先：Esc 在全屏时是"退出全屏"，不该顺手结束检查
+                if wins.handle_key(WINDOW, key, panel):
+                    continue
+                if key in (ord("q"), 27):
                     break
 
             if src.is_live and (time.perf_counter() - t0) >= args.seconds:

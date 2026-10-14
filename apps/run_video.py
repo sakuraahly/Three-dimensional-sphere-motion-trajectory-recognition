@@ -25,6 +25,9 @@ import numpy as np
 from sphere_tracker.config import AppConfig, ColorConfig, load_config
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import open_source
+from apps._window import WindowManager
+
+WINDOW = "run_video"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +70,7 @@ def main() -> int:
     src = open_source(args.path)
     print(f"输入：{src.info.kind} {src.info.width}x{src.info.height} @ {src.info.fps:.1f} fps")
     pipe = SpherePipeline(cfg)
+    wins = WindowManager()
 
     writer = None
     if args.out:
@@ -127,8 +131,12 @@ def main() -> int:
                 })
             rows.append(row)
             if not args.no_show:
-                cv2.imshow("run_video", vis)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                wins.show(WINDOW, vis)
+                key = cv2.waitKey(1) & 0xFF
+                # 全屏键优先：Esc 在全屏时是"退出全屏"，不该顺手把程序关掉
+                if wins.handle_key(WINDOW, key, vis):
+                    continue
+                if key in (ord("q"), 27):
                     break
             if args.max_frames and total >= args.max_frames:
                 break

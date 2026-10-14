@@ -40,6 +40,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker import camera_registry as cr  # noqa: E402
+from apps._window import WindowManager  # noqa: E402
+
 from sphere_tracker.sources import (  # noqa: E402
     CameraSource,
     quiet_repeated_grab_warnings,
@@ -134,14 +136,14 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
         print(f"  #{index} 打不开：{_first_line(exc)}")
         return None
 
-    win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出）"
+    win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"
+    wins = WindowManager()
+    # 这窗口画着大字提示与状态，**不主动改尺寸**（靠内容决定大小最稳）
+    wins.keep_size(win)
     gui_ok = True
     try:
         import cv2
-        try:
-            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        except cv2.error:
-            gui_ok = False
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     except Exception:                                    # noqa: BLE001
         gui_ok = False
 
@@ -169,7 +171,7 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                                     cv2.LINE_AA)
                     try:
-                        cv2.imshow(win, frame)
+                        wins.show(win, frame)
                     except cv2.error:
                         gui_ok = False
                         break
@@ -184,6 +186,8 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
                               f"拔插一次 USB 往往就好。")
                         return None
                 key = cv2.waitKey(1) & 0xFF
+                if wins.handle_key(win, key, frame):
+                    continue
                 if key == ord("q") or key == 27:
                     return ""
                 if key in _ASSIGN_KEYS:
