@@ -754,6 +754,159 @@ def test_probe_fallback_and_cache_invalidation() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_cached_mode_respects_requested_resolution() -> bool:
+    """第 13 节：**缓存里的分辨率不许盖过这次显式请求的**（2026-10-14 加）。
+
+    ## 守的是一个会让标定**静默失败**的真缺陷
+
+    缓存按**编号**存"上次探测出的后端 + 分辨率"，本意是省时间。
+    但它原来只校验 `v` 与后端，**不看这次请求的分辨率**。于是
+    `calibrate_stereo.py --width 1920 --height 1080` 会拿到一条 `640x480` 的缓存去开：
+
+    ```
+    [相机 1] 用上次记住的模式打开：DSHOW 640x480
+    相机 1: 640x480 @ 24.4 fps          ← 而相机 0 是 1920x1080
+    ! 两路分辨率不一致（(640, 480) vs (1920, 1080)）：标定要求两路完全一致
+    ```
+
+    **标定要求两路分辨率完全一致**，所以这一条就是"白跑一轮"。
+
+    而本机还有更硬的一条（受控实测，每档两轮）：**只有请求 `1920x1080` 时两路才一致**
+    —— `#0` 无视请求恒给 1920x1080，`#1` 尽量满足请求，其余每一档都对不上。
+    已写进 `docs/真机标定操作清单.md` §「要收多少对」。
+
+    ## 判据为什么不依赖真机
+
+    用**子类替身**：`_raw_open` 重写成"记一笔调用、返回 `None`（打不开）"。
+    于是 —— **替身被调用 = 走了缓存分支**（那条分支只调 `_raw_open`，
+    不自己开设备）；返回 `None` 后构造函数去搜索，最终抛错，
+    测试**从头到尾不碰真设备**，在任何机器上都确定性。
+    这比"起个真相机看看"可靠得多，也是本项目坑 24 要求的写法：
+    替身测试必须能断言"替身真的走到了那一步"。
+    """
+    print("----- 13. 缓存分辨率不许盖过显式请求 -----")
+    import cv2 as _cv2
+    from sphere_tracker import sources as _src
+
+    checks: list[tuple[str, bool]] = []
+    cache_path = _src._MODE_CACHE
+    backup = cache_path.read_text(encoding="utf-8") if cache_path.exists() else None
+    key = 991                          # 几乎不可能真存在的索引
+
+    calls: list[tuple[int, int]] = []
+    opened_indices: list[int] = []
+
+    class _FakeCap:
+        """够 `CameraSource` 走完"打开成功"那条路的最小替身。"""
+
+        def __init__(self, args):                            # noqa: ANN001
+            # `cv2.VideoCapture(index, api)` -> args = (idx, api)
+            self._idx, self._api = (list(args) + [None, None])[:2]
+            self._wh = (0, 0)
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, prop, val=None):                       # noqa: ANN001
+            import cv2 as _c
+            if prop == _c.CAP_PROP_FRAME_WIDTH:
+                self._wh = (int(val), self._wh[1])
+            elif prop == _c.CAP_PROP_FRAME_HEIGHT:
+                self._wh = (self._wh[0], int(val))
+                # 每次**请求分辨率**都记一笔：这就是"它打算用哪个分辨率开"
+                calls.append(self._wh)
+            return True
+
+        def get(self, prop):                                 # noqa: ANN001
+            import cv2 as _c
+            if prop == _c.CAP_PROP_FRAME_WIDTH:
+                return self._wh[0] or 640
+            if prop == _c.CAP_PROP_FRAME_HEIGHT:
+                return self._wh[1] or 480
+            return 30.0
+
+        def read(self):
+            import numpy as _np
+            return True, _np.full((480, 640, 3), 128, _np.uint8), 0.0
+
+        def release(self) -> None:
+            pass
+
+    def build(want_w: int, want_h: int) -> list[tuple[int, int]]:
+        """构造真的 `CameraSource`，但把 OpenCV 的设备打开整个替掉。
+
+        为什么替在**这一层**：`_open_attempt()` 走 `_raw_open()`，而**搜索循环
+        直接调 `cv2.VideoCapture`** —— 只替 `_raw_open` 会漏掉搜索那一段，
+        于是搜索仍去碰真设备（实测：`[相机 991] 试 DSHOW @ 1920x1080…`
+        → `DSHOW 整个后端打不开`，`calls` 为空，判据变成假红）。
+        替在 `cv2.VideoCapture` 上，缓存分支与搜索分支**一起**被覆盖。
+        """
+        calls.clear()
+        opened_indices.clear()
+        real_vc = _src.cv2.VideoCapture
+
+        def _factory(*a, **k):                               # noqa: ANN002, ANN003
+            opened_indices.append(int(a[0]) if a else -1)
+            return _FakeCap(a)
+
+        _src.cv2.VideoCapture = _factory                     # type: ignore[assignment]
+        try:
+            try:
+                _src.CameraSource(index=key, width=want_w, height=want_h, fps=30,
+                                  backend=_cv2.CAP_DSHOW, optimize=True)
+            except Exception:                                # noqa: BLE001
+                pass
+        finally:
+            _src.cv2.VideoCapture = real_vc                   # type: ignore[assignment]
+        return list(calls)
+
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps({
+            str(key): {"v": 2, "backend": "DSHOW", "width": 640, "height": 480,
+                       "actual_width": 640, "actual_height": 480, "fps": 30.0},
+        }), encoding="utf-8")
+
+        hits = build(640, 480)
+        miss = build(1920, 1080)
+        print(f"  请求 640x480（与缓存相同）  -> 按这些分辨率依次尝试：{hits[:4]}")
+        print(f"  请求 1920x1080（与缓存不同）-> 按这些分辨率依次尝试：{miss[:4]}")
+        # ⚠️ 判据**改过两版**，两版都错在同一个地方 —— 记下来免得再犯：
+        #
+        # 第一版：`len(miss) == 0`（"跳过缓存就该一次都不调"）。
+        #   变异测试当场证伪：守卫失效后搜索路径**照样会调** `_raw_open`，
+        #   只是**先用缓存里的 640x480 开一次**，于是 `len(miss) > 0`，
+        #   注入坏代码**不报红**（坑 36：先分清"判据弱"还是"注入没生效"）。
+        # 第二版：`miss[:1] == [(1920, 1080)]` —— **恒假**。因为那版替身永远返回
+        #   `None`（"打不开"），搜索路径**抛错退出**，`miss` 是**空的**。
+        #   第一次跑就报红，而代码其实是对的（**假红**）。
+        #
+        # 最终版：替身改成**会成功**（`_FakeCap`），于是调用序列真的等于
+        #   "它打算用哪些分辨率去开"。判据只盯**第一个**：
+        #   守卫生效 -> 第一个就是请求值；守卫失效 -> 第一个是缓存值。
+        # 两版错误的教训是同一句：**判据要盯住"决定用哪个分辨率"，
+        # 而不是"函数被调了几次"。**
+        checks += [
+            ("请求与缓存**相同**时走缓存：第一个尝试就是缓存值 640x480",
+             hits[:1] == [(640, 480)]),
+            ("请求与缓存**不同**时：第一个尝试是**请求值** 1920x1080（缓存没盖过它）",
+             miss[:1] == [(1920, 1080)]),
+            ("**不允许**出现「先拿缓存的 640x480 试一次」（那说明守卫没生效）",
+             (640, 480) not in miss),
+            ("替身确实被用上了（只碰过 991 这个不存在的索引，没碰真相机）",
+             bool(opened_indices) and set(opened_indices) == {key}),
+        ]
+    finally:
+        if backup is None:
+            cache_path.unlink(missing_ok=True)
+        else:
+            cache_path.write_text(backup, encoding="utf-8")
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_real_probe() -> bool:
     """有相机时额外验证真机枚举（无相机则跳过，不算不达标）。"""
     print("----- 附加：真机枚举（有相机才验证） -----")
@@ -815,6 +968,7 @@ def main() -> int:
             test_from_args_compat(),
             test_ignored(tmp),
             test_probe_fallback_and_cache_invalidation(),
+            test_cached_mode_respects_requested_resolution(),
         ]
         print()
         if args.probe:

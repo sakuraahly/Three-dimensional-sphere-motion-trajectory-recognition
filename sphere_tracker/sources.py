@@ -299,11 +299,32 @@ class CameraSource(VideoSource):
         # 省掉整个后端/分辨率搜索（MSMF 每次打开要 7 秒，不能白白重开）。
         # 指定后端时缓存**只在其后端一致时才用** —— 否则会把用户指定的后端
         # 覆盖成别的（双目两路混用不同后端会直接抓不到帧）。
+        #
+        # ⚠️ 2026-10-14 又补一道：**缓存里的分辨率必须与这次请求的一致**。
+        # 原来只比 `v` 和后端，于是显式请求 1920x1080 时会拿 640x480 的缓存去开 ——
+        # 实测（`calibrate_stereo.py --width 1920 --height 1080 --backend dshow`）：
+        #
+        #     [相机 1] 用上次记住的模式打开：DSHOW 640x480
+        #     相机 1: 640x480 @ 24.4 fps      ← 而相机 0 是 1920x1080
+        #     ! 两路分辨率不一致：标定要求两路完全一致
+        #
+        # 后果是**标定直接失败**，而"缓存"本意是省时间、不是改变用户要的东西。
+        # 显式请求的分辨率必须优先：它不匹配就**跳过缓存**、走正常搜索
+        # （搜索完会把正确的那条写回缓存，所以只贵这一次）。
+        want_wh = (int(width), int(height)) if (width and height) else None
         if optimize:
             cached = _load_mode_cache().get(str(index))
             cached_api = (getattr(cv2, f"CAP_{cached['backend']}", None)
                           if cached and cached.get("backend") else None)
+            if cached:
+                cache_wh = (int(cached.get("width", 0) or 0),
+                            int(cached.get("height", 0) or 0))
             # v2 之前的缓存存的是"实际分辨率"而不是"请求分辨率"，会导致重开掉速，一律作废
+            if cached and want_wh and cache_wh and cache_wh != want_wh:
+                print(f"[相机 {index}] 缓存里记的是 {cache_wh[0]}x{cache_wh[1]}，"
+                      f"而这次请求 {want_wh[0]}x{want_wh[1]} —— **跳过缓存**，"
+                      f"按请求值重新探测", flush=True)
+                cached = None
             if cached and cached.get("v") == 2 and cached_api is not None \
                     and (backend is None or cached_api == backend):
                 api = cached_api
