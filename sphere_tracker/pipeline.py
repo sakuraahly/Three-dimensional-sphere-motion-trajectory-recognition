@@ -292,6 +292,15 @@ class SpherePipeline:
         # `render_scale` 是"放大画布"的语义（用户显式要的）；
         # `display_width` 是"把输出图控制到多宽"（显示用，通常缩小）。
         scale = render_scale * (viz.scale if viz.scale and viz.scale > 0 else 1.0)
+        # ── 文字倍率：**不含 display_width**（2026-10-14 修）────────────────
+        # `display_width` 存在的唯一理由是省掉 `cv2.imshow` 的缩放开销
+        # （实测 17.74 ms → 1.84 ms/帧），它是**性能手段，不是显示意图**。
+        # 而原来字号是 `0.52 * scale`，于是 960/1920 把信息面板缩成
+        # `fscale=0.26`、笔画 1 px、行高 10 px —— 字小到认不出来，
+        # 用户反馈"字还是如此模糊，这种文字应该设置为不受清晰度设置影响"。
+        # 所以文字只跟**用户显式的放大意图**（`render_scale` / `viz.scale`）走。
+        # 几何（拖尾/圆/预测线）仍用 `scale`，否则会画到画面外。
+        overlay_scale = render_scale * (viz.scale if viz.scale and viz.scale > 0 else 1.0)
         if display_width and frame.shape[1] > 0:
             scale *= float(display_width) / float(frame.shape[1])
         if abs(scale - 1.0) > 1e-6:
@@ -301,9 +310,8 @@ class SpherePipeline:
             img = frame.copy()
 
         # ---- 以下所有叠加都画在 `img`（已是最终尺寸）上 ----
-        # 字号/线宽乘的是**最终相对原始帧的倍率**，所以：
-        #   · 缩小显示时，字按小画布的正常字号渲染 → **清晰**；
-        #   · 放大显示时，字跟着变大 → 与被放大的画面相称。
+        # 几何坐标乘 `scale`（原始帧坐标 → 画布坐标）；
+        # 文字大小乘 `overlay_scale`（与画布被显示缩放宽无关）。
         if viz.trail_enabled and result.trail:
             draw_trail(img, result.trail, fade=viz.trail_fade,
                        thickness=max(1, int(2 * scale)), scale=scale)
@@ -311,19 +319,21 @@ class SpherePipeline:
         if viz.show_circle and result.detection is not None:
             label = f"r={result.detection.radius:.1f}"
             draw_detection(img, result.detection, color=(0, 255, 0), label=label,
-                           contour=True, scale=scale)
+                           contour=True, scale=scale, text_scale=overlay_scale)
 
         if viz.show_prediction and result.prediction is not None and len(result.prediction) > 1:
             tag = "pred 3D+g" if result.prediction_3d is not None else "pred 2D"
             # 不在这里预乘 scale —— 交给 draw_prediction，让"画布缩放"只有一个负责处
             draw_prediction(img, result.prediction, color=(0, 140, 255), label=tag,
-                            thickness=max(1, int(2 * scale)), scale=scale)
+                            thickness=max(1, int(2 * scale)), scale=scale,
+                            text_scale=overlay_scale)
 
         if viz.show_mask and result.detection is not None and result.detection.mask is not None:
             paste_mask_preview(img, result.detection.mask, width=int(200 * scale))
 
         if viz.show_hud:
-            draw_hud(img, hud_lines(result, self.cfg, health=health), scale=scale)
+            draw_hud(img, hud_lines(result, self.cfg, health=health), scale=scale,
+                     text_scale=overlay_scale)
 
         if viz.show_axes_3d:
             hist = np.array([[p.x, p.y, p.z] for p in self.history3d if p.z is not None], dtype=np.float64)

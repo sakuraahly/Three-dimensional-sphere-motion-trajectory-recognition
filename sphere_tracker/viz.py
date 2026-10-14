@@ -62,11 +62,15 @@ def draw_detection(
     label: str | None = None,
     contour: bool = True,
     scale: float = 1.0,
+    text_scale: float | None = None,
 ) -> None:
     """画检测到的圆 + 圆心 + 可选的真实轮廓。
 
     `scale` 的语义同 `draw_trail` —— 检测坐标与轮廓都是**原始帧坐标**。
+    `text_scale` 只管**标签文字**（语义与 `draw_hud` 相同：显示缩放的倍率
+    不该把文字一起缩小）。默认跟随 `scale`。
     """
+    ts = scale if text_scale is None else max(0.7, float(text_scale))
     cx = int(round(det.x * scale))
     cy = int(round(det.y * scale))
     r = max(1, int(round(det.radius * scale)))
@@ -79,8 +83,8 @@ def draw_detection(
                          max(1, int(round(1 * scale))), cv2.LINE_AA)
     if label:
         cv2.putText(frame, label, (cx + r + int(round(6 * scale)), cy - int(round(6 * scale))),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * scale, color,
-                    max(1, int(round(1 * scale))), cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * ts, color,
+                    max(1, int(round(ts))), cv2.LINE_AA)
 
 
 def draw_prediction(
@@ -92,13 +96,17 @@ def draw_prediction(
     label: str | None = None,
     dots: int = 10,
     scale: float = 1.0,
+    text_scale: float | None = None,
 ) -> None:
     """把预测轨迹画成虚线（和实线的历史轨迹区分开）。
 
     `scale` 的语义同 `draw_trail`。**注意**：这里的 `points` 由调用方决定是否
     已经乘过 scale —— 为了统一，`render()` 现在**不预乘**，把 scale 交给本函数，
     这样"画布缩放"这件事只有一个地方负责。
+
+    `text_scale` 只管标签文字（语义同 `draw_hud`）。
     """
+    ts = scale if text_scale is None else max(0.7, float(text_scale))
     if points is None or len(points) < 2:
         return
     n = len(points)
@@ -123,23 +131,48 @@ def draw_prediction(
         cv2.putText(frame, label,
                     (int(round(last[0] * scale)) + int(round(8 * scale)),
                      int(round(last[1] * scale)) + int(round(4 * scale))),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * scale, color,
-                    max(1, int(round(1 * scale))), cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45 * ts, color,
+                    max(1, int(round(ts))), cv2.LINE_AA)
 
 
 def draw_hud(frame: np.ndarray, lines: list[str], origin: tuple[int, int] = (10, 10),
-             scale: float = 1.0) -> None:
+             scale: float = 1.0, text_scale: float | None = None) -> None:
     """左上角半透明信息面板。
 
-    `scale` 的语义同 `draw_trail`：面板位置、字号、行高一起按倍率走
-    —— 这样 `viz.scale=2` 出来的图就是"整张原图的 2 倍"，**所有元素都成比例**。
+    ## 两个倍率不是一回事（2026-10-14 修）
+
+    | 参数 | 管什么 |
+    | ---- | ------ |
+    | `scale` | **几何**：面板位置、内边距、行高。必须跟画布走，否则面板相对画面乱跑 |
+    | `text_scale` | **字号与笔画**。默认等于 `scale`（保持"整张图 k 倍"的语义）；实时显示时**故意传小于 scale 的值** |
+
+    ## 为什么要把字号单独拆出来
+
+    原来只有 `scale` 一个参数，字号是 `0.52 * scale`。于是实时显示
+    （`display_width=960`，1920 的 0.5 倍）把字缩成 `0.52*0.5 = 0.26`、
+    笔画 `max(1, ...)` 退到 **1 px**、行高 `20*0.5 = 10 px` ——
+    **字不是"被重采样糊掉"，是被缩到 10 像素高，根本认不出来**。
+    用户的原话是"字还是如此模糊，这种文字应该设置为不受清晰度设置影响"，
+    这个判断是对的：**`display_width` 是"为了省 imshow 缩放开销"而降的显示宽度，
+    它没有任何理由把信息面板一起缩小。**
+
+    ⚠️ 注意别把它误读成"先缩图再画字"那个回归（那个已经修好了，
+    `pipeline.render()` 的注释里有记录）。这是**第二个、独立的**字号问题：
+    即使顺序对了，字号仍被 `display_width` 折进去的 `scale` 乘小。
+
+    `text_scale` 有下限 `0.7`：再小就不可读了，而"看不清的信息面板"
+    等于没有 —— 宁可让它在小窗口里略占地方。
     """
     if not lines:
         return
+    if text_scale is None:
+        text_scale = scale
+    ts = max(0.7, float(text_scale))
     font = cv2.FONT_HERSHEY_SIMPLEX
-    fscale, thick = 0.52 * scale, max(1, int(round(1 * scale)))
+    fscale = 0.52 * ts
+    thick = max(1, int(round(ts)))
     pad = int(round(8 * scale))
-    lh = int(round(20 * scale))
+    lh = max(int(round(20 * ts)), int(round(16 * scale)))
     widths = [cv2.getTextSize(t, font, fscale, thick)[0][0] for t in lines]
     w = max(widths) + 2 * pad
     h = lh * len(lines) + pad
@@ -149,7 +182,7 @@ def draw_hud(frame: np.ndarray, lines: list[str], origin: tuple[int, int] = (10,
     cv2.rectangle(overlay, (x, y), (x2, y2), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
     for i, text in enumerate(lines):
-        cv2.putText(frame, text, (x + pad, y + pad + lh * (i + 1) - int(round(6 * scale))),
+        cv2.putText(frame, text, (x + pad, y + pad + lh * (i + 1) - int(round(5 * fscale * 2))),
                     font, fscale, (255, 255, 255), thick, cv2.LINE_AA)
 
 

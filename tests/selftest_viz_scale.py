@@ -134,10 +134,14 @@ def make_result() -> FrameResult:
                        prediction=pred, fps=30.0, detect_ms=12.0)
 
 
-def render(scale: float, hud: bool = False) -> np.ndarray:
-    """纯色背景上渲染（背景必须干净 —— 底图纹理会被算进"内容"）。"""
+def render(scale: float, hud: bool = False, display_width: int | None = None) -> np.ndarray:
+    """纯色背景上渲染（背景必须干净 —— 底图纹理会被算进"内容"）。
+
+    `display_width` 传下去是为了第 6 节：它**只该影响几何，不该影响文字**。
+    """
     frame = np.full((H, W, 3), BG.astype(np.uint8), np.uint8)
-    return SpherePipeline(make_cfg(scale, hud=hud)).render(frame, make_result())
+    return SpherePipeline(make_cfg(scale, hud=hud)).render(
+        frame, make_result(), display_width=display_width)
 
 
 def bbox(img: np.ndarray, color: np.ndarray | None, tol: int = COLOR_TOL):
@@ -272,6 +276,100 @@ def test_hud_scales_too() -> bool:
          0.9 * SCALE < rw < 1.15 * SCALE),
         (f"面板高度按 k 缩放（{0.9 * SCALE:.1f}~{1.15 * SCALE:.1f}）", 
          0.9 * SCALE < rh < 1.15 * SCALE),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_hud_text_is_immune_to_display_width() -> bool:
+    """第 6 节：**显示缩放的倍率不许作用在文字上**（2026-10-14 用户的反馈）。
+
+    ## 这一节补的是第 4 节明确"不声称能验证"的那个洞
+
+    第 4 节写着「**`fscale` 是否跟着缩放，本测试不声称能验证** ——
+    它的可见后果仅是文字相对面板偏小，属观感问题」。**那句评估是错的**：
+    实际后果不是"偏小"，是**根本认不出来**。
+
+    用户实测反馈原话：「为什么字还是如此模糊，这种文字应该设置为
+    不受清晰度设置影响」。查下来是第二个、独立的字号问题：
+
+    - 第 4 节覆盖的是「先缩图再画字」那个回归（已修，`pipeline.render()` 有记录）；
+    - 而**字号本身**仍被 `display_width` 折进去的 `scale` 乘小：
+      实时默认 `display_width=960`（1920 的 0.5 倍）→ `fscale=0.52*0.5=0.26`、
+      笔画 `max(1,...)` 退到 **1 px**、行高 `20*0.5=10 px`。
+      **字不是被重采样糊掉，是被缩到 10 像素高。**
+
+    `display_width` 存在的唯一理由是省 `cv2.imshow` 的缩放开销
+    （实测 17.74 ms → 1.84 ms/帧），它是**性能手段，不是显示意图**，
+    所以没有理由把信息面板一起缩小。
+
+    ## 判据为什么这次**能**从外部观测（第 4 节说不能）
+
+    第 4 节量的是**面板**墨迹（相对背景色），面板框由"原点 + 画布边界"决定，
+    所以量到的是面板不是字。这里换个量法：`draw_hud` 的**文字是纯白 (255,255,255)**，
+    而底图是纯色背景 —— 所以「近白像素」的外接框**就是字形本身**，
+    面板的黑底与背景都不满足。
+    """
+    print("----- 6. HUD 文字不随 display_width 变 -----")
+
+    # ⚠️ 这一节**必须用全尺寸底图（1920x1080）**，不能用本文件默认的 `W, H = 320, 240`。
+    # 原因：HUD 是"左上角一块按文字宽度自适应的面板"，实测 3 行文字的框就有
+    # 350x53。底图只有 320 宽时，**面板会超出画布右边界被 `min(x+w, ...)` 截断**，
+    # 于是"近白像素的外接框"量到的是**被裁掉的字**，而不是字本身 ——
+    # 我第一版就是这么搭的台子：量出来 236x91 / 150x72 / 75x50，
+    # 看起来像"文字跟着 display_width 缩"，其实**代码是对的、判据是错的**。
+    # （`draw_hud` 的截断行为本身见第 4 节的说明，那里也踩过同一个坑。）
+    #
+    # ⚠️⚠️ **还必须只画 HUD**：轨迹的采样点是纯白 `(255,255,255)` 的实心小圆
+    # （`draw_trail` 最后那段 `cv2.circle(..., (255,255,255), -1)`），
+    # 它们同样满足"近白"判据，会把外接框一路撑到轨迹所在的位置 ——
+    # 我第二版就是被这个骗了：同一个 display_width 下量到 91 而不是 53，
+    # 差值恰好等于那些白点。所以这一节用 `hud_only` 把其余叠加全关掉。
+    FRAME_W, FRAME_H = 1920, 1080
+
+    def hud_only(scale: float) -> AppConfig:
+        cfg = make_cfg(scale, hud=True)
+        cfg.viz.trail_enabled = False
+        cfg.viz.show_circle = False
+        cfg.viz.show_prediction = False
+        return cfg
+
+    def render_full(scale: float, display_width: int | None = None) -> np.ndarray:
+        frame = np.full((FRAME_H, FRAME_W, 3), BG.astype(np.uint8), np.uint8)
+        return SpherePipeline(hud_only(scale)).render(
+            frame, make_result(), display_width=display_width)
+
+    def glyph_box(img: np.ndarray):
+        """纯白字形的外接框（宽, 高）。底图与面板黑底都不是近白。"""
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        ys, xs = np.nonzero(g > 200)
+        if len(xs) == 0:
+            return None
+        return (int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1)
+
+    full = glyph_box(render_full(1.0))
+    half = glyph_box(render_full(1.0, display_width=FRAME_W // 2))
+    quarter = glyph_box(render_full(1.0, display_width=FRAME_W // 4))
+    print(f"  字号外接框：display_width={FRAME_W} {full}"
+          f" / {FRAME_W // 2} {half} / {FRAME_W // 4} {quarter}")
+    if full is None or half is None or quarter is None:
+        print("  [不达标] 有一档没量到文字")
+        return False
+
+    # 显式放大意图必须仍然生效：viz.scale=2 时文字也该变大（这是既有契约）
+    doubled = glyph_box(render_full(SCALE))
+    ratio = (doubled[1] / full[1]) if doubled else 0.0
+    print(f"  viz.scale={SCALE:g} 时字号外接框 {doubled}，高比 {ratio:.2f}"
+          f"（应约 {SCALE:g} —— 显式放大意图仍然生效）")
+
+    checks = [
+        (f"display_width 缩到 1/2，文字**逐像素不变**（{full} -> {half}）", full == half),
+        (f"display_width 缩到 1/4，文字仍逐像素不变（{full} -> {quarter}）",
+         full == quarter),
+        ("文字确实量到了（不是空框）", full[1] >= 8 and full[0] >= 40),
+        (f"显式 viz.scale={SCALE:g} 仍让文字变大（高比 {ratio:.2f}）",
+         0.9 * SCALE < ratio < 1.2 * SCALE),
     ]
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
@@ -593,7 +691,8 @@ def main() -> int:
                test_hud_shows_stall,
                test_content_area_grows_with_k_squared,
                test_display_width_contract,
-               test_detect_width_rescales_coordinates):
+               test_detect_width_rescales_coordinates,
+               test_hud_text_is_immune_to_display_width):
         results.append(fn())
         print()
     ok = all(results)
