@@ -277,6 +277,26 @@ def main() -> int:
         results.append(fn())
         print()
     ok = all(results)
+
+    # ⚠️ 失败了就把"是哪一节红的"再打一遍。
+    #
+    # 为什么需要：本测试有 **5 节、几十条检查**，而运行器
+    # （`apps/run_tests.py`）失败时只回显**最后几行** —— 于是"哪一节红的"
+    # 恰好被截掉，只剩一个孤零零的 `有不达标项`。
+    # 2026-10-14 就撞上过一次：整套里红、单独跑连跑 8 次全绿、
+    # `check_standards.py` 连跑 8 次退出码全 0、`启动程序.py` 的相关串也都在，
+    # **根因没能定位**（疑为并发改文件时检查器扫到中间态）。
+    # 那次之所以难查，一半原因就是**输出被截断**。
+    # 所以把结论行放在最后、并且逐节重述 —— 下次至少能一眼看出该查哪一节。
+    if not ok:
+        names = ("1 测试清单与数量", "2 登记一致", "3 权威实现可用",
+                 "4 反向自证能抓新漂移", "5 交接文档 §13 断言 vs 代码")
+        print("红的节：")
+        for name, good in zip(names, results):
+            print(f"  [{'通过' if good else '不达标'}] {name}")
+        print("\n单独复跑以定位（运行器的尾部回显会截掉上面那些明细）：")
+        print(f"  {sys.executable} tests/selftest_doc_facts.py")
+
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 
