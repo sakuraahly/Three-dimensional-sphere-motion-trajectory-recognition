@@ -43,6 +43,10 @@
   而那件事还没发生，测试自然抓不住。**不假装覆盖了。**
 - **滚轮的可用性**：绑的是 `bind_all("<MouseWheel>")`，无头环境发不了滚轮事件。
   只断言了"滚动条在需要时出现"与 `scroll_to_bottom()` 生效。
+- **日志卡片的 `expand=True`**：把 `fill="x"` 改回 `fill="both", expand=True`
+  **不会红**。原因是页面高度本来就由内容决定，`expand` 在多出来的空间里
+  没有可测的效果 —— 它只影响"看起来占多高"，而那个量没有稳的判据。
+  已经把日志挂进滚动页（这一条**有**护栏），所以不假装覆盖这个次要项。
 
 用法::
 
@@ -70,10 +74,17 @@ LAUNCHER = ROOT / "启动程序.py"
 
 
 def _load_launcher():
-    """把启动器作为模块加载（不执行 mainloop）。"""
+    """把启动器作为模块加载（不执行 mainloop）。
+
+    ⚠️ **必须先注册进 `sys.modules`**：启动器里有 `@dataclass`，
+    而 dataclasses 解析注解时要按 `cls.__module__` 去 `sys.modules` 里找模块，
+    找不到就抛 `AttributeError: 'NoneType' object has no attribute '__dict__'`。
+    直接 `exec_module` 而不注册，就是这个错。
+    """
     sys.argv = ["启动程序.py"]
     spec = importlib.util.spec_from_file_location("launcher_params", LAUNCHER)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules["launcher_params"] = mod          # ← 关键这一行
     spec.loader.exec_module(mod)
     return mod
 
@@ -242,8 +253,12 @@ def main() -> int:
          (canvas_w - page_w) < 30),
         ("内容高于视口 -> 需要竖向滚动", page_h > canvas_h),
         ("需要滚动时滚动条是显示的", bool(app._vbar.winfo_ismapped())),
-        ("四张卡片（含日志）都在滚动页里，不是挂在窗口上",
-         len(app._page.winfo_children()) == 4),
+        # ⚠️ **不要写死卡片数量**：第一版断言"正好 4 张"，加了「任务」卡片之后
+        # 就红了 —— 而那是**测试过时**，不是代码错。数量会随功能增长，
+        # 这条断言真正要守的是"卡片都挂在滚动页里，而不是挂在窗口上"。
+        ("卡片都挂在滚动页里（不是挂在窗口上）",
+         len(app._page.winfo_children()) >= 4
+         and len(app.winfo_children()) < len(app._page.winfo_children())),
         ("日志挂到滚动页下了（否则页面滚动时它纹丝不动）",
          app.log.master.master is app._page),
     ]

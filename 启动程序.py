@@ -20,11 +20,15 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -71,11 +75,75 @@ PARAM_HINT_WRAP = 720     # 初值；同上
 # 卡片左右各 16px 外边距 + 卡片内 14px 内边距 + 滚动条 ≈ 60px
 CHROME_PX = 64
 
+# 界面刷新周期（毫秒）。轮询日志 + 刷新任务耗时列，都用这一个值 ——
+# 原来轮询是 120ms、任务列又自己排了 500ms，两套节奏叠在一起。
+POLL_MS = 200
+
 
 def _cam_arg(raw: str) -> str:
     """下拉里可能是 `0 | aoni webcam A25 | 6&...`，取前面那个编号；否则原样返回角色名。"""
     m = re.match(r"\s*(\d+)", raw or "")
     return m.group(1) if m else (raw or "").strip()
+
+
+# --------------------------------------------------------------------------- #
+# 任务：启动器跑起来的每一个外部程序
+# --------------------------------------------------------------------------- #
+@dataclass
+class Task:
+    """一个正在跑（或跑完）的外部程序。
+
+    ## 为什么要单独一个对象，而不是像原来那样只留一个 `self.proc`
+
+    原来只有 `self.proc` 一个句柄，于是：
+
+    - **一次只能跑一个**（第二个会被"已有程序在运行"挡掉）；
+    - **没有任何中断手段** —— 程序卡住（相机被占、等键盘输入）时，
+      用户只能关掉整个启动器窗口，而那**不会杀掉子进程**：
+      相机仍被占着，下一次运行打不开相机，而用户不知道为什么。
+
+    记下 pid / 启动时刻 / 退出码，才能回答"它在跑吗、跑了多久、怎么死的"。
+    """
+
+    tid: int
+    title: str
+    cmd: list[str]
+    proc: subprocess.Popen
+    started: float = field(default_factory=time.monotonic)
+    ended: float | None = None
+    exit_code: int | None = None
+    stop_reason: str = ""
+
+    @property
+    def running(self) -> bool:
+        return self.proc.poll() is None
+
+    def elapsed(self) -> float:
+        end = self.ended if self.ended is not None else time.monotonic()
+        return max(0.0, end - self.started)
+
+    def cmdline(self) -> str:
+        return " ".join(self.cmd)
+
+
+def _child_pids(pid: int) -> list[int]:
+    """某个进程的子进程 pid（拿不到就返回空）。
+
+    为什么需要：`Popen.terminate()` **只杀直接子进程**。
+    我们的子进程是 python，它可能自己还有子进程（例如 OpenCV 的辅助线程、
+    或用户程序再起的进程）。**父进程死了子进程还活着**，
+    于是相机仍被占着 —— 用户看到"停了但相机打不开"。
+    所以停任务要杀**整棵树**。
+    """
+    try:
+        import psutil                                       # 可选依赖
+    except ImportError:
+        return []
+    try:
+        return [c.pid for c in psutil.Process(pid).children(recursive=True)]
+    except Exception:                                       # noqa: BLE001
+        return []
+
 
 
 class Launcher(tk.Tk):
@@ -92,6 +160,10 @@ class Launcher(tk.Tk):
         self.log_queue: queue.Queue = queue.Queue()
         # 要跟着视口宽度重新换行的标签：(控件, "卡片说明"|"参数说明")
         self._wrapped: list[tuple[ttk.Label, str]] = []
+        # 任务表：所有跑过的程序（在跑的 + 历史）。`_tid` 只增不减。
+        self.tasks: list[Task] = []
+        self._tid = 0
+        self._sel_tid: int | None = None
 
         self._init_style()
         self._build_header()
@@ -102,10 +174,11 @@ class Launcher(tk.Tk):
         self._build_step1()
         self._build_step2()
         self._build_step3()
+        self._build_tasks()      # 任务管理器：看得见、停得掉
         self._build_log()
         self._bind_scroll()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(120, self._poll)
+        self.after(POLL_MS, self._poll)
         self.after(200, self._refresh_cameras)     # 启动时就把当前设备填进下拉
         # 首帧量出真实宽度后立刻按它换行一次（<Configure> 也会触发，
         # 这里只是保证打开就已经是对的，不会先闪一下错的换行）。
@@ -842,36 +915,22 @@ class Launcher(tk.Tk):
 
     # ---------- 子进程与日志 ----------
     def _run(self, cmd: list[str], title: str) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            messagebox.showwarning("正在运行", "已有程序在运行，请先等它结束。")
-            return
-        self._append(f"\n===== {title} =====\n> " + " ".join(cmd))
-        self.status.configure(text="运行中…")
-        self.proc = subprocess.Popen(
-            cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1)
-        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        """跑一个外部程序。
 
-    def _reader(self, proc: subprocess.Popen) -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            self.log_queue.put(line.rstrip("\n"))
-        proc.wait()
-        self.log_queue.put(f"[进程结束] 返回码 {proc.returncode}")
-        self.log_queue.put(None)
+        ## 与原来的区别
 
-    def _poll(self) -> None:
-        while True:
-            try:
-                line = self.log_queue.get_nowait()
-            except queue.Empty:
-                break
-            if line is None:
-                self.proc = None
-                self.status.configure(text="就绪")
-                continue
-            self._append(line)
-        self.after(120, self._poll)
+        原来只留一个 `self.proc`，第二个任务会被"已有程序在运行"挡掉，
+        而且**没有任何中断手段**。现在：
+
+        - **允许多个任务同时跑**（用户可能就要同时开两个窗口对比）；
+          相机冲突由用户自己负责 —— 拦着不许开反而更妨碍人。
+        - 每个任务都能在「任务」卡片里**单独中断**、看耗时、看返回码。
+        - 关窗口时会**先把任务收干净**（原来不会，相机因此可能一直被占着）。
+        """
+        task = self.start_task(cmd, title)
+        self.status.configure(text=f"运行中（{len(self.running_tasks())} 个任务）")
+        self._refresh_tasks()
+        return task
 
     def _append(self, text: str) -> None:
         """往日志里追加一行，并**在合适的时候**自动滚到底。
@@ -897,10 +956,308 @@ class Launcher(tk.Tk):
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
 
+    # ------------------------------------------------------------------ #
+    # 任务：启动 / 停止 / 查询
+    # ------------------------------------------------------------------ #
+    def _spawn(self, cmd: list[str]) -> subprocess.Popen:
+        """起一个**可以被整树杀掉**的子进程。
+
+        `CREATE_NEW_PROCESS_GROUP` 是"能优雅中断"的前提：只有新进程组才能收到
+        `CTRL_BREAK_EVENT`。没有它，`send_signal` 只能换成硬杀 ——
+        而硬杀对"正在写标定结果"这种程序是有害的。
+        """
+        kw: dict = dict(cwd=str(ROOT), stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True,
+                        encoding="utf-8", errors="replace", bufsize=1)
+        if os.name == "nt":
+            kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        return subprocess.Popen(cmd, **kw)
+
+    def start_task(self, cmd: list[str], title: str) -> Task:
+        """起一个新任务并登记。**允许多个同时跑**（相机冲突由用户自己负责）。"""
+        self._tid += 1
+        proc = self._spawn(cmd)
+        task = Task(tid=self._tid, title=title, cmd=list(cmd), proc=proc)
+        self.tasks.append(task)
+        self._sel_tid = task.tid
+        self._append(f"\n===== [{task.tid}] {title} =====\n> {task.cmdline()}")
+        self._append(f"[任务 {task.tid}] 已启动，PID {proc.pid}（可在「任务」里中断）")
+        threading.Thread(target=self._reader, args=(task,), daemon=True).start()
+        self.after(200, self._refresh_tasks)
+        return task
+
+    def stop_task(self, task: Task, graceful: bool = True) -> bool:
+        """停掉一个任务（含它的子进程树）。返回是否真的下手了。
+
+        ## 为什么要杀整棵树，而不是 `proc.terminate()`
+
+        子进程是 python；父进程被杀之后**它还可能活着**，于是相机仍被占着，
+        下一次运行打不开相机，而用户看到的是"停了但相机用不了"——
+        这正是"没有任何中断手段"之外的另一半问题。
+
+        ## 为什么要先优雅后强杀
+
+        `CTRL_BREAK_EVENT` 让程序自己走退出流程（例如标定程序来得及把已经
+        收下的图像对写完）。直接 `taskkill /F` 会把它半路打断。
+        """
+        if not task.running:
+            return False
+        pid = task.proc.pid
+        task.stop_reason = "用户中断" + ("（优雅）" if graceful else "（强制）")
+        self._append(f"[任务 {task.tid}] 正在中断 PID {pid}…")
+        kids = _child_pids(pid)
+        if kids:
+            self._append(f"[任务 {task.tid}] 它有 {len(kids)} 个子进程，将一并结束")
+
+        # ① 先请求优雅退出
+        if graceful:
+            try:
+                if os.name == "nt":
+                    task.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(os.getpgid(pid), signal.SIGINT)
+            except Exception as exc:                        # noqa: BLE001
+                self._append(f"[任务 {task.tid}] 优雅中断不可用（{type(exc).__name__}），"
+                             f"将直接强制结束")
+            try:
+                task.proc.wait(timeout=3.0)
+                self._append(f"[任务 {task.tid}] 已优雅退出")
+                self._kill_leftover(kids, task)
+                return True
+            except subprocess.TimeoutExpired:
+                self._append(f"[任务 {task.tid}] 3 秒内没退出，改为强制结束")
+
+        # ② 强杀（含子树）
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, timeout=10)
+            else:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except Exception as exc:                            # noqa: BLE001
+            self._append(f"[任务 {task.tid}] 强制结束失败：{type(exc).__name__}: {exc}")
+        self._kill_leftover(kids, task)
+        return True
+
+    def _kill_leftover(self, kids: list[int], task: Task) -> None:
+        """收尾：子树里还有活着的就补刀（否则相机可能仍被占着）。"""
+        alive = []
+        for pid in kids:
+            try:
+                import psutil
+                if psutil.pid_exists(pid):
+                    alive.append(pid)
+            except Exception:                               # noqa: BLE001
+                pass
+        if not alive:
+            return
+        self._append(f"[任务 {task.tid}] 仍有 {len(alive)} 个子进程存活，补杀：{alive}")
+        for pid in alive:
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"]
+                               if os.name == "nt" else ["kill", "-9", str(pid)],
+                               capture_output=True, timeout=10)
+            except Exception:                               # noqa: BLE001
+                pass
+
+    def stop_all(self, graceful: bool = False) -> int:
+        """停掉所有在跑的任务，返回停掉几个。"""
+        running = [t for t in self.tasks if t.running]
+        for t in running:
+            self.stop_task(t, graceful=graceful)
+        return len(running)
+
+    def _reader(self, task: Task) -> None:
+        proc = task.proc
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            self.log_queue.put(f"[{task.tid}] {line.rstrip()}")
+        proc.wait()
+        task.ended = time.monotonic()
+        task.exit_code = proc.returncode
+        why = f"（{task.stop_reason}）" if task.stop_reason else ""
+        self.log_queue.put(
+            f"[任务 {task.tid} 结束] 返回码 {proc.returncode}{why}，"
+            f"耗时 {task.elapsed():.1f}s")
+        self.log_queue.put(None)
+
+    def _poll(self) -> None:
+        while True:
+            try:
+                line = self.log_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                self.proc = None
+                self._refresh_tasks()
+                self.status.configure(text="就绪" if not self.running_tasks()
+                                      else f"运行中 {len(self.running_tasks())} 个")
+                continue
+            self._append(line)
+        # 计时列要跟着走。**只在真的有任务在跑时刷** ——
+        # 空转时每 500ms 重画一次表格纯属浪费。
+        if self.running_tasks():
+            self._refresh_tasks()
+        self.after(POLL_MS, self._poll)
+
+    def running_tasks(self) -> list[Task]:
+        return [t for t in self.tasks if t.running]
+
+    # ------------------------------------------------------------------ #
+    # 任务列表界面
+    # ------------------------------------------------------------------ #
+    def _build_tasks(self) -> None:
+        """任务管理器：看得到在跑什么、跑了多久，并且**能中断**。
+
+        这一节补的是前面那个"卡死"缺口的另一半 ——
+        光让程序说清"我在等什么"还不够，用户还得有**把它停掉**的手段。
+        """
+        box = self._card(
+            "任务",
+            "这里列出启动器起过的每个程序。**卡住时用它中断** ——"
+            "直接关启动器窗口是不会杀掉子进程的，相机可能仍被占着。"
+            "「中断」先试优雅退出（让它自己收尾），3 秒不退再强制结束整棵进程树。")
+        cols = ("id", "title", "pid", "elapsed", "status")
+        heads = ("#", "任务", "PID", "已运行", "状态")
+        widths = (4, 34, 8, 9, 12)
+        self.task_tree = ttk.Treeview(box, columns=cols, show="headings",
+                                      height=5, selectmode="browse")
+        for c, h, w in zip(cols, heads, widths):
+            self.task_tree.heading(c, text=h)
+            self.task_tree.column(c, width=w * 8, anchor="w", stretch=(c == "title"))
+        self.task_tree.grid(row=1, column=0, columnspan=8, sticky="we", pady=(4, 4))
+        self.task_tree.bind("<<TreeviewSelect>>", self._on_task_select)
+
+        ttk.Button(box, text="中断选中", command=self._stop_selected).grid(
+            row=2, column=0, sticky="w", pady=2)
+        ttk.Button(box, text="强制结束选中", command=self._kill_selected).grid(
+            row=2, column=1, sticky="w", padx=(6, 0), pady=2)
+        ttk.Button(box, text="全部中断", command=self._stop_all_clicked).grid(
+            row=2, column=2, sticky="w", padx=(6, 0), pady=2)
+        ttk.Button(box, text="查看输出", command=self._show_selected_output).grid(
+            row=2, column=3, sticky="w", padx=(6, 0), pady=2)
+        ttk.Button(box, text="清理已结束", command=self._prune_tasks).grid(
+            row=2, column=4, sticky="w", padx=(6, 0), pady=2)
+        self.task_hint = ttk.Label(box, text="", style="Hint.TLabel",
+                                   wraplength=CARD_HINT_WRAP)
+        self.task_hint.grid(row=3, column=0, columnspan=9, sticky="w", pady=(4, 0))
+        self._wrapped.append((self.task_hint, "card"))
+
+    def _refresh_tasks(self) -> None:
+        """重画任务表。**保留选中行**（否则每次刷新都把用户的选择弄丢）。"""
+        if not hasattr(self, "task_tree"):
+            return
+        tree = self.task_tree
+        keep = self._sel_tid
+        tree.delete(*tree.get_children())
+        for t in self.tasks:
+            if t.running:
+                status = "运行中"
+            elif t.stop_reason:
+                status = t.stop_reason
+            else:
+                status = f"已结束(码 {t.exit_code})"
+            tree.insert("", "end", iid=str(t.tid),
+                        values=(t.tid, t.title, t.proc.pid,
+                                f"{t.elapsed():.1f}s", status))
+            if keep == t.tid:
+                tree.selection_set(str(t.tid))
+        n_run = len(self.running_tasks())
+        n_all = len(self.tasks)
+        self.task_hint.configure(
+            text=f"共 {n_all} 个任务，其中 {n_run} 个在运行。"
+                 + ("选中一个再点「中断选中」。" if n_run else "当前没有在跑的任务。"))
+
+    def _selected_task(self) -> Task | None:
+        sel = self.task_tree.selection() if hasattr(self, "task_tree") else ()
+        if not sel:
+            return None
+        tid = int(sel[0])
+        return next((t for t in self.tasks if t.tid == tid), None)
+
+    def _on_task_select(self, _evt=None) -> None:
+        t = self._selected_task()
+        self._sel_tid = t.tid if t else None
+
+    def _stop_selected(self) -> None:
+        t = self._selected_task()
+        if t is None:
+            messagebox.showinfo("先选一个任务", "在上面的列表里点一行，再点「中断选中」。")
+            return
+        if not t.running:
+            messagebox.showinfo("它已经结束了", f"任务 {t.tid}「{t.title}」已经不在运行。")
+            return
+        self.stop_task(t, graceful=True)
+        self._refresh_tasks()
+
+    def _kill_selected(self) -> None:
+        t = self._selected_task()
+        if t is None:
+            messagebox.showinfo("先选一个任务", "在上面的列表里点一行，再点「强制结束选中」。")
+            return
+        if not t.running:
+            messagebox.showinfo("它已经结束了", f"任务 {t.tid}「{t.title}」已经不在运行。")
+            return
+        if not messagebox.askyesno(
+                "强制结束？",
+                f"任务 {t.tid}「{t.title}」会被**立刻杀掉**（含子进程树），"
+                "它来不及保存已完成的结果。\n\n确定吗？"):
+            return
+        self.stop_task(t, graceful=False)
+        self._refresh_tasks()
+
+    def _stop_all_clicked(self) -> None:
+        n = len(self.running_tasks())
+        if not n:
+            messagebox.showinfo("没有在跑的任务", "当前没有需要中断的程序。")
+            return
+        if not messagebox.askyesno("全部中断？", f"将中断 {n} 个正在运行的任务。确定吗？"):
+            return
+        self.stop_all(graceful=True)
+        self._refresh_tasks()
+
+    def _show_selected_output(self) -> None:
+        """把这个任务的命令行回显到日志区（方便复制）。"""
+        t = self._selected_task()
+        if t is None:
+            messagebox.showinfo("先选一个任务", "在上面的列表里点一行。")
+            return
+        self._append(f"\n===== 任务 {t.tid}「{t.title}」=====")
+        self._append(f"PID   : {t.proc.pid}")
+        self._append(f"状态  : {'运行中' if t.running else '已结束'}"
+                     + (f"（{t.stop_reason}）" if t.stop_reason else ""))
+        self._append(f"耗时  : {t.elapsed():.1f}s")
+        self._append(f"命令  : {t.cmdline()}")
+
+    def _prune_tasks(self) -> None:
+        """清掉已结束的任务行（在跑的绝不动）。"""
+        before = len(self.tasks)
+        self.tasks = [t for t in self.tasks if t.running]
+        self._refresh_tasks()
+        self._append(f"[任务] 清理了 {before - len(self.tasks)} 条已结束记录")
+
     def _on_close(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            if not messagebox.askyesno("仍在运行", "检测程序还在运行，确定退出启动器吗？"):
+        """退出前把子进程**收干净**。
+
+        ⚠️ 原来只弹一句"确定退出吗"就 `destroy()` ——
+        子进程**不会被杀**：相机仍被占着，下一次运行打不开相机。
+        现在退出前先把在跑的任务停掉（这也是"任务管理器"存在的意义之一）。
+        """
+        running = self.running_tasks()
+        if running:
+            names = "、".join(f"{t.tid}「{t.title}」" for t in running[:4])
+            more = f" 等 {len(running)} 个" if len(running) > 4 else ""
+            if not messagebox.askyesno(
+                    "仍有任务在运行",
+                    f"还有 {len(running)} 个任务在跑：{names}{more}。\n\n"
+                    "退出启动器会**把它们一并结束**（否则相机等资源可能一直被占着）。\n"
+                    "确定退出吗？"):
                 return
+            self._append("[退出] 正在结束仍在运行的任务…")
+            n = self.stop_all(graceful=True)
+            self._append(f"[退出] 已请求结束 {n} 个任务")
         self.destroy()
 
 
