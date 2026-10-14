@@ -430,6 +430,22 @@ class Launcher(tk.Tk):
             self._hint(parent, hint)
         return ent
 
+    def _param_combo(self, parent, label: str, values: list[str], value: str,
+                     hint: str = "", width: int = 10) -> ttk.Combobox:
+        """一行参数：`标签 [下拉框]` 一行，说明一行。
+
+        与 `_param_entry` 同一套排版（说明放**下面**，避免撑开整张卡片），
+        只是把输入框换成只读下拉 —— 有固定可选值的参数用它。
+        """
+        row = self._next_row(parent)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
+        cb = ttk.Combobox(parent, values=values, width=width, state="readonly")
+        cb.set(value)
+        cb.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        if hint:
+            self._hint(parent, hint)
+        return cb
+
     def _param_check(self, parent, label: str, var, hint: str = "") -> None:
         """一行勾选项 + 说明。"""
         row = self._next_row(parent)
@@ -525,12 +541,24 @@ class Launcher(tk.Tk):
                           self.calib_relaxed,
                           "用完必须复检极线误差；不达标请处理光照/支撑后关掉它重标")
 
-        self._hint(adv, "④ 核对与留证（**强烈建议都填**）")
+        self._hint(adv, "④ 后端与核对留证")
+        # 后端：**从界面必须能设**（2026-10-14 加）。
+        # 为什么加：脚本默认后端取自 `sources.INDEX_BACKEND`（= MSMF），
+        # 而本机实测 **MSMF 打开两路要 34.6 s，DSHOW 只要 11.8 s**（快 3 倍），
+        # 且两个后端给的分辨率完全一致。标定要反复跑，「前置检查」更是每次都要等，
+        # 界面里没有这个开关，从界面走的人就只能白等 —— 那正是
+        # 「界面能设的东西不许与真实取值脱节」那条规矩的反面。
+        # 默认仍是 auto（= 脚本默认），**不替用户改行为**，只是把选择权交出来。
+        self.calib_backend = self._param_combo(
+            adv, "相机后端", ["auto", "dshow", "msmf"], "auto",
+            hint="auto = 脚本默认（MSMF）。**MSMF 打开慢**（本机实测两路 34.6 s vs "
+                 "DSHOW 11.8 s）；两台相机必须用同一个后端，所以只在这里选一次")
         # 基线留空是**有意的**：程序不知道你的装置中心距，编不出来。
         # 说明里必须讲清"不填 = 这道护栏关着"，而不是让人以为没差。
         self.calib_baseline = self._param_entry(
             adv, "预期基线 mm", "", "★ 两镜头中心距。**只有填了才会核对基线** ——"
-                                    "不填这道护栏就是关着的（程序无法替你猜这个值）")
+                                    "不填这道护栏就是关着的（程序无法替你猜这个值）。"
+                                    "**每次重新摆相机都要重新量**，别照抄旧数字")
         self.calib_savepairs = self._param_path(
             adv, "存图像对", "存下来才能离线复查/重标（出问题时唯一能回答「哪一对错了」）",
             is_dir=True)
@@ -887,9 +915,14 @@ class Launcher(tk.Tk):
                 "--right", _cam_arg(self.calib_right.get()),
                 "--cols", str(cols), "--rows", str(rows), "--square", str(square),
                 "--target", str(target), "--min-pairs", str(minp),
-                "--width", width, "--height", height, "--fps", fps,
-                # 序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致（见 pair_source）
-                "--backend", "msmf"]
+                "--width", width, "--height", height, "--fps", fps]
+        # ⚠️ 2026-10-14：这里原来**写死** `--backend msmf`（理由是"MSMF 与设备枚举
+        # 顺序一致"）。但那样界面就完全没有选择权，而本机实测 **MSMF 打开两路
+        # 要 34.6 s、DSHOW 只要 11.8 s**，且两个后端给的分辨率完全一致
+        # （idx0=1920x1080 / idx1=640x480，实测两轮）。所以改成由面板的
+        # 「相机后端」决定；`auto` 时不传参数，仍然落到脚本默认（MSMF）——
+        # **不替用户改行为，只把选择权交出来**。
+        args += self._backend_args()
         if stationary is not None:
             args += ["--stationary-px", str(stationary)]
         if sharp is not None:
@@ -905,6 +938,17 @@ class Launcher(tk.Tk):
         if report:
             args += ["--report-png", report]
         return args
+
+    def _backend_args(self) -> list[str]:
+        """面板上的「相机后端」→ 命令行参数。`auto` 返回空（落到脚本默认）。
+
+        **为什么要单独一个函数**：标定 / 复检 / 前置检查三条命令都要它。
+        原来只有标定那条写死了 `--backend msmf`，另两条根本不传 ——
+        **同一个决定散在三处，改一处忘两处**（本项目反复踩的那类问题）。
+        现在只有一个决定点：面板。
+        """
+        backend = self.calib_backend.get()
+        return ["--backend", backend] if backend and backend != "auto" else []
 
     def _run_calibration(self) -> None:
         mode = self.calib_mode.get()
@@ -937,9 +981,8 @@ class Launcher(tk.Tk):
                 return
             cmd = [PY, str(ROOT / "apps" / "verify_stereo.py"),
                    "--calib", str(calib), "--left", left, "--right", right,
-                   "--width", width, "--height", height, "--fps", fps,
-                   # 序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致（见 pair_source）
-                   "--backend", "msmf"]
+                   "--width", width, "--height", height, "--fps", fps]
+            cmd += self._backend_args()      # 同样是面板决定，不再写死 msmf
             self._run(cmd, "标定复检（判断装置是否被碰动）")
 
     def _run_probe(self) -> None:
@@ -956,6 +999,7 @@ class Launcher(tk.Tk):
         cmd = [PY, str(ROOT / "apps" / "tools" / "check_stereo_setup.py"),
                "--left", left, "--right", right,
                "--width", width, "--height", height, "--fps", fps]
+        cmd += self._backend_args()
         self._run(cmd, f"标定前置检查（左{left} / 右{right}：两路是否都看到棋盘）")
 
     def _refresh_cameras(self) -> None:

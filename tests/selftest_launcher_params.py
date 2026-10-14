@@ -201,6 +201,33 @@ def main() -> int:
     _set(app.calib_rows, "5")
     _set(app.calib_square, "25")
 
+    # ---- 2.5 相机后端必须**从面板传下去**（2026-10-14 加）----
+    #
+    # 为什么要有这一条：这里原来把 `--backend msmf` **写死**在 `_calibrate_args` 里，
+    # 而「复检」与「前置检查」两条命令**根本不传**。后果是界面完全没有选择权，
+    # 而本机实测 **MSMF 打开两路要 34.6 s、DSHOW 只要 11.8 s**（两个后端给的
+    # 分辨率完全一致，实测两轮）—— 从界面走的人只能白等半分钟，
+    # 而且"同一个决定散在三处"正是本项目反复踩的那类问题。
+    # 现在只有一个决定点（面板），三条命令都走 `_backend_args()`。
+    print("----- 2.5 相机后端来自面板，且三条命令用的是同一个决定 -----")
+    app.calib_backend.set("dshow")
+    expect("选 dshow -> 标定命令带上 --backend dshow", True, contains="--backend dshow")
+    app.calib_backend.set("auto")
+    expect("选 auto -> **不传** --backend（落到脚本默认，不替用户改行为）",
+           True, absent="--backend")
+    app.calib_backend.set("msmf")
+    expect("选 msmf -> 带上 --backend msmf", True, contains="--backend msmf")
+    # 三条命令共用同一个决定点：源码级确认没有第二份内联写法
+    launcher_src = (ROOT / "启动程序.py").read_text(encoding="utf-8")
+    inline = launcher_src.count('args += ["--backend", backend]')
+    uses_helper = launcher_src.count("self._backend_args()")
+    print(f"  源码：内联写 backend 参数 {inline} 处；调用 _backend_args() {uses_helper} 处")
+    results.append(("后端只有一个决定点（没有第二份内联复制）",
+                    inline == 0 and uses_helper >= 3))
+    print(f"  [{'通过' if inline == 0 and uses_helper >= 3 else '不达标'}] "
+          f"后端只有一个决定点（内联 0 处、helper 调用 ≥3 处）")
+    app.calib_backend.set("auto")
+
     # ---- 3. 面板默认值必须与脚本/CaptureConfig 的默认值**一致** ----
     #
     # ⚠️ **2026-10-14 改了契约**：原来这些框是**空的**，断言"留空 = 不传"。
@@ -301,7 +328,19 @@ def main() -> int:
     expect("1280x720 -> --width 1280 --height 720", True,
            contains="--width 1280 --height 720")
     app.calib_res.set("1920x1080")
-    expect("两台相机必须同后端（backend 固定 msmf）", True, contains="--backend msmf")
+    # ⚠️ **2026-10-14 改了这条断言**：它原来是
+    #   `expect("两台相机必须同后端（backend 固定 msmf）", True, contains="--backend msmf")`
+    # 也就是把"写死 msmf"当成契约。现在后端由面板决定（见第 2.5 节），
+    # 但**它要守的真实意图没有变**：`--backend` 是**一个**参数、两台相机共用，
+    # 拿不到"左路 dshow、右路 msmf"这种会直接把 MSMF 那路弄挂的组合。
+    # 所以断言改成"不多不少恰好一个 --backend"。
+    app.calib_backend.set("dshow")
+    args_b = app._calibrate_args() or []
+    n_be = args_b.count("--backend")
+    print(f"  选中 dshow 时：--backend 出现 {n_be} 次（应恰好 1 —— 两台共用同一个）")
+    results.append(("两台相机同后端：--backend 只出现一次", n_be == 1))
+    print(f"  [{'通过' if n_be == 1 else '不达标'}] 两台相机同后端：--backend 只出现一次")
+    app.calib_backend.set("auto")
 
     # ---- 9. 可滚动布局（"新加的东西把原来的挤掉"是真实回归）----
     #
