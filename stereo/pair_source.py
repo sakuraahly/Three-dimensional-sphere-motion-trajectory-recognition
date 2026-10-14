@@ -266,9 +266,26 @@ class CameraPairReader(FrameReader):
         self.label = f"camera {left_index} / {right_index}"
 
         def _open(role: str, idx: int, api: int) -> LatestFrameCamera:
+            # ⚠️ **`optimize=False` 是必须的，不是省事**（2026-10-14 修）：
+            #
+            # `CameraSource` 默认 `optimize=True`，它会**为这一台相机**搜索
+            # "最适合自己"的后端 + 分辨率。但双目要求**两路分辨率完全一致**
+            # （`image_size`、标定、三角测量全都建立在这个前提上），
+            # 于是各自优化必然把两路拉开。受控实测（连续两轮，结果完全一致）：
+            #
+            #     请求 1920x1080  optimize=False -> idx1=1920x1080 idx0=1920x1080  一致
+            #     请求 1920x1080  optimize=True  -> idx1=1280x720  idx0=1920x1080  不一致
+            #
+            # 不一致的表现是标定**直接失败**（"两路分辨率不一致…标定要求两路
+            # 完全一致"），而用户看到的是"我明明设了 1920x1080"。
+            #
+            # 关掉优化 ≠ "不管分辨率"：`CameraSource` 拿到明确的 `width/height`
+            # 就按它打开，给不出帧时仍会回退到候选分辨率 —— 那时两路是否一致
+            # 由上层**报出来**，是可见的，而不是被静默优化掉。
             try:
                 return LatestFrameCamera(CameraSource(
-                    index=idx, width=width, height=height, fps=fps, backend=api))
+                    index=idx, width=width, height=height, fps=fps, backend=api,
+                    optimize=False))
             except RuntimeError:
                 if backup_camera is None or backup_camera == idx:
                     raise
@@ -276,7 +293,8 @@ class CameraPairReader(FrameReader):
                 print("       注意：备用相机与被替换的那台型号/视野都不同，"
                       "标定结果只对当前这个组合有效")
                 return LatestFrameCamera(CameraSource(
-                    index=backup_camera, width=width, height=height, fps=fps, backend=api))
+                    index=backup_camera, width=width, height=height, fps=fps,
+                    backend=api, optimize=False))
 
         # 两路必须用同一个后端，且要**成对地**挑：一个后端能同时打开两路才算数。
         # 原因（2026-10 实测）：同一进程里混用 DSHOW + MSMF 时，MSMF 那路会
