@@ -13,7 +13,8 @@
 | 失败约定 | 绝大多数"没结果"返回 `None`/`[]` **不抛**；只有校验类错误抛异常（各节标注）                 |
 | 取帧责任 | **`pipeline` 不取帧**：`sources`（单目）/`stereo.PairSource`（双目）由 app 驱动，再把帧喂进库 |
 
-**范围与前提**：本文只覆盖三个库包（`apps/`、`tests/`、启动器、PPT 工具链不在范围内）；双目精度数字**全部来自合成真值，真机标定从未跑过**（`交接文档.md` §10.4(b)），文中"实测数字"引自源码注释或既有文档，我**没有**重跑那 6 个 selftest。
+**范围与前提**：本文只覆盖三个库包（`apps/`、`tests/`、启动器、PPT 工具链不在范围内）；文中"实测数字"引自源码注释或既有文档，我**没有**重跑那 6 个 selftest。
+**真机标定跑过，但还没有一次可用的结果**（2026-10-14 更正，原写"从未跑过"）：10-10 那轮 8 对判**不可用且未保存**（双目 RMS 46.40 px、基线 199.67 mm vs 实测 65 mm）；10-13 那轮 25 对里 22 对可用、基线 67.28 mm 只差实测 3.5%，但**两路分辨率错配**（1280x720 vs 1920x1080）所以那份 R/T 不能用。详见 `交接文档.md` §11.3、§12.2、§13.2。
 ## 1. `sphere_tracker/config.py` —— 全部可调参数
 ```python
 class ColorConfig:  @staticmethod preset(name: str) -> "ColorConfig"
@@ -32,7 +33,9 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 | `VizConfig`      | `trail_enabled/show_circle/show_prediction/show_hud=True`、`show_mask/show_axes_3d=False`、`scale=1.0`                                                                                                                                                                                                            |
 
 **坑**：① 默认颜色预设是**白色/高亮球**（`[0,0,175]`–`[179,80,255]`），**不是橙球** —— 拍橙球必须 `preset("orange_ball")` 或跑 `apps/tools/calibrate_color.py`，否则"检测不到"会被误判成算法问题。
-② `DetectorConfig.min_score` 与 `TrackerConfig.max_q_scale` **定义了但全仓库无人读取**（fusion 的孤证门限硬编码 `0.55`、`KalmanFilter.q_max` 硬编码 `q_base*64`）—— 改它们**没有任何效果**；`_merge_dataclass` 还**忽略未知字段**，所以**键名拼错会静默失效**（不报错）。
+② `DetectorConfig.min_score`（默认 `0.55`）与 `TrackerConfig.max_q_scale`（默认 `64.0`）**现在是活的** —— 接线位置：`detectors/fusion.py:75` 的孤证门限读 `cfg.min_score`、`KalmanFilter.__init__(..., max_q_scale=cfg.max_q_scale)`（`track.py:40` 用它算 `q_max`）。
+**但 `_merge_dataclass` 仍然忽略未知字段**，所以**键名拼错会静默失效**（不报错）—— 配置接线由 `tests/selftest_config_wiring.py` 扫全部字段守着。
+（2026-10-10 之前确实是两个死配置项，行为等价修复后默认值对齐了历史硬编码值 `0.55` / `64.0`，见 `交接文档.md` §10.7-1。）
 ③ `red_ball` 预设自带 `use_second_range=True`（红色跨 0 度），别只抄 `hsv_lower/upper`。
 ## 2. `sphere_tracker/types.py` —— 数据容器（字段要记准）
 **`Detection`**（单帧检测，像素）：`x, y, radius`（亚像素）；`score`（0–1）；`method`（`"color"`/`"hough"`/`"motion"`/`"fusion:color"`/`"yolo"`/`"yolo+color"`/`"yolo_sam"`）；`parts: dict[str,float]`（各子线索原始分，fusion 会塞 `votes`）；`contour: (N,2)|None`（hough/yolo 不给）；`mask`（**整幅**掩膜，**同帧多个 Detection 共享同一数组**）；`extra: dict`（YOLO 放 `"box"`）。属性 `center -> (x,y)`、`diameter -> 2*radius`。
@@ -267,7 +270,9 @@ def hud_lines(result, cfg) -> list[str]      # result/cfg 未标注类型；期�
 **坑**：① **除 `draw_3d_panel` 外全部原地改 `frame` 并返回 `None`**（`draw_3d_panel` 相反，返回新面板）—— 别写成 `frame = draw_trail(...)`。
 ② `cv2.putText` 只能画 ASCII，**中文会变成问号** —— 所以 `hud_lines` 全是英文；要中文界面得改用 PIL。
 ③ `draw_trail` 用 `TrailPoint.score == 0.0` 判定"外推段"，画成灰色细线。
-④ 疑似不一致（**读代码发现，未实机确认**）：`SpherePipeline.render()` 在 `viz.scale != 1` 时**只把预测点乘了 `scale`**，拖尾/圆/轮廓/掩膜仍按原分辨率坐标画 ⇒ 缩放显示时几何元素错位；默认 `scale=1.0`，日常看不到。
+④ ~~`SpherePipeline.render()` 在 `viz.scale != 1` 时只把预测点乘了 `scale`~~ —— **已修，本条作废**：现在每个 `draw_*` 自己接 `scale`，"画布缩放"只有一个负责处（`pipeline.py:294-336`；预测线不再由调用方预乘）。
+`viz.scale = k` 的语义是「**整张原始图的 k 倍**」——几何与文字**全部**按 k 缩放，等式 `render(k) ≈ resize(render(1), ×k)`（像素级不成立：抗锯齿按各自分辨率算，实测内容像素差 86%，那是正常行为）。
+判据是**尺度不变性**（每个元素的外接框恰为 k 倍），由 `tests/selftest_viz_scale.py` 守住（5 个变异全红）。
 ## 11. `sphere_tracker/pipeline.py` —— 单帧总编排
 ```python
 class SpherePipeline:
@@ -466,6 +471,11 @@ pt = rec.update(t, left=det_left, right_dets=dets_right)    # left 是【单个�
 
 **边界（诚实标注）**：① 本文**不覆盖** `apps/`、`tests/`、启动器与 PPT 工具链的内部实现（只在 §13.2 提了一句 `apps/_common.py` 的参数约定）。
 ② 文中所有"实测数字"（300/93/12/40 ms、~0.1 s vs ~10 s、圆度 0.61~0.63…）**引自源码注释**，我**没有**重跑那 6 个 `tests/selftest_*.py`。
-③ **未实测确认**：§10 的 `viz.scale != 1` 绘制不一致（读 `pipeline.render()` 发现，没跑起来验证；默认 `scale=1.0` 时不受影响）。
+③ ~~§10 的 `viz.scale != 1` 绘制不一致~~ —— **已修，不再是边界**（2026-10-14 的 `feat(ui)` 那轮把 scale 接进每个 `draw_*`，见 §10 坑④）。
 ④ **未确认**：`MotionDetector._bg_stale` 在长时间手持下的实际重学效果、`optimize_mode()` 在非本机摄像头上的耗时 —— 只有代码注释作依据。
 ⑤ 本文按三个包**当前源码**写成；若与源码不符，**以源码为准**并顺手改这里。
+
+> **本文自身也是漂移源**（2026-10-14 复核）：§1 坑②与 §10 坑④ 两条"定义但无人读取 / 疑似不一致"在代码修好之后**继续留在正文里**，
+> 而 `启动程序.bat standards` 查的是**路径引用与计数**、`selftest_doc_facts` 查的是**测试清单** ——
+> **两者都不检查"这段描述还成不成立"**，所以它一路绿灯。教训：**"读代码得出的结论"没有回归测试守着，就会随相邻代码一起过期**；
+> 写这类判断时必须同时写出**判据落在哪个测试里**，否则它迟早变成误导下一个人的正文。
