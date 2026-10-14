@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -166,12 +167,52 @@ def main() -> int:
     _set(app.calib_rows, "5")
     _set(app.calib_square, "25")
 
-    # ---- 3. 可选项留空 = 不传 ----
-    print("----- 3. 可选项留空 = 不传该参数 -----")
-    expect("留空不传 --stationary-px", True, absent="--stationary-px")
-    expect("留空不传 --min-sharpness", True, absent="--min-sharpness")
-    expect("留空不传 --baseline-mm（基线护栏是关着的）", True,
-           absent="--baseline-mm")
+    # ---- 3. 面板默认值必须与脚本/CaptureConfig 的默认值**一致** ----
+    #
+    # ⚠️ **2026-10-14 改了契约**：原来这些框是**空的**，断言"留空 = 不传"。
+    # 用户要求"填入默认的设置值"，所以现在框里**填着真实默认值**。
+    # 于是"留空"从常态变成"用户主动清掉"，其语义仍是**不传该参数**
+    # （`calibrate_stereo.py` 会退回自己的默认值）。
+    #
+    # 这里钉的是**两处默认值必须相同**：面板填 3 / 脚本默认也是 3，
+    # 所以"不改任何东西直接点运行"的行为与改动前**完全一致**。
+    # 若哪天脚本把默认值改成 4 而面板还写 3，这条就会红 —— 那正是要防的漂移。
+    print("----- 3. 面板默认值 == 脚本/CaptureConfig 默认值 -----")
+    import re as _re2
+    calib_src = (ROOT / "apps" / "calibrate_stereo.py").read_text(encoding="utf-8")
+    from calib.capture import CaptureConfig as _CC
+    _cc = _CC()
+    # argparse 的 default=None 表示"不传就用 CaptureConfig"；这里取后者为准
+    expect_stationary = f"{_cc.stationary_max_px:g}"
+    expect_sharp = f"{_cc.min_sharpness:g}"
+    got_stationary = app.calib_stationary.get().strip()
+    got_sharp = app.calib_sharp.get().strip()
+    print(f"  停稳上限：面板 {got_stationary!r} / CaptureConfig {expect_stationary}")
+    print(f"  清晰度  ：面板 {got_sharp!r} / CaptureConfig {expect_sharp}")
+    for label, got, want in (("停稳上限 px", got_stationary, expect_stationary),
+                             ("清晰度下限", got_sharp, expect_sharp),
+                             ("目标对数", app.calib_target.get().strip(), "25"),
+                             ("最少对数", app.calib_minpairs.get().strip(), "10"),
+                             ("内角点·列", app.calib_cols.get().strip(), "8"),
+                             ("内角点·行", app.calib_rows.get().strip(), "5"),
+                             ("方格边长 mm", app.calib_square.get().strip(), "25")):
+        good = (float(got) == float(want)) if got else False
+        print(f"  [{'通过' if good else '不达标'}] {label}: 面板 {got!r} == 脚本 {want}")
+        results.append((f"面板默认值 == 脚本默认值（{label}）", good))
+
+    # 基线**故意**留空：程序无法替你猜装置中心距。这条也要钉住，
+    # 免得有人"顺手"填个数字进去 —— 那会让基线核对用错误的锚。
+    print(f"  预期基线：面板 {app.calib_baseline.get()!r}（**应当为空**）")
+    good = app.calib_baseline.get().strip() == ""
+    print(f"  [{'通过' if good else '不达标'}] 预期基线**故意留空**（程序猜不出来）")
+    results.append(("预期基线故意留空（程序无法替你猜中心距）", good))
+
+    # ---- 3b. 清空 = 不传该参数（原来的语义仍然成立）----
+    print("----- 3b. 清空某个框 = 不传该参数 -----")
+    _set(app.calib_stationary, "")
+    expect("清空停稳上限 -> 不传 --stationary-px", True, absent="--stationary-px")
+    _set(app.calib_stationary, "3")
+    expect("填回 3 -> 又传下去", True, contains="--stationary-px 3.0")
     expect("未勾放宽不传 --relaxed", True, absent="--relaxed")
 
     # ---- 4. 填了就传 ----
@@ -262,6 +303,65 @@ def main() -> int:
         ("日志挂到滚动页下了（否则页面滚动时它纹丝不动）",
          app.log.master.master is app._page),
     ]
+
+    # ---- 9b. 参数页签里**不许有网格冲突** ----
+    #
+    # ## 这条守的是什么（真实回归，2026-10-14）
+    #
+    # 界面截图里"高级设置都是被遮挡的文字"：参数辅助函数内部占
+    # `row*2` 与 `row*2+1` **两行**，而调用方传 1、2、3… 并**另手工放**
+    # 复选框/分组标题 —— 手算的行号正好落在已被占用的行上，**文字与输入框互相盖住**。
+    #
+    # 根因是"手算行号"这种做法；现在改成每个 parent 一个游标、辅助函数自己分配。
+    # 所以这里钉的是**没有同格重复、没有同列竖向重叠**。
+    def _tabs() -> list[tuple[str, object]]:
+        found, out = [], []
+        stack = [app]
+        while stack:
+            w = stack.pop()
+            for c in w.winfo_children():
+                if c.winfo_class() == "TNotebook":
+                    found.append(c)
+                stack.append(c)
+        for nb in found:
+            for tid in nb.tabs():
+                out.append((str(nb.tab(tid, "text")).strip(), nb.nametowidget(tid)))
+        return out
+
+    tabs = _tabs()
+    print(f"  找到 {len(tabs)} 个参数页签：{[n for n, _ in tabs]}")
+    checks_layout.append(("参数区确实是「基本设置 / 高级设置」两个页签",
+                          [n for n, _ in tabs] == ["基本设置", "高级设置"]))
+    dup_any, overlap_any, too_wide_any = [], [], []
+    for name, tab in tabs:
+        kids = tab.winfo_children()
+        cells = [(c.grid_info().get("row"), c.grid_info().get("column", 0))
+                 for c in kids]
+        dup = [k for k, v in Counter(cells).items() if v > 1]
+        # ⚠️ 必须**按列分组**再比 y 区间：同一行不同列的控件 y 区间天然重叠，
+        # 那不是冲突。第一版没分组，报了一堆假阳性（「TEntry 与 目标对数 重叠」）。
+        by_col: dict[int, list] = {}
+        for c in kids:
+            by_col.setdefault(c.grid_info().get("column", 0), []).append(c)
+        ov = []
+        for _col, group in by_col.items():
+            boxes = sorted((c.winfo_y(), c.winfo_y() + c.winfo_height())
+                           for c in group)
+            for (y1, y2), (y3, _y4) in zip(boxes, boxes[1:]):
+                if y3 < y2 - 1:
+                    ov.append((_col, y1, y2, y3))
+        widest = max((c.winfo_x() + c.winfo_width() for c in kids), default=0)
+        print(f"    {name}: {len(kids)} 个控件  同格重复={len(dup)}  "
+              f"同列重叠={len(ov)}  最右={widest}（视口 {app._canvas.winfo_width()}）")
+        dup_any += [(name, d) for d in dup]
+        overlap_any += [(name, o) for o in ov]
+        if widest > app._canvas.winfo_width():
+            too_wide_any.append((name, widest))
+    checks_layout.append((f"页签内没有同格重复（实际 {len(dup_any)} 处）", not dup_any))
+    checks_layout.append((f"页签内没有同列竖向重叠（实际 {len(overlap_any)} 处）"
+                          f"—— 这就是「文字被遮挡」的判据", not overlap_any))
+    checks_layout.append((f"页签内容不超出视口（实际 {len(too_wide_any)} 处）",
+                          not too_wide_any))
     # 窗口改宽度后，换行宽度必须跟着变（这才是"动态"的证据）
     wraps: list[tuple[int, int, int]] = []
     for w in (980, 1180, 900):

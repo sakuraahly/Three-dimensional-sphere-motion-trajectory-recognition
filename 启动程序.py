@@ -343,33 +343,61 @@ class Launcher(tk.Tk):
         return box
 
     # ---------- 参数行的小工具 ----------
-    def _param_entry(self, parent, row: int, label: str, value: str,
-                     hint: str = "", **kw) -> ttk.Entry:
-        """一行参数：第一行 `标签 [输入框]`，第二行说明（换行）。
+    #
+    # ## 行号由**辅助函数自己分配**，调用方不再手算（2026-10-14 修）
+    #
+    # 原来每个 `_param_entry(parent, row, ...)` 要调用方自己给行号，而内部占
+    # `row*2` 与 `row*2+1` **两行**。结果是：参数行传 1（占 2、3 行），
+    # 下一个传 2（占 4、5 行），而手工 `.grid(row=3)` 的复选框正好落在
+    # **被占的行上** —— 文字与输入框**互相盖住**，正是界面上看到的
+    # "高级设置里都是被遮挡的文字"。
+    #
+    # 手算行号本身就是错的做法：加了/去掉一行就要重排所有编号，
+    # 迟早再撞一次。改成每个 parent 维护一个游标，**谁先放谁占下一行**。
+    def _next_row(self, parent) -> int:
+        """给 parent 分配下一个空行（每次调用 +1）。"""
+        row = getattr(parent, "_next_row", 0)
+        setattr(parent, "_next_row", row + 1)
+        return row
 
-        **为什么不把说明放在右边**：那一列会按说明文字的自然宽度撑开整张卡片
-        （实测某条说明单独就要 567 px）。放在下面并限宽，宽度就与说明长度无关。
+    def _hint(self, parent, text: str, *, indent: int = 0) -> None:
+        """一行说明文字（跨列、限宽换行）。"""
+        lab = ttk.Label(parent, text=text, style="Hint.TLabel",
+                        wraplength=PARAM_HINT_WRAP)
+        lab.grid(row=self._next_row(parent), column=indent, columnspan=4,
+                 sticky="w", pady=(0, 4))
+        self._wrapped.append((lab, "param"))
+
+    def _param_entry(self, parent, label: str, value: str,
+                     hint: str = "", **kw) -> ttk.Entry:
+        """一行参数：`标签 [输入框]` 一行，说明一行。
+
+        **说明放下面而不是右边**：那一列会按说明文字的自然宽度撑开整张卡片
+        （实测某条说明单独就要 567 px）。
         """
-        ttk.Label(parent, text=label).grid(row=row * 2, column=0, sticky="e",
-                                           padx=(0, 6), pady=(4, 0))
-        ent = ttk.Entry(parent, width=kw.pop("width", 8), **kw)
+        row = self._next_row(parent)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
+        ent = ttk.Entry(parent, width=kw.pop("width", 10), **kw)
         ent.insert(0, value)
-        ent.grid(row=row * 2, column=1, sticky="w", pady=(4, 0))
+        ent.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
         if hint:
-            lab = ttk.Label(parent, text=hint, style="Hint.TLabel",
-                            wraplength=PARAM_HINT_WRAP)
-            lab.grid(row=row * 2 + 1, column=1, columnspan=4, sticky="w",
-                     pady=(0, 2))
-            self._wrapped.append((lab, "param"))
+            self._hint(parent, hint)
         return ent
 
-    def _param_path(self, parent, row: int, label: str, hint: str,
-                    is_dir: bool) -> ttk.Entry:
-        """路径参数：`标签 [输入框] [选择…]` + 第二行说明。留空 = 不要。"""
-        ttk.Label(parent, text=label).grid(row=row * 2, column=0, sticky="e",
-                                           padx=(0, 6), pady=(4, 0))
-        ent = ttk.Entry(parent, width=30)
-        ent.grid(row=row * 2, column=1, columnspan=2, sticky="w", pady=(4, 0))
+    def _param_check(self, parent, label: str, var, hint: str = "") -> None:
+        """一行勾选项 + 说明。"""
+        row = self._next_row(parent)
+        ttk.Checkbutton(parent, text=label, variable=var).grid(
+            row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        if hint:
+            self._hint(parent, hint)
+
+    def _param_path(self, parent, label: str, hint: str, is_dir: bool) -> ttk.Entry:
+        """路径参数：`[输入框] [选择…]` 一行 + 说明一行。留空 = 不要。"""
+        row = self._next_row(parent)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
+        ent = ttk.Entry(parent, width=34)
+        ent.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(4, 0))
 
         def pick() -> None:
             got = (filedialog.askdirectory(title=label) if is_dir
@@ -379,13 +407,9 @@ class Launcher(tk.Tk):
                 ent.insert(0, got)
 
         ttk.Button(parent, text="选择…", command=pick, width=6).grid(
-            row=row * 2, column=3, sticky="w", padx=(6, 0), pady=(4, 0))
+            row=row, column=3, sticky="w", padx=(6, 0), pady=(4, 0))
         if hint:
-            lab = ttk.Label(parent, text=hint, style="Hint.TLabel",
-                            wraplength=PARAM_HINT_WRAP)
-            lab.grid(row=row * 2 + 1, column=1, columnspan=4, sticky="w",
-                     pady=(0, 2))
-            self._wrapped.append((lab, "param"))
+            self._hint(parent, hint)
         return ent
 
     def _calib_params(self) -> ttk.Frame:
@@ -404,67 +428,68 @@ class Launcher(tk.Tk):
         nb.add(adv, text="  高级设置  ")
 
         # ---- 基本 ----
-        ttk.Label(basic, text="① 收多少对（越多越准，25 对约需举板几分钟）",
-                  style="Hint.TLabel").grid(row=0, column=0, columnspan=7,
-                                            sticky="w", pady=(0, 4))
+        #
+        # 分组标题也走 `_hint()`：**行号统一由游标分配**，一处手算都没有。
+        self._hint(basic, "① 收多少对（越多越准，25 对约需举板几分钟）")
         self.calib_target = self._param_entry(
-            basic, 1, "目标对数", "25", "收够就自动开始标定（正式档 25）")
+            basic, "目标对数", "25", "收够就自动开始标定（默认 25 = 正式档）")
         self.calib_minpairs = self._param_entry(
-            basic, 2, "最少对数", "10", "少于这么多不做标定；剔除离群后不足会直接拒绝")
+            basic, "最少对数", "10", "少于这么多不做标定；剔除离群后不足会直接拒绝")
 
-        ttk.Label(basic, text="② 标定板（必须和手上那张纸完全一致）",
-                  style="Hint.TLabel").grid(row=3, column=0, columnspan=7,
-                                            sticky="w", pady=(10, 4))
+        self._hint(basic, "② 标定板（必须和手上那张纸完全一致）")
         self.calib_cols = self._param_entry(
-            basic, 4, "内角点·列", "8", "**内角点**数，不是方格数：8×5 内角点 = 9×6 方格")
-        self.calib_rows = self._param_entry(basic, 5, "内角点·行", "5")
+            basic, "内角点·列", "8", "**内角点**数，不是方格数：8×5 内角点 = 9×6 方格")
+        self.calib_rows = self._param_entry(basic, "内角点·行", "5")
         self.calib_square = self._param_entry(
-            basic, 6, "方格边长 mm", "25", "★ 必须用尺子量实际边长，别信打印设置")
+            basic, "方格边长 mm", "25", "★ 必须用尺子量实际边长，别信打印设置")
 
-        ttk.Label(basic, text="③ 两路采集（左右必须一致）", style="Hint.TLabel").grid(
-            row=7, column=0, columnspan=7, sticky="w", pady=(10, 4))
-        ttk.Label(basic, text="分辨率").grid(row=8, column=0, sticky="e", padx=(0, 6))
+        self._hint(basic, "③ 两路采集（左右必须一致）")
+        # 分辨率与帧率放在**同一行**：`标签 [框] 标签 [框]`。
+        # ⚠️ 第一版把它们放在 column 1 与 column 3、间距给 16 px，结果
+        # "帧率"二字正好压在 60 那个框上（渲染布局图时看得出来）。
+        # 现在帧率跟在分辨率**紧后面**，列号连续，不再靠间距硬撑。
+        row = self._next_row(basic)
+        ttk.Label(basic, text="分辨率").grid(row=row, column=0, sticky="w",
+                                            pady=(4, 0))
         self.calib_res = ttk.Combobox(basic, values=RESOLUTIONS, width=10,
                                       state="readonly")
         self.calib_res.set("1920x1080")
-        self.calib_res.grid(row=8, column=1, sticky="w", pady=3)
-        ttk.Label(basic, text="帧率").grid(row=8, column=2, sticky="e",
-                                          padx=(16, 6))
+        self.calib_res.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Label(basic, text="帧率").grid(row=row, column=2, sticky="e",
+                                          padx=(24, 6), pady=(4, 0))
         self.calib_fps = ttk.Entry(basic, width=6)
         self.calib_fps.insert(0, "60")
-        self.calib_fps.grid(row=8, column=3, sticky="w", pady=3)
-        ttk.Label(basic, text="（两台相机必须同分辨率、同后端）",
-                  style="Hint.TLabel").grid(row=8, column=4, columnspan=3,
-                                            sticky="w", padx=(10, 0))
+        self.calib_fps.grid(row=row, column=3, sticky="w", pady=(4, 0))
+        self._hint(basic, "两台相机必须同分辨率、同后端，否则一对有效图像都收不到")
 
         # ---- 高级 ----
-        ttk.Label(adv, text="这几项**都是拿精度换成功率**，不确定就别动",
-                  style="Hint.TLabel").grid(row=0, column=0, columnspan=7,
-                                            sticky="w", pady=(0, 4))
+        self._hint(adv, "这几项**都是拿精度换成功率**，不确定就别动")
+        # ⚠️ **默认值直接填进输入框**（用户要求）。原来这些框是**空的**，
+        # 只在说明里写"留空=默认 3" —— 那等于让用户自己去记默认值是多少，
+        # 而且"空"与"默认"在界面上分不出来。现在填上真实默认值，
+        # 说明改成"清空 = 不启用这一项"（因为这些参数是**不传就不启用**的）。
         self.calib_stationary = self._param_entry(
-            adv, 1, "停稳上限 px", "", "留空=默认 3。这条**同时替代左右同步**，"
-                                       "调大到 10 以上会让两路拍到不同位姿、R/T 系统性偏")
+            adv, "停稳上限 px", "3", "清空 = 用程序内置默认；这条**同时替代左右同步**，"
+                                     "调大到 10 以上会让两路拍到不同位姿、R/T 系统性偏")
         self.calib_sharp = self._param_entry(
-            adv, 2, "清晰度下限", "", "留空=默认 55（Laplacian 方差）。调低会收进更糊的帧")
+            adv, "清晰度下限", "55", "清空 = 用程序内置默认（Laplacian 方差）。"
+                                     "调低会收进更糊的帧")
         self.calib_relaxed = tk.BooleanVar(value=False)
-        ttk.Checkbutton(adv, text="放宽模式（手持拍摄：一次放松 6 条门限）",
-                        variable=self.calib_relaxed).grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
-        ttk.Label(adv, text="用完必须复检极线误差；不达标请处理光照/支撑后关掉它重标",
-                  style="Hint.TLabel").grid(row=4, column=0, columnspan=7,
-                                            sticky="w", pady=(0, 6))
+        self._param_check(adv, "放宽模式（手持拍摄：一次放松 6 条门限）",
+                          self.calib_relaxed,
+                          "用完必须复检极线误差；不达标请处理光照/支撑后关掉它重标")
 
-        ttk.Label(adv, text="④ 核对与留证（**强烈建议都填**）",
-                  style="Hint.TLabel").grid(row=5, column=0, columnspan=7,
-                                            sticky="w", pady=(6, 4))
+        self._hint(adv, "④ 核对与留证（**强烈建议都填**）")
+        # 基线留空是**有意的**：程序不知道你的装置中心距，编不出来。
+        # 说明里必须讲清"不填 = 这道护栏关着"，而不是让人以为没差。
         self.calib_baseline = self._param_entry(
-            adv, 6, "预期基线 mm", "", "★ 两镜头中心距。**填了才会核对基线** ——"
-                                       "不填这道护栏就是关着的")
+            adv, "预期基线 mm", "", "★ 两镜头中心距。**只有填了才会核对基线** ——"
+                                    "不填这道护栏就是关着的（程序无法替你猜这个值）")
         self.calib_savepairs = self._param_path(
-            adv, 7, "存图像对", "存下来才能离线复查/重标（出问题时唯一能回答「哪一对错了」）",
+            adv, "存图像对", "存下来才能离线复查/重标（出问题时唯一能回答「哪一对错了」）",
             is_dir=True)
         self.calib_report = self._param_path(
-            adv, 8, "验证图", "标定后出一张可视化验证图", is_dir=False)
+            adv, "验证图", "标定后出一张可视化验证图", is_dir=False)
         return nb
 
     # ---------- 第 1 步：标定 ----------
@@ -737,7 +762,14 @@ class Launcher(tk.Tk):
 
     def _read_opt_float(self, entry: ttk.Entry, label: str,
                         lo: float, hi: float) -> tuple[float | None, bool]:
-        """读一个**可留空**的浮点。返回 (值, 是否合法)；空 = (None, True)。"""
+        """读一个**可留空**的浮点。返回 (值, 是否合法)；空 = (None, True) = 不传。
+
+        ⚠️ **2026-10-14 起这些框默认不再是空的**（用户要求填上默认值），
+        所以"留空"从"常态"变成了"用户主动清掉"。语义仍然是**空 = 不传该参数**
+        （`calibrate_stereo.py` 会用它自己的默认值）。填上的默认值与脚本默认值**相同**，
+        因此"不改动就走"的行为与改动前完全一致 —— `selftest_launcher_params.py`
+        会断言这一点（面板默认值 == 脚本默认值）。
+        """
         raw = entry.get().strip()
         if not raw:
             return None, True
