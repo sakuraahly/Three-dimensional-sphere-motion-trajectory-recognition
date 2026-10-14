@@ -61,12 +61,36 @@ class DetectorConfig:
         "color"   HSV 颜色分割 + 轮廓圆度筛选（最快，需要球与背景颜色可分）
         "hough"   霍夫圆变换（不依赖颜色，对光照和虚焦较敏感）
         "motion"  背景建模差分（仅适合摄像头固定不动）
-        "fusion"  上面几种投票融合（推荐默认，鲁棒性最好）
+        "fusion"  上面几种投票融合（最鲁棒，但**最慢**：见下）
         "yolo"    YOLO 目标检测（可选依赖，需 pip install ultralytics）
         "yolo_sam" YOLO 给框 + SAM 精细分割出像素级边缘（可选依赖）
+
+    ## 默认为什么是 `color` 而不是 `fusion`（2026-10-14 改）
+
+    同一进程内**交替**实测（1920x1080，合成场景；交替是为了避免
+    "先测的那个被后测的拖慢"这种假象）：
+
+        color   18.3 ms/帧  ->  54.6 fps
+        fusion 120.6 ms/帧  ->   8.3 fps
+        color   18.4 ms/帧  ->  54.2 fps   （重复一次，稳定）
+        fusion 117.6 ms/帧  ->   8.5 fps
+
+    也就是 **6.5 倍**。`fusion` 要把 `color` + `hough` + `motion` **依次跑完**，
+    而全都在**原始分辨率**上（检测器不做降采样），于是单帧时间约等于三者之和；
+    单看 `hough` 一个就吃掉约 80 ms。
+
+    8~9 fps 在实时跟踪里是**不能用**的（球一帧就移动很远，预测完全跟不上），
+    而用户要的是"看得见球在动"。所以默认改成 `color`：**约 54 fps**，
+    颜色是最直接的线索，而本项目跟踪的就是一个**颜色已知**的球。
+
+    代价（要说清，不能只讲好处）：`color` 单独用比 `fusion` 更容易被
+    **同色的其他东西**骗到。若现场有同色干扰物，三种补救按代价从低到高：
+      ① 用 `--method fusion` 换回鲁棒性，接受 8 fps；
+      ② 调 `min_score` / `color_*` 门限把误检压掉（仍是 54 fps）；
+      ③ 用 `--preset` 选更贴合的颜色预设。
     """
 
-    method: str = "fusion"
+    method: str = "color"
     # 融合时启用的子检测器
     fusion_members: list[str] = field(default_factory=lambda: ["color", "hough", "motion"])
 

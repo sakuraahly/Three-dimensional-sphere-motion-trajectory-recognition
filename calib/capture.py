@@ -152,6 +152,51 @@ class AutoPairCollector:
         # 本帧的粗检结果，供界面直接画框（避免重复检测 —— 那是主要的卡顿来源）
         self.last_obs: tuple[BoardObservation | None, BoardObservation | None] = (None, None)
         self.last_accepted = False
+        # ---- 板占画面比例的历史（给"实时提示"和"判定建议"用）----
+        #
+        # 为什么要一直记：`min_area_ratio` 的拒收信息里**本来就有**这个数字
+        # （"左图棋盘太小(1.2%)"），但它只出现在**被拒**的那一刻，
+        # 而且只进 `rejected` 计数。结果是用户收完 25 对才从汇总里看到
+        # "6.8% 太小" —— 那时板已经收起来了，白举一场。
+        #
+        # 实测那次标定：**板只占画面 1.2%**，角点定位精度直接受影响，
+        # RMS 因此偏高（0.91 px vs ok 门限 0.80）。而 1.2% 这个数字
+        # 全程都算得出来，却**没有任何出口** —— 这是"没有出口的字段"的又一個实例。
+        self.area_seen: list[float] = []            # 每次算出的比例（各取左右较小者）
+        self.frames_with_board = 0                  # 至少一路看到棋盘的帧数
+
+    # ------------------------------------------------------------------
+    @property
+    def area_ratio_median(self) -> float:
+        """板占画面的中位比例（没有样本时返回 nan）。"""
+        if not self.area_seen:
+            return float("nan")
+        return float(np.median(self.area_seen))
+
+    @property
+    def area_ratio_max(self) -> float:
+        """见过的最大的板占比例 —— 用户"最靠近"到什么程度。"""
+        return float(max(self.area_seen)) if self.area_seen else float("nan")
+
+    def area_hint(self) -> str:
+        """**实时**建议：板该离多近。
+
+        `min_area_ratio` 是 1.2%，但那是"最远能收"的**下限**。
+        实测表明卡在下限（1.2%）会让 RMS 明显偏高 —— 因为角点像素少、
+        定位精度低。所以真正的建议是**靠近到 10% 以上**。
+        """
+        med = self.area_ratio_median
+        if not np.isfinite(med):
+            return "还没测到标定板"
+        pct = med * 100
+        if pct < 3.0:
+            return (f"板只占画面 {pct:.1f}% —— **太远了**，"
+                    f"请靠近到 10% 以上（角点像素越多，标定越准）")
+        if pct < 8.0:
+            return f"板占画面 {pct:.1f}% —— 建议再靠近些（目标 10%~30%）"
+        if pct > 60.0:
+            return f"板占画面 {pct:.1f}% —— 有点太近，边角可能出画"
+        return f"板占画面 {pct:.1f}% —— 距离合适"
 
     # ------------------------------------------------------------------
     @property
@@ -171,6 +216,8 @@ class AutoPairCollector:
         self._prev_h = {"left": None, "right": None}
         self._region_count.clear()
         self.rejected.clear()
+        self.area_seen.clear()
+        self.frames_with_board = 0
         self.last_obs = (None, None)
         self.last_accepted = False
 
@@ -216,7 +263,15 @@ class AutoPairCollector:
         self.last_obs = (obs_l, obs_r)
         self.last_accepted = False
 
-        # 0) **角点出身必须两路一致**
+        # 这里**不是**一条门限，只是记录 —— 所以编号单独用 ⓿，
+        # 免得后面 1)~N) 的门限序号被搅乱。
+        #    取左右**较小**者：双目要两路都够大才有意义。
+        _areas = [o.area_ratio for o in (obs_l, obs_r) if o.found]
+        if _areas:
+            self.area_seen.append(min(_areas))
+            self.frames_with_board += 1
+
+        # 1) **角点出身必须两路一致**
         #    经典与 SB 的角点顺序整体反序（实测直接对应 RMS 323.112 px、整份反序
         #    0.020 px），单目标定免疫、双目标定不免疫。所以"两路出身不同"这一帧
         #    必须当场丢掉，而不是留到标定结果里去猜。
@@ -226,7 +281,7 @@ class AutoPairCollector:
                 f"两路角点出身不同（左 {obs_l.detector} / 右 {obs_r.detector}）"
                 f"：顺序相反，标定会解出垃圾 R/T")
 
-        # 1) 两路都要检测到
+        # 2) 两路都要检测到
         #    这里**必须说清是哪一路**没找到：两路画面质量差很多时（比如一路蒙雾、
         #    一路正常），只说"两路未同时检测到"会让人以为是标定板的问题，
         #    在窗口前反复调整却查不到真正的原因。顺手给一句画面会诊。
@@ -414,6 +469,10 @@ class AutoPairCollector:
         """
         lines = [f"已收 {self.count}/{self.cfg.target_pairs}"
                  f"   已看 {self.frames} 帧   已拒 {self.reject_total}"]
+        # **实时距离提示**（2026-10-14 加）
+        # 这是"用户最喜欢的一条信息"：他站在相机前面举着板，需要知道"该不该再近点"。
+        # 原来这个判断只能等收完 25 对、从拒收汇总里反推出来 —— 那时板已经收起来了。
+        lines.append(self.area_hint())
         lines.append("本帧: " + (self.last_reason or "-"))
         if self.rejected:
             total = max(self.reject_total, 1)

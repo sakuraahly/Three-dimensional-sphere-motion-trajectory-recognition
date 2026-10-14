@@ -66,10 +66,10 @@ RANSAC 的随机性 —— `cv2.setRNGSeed()` **管不住它**（已实测）。
 
 from __future__ import annotations
 
+import copy
 import re
 import sys
 from pathlib import Path
-
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
     ROOT = ROOT.parent
@@ -373,15 +373,162 @@ def test_baseline_anchor_is_optional_and_therefore_silent() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def _synth_views(distance_mm: float, n: int = 12, noise_px: float = 0.15):
+    """按**真实相机模型**造一对视图：一块 8x5 / 25mm 的板放在 distance_mm 处。
+
+    ## 为什么不能用"物体点乘个系数"糊弄
+
+    本仓储的 `BoardSpec.object_points()` 返回的单位是**米**（x 范围 0~0.175），
+    我第一版临时脚本把它当毫米、又乘了个"距离系数"，于是板被放在
+    700 **米**外 —— 解出来的基线是 1e6 mm 的垃圾，而看起来"代码坏了"。
+    **是测试数据错，不是被测代码错。** 所以这里老老实实做投影。
+    """
+    w, h = 1920, 1080
+    K = np.array([[1400.0, 0, w / 2], [0, 1400.0, h / 2], [0, 0, 1]])
+    zero = np.zeros(5)
+    od = np.zeros(3)
+    base = SPEC.object_points()
+    t_r = np.array([-65.0, 0.0, 0.0]) / 1000.0        # 右相机沿 +X 平移一个基线
+    rng = np.random.default_rng(0)
+    out1, out2 = [], []
+    for k in range(n):
+        ax, ay, az = 0.28 * np.sin(k * 1.1), 0.30 * np.cos(k * 0.9), 0.10 * np.sin(k * 0.5)
+        Rx = np.array([[1, 0, 0], [0, np.cos(ax), -np.sin(ax)], [0, np.sin(ax), np.cos(ax)]])
+        Ry = np.array([[np.cos(ay), 0, np.sin(ay)], [0, 1, 0], [-np.sin(ay), 0, np.cos(ay)]])
+        Rz = np.array([[np.cos(az), -np.sin(az), 0], [np.sin(az), np.cos(az), 0], [0, 0, 1]])
+        R = Rz @ Ry @ Rx
+        cx = ((k % 4) - 1.5) * 0.25
+        cy = (((k // 4) % 3) - 1.0) * 0.20
+        t = np.array([cx, cy, distance_mm / 1000.0])
+        p_l = (R @ base.T).T + t
+        p_r = (p_l - t_r.reshape(1, 3))                  # 右相机只在 X 上平移
+        i1, _ = cv2.projectPoints(p_l, od, od, K, zero)
+        i2, _ = cv2.projectPoints(p_r, od, od, K, zero)
+        out1.append(i1 + rng.normal(0, noise_px, i1.shape))
+        out2.append(i2 + rng.normal(0, noise_px, i2.shape))
+    return out1, out2
+
+
+def test_board_area_and_tiered_verdict() -> bool:
+    """第 5 节：板占画面比例 + **分级**判定（2026-10-14 加）。
+
+    ## 这一节守的是什么
+
+    原来判定是**二值**：`rms <= ok_rms and epipolar <= ok_epipolar` 才保存，
+    否则一句"不可用 —— 请重拍"。实测一次真机标定（基线 67.28 mm vs 实际 65，
+    **只差 3.5%**，基线核对是通过的）因为 RMS 0.9143 > ok 门限 0.80 被整体否掉、
+    不保存。用户的反应是"我不是很能接受" —— 他不接受是对的：
+
+    * `ok_rms` 本来就是"够用"的意思，不是"超过就废"；
+    * 二值判定丢掉了最有用的信息 —— **差在哪、下次怎么改**。
+
+    同时，那次标定的真实原因是**板只占画面 1.2%**（放太远，角点像素少、
+    定位精度低），而这个数字**全程都算得出来却没有出口**，报告里一个字都没提。
+
+    所以本节钉四件事：
+    1. 板占比例**算得对**（对着 1200mm → 约 1%，与你那次日志里的 1.2% 同量级）；
+    2. 板放远 -> 报告里出现"板离得太远 + 靠近到 10%~30%"这条**可执行**建议；
+    3. `ok_rms < rms <= 某个程度` -> 判为**勉强可用且仍然保存**（不再一票否决）；
+    4. **真正物理错**（基线对不上）-> 仍然不可用并拒绝保存（安全边界不放宽）。
+    """
+    print("----- 5. 板占画面比例 + 分级判定 -----")
+    checks: list[tuple[str, bool]] = []
+
+    far_l, far_r = _synth_views(1200.0)
+    near_l, near_r = _synth_views(450.0)
+    cfg = CalibConfig(expected_baseline_mm=65.0)
+
+    res_far = calibrate_stereo(SPEC.object_points(), far_l, far_r, (1920, 1080), cfg, SPEC)
+    res_near = calibrate_stereo(SPEC.object_points(), near_l, near_r, (1920, 1080), cfg, SPEC)
+
+    print(f"  板放 1200mm: 占画面 {res_far.board_area * 100:5.2f}%  "
+          f"基线 {res_far.baseline_mm:6.2f}  分级={res_far.grade}")
+    print(f"  板放  450mm: 占画面 {res_near.board_area * 100:5.2f}%  "
+          f"基线 {res_near.baseline_mm:6.2f}  分级={res_near.grade}")
+
+    checks.append(("板占比例**算得出来**（不是 nan/0 —— 凸包算法正确）",
+                   np.isfinite(res_far.board_area) and res_far.board_area > 0.0))
+    checks.append(("远的那次比例明显小于近的那次（单调性正确）",
+                   res_far.board_area < res_near.board_area))
+    checks.append(("1200mm 时约 1%（与真机日志里的 1.2% 同量级）",
+                   0.004 < res_far.board_area < 0.03))
+    checks.append(("两路比例都记下来了", np.isfinite(res_far.board_area_l)
+                   and np.isfinite(res_far.board_area_r)))
+
+    rep_far = res_far.report()
+    checks.append(("报告里**出现**板占比例（不再是「没有出口的字段」）",
+                   "板占画面" in rep_far))
+
+    # ---- 建议必须**可执行**，而且不能自相矛盾 ----
+    far_sugg = " ".join(res_far.suggestions)
+    print(f"  远那次的建议 {len(res_far.suggestions)} 条：")
+    for s in res_far.suggestions:
+        print(f"    -> {s[:96]}")
+    checks.append(("报告里给出「靠近到 10%」这类**能照着做**的建议",
+                   "10%~30%" in far_sugg or "靠近" in far_sugg))
+    checks.append(("建议里含**具体数字**（不是「换更多角度」这种空话）",
+                   re.search(r"\d", far_sugg) is not None))
+    # ⚠️ 这里钉的是「**建议与判定是两件事**」：板太远是真的可以更好，与等级无关。
+    # 我第一版把建议整体挂在「没到优秀才给」下面，结果这块 1.12% 的板解出
+    # 「优秀」就**一条建议都没有**了 —— 那是错的。
+    # 真正要避免的自相矛盾只有「建议说太近、结论说不够好」这类**指向相反**的话。
+    checks.append(("板占 1.12% 时**一定**给出「板离得太远」（不受判定等级压制）",
+                   "太远" in far_sugg))
+    checks.append(("近那次的建议里不会同时出现「太近」与「太远」（不自相矛盾）",
+                   not ("太近" in " ".join(res_near.suggestions)
+                        and "太远" in " ".join(res_near.suggestions))))
+    # ---- 分级：唯一「不可用」的理由必须是物理错 ----
+    checks.append(("正常数据判为可用一级（不是「不可用」）",
+                   res_near.grade in ("优秀", "可用", "勉强可用") and res_near.ok))
+    checks.append(("分级字段非空且是四级之一",
+                   res_far.grade in ("优秀", "可用", "勉强可用", "不可用")))
+
+    bad_l, bad_r = _synth_views(700.0)
+    res_bad = calibrate_stereo(SPEC.object_points(), bad_l, bad_r, (1920, 1080),
+                               CalibConfig(expected_baseline_mm=999.0), SPEC)
+    print(f"  基线填 999mm（真值 65）: 分级={res_bad.grade}  ok={res_bad.ok}")
+    checks.append(("**基线对不上** -> 判不可用（安全边界不放宽）",
+                   res_bad.grade == "不可用" and res_bad.ok is False))
+    checks.append(("基线错的建议指向**该核对什么**（方格尺寸/中心距/左右是否反）",
+                   any("方格" in s for s in res_bad.suggestions)))
+
+    # ---- 勉强可用必须**仍然保存**（这正是这次改动的核心）----
+    #
+    # ⚠️ 这一段第一版是**重言式**：我手工改了个副本的 rms 字段，
+    # 然后断言 `res_near.grade != "不可用"` —— 而 res_near 本来就是「优秀」，
+    # 所以恒真，把判定退回二值的变异**照样通过**。已改成真的跑一次：
+    # 抬高投影噪声到 0.60 px，实测得到 RMS 0.825 / 极线 0.882 —— 都过 ok 门限，
+    # 但远没到「物理错」，**正是真机那次的形状**（0.91 / 0.81）。
+    tight_l, tight_r = _synth_views(700.0, noise_px=0.60)
+    res_tight = calibrate_stereo(SPEC.object_points(), tight_l, tight_r,
+                                 (1920, 1080), cfg, SPEC)
+    print(f"  抬高噪声到 0.60 px: RMS {res_tight.rms:.3f}（ok 门限 {cfg.ok_rms}）"
+          f"  极线 {res_tight.epipolar_rms:.3f}（ok 门限 {cfg.ok_epipolar}）"
+          f"  分级={res_tight.grade}  ok={res_tight.ok}")
+    checks.append(("两项都过 ok 门限、但基线没错 -> 判「勉强可用」",
+                   res_tight.rms > cfg.ok_rms
+                   and res_tight.epipolar_rms > cfg.ok_epipolar
+                   and res_tight.grade == "勉强可用"))
+    checks.append(("「勉强可用」**仍然保存**（ok=True）—— 不再一票否决",
+                   res_tight.ok is True))
+    checks.append(("勉强可用时报告里说清差在哪（含倍率数字）",
+                   re.search(r"门限的 [\d.]", res_tight.verdict) is not None))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
-    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚）")
+    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定）")
     print("=" * 70)
     results = []
     for fn in (test_log_summary_is_self_consistent,
                test_mono_ok_but_stereo_explodes,
                test_unusable_result_is_never_saved,
-               test_baseline_anchor_is_optional_and_therefore_silent):
+               test_baseline_anchor_is_optional_and_therefore_silent,
+               test_board_area_and_tiered_verdict):
         results.append(fn())
         print()
     ok = all(results)

@@ -230,6 +230,60 @@ def test_wiring_is_functional() -> bool:
     return all(p for _n, p in checks)
 
 
+def test_default_method_is_the_fast_one() -> bool:
+    """默认检测方法必须是**跑得动**的那个（2026-10-14 改）。
+
+    ## 为什么这条要有护栏
+
+    默认曾经是 `fusion`，而 `fusion` 会把 `color` + `hough` + `motion`
+    **依次跑完**、且全在原始分辨率上（检测器不做降采样），于是单帧时间
+    约等于三者之和。实测 1920x1080：
+
+        color    17.7 ms  ->  56 fps
+        hough    79.9 ms  ->  12.5 fps
+        fusion  109.2 ms  ->   9.2 fps   ← 曾是默认
+
+    **9 fps 的实时跟踪是不能用的**（球一帧就移动很远），而"打开就是这样"，
+    用户没有对照物，只会觉得"这软件很卡"。用户的原话是"帧率很低，十分不好用"。
+
+    这条断言把"默认必须是快的那个"钉住：谁把它改回 `fusion`，
+    这个测试就红，并且红的地方直接带着 fps 对比。
+    """
+    print("----- 默认检测方法：必须是跑得动的那个 -----")
+    checks: list[tuple[str, bool]] = []
+
+    default = DetectorConfig().method
+    # 实测单帧耗时（同机、1080p、合成场景）—— 数字写在这里是为了让红的时候
+    # 一眼看到代价，而不是去翻历史。
+    measured_ms = {"color": 18.4, "motion": 18.5, "hough": 79.9, "fusion": 118.0}
+    print(f"  DetectorConfig().method = {default!r}"
+          f"（实测 {measured_ms.get(default, '?')} ms/帧）")
+
+    checks.append(("默认方法固定在 **color**（约 56 fps 档）", default == "color"))
+    checks.append((f"默认方法的实测耗时 <= 25 ms（实际 "
+                   f"{measured_ms.get(default, float('nan'))} ms）",
+                   measured_ms.get(default, 1e9) <= 25.0))
+    checks.append(("**fusion 不再是默认**（它要 109 ms/帧 = 9 fps）",
+                   default != "fusion"))
+    # 融合成员表本身没变（改默认不该顺手改融合的内容）
+    members = DetectorConfig().fusion_members
+    checks.append(("fusion_members 未被顺手改掉（仍是 color/hough/motion）",
+                   members == ["color", "hough", "motion"]))
+    # fusion 必须仍然存在且能选 —— 不许为了"快"把它删掉
+    from sphere_tracker.detectors import build_detector          # noqa: PLC0415
+    try:
+        build_detector(dataclasses.replace(DetectorConfig(), method="fusion"))
+        fusion_ok = True
+    except Exception as exc:                                     # noqa: BLE001
+        print(f"    构造 fusion 失败：{type(exc).__name__}: {exc}")
+        fusion_ok = False
+    checks.append(("fusion 仍然能构造（只是要显式选，不是被删了）", fusion_ok))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_camera_index_backend_is_explicit() -> bool:
     """用编号开相机的地方，必须**显式**给出后端。
 
@@ -298,7 +352,9 @@ def main() -> int:
     print()
     d = test_camera_index_backend_is_explicit()
     print()
-    ok = a and b and c and d
+    e = test_default_method_is_the_fast_one()
+    print()
+    ok = a and b and c and d and e
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 
