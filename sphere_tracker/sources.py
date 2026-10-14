@@ -261,12 +261,35 @@ class CameraSource(VideoSource):
                     self._cached_hit = True
 
         errors: list[str] = []
+        # ---- 打开过程必须**可见**（2026-10-14 修的真缺陷）----
+        #
+        # 下面这个双层循环是 `for 后端 × for 分辨率`，而 MSMF 实测**单次打开要 22.9 秒**
+        # （DSHOW 0.7 秒）。全程一个字都不打印 —— 用户看到的就是"卡死了"，
+        # 于是去点关闭，或者以为程序坏了。
+        #
+        # **"慢"和"卡死"在用户眼里是同一件事，除非程序说出来它在干什么。**
+        # 所以每一步都报：现在试哪个后端、哪个分辨率、已经等了多久。
+        # 用的是**同一个计时基准**，这样"已等 Xs"是可比的。
+        t_start = time.perf_counter()
+
+        def _log(msg: str) -> None:
+            took = time.perf_counter() - t_start
+            # 刚开始那几毫秒报"已等 0.0s"是噪音；只在真的等了一会儿之后才报时长
+            suffix = f"（已等 {took:.1f}s）" if took >= 1.0 else ""
+            print(f"[相机 {index}] {msg}{suffix}", flush=True)
+
+        if self.cap is None and len(candidates) * len(res_candidates) > 1:
+            _log(f"开始逐个尝试打开：{len(candidates)} 个后端 × "
+                 f"{len(res_candidates)} 个分辨率。"
+                 f"**MSMF 后端单次可能要 20 秒以上，请耐心等**")
         for name, api in ([] if self.cap is not None else candidates):
             for rw, rh in res_candidates:
+                _log(f"试 {name} @ {rw or '原始'}x{rh or '原始'}…")
                 cap = cv2.VideoCapture(index, api)
                 if not cap.isOpened():
                     cap.release()
                     errors.append(f"{name}: 打不开")
+                    _log(f"{name} 整个后端打不开，换下一个")
                     break                      # 该后端整体不可用，换下一个后端
                 if fourcc:
                     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*fourcc))
@@ -289,19 +312,20 @@ class CameraSource(VideoSource):
                     self.cap = cap
                     self.backend_name = name
                     self.resolution_fallback = bool(rw and (rw, rh) != (width, height))
+                    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    _log(f"✔ {name} @ {rw or '原始'}x{rh or '原始'} 打开成功"
+                         f"（实际 {got_w}x{got_h}）")
                     if self.resolution_fallback:
-                        got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         print(
                             f"[提示] 摄像头 {index} 不支持 {width}x{height}（该分辨率下输出全黑），"
                             f"已自动降到 {got_w}x{got_h}。"
                         )
                     break
                 cap.release()
-                errors.append(
-                    f"{name} @ {rw or '默认'}x{rh or ''}: "
-                    + ("读不到画面" if frame is None else "输出全黑（分辨率不支持）")
-                )
+                why = "读不到画面" if frame is None else "输出全黑（分辨率不支持）"
+                errors.append(f"{name} @ {rw or '默认'}x{rh or ''}: {why}")
+                _log(f"✘ {name} @ {rw or '原始'}x{rh or '原始'}：{why}")
             if self.cap is not None:
                 break
         if self.cap is None:

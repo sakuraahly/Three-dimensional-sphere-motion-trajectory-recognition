@@ -103,16 +103,22 @@ class Task:
       相机仍被占着，下一次运行打不开相机，而用户不知道为什么。
 
     记下 pid / 启动时刻 / 退出码，才能回答"它在跑吗、跑了多久、怎么死的"。
+
+    **`log_path`：每个任务都把完整输出落盘一份。** 日志区是给眼睛看的，
+    会被下一条任务冲掉；而"上一次到底报了什么"恰恰是出问题时唯一能查的东西
+    （这次定位标定问题就是靠 `outputs/logs/calibrate_*.log`）。
     """
 
     tid: int
     title: str
     cmd: list[str]
     proc: subprocess.Popen
+    log_path: Path | None = None
     started: float = field(default_factory=time.monotonic)
     ended: float | None = None
     exit_code: int | None = None
     stop_reason: str = ""
+    lines: int = 0
 
     @property
     def running(self) -> bool:
@@ -1017,14 +1023,56 @@ class Launcher(tk.Tk):
         """起一个新任务并登记。**允许多个同时跑**（相机冲突由用户自己负责）。"""
         self._tid += 1
         proc = self._spawn(cmd)
-        task = Task(tid=self._tid, title=title, cmd=list(cmd), proc=proc)
+        log_path = self._task_log_path(self._tid, title)
+        task = Task(tid=self._tid, title=title, cmd=list(cmd), proc=proc,
+                    log_path=log_path)
         self.tasks.append(task)
         self._sel_tid = task.tid
         self._append(f"\n===== [{task.tid}] {title} =====\n> {task.cmdline()}")
         self._append(f"[任务 {task.tid}] 已启动，PID {proc.pid}（可在「任务」里中断）")
+        if log_path:
+            self._append(f"[任务 {task.tid}] 完整日志：{log_path}")
+            try:
+                log_path.write_text(
+                    f"任务 {task.tid}：{title}\n"
+                    f"启动：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"PID ：{proc.pid}\n"
+                    f"命令：{task.cmdline()}\n"
+                    + "=" * 70 + "\n", encoding="utf-8")
+            except OSError as exc:
+                self._append(f"[任务 {task.tid}] ⚠ 日志文件写不了：{exc}")
+                task.log_path = None
         threading.Thread(target=self._reader, args=(task,), daemon=True).start()
         self.after(200, self._refresh_tasks)
         return task
+
+    @staticmethod
+    def _task_log_path(tid: int, title: str) -> Path | None:
+        """给每个任务一个日志文件：`outputs/logs/task<序号>_<时间>_<标题>.log`。
+
+        **为什么要按任务分开**：同一个 `outputs/logs/` 里已经有各程序自己的日志
+        （`calibrate_*.log` 等），但启动器这一层的输出（谁起的、什么时候、
+        被谁停的、退出码多少）只有这里才有。分开写才追得下去。
+        """
+        try:
+            d = ROOT / "outputs" / "logs"
+            d.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("_")[:40] or "task"
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            return d / f"task{tid:02d}_{stamp}_{safe}.log"
+        except OSError:
+            return None
+
+    def _task_log(self, task: Task, text: str) -> None:
+        """往任务的日志文件追加一行（失败不打断任务本身）。"""
+        if task.log_path is None:
+            return
+        try:
+            with task.log_path.open("a", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+            task.lines += 1
+        except OSError:
+            task.log_path = None                              # 只报一次，不刷屏
 
     def stop_task(self, task: Task, graceful: bool = True) -> bool:
         """停掉一个任务（含它的子进程树）。返回是否真的下手了。
@@ -1111,14 +1159,20 @@ class Launcher(tk.Tk):
         proc = task.proc
         assert proc.stdout is not None
         for line in proc.stdout:
-            self.log_queue.put(f"[{task.tid}] {line.rstrip()}")
+            body = line.rstrip()
+            self._task_log(task, body)                 # ★ 每行都落盘
+            self.log_queue.put(f"[{task.tid}] {body}")
         proc.wait()
         task.ended = time.monotonic()
         task.exit_code = proc.returncode
         why = f"（{task.stop_reason}）" if task.stop_reason else ""
-        self.log_queue.put(
-            f"[任务 {task.tid} 结束] 返回码 {proc.returncode}{why}，"
-            f"耗时 {task.elapsed():.1f}s")
+        tail = (f"[任务 {task.tid} 结束] 返回码 {proc.returncode}{why}，"
+                f"耗时 {task.elapsed():.1f}s")
+        self._task_log(task, "=" * 70)
+        self._task_log(task, tail)
+        if task.log_path is not None:
+            self._task_log(task, f"日志文件：{task.log_path}")
+        self.log_queue.put(tail)
         self.log_queue.put(None)
 
     def _poll(self) -> None:
@@ -1176,8 +1230,10 @@ class Launcher(tk.Tk):
             row=2, column=2, sticky="w", padx=(6, 0), pady=2)
         ttk.Button(box, text="查看输出", command=self._show_selected_output).grid(
             row=2, column=3, sticky="w", padx=(6, 0), pady=2)
-        ttk.Button(box, text="清理已结束", command=self._prune_tasks).grid(
+        ttk.Button(box, text="打开日志文件", command=self._open_selected_log).grid(
             row=2, column=4, sticky="w", padx=(6, 0), pady=2)
+        ttk.Button(box, text="清理已结束", command=self._prune_tasks).grid(
+            row=2, column=5, sticky="w", padx=(6, 0), pady=2)
         self.task_hint = ttk.Label(box, text="", style="Hint.TLabel",
                                    wraplength=CARD_HINT_WRAP)
         self.task_hint.grid(row=3, column=0, columnspan=9, sticky="w", pady=(4, 0))
@@ -1257,7 +1313,7 @@ class Launcher(tk.Tk):
         self._refresh_tasks()
 
     def _show_selected_output(self) -> None:
-        """把这个任务的命令行回显到日志区（方便复制）。"""
+        """把这个任务的信息回显到日志区（方便复制）。"""
         t = self._selected_task()
         if t is None:
             messagebox.showinfo("先选一个任务", "在上面的列表里点一行。")
@@ -1268,6 +1324,35 @@ class Launcher(tk.Tk):
                      + (f"（{t.stop_reason}）" if t.stop_reason else ""))
         self._append(f"耗时  : {t.elapsed():.1f}s")
         self._append(f"命令  : {t.cmdline()}")
+        if t.log_path is not None:
+            self._append(f"日志  : {t.log_path}（{t.lines} 行已落盘）")
+
+    def _open_selected_log(self) -> None:
+        """用系统默认程序打开这个任务的日志文件。
+
+        **为什么要有个按钮**：查问题时第一件事就是"上次到底报了什么"，
+        而日志区会被下一条任务冲掉。落盘之后必须让人**点得到**，
+        否则文件存在但没人知道去哪找。
+        """
+        t = self._selected_task()
+        if t is None:
+            messagebox.showinfo("先选一个任务", "在上面的列表里点一行，再点「打开日志文件」。")
+            return
+        if t.log_path is None or not t.log_path.exists():
+            messagebox.showinfo(
+                "还没有日志文件",
+                f"任务 {t.tid} 没有落盘日志（可能是目录不可写）。\n"
+                "界面上的输出仍然在「运行日志」里。")
+            return
+        self._append(f"[任务 {t.tid}] 打开日志：{t.log_path}")
+        try:
+            if os.name == "nt":
+                os.startfile(t.log_path)                      # noqa: S606
+            else:
+                subprocess.Popen(["xdg-open", str(t.log_path)])
+        except Exception as exc:                              # noqa: BLE001
+            messagebox.showinfo("打不开自动打开",
+                                f"日志在：\n{t.log_path}\n\n（{type(exc).__name__}: {exc}）")
 
     def _prune_tasks(self) -> None:
         """清掉已结束的任务行（在跑的绝不动）。"""
