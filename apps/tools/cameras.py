@@ -40,7 +40,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker import camera_registry as cr  # noqa: E402
-from sphere_tracker.sources import CameraSource  # noqa: E402
+from sphere_tracker.sources import (  # noqa: E402
+    CameraSource,
+    quiet_repeated_grab_warnings,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,9 +151,16 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
             if status:
                 print(f"  当前状态：{status}（改选会覆盖它）")
             print(f"  {_KEY_HINT}")
+            # ⚠️ **相机掉线必须能自己退出来**（2026-10-14 修）。
+            # 原来这里 `while True` 里对 `read()` 失败**不做任何处理** ——
+            # 相机被别的程序抢走、或者 USB 掉线之后，循环照转，
+            # 画面冻在最后一帧、按键也没有反馈，用户看到的就是"卡死了"，
+            # 只能去关整个窗口。**这正是"启动器卡死"报告的一个来源。**
+            miss = 0
             while True:
                 ok, frame, _t = src.read()
                 if ok and frame is not None:
+                    miss = 0
                     import cv2
                     cv2.putText(frame, label, (8, 26), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.7, (0, 255, 255), 2, cv2.LINE_AA)
@@ -163,6 +173,16 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
                     except cv2.error:
                         gui_ok = False
                         break
+                else:
+                    miss += 1
+                    if miss == 30:                    # 约 1 秒
+                        print(f"  ⚠ #{index} 读不到画面了…（相机被别的程序抢走 / "
+                              f"USB 掉线？）再等 1 秒，还不行就跳过这台")
+                    if miss >= 60:                    # 约 2 秒
+                        print(f"  ✘ #{index} 连续 2 秒读不到画面，跳过这台相机。")
+                        print(f"     排查：是不是有别的程序（QQ/会议/浏览器）占着它？"
+                              f"拔插一次 USB 往往就好。")
+                        return None
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
                     return ""
@@ -535,6 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    quiet_repeated_grab_warnings()
     p = build_parser()
     args = p.parse_args()
     if not getattr(args, "cmd", None):

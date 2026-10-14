@@ -9,6 +9,7 @@ Windows 上打开摄像头的坑都在这里处理掉了：
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Sequence
@@ -64,6 +65,32 @@ def backend_name(api: int | None) -> str:
         if value == api:
             return name
     return f"backend#{api}"
+
+
+def quiet_repeated_grab_warnings() -> None:
+    """把 OpenCV 那条**每 10 秒刷一次**的抓帧警告压下去。
+
+    ## 为什么必须压
+
+    相机掉线时 MSMF 会反复打印：
+
+        [ WARN:0@48.612] global cap_msmf.cpp:1816 CvCapture_MSMF::grabFrame
+        videoio(MSMF): can't grab frame. Error: -2147483638
+
+    `-2147483638` = `MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED`（设备被别的程序
+    抢走 / USB 掉线）。实测它**每 10 秒一条、无限刷**，把真正有用的信息
+    （收到第几对、为什么拒收）淹掉。用户来问"日志里全是这条"就是这个。
+
+    ## 为什么只压这一条，而不是整体静音
+
+    整体调高 `OPENCV_LOG_LEVEL` 会把**别的**警告一起吞掉 ——
+    而"报错不要吞"是硬规矩。所以按**模块**分别设等级：
+    只把 `videoio` 调到 ERROR（丢弃它自己的 WARN），其余模块保持 WARNING。
+
+    ⚠️ 必须在**任何 `cv2.VideoCapture` 之前**调用（OpenCV 只在初始化时读一次）。
+    """
+    for mod in ("videoio", "videoio_msmf"):
+        os.environ.setdefault(f"OPENCV_LOG_LEVEL_{mod}", "ERROR")
 
 
 @dataclass

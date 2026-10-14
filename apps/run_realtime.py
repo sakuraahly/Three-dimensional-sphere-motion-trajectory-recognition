@@ -43,7 +43,12 @@ from sphere_tracker import camera_registry as cr
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detect import build_detector
 from sphere_tracker.pipeline import SpherePipeline
-from sphere_tracker.sources import INDEX_BACKEND, CameraSource, LatestFrameCamera
+from sphere_tracker.sources import (
+    INDEX_BACKEND,
+    CameraSource,
+    LatestFrameCamera,
+    quiet_repeated_grab_warnings,
+)
 from sphere_tracker.stats import FramePump, Health
 
 WINDOW = "sphere tracker (real-time)"
@@ -117,6 +122,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
 
 
 def main() -> int:
+    quiet_repeated_grab_warnings()
     args = parse_args()
     cfg = build_config(args)
 

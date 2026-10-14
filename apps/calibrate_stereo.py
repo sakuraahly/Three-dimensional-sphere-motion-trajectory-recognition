@@ -119,6 +119,7 @@ def build_report_figure(rig: StereoRig, pairs, spec: BoardSpec, out_path: Path) 
 
 
 def main() -> int:
+    quiet_repeated_grab_warnings()
     ap = argparse.ArgumentParser(description="自动双目标定")
     add_stereo_source_args(ap)
     ap.add_argument("--cols", type=int, default=8, help="棋盘格内角点列数")
@@ -236,13 +237,42 @@ def main() -> int:
         (pairs_dir / "right").mkdir(parents=True, exist_ok=True)
 
     frames = 0
+    # ⚠️ **读不到帧必须能自己收场**（2026-10-14 修的真缺陷）。
+    #
+    # 原来（`if src.is_live: continue`）在相机掉线时会**永远转下去**，
+    # 而且**一个字都不打印** —— 用户看到的就是"标定程序卡死了"，
+    # 只能去关启动器（而关窗口并不会杀掉子进程）。
+    #
+    # 相机掉线的信号很明确（`-2147483638` = MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED，
+    # 实测每 10 秒一次），所以：先报，再等，超时就带着已经收到的对数退出，
+    # 让**已经收下的图像对不白收**。
+    miss = 0
+    miss_reported = False
     try:
         while True:
             ok, left, right = src.read()
             if not ok or left is None or right is None:
-                if src.is_live:
-                    continue
-                break
+                if not src.is_live:
+                    break
+                miss += 1
+                if miss == 30 and not miss_reported:
+                    miss_reported = True
+                    why = ""
+                    health = getattr(src, "health_line", None)
+                    if callable(health):
+                        why = f"（{health()}）"
+                    print(f"\n⚠ 读不到画面了{why}。已收 {collector.count} 对。", flush=True)
+                    print("   常见原因：相机被别的程序占用 / USB 掉线 / 掉电。"
+                          "拔插一次 USB 往往就好。", flush=True)
+                    print("   再等 5 秒；还是不行就保存已收的对并退出。", flush=True)
+                if miss >= 150:                      # 约 5 秒（30fps）
+                    print(f"\n✘ 连续 5 秒读不到画面，停止采集。"
+                          f"已收 {collector.count} 对（目标 {args.target}）。", flush=True)
+                    break
+                time.sleep(0.02)
+                continue
+            miss = 0
+            miss_reported = False
             frames += 1
             if args.max_frames and frames > args.max_frames:
                 break
