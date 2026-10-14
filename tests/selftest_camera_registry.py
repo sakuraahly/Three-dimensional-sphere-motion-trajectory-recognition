@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker.camera_registry import (  # noqa: E402
+    AmbiguousMatch,
     DeviceEntry,
     ProbeResult,
     Registry,
@@ -224,11 +225,36 @@ def test_resolve_priority() -> bool:
     checks.append(("identity 缺失 -> 走端口命中外接 B",
                    r.index == 2 and r.how == "port"))
 
-    r = resolve_role("left",
+    # ⚠️ **这条在 2026-10-14 改了契约**：原来"绑了身份/端口、但对不上"会**按名字兜底**
+    # （`r.how == "name"`）。实测证明那是**危险的猜测**：
+    # 两台同型号相机同名，其中一台换了 USB 口 → 名字兜底任意抓一台 →
+    # 左右可能互换，而且两路分辨率可能不一致（一台 1280x720、一台 1920x1080），
+    # **双目标定直接失去意义，界面上却看不出异常**。
+    #
+    # 新契约：**有身份信息却对不上 = 那台不在线**，必须报错让用户重新确认，
+    # 不许用同名的另一台顶替。
+    try:
+        resolve_role("left",
                      registry_with(left=role(identity="USB\\ZZZ", port="没有这个端口",
                                              name="aoni")),
                      devs, interactive=False)
-    checks.append(("端口也缺失 -> 走名字命中", r.how == "name" and r.index in (1, 2)))
+        checks.append(("绑了身份却对不上 -> **必须拒绝**（不许按名字猜）", False))
+    except RuntimeError as exc:
+        msg = str(exc)
+        checks.append(("绑了身份却对不上 -> 拒绝，并说清期望的身份/端口",
+                       "不在线" in msg and "USB\\ZZZ" in msg))
+        checks.append(("拒绝时把当前设备清单摆出来（让用户能自己判断）",
+                       "aoni webcam A25" in msg and "#1" in msg))
+
+    # 反过来：**从没绑定过身份**的角色只能按名字找；同名多台时必须报歧义
+    # （`sample_devices()` 里 #1 与 #2 同名，所以这里必然歧义）
+    try:
+        r = resolve_role("left", registry_with(left=role(name="aoni")), devs,
+                        interactive=False)
+        checks.append(("只有名字且同名多台 -> **必须报歧义**（不许任选一台）", False))
+    except AmbiguousMatch as exc:
+        checks.append(("只有名字且同名多台 -> 报歧义并列出候选",
+                       "匹配到" in str(exc) and "#1" in str(exc)))
 
     r = resolve_role("left",
                      registry_with(left=role(identity="USB\\Q", index=5)),

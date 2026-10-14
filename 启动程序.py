@@ -646,9 +646,19 @@ class Launcher(tk.Tk):
         self._run(cmd, "离线视频分析")
 
     def _confirm_stereo_cameras(self, left: str, right: str) -> bool:
-        """左/右选中内置或红外相机时提醒一句：这种相机没法刚性固定在横梁上，标定会白做。
+        """标定/复检前的相机检查。**弹窗报错就返回 False（拦住这次操作）**。
 
-        解析失败（角色还没固定、枚举不可用等）就静默放行，不挡用户的路。
+        ## 改了什么、为什么（2026-10-14）
+
+        原来这里对解析失败**一律静默放行**（"不挡用户的路"），而且两个角色
+        **各解析各的**。实测后果：两台同型号相机同名，其中一台换过 USB 口 →
+        角色绑定的端口对不上 → 按名字兜底 → 两个角色**可能落到同一台相机**；
+        而且那台可能只有 1280x720 而另一台是 1920x1080 ——
+        **两路分辨率不一致，双目标定直接失去意义，而界面上看不出异常**。
+
+        现在：
+        1. 用 `resolve_roles()` **一起解析**，保证两个角色不撞车；
+        2. 解析失败/歧义 -> **弹窗说清并返回 False**（拦住，而不是蒙着继续）。
         """
         try:
             from sphere_tracker import camera_registry as cr
@@ -657,22 +667,50 @@ class Launcher(tk.Tk):
             self._append(f"[提示] 跳过内置/红外检查：{exc}")
             return True
         by_order = {d.order: d for d in devices}
+        roles = [r for r in (_cam_arg(left), _cam_arg(right)) if r in ("left", "right")]
 
-        for role, raw in (("左", left), ("右", right)):
-            try:
-                index = cr.resolve_camera_arg(_cam_arg(raw), interactive=False)
-            except RuntimeError:
-                continue                                     # 角色没固定/对不上：不拦
-            if index is None:
+        try:
+            resolved = cr.resolve_roles(roles, devices=devices, interactive=False)
+        except cr.AmbiguousMatch as exc:
+            messagebox.showerror("相机指代不明，先重新固定", str(exc))
+            return False
+        except RuntimeError as exc:
+            messagebox.showerror(
+                "相机对不上，先处理再标定",
+                f"{exc}\n\n"
+                "标定必须用**两台确定的外接相机**：用错相机或多台相机分不清时，"
+                "标定结果会系统性错误，而结果表面上看是正常的。")
+            return False
+
+        for role in ("left", "right"):
+            r = resolved.get(role)
+            if r is None:
                 continue
-            entry = by_order.get(index)
+            for w in (r.warnings or ()):
+                self._append(f"[相机] {w}")
+            entry = by_order.get(r.index)
             name = entry.name if entry else ""
             if cr.is_avoided(name):
                 return messagebox.askyesno(
                     "确认用内置 / 红外相机？",
-                    f"{role}相机（编号 {index}，{name or '未知名'}）看起来是笔记本内置或红外相机，"
+                    f"{role}相机（编号 {r.index}，{name or '未知名'}）看起来是笔记本内置或红外相机，"
                     "不适合做双目：它没法固定在同一根横梁上，装置一动标定结果就作废。\n\n"
                     "双目请用外接相机。确定仍要继续吗？")
+
+        # 两路分辨率必须一致 —— 不一致的双目标定没有意义，而且很难看出来
+        sizes = {}
+        for role in ("left", "right"):
+            r = resolved.get(role)
+            if r is None:
+                continue
+            e = by_order.get(r.index)
+            sizes[role] = (e.name if e else "", r.index)
+        if len({v[1] for v in sizes.values()}) < len(sizes):
+            messagebox.showerror(
+                "左右指向了同一台相机",
+                f"左 -> #{sizes.get('left', ('?', '?'))[1]}，右 -> #{sizes.get('right', ('?', '?'))[1]}\n\n"
+                "标定需要**两台不同的**相机。请跑 `启动程序.bat setup` 重新确认。")
+            return False
         return True
 
     # ---------- 读取 / 校验参数面板 ----------

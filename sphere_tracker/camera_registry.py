@@ -1090,25 +1090,72 @@ def _stdin_is_tty() -> bool:
 
 
 def _match_entry(
-    spec: RoleSpec, devices: list[DeviceEntry]
+    spec: RoleSpec, devices: list[DeviceEntry], *, taken: set[int] | None = None
 ) -> tuple[DeviceEntry | None, str]:
-    """按 identity -> port -> name 找设备；命中但不 present 视为没找到。"""
+    """按 identity -> port -> name 找设备。
+
+    ## ⚠️ 两条硬规则（都是 2026-10-14 实测踩出来的）
+
+    ### 1. 名字兜底**拒绝歧义**
+
+    实测：两台同型号相机都叫 `aoni webcam A25`。其中一台换了 USB 口，
+    于是它绑定的 **port 对不上**，`name` 兜底是**子串匹配 + 取第一个命中**，
+    结果 `right -> #0`（任意抓的同名那台），而它绑定的那台根本不在线。
+
+    危害是双重的：**用错相机**（左右可能互换），并且 #0 当时只有 1280x720
+    而 #1 是 1920x1080 —— **两路分辨率不一致，双目标定失去意义**，
+    界面上看不出任何异常。
+
+    ### 2. 已目视确认过的角色，**身份/端口对不上就不许退回名字**
+
+    这条更要紧：`verified=True` 意味着用户**亲眼确认过**哪台是左、哪台是右。
+    此时身份对不上说明**那台相机不在线（或被枚举到别处）**，
+    而按名字抓一台同型号的顶替，恰好会把左右**换掉** ——
+    用户看到"识别出来的左右跟我标的反了"，正是这个。
+
+    所以：有身份信息却对不上 -> 返回失败，让 `resolve_role` 报错并给下一步；
+    只有角色**从没被确认过**（也就没绑定身份）时才允许纯按名字找。
+    """
+    taken = taken or set()
+
+    def usable(d: DeviceEntry) -> bool:
+        return d.present and d.order not in taken
+
+    bound = bool(spec.identity or spec.port)
+
+    # ① 身份：唯一，精确匹配
     if spec.identity:
         want = spec.identity.upper()
         for d in devices:
             if d.identity.upper() == want:
-                return (d, "identity") if d.present else (None, "")
+                return (d, "identity") if usable(d) else (None, "")
+
+    # ② 端口：唯一
     if spec.port:
         want = spec.port.lower()
         for d in devices:
             if want in d.port.lower():
-                return (d, "port") if d.present else (None, "")
-    if spec.name:
+                return (d, "port") if usable(d) else (None, "")
+
+    # ③ 名字：可能不唯一，且**绑过身份的绝不用它顶替**
+    if spec.name and not bound:
         want = spec.name.lower()
-        for d in devices:
-            if want in d.name.lower():
-                return (d, "name") if d.present else (None, "")
+        hits = [d for d in devices if want in d.name.lower() and usable(d)]
+        if len(hits) == 1:
+            return hits[0], "name"
+        if len(hits) > 1:
+            orders = "、".join(f"#{d.order}" for d in hits)
+            raise AmbiguousMatch(
+                f"配置里的名字「{spec.name}」在**当前设备里匹配到 {len(hits)} 台**"
+                f"（{orders}），无法确定是哪一台。\n"
+                f"  常见原因：同型号同名相机。\n"
+                f"  怎么办：跑 python apps/tools/cameras.py identify **重新固定**，"
+                f"程序会逐个显示画面让你确认哪台是左、哪台是右。")
     return None, ""
+
+
+class AmbiguousMatch(RuntimeError):
+    """按名字匹配到多台设备 —— 不能替用户猜，必须让用户确认。"""
 
 
 def _prompt_pick(
@@ -1134,6 +1181,50 @@ def _prompt_pick(
         print("  请输入编号（如 0）或回车。")
 
 
+def resolve_roles(
+    roles: list[str],
+    reg: Registry | None = None,
+    devices: list[DeviceEntry] | None = None,
+    *,
+    interactive: bool = True,
+) -> dict[str, ResolvedCamera]:
+    """一次解析**多个**角色，并保证它们**不会落到同一台相机**上。
+
+    ## 为什么必须一起解析（而不是各解析各的）
+
+    实测的真缺陷（2026-10-14）：两台同型号相机，其中一台换了 USB 口 →
+    它绑定的端口对不上 → 按**名字**兜底 → 名字相同 → 任意抓了第一个。
+    结果 `left` 与 `right` 都可能指向同一台；而"标定窗口里两路其实是同一台"
+    这件事，用户要到**一对有效图像都收不到**时才发现，白浪费一轮。
+
+    所以这里按角色**依次**解析，并把已经认领的索引传给下一个角色排除掉。
+    """
+    reg = reg if reg is not None else load_registry()
+    if devices is None:
+        devices = list_devices()
+    out: dict[str, ResolvedCamera] = {}
+    taken: set[int] = set()
+    for role in roles:
+        spec = reg.roles.get(str(role))
+        if spec is None:
+            continue
+        entry, how = _match_entry(spec, devices, taken=taken)
+        if entry is not None:
+            taken.add(entry.order)
+            warns = ()
+            if is_device_ignored(entry, reg):
+                warns = (f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
+                         f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。",)
+            out[str(role)] = ResolvedCamera(role=str(role), index=entry.order, how=how,
+                                            entry=entry, warnings=warns)
+        else:
+            out[str(role)] = resolve_role(role, reg=reg, devices=devices,
+                                          interactive=interactive)
+            if out[str(role)].index is not None:
+                taken.add(int(out[str(role)].index))
+    return out
+
+
 def resolve_role(
     role: str,
     reg: Registry | None = None,
@@ -1145,6 +1236,9 @@ def resolve_role(
     """把一个角色解析成**当前**索引。
 
     优先级：identity -> port -> name（都对不上时：可交互就让你选，否则报错并附设备清单）。
+
+    ⚠️ **要同时解析多个角色时请用 `resolve_roles()`** —— 它会保证两个角色
+    不落到同一台相机上；单独调用本函数没有这个保证。
     """
     reg = reg if reg is not None else load_registry()
     if devices is None:
