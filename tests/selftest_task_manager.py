@@ -30,7 +30,15 @@
 关窗口不收拾子进程                       `_on_close` 里把 `stop_all` 结果置 0        exit=1
 刷新列表丢掉选中的行                    把 `if keep == t.tid:` 换成 `if False:`     exit=1
 清理连在跑的一起删                       `self.tasks = []`                           exit=1
+**强杀失败谎报成功**（第 8 节）          `stop_task` 改回"永远 `return True`"        exit=1
+**不看 taskkill 返回码**（第 8 节）      去掉 `_force_kill_tree` 里的 `returncode` 判断  exit=1
 ======================================  ==========================================  ========
+
+> 最后两条是 2026-10-14 补的。它们守的是一个**在沙箱里被误判成"环境问题"**的真缺陷：
+> 那次 `taskkill /F` 因权限不足返回 1（stderr `ERROR: Access denied`），
+> 而旧实现 `subprocess.run(..., capture_output=True)` **既不看返回码也不看 stderr** ——
+> 失败没有出口，`stop_task` 照样报"停好了"。**"看着停了其实还在"又出现了，
+> 只是这次躲在"环境限制"的借口后面。**
 
 **一条写错的变异（记下来免得重犯）**
 
@@ -122,11 +130,16 @@ def main() -> int:
         results.append((label, good))
         print(f"  [{'通过' if good else '不达标'}] {label}")
 
-    def pump(seconds: float = 0.5) -> None:
-        """跑一会儿事件循环 —— 否则 `_poll` / `_refresh_tasks` 根本没执行。"""
+    def pump(seconds: float = 0.5, target=None) -> None:
+        """跑一会儿事件循环 —— 否则 `_poll` / `_refresh_tasks` 根本没执行。
+
+        `target` 用来指定根窗口：第 7 节会把 `app` 销毁并置空，
+        之后第 8 节另起一个 `Launcher`，那时不能再往 `app` 上 update。
+        """
+        win = target if target is not None else app
         end = time.monotonic() + seconds
         while time.monotonic() < end:
-            app.update()
+            win.update()
             time.sleep(0.02)
 
     py = sys.executable
@@ -244,6 +257,85 @@ def main() -> int:
                 app.stop_all(graceful=False)
                 app.destroy()
             except Exception:                        # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------ #
+    # 8. 「杀失败」必须报出来 —— 假绿最容易藏在这条路上
+    # ------------------------------------------------------------------ #
+    #
+    # ⚠️ 为什么必须单独测这一段（2026-10-14）：
+    #
+    # 沙箱里跑本测试时，第 4 节的强制结束**真的失败了**（`taskkill /F`
+    # 返回 1、stderr 是 `ERROR: Access denied`），却报了 4 项不达标 ——
+    # 那时我以为是环境问题就放过了。**真正的问题是：那份失败在代码里没有出口。**
+    # `subprocess.run(["taskkill", ...], capture_output=True)` 既不抛异常
+    # 也不看 `returncode`，于是 `stop_task` 照样 `return True`：
+    # 界面显示"已停"、任务却还在跑、**相机还被占着** ——
+    # 与 `LatestFrameCamera` 的静默重试是同一类缺陷。
+    #
+    # 所以这一段用**替身**把"强杀失败"造出来（不依赖真实权限），
+    # 断言它变成可读的原因；并单独验证"进程还活着吗"这个判定本身。
+    # 判据必须可失败：把 `stop_task` 改回"永远 return True"，
+    # 下面第 2、3 条立刻红。
+    #
+    app2 = None
+    t8 = None
+    try:
+        print("----- 8. 强杀失败必须报出来（替身注入「拒绝访问」）-----")
+        app2 = mod.Launcher()
+        app2.update()
+
+        real_run = mod.subprocess.run
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *a, **k):
+            calls.append(list(cmd) if isinstance(cmd, (list, tuple)) else [str(cmd)])
+
+            class _R:                     # 复刻真实 taskkill 失败时的样子
+                returncode = 1
+                stdout = ""
+                stderr = "ERROR: Access denied"
+            return _R()
+
+        mod.subprocess.run = fake_run
+        try:
+            t8 = app2.start_task([py, "-c", PARENT_WITH_CHILD], "测试（杀失败）")
+            pump(1.0, app2)
+            kids8 = mod._child_pids(t8.proc.pid)
+            stopped = app2.stop_task(t8, graceful=False)
+        finally:
+            mod.subprocess.run = real_run          # 立刻还原：后面清理还要用它
+
+        print(f"  stop_task 返回={stopped}  kill_note={t8.kill_note!r}")
+        print(f"  注入期间真的调了 taskkill：{calls[:1]}")
+        ck("**强杀失败时不再谎报成功**（返回值必须是 False）", stopped is False)
+        ck("失败原因被记下来且可读（含返回码与 stderr）",
+           "Access denied" in t8.kill_note and "1" in t8.kill_note)
+        ck("**真的调了 taskkill**（否则上面两条是空转）",
+           any(str(c).lower().endswith("taskkill") or "taskkill" in str(c).lower()
+               for c in calls))
+        ck("失败后进程确实还活着（这就是要报出来的那个事实）",
+           psutil.pid_exists(t8.proc.pid))
+
+        # 判定本身：活着的必须查得出来，不存在的必须不误报
+        bogus = 999_999_999
+        ck("_alive_pids 认得出活进程", mod._alive_pids([t8.proc.pid]) == [t8.proc.pid])
+        ck("_alive_pids 不会把不存在的 pid 算成活着", mod._alive_pids([bogus]) == [])
+    finally:
+        if t8 is not None:
+            # 先杀子树、再杀父进程 —— 反过来的话 `_child_pids` 就查不到了，
+            # 长命子进程会一直留着（正是本测试要防的那种"看着停了其实还在"）。
+            for p in mod._child_pids(t8.proc.pid):
+                try:
+                    psutil.Process(p).kill()
+                except Exception:                     # noqa: BLE001
+                    pass
+            if t8.running:
+                t8.proc.kill()                        # 这一段本来就没杀掉它，收尾
+        if app2 is not None:
+            try:
+                app2.destroy()
+            except Exception:                         # noqa: BLE001
                 pass
 
     ok = all(v for _n, v in results)

@@ -126,6 +126,7 @@ class Task:
     ended: float | None = None
     exit_code: int | None = None
     stop_reason: str = ""
+    kill_note: str = ""          # 停止失败的原因（"没杀干净"必须有出口，见 stop_task）
     lines: int = 0
 
     @property
@@ -138,6 +139,34 @@ class Task:
 
     def cmdline(self) -> str:
         return " ".join(self.cmd)
+
+
+def _alive_pids(pids: list[int]) -> list[int]:
+    """这批 pid 里**还有哪些活着**（判不出来的一律当成"还活着"）。
+
+    ## 为什么需要它（而不是直接相信 `taskkill` 的调用没抛异常）
+
+    `subprocess.run(["taskkill", ...])` **不抛异常不代表杀掉了**：权限不足时
+    它只是返回 `1` 并把 `ERROR: Access denied` 写进 stderr，而
+    `capture_output=True` 会把这个返回值与输出**一起吞掉** ——
+    调用方看不到任何异常，于是"杀失败"与"杀成功"长得一模一样。
+
+    这与 `LatestFrameCamera` 的静默重试是同一类缺陷：**失败没有出口**。
+    所以这里坚持**按结果判定**：真的去问一次"还活着吗"。
+    """
+
+    alive: list[int] = []
+    for pid in pids:
+        try:
+            import psutil                                   # 可选依赖
+            if psutil.pid_exists(pid):
+                alive.append(pid)
+        except Exception:                                   # noqa: BLE001
+            # 没有 psutil / 查询被拒：**当成还活着**。
+            # 宁可多报一次"可能没杀干净"，也不要谎报成功 ——
+            # 谎报的代价是相机一直被占着而用户以为停了。
+            alive.append(pid)
+    return alive
 
 
 def _child_pids(pid: int) -> list[int]:
@@ -1123,8 +1152,30 @@ class Launcher(tk.Tk):
         except OSError:
             task.log_path = None                              # 只报一次，不刷屏
 
+    def _force_kill_tree(self, pid: int) -> str:
+        """强杀一棵进程树，**返回为什么失败**（成功时返回空串）。
+
+        ⚠️ 这里必须检查 `returncode` 与 `stderr`：走到这个函数时通常
+        "优雅退出没起作用"，如果强杀也失败，**那就真的没停掉** ——
+        而旧实现是 `subprocess.run(..., capture_output=True)` 之后
+        **两个都不看**，于是权限不足（实测 stderr 为 `ERROR: Access denied`）
+        被当成"停好了"：界面显示已停、任务却还在，相机还被占着。
+        """
+        cmd = (["taskkill", "/PID", str(pid), "/T", "/F"] if os.name == "nt"
+               else ["kill", "-9", str(pid)])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=10)
+        except Exception as exc:                            # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+        if r.returncode == 0:
+            return ""
+        detail = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+        return (f"{cmd[0]} 返回码 {r.returncode}"
+                + (f"：{detail[0]}" if detail else "（没有输出）"))
+
     def stop_task(self, task: Task, graceful: bool = True) -> bool:
-        """停掉一个任务（含它的子进程树）。返回是否真的下手了。
+        """停掉一个任务（含它的子进程树）。返回**是否确认已经停掉**。
 
         ## 为什么要杀整棵树，而不是 `proc.terminate()`
 
@@ -1136,9 +1187,16 @@ class Launcher(tk.Tk):
 
         `CTRL_BREAK_EVENT` 让程序自己走退出流程（例如标定程序来得及把已经
         收下的图像对写完）。直接 `taskkill /F` 会把它半路打断。
+
+        ## 返回值的语义（2026-10-14 改）
+
+        原来是"是否真的下手了"，**永远为真** —— 于是"没杀掉"与"杀掉了"
+        返回值一模一样，调用方无从分辨。现在返回"**确认停掉了吗**"：
+        强杀之后复查一次进程树，还在就返回 `False` 并把原因写进
+        `task.kill_note`（界面会报警）。
         """
         if not task.running:
-            return False
+            return True
         pid = task.proc.pid
         task.stop_reason = "用户中断" + ("（优雅）" if graceful else "（强制）")
         self._append(f"[任务 {task.tid}] 正在中断 PID {pid}…")
@@ -1160,49 +1218,67 @@ class Launcher(tk.Tk):
                 task.proc.wait(timeout=3.0)
                 self._append(f"[任务 {task.tid}] 已优雅退出")
                 self._kill_leftover(kids, task)
-                return True
+                return self._confirm_dead(task, kids)
             except subprocess.TimeoutExpired:
                 self._append(f"[任务 {task.tid}] 3 秒内没退出，改为强制结束")
 
         # ② 强杀（含子树）
-        try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                               capture_output=True, timeout=10)
-            else:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except Exception as exc:                            # noqa: BLE001
-            self._append(f"[任务 {task.tid}] 强制结束失败：{type(exc).__name__}: {exc}")
+        why = self._force_kill_tree(pid)
+        if why:
+            self._append(f"[任务 {task.tid}] ⚠ 强制结束**没成功**：{why}")
+            task.kill_note = f"强制结束未成功（{why}）"
+        else:
+            self._append(f"[任务 {task.tid}] 已强制结束整棵进程树")
         self._kill_leftover(kids, task)
-        return True
+        return self._confirm_dead(task, kids)
+
+    def _confirm_dead(self, task: Task, kids: list[int], wait: float = 2.0) -> bool:
+        """等一小会儿再复查：父进程与子进程**真的都没了**才算停掉。
+
+        为什么不能杀完就返回 `True`：`taskkill` 可能返回非零、也可能"命令成功
+        但进程仍卡在不可中断状态"。`_alive_pids` 查不出来时也算活着，
+        所以这里**只会偏保守**：最坏情况是多报一次"可能没停干净"。
+        """
+        deadline = time.monotonic() + wait
+        while True:
+            alive = _alive_pids([task.proc.pid, *kids])
+            if not alive:
+                return True
+            if time.monotonic() >= deadline:
+                task.kill_note = (f"仍有 {len(alive)} 个进程存活：{alive}"
+                                  + (f"（{task.kill_note}）" if task.kill_note else ""))
+                self._append(
+                    f"[任务 {task.tid}] ⚠ 停完仍有 {len(alive)} 个进程存活（{alive}）——"
+                    f"**相机可能仍被占着**，请确认后再启动新任务")
+                return False
+            time.sleep(0.05)
 
     def _kill_leftover(self, kids: list[int], task: Task) -> None:
         """收尾：子树里还有活着的就补刀（否则相机可能仍被占着）。"""
-        alive = []
-        for pid in kids:
-            try:
-                import psutil
-                if psutil.pid_exists(pid):
-                    alive.append(pid)
-            except Exception:                               # noqa: BLE001
-                pass
+        alive = _alive_pids(kids)
         if not alive:
             return
         self._append(f"[任务 {task.tid}] 仍有 {len(alive)} 个子进程存活，补杀：{alive}")
         for pid in alive:
-            try:
-                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"]
-                               if os.name == "nt" else ["kill", "-9", str(pid)],
-                               capture_output=True, timeout=10)
-            except Exception:                               # noqa: BLE001
-                pass
+            why = self._force_kill_tree(pid)
+            if why:
+                self._append(f"[任务 {task.tid}] ⚠ 子进程 {pid} 补杀失败：{why}")
 
     def stop_all(self, graceful: bool = False) -> int:
-        """停掉所有在跑的任务，返回停掉几个。"""
+        """停掉所有在跑的任务，返回**确认停掉**的个数。
+
+        ⚠️ 返回的是"确认停掉"而不是"尝试停掉"：没停掉的会留在任务表里
+        （状态显示失败原因），而不是从计数里消失。
+        """
         running = [t for t in self.tasks if t.running]
+        ok = 0
         for t in running:
-            self.stop_task(t, graceful=graceful)
-        return len(running)
+            if self.stop_task(t, graceful=graceful):
+                ok += 1
+        if ok < len(running):
+            self._append(f"[任务] ⚠ {len(running)} 个任务里只有 {ok} 个确认停掉，"
+                         f"其余请看上面的失败原因")
+        return ok
 
     def _reader(self, task: Task) -> None:
         proc = task.proc
@@ -1297,7 +1373,9 @@ class Launcher(tk.Tk):
         tree.delete(*tree.get_children())
         for t in self.tasks:
             if t.running:
-                status = "运行中"
+                # 停过但**没停掉**的，状态里直接写明原因 ——
+                # 否则它和"从没停过"看起来一样，而它正占着相机。
+                status = f"⚠ {t.kill_note}" if t.kill_note else "运行中"
             elif t.stop_reason:
                 status = t.stop_reason
             else:
@@ -1332,7 +1410,12 @@ class Launcher(tk.Tk):
         if not t.running:
             messagebox.showinfo("它已经结束了", f"任务 {t.tid}「{t.title}」已经不在运行。")
             return
-        self.stop_task(t, graceful=True)
+        if not self.stop_task(t, graceful=True):
+            messagebox.showwarning(
+                "没停下来",
+                f"任务 {t.tid}「{t.title}」**没能停掉**：\n{t.kill_note or '原因不明'}\n\n"
+                "它可能仍占着相机。可以在任务表里再点一次「中断」，"
+                "或直接去看它的日志文件。")
         self._refresh_tasks()
 
     def _kill_selected(self) -> None:
@@ -1348,7 +1431,12 @@ class Launcher(tk.Tk):
                 f"任务 {t.tid}「{t.title}」会被**立刻杀掉**（含子进程树），"
                 "它来不及保存已完成的结果。\n\n确定吗？"):
             return
-        self.stop_task(t, graceful=False)
+        if not self.stop_task(t, graceful=False):
+            messagebox.showwarning(
+                "没能强制结束",
+                f"任务 {t.tid}「{t.title}」**还在跑**：\n{t.kill_note or '原因不明'}\n\n"
+                "常见原因是权限不足。**相机可能仍被它占着** —— "
+                "请用任务管理器结束它，或注销后重试。")
         self._refresh_tasks()
 
     def _stop_all_clicked(self) -> None:
@@ -1372,6 +1460,8 @@ class Launcher(tk.Tk):
         self._append(f"状态  : {'运行中' if t.running else '已结束'}"
                      + (f"（{t.stop_reason}）" if t.stop_reason else ""))
         self._append(f"耗时  : {t.elapsed():.1f}s")
+        if t.kill_note:
+            self._append(f"停止  : ⚠ {t.kill_note}")
         self._append(f"命令  : {t.cmdline()}")
         if t.log_path is not None:
             self._append(f"日志  : {t.log_path}（{t.lines} 行已落盘）")
@@ -1429,7 +1519,17 @@ class Launcher(tk.Tk):
                 return
             self._append("[退出] 正在结束仍在运行的任务…")
             n = self.stop_all(graceful=True)
-            self._append(f"[退出] 已请求结束 {n} 个任务")
+            self._append(f"[退出] 已确认结束 {n} 个任务")
+            if n < len(running):
+                # ⚠ 不能静默退出：没停掉的那些**会继续占着相机**，
+                # 而用户下次运行只会看到"打不开相机"。
+                left = [t for t in running if t.running]
+                messagebox.showwarning(
+                    "有任务没停下来",
+                    f"{len(running)} 个任务里有 {len(left)} 个**没能结束**："
+                    + "、".join(f"{t.tid}「{t.title}」(PID {t.proc.pid})" for t in left[:4])
+                    + "\n\n启动器关闭后它们**仍在运行**，相机等资源会一直被占着。\n"
+                      "请用 Windows 任务管理器结束这些 PID，或注销后重试。")
         self.destroy()
 
 
