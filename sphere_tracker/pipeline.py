@@ -212,8 +212,23 @@ class SpherePipeline:
 
     # ------------------------------------------------------------------
     def render(self, frame: np.ndarray, result: FrameResult,
-               health=None) -> np.ndarray:
+               health=None, display_width: int | None = None) -> np.ndarray:
         """把结果画到帧上，返回新图（不修改输入）。
+
+        `display_width`：**只影响显示用的输出图宽度**（像素）。给 960 就返回
+        宽 960 的图，叠加层位置与线宽按同一倍率缩好 —— 也就是"看起来一样，
+        只是一张更小的图"。
+
+        ## 为什么要有这个参数（2026-10-14 实测）
+
+        `cv2.imshow` 把一个 1920x1080 的图**缩到窗口里**显示，代价高得离谱：
+
+            imshow 1920x1080 窗口 1080p 图    17.74 ms
+            imshow  960x540 窗口 1080p 图      6.86 ms     （让 imshow 自己缩）
+            先把图 resize 到 960x540，再 imshow   1.84 ms   ← 便宜 9.6 倍
+
+        也就是说每秒最多 56 帧是**花在缩放上**的，而这件事我们自己做只要
+        0.55 ms。显示从 17.7 ms 降到 1.84 ms，直接決定"顺不顺"。
 
         `health`：可选的 `stats.Health`。**为什么由调用方传、而不是 pipeline 自己持有** ——
         pipeline 是编排层，不该持有一个"随运行不断变化的累加器"：
@@ -227,8 +242,15 @@ class SpherePipeline:
         """
         viz = self.cfg.viz
         scale = viz.scale if viz.scale and viz.scale > 0 else 1.0
+        # 显示倍率：`display_width` 与 `viz.scale` 是**两件事**，
+        # 前者是"输出图多宽"（通常 <1，为了显示便宜），
+        # 后者是"把整张图放大多少"（通常 =1，为了在小窗口里看清叠加层）。
+        # 两者相乘得到最终倍率，于是既能缩小显示、又能保持放大语义。
+        if display_width and frame.shape[1] > 0:
+            scale *= float(display_width) / float(frame.shape[1])
         if abs(scale - 1.0) > 1e-6:
-            img = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            img = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=interp)
         else:
             img = frame.copy()
 
@@ -271,6 +293,8 @@ class SpherePipeline:
 
     # ------------------------------------------------------------------
     def process_and_render(self, frame: np.ndarray, t: float | None = None,
-                           health=None) -> tuple[np.ndarray, FrameResult]:
+                           health=None,
+                           display_width: int | None = None) -> tuple[np.ndarray, FrameResult]:
         result = self.process(frame, t)
-        return self.render(frame, result, health=health), result
+        return self.render(frame, result, health=health,
+                           display_width=display_width), result

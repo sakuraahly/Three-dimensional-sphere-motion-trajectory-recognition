@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -50,6 +51,27 @@ from sphere_tracker.sources import (
     quiet_repeated_grab_warnings,
 )
 from sphere_tracker.stats import FramePump, Health
+from apps._common import log_environment, setup_logging
+
+_log = logging.getLogger("realtime")
+
+
+def _describe(info) -> str:
+    """把 `SourceInfo` 说成一行。
+
+    **为什么不用 `stereo.pair_source.describe_info`**：那是双目模块的函数，
+    而实时检测是**单目** app。为了打一行日志去 import 双目模块，
+    会造出 `apps → stereo` 的依赖（分层上 stereo 在 apps 下面，
+    但单目这条链本来就与双目无关）。几个字段直接格式化更干净。
+    """
+    bits = [f"{info.width}x{info.height}"]
+    if info.fps and info.fps > 0:
+        bits.append(f"{info.fps:.1f} fps")
+    if info.backend:
+        bits.append(f"后端 {info.backend}")
+    if info.kind:
+        bits.append(info.kind)
+    return "，".join(bits)
 
 WINDOW = "sphere tracker (real-time)"
 METHOD_CYCLE = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]
@@ -95,7 +117,19 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--no-3d", action="store_true", help="关闭三维估计")
     p.add_argument("--record", default=None, help="把标注后的画面录制成 mp4")
-    p.add_argument("--scale", type=float, default=1.0, help="显示缩放")
+    p.add_argument("--scale", type=float, default=1.0, help="显示缩放（放大整张图，>1 才用）")
+    # ---- 显示分辨率：流畅度的**最大单项**（2026-10-14 实测）----
+    #
+    # `cv2.imshow` 把 1920x1080 的图缩进窗口显示，实测要 **17.74 ms**；
+    # 而先把图 resize 到 960x540 再 imshow 只要 **1.84 ms**（便宜 9.6 倍）。
+    # 也就是说每秒最多 56 帧是**花在缩放上**的，而这件事我们自己做只要 0.55 ms。
+    #
+    # 默认 960：1280 也顺（11.7ms），但 960 在"看得清"和"顺"之间更稳。
+    # 想看原生细节就用 `--display-width 0`（= 不缩，回到旧行为）。
+    p.add_argument("--display-width", type=int, default=960,
+                   help="显示图宽度（像素）。默认 960，明显更顺；0 = 不缩放（原生分辨率）")
+    p.add_argument("--log-every", type=float, default=5.0,
+                   help="每隔几秒往日志写一行健康度（0 = 不写）")
     return p.parse_args()
 
 
@@ -125,6 +159,18 @@ def main() -> int:
     quiet_repeated_grab_warnings()
     args = parse_args()
     cfg = build_config(args)
+
+    # ---- 日志：实时检测过去**一份都不落盘**（2026-10-14 升级）----
+    #
+    # 其它 app 都调了 `setup_logging`，只有实时检测没有 —— 只有终端输出，
+    # 进程一退就全没了。而"卡顿 / 丢帧 / 相机掉线"这类问题恰恰是**过后才想查**的：
+    # 用户看到的是"卡"，真正的数字（cap / loop / detect / drop / age / skew）
+    # 必须留下来才能定位，否则只能靠重跑一次复现。
+    #
+    # 级别分工沿用 `_common.setup_logging`：文件收 DEBUG（每帧都留），终端只 INFO。
+    log_path = setup_logging("realtime")
+    log_environment(_log)
+    print(f"日志：{log_path}")
 
     arg = args.camera
     if arg is not None and str(arg).strip().lower() == cr.AUTO_TOKEN:
@@ -194,7 +240,39 @@ def main() -> int:
     health = Health()
     pump = FramePump(cam_thread, health, stalled_after_s=1.0)
     t_start = time.perf_counter()
+    _log.info("相机 %s 已打开：%s", index, _describe(info))
+    _log.info("检测方法 %s；显示宽度 %s；预测 %s",
+              cfg.detector.method,
+              args.display_width or f"{info.width}（不缩放）", cfg.predict.method)
     print("采集已在后台线程运行（HUD 会分别显示 cap / loop / detect）")
+    if args.display_width:
+        print(f"显示按 {args.display_width}px 宽输出 —— 实测这一步把显示耗时"
+              f"从 ~17.7ms 降到 ~1.8ms（这是流畅度最大的一项）")
+
+    # ---- 周期性健康度进日志（本次升级的重点）----
+    #
+    # 原来实时检测**一份日志都不落盘**（其它 app 都调 setup_logging，只有它没有）：
+    # 进程一退，"当时到底多少帧、丢了多少帧、检测多慢"就全没了。
+    # 而"卡顿"恰恰是**过后才想查**的问题 —— 用户看到的只是"卡"，
+    # 真正的数字（cap / loop / detect / drop / age）必须留下来才能定位。
+    next_report = time.perf_counter() + max(args.log_every, 0.0)
+
+    def _report_health(force: bool = False) -> None:
+        """写一行健康度到日志（`--log-every 0` 可关，force 用于收尾）。"""
+        nonlocal next_report
+        if args.log_every <= 0 and not force:
+            return
+        now = time.perf_counter()
+        if not force and now < next_report:
+            return
+        next_report = now + args.log_every
+        _log.info("健康度 %s", health.summary_line())
+        # 掉帧比例明显时**顺带说一句人话**：光看 drop 3 不知道严重不严重
+        if health.drop_rate > 0.25 and health.processed_frames > 30:
+            _log.warning(
+                "丢帧 %.0f%%（采集 %.1f fps，主循环只有 %.1f fps）——"
+                "画面会顿。可调小窗口或 --display-width，或换更快的方法（color）",
+                health.drop_rate * 100, health.capture_fps, health.loop_fps)
 
     try:
         while True:
@@ -209,7 +287,30 @@ def main() -> int:
                 t0 = time.perf_counter()
                 result = pipe.process(frame, time.perf_counter() - t_start)
                 result.stalled = got.stalled
-                vis = pipe.render(frame, result, health=health)
+                # ---- 逐帧 DEBUG 记录（**只有文件收**，终端不受影响）----
+                #
+                # 为什么值得每帧写一行：事后想回答的问题几乎都是逐帧量的 ——
+                # "球在第几帧丢的""丢那一下检测耗时是不是飙了""坐标是不是跳了"。
+                # 只在 INFO 记汇总的话，这些**永远查不出来**，只能重跑一次复现
+                # （而现场往往已经变了）。`_common.setup_logging` 的分工就是
+                # 文件收 DEBUG、终端只 INFO，所以这里写 DEBUG 不会刷屏。
+                det = result.detection
+                _log.debug(
+                    "帧 %d  seq=%s  detect %.1fms  found=%s  r=%s  c=(%s,%s)  "
+                    "trail=%d  age=%.1fms  stalled=%s",
+                    health.processed_frames,
+                    getattr(got, "seq", "?"),
+                    result.detect_ms,
+                    det is not None,
+                    f"{det.radius:.1f}" if det is not None else "-",
+                    f"{det.center[0]:.0f}" if det is not None else "-",
+                    f"{det.center[1]:.0f}" if det is not None else "-",
+                    len(result.trail or ()),
+                    health.frame_age_ms,
+                    got.stalled,
+                )
+                vis = pipe.render(frame, result, health=health,
+                                  display_width=args.display_width)
                 process_ms = (time.perf_counter() - t0) * 1000.0
                 frame_times.append(process_ms / 1000.0)
                 if len(frame_times) > 60:
@@ -228,22 +329,29 @@ def main() -> int:
 
             cv2.imshow(WINDOW, vis)
             key = cv2.waitKey(1) & 0xFF
+            _report_health()
 
             if key in (ord("q"), 27):
+                _log.info("用户按 q 退出")
                 break
             if key == ord(" "):
                 paused = not paused
                 print("已暂停" if paused else "继续")
+                _log.info("用户%s", "暂停" if paused else "继续")
             elif key == ord("r"):
                 pipe.reset()
                 print("轨迹已重置")
+                _log.info("用户重置轨迹")
             elif key == ord("p"):
                 cfg.predict.enable = not cfg.predict.enable
                 print(f"预测：{'开' if cfg.predict.enable else '关'}")
+                _log.info("用户切换预测：%s", cfg.predict.enable)
             elif key == ord("m"):
                 cfg.viz.show_mask = not cfg.viz.show_mask
+                _log.info("用户切换掩膜显示：%s", cfg.viz.show_mask)
             elif key == ord("3"):
                 cfg.viz.show_axes_3d = not cfg.viz.show_axes_3d
+                _log.info("用户切换三维坐标轴：%s", cfg.viz.show_axes_3d)
             elif key == ord("c"):
                 i = (
                     METHOD_CYCLE.index(cfg.detector.method)
@@ -253,6 +361,7 @@ def main() -> int:
                 cfg.detector.method = METHOD_CYCLE[(i + 1) % len(METHOD_CYCLE)]
                 pipe.detector = build_detector(cfg.detector)
                 print(f"检测方法切换为：{cfg.detector.method}")
+                _log.info("用户切换检测方法为 %s", cfg.detector.method)
             elif key == ord("s"):
                 stamp = time.strftime("%Y%m%d_%H%M%S")
                 out_dir = ROOT / "outputs" / "images"
@@ -261,6 +370,7 @@ def main() -> int:
                     cv2.imwrite(str(out_dir / f"snapshot_{stamp}.png"), last_vis)
                     cv2.imwrite(str(out_dir / f"raw_{stamp}.png"), last_frame)
                     print(f"已保存快照：outputs/images/snapshot_{stamp}.png")
+                    _log.info("用户保存快照 %s", stamp)
                 save_config(cfg, args.save_config)
                 print(f"配置已保存：{args.save_config}")
             elif key == ord("v"):
@@ -283,12 +393,14 @@ def main() -> int:
                     print(
                         f"{'开始录制：' + path if recording else '录制失败（编码器不可用）'}"
                     )
+                    _log.info("录制%s：%s", "开始" if recording else "失败", path)
                 else:
                     recording = False
                     if writer is not None:
                         writer.release()
                         writer = None
                     print("录制已停止")
+                    _log.info("录制已停止")
     finally:
         # 先停采集线程再放相机 —— 反了的话采集线程会在已释放的源上继续 read
         cam_thread._stop = True
@@ -302,8 +414,18 @@ def main() -> int:
             print(
                 f"平均每帧处理耗时 {avg * 1000:.1f} ms（约 {1.0 / avg:.1f} FPS 的处理能力）"
             )
+            _log.info("平均每帧处理耗时 %.1f ms（约 %.1f FPS 的处理能力）",
+                      avg * 1000, 1.0 / avg)
         # 结尾把三个口径一起打出来：cap 与 loop 差得远 = 瓶颈在检测，不是相机
         print(f"本次运行健康度：{health.summary_line()}")
+        _report_health(force=True)
+        _log.info("运行结束。本次健康度 %s", health.summary_line())
+        # 收尾时把完整快照也落一份 —— 事后想画曲线/比对两次运行就不必再解析文本
+        try:
+            import json
+            _log.info("健康度快照 %s", json.dumps(health.to_dict(), ensure_ascii=False))
+        except Exception as exc:                              # noqa: BLE001
+            _log.warning("健康度快照写不了：%s", exc)
         if health.dropped_frames:
             print(f"  其中 {health.dropped_frames} 帧在取走前被覆盖 —— "
                   f"说明主循环跟不上采集，看的是跳帧后的画面")

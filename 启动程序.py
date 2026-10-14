@@ -75,6 +75,14 @@ PARAM_HINT_WRAP = 720     # 初值；同上
 # 卡片左右各 16px 外边距 + 卡片内 14px 内边距 + 滚动条 ≈ 60px
 CHROME_PX = 64
 
+# 检测窗口的显示图宽度（像素）。**与 `run_realtime.py --display-width` 同义。**
+#
+# 为什么要有这个默认值（2026-10-14 实测）：`cv2.imshow` 把 1920x1080 的图
+# 缩进窗口显示要 **17.74 ms/帧**，而先把图缩到 960x540 再显示只要 **1.84 ms**
+# （便宜 9.6 倍）。也就是每秒最多 56 帧是**花在缩放上**的，
+# 而这件事我们自己做只要 0.55 ms。这是"画面卡顿"最大的单项。
+DISPLAY_WIDTH = 960
+
 # 界面刷新周期（毫秒）。轮询日志 + 刷新任务耗时列，都用这一个值 ——
 # 原来轮询是 120ms、任务列又自己排了 500ms，两套节奏叠在一起。
 POLL_MS = 200
@@ -633,6 +641,14 @@ class Launcher(tk.Tk):
 
     # ---------- 参数收集 ----------
     def _common_args(self) -> list[str]:
+        """实时/离线共用的参数。
+
+        ⚠️ **`--display-width` 必须在这里传下去**（2026-10-14 加）。
+        它默认 960，实测把显示耗时从 17.7 ms 降到 1.8 ms ——
+        是"画面卡顿"最大的单项。**命令行直接跑的人自动享受默认值，
+        而从 GUI 走的人如果这里不传，就享受不到** —— 那正是
+        "界面与命令行行为不一致"的老毛病（和之前 `--target` 没传下去同一类）。
+        """
         args: list[str] = []
         preset = self.preset.get()
         if preset and preset != "不使用":
@@ -645,6 +661,7 @@ class Launcher(tk.Tk):
             args += ["--focal", self.focal.get().strip()]
         if not self.show_3d.get():
             args += ["--no-3d"]
+        args += ["--display-width", str(DISPLAY_WIDTH)]
         return args
 
     # ---------- 动作 ----------

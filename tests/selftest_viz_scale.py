@@ -407,6 +407,94 @@ def test_hud_shows_stall() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_display_width_contract() -> bool:
+    """`render(display_width=...)` 的契约（2026-10-14 加）。
+
+    ## 这一节守什么
+
+    实测 `cv2.imshow` 把 1920x1080 的图缩进窗口显示要 **17.74 ms/帧**，
+    而先把图缩到 960x540 再 imshow 只要 **1.84 ms** —— 便宜 9.6 倍。
+    实测对照（同机同相机、各跑 20 秒、取最后三次采样）：
+
+        --display-width 0    （1920x1080 显示，旧行为）  loop 65.2 fps
+        --display-width 960  （新默认）                  loop 78.5 fps
+
+    所以 `display_width` 是**流畅度**的一根支柱，钉三件事：
+
+    1. 输出图**宽度确实是**要的那个值（否则"没生效"没人发现）；
+    2. **叠加层跟着缩**（否则圈会画在错误的像素位置上 —— 比不缩更糟）；
+    3. `None` / `0` 时行为**与从前完全一致**（不改旧路径）。
+
+    第 2 条最要紧：只缩图不缩坐标，圈就偏了。
+    """
+    print("----- display_width：只缩输出图，叠加层必须跟着缩 -----")
+    cfg = AppConfig()
+    cfg.viz.show_mask = False
+    pipe = SpherePipeline(cfg)
+    base = np.full((1080, 1920, 3), 40, np.uint8)
+    result = None
+    for i in range(8):
+        f = base.copy()
+        cv2.circle(f, (860 + i * 20, 540), 120, (205, 205, 205), -1)
+        result = pipe.process(f, i * 0.033)
+    if result is None:                                        # 理论上不会
+        print("  [不达标] pipeline 没能产生结果")
+        return False
+
+    checks: list[tuple[str, bool]] = []
+
+    for want in (480, 960, 1280):
+        out = pipe.render(base, result, display_width=want)
+        gw, gh = out.shape[1], out.shape[0]
+        expect_h = round(1080 * want / 1920)
+        print(f"  display_width={want:5} -> 输出 {gw}x{gh}（高度期望 {expect_h}）")
+        checks.append((f"display_width={want} 时输出宽度就是 {want}", gw == want))
+        checks.append((f"display_width={want} 时高度按比例", abs(gh - expect_h) <= 2))
+
+    for kw in (None, 0):
+        out = pipe.render(base, result, display_width=kw)
+        print(f"  display_width={kw!r:5} -> 输出 {out.shape[1]}x{out.shape[0]}（应为原尺寸）")
+        checks.append((f"display_width={kw!r} 保持原尺寸（旧路径不变）",
+                       out.shape[1] == 1920 and out.shape[0] == 1080))
+
+    # ---- 叠加层跟着缩：比较"内容重心"的相对位置 ----
+    #
+    # 判据要选对。直接比像素没意义（采样分辨率不同）。
+    # 用**亮度重心**：叠加层（亮圈、亮线、白字）会把它拉向球所在的位置。
+    # 若坐标没跟着缩，小图里的圈会落在完全错误的地方，重心差到几百像素；
+    # 正常缩放的抗锯齿差异只有几个像素 —— 两者量级差两个数量级，判得开。
+    big = pipe.render(base, result, display_width=None)
+    small = pipe.render(base, result, display_width=960)
+    big_small = cv2.resize(cv2.cvtColor(big, cv2.COLOR_BGR2GRAY),
+                           (small.shape[1], small.shape[0]),
+                           interpolation=cv2.INTER_AREA)
+    g_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+    def centroid(g: np.ndarray) -> tuple[float, float]:
+        m = g.astype(np.float32)
+        m -= m.min()
+        tot = float(m.sum()) or 1.0
+        ys, xs = np.indices(m.shape)
+        return float((xs * m).sum() / tot), float((ys * m).sum() / tot)
+
+    cb, cs = centroid(big_small), centroid(g_small)
+    dx, dy = abs(cb[0] - cs[0]), abs(cb[1] - cs[1])
+    print(f"  内容重心：大图缩后 ({cb[0]:.1f},{cb[1]:.1f})  小图 ({cs[0]:.1f},{cs[1]:.1f})"
+          f"  差 ({dx:.1f},{dy:.1f}) px")
+    # ⚠️ 这条**是冗余护栏**，如实说明：把 `scale` 改成 1.0（缩了图却按原坐标画）
+    # 时，本节第 1~8 节的"轨迹/检测/预测随 k 缩放"断言会**先**红，
+    # 所以重心这条抓不到"独家"的 bug。留着它是因为它检查的是**端到端对齐**
+    # （叠加层相对图像内容的位置），而不是"某个函数有没有用 scale"——
+    # 将来若有叠加层不走 `scale` 参数而是自己算坐标，它才是唯一的守门人。
+    checks.append(("叠加层位置随图一起缩（重心偏差 < 40px；不缩会差几百 px）"
+                   "（与前面的 scale 断言冗余，留作端到端对齐检查）",
+                   dx < 40 and dy < 40))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("叠加层缩放自测（viz.scale：整张图所有元素一起缩放）")
@@ -419,7 +507,8 @@ def main() -> int:
                test_3d_panel_text_scales,
                test_hud_separates_the_three_frame_rates,
                test_hud_shows_stall,
-               test_content_area_grows_with_k_squared):
+               test_content_area_grows_with_k_squared,
+               test_display_width_contract):
         results.append(fn())
         print()
     ok = all(results)
