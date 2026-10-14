@@ -643,7 +643,7 @@ apps/                    可直接运行的程序
     calibrate_color.py     HSV 阈值交互标定
     calibrate_focal.py     单点焦距标定（三维必需）
 
-tests/                   回归测试（改动代码后必跑，共十个）
+tests/                   回归测试（改动代码后必跑，共 22 个）
   selftest_synthetic.py        单目全链路（clean / realistic / panning）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
@@ -654,6 +654,7 @@ tests/                   回归测试（改动代码后必跑，共十个）
   selftest_preview_lib.py      PPT 预览渲染：连线是否画出来
                                （缺 python-pptx/Pillow 时整体跳过算通过）
   selftest_camera_quality.py   相机画质会诊：蒙雾/过曝/残帧判据（全合成图）
+  …                           上面只是一部分；完整清单见 `AGENTS.md` §7
 
 docs/                    文档
   项目总纲.md            ★ 入口：项目是什么 + 文档怎么读
