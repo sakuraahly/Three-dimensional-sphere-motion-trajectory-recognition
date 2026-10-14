@@ -25,7 +25,7 @@
 | 单目三维估计（球直径先验 `Z = fR/r`）                 | ✅ 完成       | 深度误差 **0.31%**，3D RMSE **15.1 mm**                                                                 |
 | 轨迹预测（自适应窗口 + 已知重力约束）                 | ✅ 完成       | 0.1 / 0.2 / 0.3 s 分别 **0.81 / 1.20 / 1.98 px**                                                        |
 | 可视化（拖尾 / 圆 / 预测虚线 / HUD / 3D 小视图）      | ✅ 完成       | 见 `outputs/videos/annotated.mp4`                                                                       |
-| 实时程序 + 离线批处理 + CSV 导出                      | ✅ 完成       | 单路 **~160 fps**（960×540，纯 CPU 单线程）                                                             |
+| 实时程序 + 离线批处理 + CSV 导出                      | ✅ 完成       | 单路 960×540 **~160 fps**；**1920×1080 实测 17.8 ms/帧 ≈ 56 fps**（`color`，纯 CPU 单线程）                                             |
 | 合成真值自测（可直接当回归测试）                      | ✅ 完成       | `python tests/selftest_synthetic.py`                                                                    |
 | **相机运动适配**（手持/云台/平移拍摄）                | ✅ 完成       | 平移下半径误差 0.23 px（不补偿 1.58 px），见第十一节                                                    |
 | 相机自运动估计（迟滞判定 + 位移换算）                 | ✅ 完成       | 位移误差 ≤ 0.01 px 且**不随缩放比例变化**（原先差 `s²`，1080p 下 36 倍，见 `docs/交接文档.md` 坑 20）    |
@@ -38,7 +38,7 @@
 | **成对取帧（PairSource）**                            | ✅ 完成       | 按同步偏移取到"同一时刻"的左右帧，帧索引语义有回归测试                                                  |
 | **极线配对 + 三角测量**                               | ✅ 完成       | 合成真值：配对率 **100%**，三维误差 **1.3 mm**                                                          |
 | **双目整条链路**（真渲染 + 两路真检测）               | ✅ 完成       | clean 配对率 100% / 三维 RMSE **15.6 mm**（折算 1 m 处 **1.13 mm**）；realistic 99.4% / 31.6 mm         |
-| **真机标定 + 真机双目录制**                           | ⬜ **未做过** | 当前所有双目指标都是**合成真值**，见第十二节与 `docs/计划书.md` M1                                      |
+| **真机标定 + 真机双目录制**                           | ⚠️ **真机跑通，结果待提高** | 25 对真机标定：**基线 67.28 mm vs 实测 65 mm（差 3.5%，对应关系是对的）**；精度偏高（RMS 0.91 / 极线 0.81 px）的原因是**板只占画面 1.2%**。见 `docs/交接文档.md` §13.2                                      |
 | 双目接进实时主流程                                    | ⬜ 待做       | `stereo/` 模块已就绪，缺采集与显示编排                                                                  |
 | Savitzky-Golay / 3D 轨迹平滑                          | ⬜ 待做       | scipy 1.18.1 已装                                                                                       |
 | 三维可视化（Plotly / Unity）                          | ⬜ 待做       | `pip install plotly`（网络现可用）；matplotlib 3.11.2 已装可作备选                                      |
@@ -55,7 +55,7 @@
 > 双目的 **15.6 mm** 来自 `tests/selftest_stereo_branch.py`（另一套合成场景、双目三角测量）。
 > 两者基准不同，**不可直接比较大小**。
 
-> ✅ **2026-10-10 全量复核**：`tests/` 下**九个**回归测试全部输出"全部通过"，
+> ✅ **2026-10-14 全量复核**：`tests/` 下**二十二个**回归测试全部输出"全部通过"，
 > 且上表的每一项精度指标都与本文档记录**逐位一致**。
 > 复核时另修掉 3 个 bug（相机自运动的迟滞失效、位移换算差 `s²`、
 > PPT 预览的连线静默不画）。其中位移换算那个一直被合成场景盖住 ——
@@ -81,7 +81,7 @@ python apps/run_video.py outputs/videos/synthetic_ball.mp4 --out outputs/videos/
 
 # 3) 接真实摄像头（不写编号，启动时自动挑最优：优先外接、跳过标了「无关」的、跳过全黑流）
 python apps/run_realtime.py --method fusion
-#    想指定也行：--camera 0 用编号，--camera main 用角色名（需先 identify 固定）
+#    想指定也行：--camera 0 用编号；角色名（left/right）只对双目有意义
 ```
 
 ### 双目（研究思路主线）
@@ -399,7 +399,7 @@ python apps/tools/calibrate_color.py --camera 0
 python apps/run_realtime.py                       # 不指定相机：启动时自动挑最优 + 融合检测
 python apps/run_realtime.py --method color --preset white_ball   # 更快
 python apps/run_realtime.py --camera auto                 # 同上，显式写 auto
-python apps/run_realtime.py --camera main                 # 用角色名（需先 cameras.py identify）
+python apps/run_realtime.py --camera 0                    # 指定编号（编号会漂移，见相机章节）
 python apps/run_realtime.py --camera 0 --width 1280 --height 720 --fps 60   # 按编号（会漂移）
 
 # 4) 处理已有视频 / 图片（把自己的视频放到 assets/videos/）
@@ -424,7 +424,7 @@ python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.m
 
 | 参数              | 说明                                                                                   |
 | ----------------- | -------------------------------------------------------------------------------------- |
-| `--method`        | `color` / `hough` / `motion` / `fusion` / `yolo` / `yolo_sam`                          |
+| `--method`        | `color`（**默认**）/ `hough` / `motion` / `fusion` / `yolo` / `yolo_sam`                |
 | `--preset`        | `white_ball` / `orange_ball` / `green_ball` / `blue_ball` / `red_ball` / `yellow_ball` |
 | `--ball-diameter` | **球的真实直径（米）**。三维测距必需，而且必须准 —— 填错多少，深度就错多少             |
 | `--focal`         | 相机像素焦距 fx。不填就按水平视场角估算（配置项 `camera.hfov_deg`，默认 60°）          |
@@ -432,6 +432,29 @@ python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.m
 | `--predict`       | `quadratic`（默认，推荐）/ `kalman`                                                    |
 | `--gravity-fit`   | 三维预测时用已知重力约束（更准，需要标定）                                             |
 | `--config`        | 读取标定好的 JSON 配置                                                                 |
+| `--display-width` | 显示图宽度（**默认 960**）。`cv2.imshow` 缩 1080p 要 17.7 ms/帧，先缩到 960 只要 1.84 ms |
+| `--detect-width`  | 检测跑在多宽的图上（默认 0 = 原始）。坐标自动换算回原图（实测误差 1~2 px）              |
+| `--log-every`     | 每隔几秒写一行健康度到日志（默认 5 秒；`0` = 不写）                                     |
+
+**方法怎么选：要看画面纹理，不能只看"哪个词听起来稳"**（2026-10-14 实测，1920x1080）：
+
+| 方法 | 简单画面（纯色底 + 一个圆） | **真实房间（书架、床、杂物）** |
+| ---- | --------------------------- | ------------------------------ |
+| `color` | 17.7 ms → 56 fps | **17.8 ms → 56 fps** |
+| `motion` | 18.5 ms | 15.5 ms |
+| `hough` | 132 ms | **4384.9 ms → 0.2 fps** |
+| `fusion` | 181 ms | **3740.5 ms → 0.3 fps** |
+
+`hough` 先做 Canny 边缘，**纹理一多边缘就爆炸**。真实房间**永远**是纹理丰富的，
+所以"合成图上测得挺快"没有参考价值 —— **默认因此从 `fusion` 改成了 `color`**。
+要用 `hough`/`fusion` 就必须配 `--detect-width 960`，否则几秒一帧。
+
+**窗口按键**：`f` / F11 = 全屏，`Esc` = **全屏时退出全屏**（不在全屏时才退出程序）。
+`q` 退出，`c` 切方法，`m` 看掩膜，`s` 存快照，`p` 预测开关，`v` 录制，`3` 三维面板，空格暂停。
+
+**日志**：`outputs/logs/realtime_<时间>.log` —— 含每 5 秒一行健康度
+（`cap` / `loop` / `detect` / `age` / `drop`）、逐帧明细（DEBUG）、按过的键。
+**卡顿时把那一行健康度发出来就能定位。**
 
 ---
 

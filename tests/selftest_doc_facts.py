@@ -193,6 +193,77 @@ def test_checker_catches_a_brand_new_drift() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_handover_section_13_claims() -> bool:
+    """交接文档 §13 里写的具体事实，必须与代码一致。
+
+    ## 为什么这条要有
+
+    `AGENTS.md` §6：「**代码与规范冲突 = 缺陷，不是"谁赢"的问题**……
+    并存就是漂移的开始，而这正是本项目反复出现的头号问题。」
+
+    `check_standards.py` 能查**引用**（文件/行号存不存在）与**计数**，
+    但它查不出"文档说默认是 25、代码里其实改成了别的"这类**语义漂移**。
+    所以这里把 §13（2026-10-13/14 那一轮）里写下的关键事实逐条对着代码核。
+
+    **只钉"文档与代码一致"，不钉具体数值本身** —— 数值可以改，
+    但改了就必须同时改文档，否则这条会红。这正是我们要的。
+    """
+    print("----- 交接文档 §13 的断言 vs 代码 -----")
+    handover = (ROOT / "docs" / "交接文档.md").read_text(encoding="utf-8")
+    # §13 必须存在（否则下面那些核对是在"文档被删了"的情况下空跑）
+    checks: list[tuple[str, bool]] = [
+        ("交接文档里有 §13（这一轮的记录没被删）", "## 13. " in handover),
+    ]
+
+    # (说明, 文件, 必须出现的片段)
+    FACTS = [
+        ("标定默认 25 / 10", "apps/calibrate_stereo.py",
+         ["default=25", "default=10"]),
+        ("GUI 把 --display-width 传下去", "启动程序.py", ["--display-width"]),
+        ("GUI 标定面板默认 25", "启动程序.py", ['"25"']),
+        ("GUI 用 resolve_roles（两个角色不撞车）", "启动程序.py", ["resolve_roles"]),
+        ("GUI 有任务管理器且杀进程树", "启动程序.py", ["def stop_task", "taskkill"]),
+        ("同名相机歧义会被拦下", "sphere_tracker/camera_registry.py",
+         ["class AmbiguousMatch", "def resolve_roles"]),
+        ("「打开了但没帧」报错且不自动换后端", "sphere_tracker/sources.py",
+         ["不会自动换后端", "拔掉相机再插回", "两路必须同后端"]),
+        ("搜索有时间预算", "sphere_tracker/sources.py", ["search_budget_s"]),
+        ("hough 有自己的半径上限", "sphere_tracker/detectors/hough.py",
+         ["hough_max_radius"]),
+        ("配置里有 hough_max_radius 项", "sphere_tracker/config.py",
+         ["hough_max_radius"]),
+        ("显示与检测两级缩放分开", "sphere_tracker/pipeline.py",
+         ["display_width", "render_scale", "set_detect_width"]),
+        ("Detection.scaled 存在（坐标换算）", "sphere_tracker/types.py",
+         ["def scaled"]),
+        ("实时检测装了日志", "apps/run_realtime.py", ['setup_logging("realtime")']),
+        ("实时检测有 --detect-width", "apps/run_realtime.py", ["--detect-width"]),
+        ("采集时实时提示板占比例", "calib/capture.py", ["def area_hint"]),
+        ("标定四级判定", "calib/stereo_calib.py", ["勉强可用", "board_area"]),
+        ("窗口助手用 setWindowProperty 开全屏", "apps/_window.py",
+         ["setWindowProperty", "WND_PROP_FULLSCREEN"]),
+    ]
+    for label, rel, needles in FACTS:
+        p = ROOT / rel
+        if not p.exists():
+            checks.append((f"{label}（文件存在）", False))
+            continue
+        src = p.read_text(encoding="utf-8")
+        missing = [n for n in needles if n not in src]
+        ok = not missing
+        if not ok:
+            print(f"    {rel} 缺：{missing}")
+        checks.append((label, ok))
+
+    # 默认检测方法必须是 color（§13.5 的核心结论之一）
+    cfg = (ROOT / "sphere_tracker" / "config.py").read_text(encoding="utf-8")
+    checks.append(("默认检测方法是 color（不是 fusion）", 'method: str = "color"' in cfg))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("文档事实自测（外壳：调用 check_standards.py 这个权威实现）")
@@ -201,7 +272,8 @@ def main() -> int:
     for fn in (test_count_and_naming,
                test_tests_are_registered_in_agents_md,
                test_authoritative_checker_passes,
-               test_checker_catches_a_brand_new_drift):
+               test_checker_catches_a_brand_new_drift,
+               test_handover_section_13_claims):
         results.append(fn())
         print()
     ok = all(results)
