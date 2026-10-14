@@ -375,6 +375,43 @@ def test_from_args(base: Path) -> bool:
     checks.append(("--left-dir/--right-dir -> dir 帧源", src.kind == "dir"))
     src.release()
 
+    # ---- `--backend auto` 不许被折叠成某个具体后端（2026-10-14 加）----
+    #
+    # 守的真缺陷：`from_args` 原来把 `None`（= auto）
+    # **又赋成 `INDEX_BACKEND`（MSMF）**，于是 `PairSource` 里那份
+    # `[("DSHOW", ...), ("MSMF", ...)]` 成对候选顺序**从来没被走到过** ——
+    # 函数名叫 `auto`，行为却是"强制 MSMF"。实测后果（真机标定）：
+    #
+    #     MSMF : idx1=None（读 12 帧全空）  idx0=1920x1080
+    #     DSHOW: idx1=1920x1080            idx0=1920x1080
+    #
+    # 即 MSMF 对其中一台根本不给帧，而 `auto` 必选它 → 标定跑不起来，
+    # 还打出一条把人引向"换 USB 口"的错误建议。
+    #
+    # 判据是**源码级**的（与 `selftest_doc_facts` 里那几条同一手法）：
+    # 这一点要真起相机才验得了，而"auto 传了什么给 PairSource"是纯源码事实。
+    import cv2 as _cv2
+
+    from stereo.pair_source import resolve_backend
+    checks.append(("resolve_backend('auto') == None（auto 就是「不指定」）",
+                   resolve_backend("auto") is None))
+    checks.append(("resolve_backend('') == None", resolve_backend("") is None))
+    checks.append(("resolve_backend('dshow') == CAP_DSHOW",
+                   resolve_backend("dshow") == _cv2.CAP_DSHOW))
+    checks.append(("resolve_backend('msmf') == CAP_MSMF",
+                   resolve_backend("msmf") == _cv2.CAP_MSMF))
+
+    pair_src = (ROOT / "stereo" / "pair_source.py").read_text(encoding="utf-8")
+    body = pair_src.split("def from_args(")[1].split("\ndef ")[0]
+    # 这段代码块一旦出现，就说明 auto 又被折叠成固定后端了
+    checks.append(("from_args 里**不再**把 None 折叠成 INDEX_BACKEND"
+                   "（否则 auto 名不副实）",
+                   "api = INDEX_BACKEND" not in body))
+    checks.append(("from_args 确实把 api 传给了 PairSource（不是传了个死值）",
+                   "backend=api" in body))
+    checks.append(("auto 时会打印「这次按成对顺序试」（可诊断）",
+                   "成对" in body))
+
     try:
         from_args(ns())
     except RuntimeError:

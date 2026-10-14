@@ -354,13 +354,24 @@ class CameraPairReader(FrameReader):
             self.cams = opened                          # type: ignore[assignment]
             break
         if not self.cams:
+            # ⚠️ 2026-10-14 重写：原来的文案把**所有**失败都归给"USB 带宽/集线器"，
+            # 于是给出"换 USB 口"的建议。而真实原因常常完全不是那个 ——
+            # 用户那次实测：相机 0 用 MSMF 1.2 秒就开好了，相机 1 用 MSMF
+            # **读 12 帧全空**（`-2147483638`），换到 DSHOW 两路都正常。
+            # 那是**后端**问题，换 USB 口一点用都没有。
+            hint = (
+                "\n怎么定位（按代价从小到大）：\n"
+                "  ① **换一个后端**：加 `--backend dshow`（或 `--backend msmf`）再跑一次。\n"
+                "     本机实测就是这一条解决了问题：MSMF 对其中一台读不到帧，DSHOW 正常。\n"
+                "  ② 看上面每一路的报错：**两台都失败**多半是后端/驱动；\n"
+                "     **只有一台失败**先怀疑那一台（换线、换口、单独打开试试）。\n"
+                "  ③ 排除了后端再怀疑链路：把两台插到机身上**不同的 USB 口**\n"
+                "     （不要走同一个集线器/扩展坞）。\n"
+                "  ④ 都试过还不行：跑 `apps/tools/camera_quality.py` 做画质会诊（它能区分"
+                "「带宽/链路」与「光学/曝光」两类问题）。")
             raise RuntimeError(
                 f"左右相机（{left_index} / {right_index}）无法用同一个后端同时打开：\n  "
-                + "\n  ".join(errors) +
-                "\n最常见的原因：两台型号相同的外接相机挂在同一个 USB 集线器上，"
-                "带宽/枚举受限。\n"
-                "建议：把两台相机分别插到笔记本机身上**不同的 USB 口**"
-                "（不要走同一个集线器），然后再试。")
+                + "\n  ".join(errors) + hint)
 
         self._primed = False
         self.width = self.cams[0].info.width
@@ -640,16 +651,26 @@ def from_args(args) -> PairSource:
         #
         # 顺带：MSMF 在 1080p 下能跑 30fps，DSHOW 会协商成 YUY2 未压缩掉到
         # 4.3fps（见 sources.py 里 optimize_mode 的注释），所以 MSMF 两边都更优。
+        #
+        # ⚠️ **2026-10-14 修：`auto` 原来被折叠成 `INDEX_BACKEND`（= MSMF）**，
+        # 于是 `PairSource` 里那份 `[("DSHOW", ...), ("MSMF", ...)]` 候选顺序
+        # **从来没被走到过** —— 函数名叫 `auto`，行为却是"强制 MSMF"。
+        # 实测后果（用户真机跑标定，连续两轮一致）：
+        #
+        #     MSMF : idx1=None（读 12 帧全空）  idx0=1920x1080
+        #     DSHOW: idx1=1920x1080            idx0=1920x1080
+        #
+        # 即 **MSMF 对其中一台根本不给帧**，而 `auto` 必选它 → 标定跑不起来，
+        # 还打出一条把人引向"换 USB 口"的错误建议（那台相机在 DSHOW 上好好的）。
+        #
+        # 现在 `auto` 传 `None`，让 `PairSource` 的**成对挑选**真正生效：
+        # 先把两路都用 DSHOW 开，哪个开不了就**整对**换 MSMF ——
+        # 依然绝不会两路混用不同后端（那正是原注释担心的）。
         backend_arg = getattr(args, "backend", None)
         api = resolve_backend(backend_arg)
         if api is None:
-            # 默认后端取自 sources.INDEX_BACKEND —— 全项目只此一份答案，
-            # 免得这里写 MSMF、别处写 DSHOW 又漂移成两种行为。
-            from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME
-
-            api = INDEX_BACKEND
-            print(f"[后端] 未指定 --backend，相机源默认用 {INDEX_BACKEND_NAME}"
-                  "（序号在 DSHOW/MSMF 下含义不同；MSMF 与设备枚举顺序一致）")
+            print("[后端] 未指定 --backend（auto）：按 DSHOW → MSMF 的顺序"
+                  "**成对**试着打开，两路必须用同一个后端")
         return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,
                           backup_camera=getattr(args, "backup_camera", None),

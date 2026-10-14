@@ -392,9 +392,14 @@ class CameraSource(VideoSource):
             print(f"[相机 {index}] {msg}{suffix}", flush=True)
 
         if self.cap is None and len(candidates) * len(res_candidates) > 1:
+            # ⚠️ 这里原来写死"**MSMF 后端单次可能要 20 秒以上**"。但走 DSHOW
+            # 时它照样打这一句（实测：`--backend dshow` 的日志里也有），
+            # 于是读者会以为"在用 MSMF"——用户 2026-10-14 两次被它误导。
+            # 改成把**本次真的要试的后端**列出来，不再替某一种后端说话。
+            tried = "、".join(n for n, _a in candidates) or "（无）"
             _log(f"开始逐个尝试打开：{len(candidates)} 个后端 × "
-                 f"{len(res_candidates)} 个分辨率。"
-                 f"**MSMF 后端单次可能要 20 秒以上，请耐心等**")
+                 f"{len(res_candidates)} 个分辨率（本次试：{tried}）。"
+                 f"**个别后端单次可能要 20 秒以上，请耐心等**")
         # ---- **总时间预算**（2026-10-14 加）----
         #
         # 实测：相机出不了帧时，MSMF 的**每一次** `cap.read()` 都要 **10 秒**才返回失败
