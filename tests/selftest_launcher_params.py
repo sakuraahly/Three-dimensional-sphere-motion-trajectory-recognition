@@ -128,6 +128,40 @@ def main() -> int:
 
     results: list[tuple[str, bool]] = []
 
+    # ---- 界面默认值必须与命令行/文档一致（2026-10-14 加）-----------------
+    # 为什么要有这一条：这里曾经是 `METHODS[0] = "fusion"` + `set("fusion")`，
+    # 而 `run_realtime.py --method` 默认是 `color`、`docs/用户手册.md` §3.1
+    # 也写着"`color`（默认，最快）"。于是**从界面走的人必然吃上 fusion**
+    # 在真实纹理下的 265 ms/帧（实测 loop 3.7 fps、丢帧 91%），
+    # 而界面上没有任何迹象说明这个选项慢在哪 ——
+    # 与 `--target` 当年没传下去是同一类缺陷（见 `交接文档.md` §13.1）。
+    # 所以钉两件：界面默认 == 文档默认，且与脚本默认**逐字相同**。
+    print("----- 0. 检测方法的默认值必须与命令行一致 -----")
+    # `run_realtime.py` 的 `--method` 默认是 `None`，不传时沿用
+    # `DetectorConfig.method`。所以"脚本默认"要从**真正生效的那处**取 ——
+    # 直接用 `AppConfig()` 读，而不是去 grep 源码字符串
+    # （我第一版就是 grep `"color" in rt_src`，写成了一条会被正确实现判红的坏断言）。
+    from sphere_tracker.config import AppConfig as _AppConfig
+    script_default = _AppConfig().detector.method
+    got_default = app.method.get()
+    rt_src = (ROOT / "apps" / "run_realtime.py").read_text(encoding="utf-8")
+    print(f"  界面默认 = {got_default!r}；"
+          f"DetectorConfig 的默认（= 不传 --method 时生效）= {script_default!r}")
+    checks_default = [
+        (f"界面默认检测方法与脚本默认逐字相同（{script_default}）",
+         got_default == script_default),
+        ("下拉框首项就是默认值（改列表顺序不会让默认值漂走）",
+         bool(mod.METHODS) and mod.METHODS[0] == got_default),
+        ("color 排在 fusion 之前（默认项不该埋在列表中间）",
+         mod.METHODS.index("color") < mod.METHODS.index("fusion")),
+        ("脚本侧确实把 --method 的缺省交给配置（没另写一个默认值）",
+         "args.method" in rt_src and "cfg.detector.method = args.method" in rt_src),
+    ]
+    for name, ok in checks_default:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+        results.append((name, ok))
+    print()
+
     def expect(label: str, ok_expected: bool, contains: str = "",
                absent: str = "") -> None:
         box.msgs.clear()

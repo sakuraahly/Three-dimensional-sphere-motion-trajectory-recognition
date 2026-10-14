@@ -45,7 +45,16 @@ INK = "#1f2937"
 MUTED = "#6b7280"
 BG = "#eef2f8"
 
-METHODS = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]
+# 检测方法下拉框。**顺序有意义**：第一项是默认值（见下面 `self.method.set(METHODS[0])`）。
+# `color` 排第一，与 `run_realtime.py:--method` 的默认值、以及
+# `docs/用户手册.md` §3.1「`color`（默认，最快）」一致。
+#
+# ⚠️ 2026-10-14 修：这里原来是 `["fusion", ...]` 且 `set("fusion")`，于是
+# **界面默认 fusion、命令行默认 color** —— 用户从界面走就必然吃上
+# fusion 在真实纹理下 265 ms/帧（实测 loop 3.7 fps、丢帧 91%），
+# 而文档三处都写着"默认 color"。界面与命令行的默认值必须一致，
+# 否则"界面所见"与"文档所承诺"就是两份东西（同一个毛病在 `--target` 上犯过一次）。
+METHODS = ["color", "fusion", "hough", "motion", "yolo", "yolo_sam"]
 PRESETS = ["不使用", "white_ball", "orange_ball", "green_ball",
            "blue_ball", "red_ball", "yellow_ball"]
 # 左右下拉的默认项：直接给**角色名**（left/right），绑定的设备身份不随 USB 口漂移。
@@ -604,7 +613,7 @@ class Launcher(tk.Tk):
 
         ttk.Label(box, text="检测方法").grid(row=1, column=4, sticky="e", pady=4)
         self.method = ttk.Combobox(box, values=METHODS, width=10, state="readonly")
-        self.method.set("fusion")
+        self.method.set(METHODS[0])          # 取列表首项 = 与命令行/文档同一个默认值
         self.method.grid(row=1, column=5, sticky="w", padx=(4, 4), pady=4)
 
         ttk.Label(box, text="颜色预设").grid(row=2, column=0, sticky="e", pady=4)
