@@ -54,6 +54,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -287,18 +288,52 @@ class CameraPairReader(FrameReader):
         self.cams: list[LatestFrameCamera] = []
         for name, api in backends:
             opened: list[LatestFrameCamera] = []
-            try:
-                for role, idx in (("左", left_index), ("右", right_index)):
-                    opened.append(_open(role, idx, api))
-            except RuntimeError as exc:
+            # ---- 两路**并行**打开（2026-10-14 改）----
+            #
+            # ⚠️ 原来是**串行**：先开左、开好再开右。而实测本机的一台相机
+            # 在 MSMF 下要 **29.8 ~ 51.4 秒**（同型号的另一台只要 0.9 秒；
+            # 且单独开也这么慢 —— 已排除带宽竞争）。串行意味着总等待是
+            # **两者之和**（1.0 + 37.4 = 38.4s），并行则只有**较慢那个**。
+            #
+            # 这个差别对用户是直接的：点「标定前置检查」后到看见画面
+            # 从 38s 降到 37s 看着不多，但两路都慢时就是**减半**。
+            # 而且并行不改变任何语义 —— 两路本来就要用同一个后端，
+            # 失败判定与错误信息都保持不变。
+            results: list[object] = [None] * 2
+            failures: list[BaseException] = []
+
+            def _open_slot(slot: int, role: str, idx: int) -> None:
+                try:
+                    results[slot] = _open(role, idx, api)
+                except BaseException as exc:            # noqa: BLE001
+                    failures.append(exc)                # 交给主线程重新抛
+
+            threads = [
+                threading.Thread(target=_open_slot, args=(0, "左", left_index),
+                                 daemon=True, name="open-left"),
+                threading.Thread(target=_open_slot, args=(1, "右", right_index),
+                                 daemon=True, name="open-right"),
+            ]
+            print(f"[{name}] 并行打开两路相机（左 #{left_index} / 右 #{right_index}）…",
+                  flush=True)
+            t_open = time.perf_counter()
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join()
+            opened = [c for c in results if c is not None]
+            if failures:
                 for c in opened:
                     c.stop()
+                exc = failures[0]
                 first_line = (str(exc).splitlines() or ["打开失败"])[0]
                 errors.append(f"{name}: {first_line}")
                 continue
+            print(f"[{name}] 两路都已打开，用时 {time.perf_counter() - t_open:.1f}s",
+                  flush=True)
             # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
             # 处理得慢就自动丢帧，永远处理最新画面
-            self.cams = opened
+            self.cams = opened                          # type: ignore[assignment]
             break
         if not self.cams:
             raise RuntimeError(

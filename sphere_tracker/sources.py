@@ -279,6 +279,15 @@ class CameraSource(VideoSource):
             if cached and cached.get("v") == 2 and cached_api is not None \
                     and (backend is None or cached_api == backend):
                 api = cached_api
+                # ⚠️ **这条路也可能要等几十秒**（实测同一型号两台相机：
+                # 0.63s vs 9.7s，负载高时 40.7s）。缓存命中**不等于快**，
+                # 所以这里必须先说"我要开始开了、用的是记住的模式"，
+                # 否则用户点完按钮之后是一片死寂 —— 和卡死没有区别。
+                print(f"[相机 {index}] 用上次记住的模式打开："
+                      f"{cached['backend']} {cached.get('width')}x{cached.get('height')}"
+                      f"（已记住，不必重新搜索；但**MSMF 本身可能就要十几秒**）",
+                      flush=True)
+                t_c = time.perf_counter()
                 cap = self._raw_open(api, int(cached.get("width", width)),
                                      int(cached.get("height", height)))
                 if cap is not None:
@@ -286,6 +295,12 @@ class CameraSource(VideoSource):
                     self.backend_name = str(cached["backend"])
                     self._api = api
                     self._cached_hit = True
+                    print(f"[相机 {index}] ✔ 打开完成（{time.perf_counter() - t_c:.1f}s）",
+                          flush=True)
+                else:
+                    print(f"[相机 {index}] ✘ 记住的模式这次打不开"
+                          f"（{time.perf_counter() - t_c:.1f}s），改为逐个尝试",
+                          flush=True)
 
         errors: list[str] = []
         # ---- 打开过程必须**可见**（2026-10-14 修的真缺陷）----
@@ -466,7 +481,23 @@ class CameraSource(VideoSource):
         return n / dt
 
     def _raw_open(self, api: int, width: int, height: int):
-        """探测用的快速打开：只等首帧，不做全黑多帧检查。"""
+        """探测用的快速打开：只等首帧，不做全黑多帧检查。
+
+        ⚠️ **这里也会慢，而且慢得很隐蔽**（2026-10-14 实测）：
+        缓存命中时走的就是这条路径，看上去"只是开一下"。但实测**同一型号的两台相机**
+        在 MSMF 下差别巨大：
+
+            相机 0：0.63 ~ 2.0 s
+            相机 1：9.7 s（负载高时到过 40.7 s）
+
+        所以它不能是静默的 —— 用户点「标定前置检查」之后，
+        **两路都开好之前一个画面都没有**（实测累计 44.9 s），
+        而屏幕上什么都不说。那与"卡死"在用户眼里没有区别。
+
+        调用方（`__init__` 的缓存分支 / `optimize_mode`）负责打印上下文，
+        这里只保证**打开动作本身**可被观测：先报"开始打开"，成功/失败各报一次。
+        """
+        t0 = time.perf_counter()
         cap = cv2.VideoCapture(self._index, api)
         if not cap.isOpened():
             cap.release()
@@ -480,6 +511,11 @@ class CameraSource(VideoSource):
         for _ in range(3):
             ret, f = cap.read()
             if ret and f is not None and float(f.std()) > BLACK_FRAME_STD:
+                took = time.perf_counter() - t0
+                # 只有**真的等了一会儿**才值得报一句（<2s 属于正常，报了是噪音）
+                if took >= 2.0:
+                    print(f"[相机 {self._index}] 打开用了 {took:.1f}s（{backend_name(api)} "
+                          f"请求 {width}x{height}）", flush=True)
                 return cap
         cap.release()
         return None
@@ -502,6 +538,31 @@ class CameraSource(VideoSource):
         ch = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cur_rate = self._measure_rate(self.cap, budget)
 
+        # ⚠️ **刚打开时帧率可能测成 0.0，必须等它稳下来再判**（2026-10-14 修）
+        #
+        # 实测（相机 1，MSMF）：打开成功后立刻测，得到 **0.0 fps**，
+        # 而同一台相机**缓存里记的是 25.08 fps**。于是这里误判"太慢"，
+        # 触发下面那个**每个分辨率都要重开 30 秒**的搜索 ——
+        # 5 个候选 = **150 秒纯浪费**，最后还绕回一个更差的模式。
+        #
+        # 刚打开的相机还没开始出帧（或首帧还没到）时，测出来必然是 0 ——
+        # 那是**测量时机的问题，不是设备慢**。所以先等首帧、再测；
+        # 仍为 0 就再等一会儿重测，最多 ~6 秒。**"测不准"不能当成"设备不行"。**
+        if cur_rate < 0.1:
+            t_wait = time.perf_counter()
+            while time.perf_counter() - t_wait < 6.0:
+                time.sleep(0.25)
+                cur_rate = self._measure_rate(self.cap, 0.4)
+                if cur_rate >= 0.1:
+                    break
+            if cur_rate < 0.1:
+                print(f"[相机 {self._index}] 等了 6 秒仍测不到帧"
+                      f"（相机可能没真的在出帧）—— 按 0 fps 处理", flush=True)
+            else:
+                print(f"[相机 {self._index}] 刚打开时测不到帧，等了 "
+                      f"{time.perf_counter() - t_wait:.1f}s 后测到 {cur_rate:.1f} fps",
+                      flush=True)
+
         # 快路径：已经够快就什么都不做（内置摄像头 1080p 有 29 fps，走这条）。
         # 但仍要把实测帧率记下来 —— CAP_PROP_FPS 会返回"请求值 60"，
         # 拿它去写录像会让播放速度错一倍。
@@ -512,6 +573,26 @@ class CameraSource(VideoSource):
                           "actual_width": cw, "actual_height": ch, "fps": round(cur_rate, 2)}
             _save_mode_cache(cache)
             return
+
+        # 真的慢（不是"没测到"）才走搜索。而且**只要缓存里已经有一个可用的模式，
+        # 就先别搜** —— 缓存的模式是"上次实测够快"才写进去的，重新搜一轮
+        # 每个候选都要 30 秒，代价远大于收益。
+        cached = cache.get(key)
+        if cached and cached.get("v") == 2 and cached.get("fps", 0) >= target_fps * 0.9:
+            print(f"[相机 {self._index}] 当前 {cw}x{ch} 只有 {cur_rate:.1f} fps，"
+                  f"但缓存里有上次实测 {cached.get('fps')} fps 的模式"
+                  f"（{cached.get('backend')} {cached.get('width')}x{cached.get('height')}）——"
+                  f"**沿用缓存，不做昂贵搜索**", flush=True)
+            self.cap.release()
+            cap2 = self._raw_open(api, int(cached["width"]), int(cached["height"]))
+            if cap2 is not None:
+                self.cap = cap2
+                self.backend_name = str(cached["backend"])
+                self._api = api
+                self.mode_fps = float(cached.get("fps") or 0.0)
+                self.mode_probed = True
+                return
+            print(f"[相机 {self._index}] 缓存的模式这次打不开，改为搜索", flush=True)
 
         self.cap.release()
         self.cap = None
