@@ -410,15 +410,20 @@ def list_devices() -> list[DeviceEntry]:
 # --------------------------------------------------------------------------- #
 # 探测与自动选择
 # --------------------------------------------------------------------------- #
-def _default_opener(index: int, width: int, height: int, fps: int):
+def _default_opener(index: int, width: int, height: int, fps: int,
+                    backend: int | None = None):
     from .sources import INDEX_BACKEND, CameraSource  # 惰性导入：不探测就用不到 cv2
 
     # **必须固定后端**：传进来的 index 是 PnP 枚举的位次（`DeviceEntry.order`），
     # 而 cv2 各后端有自己的枚举顺序 —— 用 auto 会读到"另一台相机"的属性，
     # 于是自动挑相机、画质会诊、identify 全都在评错对象。
     # 完整实测对照见 sources.py 的 INDEX_BACKEND 注释。
+    #
+    # `backend=None` = 用 `INDEX_BACKEND`；显式给值时**只开那一个**，
+    # 供 `probe_index_with_fallback()` 在上面做受控回退（理由见那个函数）。
     return CameraSource(index=index, width=width, height=height, fps=fps,
-                        backend=INDEX_BACKEND, optimize=False)
+                        backend=INDEX_BACKEND if backend is None else backend,
+                        optimize=False)
 
 
 def probe_index(
@@ -428,11 +433,17 @@ def probe_index(
     height: int = 720,
     fps: int = 30,
     opener=None,
+    backend: int | None = None,
 ) -> ProbeResult:
-    """打开某个索引、读一帧，判断"能不能用"。任何异常都变成 ok=False，不抛。"""
+    """打开某个索引、读一帧，判断"能不能用"。任何异常都变成 ok=False，不抛。
+
+    `backend=None` 走 `_default_opener`（= `INDEX_BACKEND`，一次尝试）。
+    显式给后端时**只试那一个**（供测试与 `--backend` 覆盖用）。
+    """
     open_fn = opener or _default_opener
+    kwargs = {} if opener is not None else {"backend": backend}
     try:
-        src = open_fn(index, width, height, fps)
+        src = open_fn(index, width, height, fps, **kwargs)
     except Exception as exc:  # noqa: BLE001 - 打不开的原因五花八门，统一收成一句话
         first = (str(exc).splitlines() or ["打不开"])[0]
         return ProbeResult(index=index, ok=False, error=first)
@@ -459,6 +470,63 @@ def probe_index(
         return ProbeResult(index=index, ok=False, error=str(exc).splitlines()[0])
     finally:
         _call(getattr(src, "release", lambda: None), default=None)
+
+
+def probe_index_with_fallback(
+    index: int,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+) -> ProbeResult:
+    """探测一台相机，主后端给不出帧时**受控回退**到另一个后端。
+
+    ## 为什么探测路径可以有回退，而实时取帧路径刻意没有
+
+    `sources.py` 里有一段长注释说明"**不做自动换后端**"：同一进程里混用
+    DSHOW + MSMF 会让 MSMF 那路"打开成功但抓不到帧"，所以实时取帧**宁可
+    说清让人显式选**（那次实测：自动换完更糟，还把分辨率降到 1280x720 写进缓存）。
+
+    那条结论针对的是**同时开着两路、并长期持有**的场景。
+    而这里（探测）是**短命的一次试开**：开一台、读一帧、立刻 `release()`，
+    不存在"MSMF 那路一直挂着"。所以回退是安全的 —— 而且必要：
+
+    `_default_opener` 用的是 `INDEX_BACKEND`（MSMF，2026-10-10 的实测选择），
+    而 MSMF 在本机是**间歇性**坏的。2026-10-14 一个下午就见到它来回变：
+
+        MSMF idx=1:  好 9.2s / 好（640x480）→ 坏 34.3s → 坏 33.5s → 又好
+
+    而**同一台相机在 DSHOW 上每次都秒开、15/15 帧、同样能给 1920x1080**。
+    坏的时候 `probe_index` 要等 **33 秒**才失败，于是
+    `cameras.py list --probe` / 画质会诊 / 自动挑相机**全都报"一帧都拿不到"**，
+    用户会以为相机坏了。
+
+    回退**不改变探测语义**：`DeviceEntry.order` 是 PnP 位次，而本机实测
+    **DSHOW 与 MSMF 的分辨率枚举一致**（idx 0 = 1920x1080、idx 1 = 640x480，
+    两个后端给的是同一组值），所以"判定这台能不能用"用哪个后端都一样，
+    只有**设备身份**才依赖后端枚举顺序 —— 那件事由 `cameras.py identify`
+    目视确认 + 记 `identity`/`port` 解决，不靠这里。
+    """
+    from .sources import (INDEX_BACKEND, WINDOWS_BACKENDS,  # 惰性：不探测用不到 cv2
+                          backend_name)
+
+    r = probe_index(index, width=width, height=height, fps=fps, backend=INDEX_BACKEND)
+    if r.ok:
+        return r
+    if current_platform() != "windows":
+        return r          # 非 Windows 没有第二套后端可回退（设计上退化为纯索引）
+    for name, api in WINDOWS_BACKENDS:
+        if api == INDEX_BACKEND or name == "ANY":
+            continue
+        alt = probe_index(index, width=width, height=height, fps=fps, backend=api)
+        if alt.ok:
+            print(f"[相机 {index}] {backend_name(INDEX_BACKEND)} 给不出帧，"
+                  f"但 {name} 正常（{alt.width}x{alt.height} std {alt.std:.1f}）——"
+                  f"这次判定用 {name} 的结果", flush=True)
+            return ProbeResult(index=index, ok=True, width=alt.width, height=alt.height,
+                               fps=alt.fps, std=alt.std,
+                               error=f"（{backend_name(INDEX_BACKEND)} 无帧，改用 {name} 探到）")
+    return r
 
 
 def is_avoided(name: str, settings: dict | None = None) -> bool:
@@ -552,7 +620,7 @@ def camera_availability(
     *,
     need: int = 1,
     devices: list[DeviceEntry] | None = None,
-    probe=probe_index,
+    probe=probe_index_with_fallback,
     reg: Registry | None = None,
     settings: dict | None = None,
 ) -> Availability:
@@ -673,7 +741,7 @@ def select_cameras_detailed(
     *,
     need: int = 1,
     devices: list[DeviceEntry] | None = None,
-    probe=probe_index,
+    probe=probe_index_with_fallback,
     reg: Registry | None = None,
     settings: dict | None = None,
     indices: list[int] | None = None,
@@ -712,7 +780,7 @@ def select_cameras(
     *,
     need: int = 1,
     devices: list[DeviceEntry] | None = None,
-    probe=probe_index,
+    probe=probe_index_with_fallback,
     reg: Registry | None = None,
     settings: dict | None = None,
     indices: list[int] | None = None,

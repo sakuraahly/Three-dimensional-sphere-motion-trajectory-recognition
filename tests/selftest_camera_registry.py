@@ -656,6 +656,104 @@ def test_ignored(tmp: Path) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+def test_probe_fallback_and_cache_invalidation() -> bool:
+    """第 12 节：探测的回退 + 坏缓存必须自己作废（2026-10-14 加）。
+
+    ## 守的是两个**只在真机上才看得见**的缺陷
+
+    **① 探测后端被写死成 MSMF，而它是间歇性坏的。**
+    `_default_opener` 用 `INDEX_BACKEND`（= MSMF，2026-10-10 的实测选择），
+    但 2026-10-14 一个下午就见到它来回变：
+    `MSMF idx=1` 好 9.2s → 好 → **坏 34.3s** → **坏 33.5s** → 又好。
+    而同一台相机在 **DSHOW 上每次都秒开、15/15 帧、同样给 1920x1080**。
+    坏的时候 `probe_index` 要等 33 秒才失败，于是
+    `cameras.py list --probe` / 画质会诊 / 自动挑相机**全报"一帧都拿不到"**，
+    用户会以为相机坏了。所以探测路径加**受控回退**（实时取帧路径**刻意不加**，
+    因为混用后端会让 MSMF 那路挂掉，见 `sources.py` 的长注释）。
+
+    **② 缓存只在"打不开"时作废，不在"打得开但拿不出帧"时作废。**
+    `_raw_open` 已经校验首帧，所以它返回 `None` 就意味着**这条缓存是坏的**；
+    旧代码只打印一句就往下搜，**缓存不删** → 每次启动都白等一遍
+    （实测 34.3 s）。这正是 `交接文档.md` 坑 35「缓存没有过期概念」的同一件事。
+
+    ## 判据怎么做到"不依赖真机"
+
+    回退那条用**替身**注入（第一次"无帧"、第二次"有帧"），
+    并断言替身被调了**两次**且拿到的是第二次的结果 ——
+    否则"回退没生效"会与"回退生效了"长得一样（坑 24：替身测试必须断言
+    "替身真的走到了那一步"）。缓存那条用临时 JSON 做真实的读写往返。
+    """
+    print("----- 12. 探测回退 + 坏缓存自动作废 -----")
+    import json as _json
+    import sphere_tracker.camera_registry as cr
+
+    checks: list[tuple[str, bool]] = []
+
+    # ---- ① 回退：主后端无帧 -> 换一个后端再探 ----
+    if cr.current_platform() != "windows":
+        print(f"  [跳过] 平台 {cr.current_platform()}（没有第二套后端可回退）")
+    else:
+        calls: list[int | None] = []
+
+        def fake_probe(idx, *, width=0, height=0, fps=0, backend=None, opener=None):
+            calls.append(backend)
+            if len(calls) == 1:                      # 第一次：假装主后端无帧
+                return cr.ProbeResult(index=idx, ok=False, error="读不到画面")
+            return cr.ProbeResult(index=idx, ok=True, width=1280, height=720,
+                                  fps=30.0, std=42.0)   # 第二次：另一个后端正常
+
+        real = cr.probe_index
+        cr.probe_index = fake_probe                    # type: ignore[assignment]
+        try:
+            r = cr.probe_index_with_fallback(1)
+        finally:
+            cr.probe_index = real                      # type: ignore[assignment]
+        print(f"  替身调用 {len(calls)} 次，后端依次 = {calls}")
+        print(f"  回退结果：ok={r.ok} {r.width}x{r.height} std={r.std} note={r.error!r}")
+        checks += [
+            ("主后端无帧时会**真的再试一次**（替身被调 2 次）", len(calls) == 2),
+            ("两次用的是**不同**的后端（确实换了，不是原地重试）",
+             len(calls) == 2 and calls[0] != calls[1]),
+            ("回退成功时判定为可用（不再报「一帧都拿不到」）", r.ok is True),
+            ("结果带上了「这次是回退来的」痕迹（可诊断）", "改用" in (r.error or "")),
+        ]
+
+    # ---- ② 坏缓存：确认给不出帧时必须把自己删掉 ----
+    cache_path = cr._MODE_CACHE if hasattr(cr, "_MODE_CACHE") else None
+    if cache_path is None:
+        from sphere_tracker import sources as _s
+        cache_path = _s._MODE_CACHE
+    from sphere_tracker import sources as _src
+    backup = cache_path.read_text(encoding="utf-8") if cache_path.exists() else None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(_json.dumps({
+            "77": {"v": 2, "backend": "MSMF", "width": 1920, "height": 1080,
+                   "actual_width": 1920, "actual_height": 1080, "fps": 30.0},
+            "78": {"v": 2, "backend": "DSHOW", "width": 640, "height": 480,
+                   "actual_width": 640, "actual_height": 480, "fps": 30.0},
+        }), encoding="utf-8")
+        dropped = _src._drop_mode_cache(77)
+        left = _json.loads(cache_path.read_text(encoding="utf-8"))
+        dropped_again = _src._drop_mode_cache(77)
+        print(f"  删 77 -> {dropped}；剩下的键 = {sorted(left)}；再删一次 -> {dropped_again}")
+        checks += [
+            ("作废坏缓存返回 True（真的删到了）", dropped is True),
+            ("被作废的那条**不在**缓存里了", "77" not in left),
+            ("**别的相机不受影响**（78 还在）", "78" in left),
+            ("对不存在的键返回 False（幂等、不误报）", dropped_again is False),
+        ]
+    finally:
+        if backup is None:
+            cache_path.unlink(missing_ok=True)
+        else:
+            cache_path.write_text(backup, encoding="utf-8")
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_real_probe() -> bool:
     """有相机时额外验证真机枚举（无相机则跳过，不算不达标）。"""
     print("----- 附加：真机枚举（有相机才验证） -----")
@@ -716,6 +814,7 @@ def main() -> int:
             test_select_cameras(),
             test_from_args_compat(),
             test_ignored(tmp),
+            test_probe_fallback_and_cache_invalidation(),
         ]
         print()
         if args.probe:

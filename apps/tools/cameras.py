@@ -79,7 +79,11 @@ def cmd_list(args) -> int:
     if args.probe:
         indices = sorted({d.order for d in devices} | set(range(max_index + 1)))
         for i in indices:
-            probes[i] = cr.probe_index(i)
+            # 用带回退的版本：MSMF 在本机**间歇性**给不出帧（实测一个下午里
+            # 好→坏→坏→又好），而 DSHOW 一直正常。没有回退时这里会等 33 秒
+            # 然后报"一帧都拿不到"，用户会以为相机坏了。理由详见
+            # `camera_registry.probe_index_with_fallback()` 的文档串。
+            probes[i] = cr.probe_index_with_fallback(i)
 
     if args.json:
         payload = {
