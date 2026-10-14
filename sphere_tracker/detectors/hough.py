@@ -37,7 +37,10 @@ class HoughDetector(BaseDetector):
             param1=self.cfg.hough_param1,
             param2=self.cfg.hough_param2,
             minRadius=int(self.cfg.min_radius),
-            maxRadius=int(self.cfg.max_radius),
+            # ⚠️ 用 hough **自己**的上限，不是物理约束 max_radius。
+            # HoughCircles 的代价随搜索半径区间线性上涨；实测 1080p 真实纹理下
+            # 用 200 要 4 秒一帧（见 config.py 的注释）。80 已经够用。
+            maxRadius=int(min(self.cfg.hough_max_radius, self.cfg.max_radius)),
         )
         out: list[Detection] = []
         if circles is None:

@@ -131,6 +131,17 @@ def parse_args() -> argparse.Namespace:
                    help="显示图宽度（像素）。默认 960，明显更顺；0 = 不缩放（原生分辨率）")
     p.add_argument("--log-every", type=float, default=5.0,
                    help="每隔几秒往日志写一行健康度（0 = 不写）")
+    # ---- 检测分辨率：真实纹理下这是**唯一有效**的提速杠杆 ----
+    #
+    # 实测（1080p，书架那种真实纹理）：color 17.8ms、hough **4384.9ms**、
+    # fusion **3740.5ms**。而同样的画面若是纯色合成图，hough 只要 132ms ——
+    # HoughCircles 的 Canny 边缘一多，累加器搜索就是指数级的。
+    #
+    # 默认 0 = 不缩（保持既有精度，不悄悄改变行为）。
+    # 想跑 fusion/hough 就**必须**开这个，否则 3.7 秒一帧。
+    p.add_argument("--detect-width", type=int, default=0,
+                   help="检测跑在多宽的图上（0=原始分辨率）。fusion/hough 在真实"
+                        "纹理下要几秒一帧，给 960 会快一个量级")
     return p.parse_args()
 
 
@@ -224,6 +235,11 @@ def main() -> int:
           f"{wins.fullscreen_hint()}，按 q 退出。")
 
     pipe = SpherePipeline(cfg)
+    if args.detect_width:
+        pipe.set_detect_width(args.detect_width)
+        print(f"检测跑在 {args.detect_width}px 宽的图上（坐标会自动换算回原图）。"
+              f"\\n  代价：小目标的定位精度会下降；换来的是 hough/fusion 从几秒一帧"
+              f"降到可用的量级。")
     writer: cv2.VideoWriter | None = None
     recording = False
     paused = False
@@ -325,7 +341,14 @@ def main() -> int:
                                  process_ms=process_ms)
                 last_frame, last_vis = frame, vis
                 if recording and writer is not None:
-                    writer.write(vis)
+                    # ⚠️ 录制**不能**录那张 960 的小图 —— 显示要小（省 imshow 开销），
+                    # 但存档要好。所以录制时按原始分辨率另渲一张（只有录制才付这份钱）。
+                    if args.display_width:
+                        rec_vis = pipe.render(frame, result, health=health,
+                                              render_scale=1.0)
+                    else:
+                        rec_vis = vis
+                    writer.write(rec_vis)
             else:
                 vis = (
                     last_vis

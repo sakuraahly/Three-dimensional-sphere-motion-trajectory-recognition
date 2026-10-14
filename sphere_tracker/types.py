@@ -47,6 +47,40 @@ class Detection:
     def diameter(self) -> float:
         return 2.0 * self.radius
 
+    def scaled(self, k: float) -> "Detection":
+        """把几何量乘 `k`，返回新对象（不改原对象）。
+
+        ## 用途：检测在缩小图上做，坐标要换算回原图
+
+        实测（2026-10-14）：`HoughCircles` 在**真实纹理**画面（书架那样）上
+        要 **4.4 秒一帧**（纯色合成图只要 132 ms）—— 因为 Canny 边缘一多，
+        累加器搜索量暴涨。降分辨率是唯一有效的杠杆。
+
+        但降了分辨率就**必须**把坐标换回来，否则：
+          · 圈画在错误位置；
+          · **半径错一倍，三维深度就错一倍**（`camera.depth_from_radius` 直接吃半径）。
+
+        ## ⚠️ `mask` 刻意**不缩放**
+
+        `mask` 是与原帧同尺寸的整帧布尔数组，"乘个系数"没有意义（那不是几何量）。
+        缩放后它被置空 —— 要用掩膜请按新尺寸重新算，**不要拿这个已经对不上的数组**。
+        留着错的数组比清掉更危险。`contour` 是点集，属于几何量，正常缩放。
+        """
+        if abs(k - 1.0) < 1e-9:
+            return self
+        return Detection(
+            x=self.x * k,
+            y=self.y * k,
+            radius=self.radius * k,
+            score=self.score,
+            method=self.method,
+            parts=dict(self.parts),
+            contour=(None if self.contour is None
+                     else np.asarray(self.contour, dtype=np.float64) * k),
+            mask=None,
+            extra=dict(self.extra),
+        )
+
 
 @dataclass
 class TrailPoint:

@@ -75,7 +75,7 @@ if str(ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from sphere_tracker.config import AppConfig
+from sphere_tracker.config import AppConfig, ColorConfig
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.stats import Health
 from sphere_tracker.types import Detection, FrameResult, TrailPoint
@@ -495,6 +495,90 @@ def test_display_width_contract() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_detect_width_rescales_coordinates() -> bool:
+    """`pipe.set_detect_width()` 的契约（2026-10-14 加）。
+
+    ## 这一节守什么
+
+    实测（1080p、**真实纹理**画面 —— 书架那种）：
+
+        color    17.8 ms
+        hough  4384.9 ms   ← 4.4 秒一帧
+        fusion 3740.5 ms   ← 3.7 秒一帧
+
+    而同样的帧若是**纯色合成图**，`hough` 只要 132 ms。差别在于 `HoughCircles`
+    先做 Canny，纹理一多边缘就爆炸。**真实房间永远是纹理丰富的**，
+    所以"合成图上测得挺快"没有参考价值 —— 这是本项目的老教训。
+
+    降检测分辨率是有效的杠杆，但降了分辨率就**必须把坐标换算回原图**：
+    不换算的话，圈画在错位置，而且**半径错一倍 → 三维深度错一倍**
+    （`camera.depth_from_radius` 直接吃半径）。
+
+    判据：**同一个球，在不同 `detect_width` 下解出的圆心/半径必须一致**
+    （换算正确 → 一致；漏换算 → 差一个倍率）。
+    """
+    print("----- detect_width：检测在缩图上跑，坐标必须换算回原图 -----")
+    checks: list[tuple[str, bool]] = []
+
+    # 造一个"灰底 + 一个大白球"的帧：color 检测器对它有稳定响应。
+    # 球放在**非中心**位置，这样"位置错一个倍率"会立刻暴露。
+    H, W = 1080, 1920
+    frame = np.full((H, W, 3), 60, np.uint8)
+    truth_x, truth_y, truth_r = 1300.0, 400.0, 90.0
+
+    def make() -> np.ndarray:
+        f = frame.copy()
+        cv2.circle(f, (int(truth_x), int(truth_y)), int(truth_r),
+                   (235, 235, 235), -1)
+        return f
+
+    got: dict[int, tuple[float, float, float]] = {}
+    for dw in (0, 960, 640):
+        cfg = AppConfig()
+        cfg.detector.color = ColorConfig.preset("white_ball")   # 白色球的预设
+        pipe = SpherePipeline(cfg)
+        if dw:
+            pipe.set_detect_width(dw)
+        res = None
+        for i in range(3):                          # 跑几帧让内部状态稳
+            res = pipe.process(make(), i * 0.033)
+        det = res.detection
+        if det is None:
+            print(f"  detect_width={dw or '原始':>6} -> **没检出**")
+            checks.append((f"detect_width={dw} 时能检出球", False))
+            continue
+        got[dw] = (det.x, det.y, det.radius)
+        print(f"  detect_width={dw or '原始':>6} -> "
+              f"({det.x:7.1f},{det.y:6.1f}) r={det.radius:6.1f}"
+              f"   真值 ({truth_x:.0f},{truth_y:.0f}) r={truth_r:.0f}")
+
+    checks.append(("三种检测宽度都能检出球", len(got) == 3))
+    if len(got) == 3:
+        base = got[0]
+        for dw in (960, 640):
+            g = got[dw]
+            dx = abs(g[0] - base[0])
+            dy = abs(g[1] - base[1])
+            dr = abs(g[2] - base[2])
+            print(f"  detect_width={dw} 与原始分辨率之差："
+                  f"位置 ({dx:.1f},{dy:.1f}) px  半径 {dr:.1f} px")
+            # 换算正确 -> 差在抗锯齿/取整的量级（几 px）；
+            # 漏换算 -> 位置差几百 px、半径差一个倍率。两者量级完全不同。
+            checks.append((f"detect_width={dw} 时**位置**换算正确（误差 < 15px，"
+                           f"漏换算会差几百 px）", dx < 15 and dy < 15))
+            checks.append((f"detect_width={dw} 时**半径**换算正确（误差 < 15px，"
+                           f"漏换算会差一个倍率 —— 深度会跟着错）", dr < 15))
+        # 与真值比：确认球确实被找到对的地方（不只是"两次都错得一样"）
+        bx, by, br = base
+        checks.append(("原始分辨率下与真值一致（位置 < 15px、半径 < 20px）",
+                       abs(bx - truth_x) < 15 and abs(by - truth_y) < 15
+                       and abs(br - truth_r) < 20))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("叠加层缩放自测（viz.scale：整张图所有元素一起缩放）")
@@ -508,7 +592,8 @@ def main() -> int:
                test_hud_separates_the_three_frame_rates,
                test_hud_shows_stall,
                test_content_area_grows_with_k_squared,
-               test_display_width_contract):
+               test_display_width_contract,
+               test_detect_width_rescales_coordinates):
         results.append(fn())
         print()
     ok = all(results)

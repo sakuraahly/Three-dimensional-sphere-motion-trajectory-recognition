@@ -55,6 +55,8 @@ class SpherePipeline:
         self._fps_ema = 0.0
         self._t0: float | None = None
         self._detector_error: str | None = None
+        # 检测输入宽度（None = 用原始分辨率）。见 set_detect_width。
+        self._detect_width: int | None = None
         # 相机自运动估计（手持/云台/平移拍摄时用它区分"画面在动"与"球在动"）
         self.motion_estimator = GlobalMotionEstimator(
             work_width=self.cfg.detector.motion_work_width,
@@ -74,6 +76,15 @@ class SpherePipeline:
         self._prev_gray = None
         self._frame_index = 0
         self._prev_t = None
+
+    def set_detect_width(self, width: int | None) -> None:
+        """让检测跑在**缩小的图**上（坐标会自动换算回原图）。
+
+        None / 0 = 不缩（默认，保持既有精度）。
+        见 process() 里那段长注释：真实纹理下 hough 在 1080p 上要 4.4 秒一帧，
+        降到 960 宽是唯一有效的杠杆。
+        """
+        self._detect_width = int(width) if width else None
 
     def _ensure_camera(self, frame: np.ndarray) -> None:
         if self.camera is not None:
@@ -123,14 +134,47 @@ class SpherePipeline:
         ctx = FrameContext(t=t, gray=gray, motion=motion, camera_moving=camera_moving)
 
         t_det = time.perf_counter()
+        # ---- 检测可以在**更小的图**上跑（2026-10-14 加）----
+        #
+        # ## 为什么这是必需的，不是优化
+        #
+        # 实测（1920x1080，**有真实纹理**的画面 —— 书架/床/杂物那种）：
+        #
+        #     color    17.8 ms  ->  56 fps
+        #     motion   15.5 ms  ->  64 fps
+        #     hough  4384.9 ms  -> 0.2 fps   ← **4.4 秒一帧**
+        #     fusion 3740.5 ms  -> 0.3 fps   ← **3.7 秒一帧**
+        #
+        # 而同样的画面如果是"纯色底 + 一个圆"，`hough` 只要 132 ms。
+        # 差别在于 `HoughCircles` 要先做 Canny，**纹理一多边缘就爆炸**，
+        # 累加器搜索量随边缘数暴涨。真实房间**永远**是纹理丰富的，
+        # 所以"合成图上测得挺快"完全没有参考价值 —— 这是本项目的老教训。
+        #
+        # 降分辨率是这里**唯一有效**的杠杆：像素少 4 倍，边缘与累加器都少一个量级。
+        # 代价是小目标的定位精度下降，所以：
+        #   · 默认**不降**（保持既有行为，避免悄悄改变精度）；
+        #   · 由 app 通过 `--detect-width` 显式打开，并在启用时打印代价。
+        detect_frame = frame
+        detect_scale = 1.0
+        if self._detect_width and 0 < self._detect_width < frame.shape[1]:
+            detect_scale = float(self._detect_width) / float(frame.shape[1])
+            detect_frame = cv2.resize(
+                frame, None, fx=detect_scale, fy=detect_scale,
+                interpolation=cv2.INTER_AREA)
         try:
-            detections = self.detector.detect(frame, ctx)
+            detections = self.detector.detect(detect_frame, ctx)
         except RuntimeError as exc:  # AI 后端未安装时给出清晰提示
             detections = []
             if self._detector_error is None:
                 self._detector_error = str(exc)
                 print(f"[检测器不可用] {exc}")
         detect_ms = (time.perf_counter() - t_det) * 1000.0
+
+        # 检测是在缩小的图上做的 -> **坐标必须换算回原图**。
+        # 不换算的话，圈会画在错位置、三维反投影也会全错
+        # （半径直接决定深度，半径错一倍深度就错一倍）。
+        if detect_scale < 1.0 and detections:
+            detections = [d.scaled(1.0 / detect_scale) for d in detections]
 
         best = detections[0] if detections else None
         track = self.tracker.update(detections, t)
@@ -212,23 +256,27 @@ class SpherePipeline:
 
     # ------------------------------------------------------------------
     def render(self, frame: np.ndarray, result: FrameResult,
-               health=None, display_width: int | None = None) -> np.ndarray:
+               health=None, display_width: int | None = None,
+               render_scale: float = 1.0) -> np.ndarray:
         """把结果画到帧上，返回新图（不修改输入）。
 
-        `display_width`：**只影响显示用的输出图宽度**（像素）。给 960 就返回
-        宽 960 的图，叠加层位置与线宽按同一倍率缩好 —— 也就是"看起来一样，
-        只是一张更小的图"。
+        ## 两个缩放参数**不是一回事**，别混
 
-        ## 为什么要有这个参数（2026-10-14 实测）
+        | 参数 | 管什么 | 什么时候用 |
+        | ---- | ------ | ---------- |
+        | `display_width` | **先缩图再画叠加**：把输出图缩到指定宽度 | 实时显示（省 imshow 的缩放开销） |
+        | `render_scale` | **先放大再画叠加**：整张画布（含叠加）等比放大 | 想把叠加层画大些看细节 |
 
-        `cv2.imshow` 把一个 1920x1080 的图**缩到窗口里**显示，代价高得离谱：
+        ## ⚠️ 顺序：**先缩图/放大，再画叠加**（2026-10-14 修的真回归）
 
-            imshow 1920x1080 窗口 1080p 图    17.74 ms
-            imshow  960x540 窗口 1080p 图      6.86 ms     （让 imshow 自己缩）
-            先把图 resize 到 960x540，再 imshow   1.84 ms   ← 便宜 9.6 倍
+        我第一版把 `display_width` 折进同一个 `scale`，于是变成
+        **先 resize、再用原尺寸字号画 HUD** —— `cv2.putText` 在 1920 的画布上
+        写完字，整张图（连字一起）被压到 960，**字就糊了**。
+        用户的原话是"连参数文字也变得模糊了"，这是对的。
 
-        也就是说每秒最多 56 帧是**花在缩放上**的，而这件事我们自己做只要
-        0.55 ms。显示从 17.7 ms 降到 1.84 ms，直接決定"顺不顺"。
+        正确做法是**先定画布尺寸、再在上面画**：字在最终分辨率上渲染，
+        永远清晰。所以 `display_width` 走"先 resize 再作画"这条路，
+        而 `render_scale` 走"先放大再作画"。
 
         `health`：可选的 `stats.Health`。**为什么由调用方传、而不是 pipeline 自己持有** ——
         pipeline 是编排层，不该持有一个"随运行不断变化的累加器"：
@@ -241,11 +289,9 @@ class SpherePipeline:
         不传时 HUD 退化成一行明确的 `loop ...`（不再有裸 `FPS`）。
         """
         viz = self.cfg.viz
-        scale = viz.scale if viz.scale and viz.scale > 0 else 1.0
-        # 显示倍率：`display_width` 与 `viz.scale` 是**两件事**，
-        # 前者是"输出图多宽"（通常 <1，为了显示便宜），
-        # 后者是"把整张图放大多少"（通常 =1，为了在小窗口里看清叠加层）。
-        # 两者相乘得到最终倍率，于是既能缩小显示、又能保持放大语义。
+        # `render_scale` 是"放大画布"的语义（用户显式要的）；
+        # `display_width` 是"把输出图控制到多宽"（显示用，通常缩小）。
+        scale = render_scale * (viz.scale if viz.scale and viz.scale > 0 else 1.0)
         if display_width and frame.shape[1] > 0:
             scale *= float(display_width) / float(frame.shape[1])
         if abs(scale - 1.0) > 1e-6:
@@ -254,6 +300,10 @@ class SpherePipeline:
         else:
             img = frame.copy()
 
+        # ---- 以下所有叠加都画在 `img`（已是最终尺寸）上 ----
+        # 字号/线宽乘的是**最终相对原始帧的倍率**，所以：
+        #   · 缩小显示时，字按小画布的正常字号渲染 → **清晰**；
+        #   · 放大显示时，字跟着变大 → 与被放大的画面相称。
         if viz.trail_enabled and result.trail:
             draw_trail(img, result.trail, fade=viz.trail_fade,
                        thickness=max(1, int(2 * scale)), scale=scale)
@@ -293,8 +343,9 @@ class SpherePipeline:
 
     # ------------------------------------------------------------------
     def process_and_render(self, frame: np.ndarray, t: float | None = None,
-                           health=None,
-                           display_width: int | None = None) -> tuple[np.ndarray, FrameResult]:
+                           health=None, display_width: int | None = None,
+                           render_scale: float = 1.0) -> tuple[np.ndarray, FrameResult]:
         result = self.process(frame, t)
         return self.render(frame, result, health=health,
-                           display_width=display_width), result
+                           display_width=display_width,
+                           render_scale=render_scale), result

@@ -123,6 +123,20 @@ class DetectorConfig:
     hough_param1: float = 120.0        # Canny 高阈值
     hough_param2: float = 30.0         # 圆心累加器阈值，越小越容易检出也越多误检
     hough_blur_ksize: int = 7
+    # ---- hough 的**搜索半径上限**（2026-10-14 加，别与 min/max_radius 混）----
+    #
+    # `cv2.HoughCircles` 的代价随 `maxRadius - minRadius` **线性上涨**：
+    # 它要对每个边缘像素，把这一段里的半径逐个投票。
+    #
+    # 实测（1080p、书架那种真实纹理）：原来用 `max_radius = 200`
+    # （相当于直径 400px 的球）时，hough 要 **4 秒一帧**；
+    # 而同样的帧如果是纯色合成图只要 132 ms —— 真实场景的边缘像素多两三个数量级，
+    # 于是"搜索 192 种半径 × 每个边缘像素"直接爆炸。
+    #
+    # 所以给 hough 一个**独立的**上限：物理约束 `max_radius` 还要给几何校验
+    # 和 color 用，不该为一个检测器的性能去动它。
+    # 80 约合 1080p 下直径 160px 的球，对"球直径 4cm、距离一两米"绰绰有余。
+    hough_max_radius: float = 80.0
 
     # ---- 运动检测 ----
     motion_history: int = 300
