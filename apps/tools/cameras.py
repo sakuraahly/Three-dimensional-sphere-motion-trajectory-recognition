@@ -129,7 +129,10 @@ _backend_used: dict[int, str] = {}
 
 
 def _open_preview(index: int):
-    """打开预览源：**偏好后端打不开就换另一个**，并说明用的是哪个。
+    """打开预览源，返回 `(src, 后端名)`；打不开返回 `(None, None)`。
+
+    ⚠️ **两个返回分支形状必须一致**：调用点解包两个值。
+    2026-10-15 就是因为早退分支 `return None` 而崩过一次（见下面的注释）。
 
     ## 为什么不能写死一个后端（2026-10-15 修的真缺陷）
 
@@ -185,19 +188,34 @@ def _open_preview(index: int):
     try:
         src = CameraSource(index=index, width=640, height=480, backend=api)
     except RuntimeError as exc:
+        # ⚠️ **这里必须返回两个值**（2026-10-15 修的真崩溃）。
+        # 上一版改返回值时漏了这个早退分支，于是 `_open_preview` 返回单值 `None`，
+        # 而调用点解包两个 → `TypeError: cannot unpack non-iterable NoneType object`，
+        # **整个 identify 直接崩掉**（用户 21:08 那次日志的最后 8 行就是这么来的）。
+        # 修法不是"在调用点多判一次"，而是**让所有分支的返回形状一致** ——
+        # 否则下次再加一条分支还会犯。
         print(f"  #{index} 打不开：{_first_line(exc)}")
-        return None
+        return None, None
     _backend_used[index] = used_name
+    return src, used_name
 
 
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> str | None:
-    """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。"""
+    """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
+
+    ⚠️ `_open_preview` **必须**返回 `(src, 后端名)` 两元组 —— 两个分支形状一致。
+    这里崩过一次（2026-10-15）：早退分支写成 `return None`，解包时抛
+    `TypeError: cannot unpack non-iterable NoneType object`，整个 identify 崩掉。
+    判据放在 `tests/selftest_camera_registry.py` 第 14 节（**穷举返回路径**验形状）。
+    """
     label = f"#{index}  {entry.name or '(无名字)'}  端口 {entry.port or '-'}"
     try:
         src, backend_used = _open_preview(index)
     except RuntimeError as exc:
         print(f"  #{index} 打不开：{_first_line(exc)}")
         return None
+    if src is None:
+        return None                     # 两个后端都出不了图 -> 跳过这台（**不崩**）
     _backend_used[index] = backend_used
 
     win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"

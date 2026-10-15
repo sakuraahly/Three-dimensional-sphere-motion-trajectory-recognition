@@ -907,6 +907,100 @@ def test_cached_mode_respects_requested_resolution() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_identify_open_preview_shape() -> bool:
+    """第 14 节：`cameras.py identify` 的 `_open_preview` **两个分支返回形状必须一致**。
+
+    ## 守的是一个把整个 identify 打崩的真缺陷（2026-10-15）
+
+    用户跑「相机设备管理」直接崩：
+
+        File "apps/tools/cameras.py", line 197, in _preview_and_assign
+            src, backend_used = _open_preview(index)
+        TypeError: cannot unpack non-iterable NoneType object
+
+    原因：我给 `_open_preview` 加后端回退时，把主返回改成 `(src, 名字)`
+    两元组，**却漏了"打不开"那条早退分支**（它仍是单值 `return None`）。
+    于是**恰好在那台开不了的相机上**崩掉 —— 而"有相机开不了"正是这个工具
+    存在的意义，所以这条路径是**常态，不是边缘**。
+
+    ## 判据
+
+    穷举 `_open_preview` 的**每一条返回路径**，断言形状都是两元组。
+    用替身（不碰真设备）：把 `pick_backend_for_device` 与 `CameraSource`
+    分别换成"挑不到后端"和"打不开"的版本，两条路径都要走到。
+    """
+    print("----- 14. identify 的 _open_preview 返回形状 -----")
+    import importlib.util
+
+    import sphere_tracker.camera_registry as _cr
+
+    cam_path = ROOT / "apps" / "tools" / "cameras.py"
+    spec = importlib.util.spec_from_file_location("cam_tool_shape", cam_path)
+    cam = importlib.util.module_from_spec(spec)
+    sys.modules["cam_tool_shape"] = cam
+    assert spec.loader is not None
+    spec.loader.exec_module(cam)
+
+    checks: list[tuple[str, bool]] = []
+    real_pick = _cr.pick_backend_for_device
+
+    # ① 挑不到任何后端 -> 抛 RuntimeError（**调用点接住了它**，这是设计）
+    try:
+        _cr.pick_backend_for_device = lambda *a, **k: (None, _cr.ProbeResult(
+            index=0, ok=False, error="（替身）两个后端都不行"))
+        got = cam._open_preview(0)
+        ok1 = False                       # 这条路径不该正常返回
+        print(f"  ① 挑不到后端 -> 返回了 {got!r}（**不该**，应为 RuntimeError）")
+    except RuntimeError as exc:
+        ok1 = bool(str(exc).strip())
+        print(f"  ① 挑不到后端 -> 抛 RuntimeError({str(exc)[:44]!r})，"
+              f"调用点接住并跳过这台")
+    except Exception as exc:                              # noqa: BLE001
+        ok1 = False
+        print(f"  ① 挑不到后端 -> 抛了非 RuntimeError：{type(exc).__name__}: {exc}")
+    finally:
+        _cr.pick_backend_for_device = real_pick
+    checks.append(("挑不到后端时抛**带原因的** RuntimeError（调用点接得住）", ok1))
+
+    # ② 挑到了后端，但 CameraSource 打不开（RuntimeError）
+    real_src = cam.CameraSource
+    try:
+        _cr.pick_backend_for_device = lambda *a, **k: (
+            __import__("cv2").CAP_DSHOW, _cr.ProbeResult(index=0, ok=True,
+                                                         width=640, height=480,
+                                                         fps=30.0, std=50.0))
+
+        def _boom(*a, **k):                               # noqa: ANN002, ANN003
+            raise RuntimeError("（替身）打不开")
+
+        cam.CameraSource = _boom                            # type: ignore[assignment]
+        got2 = cam._open_preview(0)
+        ok2 = isinstance(got2, tuple) and len(got2) == 2 and got2[0] is None
+        print(f"  ② 后端挑到了但打不开 -> 返回 {got2!r}")
+    except Exception as exc:                              # noqa: BLE001
+        ok2 = False
+        print(f"  ② 后端挑到了但打不开 -> 抛了 {type(exc).__name__}: {exc}")
+    finally:
+        cam.CameraSource = real_src                         # type: ignore[assignment]
+        _cr.pick_backend_for_device = real_pick
+    checks.append(("CameraSource 抛 RuntimeError 时也返回两元组，不是单值 None",
+                   ok2))
+
+    # ③ 静态穷举：所有 `return` 语句要么两元组、要么在 docstring 里
+    import re
+    body = cam_path.read_text(encoding="utf-8").split("def _open_preview(")[1]
+    body = body.split("\ndef ")[0]
+    rets = [m.group(1).strip() for m in re.finditer(r"^\s+return\s+(.+)$", body,
+                                                    re.MULTILINE)]
+    print(f"  ③ _open_preview 的 return 语句：{rets}")
+    checks.append(("每一条 return 都是两元组（`X, Y`）",
+                   bool(rets) and all("," in r for r in rets)))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_real_probe() -> bool:
     """有相机时额外验证真机枚举（无相机则跳过，不算不达标）。"""
     print("----- 附加：真机枚举（有相机才验证） -----")
@@ -969,6 +1063,7 @@ def main() -> int:
             test_ignored(tmp),
             test_probe_fallback_and_cache_invalidation(),
             test_cached_mode_respects_requested_resolution(),
+            test_identify_open_preview_shape(),
         ]
         print()
         if args.probe:

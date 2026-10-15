@@ -409,7 +409,21 @@ class CameraSource(VideoSource):
         # 搜索本身是**为了更好**，不是为了**卡住**。给它一个上限：
         # 到点就带着"已经试过哪些、为什么都不行"收场，让上层报错。
         # 60 秒足够正常相机试完（正常打开 1~2 秒），也不会让人干等。
+        #
+        # ⚠️ **2026-10-15 修：预算必须按后端切分，否则后面的后端根本轮不到。**
+        # 实测（`cameras.py identify`，相机 0 两个后端都坏）：
+        #
+        #     MSMF  试 1 档就花了 ~21 s（每次 read 约 0.9 s，12 次 ≈ 10.5 s，
+        #           再加上打开本身的几秒）
+        #     MSMF  三档 + ANY 三档 = 已过 60 s → **DSHOW 一次都没被试**
+        #     报错却写着「已尝试全部后端与分辨率」  ← **这句话是假的**
+        #
+        # 而"换个后端"恰恰是这台机器上最有效的一招，所以**第一个后端把预算吃光
+        # = 把最有效的排查手段跳过**。现在给每个后端一份**均分**的预算，
+        # 并且预算真的不够时**如实说**，不再谎报"全部试过"。
         search_budget_s = 60.0
+        # 每个后端一份均分预算（下限 12 s，免得后端多时每份太短试不出东西）
+        per_backend_s = max(12.0, search_budget_s / max(1, len(candidates)))
         budget_hit = False
         # 第一档就**一帧都没有** -> 剩下的分辨率不必试。
         # 分辨率不对的表现是"能出帧但全黑"，而"一帧都读不到"是**设备层面**的问题
@@ -417,18 +431,25 @@ class CameraSource(VideoSource):
         # 实测证据：MSMF 对这台相机每个分辨率都要 10 秒才失败，4 档 = 40 秒纯浪费。
         no_frame_at_all = False
         for name, api in ([] if self.cap is not None else candidates):
+            t_backend = time.perf_counter()
             for rw, rh in res_candidates:
                 if no_frame_at_all:
                     errors.append(f"{name}: 第一档就一帧都读不到，跳过其余分辨率")
                     _log(f"⏭ {name} 一帧都读不到（设备层面问题），"
                          f"不再试其它分辨率")
                     break
+                if time.perf_counter() - t_backend > per_backend_s:
+                    errors.append(
+                        f"{name}: 已用满本后端的 {per_backend_s:.0f}s 预算，"
+                        f"**转下一个后端**（不是「全试过了」）")
+                    _log(f"⏱ {name} 用满 {per_backend_s:.0f}s 预算，转下一个后端")
+                    break
                 if time.perf_counter() - t_start > search_budget_s:
                     budget_hit = True
                     errors.append(
-                        f"搜索超时（已试 {search_budget_s:.0f}s）：相机持续给不出画面，"
-                        f"不再继续试剩下的组合")
-                    _log(f"⏱ 已超 {search_budget_s:.0f}s，停止搜索"
+                        f"搜索总超时（已试 {search_budget_s:.0f}s）：相机持续给不出画面，"
+                        f"**后面的后端没轮到**（不要说成「全部后端都试过」）")
+                    _log(f"⏱ 已超总预算 {search_budget_s:.0f}s，停止搜索"
                          f"（相机一直给不出画面，继续试只是让人干等）")
                     break
                 _log(f"试 {name} @ {rw or '原始'}x{rh or '原始'}…")
