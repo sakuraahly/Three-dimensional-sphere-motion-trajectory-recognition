@@ -122,23 +122,74 @@ IGNORE_TOKEN = "ignore"
 _ASSIGN_KEYS = {ord("l"): "left", ord("r"): "right",
                 ord("m"): "main", ord("n"): IGNORE_TOKEN}
 _KEY_HINT = "l=左相机  r=右相机  n=无关(这台不要用)  m=单目主相机  s=跳过  q=退出"
+# 每个索引的预览**实际用上了哪个后端**（`_preview_and_assign` 填）。
+# 为什么值得记：标定/检测要用同一个后端才稳，而这个后端不一定等于偏好后端 ——
+# 打不开时会回退。不告诉用户，他标定时就得再踩一次同样的坑。
+_backend_used: dict[int, str] = {}
+
+
+def _open_preview(index: int):
+    """打开预览源：**偏好后端打不开就换另一个**，并说明用的是哪个。
+
+    ## 为什么不能写死一个后端（2026-10-15 修的真缺陷）
+
+    这里原来是 `CameraSource(index=index, backend=INDEX_BACKEND)`，注释写着
+    「**必须固定 MSMF**」，理由是「DSHOW 的枚举与 PnP 错位」。但那条理由
+    **只对"不带后端"（auto）成立**；实测本机**两个后端的索引→设备映射一致**
+    （idx0=1920x1080 / idx1=640x480，两轮四组读数相同）。
+
+    而写死 MSMF 的后果是**致命的**：本机 **MSMF 对相机 0 读不到任何一帧**
+    （`-2147483638`）。用户 2026-10-15 的实测日志：
+
+        [相机 0] ✘ MSMF @ 640x480：读不到画面（已等 10.6s）
+          #0 打不开：摄像头 0 用 MSMF 能打开，但**一帧都拿不到**（读 12 次全空）
+        ...（相机 1 打开了）
+          [right] <- #1 aoni webcam A25（身份已记录）
+          [left]  <- #1 aoni webcam A25（身份已记录）   ← 同一台被记成两个角色
+
+    于是 **#0 根本没机会被分配**，而 #1 被先后按了 r 和 l，
+    `config/cameras.json` 里 `left` 与 `right` 指向**同一台相机** ——
+    标定直接废掉。**识别工具自己把这个坑造了出来。**
+
+    ## 为什么回退是安全的
+
+    回退**不改变"哪个索引是哪台设备"这个前提的可验证性**：画面就在用户眼前，
+    标签（`#N 名字 端口`）与画面是同一路流。真要错位，人一眼能看出来 ——
+    这正是 `identify` 存在的意义（"目视确认"）。反过来，**打不开**是没法目视确认的。
+
+    并且回退会**明确打印用了哪个后端**，用户能在标定前知道该用哪个。
+    """
+    from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME, WINDOWS_BACKENDS
+
+    order = [(INDEX_BACKEND_NAME, INDEX_BACKEND)]
+    for name, api in WINDOWS_BACKENDS:
+        if api != INDEX_BACKEND and name != "ANY":
+            order.append((name, api))
+
+    errs: list[str] = []
+    for pos, (name, api) in enumerate(order):
+        try:
+            src = CameraSource(index=index, width=640, height=480, backend=api)
+        except RuntimeError as exc:
+            errs.append(f"{name}: {_first_line(exc)}")
+            continue
+        if pos > 0:
+            print(f"  ℹ #{index} 用 {order[0][0]} 打不开"
+                  f"（{errs[0] if errs else '无帧'}），**已改用 {name}**"
+                  f" —— 标定时请相应加 `--backend {name.lower()}`", flush=True)
+        return src, name
+    raise RuntimeError("；".join(errs) or "打不开")
 
 
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。"""
     label = f"#{index}  {entry.name or '(无名字)'}  端口 {entry.port or '-'}"
     try:
-        # **必须固定 MSMF**：`entry` 是按 PnP 枚举行的名字，而 `index` 交给 cv2 之后
-        # 走的是**后端自己的枚举**。DSHOW 的枚举与 PnP 错位（实测 DSHOW #1 是笔记本
-        # 内置、#2 才是外接），于是会出现"画面是 A、标签写着 B"——
-        # 人看着 A 的画面按 r，配置却记到了 B 上。MSMF 的枚举与 PnP 一致，标签才是真的。
-        # 见 sphere_tracker/sources.py 的 INDEX_BACKEND 注释（那里有完整实测表）。
-        from sphere_tracker.sources import INDEX_BACKEND
-
-        src = CameraSource(index=index, width=640, height=480, backend=INDEX_BACKEND)
+        src, backend_used = _open_preview(index)
     except RuntimeError as exc:
         print(f"  #{index} 打不开：{_first_line(exc)}")
         return None
+    _backend_used[index] = backend_used
 
     win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"
     wins = WindowManager()
@@ -282,6 +333,29 @@ def cmd_identify(args) -> int:
         return 1
     print(f"\n已写入 {path}")
     print("之后启动标定/检测可直接用角色名：--left left --right right")
+    # ⚠️ 角色指向同一台相机 = 配置自相矛盾（2026-10-15 加）。
+    # 这次就是这么坏的：相机 #0 用 MSMF 打不开 → 用户只能给 #1 按键 →
+    # 先后按了 r 和 l → left 与 right 记成同一台，**而工具一声不响**。
+    # 双目拿这个配置去标定必然失败，且失败点离原因很远。
+    by_identity: dict[str, list[str]] = {}
+    for role, spec in reg.roles.items():
+        key = spec.identity or f"idx:{spec.index}"
+        by_identity.setdefault(key, []).append(role)
+    clash = {k: v for k, v in by_identity.items() if len(v) > 1}
+    if clash:
+        print("\n⚠ **配置有问题**：以下角色指向的是**同一台**相机 ——")
+        for key, roles in clash.items():
+            print(f"    {' / '.join(roles)}  ->  {key}")
+        print("    双目要求左右是**两台不同的相机**，现在这份配置没法用来标定。")
+        print("    原因通常是**有一台没打开**（换后端试试：`--backend dshow`），")
+        print("    于是你只能给另一台按键。请重跑 identify，确保两台各按一次。")
+    if _backend_used:
+        used = "、".join(f"#{i}->{b}" for i, b in sorted(_backend_used.items()))
+        print(f"预览实际用的后端：{used}")
+        names = {b.lower() for b in _backend_used.values()}
+        if len(names) > 1:
+            print("⚠ 两台用的后端**不一样**。标定/检测要用同一个后端，"
+                  "请显式指定其中一个（建议 `--backend dshow`）。")
     if reg.ignored:
         names = "、".join((s.name or f"#{s.index}") for s in reg.ignored)
         print(f"已标为「无关」的相机（自动挑相机时跳过）：{names}")
