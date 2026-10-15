@@ -642,6 +642,134 @@ def cmd_check(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# doctor：一次把"能不能跑双目"全查完
+# --------------------------------------------------------------------------- #
+# 为什么要有它（2026-08 ~ 10 的教训都指向同一件事）：
+#
+# 这台机器上"相机能不能用"是**浮动**的，而且失败时会以**五六种不同的面孔**出现：
+# 打不开 / 能打开但无帧 / 出帧但恒为纯黑 / 只有某个后端行 / 两路分辨率不一致 /
+# 配置指向已换口的旧身份。这些我这几轮**一条一条手跑命令去查**，
+# 每次都写一段临时 Python —— 按项目规矩（重复 3 遍就固化）该收进工具里。
+#
+# 与 `check` 的分工：
+#   `check`  = 配置 vs 设备（**不开相机**，秒级）—— 查"配置还对不对"
+#   `doctor` = **真开相机**，查"现在到底能不能出图、能不能凑成一对"
+# 两者都**只报告不改配置**。
+def cmd_doctor(args) -> int:
+    """打开每台相机实测一遍，回答"现在能不能跑双目"。"""
+    import tempfile
+
+    from sphere_tracker import camera_registry as cr
+    from sphere_tracker.sources import backend_name
+
+    reg = cr.load_registry()
+    devices = cr.list_devices()
+    want_w, want_h = (args.width, args.height)
+
+    print("=" * 68)
+    print("相机体检（真开相机；只报告，不改配置）")
+    print("=" * 68)
+    if not devices:
+        print("枚举不到任何相机设备（非 Windows / 注册表不可读 / 真的没插）。")
+        return 1
+
+    # ---- ① 枚举 ----
+    print(f"\n① 枚举到 {len(devices)} 台：")
+    for d in devices:
+        mark = "  [无关]" if cr.is_device_ignored(d, reg) else ""
+        print(f"    #{d.order}  {d.name or '(无名字)':22} 端口 {d.port or '-'}{mark}")
+
+    # ---- ② 角色解析（不开相机）----
+    print("\n② 角色解析：")
+    resolved: dict[str, int | None] = {}
+    fail = False
+    for role in ("left", "right"):
+        spec = reg.roles.get(role)
+        if spec is None:
+            print(f"    「{role}」：配置里没有这个角色 → 先跑 identify")
+            resolved[role] = None
+            fail = True
+            continue
+        try:
+            r = cr.resolve_role(role, reg, devices, interactive=False)
+            resolved[role] = r.index
+            print(f"    「{role}」-> #{r.index}（how={r.how}）")
+        except RuntimeError as exc:
+            resolved[role] = None
+            fail = True
+            print(f"    「{role}」-> **解析失败**：{_first_line(exc)}")
+            for line in cr.describe_moved_device(spec, devices, role).splitlines():
+                print(line)
+
+    # ---- ③ 每台实测：哪个后端真能出图 ----
+    print(f"\n③ 逐台实测（各后端都试；判据是「真能出图」而不是「能打开」）：")
+    usable: dict[str, tuple[int, int, int]] = {}      # role -> (index, api, std)
+    for role in ("left", "right"):
+        idx = resolved.get(role)
+        if idx is None:
+            continue
+        api, probe = cr.pick_backend_for_device(idx, width=want_w, height=want_h)
+        if api is None:
+            fail = True
+            print(f"    「{role}」#{idx}：**没有可用后端** —— {probe.error}")
+            continue
+        usable[role] = (idx, api, int(probe.std))
+        print(f"    「{role}」#{idx}：后端 {backend_name(api)}，"
+              f"{probe.width}x{probe.height}，std {probe.std:.1f} ✅")
+
+    # ---- ④ 两路能不能凑成一对（同后端 + 同分辨率）----
+    print(f"\n④ 两路一致性（双目硬要求：**同一个后端 + 同一个分辨率**）：")
+    if len(usable) < 2:
+        fail = True
+        print("    ✘ 不足两路可用，没法组双目。")
+    else:
+        (li, la, _), (ri, ra, _) = usable["left"], usable["right"]
+        if la != ra:
+            fail = True
+            print(f"    ✘ 两路**后端不同**（left={backend_name(la)} / "
+                  f"right={backend_name(ra)}）—— 同一进程混用会挂一路。"
+                  f"标定请显式指定：`--backend {backend_name(la).lower()}` 或换一台。")
+        else:
+            print(f"    ✓ 两路同后端（{backend_name(la)}）")
+        # 用**临时缓存**做一致性测试，绝不污染真缓存（"缓存把分辨率钉死"
+        # 正是踩过的坑：`config/camera_modes.json` 里记着 640x480，
+        # 于是显式请求 1920x1080 也被盖过）。
+        import sphere_tracker.sources as _src
+
+        saved_cache = _src._MODE_CACHE
+        res: dict[str, tuple[int, int] | None] = {}
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                _src._MODE_CACHE = Path(td) / "probe_modes.json"
+                for role in ("left", "right"):
+                    api, probe = cr.pick_backend_for_device(
+                        usable[role][0], width=want_w, height=want_h,
+                        prefer=usable[role][1])
+                    res[role] = (probe.width, probe.height) if api else None
+        finally:
+            _src._MODE_CACHE = saved_cache
+        print(f"    实测分辨率：left={res.get('left')}  right={res.get('right')}")
+        if res.get("left") and res.get("left") == res.get("right"):
+            print(f"    ✓ 两路一致 {res['left']} —— 满足标定要求")
+        else:
+            fail = True
+            print(f"    ✘ 两路**不一致** —— 标定会直接失败。"
+                  f"本机实测：只有请求 **1920x1080** 时两路才可能一致"
+                  f"（`#0` 那台无视请求恒给 1920x1080）。")
+
+    # ---- ⑤ 结论 ----
+    print("\n" + "=" * 68)
+    if fail:
+        print("结论：**还不能跑双目。** 按上面 ✘ 那几行的指引处理；")
+        print("     换过 USB 口先跑 `identify` 重新确认（InstanceId 里编着端口号）。")
+        return 2
+    print("结论：**可以跑双目。** 下一步：")
+    print(f"    启动程序.bat precheck      （举棋盘确认两路都看得到）")
+    print(f"    启动程序.bat calibrate     （标定；基线核对记得填你量到的中心距）")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="摄像头设备管理（列表 / 确认 / 固定 / 标无关 / 检查）",
@@ -679,6 +807,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     pc = sub.add_parser("check", help="比对配置与当前设备：有没有漂移/被占用")
     pc.set_defaults(func=cmd_check)
+
+    pd = sub.add_parser(
+        "doctor", help="**真开相机**体检一遍：现在能不能跑双目（只报告，不改配置）")
+    pd.add_argument("--width", type=int, default=1920,
+                    help="目标宽度（默认 1920 —— 本机实测只有这个值两路才可能一致）")
+    pd.add_argument("--height", type=int, default=1080, help="目标高度（默认 1080）")
+    pd.set_defaults(func=cmd_doctor)
     return p
 
 

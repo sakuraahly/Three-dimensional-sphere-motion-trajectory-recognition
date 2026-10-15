@@ -78,6 +78,20 @@ MUST_RUN = (
     "selftest_config_wiring.py",     # 配置项写了没人读 = 改了不生效
     "selftest_camera_registry.py",   # 索引漂移 = 用错相机还看不出来
 )
+# **永不进 fast 档**：无论计时数据怎么说（甚至完全没有数据）。
+#
+# 为什么需要它（`unknown` 的默认行为会咬人）：
+# 没有实测耗时的测试会被塞进 fast 里跑掉（见 `classify` 的文档串），
+# 而 `selftest_mutation_guards.py` **会临时改写源码文件**（改完靠 SHA256 校验还原）。
+# 让它在 `fast` 档里跑有两个后果：
+#   ① `启动程序.bat test` 从"十几秒~1 分钟"变成 ~10 分钟 —— 快速自检就此失去意义；
+#   ② 它在运行期把某个源码文件改成"缺陷版"，**同进程/同仓的任何并发观察者
+#      都会看到坏代码**（当前运行器是串行的 [已核实]，但把这种前提交给
+#      "千万别改成并行"来维持，太脆）。
+# 所以：**改源码的测试，必须显式排除在快速档之外。**
+NEVER_FAST = (
+    "selftest_mutation_guards.py",
+)
 # 每个测试保留最近几次耗时，取**中位数**分层（比"最后一次"抗抖动）。
 TIMING_HISTORY = 5
 
@@ -150,15 +164,26 @@ def classify(names: list[str], timings: dict[str, list[float]],
     """分成 (fast, slow, unknown)。
 
     分层依据是**历史耗时的中位数**（见 `TIMING_HISTORY` 处的说明），
-    但 `MUST_RUN` 里的测试**永远进 fast**，不受计时影响。
+    但：
+    - `MUST_RUN` 里的测试**永远进 fast**，不受计时影响；
+    - `NEVER_FAST` 里的测试**永远不进 fast**（改源码的测试不能混进快速自检），
+      所以它直接落 slow，连 `unknown` 都不进。
+
+    两个名单**不许重叠**（重叠 = 配置自相矛盾，直接报错而不是挑一个赢）。
 
     `unknown` = 还没有实测耗时的测试。**第一轮它们会被塞进 fast 里跑掉**
     —— 宁可第一次慢一点，也不要因为"没数据"就把某个测试永久排除在外。
     """
+    clash = set(MUST_RUN) & set(NEVER_FAST)
+    if clash:
+        raise SystemExit(f"MUST_RUN 与 NEVER_FAST 重叠：{sorted(clash)} —— 请修名单")
     fast, slow, unknown = [], [], []
     for n in names:
         if n in MUST_RUN:
             fast.append(n)
+            continue
+        if n in NEVER_FAST:
+            slow.append(n)
             continue
         series = timings.get(n) or []
         if not series:
@@ -286,9 +311,16 @@ def main(argv: list[str] | None = None) -> int:
         print("分层依据：还没有实测耗时 —— 这一次会跑全套，跑完就记住了")
     print(f"保底名单（无论计时如何都跑）：{', '.join(MUST_RUN)}")
     if slow:
-        print(f"本档跳过（中位耗时超过 {args.slow_threshold:.0f}s）：")
+        print("本档跳过：")
         for n in slow:
-            print(f"    · {n}（中位 {median(timings[n]):.1f}s）")
+            # ⚠️ `NEVER_FAST` 的测试**可能完全没有计时数据**（第一次就是被排除了），
+            # 所以这里不能直接 `timings[n]` —— 那会在第一次引入时就 KeyError 崩掉
+            # （2026-10-15 实测：引入 selftest_mutation_guards 后 `test full` 直接崩）。
+            series = timings.get(n) or []
+            if not series:
+                print(f"    · {n}（**从不进 fast 档**：它会临时改源码）")
+            else:
+                print(f"    · {n}（中位 {median(series):.1f}s）")
     if unknown:
         print(f"尚无耗时记录、本档仍会跑：{len(unknown)} 个")
     print()

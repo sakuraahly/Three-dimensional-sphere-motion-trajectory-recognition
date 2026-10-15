@@ -57,8 +57,15 @@ AGENTS_MD = ROOT / "AGENTS.md"
 CHECKER = ROOT / "apps" / "tools" / "check_standards.py"
 SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 
-# 本测试自己也是测试，也要被数进去
-REAL_TEST_COUNT = 22
+# 本测试自己也是测试，也要被数进去。
+#
+# ⚠️ **这个数字是"有意的确认门"，不是可以自动推导的东西** —— 别把它改成
+# `len(glob(...))`，那就是重言式（自己数自己，恒真）。
+# 分工：**"漏登记"由第 2 节自动抓**（集合差），
+# 这里只负责"数量变了要有人点头"。往 `tests/` 加文件后，
+# 改这个数字就是那次点头 —— 忘了改它会红，那是**设计如此**。
+# 历次：21 → 22（加 `selftest_window_mode.py`）→ 23（加 `selftest_mutation_guards.py`）。
+REAL_TEST_COUNT = 23
 # 测试命名规范（AGENTS.md §4）
 TEST_NAME_RE = re.compile(r"^selftest_[a-z0-9_]+\.py$")
 # 临时探针用的假路径（造一处新漂移用；用完即删）
