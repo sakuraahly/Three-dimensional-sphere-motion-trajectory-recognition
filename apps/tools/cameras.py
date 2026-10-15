@@ -157,28 +157,37 @@ def _open_preview(index: int):
     标签（`#N 名字 端口`）与画面是同一路流。真要错位，人一眼能看出来 ——
     这正是 `identify` 存在的意义（"目视确认"）。反过来，**打不开**是没法目视确认的。
 
-    并且回退会**明确打印用了哪个后端**，用户能在标定前知道该用哪个。
+    ## ⚠️ 2026-10-15 二次修：原来的回退抓不到"**纯黑**"
+
+    第一版只按"能不能打开"回退（`CameraSource` 抛不抛 `RuntimeError`）。
+    但本机更常见的坏状态是"**打开成功、每一帧都是纯黑**"，它**不抛异常**。
+    实测同一次会话里两个后端的结论正好相反：
+
+        #0（right）  DSHOW: **纯黑** mean=0.0     MSMF: 正常 mean=116.4
+        #1（left）   DSHOW: 正常                 MSMF: 正常
+
+    于是"写死 MSMF"和"MSMF 失败才换"都会在某个时刻坏掉。
+    现在改用 `camera_registry.pick_backend_for_device()` ——
+    它复用 `probe_index`（已经把纯黑判成 `ok=False`），
+    **按"真能出图"挑后端**，不再按"能不能打开"。
     """
-    from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME, WINDOWS_BACKENDS
+    from sphere_tracker import camera_registry as _cr
+    from sphere_tracker.sources import INDEX_BACKEND_NAME, backend_name
 
-    order = [(INDEX_BACKEND_NAME, INDEX_BACKEND)]
-    for name, api in WINDOWS_BACKENDS:
-        if api != INDEX_BACKEND and name != "ANY":
-            order.append((name, api))
-
-    errs: list[str] = []
-    for pos, (name, api) in enumerate(order):
-        try:
-            src = CameraSource(index=index, width=640, height=480, backend=api)
-        except RuntimeError as exc:
-            errs.append(f"{name}: {_first_line(exc)}")
-            continue
-        if pos > 0:
-            print(f"  ℹ #{index} 用 {order[0][0]} 打不开"
-                  f"（{errs[0] if errs else '无帧'}），**已改用 {name}**"
-                  f" —— 标定时请相应加 `--backend {name.lower()}`", flush=True)
-        return src, name
-    raise RuntimeError("；".join(errs) or "打不开")
+    # `pick_backend_for_device` 自己会把"哪个后端不可用、改用了哪个"打出来，
+    # 所以这里不再重复打印 —— **同一个事实只留一个实现**。
+    api, probe = _cr.pick_backend_for_device(index, width=640, height=480)
+    if api is None:
+        raise RuntimeError(probe.error or "打不开")
+    used_name = backend_name(api)
+    if used_name != INDEX_BACKEND_NAME:
+        print(f"  ℹ 标定/检测请相应加 `--backend {used_name.lower()}`", flush=True)
+    try:
+        src = CameraSource(index=index, width=640, height=480, backend=api)
+    except RuntimeError as exc:
+        print(f"  #{index} 打不开：{_first_line(exc)}")
+        return None
+    _backend_used[index] = used_name
 
 
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> str | None:

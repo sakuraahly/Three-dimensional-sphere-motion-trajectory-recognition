@@ -529,6 +529,63 @@ def probe_index_with_fallback(
     return r
 
 
+def pick_backend_for_device(
+    index: int,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    fps: int = 30,
+    prefer: int | None = None,
+) -> tuple[int | None, ProbeResult]:
+    """给一台相机挑一个**真能出图**的后端，返回 (后端常量, 探测结果)。
+
+    ## 为什么需要它（2026-10-15 实测的真问题）
+
+    这台机器上"哪个后端能用"是**浮动**的，而且在两个后端之间来回翻。
+    同一次会话里两次探测，结论**正好相反**：
+
+        （前一天）  MSMF: idx1=None        DSHOW: idx1=1920x1080
+        （当天）    #0  DSHOW:**纯黑**     MSMF :#0 正常 mean=116.4 std=64.4
+                    #1  DSHOW:正常        MSMF :#1 正常
+
+    于是任何"写死一个后端"的做法都必然在某个时刻坏掉 ——
+    `cameras.py identify` 原来写死 MSMF，用户就在 MSMF 坏的那一刻跑，
+    结果相机 0 打不开、他只能给相机 1 按键，`config/cameras.json` 被写成
+    **两个角色指向同一台**。
+
+    ## 判据为什么看"画面质量"而不只是"能不能打开"
+
+    "打开成功但**每一帧都是纯黑**"是这里最常见的坏状态（实测 `min=max=0`）。
+    `probe_index` 已把这种判为 `ok=False`（`std <= 1.0` → "画面是全黑常量流"），
+    所以**只用 `ok` 就够** —— 这也是本函数不自己读帧、而是复用 `probe_index`
+    的原因：**同一个事实只留一个实现**。
+
+    `prefer`：两路都能出图时优先用哪个（None = 用 `INDEX_BACKEND`）。
+    返回 `(None, 最后一次结果)` 表示两个后端都不可用。
+    """
+    from .sources import INDEX_BACKEND, WINDOWS_BACKENDS, backend_name
+
+    first = INDEX_BACKEND if prefer is None else prefer
+    order: list[int] = [first]
+    if current_platform() == "windows":
+        for _name, api in WINDOWS_BACKENDS:
+            if api is not None and api not in order:
+                order.append(api)
+
+    last: ProbeResult | None = None
+    for api in order:
+        r = probe_index(index, width=width, height=height, fps=fps, backend=api)
+        if r.ok:
+            if api != first and last is not None:
+                print(f"[相机 {index}] {backend_name(first)} 不可用"
+                      f"（{last.error}），**改用 {backend_name(api)}**"
+                      f"（{r.width}x{r.height} std {r.std:.1f}）", flush=True)
+            return api, r
+        last = r
+        print(f"[相机 {index}] {backend_name(api)} 不可用：{r.error}", flush=True)
+    return None, (last or ProbeResult(index=index, ok=False, error="没有可用后端"))
+
+
 def is_avoided(name: str, settings: dict | None = None) -> bool:
     """名字看着像内置/红外？这类相机不适合做双目（没法刚性固定在横梁上）。"""
     merged = {**DEFAULT_SETTINGS, **(settings or {})}
