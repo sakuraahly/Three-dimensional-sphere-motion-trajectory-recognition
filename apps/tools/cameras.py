@@ -260,12 +260,19 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> 
                 else:
                     miss += 1
                     if miss == 30:                    # 约 1 秒
-                        print(f"  ⚠ #{index} 读不到画面了…（相机被别的程序抢走 / "
+                        print(f"  ⚠ #{index} 读不到画面了…（镜头被挡 / 被别的程序抢走 / "
                               f"USB 掉线？）再等 1 秒，还不行就跳过这台")
                     if miss >= 60:                    # 约 2 秒
                         print(f"  ✘ #{index} 连续 2 秒读不到画面，跳过这台相机。")
-                        print(f"     排查：是不是有别的程序（QQ/会议/浏览器）占着它？"
-                              f"拔插一次 USB 往往就好。")
+                        # ⚠️ 排查顺序**先问"这台是哪台"**（2026-10-15 加，坑 37）：
+                        # 本机的**笔记本内置相机被用户有意遮住**，它必然读不到画面 ——
+                        # 那是**预期行为**。原来的提示只写"是不是别的程序占着"，
+                        # 会把内置相机这种正常情况也引向"去查占用/拔插"。
+                        print(f"     排查（按顺序）：① 这台是不是**笔记本内置相机**"
+                              f"（名字含 `Integrated`）？本机它是**有意被遮住**的，"
+                              f"读不到画面属正常 → 按 `n` 标「无关」即可；")
+                        print(f"     ② 若是外接那台：镜头是否被挡/盖 → 别的程序"
+                              f"（QQ/会议/浏览器）是否占着 → 拔插 USB。")
                         return None
                 key = cv2.waitKey(1) & 0xFF
                 if wins.handle_key(win, key, frame):
