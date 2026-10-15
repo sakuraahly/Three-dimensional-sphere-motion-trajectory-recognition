@@ -1001,6 +1001,106 @@ def test_identify_open_preview_shape() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_usb_port_change_is_diagnosable() -> bool:
+    """第 15 节：**换 USB 口**后，报错必须自己说清"是换口，不是相机丢了"。
+
+    ## 守的是用户 2026-10-15 实际踩的那一步
+
+    用户把一个相机换到另一个 USB 口，`cameras.py check` 报：
+
+        [漂移] 「right」(已确认) 解析失败：「right」指定的相机当前不在线
+               （期望 身份 USB\\VID_1BCF&PID_2A25&MI_00\\6&212acdc8&0&0000；…）
+
+    **技术上没错，但没告诉用户发生了什么** —— 于是看起来像"相机丢了"。
+    真相是 **Windows 的 PnP `InstanceId` 把端口编在里面**：
+
+        USB\\VID_1BCF&PID_2A25&MI_00\\6&212acdc8&0&0000
+                                    ^^^^^^^^^^ 这一段就是"插在哪个口"
+
+    换口 → 这一段变（实测 `6&212acdc8` → `7&24e47704`）→ **整条身份变了**。
+
+    ## 顺带钉住第二个缺陷：解析失败必须算危险项
+
+    `cmd_check` 原来遇到解析失败只 `continue`、**不置 danger** ——
+    报了一行失败却返回**退出码 0**，而 `cameras.py check --help`
+    与用户手册都承诺「有 [危险] 项时退出码为 2」。
+
+    ## 判据（全部用注入数据，不碰真设备）
+
+    - 身份对不上 + 有 1 台同名 → 提示里出现"换"与 `identify`/`pin`
+    - 身份对不上 + 同名 0 台 → 提示里出现"不在线"（**不是**换口）
+    - 身份对不上 + 同名多台 → 提示里出现"目视确认"（不许替用户猜）
+    """
+    print("----- 15. 换 USB 口必须可诊断 -----")
+    import sphere_tracker.camera_registry as cr
+
+    def dev(order: int, name: str, identity: str, port: str) -> object:
+        return cr.DeviceEntry(order=order, name=name, identity=identity,
+                              port=port, present=True, source="system")
+
+    # ① 同名 1 台（就是"换了口"的样子）
+    stale = cr.RoleSpec(identity="USB\\VID_1BCF&PID_2A25&MI_00\\6&212acdc8&0&0000",
+                        port="6&212acdc8&0&0000", name="aoni webcam A25",
+                        index=0, verified=True)
+    moved = [dev(1, "aoni webcam A25",
+                 "USB\\VID_1BCF&PID_2A25&MI_00\\7&24e47704&0&0000",
+                 "7&24e47704&0&0000")]
+    t1 = cr.explain_role_miss(stale, moved, "right")
+
+    # ② 同名 0 台（真的不在线）
+    t2 = cr.explain_role_miss(stale, [dev(2, "Integrated Camera", "USB\\X", "p")], "right")
+
+    # ③ 同名多台（同型号，无法靠名字判断）
+    t3 = cr.explain_role_miss(stale, [
+        dev(0, "aoni webcam A25", "USB\\A", "6&aaa"),
+        dev(1, "aoni webcam A25", "USB\\B", "7&bbb"),
+    ], "right")
+
+    for label, tips in (("① 同名 1 台", t1), ("② 同名 0 台", t2), ("③ 同名多台", t3)):
+        print(f"  {label}:")
+        for line in tips:
+            print(f"      {line[:96]}")
+
+    checks = [
+        ("换口场景提到「换」（说清是身份变了，不是相机坏了）",
+         any("换" in x for x in t1)),
+        ("换口场景给出**可执行**的两条路（identify / pin）",
+         any("identify" in x for x in t1) and any("pin" in x for x in t1)),
+        ("真不在线时不误报成换口", any("不在线" in x for x in t2)
+         and not any("换过 USB 口" in x for x in t2)),
+        ("同名多台时要求目视确认（不替用户猜）",
+         any("目视确认" in x for x in t3)),
+    ]
+
+    # ④ 非交互报错里也要带上线索（脚本/子进程只看得见这一句）
+    try:
+        cr.resolve_role("right", reg=cr.Registry(roles={"right": stale}),
+                        devices=moved, interactive=False)
+        msg = ""
+        checks.append(("非交互时应当抛错", False))
+    except RuntimeError as exc:
+        msg = str(exc)
+        checks.append(("非交互时抛 RuntimeError（可被上层接住）", True))
+    # ④ 非交互报错里也要带上**线索行**（脚本/子进程只看得见这一句）
+    #
+    # ⚠️ 判据**改过一次**：第一版是 `"换" in msg and "InstanceId" in msg`，
+    # 而报错末尾还有一句**硬编码**的"注意：Windows 的 InstanceId 把端口编在里面"，
+    # 于是把线索整段删掉**照样通过** —— 变异测试当场证明那条判据是空的。
+    # 现在盯**线索行本身**（`·` 开头、且含可执行命令），那是 `extra` 独有的。
+    tip_lines = [ln for ln in msg.splitlines() if ln.strip().startswith("·")]
+    print(f"  ④ 非交互报错里的线索行 {len(tip_lines)} 条：")
+    for ln in tip_lines:
+        print(f"      {ln.strip()[:92]}")
+    checks.append(("非交互报错里带上了线索行（`·` 开头；脚本只看得见这句）",
+                   bool(tip_lines)))
+    checks.append(("线索行里给了**可执行**命令（identify / pin）",
+                   any(("identify" in ln or "pin" in ln) for ln in tip_lines)))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_real_probe() -> bool:
     """有相机时额外验证真机枚举（无相机则跳过，不算不达标）。"""
     print("----- 附加：真机枚举（有相机才验证） -----")
@@ -1064,6 +1164,7 @@ def main() -> int:
             test_probe_fallback_and_cache_invalidation(),
             test_cached_mode_respects_requested_resolution(),
             test_identify_open_preview_shape(),
+            test_usb_port_change_is_diagnosable(),
         ]
         print()
         if args.probe:

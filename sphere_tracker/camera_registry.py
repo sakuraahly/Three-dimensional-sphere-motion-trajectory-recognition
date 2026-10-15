@@ -1350,6 +1350,67 @@ def resolve_roles(
     return out
 
 
+def explain_role_miss(spec: RoleSpec, devices: list[DeviceEntry],
+                      role: str = "<角色名>") -> list[str]:
+    """角色解析失败时给出的**可执行**补充说明（每项一行）。可能为空。
+
+    ## 为什么需要它（2026-10-15 用户实测）
+
+    用户**换了一个 USB 口**，`cameras.py check` 就报：
+
+        [漂移] 「right」(已确认) 解析失败：「right」指定的相机当前不在线
+               （期望 身份 USB\\VID_1BCF&PID_2A25&MI_00\\6&212acdc8&0&0000；…）
+
+    技术上没错，但**没告诉用户发生了什么、下一步做什么**。而真相是：
+
+        Windows 的 PnP `InstanceId` **把端口编在里面** ——
+        `USB\\VID_1BCF&PID_2A25&MI_00\\6&212acdc8&0&0000`
+                                            ^^^^^^^^^^ 这一段就是"插在哪个口"
+        换口 -> 这一段变 -> **整条身份变了**，配置里记的那条自然"不在线"。
+
+    **"换 USB 口"看起来像"相机丢了"** —— 这是本工具最容易让人困惑的一步。
+
+    ## 输出分两段，按"用户此刻在跑什么"分开
+
+    非交互（脚本/子进程）下只有 `resolve_role` 的报错可见，
+    **所以线索必须一起塞进那句报错**；`check` 有自己的输出通道，用第二段。
+
+    ## 绝不自动改绑
+
+    只报"有哪些候选"，**绝不动配置**：同名相机自动顶替会把左右换掉，
+    那正是 `_match_entry()` 硬规则 2 要防的（实测过：`right` 被顶替到 `#0`，
+    两路分辨率不一致，标定失去意义且界面上看不出异常）。
+    """
+    out: list[str] = []
+    if not spec.name:
+        return out
+    want = spec.name.lower()
+    hits = [d for d in devices if want in (d.name or "").lower()]
+    if not hits:
+        out.append(f"当前枚举里**没有任何**名字含「{spec.name}」的设备 —— "
+                   f"这台**真的不在线**（拔了 / 没供电 / 被禁用），不是换口。")
+        return out
+    if len(hits) == 1:
+        d = hits[0]
+        out.append(f"当前有 1 台同名的 #{d.order}（端口 {d.port or '-'}）。"
+                   f"**换过 USB 口就会这样**：Windows 的 InstanceId 把端口编在里面，"
+                   f"换口就等于身份变了，配置里那条成了「上次那个口上的它」。")
+        out.append("怎么办：跑 `python apps/tools/cameras.py identify` 逐个画面确认；"
+                   f"或 `python apps/tools/cameras.py pin {role} port:{d.port}` 直接改绑。")
+        return out
+    orders = "、".join(f"#{d.order}" for d in hits)
+    out.append(f"当前有 {len(hits)} 台同名设备（{orders}）—— 同型号时"
+               f"**无法靠名字判断哪台是它**，必须目视确认。")
+    out.append("怎么办：跑 `python apps/tools/cameras.py identify` 逐个画面确认哪台是左/右。")
+    return out
+
+
+def describe_moved_device(spec: RoleSpec, devices: list[DeviceEntry],
+                          role: str = "<角色名>") -> str:
+    """给 `cameras.py check` 用的缩进版说明（包一层 `explain_role_miss`）。"""
+    return "\n".join(f"    → {line}" for line in explain_role_miss(spec, devices, role))
+
+
 def resolve_role(
     role: str,
     reg: Registry | None = None,
@@ -1414,10 +1475,17 @@ def resolve_role(
         return ResolvedCamera(role=str(role), index=chosen, how="manual",
                               entry=hit, warnings=warns)
 
+    # ⚠️ 非交互路径下**只有这句报错可见**（`cameras.py check` 有自己的输出通道，
+    # 但脚本/子进程里就只有它）。所以"是不是换 USB 口了"这条线索必须一起塞进来 ——
+    # 用户 2026-10-15 换口后就是只看到"当前不在线"，然后以为相机丢了。
+    tips = explain_role_miss(spec, devices, str(role))
+    extra = ("\n" + "\n".join(f"  · {t}" for t in tips)) if tips else ""
     raise RuntimeError(
         f"「{role}」指定的相机当前不在线（{why}）。\n"
         f"检测到的相机：\n{format_device_table(devices)}\n"
-        f"请先跑 python apps/tools/cameras.py check 看是不是端口变了。"
+        f"{extra}\n"
+        f"（注意：Windows 的 InstanceId **把 USB 端口编在里面** —— "
+        f"换一个口插，这一台的身份就变了，不是相机坏了。）"
     )
 
 

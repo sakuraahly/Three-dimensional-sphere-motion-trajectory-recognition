@@ -577,7 +577,19 @@ def cmd_check(args) -> int:
         try:
             res = cr.resolve_role(role, reg, devices, interactive=False)
         except RuntimeError as exc:
-            print(f"[漂移] 「{role}」({tag}) 解析失败：{_first_line(exc)}")
+            # ⚠️ **解析失败必须算危险项**（2026-10-15 修）。
+            # 这里原来只 `continue`，**没有置 danger** —— 于是"角色解析失败"
+            # 却返回退出码 0，而本文档与用户手册都承诺「有 [危险] 项时退出码为 2」。
+            # 用户 2026-10-15 换 USB 口后跑 check 就是这样：报了一行失败、退出码 0，
+            # 看起来像"没事"。
+            danger = True
+            print(f"[危险] 「{role}」({tag}) **解析失败**：{_first_line(exc)}")
+            # 光说"不在线"没用 —— 换 USB 口也会这样，而那是本工具最容易让人困惑的一步。
+            # 补一句"当前有没有同名的设备"（**只报告，不自动改绑**）。
+            hint = cr.describe_moved_device(spec, devices, role)
+            if hint:
+                for line in hint.splitlines():
+                    print(line)
             continue
 
         if res.how == "identity":
