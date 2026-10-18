@@ -366,7 +366,7 @@ def test_from_args(base: Path) -> bool:
     def ns(**kw):
         d = dict(left=None, right=None, left_video=None, right_video=None,
                  left_dir=None, right_dir=None, width=1920, height=1080, fps=60,
-                 backup_camera=None)
+                 backup_camera=None, backend=None, auto_cameras=False)
         d.update(kw)
         return argparse.Namespace(**d)
 
@@ -403,14 +403,35 @@ def test_from_args(base: Path) -> bool:
 
     pair_src = (ROOT / "stereo" / "pair_source.py").read_text(encoding="utf-8")
     body = pair_src.split("def from_args(")[1].split("\ndef ")[0]
-    # 这段代码块一旦出现，就说明 auto 又被折叠成固定后端了
-    checks.append(("from_args 里**不再**把 None 折叠成 INDEX_BACKEND"
-                   "（否则 auto 名不副实）",
-                   "api = INDEX_BACKEND" not in body))
+
+    # ⚠️ **2026-10-18 改了口径**（旧判据现在恰好反了）：
+    # 上一版判据是"from_args 里**不许**出现 `api = INDEX_BACKEND`"，
+    # 理由是"auto 应该真的成对挑后端"。
+    # 但那次改成"auto → DSHOW 优先"引出了更严重的 bug：
+    # `left_i/right_i` 是 **PnP 位次**，DSHOW 的编号空间与它错位
+    # （实测 DSHOW #1=内置、#2=aoni），于是**角色 right 会开到内置相机**，
+    # 两路都报 1920x1080、界面上完全看不出 —— 比"打不开"危险得多。
+    # 所以现在的正确行为是：**索引来自角色/auto 时锁死 INDEX_BACKEND**；
+    # 想用别的后端必须显式给数字编号。
+    checks.append(("索引来自角色/auto 时**锁死** INDEX_BACKEND（PnP 位次只对它成立）",
+                   "api = INDEX_BACKEND" in body))
     checks.append(("from_args 确实把 api 传给了 PairSource（不是传了个死值）",
                    "backend=api" in body))
-    checks.append(("auto 时会打印「这次按成对顺序试」（可诊断）",
-                   "成对" in body))
+    checks.append(("显式数字编号时**不**锁后端（用户自认编号空间）",
+                   "_explicit_index" in body))
+
+    # 守卫：角色名 + dshow 必须被拒绝（这是"静默用错相机"的唯一入口）
+    try:
+        from_args(ns(left="left", right="right", backend="dshow"))
+        checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", False))
+    except RuntimeError as exc:
+        msg = str(exc)
+        ok_guard = ("不能一起用" in msg) and ("PnP" in msg)
+        print(f"  守卫拒绝：{msg.splitlines()[0][:74]}")
+        checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", ok_guard))
+    except Exception as exc:                         # noqa: BLE001
+        checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", False))
+        print(f"  守卫抛了非 RuntimeError：{type(exc).__name__}: {exc}")
 
     try:
         from_args(ns())

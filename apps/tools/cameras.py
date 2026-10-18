@@ -128,65 +128,46 @@ _KEY_HINT = "l=左相机  r=右相机  n=无关(这台不要用)  m=单目主相
 _backend_used: dict[int, str] = {}
 
 
-def _open_preview(index: int):
+def _open_preview(index: int, backend: int):
     """打开预览源，返回 `(src, 后端名)`；打不开返回 `(None, None)`。
 
     ⚠️ **两个返回分支形状必须一致**：调用点解包两个值。
     2026-10-15 就是因为早退分支 `return None` 而崩过一次（见下面的注释）。
 
-    ## 为什么不能写死一个后端（2026-10-15 修的真缺陷）
+    ## 🔴 2026-10-18：上一版的"回退换后端"是真 bug，这里改回单后端
 
-    这里原来是 `CameraSource(index=index, backend=INDEX_BACKEND)`，注释写着
-    「**必须固定 MSMF**」，理由是「DSHOW 的枚举与 PnP 错位」。但那条理由
-    **只对"不带后端"（auto）成立**；实测本机**两个后端的索引→设备映射一致**
-    （idx0=1920x1080 / idx1=640x480，两轮四组读数相同）。
+    **上一版**（我改的）按"真能出图"给**每个索引单独挑后端**
+    （`pick_backend_for_device`：先 MSMF，不成再 DSHOW）。我当时写的理由是
+    「画面就在用户眼前，标签与画面是同一路流，真要错位人一眼能看出来」——
+    **这条理由是错的**，而且是这个工具最不该犯的错：
 
-    而写死 MSMF 的后果是**致命的**：本机 **MSMF 对相机 0 读不到任何一帧**
-    （`-2147483638`）。用户 2026-10-15 的实测日志：
+    - **两台 aoni 长得一模一样**，用户**看画面根本分不出哪台是哪台**；
+    - 更致命的是 **DSHOW 的枚举顺序与 PnP 错位**（实测，见下表）——
+      一旦某个索引回退到 DSHOW，**标签写的是 PnP 那台，画面却是另一台**。
 
-        [相机 0] ✘ MSMF @ 640x480：读不到画面（已等 10.6s）
-          #0 打不开：摄像头 0 用 MSMF 能打开，但**一帧都拿不到**（读 12 次全空）
-        ...（相机 1 打开了）
-          [right] <- #1 aoni webcam A25（身份已记录）
-          [left]  <- #1 aoni webcam A25（身份已记录）   ← 同一台被记成两个角色
+    本机实测（2026-10-18，`outputs/_handoff_read/probe_index_map.py`）：
 
-    于是 **#0 根本没机会被分配**，而 #1 被先后按了 r 和 l，
-    `config/cameras.json` 里 `left` 与 `right` 指向**同一台相机** ——
-    标定直接废掉。**识别工具自己把这个坑造了出来。**
+        PnP 标签：#0 aoni-left   #1 aoni-right   #2 Integrated   #3 Integrated IR
+        MSMF     ：#0 有图       #1 有图        #2 纯黑(被遮)   #3 打不开   ← 与 PnP 一致
+        DSHOW    ：#0 有图       #1 **纯黑**    #2 **有图**     #3 打不开   ← 整体错位
 
-    ## 为什么回退是安全的
+    即 **DSHOW #1 = 内置相机、DSHOW #2 = aoni**。于是回退一次，用户就会看到
+    "aoni 相机被显示成 Integrated Camera"、同一台被认成两台 —— 这正是用户的报告。
+    **用户据此绑定的角色会落到错的相机上，标定直接废掉。**
 
-    回退**不改变"哪个索引是哪台设备"这个前提的可验证性**：画面就在用户眼前，
-    标签（`#N 名字 端口`）与画面是同一路流。真要错位，人一眼能看出来 ——
-    这正是 `identify` 存在的意义（"目视确认"）。反过来，**打不开**是没法目视确认的。
+    ## 所以：索引与标签的对应关系，只在一个后端内成立
 
-    ## ⚠️ 2026-10-15 二次修：原来的回退抓不到"**纯黑**"
+    **同一次 `identify` 里绝不允许换后端。** 打不开就如实说"打不开"并跳过，
+    让人改用 `pin`（按 `name:` / `port:` / `id:` 直接绑，**根本不用开相机**）。
 
-    第一版只按"能不能打开"回退（`CameraSource` 抛不抛 `RuntimeError`）。
-    但本机更常见的坏状态是"**打开成功、每一帧都是纯黑**"，它**不抛异常**。
-    实测同一次会话里两个后端的结论正好相反：
-
-        #0（right）  DSHOW: **纯黑** mean=0.0     MSMF: 正常 mean=116.4
-        #1（left）   DSHOW: 正常                 MSMF: 正常
-
-    于是"写死 MSMF"和"MSMF 失败才换"都会在某个时刻坏掉。
-    现在改用 `camera_registry.pick_backend_for_device()` ——
-    它复用 `probe_index`（已经把纯黑判成 `ok=False`），
-    **按"真能出图"挑后端**，不再按"能不能打开"。
+    `backend` 由调用方（`cmd_identify`）选定并对**整个会话**生效；
+    默认取 `INDEX_BACKEND`（MSMF）—— 那是**唯一实测与 PnP 位次一致**的后端。
     """
-    from sphere_tracker import camera_registry as _cr
-    from sphere_tracker.sources import INDEX_BACKEND_NAME, backend_name
+    from sphere_tracker.sources import backend_name
 
-    # `pick_backend_for_device` 自己会把"哪个后端不可用、改用了哪个"打出来，
-    # 所以这里不再重复打印 —— **同一个事实只留一个实现**。
-    api, probe = _cr.pick_backend_for_device(index, width=640, height=480)
-    if api is None:
-        raise RuntimeError(probe.error or "打不开")
-    used_name = backend_name(api)
-    if used_name != INDEX_BACKEND_NAME:
-        print(f"  ℹ 标定/检测请相应加 `--backend {used_name.lower()}`", flush=True)
+    used_name = backend_name(backend)
     try:
-        src = CameraSource(index=index, width=640, height=480, backend=api)
+        src = CameraSource(index=index, width=640, height=480, backend=backend)
     except RuntimeError as exc:
         # ⚠️ **这里必须返回两个值**（2026-10-15 修的真崩溃）。
         # 上一版改返回值时漏了这个早退分支，于是 `_open_preview` 返回单值 `None`，
@@ -194,28 +175,32 @@ def _open_preview(index: int):
         # **整个 identify 直接崩掉**（用户 21:08 那次日志的最后 8 行就是这么来的）。
         # 修法不是"在调用点多判一次"，而是**让所有分支的返回形状一致** ——
         # 否则下次再加一条分支还会犯。
-        print(f"  #{index} 打不开：{_first_line(exc)}")
+        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")
         return None, None
     _backend_used[index] = used_name
     return src, used_name
 
 
-def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "") -> str | None:
+def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
+                        *, backend: int) -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
 
     ⚠️ `_open_preview` **必须**返回 `(src, 后端名)` 两元组 —— 两个分支形状一致。
     这里崩过一次（2026-10-15）：早退分支写成 `return None`，解包时抛
     `TypeError: cannot unpack non-iterable NoneType object`，整个 identify 崩掉。
     判据放在 `tests/selftest_camera_registry.py` 第 14 节（**穷举返回路径**验形状）。
+
+    ⚠️ `backend` 是**整个 identify 会话共用的**，不允许按索引换（见 `_open_preview`
+    里的长注释与那张实测表）。`keyword-only` 是为了让每个调用点都必须显式交代它。
     """
     label = f"#{index}  {entry.name or '(无名字)'}  端口 {entry.port or '-'}"
     try:
-        src, backend_used = _open_preview(index)
+        src, backend_used = _open_preview(index, backend)
     except RuntimeError as exc:
         print(f"  #{index} 打不开：{_first_line(exc)}")
         return None
     if src is None:
-        return None                     # 两个后端都出不了图 -> 跳过这台（**不崩**）
+        return None                     # 这个后端出不了图 -> 跳过这台（**不崩、也不换后端**）
     _backend_used[index] = backend_used
 
     win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"
@@ -327,6 +312,31 @@ def cmd_identify(args) -> int:
         print("没有可识别的索引。先跑 python apps/tools/cameras.py list 看看设备。")
         return 1
 
+    # ---- 选定**本次会话唯一**的后端（绝不在索引之间切换）-----------------
+    #
+    # 为什么必须在会话级定死：`#N` 的标签来自 PnP 枚举，而 cv2 用的是**后端自己的
+    # 枚举**。只有 MSMF 实测与 PnP 位次一致；DSHOW 整体错位（#1=内置、#2=aoni）。
+    # 所以换后端 = 标签与画面脱钩 = 用户把角色绑到错的相机上（2026-10-18 的真 bug）。
+    from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME, backend_name
+
+    backend = INDEX_BACKEND if not getattr(args, "backend", None) else {
+        "msmf": __import__("cv2").CAP_MSMF,
+        "dshow": __import__("cv2").CAP_DSHOW,
+    }[args.backend]
+    used = backend_name(backend)
+    print(f"后端：**{used}**（整场只用这一个，不会中途换）")
+    if backend != INDEX_BACKEND:
+        print("=" * 70)
+        print(f"⚠️ 你指定了 {used}。**它的枚举顺序与本机设备列表不一致**：")
+        print("   实测 DSHOW #1 = 笔记本内置、#2 才是外接 aoni；"
+              f"而 {INDEX_BACKEND_NAME} 与设备列表一致。")
+        print(f"   用 {used} 识别，**可能把画面上的相机贴成另一台的名字**。")
+        print("   除非你已经确认过这个后端的编号，否则建议：按 Ctrl+C 退出，改用")
+        print("     python apps/tools/cameras.py pin left  name:\"aoni webcam A25 left\"")
+        print("     python apps/tools/cameras.py pin right name:\"aoni webcam A25 right\"")
+        print("   —— 按名字直接绑，**根本不用开相机**，也就没有错位问题。")
+        print("=" * 70)
+
     reg = cr.load_registry()
     print("逐个索引显示画面，请按提示确认哪台是左、哪台是右、哪台「无关」：")
     print(f"（按键：{_KEY_HINT}）\n")
@@ -334,7 +344,7 @@ def cmd_identify(args) -> int:
     for idx in indices:
         entry = by_order.get(idx) or cr.DeviceEntry(order=idx)
         status = _describe_status(reg, idx, entry)
-        role = _preview_and_assign(idx, entry, status)
+        role = _preview_and_assign(idx, entry, status, backend=backend)
         if role == "":                                   # 退出
             break
         if not role:                                     # 跳过：不改配置
@@ -701,21 +711,34 @@ def cmd_doctor(args) -> int:
             for line in cr.describe_moved_device(spec, devices, role).splitlines():
                 print(line)
 
-    # ---- ③ 每台实测：哪个后端真能出图 ----
-    print(f"\n③ 逐台实测（各后端都试；判据是「真能出图」而不是「能打开」）：")
+    # ---- ③ 每台实测：**在唯一可信的后端上**真能出图吗 ----
+    #
+    # ⚠️ 2026-10-18 修：原来用 `pick_backend_for_device()` 给每个索引单独挑后端 ——
+    # 那是错的。`resolved[role]` 是 **PnP 位次**，只有 MSMF 与它一致；
+    # 换成 DSHOW 后同一个编号指向**另一台物理相机**（实测 #1=内置、#2=aoni），
+    # 于是"实测这一路"其实测的是别的相机，结论整个失真。
+    # 现在：**整场只用一个后端**，与 `identify` 同一条纪律。
+    from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME
+
+    probe_backend = INDEX_BACKEND
+    print(f"\n③ 逐台实测（后端固定为 **{INDEX_BACKEND_NAME}** —— 唯一与设备位次一致的后端；"
+          f"判据是「真能出图」）：")
     usable: dict[str, tuple[int, int, int]] = {}      # role -> (index, api, std)
     for role in ("left", "right"):
         idx = resolved.get(role)
         if idx is None:
             continue
-        api, probe = cr.pick_backend_for_device(idx, width=want_w, height=want_h)
-        if api is None:
+        probe = cr.probe_index(idx, width=want_w, height=want_h,
+                               fps=30.0, backend=probe_backend)
+        if not probe.ok:
             fail = True
-            print(f"    「{role}」#{idx}：**没有可用后端** —— {probe.error}")
+            print(f"    「{role}」#{idx}：**出不了图** —— {probe.error}")
+            print(f"       （不换后端试：换后端后 #{idx} 会指到**另一台**相机，"
+                  f"测出来的不是这一台）")
             continue
-        usable[role] = (idx, api, int(probe.std))
-        print(f"    「{role}」#{idx}：后端 {backend_name(api)}，"
-              f"{probe.width}x{probe.height}，std {probe.std:.1f} ✅")
+        usable[role] = (idx, probe_backend, int(probe.std))
+        print(f"    「{role}」#{idx}：{probe.width}x{probe.height}，"
+              f"std {probe.std:.1f} ✅")
 
     # ---- ④ 两路能不能凑成一对（同后端 + 同分辨率）----
     print(f"\n④ 两路一致性（双目硬要求：**同一个后端 + 同一个分辨率**）：")
@@ -727,8 +750,7 @@ def cmd_doctor(args) -> int:
         if la != ra:
             fail = True
             print(f"    ✘ 两路**后端不同**（left={backend_name(la)} / "
-                  f"right={backend_name(ra)}）—— 同一进程混用会挂一路。"
-                  f"标定请显式指定：`--backend {backend_name(la).lower()}` 或换一台。")
+                  f"right={backend_name(ra)}）—— 同一进程混用会挂一路。")
         else:
             print(f"    ✓ 两路同后端（{backend_name(la)}）")
         # 用**临时缓存**做一致性测试，绝不污染真缓存（"缓存把分辨率钉死"
@@ -742,10 +764,11 @@ def cmd_doctor(args) -> int:
             with tempfile.TemporaryDirectory() as td:
                 _src._MODE_CACHE = Path(td) / "probe_modes.json"
                 for role in ("left", "right"):
-                    api, probe = cr.pick_backend_for_device(
-                        usable[role][0], width=want_w, height=want_h,
-                        prefer=usable[role][1])
-                    res[role] = (probe.width, probe.height) if api else None
+                    # ⚠️ 这里也**只测同一个后端**（同一条纪律），不按索引换后端。
+                    probe = cr.probe_index(usable[role][0], width=want_w,
+                                           height=want_h, fps=30.0,
+                                           backend=usable[role][1])
+                    res[role] = (probe.width, probe.height) if probe.ok else None
         finally:
             _src._MODE_CACHE = saved_cache
         print(f"    实测分辨率：left={res.get('left')}  right={res.get('right')}")
@@ -786,6 +809,10 @@ def build_parser() -> argparse.ArgumentParser:
     pi = sub.add_parser("identify", help="逐个索引显示画面，确认哪个是左/右/无关")
     pi.add_argument("--indices", default=None, help="只识别这些索引，如 0,2")
     pi.add_argument("--max-index", type=int, default=6, help="没给 --indices 时补探到第几个索引")
+    pi.add_argument(
+        "--backend", choices=("msmf", "dshow"), default=None,
+        help="整场用哪个后端。**默认 msmf** —— 只有它与系统设备列表的顺序一致；"
+             "dshow 会整体错位，用它识别可能把标签贴到别的相机上")
     pi.set_defaults(func=cmd_identify)
 
     pp = sub.add_parser("pin", help="非交互地把某角色固定到某设备")

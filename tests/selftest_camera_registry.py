@@ -942,47 +942,43 @@ def test_identify_open_preview_shape() -> bool:
     spec.loader.exec_module(cam)
 
     checks: list[tuple[str, bool]] = []
-    real_pick = _cr.pick_backend_for_device
+    import cv2 as _cv2
 
-    # ① 挑不到任何后端 -> 抛 RuntimeError（**调用点接住了它**，这是设计）
-    try:
-        _cr.pick_backend_for_device = lambda *a, **k: (None, _cr.ProbeResult(
-            index=0, ok=False, error="（替身）两个后端都不行"))
-        got = cam._open_preview(0)
-        ok1 = False                       # 这条路径不该正常返回
-        print(f"  ① 挑不到后端 -> 返回了 {got!r}（**不该**，应为 RuntimeError）")
-    except RuntimeError as exc:
-        ok1 = bool(str(exc).strip())
-        print(f"  ① 挑不到后端 -> 抛 RuntimeError({str(exc)[:44]!r})，"
-              f"调用点接住并跳过这台")
-    except Exception as exc:                              # noqa: BLE001
-        ok1 = False
-        print(f"  ① 挑不到后端 -> 抛了非 RuntimeError：{type(exc).__name__}: {exc}")
-    finally:
-        _cr.pick_backend_for_device = real_pick
-    checks.append(("挑不到后端时抛**带原因的** RuntimeError（调用点接得住）", ok1))
+    # ① `_open_preview` 已经**不再挑后端**（2026-10-18 改：挑后端会让标签贴错）。
+    #    所以"挑不到后端"这条路径不存在了 —— 直接断言这一点，避免判据过期后
+    #    变成永远无法触发的死断言。
+    #
+    #    ⚠️ 用 **AST** 查"有没有被调用"，而不是 `in src_text`：
+    #    `cameras.py` 的**注释里**就写着这个名字（讲这段历史），
+    #    字符串匹配会误判成"还在用"——判据本身必须长在语法树上才可靠。
+    import ast
 
-    # ② 挑到了后端，但 CameraSource 打不开（RuntimeError）
+    cam_text = cam_path.read_text(encoding="utf-8")
+    calls: list[str] = []
+    for node in ast.walk(ast.parse(cam_text)):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+            if name:
+                calls.append(name)
+    checks.append(("`_open_preview` 不再按索引挑后端（AST：没有 pick_backend_for_device 调用）",
+                   "pick_backend_for_device" not in calls))
+
+    # ② CameraSource 打不开（RuntimeError）-> 必须返回两元组，不能是单值 None
     real_src = cam.CameraSource
     try:
-        _cr.pick_backend_for_device = lambda *a, **k: (
-            __import__("cv2").CAP_DSHOW, _cr.ProbeResult(index=0, ok=True,
-                                                         width=640, height=480,
-                                                         fps=30.0, std=50.0))
-
         def _boom(*a, **k):                               # noqa: ANN002, ANN003
             raise RuntimeError("（替身）打不开")
 
         cam.CameraSource = _boom                            # type: ignore[assignment]
-        got2 = cam._open_preview(0)
+        got2 = cam._open_preview(0, _cv2.CAP_DSHOW)
         ok2 = isinstance(got2, tuple) and len(got2) == 2 and got2[0] is None
-        print(f"  ② 后端挑到了但打不开 -> 返回 {got2!r}")
+        print(f"  ② 打不开 -> 返回 {got2!r}")
     except Exception as exc:                              # noqa: BLE001
         ok2 = False
-        print(f"  ② 后端挑到了但打不开 -> 抛了 {type(exc).__name__}: {exc}")
+        print(f"  ② 打不开 -> 抛了 {type(exc).__name__}: {exc}")
     finally:
         cam.CameraSource = real_src                         # type: ignore[assignment]
-        _cr.pick_backend_for_device = real_pick
     checks.append(("CameraSource 抛 RuntimeError 时也返回两元组，不是单值 None",
                    ok2))
 
@@ -1119,6 +1115,104 @@ def test_real_probe() -> bool:
     return True
 
 
+def test_identify_never_switches_backend() -> bool:
+    """第 16 节：`identify` **整场只用一个后端**，绝不在索引之间切换。
+
+    ## 守的是用户 2026-10-18 报的"生产级 bug"
+
+    > 运行相机管理选择的时候，把我的 aoni 相机识别为了 aoni 相机和 integrated
+    > 相机，也就是识别了两次
+
+    **根因**：上一版为了绕开"某个后端打不开某台相机"，给**每个索引单独挑后端**
+    （先 MSMF，不成再 DSHOW）。而 `#N` 的标签来自 **PnP 枚举**，
+    `cv2.VideoCapture(N, backend)` 用的是**后端自己的枚举**。本机实测
+    （`outputs/_handoff_read/probe_index_map.py`）：
+
+        PnP 标签：#0 aoni-left   #1 aoni-right   #2 Integrated   #3 Integrated IR
+        MSMF     ：#0 有图       #1 有图        #2 纯黑(被遮)   #3 打不开   ← 一致
+        DSHOW    ：#0 有图       #1 **纯黑**    #2 **有图**     #3 打不开   ← 错位
+
+    所以任一索引回退到 DSHOW，**标签就贴到了另一台相机上** ——
+    用户看到"aoni 被显示成 Integrated"，据此绑定就绑错、标定废掉。
+
+    ## 判据（行为级，不只看源码）
+
+    1. `cameras.py` **不再使用** `pick_backend_for_device`（它是"按索引换后端"的入口）；
+    2. `_open_preview(index, backend)` 用的就是**传进来的那个**后端；
+    3. 该后端打不开时**返回失败、不再试别的**（替身只应被调用一次）；
+    4. `identify` 的 `--backend` 默认 `None`（= 用 `INDEX_BACKEND`）。
+    """
+    print("----- 16. identify 整场只用一个后端 -----")
+    import cv2
+
+    import sphere_tracker.sources as _src
+    from sphere_tracker import camera_registry as _cr
+
+    cam_path = ROOT / "apps" / "tools" / "cameras.py"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cam_tool_sw", cam_path)
+    cam = importlib.util.module_from_spec(spec)
+    sys.modules["cam_tool_sw"] = cam
+    assert spec.loader is not None
+    spec.loader.exec_module(cam)
+
+    checks: list[tuple[str, bool]] = []
+
+    # （"不再按索引挑后端"这条判据在**本文件第 14 节**用 AST 查过了 ——
+    #  这里不重复，避免同一事实两套判据、改一处忘一处。）
+
+    # ---- 行为：传什么后端就用什么后端 ----
+    real_src = cam.CameraSource
+    used: list[int] = []
+
+    class _Fake:
+        def __init__(self, **kw):                         # noqa: ANN003
+            used.append(kw.get("backend"))
+
+        def release(self) -> None:
+            pass
+
+    try:
+        cam.CameraSource = _Fake                        # type: ignore[assignment]
+        got = cam._open_preview(3, cv2.CAP_DSHOW)
+        ok_used = used == [cv2.CAP_DSHOW]
+        ok_name = got[0] is not None and got[1] == "DSHOW"
+        print(f"  ① 传 DSHOW -> 实际用 {used}（期望 [{cv2.CAP_DSHOW}]），返回名 {got[1]!r}")
+        checks.append(("① `_open_preview` 只用**传入的**后端（不自己挑）", ok_used))
+        checks.append(("① 返回的后端名与实际一致", ok_name))
+
+        # ---- 打不开时不许换后端再试 ----
+        used.clear()
+
+        def _boom(**kw):                                # noqa: ANN003
+            used.append(kw.get("backend"))
+            raise RuntimeError("（替身）打不开")
+
+        cam.CameraSource = _boom                        # type: ignore[assignment]
+        got2 = cam._open_preview(3, cv2.CAP_MSMF)
+        ok_once = len(used) == 1
+        ok_none = got2 == (None, None)
+        print(f"  ② 打不开 -> 尝试次数 {len(used)}（期望 1），返回 {got2!r}")
+        checks.append(("② 打不开时**不换后端重试**（标签才不会贴错）", ok_once))
+        checks.append(("② 打不开时返回 `(None, None)`（形状一致、不崩）", ok_none))
+    finally:
+        cam.CameraSource = real_src                     # type: ignore[assignment]
+
+    # ---- 默认后端 ----
+    p = cam.build_parser()
+    ns_ = p.parse_args(["identify"])
+    checks.append(("`identify --backend` 默认 None（= 用 INDEX_BACKEND）",
+                   getattr(ns_, "backend", "缺失") is None))
+    checks.append(("默认后端就是 INDEX_BACKEND，且它确实是 MSMF（唯一与 PnP 一致的）",
+                   _src.INDEX_BACKEND == cv2.CAP_MSMF
+                   and _src.INDEX_BACKEND_NAME == "MSMF"))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def make_scratch_dir() -> Path:
     """可写的临时目录（沙箱里 %TEMP% 可能不可写，退回项目内 outputs/）。"""
     import tempfile
@@ -1165,6 +1259,7 @@ def main() -> int:
             test_cached_mode_respects_requested_resolution(),
             test_identify_open_preview_shape(),
             test_usb_port_change_is_diagnosable(),
+            test_identify_never_switches_backend(),
         ]
         print()
         if args.probe:

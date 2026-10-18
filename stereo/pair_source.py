@@ -668,9 +668,56 @@ def from_args(args) -> PairSource:
         # 依然绝不会两路混用不同后端（那正是原注释担心的）。
         backend_arg = getattr(args, "backend", None)
         api = resolve_backend(backend_arg)
-        if api is None:
-            print("[后端] 未指定 --backend（auto）：按 DSHOW → MSMF 的顺序"
-                  "**成对**试着打开，两路必须用同一个后端")
+
+        # ---- 索引来自「PnP 位次」时，后端**只能**是 INDEX_BACKEND ----------------
+        #
+        # 🔴 2026-10-18 修的真缺陷（用户报"aoni 被认成 Integrated"时发现）：
+        # `left_i/right_i` 来自 `resolve_camera_arg()` / `select_cameras()`，
+        # 也就是 **Windows PnP 枚举位次**。而 `cv2.VideoCapture(index, backend)`
+        # 用的是**后端自己的枚举顺序** —— 实测本机（`probe_index_map.py`）：
+        #
+        #     PnP 标签：#0 aoni-left   #1 aoni-right   #2 Integrated   #3 Integrated IR
+        #     MSMF     ：#0 有图       #1 有图        #2 纯黑(被遮)   #3 打不开   ← 一致
+        #     DSHOW    ：#0 有图       #1 **纯黑**    #2 **有图**     #3 打不开   ← 错位
+        #
+        # 即 **DSHOW #1 是笔记本内置、#2 才是 aoni**。所以拿 PnP 位次 + DSHOW
+        # 开会**开到另一台相机**：角色 `right` 实际拿到的是**被遮住的内置相机**，
+        # 两路都报 1920x1080、界面上完全看不出，**标定直接废掉**。
+        #
+        # 这比"打不开"危险得多 —— 打不开会报错，错位是**静默**的。
+        #
+        # 因此：只要有一路的索引是**按角色名/auto 解析**出来的，就锁死
+        # `INDEX_BACKEND`；想用别的后端必须**显式给数字编号**（那样索引就在
+        # 那个后端的编号空间里，是用户自己确认过的）。
+        def _explicit_index(v) -> bool:
+            return v is not None and str(v).strip().isdigit()
+
+        from sphere_tracker.sources import INDEX_BACKEND, INDEX_BACKEND_NAME
+
+        pnp_derived = auto or not (_explicit_index(left_raw)
+                                   and _explicit_index(right_raw))
+        if pnp_derived:
+            if api is None:
+                api = INDEX_BACKEND
+                print(f"[后端] 索引来自角色/auto（PnP 位次），锁定 "
+                      f"{INDEX_BACKEND_NAME} —— 只有它与 PnP 位次一致。"
+                      f"（想用别的后端请显式给数字编号）")
+            elif api != INDEX_BACKEND:
+                raise RuntimeError(
+                    f"`--backend {backend_arg}` 与「按角色名解析索引」**不能一起用**。\n"
+                    f"  原因：角色名解析出的是 **PnP 位次**，而各后端的编号空间不同。\n"
+                    f"        本机实测：DSHOW 的 #1 是笔记本内置相机，#2 才是外接 aoni；\n"
+                    f"        而 MSMF 与 PnP 一致。用 DSHOW 打开会把**另一台**相机当成\n"
+                    f"        这一路，两路照样报 1920x1080，**界面上看不出任何异常**。\n"
+                    f"  怎么办（二选一）：\n"
+                    f"    1) 去掉 `--backend`，用默认的 {INDEX_BACKEND_NAME}；\n"
+                    f"    2) 确认过 DSHOW 的编号后，**显式给数字**：\n"
+                    f"         --left 0 --right 2 --backend {backend_arg}\n"
+                    f"       （数字是 DSHOW 的编号，不是 `cameras.py list` 里的那个）")
+        else:
+            print(f"[后端] 用显式数字编号 + {backend_arg or 'auto'}："
+                  f"编号按**该后端自己的**顺序解释，请自行确认对应关系")
+
         return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,
                           backup_camera=getattr(args, "backup_camera", None),

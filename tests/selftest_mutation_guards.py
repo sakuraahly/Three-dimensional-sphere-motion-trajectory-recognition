@@ -124,15 +124,18 @@ MUTATIONS: list[dict[str, str]] = [
         "new": '        args += ["--backend", "msmf"]   # ← 注入：写死回旧行为',
     },
     {
-        "key": "auto-backend",
+        # ⚠️ 这条替换了旧的 `auto-backend`（它的语义已被 2026-10-18 的修复反转：
+        # 现在"索引来自角色时锁死 INDEX_BACKEND"才是**正确**行为）。
+        # 新变异守住的是同一个真实危害的**反面**：
+        # 一旦放手允许"角色名 + DSHOW"，就会**静默开到另一台相机**。
+        "key": "backend-guard",
         "target": "stereo/pair_source.py",
         "test": "tests/selftest_pair_source.py",
-        "why": "`--backend auto` 被折叠成 INDEX_BACKEND（MSMF）—— "
-               "PairSource 里那份 DSHOW→MSMF 成对候选顺序**从没被走到过**",
-        "old": '            print("[后端] 未指定 --backend（auto）：按 DSHOW → MSMF 的顺序"\n'
-               '                  "**成对**试着打开，两路必须用同一个后端")',
-        "new": "            from sphere_tracker.sources import INDEX_BACKEND\n"
-               "            api = INDEX_BACKEND          # ← 注入：把 auto 折叠回固定后端",
+        "why": "关掉「PnP 位次 + 非 MSMF 后端」守卫 —— "
+               "DSHOW 的 #1 是笔记本内置、#2 才是 aoni，于是角色 right 开到内置相机，"
+               "两路都报 1920x1080、界面看不出，**标定静默废掉**",
+        "old": "        if pnp_derived:",
+        "new": "        if False:   # ← 注入：关掉守卫（允许角色名 + 任意后端）",
     },
     {
         "key": "probe-fallback",
@@ -168,9 +171,9 @@ MUTATIONS: list[dict[str, str]] = [
         "test": "tests/selftest_camera_registry.py",
         "why": "_open_preview 早退分支返回单值 None —— 调用点解包两个值 → "
                "TypeError，**整个 identify 崩掉**（我引入过的真崩溃）",
-        "old": '        print(f"  #{index} 打不开：{_first_line(exc)}")\n'
+        "old": '        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")\n'
                "        return None, None",
-        "new": '        print(f"  #{index} 打不开：{_first_line(exc)}")\n'
+        "new": '        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")\n'
                "        return None          # ← 注入：形状不一致",
     },
     {
