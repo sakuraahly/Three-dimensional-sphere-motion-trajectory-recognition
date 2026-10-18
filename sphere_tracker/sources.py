@@ -276,6 +276,7 @@ class CameraSource(VideoSource):
         optimize: bool = True,
         target_fps: float = 25.0,
         search_budget_s: float = 60.0,
+        first_frame_timeout_s: float = 3.0,
     ) -> None:
         self.cap = None
         self.backend_name = ""
@@ -285,6 +286,12 @@ class CameraSource(VideoSource):
         # 打开失败的相机要**多快放弃**：默认 60 s 适合正式启动（宁可等也别误判），
         # 但设备识别/预览只想知道“能不能看到画面”，不该让人干等一分钟。
         self._search_budget_s = float(search_budget_s)
+        # 单个"后端 × 分辨率"组合里，**等第一帧**最多多久。
+        # 3 s 对正常相机够（实测 1~2 s），但**有的相机会慢到 20 秒以上**
+        # —— 2026-10-18 实测：aoni #0 用 MSMF 要 ~24 s 才给第一帧，
+        # 而旧代码 3 s 就判它"一帧都拿不到"，于是它在识别界面里彻底消失。
+        # 预览可以给足时间（见 cameras.PREVIEW_*），正式启动保持 3 s。
+        self._first_frame_timeout_s = float(first_frame_timeout_s)
         self.mode_probed = False
         candidates = (
             [(backend_name(backend), backend)] if backend is not None
@@ -476,8 +483,10 @@ class CameraSource(VideoSource):
                 # 12 次 × 10 秒 = 120 秒，光"等它自己承认失败"就两分钟。
                 # 3 秒足够正常相机出首帧（实测 1~2 秒），超出就是设备不给帧。
                 t_read = time.perf_counter()
+                # ⚠️ 上限来自构造参数：慢相机（实测 ~24 s）在这里被误杀过一次。
+                ff_budget = float(getattr(self, "_first_frame_timeout_s", 3.0))
                 for _ in range(12):
-                    if time.perf_counter() - t_read > 3.0:
+                    if time.perf_counter() - t_read > ff_budget:
                         break                  # 这个组合不值得再等
                     ret, f = cap.read()
                     if ret and f is not None:

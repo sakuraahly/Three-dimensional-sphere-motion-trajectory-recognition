@@ -437,16 +437,22 @@ def _default_opener(index: int, width: int, height: int, fps: int,
     #
     # `backend=None` = 用 `INDEX_BACKEND`；显式给值时**只开那一个**，
     # 供 `probe_index_with_fallback()` 在上面做受控回退（理由见那个函数）。
+    # ⚠️ 探测是**用户主动发起的一次诊断**，值得等：
+    # 实测有的相机（aoni + MSMF）要 ~23 s 才给第一帧；默认 3 s 会把好相机
+    # 判成坏相机，于是它"从界面上消失"。这里给足 30 s。
     return CameraSource(index=index, width=width, height=height, fps=fps,
                         backend=INDEX_BACKEND if backend is None else backend,
-                        optimize=False)
+                        optimize=False, first_frame_timeout_s=30.0,
+                        search_budget_s=40.0)
 
 
 def probe_index(
     index: int,
     *,
-    width: int = 1280,
-    height: int = 720,
+    # ⚠️ 默认请求**原生**（0x0）：实测有的相机（aoni + MSMF）只认 1920x1080，
+    # 请求 1280x720/640x480 会"打开成功但一帧都不给"，于是被误判成坏相机。
+    width: int = 0,
+    height: int = 0,
     fps: int = 30,
     opener=None,
     backend: int | None = None,

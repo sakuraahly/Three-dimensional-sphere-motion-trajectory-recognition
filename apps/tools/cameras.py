@@ -171,11 +171,23 @@ def _try_open(index: int, api: int):
     search_budget_s 默认 60 s —— 遇到打不开的相机会干等一分钟。两者叠加
     就是用户看到的"卡顿"。
     """
-    return CameraSource(index=index, width=640, height=480, backend=api,
-                        optimize=False, search_budget_s=PREVIEW_BUDGET_S)
+    # ⚠️ **请求 1920x1080（原生）而不是 640x480**。
+    #
+    # 2026-10-18 实测这台 aoni：MSMF 下**只认 1920x1080** ——
+    # 请求 640x480 / 1280x720 都是"打开成功但一帧都不给"（10.6 s 后判死），
+    # 而 1920x1080 能出帧（约 23 s；另一台约 2 s）。
+    # 旧代码请求 640x480，于是那台在识别界面里**彻底消失**。
+    return CameraSource(index=index, width=1920, height=1080, backend=api,
+                        optimize=False, search_budget_s=PREVIEW_BUDGET_S,
+                        first_frame_timeout_s=PREVIEW_FIRST_FRAME_S)
 
 
-PREVIEW_BUDGET_S = 10.0
+# 预览里"等第一帧"的上限（秒）。**慢相机实测要 ~24 秒**才给第一帧
+#（aoni #0 + MSMF）；3 秒会把它误判成"一帧都拿不到"，于是它在界面上彻底消失。
+PREVIEW_FIRST_FRAME_S = 30.0
+
+# 单台预览的**总**预算：要能容纳上面那次首帧等待 + 一次分辨率降级。
+PREVIEW_BUDGET_S = 40.0
 
 
 def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
