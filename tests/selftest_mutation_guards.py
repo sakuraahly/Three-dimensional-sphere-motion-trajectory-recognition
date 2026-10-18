@@ -171,10 +171,14 @@ MUTATIONS: list[dict[str, str]] = [
         "test": "tests/selftest_camera_registry.py",
         "why": "_open_preview 早退分支返回单值 None —— 调用点解包两个值 → "
                "TypeError，**整个 identify 崩掉**（我引入过的真崩溃）",
-        "old": '        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")\n'
-               "        return None, None",
-        "new": '        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")\n'
-               "        return None          # ← 注入：形状不一致",
+        # 2026-10-18：_open_preview 拆出 _try_open 后，旧锚点失效。
+        # 重新钉在**当前**那唯一一处 (None, None) 早退分支上。
+        "old": '    if last_exc is not None:\n'
+               '        print(f"  #{index}（{used_name}）打不开：{_first_line(last_exc)}")\n'
+               '    return None, None',
+        "new": '    if last_exc is not None:\n'
+               '        print(f"  #{index}（{used_name}）打不开：{_first_line(last_exc)}")\n'
+               "    return None          # ← 注入：形状不一致",
     },
     {
         "key": "port-change-hint",

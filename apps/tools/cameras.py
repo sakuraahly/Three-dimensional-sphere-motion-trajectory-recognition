@@ -134,66 +134,83 @@ def _open_preview(index: int, backend: int):
     ⚠️ **两个返回分支形状必须一致**：调用点解包两个值。
     2026-10-15 就是因为早退分支 `return None` 而崩过一次（见下面的注释）。
 
-    ## 🔴 2026-10-18：上一版的"回退换后端"是真 bug，这里改回单后端
+    ## 索引与标签的对应关系，只在 INDEX_BACKEND 内成立
 
-    **上一版**（我改的）按"真能出图"给**每个索引单独挑后端**
-    （`pick_backend_for_device`：先 MSMF，不成再 DSHOW）。我当时写的理由是
-    「画面就在用户眼前，标签与画面是同一路流，真要错位人一眼能看出来」——
-    **这条理由是错的**，而且是这个工具最不该犯的错：
-
-    - **两台 aoni 长得一模一样**，用户**看画面根本分不出哪台是哪台**；
-    - 更致命的是 **DSHOW 的枚举顺序与 PnP 错位**（实测，见下表）——
-      一旦某个索引回退到 DSHOW，**标签写的是 PnP 那台，画面却是另一台**。
-
-    本机实测（2026-10-18，`outputs/_handoff_read/probe_index_map.py`）：
+    #N 的标签来自 **PnP 枚举**，而 cv2.VideoCapture(N, backend) 用的是
+    **后端自己的枚举**。实测本机：
 
         PnP 标签：#0 aoni-left   #1 aoni-right   #2 Integrated   #3 Integrated IR
         MSMF     ：#0 有图       #1 有图        #2 纯黑(被遮)   #3 打不开   ← 与 PnP 一致
         DSHOW    ：#0 有图       #1 **纯黑**    #2 **有图**     #3 打不开   ← 整体错位
 
-    即 **DSHOW #1 = 内置相机、DSHOW #2 = aoni**。于是回退一次，用户就会看到
-    "aoni 相机被显示成 Integrated Camera"、同一台被认成两台 —— 这正是用户的报告。
-    **用户据此绑定的角色会落到错的相机上，标定直接废掉。**
+    所以"换后端"不能白换 —— 换过之后 #N 就不再是 PnP 里的第 N 台。
 
-    ## 所以：索引与标签的对应关系，只在一个后端内成立
+    ## 但**不换**会让"打不开的那台"直接从界面上消失
 
-    **同一次 `identify` 里绝不允许换后端。** 打不开就如实说"打不开"并跳过，
-    让人改用 `pin`（按 `name:` / `port:` / `id:` 直接绑，**根本不用开相机**）。
+    2026-10-18 我一度把回退整个删掉（33b7164），本意是修"标签贴错"。
+    后果是：MSMF 打不开的那台在识别界面里**消失**了
+    （用户原话："aoni 摄像头又是只能检测到一个了"），而 list --probe
+    （它带回退）明明两台都能出图。
 
-    `backend` 由调用方（`cmd_identify`）选定并对**整个会话**生效；
-    默认取 `INDEX_BACKEND`（MSMF）—— 那是**唯一实测与 PnP 位次一致**的后端。
-    """
-    from sphere_tracker.sources import backend_name
+    ## 正确分工：**回退只为"让你看见画面"，绝不据此绑定身份**
 
+    - 本后端打不开 → 换另一个后端把画面放出来（否则连"它活着吗"都不知道）；
+    - 一旦换了后端，本次**按下的键不会写入配置**（上层会拒绝并提示改用 pin）。
+      因为"我看到了画面"与"这是 PnP 列表里的第 N 台"是两件事。
+        """
+    from sphere_tracker.sources import INDEX_BACKEND, backend_name
+
+    # ⚠️ **2026-10-18 修：回退只为“让你看见画面”，不用于绑定身份。**
+    #
+    # 我在 33b7164 修“标签贴错”时把回退**整个删掉**了。后果：MSMF 打不开的那台
+    # 在识别界面里**直接消失**（用户的原话是“aoni 摄像头只能检测到一个”），
+    # 而 cameras.py list --probe（它带回退）明明两台都能出图。
+    #
+    # 正确的分工：
+    #   · **回退** —— 让你能看见这一路的画面（否则连“它活着吗”都不知道）；
+    #   · **但不许据此绑定** —— 换过后端，编号就不再对应 PnP 名字（DSHOW #1 是内置、
+    #     #2 才是外接）。所以这里把“用的是不是可信后端”一起返回，由上层决定。
+    order = [backend] + [b for b in (INDEX_BACKEND, _other_backend(backend))
+                         if b != backend]
     used_name = backend_name(backend)
-    try:
-        # ⚠️ optimize=False + 短预算（2026-10-18，用户反馈“卡顿明显”）：
-        #
-        # 设备识别只需要“把画面抓出来让人按键”，**不需要**挑最优分辨率/帧率。
-        # 之前用默认参数时：
-        #   · optimize=True 会跑一遍模式搜索（冷缓存最坏 10~40 s）；
-        #   · search_budget_s 默认 60 s —— 遇到**打不开**的相机（本机 aoni #0
-        #     在 MSMF 下就是“能打开但一帧都拿不到”），会**干等一分钟**才报错。
-        # 两者叠加就是用户看到的“卡顿”。
-        src = CameraSource(index=index, width=640, height=480, backend=backend,
-                           optimize=False, search_budget_s=PREVIEW_BUDGET_S)
-    except RuntimeError as exc:
-        # ⚠️ **这里必须返回两个值**（2026-10-15 修的真崩溃）。
-        # 上一版改返回值时漏了这个早退分支，于是 `_open_preview` 返回单值 `None`，
-        # 而调用点解包两个 → `TypeError: cannot unpack non-iterable NoneType object`，
-        # **整个 identify 直接崩掉**（用户 21:08 那次日志的最后 8 行就是这么来的）。
-        # 修法不是"在调用点多判一次"，而是**让所有分支的返回形状一致** ——
-        # 否则下次再加一条分支还会犯。
-        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")
-        return None, None
-    _backend_used[index] = used_name
-    return src, used_name
+    last_exc: Exception | None = None
+    for pos, api in enumerate(order):
+        try:
+            src = _try_open(index, api)
+        except RuntimeError as exc:
+            last_exc = exc
+            used_name = backend_name(api)
+            continue
+        used_name = backend_name(api)
+        if pos > 0:
+            print(f"  ℹ #{index} 用 {backend_name(backend)} 打不开，"                  f"**已改用 {used_name} 只为显示画面**（编号不再对应设备名，"                  f"不能据此绑定角色）", flush=True)
+        _backend_used[index] = used_name
+        return src, used_name
+    if last_exc is not None:
+        print(f"  #{index}（{used_name}）打不开：{_first_line(last_exc)}")
+    return None, None
 
 
-# 设备识别/预览单台相机的**打开预算**（秒）。
-#
-# 为什么单独给一个短预算：识别是“人盯着屏幕等”的交互，一台打不开就跳过；
-# 而正式启动（run/calibrate）可以等 —— 那里仍用默认 60 s。
+def _other_backend(backend: int) -> int:
+    """另一个 Windows 视频后端常量。"""
+    import cv2
+
+    return cv2.CAP_DSHOW if backend != cv2.CAP_DSHOW else cv2.CAP_MSMF
+
+
+def _try_open(index: int, api: int):
+    """按给定后端开一路预览；失败**抛 RuntimeError**，由调用方决定是否回退。
+
+    optimize=False + 短预算（2026-10-18，用户反馈"卡顿明显"）：
+    设备识别只需要"把画面抓出来让人按键"，**不需要**挑最优分辨率/帧率。
+    之前用默认参数时：optimize=True 会跑模式搜索（冷缓存最坏 10~40 s），
+    search_budget_s 默认 60 s —— 遇到打不开的相机会干等一分钟。两者叠加
+    就是用户看到的"卡顿"。
+    """
+    return CameraSource(index=index, width=640, height=480, backend=api,
+                        optimize=False, search_budget_s=PREVIEW_BUDGET_S)
+
+
 PREVIEW_BUDGET_S = 10.0
 
 
@@ -230,6 +247,11 @@ def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
     return f"#{index}  推测:{entry.name or '(无名字)'}  端口 {entry.port or '-'}"
 
 
+def _untrusted_label(index: int, used_backend: str) -> str:
+    """**换过后端**时的标签：只说明"这一路能看到画面"，不声称它是哪台。"""
+    return f"#{index}  ？？未知（经 {used_backend} 打开；编号不对应设备名）"
+
+
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                         *, backend: int) -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
@@ -251,6 +273,15 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
     if src is None:
         return None                     # 这个后端出不了图 -> 跳过这台（**不崩、也不换后端**）
     _backend_used[index] = backend_used
+
+    # 换过后端 → 本路的**编号不可信**：画面可以看，但按键不写配置。
+    from sphere_tracker.sources import INDEX_BACKEND_NAME
+
+    trusted = (backend_used == INDEX_BACKEND_NAME)
+    if not trusted:
+        label = _untrusted_label(index, backend_used)
+        print(f"  ⚠ #{index} 这一路是经 {backend_used} 打开的：**编号不对应设备名**，"
+              f"接下来按的键**不会写入配置**（只让你确认它能不能出图）。")
 
     win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"
     wins = WindowManager()
@@ -314,6 +345,12 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                 if key == ord("q") or key == 27:
                     return ""
                 if key in _ASSIGN_KEYS:
+                    if not trusted:
+                        print(f"  ⛔ 不写入配置：这一路是经 {backend_used} 看到的，"
+                              f"编号与设备名对不上。要绑角色请用：")
+                        print('     python apps/tools/cameras.py pin left '
+                              'name:"<完整设备名>"')
+                        return None
                     return _ASSIGN_KEYS[key]
         if not gui_ok:
             # 没有图形界面：打印设备信息，用命令行输入角色名
