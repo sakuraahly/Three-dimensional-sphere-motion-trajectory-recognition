@@ -197,7 +197,14 @@ class TrackerConfig:
     maneuver_min_px_s: float = 250.0   # 速度突变的最小绝对值（像素/秒），低于此不认为是机动
     maneuver_ratio: float = 1.6        # 速度突变超过当前速度的多少倍才判定为机动
     max_q_scale: float = 64.0          # 自适应过程噪声最多放大到基准值的多少倍
-    max_coast_frames: int = 12         # 连续丢失多少帧后删除轨迹
+    # 连续丢失多久后删除轨迹。
+    #
+    # ⚠️ 2026-10-18：**优先用秒**（max_coast_s），帧数只作兜底。
+    # 只数帧会让"遮挡容忍度"随帧率变：同一段 0.3 s 遮挡，
+    # 30 fps 是 9 帧（轨迹延续）、60 fps 是 18 帧（轨迹断开）。
+    # 本项目两路常跑 30/60 fps，所以必须用与帧率无关的时间口径。
+    max_coast_s: float = 0.4           # 秒；<=0 表示退回按帧数
+    max_coast_frames: int = 12         # 兜底：不知道 fps / max_coast_s<=0 时才算它
     init_hits: int = 2                 # 连续命中多少帧才认为轨迹"确认"
     trail_length: int = 240            # 保存多少个历史点用于画拖尾
     # 轨迹点存"原始观测"还是"滤波结果"？

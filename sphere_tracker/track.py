@@ -194,6 +194,7 @@ class Track:
         self.score = float(det.score)
         self.hits = 1
         self.misses = 0
+        self.last_hit_t = float(t)
         self.age = 1
         self.confirmed = cfg.init_hits <= 1
         self.coasting = False
@@ -252,6 +253,7 @@ class Track:
             self._init_points.append((t, det.x, det.y))
         self.hits += 1
         self.misses = 0
+        self.last_hit_t = float(t)      # ← 时间口径的"最后一次命中"（见 `dead`）
         self.coasting = False
         # 半径用指数滑动平均，抗单帧的半径抖动。
         # 别取太小：半径决定了单目测深的 Z，滞后会直接变成深度误差。
@@ -281,6 +283,24 @@ class Track:
 
     @property
     def dead(self) -> bool:
+        """这条轨迹该删了吗？
+
+        ## ⚠️ 2026-10-18 修：原来只数**帧数**，于是遮挡容忍度随帧率变
+
+        `max_coast_frames = 12` 是**帧**。同一段 0.3 s 的遮挡：
+
+            30 fps -> 9 帧  -> 轨迹**延续**（id 1->1）
+            60 fps -> 18 帧 -> 轨迹**断开**（id 1->2，起了一条新轨迹）
+
+        也就是说**帧率翻倍、遮挡容忍度减半**。本项目两路常跑 30/60 fps
+        （取决于后端与分辨率），于是同一套配置在不同帧率下行为不同 ——
+        而"轨迹断开"意味着拖尾/预测历史清零，跟踪连续性静默变差。
+
+        修法：优先用**时间口径** `max_coast_s`（秒），与帧率无关；
+        `max_coast_frames` 保留作兜底（老配置 / 不知道 fps 时）。
+        """
+        if self.cfg.max_coast_s > 0:
+            return (self.t - self.last_hit_t) > self.cfg.max_coast_s
         return self.misses > self.cfg.max_coast_frames
 
     def state(self) -> TrackState:

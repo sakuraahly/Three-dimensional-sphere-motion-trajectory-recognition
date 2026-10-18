@@ -340,6 +340,81 @@ def test_camera_index_backend_is_explicit() -> bool:
     return not bad
 
 
+
+def test_coast_window_is_frame_rate_independent() -> bool:
+    """max_coast_s 必须让「遮挡容忍度」与帧率无关（审查 C3）。
+
+    ## 守的是什么（2026-10-18 实测）
+
+    原来 Track.dead 只数帧：misses > max_coast_frames（12 帧）。
+    同一段 **0.3 秒**的遮挡：
+
+        30 fps -> 9 帧  -> 轨迹延续（id 1->1）
+        60 fps -> 18 帧 -> 轨迹**断开**（id 1->2，起了一条新轨迹）
+
+    即**帧率翻倍、遮挡容忍度减半**。本项目两路常跑 30/60 fps，
+    于是同一套配置在不同帧率下行为不同；而"轨迹断开"会让拖尾与预测历史清零，
+    跟踪连续性**静默变差**。
+
+    修法：TrackerConfig.max_coast_s（秒）优先，max_coast_frames 兜底。
+
+    ## 判据
+
+    1. 默认配置里有 max_coast_s 且 > 0；
+    2. 同一段 0.3 s 遮挡，30 fps 与 60 fps 下**轨迹 id 都延续**；
+    3. max_coast_s = 0 时退回按帧数（老配置仍然能用）。
+    """
+    print("----- max_coast_s：遮挡容忍度与帧率无关 -----")
+    import numpy as np
+
+    from sphere_tracker.config import TrackerConfig
+    from sphere_tracker.track import BallTracker
+    from sphere_tracker.types import Detection
+
+    def traj(t: float) -> tuple[float, float]:
+        return 400.0 * t + 200.0, -900.0 * t + 900.0 * t * t + 400.0
+
+    def run(fps: int, cfg: TrackerConfig, gap_s: float = 0.3,
+            seed: int = 0) -> tuple[int | None, int | None]:
+        rng = np.random.default_rng(seed)
+        tr = BallTracker(cfg)
+        dt = 1.0 / fps
+        id_before = None
+        for i in range(int(1.2 * fps)):
+            t = i * dt
+            x, y = traj(t)
+            dets = ([] if 0.4 <= t < 0.4 + gap_s else
+                    [Detection(x=x + rng.normal(0, 1.0),
+                               y=y + rng.normal(0, 1.0), radius=12.0, score=0.9)])
+            if id_before is None and t >= 0.4:
+                id_before = tr.primary.id if tr.primary is not None else None
+            tr.update(dets, t)
+        after = tr.primary.id if tr.primary is not None else None
+        return id_before, after
+
+    base = TrackerConfig()
+    checks = [
+        ("TrackerConfig 有 max_coast_s 且 > 0", getattr(base, "max_coast_s", 0) > 0),
+    ]
+    ids = {fps: run(fps, base) for fps in (30, 60)}
+    for fps, (a, b) in ids.items():
+        print(f"  {fps} fps：id {a}->{b}")
+        checks.append((f"{fps} fps 下 0.3 s 遮挡后轨迹 id **延续**", a is not None and a == b))
+    checks.append(("30 与 60 fps 的行为一致（同一段物理遮挡）",
+                   ids[30][1] is not None and ids[30][1] == ids[60][1]))
+
+    legacy = TrackerConfig()
+    legacy.max_coast_s = 0.0          # 退回按帧数
+    a, b = run(60, legacy)
+    print(f"  兜底（max_coast_s=0，60 fps）：id {a}->{b}")
+    checks.append(("max_coast_s=0 时退回按帧数（老配置仍可用，60fps 会断开）",
+                   a is not None and a != b))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -354,7 +429,9 @@ def main() -> int:
     print()
     e = test_default_method_is_the_fast_one()
     print()
-    ok = a and b and c and d and e
+    f = test_coast_window_is_frame_rate_independent()
+    print()
+    ok = a and b and c and d and e and f
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 
