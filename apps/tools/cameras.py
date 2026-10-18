@@ -129,73 +129,37 @@ _backend_used: dict[int, str] = {}
 
 
 def _open_preview(index: int, backend: int):
-    """打开预览源，返回 `(src, 后端名)`；打不开返回 `(None, None)`。
+    """按**给定的那一个后端**打开预览；返回 (src, 后端名)，打不开返回 (None, None)。
 
-    ⚠️ **两个返回分支形状必须一致**：调用点解包两个值。
-    2026-10-15 就是因为早退分支 `return None` 而崩过一次（见下面的注释）。
+    ## 为什么**绝不**在这里换后端（2026-10-18 第三次修正，用户实测反馈）
 
-    ## 索引与标签的对应关系，只在 INDEX_BACKEND 内成立
+    教训链（两次都是我改坏的）：
 
-    #N 的标签来自 **PnP 枚举**，而 cv2.VideoCapture(N, backend) 用的是
-    **后端自己的枚举**。实测本机：
+    1. f8bb30 加了"按索引换后端" → 用户看到 **aoni 被标成 Integrated**
+       （DSHOW 的编号与 PnP 错位）；
+    2. 33b7164 把回退整个删掉 → MSMF 打不开的那台 **从界面消失**
+       （"只能检测到一个"）；
+    3. 我又改成"回退只为显示、不许绑定" → 用户看到 **同一台 aoni left 出现两次**
+       而 right 不见 —— 因为回退让 DSHOW #2 与 MSMF #0 **可能是同一台**。
 
-        PnP 标签：#0 aoni-left   #1 aoni-right   #2 Integrated   #3 Integrated IR
-        MSMF     ：#0 有图       #1 有图        #2 纯黑(被遮)   #3 打不开   ← 与 PnP 一致
-        DSHOW    ：#0 有图       #1 **纯黑**    #2 **有图**     #3 打不开   ← 整体错位
+    **结论：按索引回退在"显示"这一层也站不住** —— 它会**重复**同一台物理相机。
+    PnP 与各后端的编号是**互不相容的三套命名空间**，任何"混着用"的方案都会
+    要么贴错标签、要么重复、要么遗漏。
 
-    所以"换后端"不能白换 —— 换过之后 #N 就不再是 PnP 里的第 N 台。
+    所以这里只做一件事：**在同一个后端内**开一个编号。
+    想确认"另一台在别的后端下能不能出图"，用 cameras.py probe（它逐后端
+    分别列出，本来就**不下结论说"哪台是哪台"**），或显式 --backend dshow。
+    """
+    from sphere_tracker.sources import backend_name
 
-    ## 但**不换**会让"打不开的那台"直接从界面上消失
-
-    2026-10-18 我一度把回退整个删掉（33b7164），本意是修"标签贴错"。
-    后果是：MSMF 打不开的那台在识别界面里**消失**了
-    （用户原话："aoni 摄像头又是只能检测到一个了"），而 list --probe
-    （它带回退）明明两台都能出图。
-
-    ## 正确分工：**回退只为"让你看见画面"，绝不据此绑定身份**
-
-    - 本后端打不开 → 换另一个后端把画面放出来（否则连"它活着吗"都不知道）；
-    - 一旦换了后端，本次**按下的键不会写入配置**（上层会拒绝并提示改用 pin）。
-      因为"我看到了画面"与"这是 PnP 列表里的第 N 台"是两件事。
-        """
-    from sphere_tracker.sources import INDEX_BACKEND, backend_name
-
-    # ⚠️ **2026-10-18 修：回退只为“让你看见画面”，不用于绑定身份。**
-    #
-    # 我在 33b7164 修“标签贴错”时把回退**整个删掉**了。后果：MSMF 打不开的那台
-    # 在识别界面里**直接消失**（用户的原话是“aoni 摄像头只能检测到一个”），
-    # 而 cameras.py list --probe（它带回退）明明两台都能出图。
-    #
-    # 正确的分工：
-    #   · **回退** —— 让你能看见这一路的画面（否则连“它活着吗”都不知道）；
-    #   · **但不许据此绑定** —— 换过后端，编号就不再对应 PnP 名字（DSHOW #1 是内置、
-    #     #2 才是外接）。所以这里把“用的是不是可信后端”一起返回，由上层决定。
-    order = [backend] + [b for b in (INDEX_BACKEND, _other_backend(backend))
-                         if b != backend]
     used_name = backend_name(backend)
-    last_exc: Exception | None = None
-    for pos, api in enumerate(order):
-        try:
-            src = _try_open(index, api)
-        except RuntimeError as exc:
-            last_exc = exc
-            used_name = backend_name(api)
-            continue
-        used_name = backend_name(api)
-        if pos > 0:
-            print(f"  ℹ #{index} 用 {backend_name(backend)} 打不开，"                  f"**已改用 {used_name} 只为显示画面**（编号不再对应设备名，"                  f"不能据此绑定角色）", flush=True)
-        _backend_used[index] = used_name
-        return src, used_name
-    if last_exc is not None:
-        print(f"  #{index}（{used_name}）打不开：{_first_line(last_exc)}")
-    return None, None
-
-
-def _other_backend(backend: int) -> int:
-    """另一个 Windows 视频后端常量。"""
-    import cv2
-
-    return cv2.CAP_DSHOW if backend != cv2.CAP_DSHOW else cv2.CAP_MSMF
+    try:
+        src = _try_open(index, backend)
+    except RuntimeError as exc:
+        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")
+        return None, None
+    _backend_used[index] = used_name
+    return src, used_name
 
 
 def _try_open(index: int, api: int):
@@ -247,11 +211,6 @@ def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
     return f"#{index}  推测:{entry.name or '(无名字)'}  端口 {entry.port or '-'}"
 
 
-def _untrusted_label(index: int, used_backend: str) -> str:
-    """**换过后端**时的标签：只说明"这一路能看到画面"，不声称它是哪台。"""
-    return f"#{index}  ？？未知（经 {used_backend} 打开；编号不对应设备名）"
-
-
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                         *, backend: int) -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
@@ -273,15 +232,6 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
     if src is None:
         return None                     # 这个后端出不了图 -> 跳过这台（**不崩、也不换后端**）
     _backend_used[index] = backend_used
-
-    # 换过后端 → 本路的**编号不可信**：画面可以看，但按键不写配置。
-    from sphere_tracker.sources import INDEX_BACKEND_NAME
-
-    trusted = (backend_used == INDEX_BACKEND_NAME)
-    if not trusted:
-        label = _untrusted_label(index, backend_used)
-        print(f"  ⚠ #{index} 这一路是经 {backend_used} 打开的：**编号不对应设备名**，"
-              f"接下来按的键**不会写入配置**（只让你确认它能不能出图）。")
 
     win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"
     wins = WindowManager()
@@ -345,12 +295,6 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                 if key == ord("q") or key == 27:
                     return ""
                 if key in _ASSIGN_KEYS:
-                    if not trusted:
-                        print(f"  ⛔ 不写入配置：这一路是经 {backend_used} 看到的，"
-                              f"编号与设备名对不上。要绑角色请用：")
-                        print('     python apps/tools/cameras.py pin left '
-                              'name:"<完整设备名>"')
-                        return None
                     return _ASSIGN_KEYS[key]
         if not gui_ok:
             # 没有图形界面：打印设备信息，用命令行输入角色名
@@ -590,10 +534,13 @@ def cmd_identify(args) -> int:
     print("\n逐个索引显示画面，请按提示确认哪台是左、哪台是右、哪台「无关」：")
     print(f"（按键：{_KEY_HINT}）\n")
 
+    _unopened: list[int] = []
     for idx in indices:
         entry = by_order.get(idx) or cr.DeviceEntry(order=idx)
         status = _describe_status(reg, idx, entry)
         role = _preview_and_assign(idx, entry, status, backend=backend)
+        if role is None and idx not in _unopened:
+            _unopened.append(idx)
         if role == "":                                   # 退出
             break
         if not role:                                     # 跳过：不改配置
@@ -635,6 +582,12 @@ def cmd_identify(args) -> int:
         key = spec.identity or f"idx:{spec.index}"
         by_identity.setdefault(key, []).append(role)
     clash = {k: v for k, v in by_identity.items() if len(v) > 1}
+    if _unopened:
+        print()
+        print(f"以下编号在 {used} 下**没能打开**（不是没插，是这个后端打不开）：{_unopened}")
+        print("  想确认它们在**别的后端**下是否可用：")
+        print(f"     python apps/tools/cameras.py probe --max-index {max(_unopened)}")
+        print("  （probe 逐后端分别列出 —— **不同后端的编号不是同一台**，它也不下结论说哪台是哪台）")
     if clash:
         print("\n⚠ **配置有问题**：以下角色指向的是**同一台**相机 ——")
         for key, roles in clash.items():

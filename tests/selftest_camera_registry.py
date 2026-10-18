@@ -1182,12 +1182,10 @@ def test_identify_never_switches_backend() -> bool:
         checks.append(("① `_open_preview` 只用**传入的**后端（不自己挑）", ok_used))
         checks.append(("① 返回的后端名与实际一致", ok_name))
 
-        # ---- 打不开时**会**再试另一个后端，但那只是"为了显示" ----
+        # ---- 打不开时**绝不**换后端（换 = 重复/贴错，2026-10-18 实测） ----
         #
-        # ⚠️ 2026-10-18 改口径：原来断言"不换后端"，因为换后端会让标签贴错。
-        # 但完全不换的后果是"打不开的那台直接从界面上消失"（用户反馈）。
-        # 现在允许回退**只为让你看见画面**，防回归改由"换过后端就不许写配置"来守
-        #（见 _preview_and_assign 里的 trusted 判断）。
+        # 三次反复都记在这里：换后端 → 标签贴错；不换但隐藏 → 相机消失；
+        # 回退只为显示 → **同一台出现两次**。所以这里钉死"只尝试 1 次"。
         used.clear()
 
         def _boom(**kw):                                # noqa: ANN003
@@ -1196,34 +1194,11 @@ def test_identify_never_switches_backend() -> bool:
 
         cam.CameraSource = _boom                        # type: ignore[assignment]
         got2 = cam._open_preview(3, cv2.CAP_MSMF)
+        ok_once = len(used) == 1
         ok_none = got2 == (None, None)
-        ok_tries = len(used) == 2
-        print(f"  ② 两个后端都打不开 -> 尝试 {len(used)} 次（期望 2），返回 {got2!r}")
-        checks.append(("② 主后端失败后**只**回退一次（共 2 次），不会无限试", ok_tries))
-        checks.append(("② 两个都失败时返回 (None, None)（形状一致、不崩）", ok_none))
-
-        # 主后端失败、另一个可用 -> 必须回退成功，并**如实报出实际后端**
-        calls = {"n": 0}
-
-        class _Ok:
-            def __init__(self, **kw):                   # noqa: ANN003
-                used.append(kw.get("backend"))
-
-            def release(self) -> None:
-                pass
-
-        def _first_fails(**kw):                         # noqa: ANN003
-            used.append(kw.get("backend"))
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise RuntimeError("（替身）主后端不行")
-            return _Ok(**kw)
-
-        cam.CameraSource = _first_fails                 # type: ignore[assignment]
-        got3 = cam._open_preview(3, cv2.CAP_MSMF)
-        came_back = got3[0] is not None and got3[1] == "DSHOW"
-        print(f"  ③ 主后端失败、另一个可用 -> 返回后端 {got3[1]!r}（期望 DSHOW）")
-        checks.append(("③ 回退时**如实报出实际后端**（上层据此禁止绑身份）", came_back))
+        print(f"  ② 打不开 -> 尝试 {len(used)} 次（期望 1），返回 {got2!r}")
+        checks.append(("② 打不开时**只试 1 次**（换后端会导致重复/贴错）", ok_once))
+        checks.append(("② 打不开时返回 (None, None)（形状一致、不崩）", ok_none))
     finally:
         cam.CameraSource = real_src                     # type: ignore[assignment]
 
