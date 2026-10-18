@@ -537,6 +537,46 @@ def test_board_area_caps_grade() -> bool:
     return all(ok for _n, ok in checks)
 
 
+
+def test_epipolar_rejects_mismatch() -> bool:
+    """左右角点数不一致时必须**报错**，不许静默截断（审查 A8）。
+
+    旧代码 
+ = min(len(p1), len(p2)) 后截断再比 —— 等于拿**错配的点对**算极线误差，
+    把一个真实故障（角点漏检/配错对）掩盖成"误差稍微大一点"。
+    """
+    print("\n----- 极线误差：角点数不一致必须报错 -----")
+    from calib.stereo_calib import _epipolar_errors
+
+    K = _K(1000.0, 1000.0, 640.0, 360.0)
+    D = np.zeros(5)
+    R = np.eye(3)
+    P = np.hstack([K, np.zeros((3, 1))])
+    rng = np.random.default_rng(0)
+    a = (rng.normal(size=(10, 2)) * 100 + 600).astype(np.float32)
+    b = (rng.normal(size=(8, 2)) * 100 + 600).astype(np.float32)
+
+    checks = []
+    try:
+        out = _epipolar_errors([a], [a], K, D, K, D, R, R, P, P)
+        checks.append(("点数一致时正常算出误差", out.shape == (1,) and np.isfinite(out[0])))
+    except Exception as exc:                              # noqa: BLE001
+        checks.append((f"点数一致时抛了 {type(exc).__name__}: {exc}", False))
+
+    try:
+        _epipolar_errors([a], [b], K, D, K, D, R, R, P, P)
+        checks.append(("点数不一致 -> **必须报错**（不许静默截断）", False))
+    except ValueError as exc:
+        ok = "不一致" in str(exc)
+        print(f"  报错：{str(exc).splitlines()[0][:78]}")
+        checks.append(("点数不一致 -> **必须报错**（不许静默截断）", ok))
+    except Exception as exc:                              # noqa: BLE001
+        checks.append((f"点数不一致 -> 抛了非 ValueError：{type(exc).__name__}", False))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目标定自测（合成真值）")
     ap.add_argument("--views", type=int, default=25,
@@ -578,6 +618,7 @@ def main() -> int:
         all_ok = all_ok and ok
     all_ok = test_T_sign_convention() and all_ok
     all_ok = test_board_area_caps_grade() and all_ok
+    all_ok = test_epipolar_rejects_mismatch() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1

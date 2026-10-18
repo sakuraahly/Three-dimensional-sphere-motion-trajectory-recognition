@@ -280,13 +280,34 @@ def _rectify(K1, D1, K2, D2, size, R, T, alpha: float):
 
 
 def _epipolar_errors(ip1, ip2, K1, D1, K2, D2, R1, R2, P1, P2) -> np.ndarray:
-    """逐对图像的极线误差：校正后同名点的 y 之差。"""
-    errs = []
-    for c1, c2 in zip(ip1, ip2):
-        p1 = cv2.undistortPoints(c1.reshape(-1, 1, 2).astype(np.float64), K1, D1, R=R1, P=P1).reshape(-1, 2)
-        p2 = cv2.undistortPoints(c2.reshape(-1, 1, 2).astype(np.float64), K2, D2, R=R2, P=P2).reshape(-1, 2)
+    """逐对图像的极线误差：校正后同名点的 y 之差。
+
+    ## ⚠️ 2026-10-18 修：原来对"左右点数不一致"是**静默截断**
+
+    旧代码：
+
         n = min(len(p1), len(p2))
         dy = p1[:n, 1] - p2[:n, 1]
+
+    左右角点数不同意味着**对应关系已经不可信**（棋盘角点数量由板决定，两路必然一致；
+    不一致只能是检测/关联出了问题）。这时截断后继续比较，等于**拿错配的点对算误差**，
+    而且会把一个真实故障掩盖成"极线误差偏大一点点"。
+
+    现在直接报错：让故障在**离根因最近**的地方暴露，而不是变成一个看不懂的数字。
+    """
+    errs = []
+    for i, (c1, c2) in enumerate(zip(ip1, ip2)):
+        n1 = int(np.asarray(c1).reshape(-1, 2).shape[0])
+        n2 = int(np.asarray(c2).reshape(-1, 2).shape[0])
+        if n1 != n2:
+            raise ValueError(
+                f"第 {i} 对图像的左右角点数不一致（左 {n1} / 右 {n2}）—— "
+                f"对应关系不可信，无法计算极线误差。\n"
+                f"  常见原因：某一侧漏检/多检了角点，或左右图像配错了对。\n"
+                f"  处置：丢弃这一对（或整组重拍），不要截断后继续比较。")
+        p1 = cv2.undistortPoints(c1.reshape(-1, 1, 2).astype(np.float64), K1, D1, R=R1, P=P1).reshape(-1, 2)
+        p2 = cv2.undistortPoints(c2.reshape(-1, 1, 2).astype(np.float64), K2, D2, R=R2, P=P2).reshape(-1, 2)
+        dy = p1[:, 1] - p2[:, 1]
         errs.append(float(np.sqrt(np.mean(dy * dy))))
     return np.asarray(errs, dtype=np.float64)
 

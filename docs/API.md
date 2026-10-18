@@ -378,6 +378,12 @@ def calibrate_stereo(objp, imgpoints1: list[np.ndarray], imgpoints2: list[np.nda
 ② `objp` 可以是单个 `(N,3)` 数组（所有视图共用一块板，本项目常态）或逐视图列表；内部**强制转 `float32`**（OpenCV 5 对 float64 物体点直接报错）。
 ③ 离群阈值 `thresh = max(median + sigma*1.4826*MAD, outlier_min_px)`；剔完剩余对数 `< min_pairs_after_reject` 就停；`best` 取的是**各轮中 RMS 最小**那一轮的完整参数（不是最后一轮），因为精化不一定总是更好。
 ④ 判定：`rms≤0.35 且 epipolar≤0.25` → "优秀"；`≤0.80 / ≤0.60` → "可用"；否则 `ok=False`。**`StereoRig.from_result()` 对 `ok=False` 抛 `ValueError`** ⇒ "能算出矩阵" ≠ "能拿去用"。
+⑤ **"优秀"还有一道硬条件**（2026-10-18 加）：`board_area ≥ min_board_area_for_good`（默认 8%）。
+   合成真值证明**同一个 RMS 可以对应 4 倍不同的深度精度**（板占 1.9% vs 7.9%，RMS 都是 0.41 px，
+   Z 误差 σ 5.76 vs 1.40 mm）—— 所以"指标完美但板太小"最高只判"可用"，并在 `warnings` 里说明。
+⑥ 新增不确定度出口：`std1/std2`（来自 `calibrateCameraExtended` 的 `stdDeviationsIntrinsics`，
+   **原来被丢弃**）、`fx_sigma()`、`depth_sigma_mm(z)`。后者的公式与**边界**见其文档串 ——
+   含焦距项 + 视差项，**不含基线项**，属数量级估计，不是验收门限。
 ### 12.4 `calib/params.py`
 ```python
 @dataclass StereoRig:
@@ -390,11 +396,14 @@ def calibrate_stereo(objp, imgpoints1: list[np.ndarray], imgpoints2: list[np.nda
     def triangulate(self, pts_left, pts_right) -> np.ndarray        # (N,3) 米；点数不等抛 ValueError
     def epipolar_error(self, pts_left, pts_right) -> float          # 校正后 y 之差 RMS；空输入 nan
     def baseline_side(self) -> str              # "right" / "left" / "unknown"
-    def disparity_sign(self) -> int             # 右相机在右 -> -1；装反 -> +1；未知 -> 0
+    def disparity_sign(self) -> int             # 右相机在右 -> +1；装反 -> -1；未知 -> 0
     def save(self, path) -> tuple[Path, Path]   # 同时写 .npz + .json
     @classmethod load(cls, path) -> "StereoRig";  @classmethod from_result(cls, res, meta=None) -> "StereoRig"   # not res.ok 抛 ValueError
 def load_stereo_rig(path) -> StereoRig;  def save_stereo_rig(rig, path)
 ```
+> ⚠️ **`Q` 存了但全项目没有一处用它做重建**（只走 `P1/P2` + `triangulatePoints`）。
+> 不是 bug，但"存了两套真值、只校核一套"是维护负担：要么在文档里认下
+> "`Q` 仅供外部工具/导出"，要么干脆不出存。**改之前先搜一遍消费者**（2026-10-18 审查 B6）。
 **坐标系与单位（最要紧）**：三维点在**校正后的左相机坐标系**，原点在左相机光心、Z 向前、**单位米**（因为 `BoardSpec.object_points()` 是米）。`T` 是"右光心在左相机系里的位置"（`X_right = R @ X_left + T`）。
 
 **坑**：① `rectify_maps` 的映射表**依赖 `image_size`**：换分辨率要重新 `rectify_maps()` 或重标定；`rectify_image(img, side)` 的 `side` 只能是 `"left"`/`"right"`，给 `"both"` 会去解包元组直接报错。
