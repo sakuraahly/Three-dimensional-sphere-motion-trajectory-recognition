@@ -337,6 +337,34 @@ def _describe_status(reg: cr.Registry, index: int,
     return ""
 
 
+def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
+    """按**当前实际设备**生成 `pin` 示例命令（不写死任何型号名）。
+
+    ## 为什么改成动态生成（2026-10-18）
+
+    原来这两行是写死的：
+
+        python apps/tools/cameras.py pin left  name:"aoni webcam A25 left"
+        python apps/tools/cameras.py pin right name:"aoni webcam A25 right"
+
+    换一台相机、或用户改了名，这段提示就变成**错的/看不懂的** ——
+    而它正是"名字不可靠时该怎么办"的关键指引，错不起。
+    现在从 `list_devices()` 取**真实存在**、且未被标「无关」/未被判为内置的设备。
+    """
+    reg = cr.load_registry()
+    usable = [d for d in devices
+              if d.name
+              and not cr.is_device_ignored(d, reg)
+              and not cr.is_avoided(d.name, reg.settings)]
+    if len(usable) < 2:
+        return ["     python apps/tools/cameras.py list   # 先看有哪些设备名可用"]
+    a, b = usable[0], usable[1]
+    return [
+        f'     python apps/tools/cameras.py pin left  name:"{a.name}"',
+        f'     python apps/tools/cameras.py pin right name:"{b.name}"',
+    ]
+
+
 def cmd_identify(args) -> int:
     devices = cr.list_devices()
     by_order = {d.order: d for d in devices}
@@ -361,12 +389,13 @@ def cmd_identify(args) -> int:
     if backend != INDEX_BACKEND:
         print("=" * 70)
         print(f"⚠️ 你指定了 {used}。**它的枚举顺序与本机设备列表不一致**：")
-        print("   实测 DSHOW #1 = 笔记本内置、#2 才是外接 aoni；"
-              f"而 {INDEX_BACKEND_NAME} 与设备列表一致。")
+        print("   实测本机 DSHOW 的编号整体错位（`#1` 是笔记本内置、"
+              "`#2` 才是外接那台），")
+        print(f"   而 {INDEX_BACKEND_NAME} 与设备列表一致。")
         print(f"   用 {used} 识别，**可能把画面上的相机贴成另一台的名字**。")
         print("   除非你已经确认过这个后端的编号，否则建议：按 Ctrl+C 退出，改用")
-        print("     python apps/tools/cameras.py pin left  name:\"aoni webcam A25 left\"")
-        print("     python apps/tools/cameras.py pin right name:\"aoni webcam A25 right\"")
+        for line in _pin_example_lines(devices):
+            print(line)
         print("   —— 按名字直接绑，**根本不用开相机**，也就没有错位问题。")
         print("=" * 70)
 
@@ -387,8 +416,8 @@ def cmd_identify(args) -> int:
           "而编号与设备列表的对应关系")
     print("   在两台同型号相机之间**无法由程序证明**（它们同 VID/PID、同分辨率）。")
     print("   所以：**请以画面为准**按键。若你已用名字区分了左右，更可靠的做法是")
-    print('     python apps/tools/cameras.py pin left  name:"<完整的左相机名字>"')
-    print('     python apps/tools/cameras.py pin right name:"<完整的右相机名字>"')
+    for line in _pin_example_lines(devices):
+        print(line)
     print("   —— 按名字绑身份，**不开相机、不碰编号**，也就不存在左右颠倒。")
     print("\n逐个索引显示画面，请按提示确认哪台是左、哪台是右、哪台「无关」：")
     print(f"（按键：{_KEY_HINT}）\n")
@@ -869,11 +898,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     pp = sub.add_parser("pin", help="非交互地把某角色固定到某设备")
     pp.add_argument("role", help="角色名，如 left / right / main")
-    pp.add_argument("value", help="0 | port:Port_#0001.Hub_#0003 | id:USB\\... | name:aoni")
+    pp.add_argument("value", help="0 | port:Port_#0001.Hub_#0003 | id:USB\\... | name:<名字片段>")
     pp.set_defaults(func=cmd_pin)
 
     pig = sub.add_parser("ignore", help="把某台相机标为「无关」（自动挑相机时跳过）")
-    pig.add_argument("value", help="0 | port:Port_#0001.Hub_#0003 | id:USB\\... | name:aoni")
+    pig.add_argument("value", help="0 | port:Port_#0001.Hub_#0003 | id:USB\\... | name:<名字片段>")
     pig.set_defaults(func=cmd_ignore)
 
     pu = sub.add_parser("unignore", help="取消「无关」标记（单台，或 --all 清空整份清单）")

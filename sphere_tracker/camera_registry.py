@@ -39,9 +39,15 @@
         {"identity": "USB\\VID_30C9&PID_00EC&MI_00\\...", "port": "...",
          "name": "Integrated Camera", "index": 2, "verified": true}
       ],
-      "settings": {"prefer_external": true, "avoid_names": ["Integrated Camera"],
+      "settings": {"prefer_external": true,
+                   "avoid_names": ["Integrated Camera"],
+                   "avoid_name_patterns": ["infrared", "\\bir\\b"],
                    "min_width": 1280, "min_height": 720, "min_fps": 15.0, "max_index": 6}
     }
+
+`settings.avoid_names`（**子串**）与 `settings.avoid_name_patterns`（**正则**）
+决定"哪些名字的相机不适合双目"（内置 / 红外类）。两者都可覆盖，
+写 `"avoid_name_patterns": []` 即可关掉红外启发式。
 
 `ignored` 是**「无关」清单**：用户明确标记"这台不要用"（典型是笔记本内置相机与红外相机）。
 它和 `roles` 一样**记身份而不是编号**，所以重插 USB 之后依然有效。语义：
@@ -74,7 +80,17 @@ AUTO_TOKEN = "auto"
 
 DEFAULT_SETTINGS: dict = {
     "prefer_external": True,
+    # 名字里含这些**子串**就判为「不适合双目」（内置 / 红外类）。
+    # 子串匹配是刻意选的：`Integrated Camera` 也能命中 `Integrated IR Camera`。
     "avoid_names": ["Integrated Camera", "Integrated IR Camera"],
+    # 名字里命中这些**正则**同样判为不可用。
+    #
+    # ⚠️ 2026-10-18：这两条原来是**写死在 `is_avoided()` 里**的
+    # （`"infrared" in low or re.search(r"\bir\b", low)`），用户改不了 ——
+    # 换一台名字里带 `IR` 的正常相机就会被永久误伤，而且只能改源码。
+    # 现在搬进配置：要放宽/收紧，改 `config/cameras.json` 的
+    # `settings.avoid_name_patterns` 即可（写 `[]` 表示"不再按红外自动排除"）。
+    "avoid_name_patterns": ["infrared", r"\bir\b"],
     "min_width": 1280,
     "min_height": 720,
     "min_fps": 15.0,
@@ -587,14 +603,39 @@ def pick_backend_for_device(
 
 
 def is_avoided(name: str, settings: dict | None = None) -> bool:
-    """名字看着像内置/红外？这类相机不适合做双目（没法刚性固定在横梁上）。"""
+    """名字看着像内置/红外？这类相机不适合做双目（没法刚性固定在横梁上）。
+
+    ## 判据全部来自配置（2026-10-18 改）
+
+    两条规则，都能在 `config/cameras.json` 的 `settings` 里改：
+
+    | 配置项 | 匹配方式 | 默认值 |
+    | ------ | -------- | ------ |
+    | `avoid_names` | **子串**（不区分大小写） | `["Integrated Camera", "Integrated IR Camera"]` |
+    | `avoid_name_patterns` | **正则**（不区分大小写） | `["infrared", "\\bir\\b"]` |
+
+    **为什么把原来写死的那条搬出来**：`is_avoided()` 里原本硬编码
+    `"infrared" in low or re.search(r"\bir\b", low)` —— 用户换一台名字里
+    带 `IR` 的**正常**相机就会被永久误伤，而且**只能改源码**。
+    现在写 `"avoid_name_patterns": []` 就能关掉整条红外启发式。
+
+    **非法正则会怎样**：跳过那一条并打印警告，**不抛异常** ——
+    一个配置项写错不该让整个设备管理跑不起来。剩下的规则照常生效。
+    """
     merged = {**DEFAULT_SETTINGS, **(settings or {})}
     low = (name or "").lower()
     if not low:
         return False
     if any(str(p).lower() in low for p in merged.get("avoid_names") or []):
         return True
-    return "infrared" in low or re.search(r"\bir\b", low) is not None
+    for pat in merged.get("avoid_name_patterns") or []:
+        try:
+            if re.search(str(pat), low) is not None:
+                return True
+        except re.error as exc:
+            print(f"[警告] settings.avoid_name_patterns 里的正则 {pat!r} 无效"
+                  f"（{exc}），已跳过这一条")
+    return False
 
 
 def rank_candidates(

@@ -230,9 +230,15 @@ def role_of_device(reg: Registry, d: DeviceEntry) -> str | None
 def mark_ignored(reg, *, entry=None, index=None, verified=False) -> RoleSpec   # 顺手把它从 roles 里摘掉
 def unmark_ignored(reg, *, entry=None, index=None) -> int      # 返回摘掉几条
 def clear_ignored(reg: Registry) -> int
-AUTO_TOKEN = "auto";  DEFAULT_SETTINGS = {...}   # prefer_external / min_width / min_height / min_fps / avoid_names / max_index
+AUTO_TOKEN = "auto";  DEFAULT_SETTINGS = {...}   # prefer_external / min_width / min_height / min_fps / avoid_names / avoid_name_patterns / max_index
 ```
 `resolve_camera_arg` 规则：`None`/`""` → `None`；`int` → 原样；`"0"` → `0`；`"port:xx"`/`"id:xx"`/`"name:xx"` → 匹配设备；**其它字符串当角色名**（查 `config/cameras.json`）。
+
+**`is_avoided(name, settings)` 的两条规则都来自配置**（2026-10-18 改）：
+`avoid_names` 走**子串**、`avoid_name_patterns` 走**正则**，两者是"或"关系。
+原来 `infrared` / `\bir\b` 是**写死在函数里**的，用户换一台名字带 `IR` 的正常相机
+就会被永久误伤且只能改源码；现在写 `"avoid_name_patterns": []` 即可整体关掉。
+**非法正则**只跳过那一条并警告，**不抛异常**（配置写错不该让设备管理跑不起来）。
 
 **`Registry.ignored` = 「无关」清单**：用户明确标记"这台不要用"（笔记本内置 / 红外）。
 与 `roles` 同样记**身份**而非编号，所以重插 USB 后仍有效。语义：

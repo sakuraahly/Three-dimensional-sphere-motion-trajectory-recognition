@@ -242,7 +242,7 @@ def verdict(pair: list[Quality]) -> None:
         print(f"  ⚠ 链路（带宽/线材/口）有问题：{who}")
         print(f"     依据：残帧 > 0 或实测帧率 < 20 fps。")
         print(f"     → 先按下面「交换测试」定位是相机、线、还是口；")
-        print(f"       两台同型号相机别插在同一个集线器上（本机两台 aoni 就在同一条 2.0 总线上）。")
+        print(f"       两台同型号相机别插在同一个集线器上（会共用同一条总线）。")
         print()
 
     sharp = [q for q in good if q.sharp > 0]
@@ -372,8 +372,8 @@ def main() -> int:
         if starved:
             print("  → 两路同开会互相拖慢 = **带宽/总线**确实紧张。")
             print("    解决：把两台分别插到**不同的 USB 控制器**上（机身不同的口，")
-            print("    不要都走同一个扩展坞/集线器）。注意 A25 是 USB 2.0 设备，")
-            print("    插蓝口也不会变超速，只是**分总线**而已。")
+            print("    不要都走同一个扩展坞/集线器）。")
+            print("    ⚠️ USB 2.0 的相机插蓝口（3.x）也不会变快，只是**分总线**而已。")
         else:
             print("  → 同开没有明显掉速，**带宽不是问题**。")
     elif args.together:

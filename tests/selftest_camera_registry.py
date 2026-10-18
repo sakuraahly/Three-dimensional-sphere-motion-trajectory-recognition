@@ -1274,6 +1274,58 @@ def test_preview_label_admits_it_is_a_guess() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_avoid_rules_are_configurable() -> bool:
+    """第 18 节：`is_avoided()` 的两条规则**都来自配置**，不再写死在代码里。
+
+    ## 守的是什么（2026-10-18 的"参数化"改动）
+
+    原来 `is_avoided()` 里硬编码了 `"infrared" in low or re.search(r"\\bir\\b", low)`
+    —— 用户换一台名字里带 `IR` 的**正常**相机就会被永久误伤，
+    而且**只能改源码**才能关掉。
+
+    现在两条规则都在 `settings` 里：`avoid_names`（子串）、
+    `avoid_name_patterns`（正则）。
+
+    ## 判据
+
+    - 默认：`infrared` / 独立 `IR` 命中；普通名字不命中；
+    - `avoid_name_patterns: []` → 红外启发式**整体关掉**（其余规则仍生效）；
+    - 自定义正则确实生效；
+    - **非法正则**：跳过那一条并警告，**不抛异常**、不连累其它规则。
+    """
+    print("----- 18. avoid 规则可配置 -----")
+    import sphere_tracker.camera_registry as cr
+
+    checks: list[tuple[str, bool]] = [
+        ("默认：`Some IR Camera` 判为不可用（原写死的行为保留）",
+         cr.is_avoided("Some IR Camera")),
+        ("默认：`MyInfraredThing` 判为不可用", cr.is_avoided("MyInfraredThing")),
+        ("默认：普通外接名字**不**误伤", not cr.is_avoided("aoni webcam A25 left")),
+        ("默认：内置相机名字仍命中 avoid_names", cr.is_avoided("Integrated Camera")),
+        ("`avoid_name_patterns: []` 关掉红外启发式",
+         not cr.is_avoided("Some IR Camera", {"avoid_name_patterns": []})),
+        ("关掉红外后，`avoid_names` 仍然生效（两套规则互不牵连）",
+         cr.is_avoided("Integrated Camera", {"avoid_name_patterns": []})),
+        ("自定义正则生效（只排除以 left 结尾）",
+         cr.is_avoided("cam left", {"avoid_name_patterns": [r"left$"]})
+         and not cr.is_avoided("cam right", {"avoid_name_patterns": [r"left$"]})),
+    ]
+
+    try:
+        got = cr.is_avoided("Integrated Camera",
+                            {"avoid_name_patterns": ["[unclosed"]})
+        ok = got is True
+        print(f"  非法正则 -> 返回 {got}（未抛异常）")
+    except Exception as exc:                              # noqa: BLE001
+        ok = False
+        print(f"  非法正则 -> 抛了 {type(exc).__name__}: {exc}")
+    checks.append(("非法正则不抛异常、且不连累 `avoid_names`", ok))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def make_scratch_dir() -> Path:
     """可写的临时目录（沙箱里 %TEMP% 可能不可写，退回项目内 outputs/）。"""
     import tempfile
@@ -1322,6 +1374,7 @@ def main() -> int:
             test_usb_port_change_is_diagnosable(),
             test_identify_never_switches_backend(),
             test_preview_label_admits_it_is_a_guess(),
+            test_avoid_rules_are_configurable(),
         ]
         print()
         if args.probe:
