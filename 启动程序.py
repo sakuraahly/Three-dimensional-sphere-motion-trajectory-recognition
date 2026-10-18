@@ -986,8 +986,20 @@ class Launcher(tk.Tk):
             self._run(cmd, "标定复检（判断装置是否被碰动）")
 
     def _run_probe(self) -> None:
-        cmd = [PY, str(ROOT / "apps" / "tools" / "list_cameras.py"), "--max-index", "3"]
-        self._run(cmd, "相机探测（核对两路分辨率 / 帧率是否一致）")
+        """真的开一次相机，回答「现在有几台能出图」。
+
+        ## 为什么换成 cameras.py probe（2026-10-18）
+
+        原来调 list_cameras.py，它按**单后端**逐个试开。本机 MSMF/DSHOW
+        会各自卡在一台上（一台只在 MSMF 出图、另一台只在 DSHOW 出图），
+        于是用户看到"只有一台"却不知道为什么。
+
+        新命令会**逐后端 × 逐编号**实测，并把"两台各自只在不同后端下工作"
+        这种状态直接说出来 —— 那正是"双目跑不起来"的真因。
+        """
+        cmd = [PY, str(ROOT / "apps" / "tools" / "cameras.py"),
+               "probe", "--max-index", "3"]
+        self._run(cmd, "相机探测（真的开一次：有几台能出图、在哪个后端）")
 
     def _run_precheck(self) -> None:
         left_raw, right_raw = self.calib_left.get(), self.calib_right.get()
@@ -1033,6 +1045,11 @@ class Launcher(tk.Tk):
             self._append(cr.format_device_table(devices, reg=reg))
             self._append("左/右可直接选 left / right（按设备身份，换 USB 口也不漂）；"
                          "也可选具体编号应急。")
+            # 必须说清这个按钮的**能力边界**：它只列"系统里存在哪些设备"，
+            # 不打开相机，所以**回答不了"相机现在活着吗"**。
+            # 用户 2026-10-18 的反馈正是："刷新设备列表和检查映射不能保证有用"。
+            self._append("（注意：本按钮只**枚举**，不打开相机 —— "
+                         "要确认相机现在能不能出图，请点『相机探测』）")
             if reg.ignored:
                 names = "、".join((s.name or f"#{s.index}") for s in reg.ignored)
                 self._append(f"已标为「无关」（自动挑相机会跳过）：{names}")

@@ -337,6 +337,121 @@ def _describe_status(reg: cr.Registry, index: int,
     return ""
 
 
+
+def cmd_probe(args) -> int:
+    """回答一个**不需要知道"哪台是哪台"**的问题：**现在有几台相机真的能出图？**
+
+    ## 为什么必须有这个命令（2026-10-18 用户的真实困惑）
+
+    用户反馈：「刷新设备列表和检查映射不能保证有用」+「aoni 摄像头又是只能检测到一个」。
+
+    前半句是**对的**，因为那两个功能都**只读配置/枚举，根本不打开相机**：
+
+    | 入口 | 实际做了什么 | 能不能回答"相机活着吗" |
+    | ---- | ------------ | ----------------------- |
+    | 刷新设备列表 | list_devices()（读注册表/PnP） | ❌ 只能列出**存在**的设备 |
+    | 检查相机映射 | cameras.py check（比对配置 vs 枚举） | ❌ 只看配置有没有漂移 |
+
+    而后半句的机制是本机 **MSMF 间歇性变慢/打不开**（实测 MSMF #0 一次要 20 s 以上，
+    另一次直接超时），于是"单个后端试着开"的界面就只剩一台。
+
+    ## 这个命令的口径（**只说它敢保证的事**）
+
+    对**每个后端**、每个编号，真的开一次、读几帧，报「有图 / 纯黑 / 打不开 / 读不到帧」。
+    于是"两台 aoni 是不是都活着"有了确定答案。
+
+    ⚠️ **它不能用来绑角色**：两个后端的编号**不是同一台设备**
+    （实测 DSHOW #1 = 笔记本内置、#2 才是外接）。本命令只回答"有几台能出图"，
+    绑角色请用 pin <role> name:"<完整名字>" —— 那条路不开相机、不碰编号。
+    """
+    from sphere_tracker.sources import backend_name
+
+    import cv2
+
+    devices = cr.list_devices()
+    names = {d.order: d.name for d in devices}
+    max_index = args.max_index
+    which = args.backends
+    backends = []
+    if which in ("both", "msmf"):
+        backends.append(cv2.CAP_MSMF)
+    if which in ("both", "dshow"):
+        backends.append(cv2.CAP_DSHOW)
+
+    print("=" * 68)
+    print("相机能不能出图（真的开一次，逐后端 × 逐编号）")
+    print("=" * 68)
+    if devices:
+        print(f"系统里存在 {len(devices)} 台：")
+        for d in devices:
+            print(f"    #{d.order}  {d.name or '(无名字)'}")
+    else:
+        print("（枚举不到设备 —— 只能按编号盲探）")
+    print()
+    print("⚠️ **不同后端的编号不是同一台设备**，所以下面只回答"
+          "「这个后端下这个编号能不能出图」，")
+    print("   **不能**用来决定哪台是 left / 哪台是 right（绑角色请用 pin name:）。")
+    print()
+
+    # "能打开"不等于"有可用画面"：**每帧几乎恒定的纯色**（std 很小）说明镜头被挡/
+    # 被遮住/没曝光。本机那台内置相机就是被有意遮住的 —— 若把它算进"能出图"，
+    # 用户会得到"两台都在"的错误结论，而这正是他这次困惑的来源之一。
+    DARK_STD = 5.0
+
+    counts: dict[str, int] = {}
+    working: dict[str, set[int]] = {}          # 每个后端下"真正出图"的编号
+    for api in backends:
+        nm = backend_name(api)
+        ok_n = 0
+        dark_n = 0
+        working[nm] = set()
+        cells = []
+        for idx in range(max_index + 1):
+            r = cr.probe_index(idx, width=640, height=480, fps=30.0, backend=api)
+            if r.ok and r.std >= DARK_STD:
+                ok_n += 1
+                working[nm].add(idx)
+                cells.append(f"#{idx} ✅ 有图 {r.width}x{r.height} std{r.std:.0f}")
+            elif r.ok:
+                dark_n += 1
+                cells.append(f"#{idx} ⚠ 近乎纯黑（std{r.std:.1f}，std<{DARK_STD:.0f}）"
+                             f" —— 可能是镜头被挡/被遮住")
+            else:
+                first = (r.error or "").splitlines()[0][:26]
+                cells.append(f"#{idx} ✘ {first}")
+        counts[nm] = ok_n
+        print(f"  {nm:5} **真正出图 {ok_n} 台**" +
+              (f"（另有 {dark_n} 台能打开但画面近乎纯黑）" if dark_n else ""))
+        for c in cells:
+            print(f"        {c}")
+        print()
+
+    best = max(counts.values()) if counts else 0
+    print("-" * 68)
+    print(f"结论：**最多 {best} 台**能真正出图"
+          f"（{'、'.join(f'{k} {v} 台' for k, v in counts.items())}）。")
+    if best >= 2:
+        print("  → 有一个后端能同时开出两台，可用来做双目。"
+              "标定时请**显式指定**该后端（--backend dshow|msmf）。")
+    elif len(working) >= 2 and sum(len(v) for v in working.values()) >= 2 \
+            and not (set.intersection(*working.values()) if working else set()):
+        # 每个后端各只有一台、且**编号互不相同** —— 本机实测就是这种状态
+        print("  → ⚠️ **两台各自只在不同的后端下工作，没有任何后端能同时开出两台。**")
+        for nm, idxs in working.items():
+            print(f"        {nm}：编号 {sorted(idxs)} 能出图")
+        print("     这不是识别逻辑的问题，是**后端/驱动层面的状态**。"
+              "双目要求同一个后端同时开两路，所以现在**标定跑不起来**。")
+        print("     按顺序试：① 两台都拔掉、等 5 秒、插回（重置驱动状态）；"
+              "② 换到机身不同的 USB 口；")
+        print("     ③ 关掉可能占用相机的程序；④ 再跑一次本命令，"
+              "看是否变成「两台都在同一个后端」。")
+    else:
+        print("  → 只有一台能出图。按顺序查：① 是否有一台**镜头被挡/被遮住**"
+              "（近乎纯黑就是它）；")
+        print("     ② 拔插换 USB 口；③ 是否被别的程序（会议/浏览器）占着。")
+    return 0 if best >= 1 else 1
+
+
 def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     """按**当前实际设备**生成 `pin` 示例命令（不写死任何型号名）。
 
@@ -915,6 +1030,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     pc = sub.add_parser("check", help="比对配置与当前设备：有没有漂移/被占用")
     pc.set_defaults(func=cmd_check)
+
+    ppr = sub.add_parser(
+        "probe", help="真的开一次：逐后端 × 逐编号报「能不能出图」（只诊断，不绑角色）")
+    ppr.add_argument("--max-index", type=int, default=3, help="探测到第几个编号（默认 3）")
+    ppr.add_argument("--backends", choices=("both", "msmf", "dshow"), default="both",
+                     help="探测哪些后端（默认 both）")
+    ppr.set_defaults(func=cmd_probe)
 
     pd = sub.add_parser(
         "doctor", help="**真开相机**体检一遍：现在能不能跑双目（只报告，不改配置）")
