@@ -181,6 +181,39 @@ def _open_preview(index: int, backend: int):
     return src, used_name
 
 
+def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
+    """预览窗口上的标签。**必须写明"推测"** —— 这不是事实，是我们猜的。
+
+    ## 为什么必须标"推测"（2026-10-18，用户第二次纠正）
+
+    用户问："你的相机管理的视频画面的内容是不是根本不是通过相机的名字来设置的?
+    为什么我的命名为 right 的相机却在画面上是 left?"
+
+    **他说得对，而且这条比上一轮更根本。**
+
+    `cv2.VideoCapture(N, backend)` **只能按编号打开** —— 名字根本不参与。
+    窗口上那行 `#N <名字>` 是"编号 N 对应设备列表里第 N 台"这个**假设**的产物。
+
+    我的证据缺口在这里：
+
+    | 我验证过的 | 结论 |
+    | --- | --- |
+    | aoni vs Integrated（MSMF `#2` 黑 = PnP `#2` 内置） | 成立 |
+    | **两台一模一样的 aoni 谁在 `#0`、谁在 `#1`** | **从未验证** |
+
+    拿"`#2` 是内置"外推到"整个顺序都对"，是**用一条弱证据支撑了一个强结论**。
+    两台 aoni 同 VID/PID、同分辨率、同画面特征 —— **在软件层面不可区分**，
+    所以这个顺序**原理上无法由 OpenCV 证明**。
+
+    于是：这条标签**永远只能是推测**。把推测写成事实，用户就会按错的标签绑定角色
+    （他说"命名为 right 的相机在画面上是 left"就是这么来的）。
+
+    正确做法：**标签照实说它是推测**，绑定走 `cameras.py pin <role> name:"<完整名字>"`
+    —— 那条路径按**用户赋予的名字**解析到身份，**完全不开相机、也不碰编号**。
+    """
+    return f"#{index}  推测:{entry.name or '(无名字)'}  端口 {entry.port or '-'}"
+
+
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                         *, backend: int) -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
@@ -193,7 +226,7 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
     ⚠️ `backend` 是**整个 identify 会话共用的**，不允许按索引换（见 `_open_preview`
     里的长注释与那张实测表）。`keyword-only` 是为了让每个调用点都必须显式交代它。
     """
-    label = f"#{index}  {entry.name or '(无名字)'}  端口 {entry.port or '-'}"
+    label = _preview_label(index, entry)
     try:
         src, backend_used = _open_preview(index, backend)
     except RuntimeError as exc:
@@ -338,7 +371,26 @@ def cmd_identify(args) -> int:
         print("=" * 70)
 
     reg = cr.load_registry()
-    print("逐个索引显示画面，请按提示确认哪台是左、哪台是右、哪台「无关」：")
+    # 🔴 这段警告是 2026-10-18 用户第二次纠正后加的，**不要删**。
+    #
+    # 用户问："视频画面的内容是不是根本不是通过相机的名字来设置的?
+    #          为什么我的命名为 right 的相机却在画面上是 left?"
+    #
+    # 答案：**是，画面只按编号打开，名字根本不参与。**
+    # 窗口上 `#N 推测:<名字>` 里的名字，是"编号 N ↔ 设备列表第 N 台"这个**假设**的产物。
+    # 而这条假设 **只在"两台 aoni 谁在 #0/#1"这一层上从未被验证过** ——
+    # 两台同 VID/PID、同分辨率、同画面特征，**软件层面不可区分**。
+    # 所以标签可能是反的，**必须以你眼睛看到的画面为准**；
+    # 要"名字说了算"，请用 `pin name:`（那条路径不开相机、不碰编号）。
+    print("⚠️ 下面每台窗口的标签写着「推测:<名字>」——**名字是猜的，不是事实。**")
+    print("   `cv2.VideoCapture` 只能按**编号**打开，名字不参与；"
+          "而编号与设备列表的对应关系")
+    print("   在两台同型号相机之间**无法由程序证明**（它们同 VID/PID、同分辨率）。")
+    print("   所以：**请以画面为准**按键。若你已用名字区分了左右，更可靠的做法是")
+    print('     python apps/tools/cameras.py pin left  name:"<完整的左相机名字>"')
+    print('     python apps/tools/cameras.py pin right name:"<完整的右相机名字>"')
+    print("   —— 按名字绑身份，**不开相机、不碰编号**，也就不存在左右颠倒。")
+    print("\n逐个索引显示画面，请按提示确认哪台是左、哪台是右、哪台「无关」：")
     print(f"（按键：{_KEY_HINT}）\n")
 
     for idx in indices:

@@ -1213,6 +1213,67 @@ def test_identify_never_switches_backend() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_preview_label_admits_it_is_a_guess() -> bool:
+    """第 17 节：预览标签**必须自己承认是推测**，不许把猜测写成事实。
+
+    ## 守的是用户 2026-10-18 的第二次纠正
+
+    > 你的相机管理的视频画面的内容是不是根本不是通过相机的名字来设置的?
+    > 为什么我的命名为 right 的相机却在画面上是 left?
+
+    **他说得对，而且这条比"换后端"更根本。**
+
+    `cv2.VideoCapture(N, backend)` **只能按编号打开，名字不参与**；
+    窗口上 `#N <名字>` 是"编号 N ↔ 设备列表第 N 台"这个**假设**的产物。
+
+    而那条假设的证据链有个缺口：
+
+    | 验证过的 | 结论 |
+    | -------- | ---- |
+    | aoni vs Integrated（MSMF `#2` 黑 = PnP `#2` 内置） | 成立 |
+    | **两台一模一样的 aoni 谁在 `#0`/`#1`** | **从未验证** |
+
+    两台 aoni 同 VID/PID、同分辨率、同画面特征 —— **软件层面不可区分**，
+    所以这个顺序**原理上无法由 OpenCV 证明**。标签如果写成事实，
+    用户就会按错的标签绑角色（"命名为 right 却在画面上是 left"就是这么来的）。
+
+    ## 判据
+
+    - 标签里必须出现「推测」（把不确定性写在用户看得见的地方）；
+    - 标签里仍要有名字与端口（否则用户没有任何线索可用）。
+    """
+    print("----- 17. 预览标签必须自认「推测」 -----")
+    import importlib.util
+
+    cam_path = ROOT / "apps" / "tools" / "cameras.py"
+    spec = importlib.util.spec_from_file_location("cam_tool_label", cam_path)
+    cam = importlib.util.module_from_spec(spec)
+    sys.modules["cam_tool_label"] = cam
+    assert spec.loader is not None
+    spec.loader.exec_module(cam)
+
+    import sphere_tracker.camera_registry as cr
+
+    entry = cr.DeviceEntry(order=0, name="aoni webcam A25 left",
+                           identity="USB\\X", port="6&abc&0&0000")
+    label = cam._preview_label(0, entry)
+    print(f"  标签 = {label!r}")
+
+    blank = cr.DeviceEntry(order=3)
+    label2 = cam._preview_label(3, blank)
+    print(f"  无名字时 = {label2!r}")
+
+    checks = [
+        ("标签写明「推测」（不许把猜测写成事实）", "推测" in label),
+        ("标签仍带名字（用户需要线索）", "aoni webcam A25 left" in label),
+        ("标签仍带端口（名字不可靠时的第二线索）", "6&abc&0&0000" in label),
+        ("没有名字时给出占位而不是空白", "(无名字)" in label2),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def make_scratch_dir() -> Path:
     """可写的临时目录（沙箱里 %TEMP% 可能不可写，退回项目内 outputs/）。"""
     import tempfile
@@ -1260,6 +1321,7 @@ def main() -> int:
             test_identify_open_preview_shape(),
             test_usb_port_change_is_diagnosable(),
             test_identify_never_switches_backend(),
+            test_preview_label_admits_it_is_a_guess(),
         ]
         print()
         if args.probe:
