@@ -245,6 +245,15 @@ class StereoRig:
                 "epipolar_rms": res.epipolar_rms, "epipolar_max": res.epipolar_max,
                 "n_pairs_used": res.n_pairs_used, "n_pairs_in": res.n_pairs_in,
                 "verdict": res.verdict,
+                # ---- 不确定度（2026-10-18 加，审查 A5）----
+                #
+                # 为什么存进 JSON：RMS 是"拟合得多好"，这两个数是"参数能信到什么
+                # 程度"。合成真值里**同一份 RMS** 可以对应 4 倍不同的深度精度，
+                # 所以只看 RMS 会误判。存下来，事后复盘才有依据。
+                "grade": res.grade,
+                "board_area": res.board_area,
+                "fx_sigma_px": res.fx_sigma(),
+                "depth_sigma_mm_at_0_6m": res.depth_sigma_mm(0.6),
             },
             meta=meta or {},
         )

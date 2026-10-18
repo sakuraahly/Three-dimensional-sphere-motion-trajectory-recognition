@@ -45,6 +45,24 @@ class CalibConfig:
     good_epipolar: float = 0.25
     ok_epipolar: float = 0.60
 
+    # 板占画面比例下限：低于它**不许判"优秀"**。
+    #
+    # ## 为什么要有这条（2026-10-18 实测，见审查计划书 A5）
+    #
+    # 合成真值 + 0.30 px 亚像素噪声、**同样的 RMS**：
+    #
+    #     板占 1.9%（只在中央）：RMS 0.414 px   Z 误差 σ 5.76 mm  最大 13.7 mm
+    #     板占 7.9%（铺满画面）：RMS 0.413 px   Z 误差 σ 1.40 mm  最大  2.8 mm
+    #
+    # 即 **RMS 对"板太小"几乎免疫，而深度精度差 4 倍**。
+    # 机制：板只在中央时，焦距/主点与畸变在数据上强耦合，换个噪声样本
+    # fx 就漂 ±9 px；而 `Z = f·B/d` 对焦距是**一阶**敏感，直接变成深度系统误差。
+    #
+    # 所以"RMS 好看"不能作为高等级判定的充分条件 —— 必须再卡一个
+    # "板在画面里够大"的硬条件。数值取 8%：与报告里"建议 10%~30%"同侧，
+    # 留一点余量给"刚好 8~10%"的情况。
+    min_board_area_for_good: float = 0.08
+
     expected_baseline_mm: float | None = None   # 若提供，用于检查标定是否离谱
     baseline_tolerance: float = 0.20            # 允许的相对偏差
 
@@ -95,12 +113,68 @@ class StereoCalibrationResult:
     grade: str = ""                         # 优秀 / 可用 / 勉强可用 / 不可用
     # **可执行的下一步建议**（不是"换更多角度"这种没法照做的话）
     suggestions: list[str] = field(default_factory=list)
+    # ---- 参数不确定度（2026-10-18 加，审查 A5）----
+    #
+    # `cv2.calibrateCameraExtended` 会返回 `stdDeviationsIntrinsics`，
+    # 而原来 `_calibrate_one()` **把它丢掉了**（`_sdi` 下划线变量）。
+    # 那正是"这个焦距有多可信"的答案 —— 丢掉它，就只能靠 RMS 猜，
+    # 而 RMS 对"板太小"这种退化几乎免疫（见 `min_board_area_for_good` 的注释）。
+    #
+    # 顺序同 OpenCV：[fx, fy, cx, cy, 畸变...]，单位与参数一致（像素）。
+    std1: np.ndarray | None = None
+    std2: np.ndarray | None = None
 
     @property
     def board_area(self) -> float:
         """两路里**较小**的那个比例（双目要两路都够大才有意义）。"""
         vals = [v for v in (self.board_area_l, self.board_area_r) if np.isfinite(v)]
         return float(min(vals)) if vals else float("nan")
+
+    # ---- 不确定度（审查 A5）---------------------------------------------
+    def fx_sigma(self) -> float:
+        """左目 `fx` 的标准差估计（像素）；拿不到返回 nan。"""
+        if self.std1 is None or np.size(self.std1) < 1:
+            return float("nan")
+        return float(np.ravel(self.std1)[0])
+
+    def depth_sigma_mm(self, z_m: float = 0.6) -> float:
+        """在距离 `z_m`（米）处的**深度标准差估计**，单位 mm。
+
+        ## 公式与它的边界
+
+        `Z = f·B/d`，两边取相对误差（忽略协方差）：
+
+            (σ_Z/Z)² = (σ_f/f)² + (σ_d/d)²   [+ (σ_B/B)²]
+
+        - `σ_f`：来左目内参的标准差（`calibrateCameraExtended` 的
+          `stdDeviationsIntrinsics`，原来被丢弃）；
+        - `d = f·B/z`：该距离处的视差（像素）；
+        - `σ_d ≈ √2 · rms`：左右两路各贡献一次角点定位误差，近似独立；
+        - **不包含 `σ_B`**：`cv2.stereoCalibrate` 不返回 `T` 的方差，
+          所以这里**没有**基线项。真要在意基线精度，得用重采样另估。
+
+        ⚠️ 这是**数量级估计**，不是严格置信区间。已知偏差：用合成数据验证时
+        它给出的排序正确（板小 → 不确定度大，约 3 倍差异），但绝对值与实测
+        离散度不一定吻合（实测里还混有"收敛到更差局部解"的成分）。
+        **用途：让"该信到什么程度"有个可比较的数字，而不是当验收门限。**
+        """
+        f = float(self.K1[0, 0]) if self.K1 is not None else float("nan")
+        b = float(np.linalg.norm(np.ravel(self.T))) if self.T is not None else float("nan")
+        if not (np.isfinite(f) and np.isfinite(b) and b > 0 and z_m > 0):
+            return float("nan")
+        d = f * b / float(z_m)
+        if not np.isfinite(d) or d <= 0:
+            return float("nan")
+        sd = float(np.sqrt(2.0) * self.rms) if np.isfinite(self.rms) else float("nan")
+        sf = self.fx_sigma()
+        rel = 0.0
+        if np.isfinite(sd):
+            rel += (sd / d) ** 2
+        if np.isfinite(sf) and f > 0:
+            rel += (sf / f) ** 2
+        if rel <= 0:
+            return float("nan")
+        return float(np.sqrt(rel) * z_m * 1000.0)
 
     def report(self) -> str:
         lines = []
@@ -123,6 +197,21 @@ class StereoCalibrationResult:
             lines.append(f"板占画面      : {self.board_area * 100:.1f}%"
                          f"（左 {self.board_area_l * 100:.1f}% / 右 {self.board_area_r * 100:.1f}%；"
                          f"建议 10%~30%）")
+        # ---- 不确定度（审查 A5）----
+        #
+        # 为什么一定要打印：RMS 是"拟合得多好"，而这两个数是"参数能信到什么程度"。
+        # 合成真值里同一份 RMS 可以对应 4 倍不同的深度精度 —— 只看 RMS 会误判。
+        sf = self.fx_sigma()
+        if np.isfinite(sf):
+            f = float(self.K1[0, 0])
+            lines.append(f"焦距不确定度  : σ(fx) = {sf:.2f} px"
+                         f"（相对 {sf / f * 100:.3f}%）")
+        else:
+            lines.append("焦距不确定度  : 不可用（本版 OpenCV 未返回参数标准差）")
+        dz = self.depth_sigma_mm(0.6)
+        if np.isfinite(dz):
+            lines.append(f"深度不确定度  : 在 0.60 m 处约 **±{dz:.1f} mm**"
+                         f"（含焦距项 + 视差项，**不含基线项**；数量级估计）")
         lines.append("-" * 62)
         lines.append(f"判定          : {self.verdict}")
         for w in self.warnings:
@@ -140,7 +229,13 @@ def _rms(x: np.ndarray) -> float:
 
 
 def _calibrate_one(objp, imgp, size, cfg: CalibConfig):
-    """单目标定，返回 (K, D, 逐图重投影误差)。"""
+    """单目标定，返回 (K, D, 逐图重投影误差, 参数标准差)。
+
+    ⚠️ 第 4 个返回值是 2026-10-18 补上的：`calibrateCameraExtended` 一直返回
+    `stdDeviationsIntrinsics`，而这里**原来丢掉它**（`_sdi` 下划线）。
+    丢掉之后，判定只能靠 RMS —— 而合成真值证明 RMS 对"板太小"几乎免疫
+    （板占 1.9% 与 7.9% 的 RMS 都是 0.41 px，深度精度差 4 倍）。
+    """
     flags = 0
     if cfg.rational_model:
         flags |= cv2.CALIB_RATIONAL_MODEL
@@ -148,8 +243,9 @@ def _calibrate_one(objp, imgp, size, cfg: CalibConfig):
         flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-7)
     out = cv2.calibrateCameraExtended(objp, imgp, size, None, None, criteria=criteria, flags=flags)
-    _ret, K, D, _rv, _tv, _sdi, _sde, per_view = out
-    return K, D, np.asarray(per_view, dtype=np.float64).ravel()
+    _ret, K, D, _rv, _tv, sdi, _sde, per_view = out
+    return (K, D, np.asarray(per_view, dtype=np.float64).ravel(),
+            np.asarray(sdi, dtype=np.float64).ravel())
 
 
 def _stereo_once(objp, ip1, ip2, K1, D1, K2, D2, size, cfg: CalibConfig):
@@ -247,8 +343,8 @@ def calibrate_stereo(
         p1 = [imgpoints1[i] for i in idx]
         p2 = [imgpoints2[i] for i in idx]
 
-        K1, D1, e1 = _calibrate_one(o, p1, image_size, cfg)
-        K2, D2, e2 = _calibrate_one(o, p2, image_size, cfg)
+        K1, D1, e1, sdi1 = _calibrate_one(o, p1, image_size, cfg)
+        K2, D2, e2, sdi2 = _calibrate_one(o, p2, image_size, cfg)
         rms, K1, D1, K2, D2, R, T, E, F = _stereo_once(o, p1, p2, K1, D1, K2, D2, image_size, cfg)
         R1, R2, P1, P2, Q, roi1, roi2 = _rectify(K1, D1, K2, D2, image_size, R, T, cfg.alpha)
         epi = _epipolar_errors(p1, p2, K1, D1, K2, D2, R1, R2, P1, P2)
@@ -262,7 +358,7 @@ def calibrate_stereo(
         cur = dict(idx=list(idx), K1=K1, D1=D1, K2=K2, D2=D2, R=R, T=T, E=E, F=F,
                    R1=R1, R2=R2, P1=P1, P2=P2, Q=Q, roi1=roi1, roi2=roi2,
                    rms=float(rms), e1=float(_rms(e1)), e2=float(_rms(e2)),
-                   epi=epi, per_pair=per_pair)
+                   epi=epi, per_pair=per_pair, std1=sdi1, std2=sdi2)
         if best is None or cur["rms"] <= best["rms"]:
             best = cur
 
@@ -284,6 +380,7 @@ def calibrate_stereo(
     res.per_pair_epipolar = [float(v) for v in b["epi"]]
     res.used_index = list(b["idx"])
     res.rejected_index = [i for i in range(res.n_pairs_in) if i not in set(b["idx"])]
+    res.std1, res.std2 = b.get("std1"), b.get("std2")
 
     # ---- 板占画面比例：从**实际用上**的那些对的角点算 ----
     #
@@ -392,6 +489,19 @@ def calibrate_stereo(
     res.warnings = warns
 
     # ---- 分级 ----
+    #
+    # ⚠️ 2026-10-18：优秀这一档**多了一道硬条件**：板在画面里必须够大。
+    # 依据见 `min_board_area_for_good` 的注释 —— 同样的 RMS 下，
+    # 板占 1.9% 与 7.9% 的深度精度差 4 倍。RMS 好看**不足以**判"优秀"。
+    area_big_enough = (not np.isfinite(res.board_area)
+                       or res.board_area >= cfg.min_board_area_for_good)
+    if (res.rms <= cfg.good_rms and res.epipolar_rms <= cfg.good_epipolar
+            and not area_big_enough):
+        warns.append(
+            f"精度指标已达「优秀」档，但板只占画面 {res.board_area * 100:.1f}%"
+            f"（< {cfg.min_board_area_for_good * 100:.0f}%）—— 因此**最高只判「可用」**。"
+            f"板小会让焦距/主点与畸变强耦合，深度误差被放大而 RMS 看不出来。")
+
     if diverged or baseline_bad or res.n_pairs_used < 8:
         # 只有"物理上错了"才不可用
         if diverged:
@@ -403,7 +513,8 @@ def calibrate_stereo(
         res.grade = "不可用"
         res.verdict = f"不可用 —— {why}，请重拍"
         res.ok = False
-    elif res.rms <= cfg.good_rms and res.epipolar_rms <= cfg.good_epipolar:
+    elif (res.rms <= cfg.good_rms and res.epipolar_rms <= cfg.good_epipolar
+          and area_big_enough):
         res.grade = "优秀"
         res.verdict = "优秀 —— 可以直接用于三角测量"
         res.ok = True

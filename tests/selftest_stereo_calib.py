@@ -436,6 +436,107 @@ def test_T_sign_convention() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_board_area_caps_grade() -> bool:
+    """板占比必须能**卡住**等级，且不确定度要真的算出来（审查 A5）。
+
+    ## 守的是什么（2026-10-18）
+
+    合成真值 + 0.30 px 亚像素噪声，**同样的 RMS**：
+
+        板占 1.9%（只在中央）：RMS 0.414 px   Z 误差 σ 5.76 mm  最大 13.7 mm
+        板占 7.9%（铺满画面）：RMS 0.413 px   Z 误差 σ 1.40 mm  最大  2.8 mm
+
+    **RMS 对"板太小"几乎免疫，而深度精度差 4 倍。**
+    所以"RMS/极线都达标"**不足以**判"优秀"，必须再卡板占比；
+    同时要把 `stdDeviationsIntrinsics`（原来被丢弃）接出来，
+    让"参数有多可信"有数字可看。
+
+    ## 判据
+
+    1. 板小 + 指标完美 → **不得判"优秀"**（最高"可用"），且给出原因；
+    2. 板大 + 指标完美 → 判"优秀"（不是把"优秀"这一档废掉）；
+    3. `std1` 非空、`fx_sigma()` 有限且 > 0；
+    4. `depth_sigma_mm()` 随距离增大而增大（单调），且在 0.6 m 处量级合理。
+    """
+    print("\n----- 板占比对判级的约束（审查 A5） -----")
+    W, H = 1280, 720
+    f = 1000.0
+    B = 0.065
+    K = _K(f, f, W / 2, H / 2)
+    D = np.zeros(5)
+    spec = BoardSpec(square_mm=25.0)
+    objp = spec.object_points().astype(np.float64)
+
+    def make(z: float, n: int = 14, seed: int = 3):
+        rng = np.random.default_rng(seed)
+        img1, img2 = [], []
+        for i in range(n):
+            rv = np.array([rng.uniform(-0.25, 0.25), rng.uniform(-0.25, 0.25),
+                           rng.uniform(-0.20, 0.20)])
+            tv = np.array([rng.uniform(-0.05, 0.05), rng.uniform(-0.04, 0.04),
+                           z + 0.03 * (i % 4)])
+            Rm, _ = cv2.Rodrigues(rv)
+            P_l = (Rm @ objp.T).T + tv.reshape(1, 3)
+            P_r = P_l - np.array([B, 0.0, 0.0])
+            p1, _ = cv2.projectPoints(P_l, np.zeros(3), np.zeros(3), K, D)
+            p2, _ = cv2.projectPoints(P_r, np.zeros(3), np.zeros(3), K, D)
+            img1.append(p1.astype(np.float32))
+            img2.append(p2.astype(np.float32))
+        return img1, img2
+
+    img1_s, img2_s = make(z=1.05)      # 板小
+    img1_b, img2_b = make(z=0.38)      # 板大
+    # 第三组：**带噪声**。零噪声下不确定度恒为 0（物理上正确），
+    # 所以"量级是否合理"必须用有噪声的数据测，否则判据本身不成立。
+    img1_n, img2_n = make(z=0.75, seed=11)
+    rng = np.random.default_rng(2024)
+    img1_n = [(p + rng.normal(0, 0.3, p.shape)).astype(np.float32) for p in img1_n]
+    img2_n = [(p + rng.normal(0, 0.3, p.shape)).astype(np.float32) for p in img2_n]
+    cfg = CalibConfig()
+    res_s = calibrate_stereo(objp, img1_s, img2_s, (W, H), cfg)
+    res_b = calibrate_stereo(objp, img1_b, img2_b, (W, H), cfg)
+    res_n = calibrate_stereo(objp, img1_n, img2_n, (W, H), cfg)
+
+    print(f"  小：板占 {res_s.board_area * 100:.1f}%  rms {res_s.rms:.4f} px  "
+          f"判决 {res_s.grade}")
+    print(f"  大：板占 {res_b.board_area * 100:.1f}%  rms {res_b.rms:.4f} px  "
+          f"判决 {res_b.grade}")
+
+    print(f"  带噪声：rms {res_n.rms:.4f} px  σ(fx)={res_n.fx_sigma():.2f} px  "
+          f"σ_Z(0.6m)={res_n.depth_sigma_mm(0.6):.2f} mm  "
+          f"σ_Z(1.2m)={res_n.depth_sigma_mm(1.2):.2f} mm")
+
+    checks = [
+        ("小板确实落在门限之下（测试前提成立）",
+         res_s.board_area < cfg.min_board_area_for_good),
+        ("大板确实落在门限之上（测试前提成立）",
+         res_b.board_area >= cfg.min_board_area_for_good),
+        ("小板 + 指标完美 **不得判优秀**",
+         res_s.grade != "优秀"),
+        ("小板给出「最高只判可用」的原因说明",
+         any("最高只判" in w for w in res_s.warnings)),
+        ("大板 + 指标完美 **仍判优秀**（不是把这一档废掉）",
+         res_b.grade == "优秀"),
+        ("std1 被保留下来（原来被丢弃）",
+         res_n.std1 is not None and np.size(res_n.std1) >= 4),
+        ("fx_sigma() 有限且 > 0（带噪声数据）",
+         np.isfinite(res_n.fx_sigma()) and res_n.fx_sigma() > 0),
+        ("depth_sigma_mm() 随距离单调增大",
+         res_n.depth_sigma_mm(0.6) < res_n.depth_sigma_mm(1.2)),
+        ("0.6 m 处深度不确定度在 0.5~50 mm 量级（合理性）",
+         0.5 < res_n.depth_sigma_mm(0.6) < 50.0),
+        ("零噪声时不确定度趋于 0（不虚报）",
+         not np.isfinite(res_s.depth_sigma_mm(0.6))
+         or res_s.depth_sigma_mm(0.6) < 1.0),
+        ("报告里出现了「深度不确定度」这一行",
+         "深度不确定度" in res_n.report()),
+        ("报告里出现了「板占画面」这一行", "板占画面" in res_n.report()),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目标定自测（合成真值）")
     ap.add_argument("--views", type=int, default=25,
@@ -476,6 +577,7 @@ def main() -> int:
         )
         all_ok = all_ok and ok
     all_ok = test_T_sign_convention() and all_ok
+    all_ok = test_board_area_caps_grade() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1
