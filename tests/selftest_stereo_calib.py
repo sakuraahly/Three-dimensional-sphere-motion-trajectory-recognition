@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 from calib import AutoPairCollector, BoardSpec, CalibConfig, calibrate_stereo
+from calib.params import StereoRig
 
 
 # --------------------------------------------------------------------------
@@ -354,6 +355,87 @@ def run_case(
     return ok
 
 
+def test_T_sign_convention() -> bool:
+    """`T` 的符号约定：**右相机物理在右侧 ⟹ `T[0] < 0`**（合成真值判据）。
+
+    ## 守的是一个"每台正常装置都会报假警报"的真缺陷（2026-10-18 修）
+
+    原实现 `baseline_side()` 认为 `T[0] > 0` 才是"右相机在右边"，于是
+    `StereoRig.describe()` 对**每一台正常装置**都打印
+    「[警告] 标定时 --left/--right 可能接反了」。假警报会训练人忽略真警报。
+
+    ## 为什么必须走"真标定求解器"而不是只测 `baseline_side()`
+
+    只测 `baseline_side()` 只能证明它和当前实现自洽 —— 而错误恰恰在
+    "这个符号跟 OpenCV 的约定对不对得上"。所以这里**造真值**：
+    右相机放在左相机 `+X`（物理右侧），用 `cv2.projectPoints` 生成角点，
+    再交给 `calibrate_stereo()` 反解，看它解出的 `T[0]` 是正还是负。
+
+    判据全部对照**真值**，不引用被测函数的中间量。
+    """
+    print("\n----- T 符号约定（合成真值） -----")
+    W, H = 1280, 720
+    f = 1000.0
+    B = 0.065
+    K = _K(f, f, W / 2, H / 2)
+    D = np.zeros(5)
+    spec = BoardSpec(square_mm=25.0)
+    objp = spec.object_points().astype(np.float64)
+
+    rng = np.random.default_rng(7)
+    img1, img2 = [], []
+    for i in range(14):
+        rv = np.array([rng.uniform(-0.30, 0.30), rng.uniform(-0.30, 0.30),
+                       rng.uniform(-0.25, 0.25)])
+        tv = np.array([rng.uniform(-0.10, 0.10), rng.uniform(-0.07, 0.07),
+                       0.45 + 0.05 * (i % 5)])
+        Rm, _ = cv2.Rodrigues(rv)
+        P_l = (Rm @ objp.T).T + tv.reshape(1, 3)
+        # 真值：右光心在左相机系里的位置 C = (+B, 0, 0)（物理右侧）
+        P_r = P_l - np.array([B, 0.0, 0.0])
+        p1, _ = cv2.projectPoints(P_l, np.zeros(3), np.zeros(3), K, D)
+        p2, _ = cv2.projectPoints(P_r, np.zeros(3), np.zeros(3), K, D)
+        img1.append(p1.astype(np.float32))
+        img2.append(p2.astype(np.float32))
+
+    res = calibrate_stereo(objp, img1, img2, (W, H), CalibConfig())
+    t = np.ravel(res.T)
+    print(f"  真值：右光心在左相机 +X（物理右侧），B={B * 1000:.0f} mm")
+    print(f"  解出：T = [{t[0]:+.6f} {t[1]:+.6f} {t[2]:+.6f}]   "
+          f"基线 {np.linalg.norm(t) * 1000:.2f} mm  rms {res.rms:.4f} px")
+    rig = StereoRig.from_result(res)
+    side, sign = rig.baseline_side(), rig.disparity_sign()
+    print(f"  baseline_side()={side!r}  disparity_sign()={sign:+d}")
+
+    # 真值视差符号（无畸变、R≈I，直接看 x 差）
+    d_true = float((img1[0][:, 0, 0] - img2[0][:, 0, 0]).mean())
+    print(f"  真值视差 x_left-x_right = {d_true:+.2f} px")
+
+    checks = [
+        ("解出的 T[0] 为**负**（符合 X_right = R·X_left + T）", float(t[0]) < 0),
+        ("基线长度与真值一致（±2%）", abs(np.linalg.norm(t) - B) / B < 0.02),
+        ("baseline_side() 判为 'right'（物理右侧）", side == "right"),
+        ("disparity_sign() 为 +1", sign == 1),
+        ("与真值视差符号一致", np.sign(d_true) == sign),
+        ("describe() **不再**对正常装置报「可能接反了」",
+         "可能接反" not in rig.describe()),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+
+    # 镜像 check：把左右对调，必须**报**接反
+    img1b, img2b = img2, img1
+    res_b = calibrate_stereo(objp, img1b, img2b, (W, H), CalibConfig())
+    rig_b = StereoRig.from_result(res_b)
+    hit = "可能接反" in rig_b.describe()
+    print(f"  镜像（左右对调）：baseline_side()={rig_b.baseline_side()!r}  "
+          f"describe 报警={hit}")
+    checks.append(("左右对调后 describe() **确实**报警（不是永远不报）", hit))
+    checks.append(("左右对调后 disparity_sign() 变为 -1", rig_b.disparity_sign() == -1))
+
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目标定自测（合成真值）")
     ap.add_argument("--views", type=int, default=25,
@@ -393,6 +475,7 @@ def main() -> int:
             stills=args.stills,
         )
         all_ok = all_ok and ok
+    all_ok = test_T_sign_convention() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1

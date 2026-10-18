@@ -419,16 +419,21 @@ def test_baseline_sign() -> bool:
     truth_pt = None
 
     checks: list[tuple[str, bool]] = []
+    # ⚠️ 2026-10-18 修正了这里的**标签**（数值断言原本就对）：
+    # `T` 是"左光心在右相机系里的位置"（`T = -R·C`，`C` = 右光心在左相机系里的位置），
+    # 所以 **`T[0] < 0` 才对应"右相机在右边"**。原来的标签恰好标反了
+    # （把 `tx=+0.15` 叫"正常"），与 `baseline_side()` 的错误实现互相印证。
+    # 真值依据：`outputs/_handoff_read/audit_T_sign.py`。
     for name, tx, want_side, want_sign in (
-        ("右相机在右边（正常）", +0.15, "right", -1),
-        ("右相机在左边（左右装反）", -0.15, "left", +1),
+        ("右相机在右边（正常，T[0]<0）", -0.15, "right", +1),
+        ("右相机在左边（左右装反，T[0]>0）", +0.15, "left", -1),
     ):
         rig = rig_with(tx)
         side, sign = rig.baseline_side(), rig.disparity_sign()
         checks.append((f"{name}：baseline_side={side}（应为 {want_side}）", side == want_side))
         checks.append((f"{name}：视差符号 {sign:+d}（应为 {want_sign:+d}）", sign == want_sign))
 
-        # 把"P2 第 4 列 = -f * T[0]"这个实测关系钉住 —— 符号判定的依据就是它
+        # 把 `P2[0,3] = f·C = -f·T[0]` 这个关系钉住 —— 符号判定的依据就是它
         implied = -float(rig.P2[0, 3]) / float(rig.P2[0, 0])
         checks.append((f"{name}：P2 第 4 列反推基线 {implied:+.4f} 与 T[0]={tx:+.2f} 反号",
                        abs(implied + tx) < 1e-6))
