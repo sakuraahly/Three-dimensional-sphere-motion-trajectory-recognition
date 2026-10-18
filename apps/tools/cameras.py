@@ -167,7 +167,16 @@ def _open_preview(index: int, backend: int):
 
     used_name = backend_name(backend)
     try:
-        src = CameraSource(index=index, width=640, height=480, backend=backend)
+        # ⚠️ optimize=False + 短预算（2026-10-18，用户反馈“卡顿明显”）：
+        #
+        # 设备识别只需要“把画面抓出来让人按键”，**不需要**挑最优分辨率/帧率。
+        # 之前用默认参数时：
+        #   · optimize=True 会跑一遍模式搜索（冷缓存最坏 10~40 s）；
+        #   · search_budget_s 默认 60 s —— 遇到**打不开**的相机（本机 aoni #0
+        #     在 MSMF 下就是“能打开但一帧都拿不到”），会**干等一分钟**才报错。
+        # 两者叠加就是用户看到的“卡顿”。
+        src = CameraSource(index=index, width=640, height=480, backend=backend,
+                           optimize=False, search_budget_s=PREVIEW_BUDGET_S)
     except RuntimeError as exc:
         # ⚠️ **这里必须返回两个值**（2026-10-15 修的真崩溃）。
         # 上一版改返回值时漏了这个早退分支，于是 `_open_preview` 返回单值 `None`，
@@ -179,6 +188,13 @@ def _open_preview(index: int, backend: int):
         return None, None
     _backend_used[index] = used_name
     return src, used_name
+
+
+# 设备识别/预览单台相机的**打开预算**（秒）。
+#
+# 为什么单独给一个短预算：识别是“人盯着屏幕等”的交互，一台打不开就跳过；
+# 而正式启动（run/calibrate）可以等 —— 那里仍用默认 60 s。
+PREVIEW_BUDGET_S = 10.0
 
 
 def _preview_label(index: int, entry: cr.DeviceEntry) -> str:

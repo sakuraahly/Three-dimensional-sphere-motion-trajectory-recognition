@@ -609,7 +609,8 @@ class Launcher(tk.Tk):
         ttk.Button(box, text="标定前置检查（两路是否都看到棋盘）",
                    command=self._run_precheck).grid(
             row=6, column=2, columnspan=3, sticky="w", pady=(10, 2))
-        ttk.Button(box, text="刷新设备列表", command=self._refresh_cameras).grid(
+        ttk.Button(box, text="刷新并检测相机（枚举 + 实测能否出图）",
+                   command=self._refresh_cameras).grid(
             row=6, column=5, columnspan=3, sticky="w", pady=(10, 2))
         ttk.Button(box, text="相机探测（核对两路参数是否一致）",
                    command=self._run_probe).grid(
@@ -617,8 +618,6 @@ class Launcher(tk.Tk):
         ttk.Button(box, text="相机设备管理（识别 / 固定 / 标无关）",
                    command=self._run_cameras_identify).grid(
             row=7, column=3, columnspan=2, sticky="w", pady=(2, 2))
-        ttk.Button(box, text="检查相机映射", command=self._run_cameras_check).grid(
-            row=7, column=5, columnspan=2, sticky="w", pady=(2, 2))
         ttk.Button(box, text="「无关」相机清单（自动挑选会跳过）",
                    command=self._run_cameras_ignored).grid(
             row=8, column=0, columnspan=3, sticky="w", pady=(2, 2))
@@ -1048,14 +1047,17 @@ class Launcher(tk.Tk):
             # 必须说清这个按钮的**能力边界**：它只列"系统里存在哪些设备"，
             # 不打开相机，所以**回答不了"相机现在活着吗"**。
             # 用户 2026-10-18 的反馈正是："刷新设备列表和检查映射不能保证有用"。
-            self._append("（注意：本按钮只**枚举**，不打开相机 —— "
-                         "要确认相机现在能不能出图，请点『相机探测』）")
+            self._append("接下来会自动**实测**每台能不能出图（下面另起一个任务）。")
             if reg.ignored:
                 names = "、".join((s.name or f"#{s.index}") for s in reg.ignored)
                 self._append(f"已标为「无关」（自动挑相机会跳过）：{names}")
             else:
                 self._append("提示：不打算用的相机（笔记本内置 / 红外）可以在"
                              "『相机设备管理』的画面里按 n 标成「无关」。")
+            # 枚举 ≠ 能用：立刻再跑一次**真开相机**的探测，让这个按钮真的回答问题。
+            self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"),
+                       "probe", "--max-index", "3"],
+                      "相机探测（真的开一次：有几台能出图、在哪个后端）")
         else:
             self._append("没有枚举到设备（非 Windows 或系统枚举不可用），"
                          "只能按编号使用。")
@@ -1064,10 +1066,6 @@ class Launcher(tk.Tk):
         self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "identify"],
                   "相机设备管理（逐个画面确认：l=左 / r=右 / n=无关 / m=主，"
                   "结果写入 config/cameras.json）")
-
-    def _run_cameras_check(self) -> None:
-        self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "check"],
-                  "检查相机映射（重插相机后看看有没有漂移）")
 
     def _run_cameras_ignored(self) -> None:
         self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "ignored"],

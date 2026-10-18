@@ -275,12 +275,16 @@ class CameraSource(VideoSource):
         backend: int | None = None,
         optimize: bool = True,
         target_fps: float = 25.0,
+        search_budget_s: float = 60.0,
     ) -> None:
         self.cap = None
         self.backend_name = ""
         self.resolution_fallback = False
         self._index, self._api = index, backend
         self._fps_req, self._fourcc = fps, fourcc
+        # 打开失败的相机要**多快放弃**：默认 60 s 适合正式启动（宁可等也别误判），
+        # 但设备识别/预览只想知道“能不能看到画面”，不该让人干等一分钟。
+        self._search_budget_s = float(search_budget_s)
         self.mode_probed = False
         candidates = (
             [(backend_name(backend), backend)] if backend is not None
@@ -421,7 +425,7 @@ class CameraSource(VideoSource):
         # 而"换个后端"恰恰是这台机器上最有效的一招，所以**第一个后端把预算吃光
         # = 把最有效的排查手段跳过**。现在给每个后端一份**均分**的预算，
         # 并且预算真的不够时**如实说**，不再谎报"全部试过"。
-        search_budget_s = 60.0
+        search_budget_s = float(getattr(self, "_search_budget_s", 60.0))
         # 每个后端一份均分预算（下限 12 s，免得后端多时每份太短试不出东西）
         per_backend_s = max(12.0, search_budget_s / max(1, len(candidates)))
         budget_hit = False
