@@ -184,6 +184,10 @@ def _try_open(index: int, api: int):
 
 # 预览里"等第一帧"的上限（秒）。**慢相机实测要 ~24 秒**才给第一帧
 #（aoni #0 + MSMF）；3 秒会把它误判成"一帧都拿不到"，于是它在界面上彻底消失。
+# 预览窗口的**显示宽度**（超过就等比降采样）。识别只需看清是哪台，
+# 而 1920x1080 每帧约 6 MB，直接 imshow 在核显上会明显掉帧。
+PREVIEW_DISPLAY_W = 960
+
 PREVIEW_FIRST_FRAME_S = 30.0
 
 # 单台预览的**总**预算：要能容纳上面那次首帧等待 + 一次分辨率降级。
@@ -273,14 +277,27 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                 if ok and frame is not None:
                     miss = 0
                     import cv2
-                    cv2.putText(frame, label, (8, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                    # ⚠️ **显示前先降采样**（2026-10-18，用户反馈"画面依然很卡顿"）。
+                    #
+                    # 这台相机只肯给 1920x1080；而识别只需要"能看出这是哪台"。
+                    # 每帧直接 imshow 1080p（约 6 MB/帧）在中低端核显上会明显掉帧，
+                    # 再加上 putText 也在全尺寸上做，就更慢。
+                    # 降到 960 宽后，imshow 的拷贝量降到 1/4。
+                    disp = frame
+                    if frame.shape[1] > PREVIEW_DISPLAY_W:
+                        ratio = PREVIEW_DISPLAY_W / float(frame.shape[1])
+                        disp = cv2.resize(
+                            frame,
+                            (PREVIEW_DISPLAY_W, max(1, int(frame.shape[0] * ratio))),
+                            interpolation=cv2.INTER_AREA)
+                    cv2.putText(disp, label, (8, 26), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.7, (0, 255, 255), 2, cv2.LINE_AA)
                     if status:
-                        cv2.putText(frame, f"now: {status}", (8, 54),
+                        cv2.putText(disp, f"now: {status}", (8, 54),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
                                     cv2.LINE_AA)
                     try:
-                        wins.show(win, frame)
+                        wins.show(win, disp)
                     except cv2.error:
                         gui_ok = False
                         break
@@ -302,7 +319,7 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                               f"（QQ/会议/浏览器）是否占着 → 拔插 USB。")
                         return None
                 key = cv2.waitKey(1) & 0xFF
-                if wins.handle_key(win, key, frame):
+                if wins.handle_key(win, key, disp):
                     continue
                 if key == ord("q") or key == 27:
                     return ""
