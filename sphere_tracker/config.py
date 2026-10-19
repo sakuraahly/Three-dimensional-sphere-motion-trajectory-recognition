@@ -64,9 +64,10 @@ class SpecularConfig:
     所以用 **人工 seed + CSRT 跟踪 + 模板/运动门控**；不做全图 Hough 自动锁定。
     """
 
-    min_radius: float = 24.0
-    max_radius: float = 48.0
+    min_radius: float = 18.0
+    max_radius: float = 100.0
     init_box: int = 64
+    max_box: int = 140
     max_jump_px: float = 120.0   # 实测球速可达 ~80 px/帧；50 会把真球误判成跟丢
     min_ncc: float = 0.0       # 仅记录；实测镜面反射下 0.30 会把真球误杀
     min_motion: float = 0.0    # 仅记录；顶点附近球几乎静止，硬门控会误杀

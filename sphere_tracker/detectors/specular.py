@@ -150,6 +150,9 @@ class SpecularBallDetector(BaseDetector):
                     self.last_error = (f"seed 半径 {r:.1f} 超出建议范围 "
                                        f"{c.min_radius:.0f}~{c.max_radius:.0f}，仍尝试")
                 side = int(c.init_box)
+                if r > 45.0:                      # 大球（>90px 直径）才放大框；36px 球仍用 64
+                    side = max(side, int(round(1.8 * r)))
+                side = min(side, int(c.max_box))
                 bbox = self._bbox_at(x, y, side, gray.shape)
                 tracker = self._make_tracker()
                 if tracker is None:
