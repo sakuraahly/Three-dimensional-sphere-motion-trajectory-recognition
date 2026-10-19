@@ -1,0 +1,507 @@
+"""双路无损录制：两台相机各写一个无损 MKV（默认 HFYU），并落 `session.json`。
+
+为什么不是直接用 `PairSource` 录
+--------------------------------
+`PairSource` 的相机模式是"永远取最新帧"——处理慢就丢帧，这是实时预览要的语义，
+但**录制要每一帧都留下**。所以这里自己开两路 `CameraSource`，各跑一个采集线程、
+各写一个 writer，主线程只负责计时 / 预览 / 停止。
+
+录完做什么
+----------
+- 写 `session.json`（分辨率 / 实测 fps / 帧数 / 标定快照 + sha256 / 同步偏移）；
+- 用两路逐帧亮度找闪光/拍手偏移（`stereo.sync.find_offset`）；
+- 跑 `validate_session`，有 error 就退出码 1（文件保留，方便查）。
+
+用法::
+
+    python apps/record_stereo.py --left left --right right --duration 10 --preview
+    python apps/record_stereo.py --left 0 --right 1 --backend dshow --duration 10
+
+⚠️ 角色名 + `--backend dshow` 会被拒绝：角色名解析出的是 PnP 位次，
+   DSHOW 编号是另一套命名空间（见 `docs/交接文档.md` §10.13）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import shutil
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker").is_dir())
+import sys
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from apps._common import setup_logging                      # noqa: E402
+from calib.params import StereoRig                           # noqa: E402
+from sphere_tracker.camera_registry import (                 # noqa: E402
+    load_registry,
+    resolve_camera_arg,
+)
+from sphere_tracker.sources import (                         # noqa: E402
+    INDEX_BACKEND,
+    CameraSource,
+)
+from stereo.sessions import (                                # noqa: E402
+    CalibrationInfo,
+    CameraInfo,
+    SyncInfo,
+    create_session,
+    describe,
+    save_session,
+    sha256_file,
+    validate_session,
+)
+from stereo.sync import SyncConfig, find_offset              # noqa: E402
+
+LOG = logging.getLogger("record")
+# 1080p30 × 2 的实测吞吐（本机）：HFYU ≈ 34 fps/路；FFV1 ≈ 8 fps/路。
+# 所以默认 HFYU（无损、能跟上相机），FFV1 留给"不赶时间"的归档。
+CODECS = {"hfyuv": ("HFYU", "HuffYUV（无损，默认）"),
+          "ffv1": ("FFV1", "FFV1（无损，但本机 2×1080p 只有约 8 fps/路）")}
+
+
+def _backend_of(args) -> int:
+    if args.backend == "msmf":
+        return cv2.CAP_MSMF
+    if args.backend == "dshow":
+        return cv2.CAP_DSHOW
+    # auto：角色名/PnP 位次只和 MSMF 对齐；显式编号也默认 MSMF，避免两路各挑一个后端
+    return INDEX_BACKEND
+
+
+def _looks_like_role(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text) and not text.isdigit() and not any(
+        text.startswith(p) for p in ("port:", "id:", "name:", "auto"))
+
+
+def _role_spec(reg, value: str):
+    if not _looks_like_role(value):
+        return None
+    return reg.roles.get(str(value).strip())
+
+
+def _open_one(side: str, value: str, args, api: int, out: dict) -> None:
+    try:
+        idx = resolve_camera_arg(value, reg=load_registry(), interactive=False)
+        if idx is None:
+            raise RuntimeError(f"{side} 没有解析出相机编号")
+        src = CameraSource(
+            index=idx,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            backend=api,
+            optimize=False,
+            first_frame_timeout_s=30.0,
+        )
+        out[side] = (idx, src)
+    except BaseException as exc:                            # noqa: BLE001
+        out[side] = exc
+
+
+def _open_pair(args) -> tuple[dict, int]:
+    if args.backend == "dshow" and (
+            _looks_like_role(args.left) or _looks_like_role(args.right)):
+        print("[错误] 角色名不能和 --backend dshow 一起用：角色名解析出的是 PnP 位次，")
+        print("       DSHOW 编号是另一套命名空间。请改成显式编号（如 --left 0 --right 1），")
+        print("       或把后端改回 msmf。")
+        return {}, 2
+
+    api = _backend_of(args)
+    print(f"[后端] {('MSMF' if api == cv2.CAP_MSMF else 'DSHOW')}；"
+          f"请求 {args.width}x{args.height}@{args.fps} fps")
+    print("[打开] 并行打开两路（首次可能要 20 秒以上，请等）…")
+    out: dict = {}
+    threads = [
+        threading.Thread(target=_open_one, args=("left", args.left, args, api, out),
+                         daemon=True, name="open-left"),
+        threading.Thread(target=_open_one, args=("right", args.right, args, api, out),
+                         daemon=True, name="open-right"),
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    errors = []
+    for side in ("left", "right"):
+        item = out.get(side)
+        if isinstance(item, BaseException):
+            errors.append(f"{side}: {item}")
+        elif item is None:
+            errors.append(f"{side}: 没有结果")
+    if errors:
+        print("[错误] 相机没打开：")
+        for e in errors:
+            print(f"  - {e}")
+        return {}, 1
+
+    cams = {}
+    for side in ("left", "right"):
+        idx, src = out[side]
+        info = src.info
+        print(f"[{side}] camera {idx}: {info.width}x{info.height} @ {info.fps:.1f} fps "
+              f"({info.backend})")
+        if (info.width, info.height) != (args.width, args.height):
+            print(f"[错误] {side} 实际 {info.width}x{info.height}，"
+                  f"与请求 {args.width}x{args.height} 不一致；双目要求两路完全一致")
+            for item in out.values():
+                if isinstance(item, tuple):
+                    item[1].release()
+            return {}, 1
+        cams[side] = (idx, src)
+    return cams, 0
+
+
+def _lossless_selfcheck(width: int, height: int, fps: int, tag: str) -> tuple[bool, str]:
+    """写两帧 -> 读回 -> 逐位比较；编码器不可用就提前失败，别录完才发现。"""
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*tag)
+        with tempfile.TemporaryDirectory(prefix="lossless_check_") as td:
+            path = Path(td) / "check.mkv"
+            vw = cv2.VideoWriter(str(path), fourcc, float(fps), (width, height))
+            if not vw.isOpened():
+                return False, f"VideoWriter 打不开 {tag}/MKV"
+            rng = np.random.default_rng(12345)
+            frames = [
+                rng.integers(0, 256, (height, width, 3), dtype=np.uint8),
+                rng.integers(0, 256, (height, width, 3), dtype=np.uint8),
+            ]
+            for f in frames:
+                vw.write(f)
+            vw.release()
+            cap = cv2.VideoCapture(str(path))
+            try:
+                ok, got = cap.read()
+                if not ok or got is None:
+                    return False, f"写出的 {tag} 读不回第一帧"
+                if got.shape != frames[0].shape:
+                    return False, f"读回尺寸 {got.shape} != {frames[0].shape}"
+                if not np.array_equal(got, frames[0]):
+                    return False, f"{tag} 第一帧不是逐位一致"
+                ok, got = cap.read()
+                if not ok or got is None or not np.array_equal(got, frames[1]):
+                    return False, f"{tag} 第二帧不是逐位一致"
+            finally:
+                cap.release()
+            return True, f"{tag} 写/读逐位一致"
+    except Exception as exc:                                # noqa: BLE001
+        return False, f"{tag} 自检异常：{exc}"
+
+
+class _SideRecorder(threading.Thread):
+    def __init__(self, side: str, src: CameraSource, writer, start_evt: threading.Event,
+                 stop_evt: threading.Event, preview: dict, lock: threading.Lock):
+        super().__init__(daemon=True, name=f"record-{side}")
+        self.side = side
+        self.src = src
+        self.writer = writer
+        self.start_evt = start_evt
+        self.stop_evt = stop_evt
+        self.preview = preview
+        self.lock = lock
+        self.times: list[tuple[int, float, float]] = []
+        self.brightness: list[float] = []
+        self.frame_count = 0
+        self.errors = 0
+        self.error = ""
+
+    def run(self) -> None:
+        self.start_evt.wait()
+        while not self.stop_evt.is_set():
+            ok, frame, t = self.src.read()
+            if not ok or frame is None:
+                self.errors += 1
+                if self.errors >= 30:
+                    self.error = f"连续 {self.errors} 帧读不到"
+                    return
+                time.sleep(0.005)
+                continue
+            self.errors = 0
+            try:
+                self.writer.write(frame)
+            except Exception as exc:                        # noqa: BLE001
+                self.error = f"writer.write 失败：{exc}"
+                return
+            self.times.append((self.frame_count, t, time.time()))
+            self.brightness.append(float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean()))
+            self.frame_count += 1
+            with self.lock:
+                self.preview[self.side] = frame
+
+
+def _make_writer(path: Path, width: int, height: int, fps: int, tag: str):
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*tag),
+                         float(fps), (width, height))
+    if not vw.isOpened():
+        raise RuntimeError(f"打不开 {tag} writer：{path}")
+    return vw
+
+
+def _write_times(path: Path, times: list[tuple[int, float, float]]) -> None:
+    """每帧时间戳 sidecar：容器 fps 只是标称值，真实节奏看这里。"""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["frame", "perf_counter_s", "unix_time_s"])
+        for idx, perf, unix in times:
+            w.writerow([idx, f"{perf:.6f}", f"{unix:.6f}"])
+
+
+def _copy_calibration(session_dir: Path, calib_base: Path) -> tuple[Path, StereoRig]:
+    calib_dir = session_dir / "calib"
+    calib_dir.mkdir(parents=True, exist_ok=True)
+    npz_src = calib_base.with_suffix(".npz")
+    json_src = calib_base.with_suffix(".json")
+    if not npz_src.exists():
+        raise FileNotFoundError(f"找不到标定文件：{npz_src}")
+    npz_dst = calib_dir / npz_src.name
+    shutil.copy2(npz_src, npz_dst)
+    if json_src.exists():
+        shutil.copy2(json_src, calib_dir / json_src.name)
+    rig = StereoRig.load(npz_dst)
+    return npz_dst, rig
+
+
+def _camera_info(side: str, idx: int, src: CameraSource, args, role_spec) -> CameraInfo:
+    return CameraInfo(
+        role=side,
+        video=f"{side}.mkv",
+        width=int(src.info.width),
+        height=int(src.info.height),
+        frame_count=0,
+        fps_requested=float(args.fps),
+        fps_measured=0.0,
+        backend=str(src.info.backend or ""),
+        identity=(role_spec.identity if role_spec else ""),
+        name=(role_spec.name if role_spec else ""),
+        port=(role_spec.port if role_spec else ""),
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="双路无损录制（HFYU/FFV1 MKV + session.json）")
+    ap.add_argument("--left", default="left", help="左路：角色名 / 编号 / name:...")
+    ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
+    ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
+    ap.add_argument("--width", type=int, default=1920)
+    ap.add_argument("--height", type=int, default=1080)
+    ap.add_argument("--fps", type=int, default=30, help="请求帧率（相机实测只有约 27–30）")
+    ap.add_argument("--codec", choices=tuple(CODECS), default="hfyuv",
+                    help="无损编码器：hfyuv（默认，1080p30 能跟上）/ ffv1（更通用但很慢）")
+    ap.add_argument("--duration", type=float, default=10.0, help="录制秒数")
+    ap.add_argument("--countdown", type=float, default=3.0)
+    ap.add_argument("--out", default=str(ROOT / "data" / "sessions"))
+    ap.add_argument("--calib", default=str(ROOT / "config" / "stereo_calibration"))
+    ap.add_argument("--baseline-mm", type=float, default=None,
+                    help="物理基线（只作核对；不填则会话里不记）")
+    ap.add_argument("--label", default="")
+    ap.add_argument("--notes", default="")
+    ap.add_argument("--preview", action="store_true", help="显示两路预览（会略增负载）")
+    ap.add_argument("--self-check-only", action="store_true",
+                    help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
+    args = ap.parse_args()
+
+    log_path = setup_logging("record")
+    print(f"本次日志：{log_path}")
+    LOG.info("=== 双路录制开始 ===")
+    LOG.info("参数：left=%s right=%s backend=%s %dx%d@%d duration=%.1f",
+             args.left, args.right, args.backend, args.width, args.height,
+             args.fps, args.duration)
+
+    if args.self_check_only:
+        tag, label = CODECS[args.codec]
+        ok, msg = _lossless_selfcheck(args.width, args.height, args.fps, tag)
+        print(f"[自检] {label}：{msg}")
+        LOG.info("%s 自检（仅自检）：%s（%s）", tag, "PASS" if ok else "FAIL", msg)
+        return 0 if ok else 1
+
+    tag, label = CODECS[args.codec]
+    print(f"[编码] {label}")
+    calib_base = Path(args.calib)
+    if not calib_base.with_suffix(".npz").exists():
+        print(f"[错误] 找不到标定：{calib_base.with_suffix('.npz')}")
+        return 1
+
+    cams, code = _open_pair(args)
+    if code != 0:
+        return code
+    left_idx, left_src = cams["left"]
+    right_idx, right_src = cams["right"]
+
+    try:
+        ok, msg = _lossless_selfcheck(args.width, args.height, args.fps, tag)
+        print(f"[自检] {msg}")
+        LOG.info("%s 自检：%s（%s）", tag, "PASS" if ok else "FAIL", msg)
+        if not ok:
+            return 1
+
+        session_dir, session = create_session(
+            args.out, label=args.label, notes=args.notes)
+        if not (_looks_like_role(args.left) and _looks_like_role(args.right)):
+            suffix = (f"backend={args.backend} left_index={left_idx} "
+                      f"right_index={right_idx}（显式编号；编号映射已由使用者确认）")
+            session.notes = f"{session.notes}；{suffix}" if session.notes else suffix
+        print(f"[会话] {session_dir}")
+        LOG.info("会话目录：%s", session_dir)
+
+        try:
+            calib_path, rig = _copy_calibration(session_dir, calib_base)
+        except Exception as exc:                            # noqa: BLE001
+            print(f"[错误] 标定快照失败：{exc}")
+            return 1
+        session.calibration = CalibrationInfo(
+            path=str(calib_path.relative_to(session_dir)).replace("\\", "/"),
+            sha256=sha256_file(calib_path),
+            image_size=[int(rig.image_size[0]), int(rig.image_size[1])],
+            baseline_mm=float(rig.baseline_mm),
+            baseline_measured_mm=args.baseline_mm,
+            created=str(rig.meta.get("created") or ""),
+            verdict=str((rig.quality or {}).get("verdict") or ""),
+        )
+        session.codec = tag
+        session.container = "mkv"
+        session.lossless = True
+
+        left_path = session_dir / "left.mkv"
+        right_path = session_dir / "right.mkv"
+        try:
+            left_writer = _make_writer(left_path, args.width, args.height, args.fps, tag)
+            right_writer = _make_writer(right_path, args.width, args.height, args.fps, tag)
+        except Exception as exc:                            # noqa: BLE001
+            print(f"[错误] {exc}")
+            return 1
+
+        start_evt = threading.Event()
+        stop_evt = threading.Event()
+        preview: dict = {}
+        lock = threading.Lock()
+        left_rec = _SideRecorder("left", left_src, left_writer, start_evt, stop_evt,
+                                 preview, lock)
+        right_rec = _SideRecorder("right", right_src, right_writer, start_evt, stop_evt,
+                                  preview, lock)
+
+        print()
+        print("准备好后看倒计时。录制开始后 **1 秒内闪一次光**（或拍一次手），")
+        print("结束前再闪一次；球保持在两路视野内。")
+        print(f"本次录 {args.duration:.0f} 秒；按 q / Esc 可提前结束。")
+        for i in range(int(max(0, args.countdown)), 0, -1):
+            print(f"  {i}…", end="", flush=True)
+            time.sleep(1.0)
+        print(" 开始！", flush=True)
+
+        left_rec.start()
+        right_rec.start()
+        start_evt.set()
+        t0 = time.perf_counter()
+        try:
+            while time.perf_counter() - t0 < args.duration:
+                if args.preview:
+                    with lock:
+                        lf = preview.get("left")
+                        rf = preview.get("right")
+                    if lf is not None and rf is not None:
+                        thumb_l = cv2.resize(lf, (640, 360), interpolation=cv2.INTER_AREA)
+                        thumb_r = cv2.resize(rf, (640, 360), interpolation=cv2.INTER_AREA)
+                        cv2.imshow("record left | right", np.hstack([thumb_l, thumb_r]))
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q")):
+                        break
+                else:
+                    time.sleep(0.02)
+        finally:
+            stop_evt.set()
+            left_rec.join(timeout=5.0)
+            right_rec.join(timeout=5.0)
+            if left_rec.is_alive() or right_rec.is_alive():
+                print("[警告] 采集线程 5 秒内没退出，强制 release 相机")
+                left_src.release()
+                right_src.release()
+                left_rec.join(timeout=2.0)
+                right_rec.join(timeout=2.0)
+            left_writer.release()
+            right_writer.release()
+            if args.preview:
+                cv2.destroyAllWindows()
+            elapsed = max(1e-6, time.perf_counter() - t0)
+
+        if left_rec.error or right_rec.error:
+            print(f"[错误] 采集线程失败：left={left_rec.error or 'ok'} "
+                  f"right={right_rec.error or 'ok'}")
+            # 不直接 return：文件仍然保留，session 也要写出来，便于查
+        left_fps = left_rec.frame_count / elapsed
+        right_fps = right_rec.frame_count / elapsed
+
+        session.left = _camera_info("left", left_idx, left_src, args, _role_spec(load_registry(), args.left))
+        session.right = _camera_info("right", right_idx, right_src, args, _role_spec(load_registry(), args.right))
+        session.left.frame_count = left_rec.frame_count
+        session.right.frame_count = right_rec.frame_count
+        session.left.fps_measured = left_fps
+        session.right.fps_measured = right_fps
+        _write_times(session_dir / "left_times.csv", left_rec.times)
+        _write_times(session_dir / "right_times.csv", right_rec.times)
+
+        # 同步：用逐帧亮度找闪光/拍手
+        sync_note = ""
+        try:
+            lb = np.asarray(left_rec.brightness, dtype=np.float64)
+            rb = np.asarray(right_rec.brightness, dtype=np.float64)
+            np.save(session_dir / "derived" / "left_brightness.npy", lb)
+            np.save(session_dir / "derived" / "right_brightness.npy", rb)
+            res = find_offset(lb, rb, SyncConfig(max_offset=180, min_overlap=30))
+            if res.usable:
+                session.sync = SyncInfo(method="flash", offset=int(res.offset),
+                                        confidence=float(res.confidence),
+                                        note=str(res.note or ""))
+            else:
+                session.sync = SyncInfo(method="none", offset=0,
+                                        confidence=float(res.confidence),
+                                        note=res.note or "没有检测到可用的闪光/拍手事件")
+            sync_note = str(res)
+            print(f"[同步] {res}")
+        except Exception as exc:                            # noqa: BLE001
+            session.sync = SyncInfo(method="none", note=f"同步计算失败：{exc}")
+            print(f"[警告] 同步计算失败：{exc}")
+
+        session.checks = [
+            f"{msg}",
+            f"帧数：left={left_rec.frame_count} right={right_rec.frame_count}",
+            f"实测 fps：left={left_fps:.2f} right={right_fps:.2f}",
+            "时间戳 sidecar：left_times.csv / right_times.csv",
+        ]
+        if sync_note:
+            session.checks.append(f"同步：{sync_note}")
+        save_session(session, session_dir)
+        print()
+        print(describe(session))
+        print()
+
+        errors, warnings = validate_session(session_dir)
+        if errors:
+            print("[校验] 有错误：")
+            for e in errors:
+                print(f"  ✘ {e}")
+        if warnings:
+            print("[校验] 警告：")
+            for w in warnings:
+                print(f"  ! {w}")
+        if not errors and not warnings:
+            print("[校验] 通过（无错误 / 无警告）")
+        LOG.info("会话完成：%s；errors=%s warnings=%s", session_dir, errors, warnings)
+        return 1 if errors else 0
+    finally:
+        left_src.release()
+        right_src.release()
+        LOG.info("=== 双路录制结束 ===")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

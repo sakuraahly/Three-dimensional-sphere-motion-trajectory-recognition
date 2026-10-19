@@ -80,6 +80,12 @@ def _corr_at(da: np.ndarray, db: np.ndarray, offset: int) -> tuple[float, int]:
     m = len(a)
     if m < 2:
         return 0.0, 0
+    # 左右帧数不等时，某个 offset 下两条切片可能不一样长；按短的重叠段算，
+    # 既避免 "Mean of empty slice"，也避免把长度差当成相关性。
+    m = min(m, len(b))
+    if m < 2:
+        return 0.0, 0
+    a, b = a[:m], b[:m]
     a = a - a.mean()
     b = b - b.mean()
     na, nb = np.linalg.norm(a), np.linalg.norm(b)
