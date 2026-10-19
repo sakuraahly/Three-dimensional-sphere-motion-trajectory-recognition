@@ -16,6 +16,7 @@ from .base import BaseDetector
 from .color import ColorBlobDetector
 from .hough import HoughDetector
 from .motion import MotionDetector
+from .specular import SpecularBallDetector
 
 
 def build_single_detector(name: str, cfg: DetectorConfig) -> BaseDetector | None:
@@ -27,4 +28,6 @@ def build_single_detector(name: str, cfg: DetectorConfig) -> BaseDetector | None
         return HoughDetector(cfg)
     if name == "motion":
         return MotionDetector(cfg)
+    if name == "specular":
+        return SpecularBallDetector(cfg)
     return None

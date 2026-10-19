@@ -114,8 +114,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="离线双目三维轨迹（读会话）")
     ap.add_argument("session", help="data/sessions/<id> 目录或 session.json")
     ap.add_argument("--method", default="color",
-                    choices=("color", "hough", "fusion", "motion"))
+                    choices=("color", "hough", "fusion", "motion", "specular"))
     ap.add_argument("--preset", default="", help="color 预设，如 white_ball；空=默认")
+    ap.add_argument("--seed", default="",
+                    help="specular 左路人工种子 x,y,r（1920 下 r 约 32~40）")
+    ap.add_argument("--seed-right", default="",
+                    help="specular 右路人工种子 x,y,r（不能用左路 seed 代替）")
+    ap.add_argument("--seed-frame", type=int, default=0,
+                    help="specular 在第几帧初始化（默认 0；种子坐标要对应这一帧）")
     ap.add_argument("--detect-width", type=int, default=0,
                     help="检测缩到多宽（0=原图；真实纹理下 hough 建议 960）")
     ap.add_argument("--min-radius", type=float, default=8.0)
@@ -167,6 +173,9 @@ def main() -> int:
 
     cfg = AppConfig()
     cfg.detector.method = args.method
+    if args.method == "specular" and abs(args.max_epipolar - 2.5) < 1e-9:
+        args.max_epipolar = 8.0
+        print("[specular] 极线门限 2.5px 对人工 seed/CSRT 太紧，默认放宽到 8px")
     cfg.detector.min_radius = float(args.min_radius)
     cfg.detector.max_radius = float(args.max_radius)
     cfg.detector.hough_max_radius = float(args.hough_max_radius)
@@ -175,6 +184,35 @@ def main() -> int:
         cfg.detector.color = ColorConfig.preset(args.preset)
     pipe_l = _make_pipeline(cfg, rig, "left")
     pipe_r = _make_pipeline(cfg, rig, "right")
+    if args.method == "specular":
+        def _seed_arg(text: str, what: str):
+            try:
+                parts = [float(v) for v in text.split(",")]
+            except ValueError:
+                parts = []
+            if len(parts) != 3 or parts[2] <= 0:
+                print(f"[错误] {what} 要写成 x,y,r 三个数，例如 1190,300,36；现在是 {text!r}")
+                return None
+            return tuple(parts)
+
+        if not args.seed or not args.seed_right:
+            print("[错误] --method specular 需要人工种子：")
+            print("  --seed 左路x,y,r --seed-right 右路x,y,r")
+            print("  1920x1080 下球半径约 32~40 px；自动初始化不可靠，故意不猜。")
+            return 2
+        if args.detect_width:
+            print("[错误] --method specular 暂不支持 --detect-width："
+                  "种子坐标是原图坐标，缩放会错位。")
+            return 2
+        seed_l = _seed_arg(args.seed, "--seed")
+        seed_r = _seed_arg(args.seed_right, "--seed-right")
+        if seed_l is None or seed_r is None:
+            return 2
+        pipe_l.detector.seed(*seed_l, frame_index=args.seed_frame)
+        pipe_r.detector.seed(*seed_r, frame_index=args.seed_frame)
+        print(f"[specular] 左 seed={seed_l} 右 seed={seed_r} 初始化帧={args.seed_frame}")
+    elif args.seed or args.seed_right:
+        print("[警告] 只有 --method specular 使用 --seed/--seed-right；已忽略。")
     if args.detect_width:
         pipe_l.set_detect_width(args.detect_width)
         pipe_r.set_detect_width(args.detect_width)

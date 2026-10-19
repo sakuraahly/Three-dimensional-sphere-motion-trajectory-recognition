@@ -93,10 +93,11 @@ class BaseDetector:
     def reset(self) -> None                                    # 换视频源时调用
     def _score_candidate(self, radius, circularity=0.0, fill_ratio=0.0, radial=0.0, edge_support=0.0, weights=(0.30, 0.28, 0.27, 0.15)) -> float
 def build_single_detector(name: str, cfg) -> BaseDetector | None;  def build_detector(cfg: DetectorConfig) -> BaseDetector
-    # 前者只认 color/hough/motion（其它返回 None）；后者未知名字抛 ValueError，"sam"/"sam2" 等价 "yolo_sam"
+    # 前者只认 color/hough/motion/specular（其它返回 None）；后者未知名字抛 ValueError，"sam"/"sam2" 等价 "yolo_sam"
 class ColorBlobDetector(BaseDetector):  # "color"；def build_mask(frame) -> np.ndarray；给 contour+mask
 class HoughDetector(BaseDetector):  # "hough"；无 contour / 无 mask
 class MotionDetector(BaseDetector):  # "motion"；last_mode: "bg" | "compensated"
+class SpecularBallDetector(BaseDetector):  # "specular"；必须 seed(x,y,r,frame_index=0)；CSRT 返回 0/1
 class FusionDetector(BaseDetector):  # "fusion"；返回 0 或 1 个，method="fusion:<子名>"
 class YoloDetector / YoloSamDetector  # "yolo" / "yolo_sam"；def refine_circle_in_box(frame, det, cfg) -> Detection | None
 ```
@@ -107,6 +108,7 @@ class YoloDetector / YoloSamDetector  # "yolo" / "yolo_sam"；def refine_circle_
 | color  | `gray`                   | 有 / 有（整幅）    | 只对**前 3 个**候选做亚像素细化                                |
 | hough  | `gray`                   | 无 / 无           | 两道梯度门：`hough_min_support`、`hough_min_sign_consistency`   |
 | motion | `motion`+`camera_moving` | 有 / 有（`fg`）   | 需 `_prev_frame` 与 `motion.matrix` 才走补偿分支               |
+| specular | 不用（内部转灰度）    | 无 / 无           | **必须人工 seed**；CSRT 跑 BGR；丢失返回 `[]`，不 snap 背景    |
 | fusion | 透传                     | 取胜出者           | 子检测器由 `cfg.fusion_members` 决定                            |
 | neural | 不用                     | SAM 有 / YOLO 无   | 需 `ultralytics`；缺依赖时**抛 RuntimeError**                  |
 

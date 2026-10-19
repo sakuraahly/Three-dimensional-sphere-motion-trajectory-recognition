@@ -54,6 +54,26 @@ class ColorConfig:
 
 
 @dataclass
+class SpecularConfig:
+    """镜面球（金属摆锤）检测器参数。
+
+    实测（1920x1080，`data/sessions/20261019-193809`）：
+      - 球半径 35~40 px（不是 640 宽预览里的 8~12 px）；
+      - 球速可达 ~80 px/帧；
+      - 饱和度与背景白袋几乎一样，不能靠颜色分。
+    所以用 **人工 seed + CSRT 跟踪 + 模板/运动门控**；不做全图 Hough 自动锁定。
+    """
+
+    min_radius: float = 24.0
+    max_radius: float = 48.0
+    init_box: int = 64
+    max_jump_px: float = 120.0   # 实测球速可达 ~80 px/帧；50 会把真球误判成跟丢
+    min_ncc: float = 0.0       # 仅记录；实测镜面反射下 0.30 会把真球误杀
+    min_motion: float = 0.0    # 仅记录；顶点附近球几乎静止，硬门控会误杀
+    motion_grace_frames: int = 5
+
+
+@dataclass
 class DetectorConfig:
     """检测器配置。
 
@@ -116,6 +136,9 @@ class DetectorConfig:
 
     # ---- 颜色 ----
     color: ColorConfig = field(default_factory=ColorConfig)
+
+    # ---- 镜面球（金属摆锤）----
+    specular: SpecularConfig = field(default_factory=SpecularConfig)
 
     # ---- 霍夫圆 ----
     hough_dp: float = 1.2

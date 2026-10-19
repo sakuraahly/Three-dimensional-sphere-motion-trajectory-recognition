@@ -23,12 +23,14 @@ from .fusion import FusionDetector
 from .hough import HoughDetector
 from .motion import MotionDetector
 from .neural import YoloDetector, YoloSamDetector, refine_circle_in_box
+from .specular import SpecularBallDetector
 
 __all__ = [
     "BaseDetector",
     "ColorBlobDetector",
     "HoughDetector",
     "MotionDetector",
+    "SpecularBallDetector",
     "FusionDetector",
     "YoloDetector",
     "YoloSamDetector",
@@ -45,7 +47,7 @@ __all__ = [
 def build_detector(cfg: DetectorConfig) -> BaseDetector:
     """根据配置创建检测器。"""
     name = cfg.method.strip().lower()
-    if name in ("color", "hough", "motion"):
+    if name in ("color", "hough", "motion", "specular"):
         det = build_single_detector(name, cfg)
         assert det is not None
         return det
@@ -56,5 +58,6 @@ def build_detector(cfg: DetectorConfig) -> BaseDetector:
     if name in ("yolo_sam", "sam", "sam2"):
         return YoloSamDetector(cfg)
     raise ValueError(
-        f"未知检测方法 {cfg.method!r}，可选：color / hough / motion / fusion / yolo / yolo_sam"
+        f"未知检测方法 {cfg.method!r}，可选：color / hough / motion / specular / "
+        "fusion / yolo / yolo_sam"
     )
