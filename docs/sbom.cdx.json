@@ -1,0 +1,2572 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:50f83e22-6fb8-4942-9d29-4e756c685303",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-10-19T10:48:33+08:00",
+    "tools": [
+      {
+        "vendor": "DeepSeek Harness",
+        "name": "manual SBOM builder",
+        "version": "1.0"
+      }
+    ],
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:generic/three-dimensional-sphere-motion-trajectory-recognition@7b78c88",
+      "name": "Three-dimensional-sphere-motion-trajectory-recognition",
+      "version": "7b78c88",
+      "properties": [
+        {
+          "name": "dsh:python",
+          "value": "3.14.7"
+        },
+        {
+          "name": "dsh:platform",
+          "value": "Windows-11-10.0.26300-SP0"
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/anyio@4.15.1",
+      "name": "anyio",
+      "version": "4.15.1",
+      "purl": "pkg:pypi/anyio@4.15.1",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "High-level concurrency and networking framework on top of asyncio or Trio",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://anyio.readthedocs.io/en/latest/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/certifi@2026.7.22",
+      "name": "certifi",
+      "version": "2026.7.22",
+      "purl": "pkg:pypi/certifi@2026.7.22",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MPL-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Python package for providing Mozilla's CA Bundle.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/certifi/python-certifi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/charset-normalizer@3.5.1",
+      "name": "charset-normalizer",
+      "version": "3.5.1",
+      "purl": "pkg:pypi/charset-normalizer@3.5.1",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "The Real First Universal Charset Detector. Open, modern and actively maintained alternative to Chardet.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/jawah/charset_normalizer/blob/master/CHANGELOG.md"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/click@8.5.0",
+      "name": "click",
+      "version": "8.5.0",
+      "purl": "pkg:pypi/click@8.5.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Composable command line interface toolkit",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://click.palletsprojects.com/page/changes/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/colorama@0.4.6",
+      "name": "colorama",
+      "version": "0.4.6",
+      "purl": "pkg:pypi/colorama@0.4.6",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "Cross-platform colored terminal text.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/tartley/colorama"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/contourpy@1.4.0",
+      "name": "contourpy",
+      "version": "1.4.0",
+      "purl": "pkg:pypi/contourpy@1.4.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Python library for calculating contours of 2D quadrilateral grids",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/contourpy/contourpy"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/cycler@0.12.1",
+      "name": "cycler",
+      "version": "0.12.1",
+      "purl": "pkg:pypi/cycler@0.12.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "Composable style cycles",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://matplotlib.org/cycler/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/filelock@4.0.1",
+      "name": "filelock",
+      "version": "4.0.1",
+      "purl": "pkg:pypi/filelock@4.0.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Unlicense"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "A platform independent file lock.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://py-filelock.readthedocs.io"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/fonttools@4.65.0",
+      "name": "fonttools",
+      "version": "4.65.0",
+      "purl": "pkg:pypi/fonttools@4.65.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Tools to manipulate font files",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "http://github.com/fonttools/fonttools"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/fsspec@2026.9.0",
+      "name": "fsspec",
+      "version": "2026.9.0",
+      "purl": "pkg:pypi/fsspec@2026.9.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "File-system specification",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://filesystem-spec.readthedocs.io/en/latest/changelog.html"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/h11@0.16.0",
+      "name": "h11",
+      "version": "0.16.0",
+      "purl": "pkg:pypi/h11@0.16.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "A pure-Python, bring-your-own-I/O implementation of HTTP/1.1",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/python-hyper/h11"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/hf-xet@1.6.0",
+      "name": "hf-xet",
+      "version": "1.6.0",
+      "purl": "pkg:pypi/hf-xet@1.6.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "Fast transfer of large files with the Hugging Face Hub.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://huggingface.co/docs/hub/xet/index"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/httpcore@1.0.9",
+      "name": "httpcore",
+      "version": "1.0.9",
+      "purl": "pkg:pypi/httpcore@1.0.9",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "A minimal low-level HTTP client.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://www.encode.io/httpcore"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/httpx@0.28.1",
+      "name": "httpx",
+      "version": "0.28.1",
+      "purl": "pkg:pypi/httpx@0.28.1",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "The next generation HTTP client.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/encode/httpx/blob/master/CHANGELOG.md"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/huggingface-hub@1.32.0",
+      "name": "huggingface_hub",
+      "version": "1.32.0",
+      "purl": "pkg:pypi/huggingface-hub@1.32.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Client library to download and publish models, datasets and other repos on the huggingface.co hub",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/huggingface/huggingface_hub"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/idna@3.20",
+      "name": "idna",
+      "version": "3.20",
+      "purl": "pkg:pypi/idna@3.20",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Internationalized Domain Names in Applications (IDNA)",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/kjd/idna/blob/master/HISTORY.md"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/jinja2@3.1.6",
+      "name": "Jinja2",
+      "version": "3.1.6",
+      "purl": "pkg:pypi/jinja2@3.1.6",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "A very fast and expressive template engine.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://jinja.palletsprojects.com/changes/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/kiwisolver@1.5.1",
+      "name": "kiwisolver",
+      "version": "1.5.1",
+      "purl": "pkg:pypi/kiwisolver@1.5.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "A fast implementation of the Cassowary constraint solver",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/nucleic/kiwi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/lap@0.5.13",
+      "name": "lap",
+      "version": "0.5.13",
+      "purl": "pkg:pypi/lap@0.5.13",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-2-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Linear Assignment Problem solver (LAPJV/LAPMOD).",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/gatagat/lap"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/lxml@6.1.3",
+      "name": "lxml",
+      "version": "6.1.3",
+      "purl": "pkg:pypi/lxml@6.1.3",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "docs/开发指南.md"
+        }
+      ],
+      "description": "Powerful and Pythonic XML processing library combining libxml2/libxslt with the ElementTree API.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://lxml.de/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/markupsafe@3.0.3",
+      "name": "MarkupSafe",
+      "version": "3.0.3",
+      "purl": "pkg:pypi/markupsafe@3.0.3",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Safely add untrusted strings to HTML/XML markup.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://palletsprojects.com/donate"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/matplotlib@3.11.2",
+      "name": "matplotlib",
+      "version": "3.11.2",
+      "purl": "pkg:pypi/matplotlib@3.11.2",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "Matplotlib License (PSF-based)"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-required"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements.txt"
+        }
+      ],
+      "description": "Python plotting package",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://matplotlib.org"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/mpmath@1.3.0",
+      "name": "mpmath",
+      "version": "1.3.0",
+      "purl": "pkg:pypi/mpmath@1.3.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Python library for arbitrary-precision floating-point arithmetic",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "http://mpmath.org/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/munkres@1.1.4",
+      "name": "munkres",
+      "version": "1.1.4",
+      "purl": "pkg:pypi/munkres@1.1.4",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "Munkres (Hungarian) algorithm for the Assignment Problem",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://software.clapper.org/munkres/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/networkx@3.6.1",
+      "name": "networkx",
+      "version": "3.6.1",
+      "purl": "pkg:pypi/networkx@3.6.1",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Python package for creating and manipulating graphs and networks",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://networkx.org/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/numpy@2.5.3",
+      "name": "numpy",
+      "version": "2.5.3",
+      "purl": "pkg:pypi/numpy@2.5.3",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-required"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements.txt"
+        }
+      ],
+      "description": "Fundamental package for array computing in Python",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://numpy.org"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/nvidia-ml-py@13.610.43",
+      "name": "nvidia-ml-py",
+      "version": "13.610.43",
+      "purl": "pkg:pypi/nvidia-ml-py@13.610.43",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Python Bindings for the NVIDIA Management Library",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://forums.developer.nvidia.com"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/opencv-contrib-python@5.0.0.93",
+      "name": "opencv-contrib-python",
+      "version": "5.0.0.93",
+      "purl": "pkg:pypi/opencv-contrib-python@5.0.0.93",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-required"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements.txt"
+        }
+      ],
+      "description": "Wrapper package for OpenCV python bindings.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/opencv/opencv-python"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/packaging@26.3",
+      "name": "packaging",
+      "version": "26.3",
+      "purl": "pkg:pypi/packaging@26.3",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSD-2-Clause"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Core utilities for Python packages",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://packaging.pypa.io/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pandas@3.0.6",
+      "name": "pandas",
+      "version": "3.0.6",
+      "purl": "pkg:pypi/pandas@3.0.6",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Powerful data structures for data analysis, time series, and statistics",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pandas.pydata.org"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pillow@12.3.0",
+      "name": "pillow",
+      "version": "12.3.0",
+      "purl": "pkg:pypi/pillow@12.3.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "MIT-CMU"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "docs/开发指南.md"
+        }
+      ],
+      "description": "Python Imaging Library (fork)",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pillow.readthedocs.io/en/stable/releasenotes/index.html"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pip@26.2.1",
+      "name": "pip",
+      "version": "26.2.1",
+      "purl": "pkg:pypi/pip@26.2.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "The PyPA recommended tool for installing Python packages.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pip.pypa.io/en/stable/news/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/polars@1.44.2",
+      "name": "polars",
+      "version": "1.44.2",
+      "purl": "pkg:pypi/polars@1.44.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Blazingly fast DataFrame library",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://www.pola.rs/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/polars-runtime-32@1.44.2",
+      "name": "polars-runtime-32",
+      "version": "1.44.2",
+      "purl": "pkg:pypi/polars-runtime-32@1.44.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Blazingly fast DataFrame library",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://www.pola.rs/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/psutil@7.2.2",
+      "name": "psutil",
+      "version": "7.2.2",
+      "purl": "pkg:pypi/psutil@7.2.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Cross-platform lib for process and system monitoring.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/giampaolo/psutil"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/py-cpuinfo@9.0.0",
+      "name": "py-cpuinfo",
+      "version": "9.0.0",
+      "purl": "pkg:pypi/py-cpuinfo@9.0.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Get CPU info with pure Python",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/workhorsy/py-cpuinfo"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyparsing@3.3.3",
+      "name": "pyparsing",
+      "version": "3.3.3",
+      "purl": "pkg:pypi/pyparsing@3.3.3",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "pyparsing - Classes and methods to define and execute parsing grammars",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pyparsing-docs.readthedocs.io/en/latest/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyside6@6.11.2",
+      "name": "PySide6",
+      "version": "6.11.2",
+      "purl": "pkg:pypi/pyside6@6.11.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "LGPL-3.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/python-dateutil@2.9.0.post0",
+      "name": "python-dateutil",
+      "version": "2.9.0.post0",
+      "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSD-3-Clause"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "description": "Extensions to the standard Python datetime module",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/dateutil/dateutil"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/python-pptx@1.0.2",
+      "name": "python-pptx",
+      "version": "1.0.2",
+      "purl": "pkg:pypi/python-pptx@1.0.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "docs/开发指南.md"
+        }
+      ],
+      "description": "Create, read, and update PowerPoint 2007+ (.pptx) files.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/scanny/python-pptx/blob/master/HISTORY.rst"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/pyyaml@6.0.3",
+      "name": "PyYAML",
+      "version": "6.0.3",
+      "purl": "pkg:pypi/pyyaml@6.0.3",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements.txt"
+        }
+      ],
+      "description": "YAML parser and emitter for Python",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pyyaml.org/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/requests@2.34.2",
+      "name": "requests",
+      "version": "2.34.2",
+      "purl": "pkg:pypi/requests@2.34.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Python HTTP for Humans.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://requests.readthedocs.io"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/safetensors@0.8.0",
+      "name": "safetensors",
+      "version": "0.8.0",
+      "purl": "pkg:pypi/safetensors@0.8.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/huggingface/safetensors"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/scipy@1.18.1",
+      "name": "scipy",
+      "version": "1.18.1",
+      "purl": "pkg:pypi/scipy@1.18.1",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "classifier"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "docs/计划书.md"
+        }
+      ],
+      "description": "Fundamental algorithms for scientific computing in Python",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://scipy.org/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/setuptools@81.0.0",
+      "name": "setuptools",
+      "version": "81.0.0",
+      "purl": "pkg:pypi/setuptools@81.0.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Easily download, build, install, upgrade, and uninstall Python packages",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/pypa/setuptools"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/shiboken6@6.11.2",
+      "name": "shiboken6",
+      "version": "6.11.2",
+      "purl": "pkg:pypi/shiboken6@6.11.2",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "LGPL-3.0-only"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/six@1.17.0",
+      "name": "six",
+      "version": "1.17.0",
+      "purl": "pkg:pypi/six@1.17.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Python 2 and 3 compatibility utilities",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/benjaminp/six"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/sympy@1.14.0",
+      "name": "sympy",
+      "version": "1.14.0",
+      "purl": "pkg:pypi/sympy@1.14.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Computer algebra system (CAS) in Python",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://sympy.org"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/timm@1.0.29",
+      "name": "timm",
+      "version": "1.0.29",
+      "purl": "pkg:pypi/timm@1.0.29",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "PyTorch Image Models",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/huggingface/pytorch-image-models"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/torch@2.11.0%2Bcu128",
+      "name": "torch",
+      "version": "2.11.0+cu128",
+      "purl": "pkg:pypi/torch@2.11.0%2Bcu128",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements-ai.txt"
+        }
+      ],
+      "description": "Tensors and Dynamic neural networks in Python with strong GPU acceleration",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pytorch.org"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/torchvision@0.26.0%2Bcu128",
+      "name": "torchvision",
+      "version": "0.26.0+cu128",
+      "purl": "pkg:pypi/torchvision@0.26.0%2Bcu128",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements-ai.txt"
+        }
+      ],
+      "description": "image and video datasets and models for torch deep learning",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/pytorch/vision"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/tornado@6.5.10",
+      "name": "tornado",
+      "version": "6.5.10",
+      "purl": "pkg:pypi/tornado@6.5.10",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "environment-only"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Tornado is a Python web framework and asynchronous networking library, originally developed at FriendFeed.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "http://www.tornadoweb.org/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/tqdm@4.70.1",
+      "name": "tqdm",
+      "version": "4.70.1",
+      "purl": "pkg:pypi/tqdm@4.70.1",
+      "scope": "optional",
+      "licenses": [
+        {
+          "expression": "MPL-2.0 AND MIT"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Fast, Extensible Progress Meter",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://tqdm.github.io"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/typing-extensions@4.16.0",
+      "name": "typing_extensions",
+      "version": "4.16.0",
+      "purl": "pkg:pypi/typing-extensions@4.16.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "PSF-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "Backported and Experimental Type Hints for Python 3.9+",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/python/typing_extensions/issues"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/tzdata@2026.4",
+      "name": "tzdata",
+      "version": "2026.4",
+      "purl": "pkg:pypi/tzdata@2026.4",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Provider of IANA time zone data",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/python/tzdata"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/ultralytics@8.4.159",
+      "name": "ultralytics",
+      "version": "8.4.159",
+      "purl": "pkg:pypi/ultralytics@8.4.159",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "AGPL-3.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "direct-optional"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        },
+        {
+          "name": "dsh:declared_by",
+          "value": "requirements-ai.txt"
+        }
+      ],
+      "description": "Ultralytics YOLO 🚀 for SOTA object detection, instance segmentation, semantic segmentation, depth estimation, classification, pose estimation, oriented object detection, and multi-object tracking.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://ultralytics.com"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/ultralytics-thop@2.1.6",
+      "name": "ultralytics-thop",
+      "version": "2.1.6",
+      "purl": "pkg:pypi/ultralytics-thop@2.1.6",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "AGPL-3.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "Ultralytics THOP package for fast computation of PyTorch model FLOPs and parameters.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://ultralytics.com"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/urllib3@2.8.0",
+      "name": "urllib3",
+      "version": "2.8.0",
+      "purl": "pkg:pypi/urllib3@2.8.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "curated"
+        }
+      ],
+      "description": "HTTP library with thread-safe connection pooling, file post, and more.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/urllib3/urllib3/blob/main/CHANGES.rst"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:pypi/xlsxwriter@3.2.9",
+      "name": "xlsxwriter",
+      "version": "3.2.9",
+      "purl": "pkg:pypi/xlsxwriter@3.2.9",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-2-Clause"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "transitive"
+        },
+        {
+          "name": "dsh:license_source",
+          "value": "metadata"
+        }
+      ],
+      "description": "A Python module for creating Excel XLSX files.",
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/jmcnamara/XlsxWriter"
+        }
+      ]
+    },
+    {
+      "type": "platform",
+      "bom-ref": "pkg:generic/cpython@3.14.7",
+      "name": "CPython",
+      "version": "3.14.7",
+      "purl": "pkg:generic/cpython@3.14.7",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "PSF-2.0"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "解释器；绝对路径 `%USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe`"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/ffmpeg%EF%BC%88opencv-wheel-%E5%86%85%E7%BD%AE%EF%BC%89@prebuilt%EF%BC%88%E7%89%88%E6%9C%AC%E6%9C%AA%E6%9A%B4%E9%9C%B2%EF%BC%89",
+      "name": "FFmpeg（OpenCV wheel 内置）",
+      "version": "prebuilt（版本未暴露）",
+      "purl": "pkg:generic/ffmpeg%EF%BC%88opencv-wheel-%E5%86%85%E7%BD%AE%EF%BC%89@prebuilt%EF%BC%88%E7%89%88%E6%9C%AC%E6%9C%AA%E6%9A%B4%E9%9C%B2%EF%BC%89",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "LGPL-2.1-or-later OR GPL-2.0-or-later"
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "OpenCV 的 FFMPEG 后端；许可证取决于 wheel 构建，分发前复核"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/nvidia-cuda-runtime@12.8",
+      "name": "NVIDIA CUDA Runtime",
+      "version": "12.8",
+      "purl": "pkg:generic/nvidia-cuda-runtime@12.8",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "name": "NVIDIA proprietary (EULA)"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "torch 2.11.0+cu128；AI 后端才需要"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/nvidia-cudnn@9.19.0",
+      "name": "NVIDIA cuDNN",
+      "version": "9.19.0",
+      "purl": "pkg:generic/nvidia-cudnn@9.19.0",
+      "scope": "optional",
+      "licenses": [
+        {
+          "license": {
+            "name": "NVIDIA proprietary (EULA)"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "torch.backends.cudnn 报 91900"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/nvidia-display-driver@577.05",
+      "name": "NVIDIA Display Driver",
+      "version": "577.05",
+      "purl": "pkg:generic/nvidia-display-driver@577.05",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "NVIDIA proprietary (EULA)"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "RTX 5060 Laptop 8 GB；CUDA 12.8 的最低驱动"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/intel-mkl@2026.1.0",
+      "name": "Intel MKL",
+      "version": "2026.1.0",
+      "purl": "pkg:generic/intel-mkl@2026.1.0",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "Intel Simplified Software License"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "conda 环境里的 BLAS/LAPACK；numpy 使用"
+        }
+      ]
+    },
+    {
+      "type": "platform",
+      "bom-ref": "pkg:generic/windows@11%2010.0.26300",
+      "name": "Windows",
+      "version": "11 10.0.26300",
+      "purl": "pkg:generic/windows@11%2010.0.26300",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "Proprietary"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "name": "dsh:relationship",
+          "value": "native"
+        },
+        {
+          "name": "dsh:note",
+          "value": "操作系统"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:generic/three-dimensional-sphere-motion-trajectory-recognition@7b78c88",
+      "dependsOn": [
+        "pkg:pypi/lxml@6.1.3",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/opencv-contrib-python@5.0.0.93",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/python-pptx@1.0.2",
+        "pkg:pypi/pyyaml@6.0.3",
+        "pkg:pypi/scipy@1.18.1",
+        "pkg:pypi/torch@2.11.0%2Bcu128",
+        "pkg:pypi/torchvision@0.26.0%2Bcu128",
+        "pkg:pypi/ultralytics@8.4.159"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/anyio@4.15.1",
+      "dependsOn": [
+        "pkg:pypi/idna@3.20",
+        "pkg:pypi/typing-extensions@4.16.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/certifi@2026.7.22",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/charset-normalizer@3.5.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/click@8.5.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/colorama@0.4.6",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/contourpy@1.4.0",
+      "dependsOn": [
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/pillow@12.3.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/cycler@0.12.1",
+      "dependsOn": [
+        "pkg:pypi/matplotlib@3.11.2"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/filelock@4.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/fonttools@4.65.0",
+      "dependsOn": [
+        "pkg:pypi/lxml@6.1.3",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/munkres@1.1.4",
+        "pkg:pypi/scipy@1.18.1",
+        "pkg:pypi/sympy@1.14.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/fsspec@2026.9.0",
+      "dependsOn": [
+        "pkg:pypi/jinja2@3.1.6",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/pandas@3.0.6",
+        "pkg:pypi/requests@2.34.2",
+        "pkg:pypi/tqdm@4.70.1",
+        "pkg:pypi/urllib3@2.8.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/h11@0.16.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/hf-xet@1.6.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/httpcore@1.0.9",
+      "dependsOn": [
+        "pkg:pypi/anyio@4.15.1",
+        "pkg:pypi/certifi@2026.7.22",
+        "pkg:pypi/h11@0.16.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/httpx@0.28.1",
+      "dependsOn": [
+        "pkg:pypi/anyio@4.15.1",
+        "pkg:pypi/certifi@2026.7.22",
+        "pkg:pypi/click@8.5.0",
+        "pkg:pypi/httpcore@1.0.9",
+        "pkg:pypi/idna@3.20"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/huggingface-hub@1.32.0",
+      "dependsOn": [
+        "pkg:pypi/click@8.5.0",
+        "pkg:pypi/filelock@4.0.1",
+        "pkg:pypi/fsspec@2026.9.0",
+        "pkg:pypi/hf-xet@1.6.0",
+        "pkg:pypi/httpx@0.28.1",
+        "pkg:pypi/jinja2@3.1.6",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/packaging@26.3",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/pyyaml@6.0.3",
+        "pkg:pypi/requests@2.34.2",
+        "pkg:pypi/safetensors@0.8.0",
+        "pkg:pypi/torch@2.11.0%2Bcu128",
+        "pkg:pypi/tqdm@4.70.1",
+        "pkg:pypi/typing-extensions@4.16.0",
+        "pkg:pypi/urllib3@2.8.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/idna@3.20",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/jinja2@3.1.6",
+      "dependsOn": [
+        "pkg:pypi/markupsafe@3.0.3"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/kiwisolver@1.5.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/lap@0.5.13",
+      "dependsOn": [
+        "pkg:pypi/numpy@2.5.3"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/lxml@6.1.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/markupsafe@3.0.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/matplotlib@3.11.2",
+      "dependsOn": [
+        "pkg:pypi/contourpy@1.4.0",
+        "pkg:pypi/cycler@0.12.1",
+        "pkg:pypi/fonttools@4.65.0",
+        "pkg:pypi/kiwisolver@1.5.1",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/packaging@26.3",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/pyparsing@3.3.3",
+        "pkg:pypi/python-dateutil@2.9.0.post0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/mpmath@1.3.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/munkres@1.1.4",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/networkx@3.6.1",
+      "dependsOn": [
+        "pkg:pypi/lxml@6.1.3",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/pandas@3.0.6",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/scipy@1.18.1",
+        "pkg:pypi/sympy@1.14.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/numpy@2.5.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/nvidia-ml-py@13.610.43",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/opencv-contrib-python@5.0.0.93",
+      "dependsOn": [
+        "pkg:pypi/numpy@2.5.3"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/packaging@26.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/pandas@3.0.6",
+      "dependsOn": [
+        "pkg:pypi/fsspec@2026.9.0",
+        "pkg:pypi/jinja2@3.1.6",
+        "pkg:pypi/lxml@6.1.3",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/python-dateutil@2.9.0.post0",
+        "pkg:pypi/scipy@1.18.1",
+        "pkg:pypi/tzdata@2026.4",
+        "pkg:pypi/xlsxwriter@3.2.9"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/pillow@12.3.0",
+      "dependsOn": [
+        "pkg:pypi/packaging@26.3",
+        "pkg:pypi/setuptools@81.0.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/pip@26.2.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/polars@1.44.2",
+      "dependsOn": [
+        "pkg:pypi/fsspec@2026.9.0",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/pandas@3.0.6",
+        "pkg:pypi/polars-runtime-32@1.44.2",
+        "pkg:pypi/tzdata@2026.4",
+        "pkg:pypi/xlsxwriter@3.2.9"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/polars-runtime-32@1.44.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/psutil@7.2.2",
+      "dependsOn": [
+        "pkg:pypi/colorama@0.4.6",
+        "pkg:pypi/packaging@26.3",
+        "pkg:pypi/requests@2.34.2",
+        "pkg:pypi/setuptools@81.0.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/py-cpuinfo@9.0.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/pyparsing@3.3.3",
+      "dependsOn": [
+        "pkg:pypi/jinja2@3.1.6"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/pyside6@6.11.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/python-dateutil@2.9.0.post0",
+      "dependsOn": [
+        "pkg:pypi/six@1.17.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/python-pptx@1.0.2",
+      "dependsOn": [
+        "pkg:pypi/lxml@6.1.3",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/typing-extensions@4.16.0",
+        "pkg:pypi/xlsxwriter@3.2.9"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/pyyaml@6.0.3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/requests@2.34.2",
+      "dependsOn": [
+        "pkg:pypi/certifi@2026.7.22",
+        "pkg:pypi/charset-normalizer@3.5.1",
+        "pkg:pypi/idna@3.20",
+        "pkg:pypi/urllib3@2.8.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/safetensors@0.8.0",
+      "dependsOn": [
+        "pkg:pypi/fsspec@2026.9.0",
+        "pkg:pypi/huggingface-hub@1.32.0",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/torch@2.11.0%2Bcu128"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/scipy@1.18.1",
+      "dependsOn": [
+        "pkg:pypi/click@8.5.0",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/mpmath@1.3.0",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/typing-extensions@4.16.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/setuptools@81.0.0",
+      "dependsOn": [
+        "pkg:pypi/filelock@4.0.1",
+        "pkg:pypi/packaging@26.3",
+        "pkg:pypi/pip@26.2.1"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/shiboken6@6.11.2",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/six@1.17.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/sympy@1.14.0",
+      "dependsOn": [
+        "pkg:pypi/mpmath@1.3.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/timm@1.0.29",
+      "dependsOn": [
+        "pkg:pypi/huggingface-hub@1.32.0",
+        "pkg:pypi/pyyaml@6.0.3",
+        "pkg:pypi/safetensors@0.8.0",
+        "pkg:pypi/torch@2.11.0%2Bcu128",
+        "pkg:pypi/torchvision@0.26.0%2Bcu128"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/torch@2.11.0%2Bcu128",
+      "dependsOn": [
+        "pkg:pypi/filelock@4.0.1",
+        "pkg:pypi/fsspec@2026.9.0",
+        "pkg:pypi/jinja2@3.1.6",
+        "pkg:pypi/networkx@3.6.1",
+        "pkg:pypi/pyyaml@6.0.3",
+        "pkg:pypi/setuptools@81.0.0",
+        "pkg:pypi/sympy@1.14.0",
+        "pkg:pypi/typing-extensions@4.16.0"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/torchvision@0.26.0%2Bcu128",
+      "dependsOn": [
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/scipy@1.18.1",
+        "pkg:pypi/torch@2.11.0%2Bcu128"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/tornado@6.5.10",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/tqdm@4.70.1",
+      "dependsOn": [
+        "pkg:pypi/colorama@0.4.6",
+        "pkg:pypi/requests@2.34.2"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/typing-extensions@4.16.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/tzdata@2026.4",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/ultralytics@8.4.159",
+      "dependsOn": [
+        "pkg:pypi/filelock@4.0.1",
+        "pkg:pypi/lap@0.5.13",
+        "pkg:pypi/matplotlib@3.11.2",
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/nvidia-ml-py@13.610.43",
+        "pkg:pypi/packaging@26.3",
+        "pkg:pypi/pillow@12.3.0",
+        "pkg:pypi/polars@1.44.2",
+        "pkg:pypi/psutil@7.2.2",
+        "pkg:pypi/pyyaml@6.0.3",
+        "pkg:pypi/requests@2.34.2",
+        "pkg:pypi/setuptools@81.0.0",
+        "pkg:pypi/torch@2.11.0%2Bcu128",
+        "pkg:pypi/torchvision@0.26.0%2Bcu128",
+        "pkg:pypi/ultralytics-thop@2.1.6"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/ultralytics-thop@2.1.6",
+      "dependsOn": [
+        "pkg:pypi/numpy@2.5.3",
+        "pkg:pypi/torch@2.11.0%2Bcu128"
+      ]
+    },
+    {
+      "ref": "pkg:pypi/urllib3@2.8.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:pypi/xlsxwriter@3.2.9",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/cpython@3.14.7",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/ffmpeg%EF%BC%88opencv-wheel-%E5%86%85%E7%BD%AE%EF%BC%89@prebuilt%EF%BC%88%E7%89%88%E6%9C%AC%E6%9C%AA%E6%9A%B4%E9%9C%B2%EF%BC%89",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/nvidia-cuda-runtime@12.8",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/nvidia-cudnn@9.19.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/nvidia-display-driver@577.05",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/intel-mkl@2026.1.0",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:generic/windows@11%2010.0.26300",
+      "dependsOn": []
+    }
+  ]
+}
