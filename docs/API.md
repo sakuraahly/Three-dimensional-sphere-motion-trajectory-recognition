@@ -404,12 +404,25 @@ def load_stereo_rig(path) -> StereoRig;  def save_stereo_rig(rig, path)
 > ⚠️ **`Q` 存了但全项目没有一处用它做重建**（只走 `P1/P2` + `triangulatePoints`）。
 > 不是 bug，但"存了两套真值、只校核一套"是维护负担：要么在文档里认下
 > "`Q` 仅供外部工具/导出"，要么干脆不出存。**改之前先搜一遍消费者**（2026-10-18 审查 B6）。
-**坐标系与单位（最要紧）**：三维点在**校正后的左相机坐标系**，原点在左相机光心、Z 向前、**单位米**（因为 `BoardSpec.object_points()` 是米）。`T` 是"右光心在左相机系里的位置"（`X_right = R @ X_left + T`）。
+> 2026-10-19：`calib/export.py` 已把 `Q` 原样导出给外部工具，属于"仅供导出"的消费者。
+**坐标系与单位（最要紧）**：三维点在**校正后的左相机坐标系**，原点在左相机光心、Z 向前、**单位米**（因为 `BoardSpec.object_points()` 是米）。`T` 是**左光心在右相机系里的位置**（`X_right = R @ X_left + T`；等价地 `T = -R·C`，`C` 是右光心在左相机系的位置），单位米。
 
 **坑**：① `rectify_maps` 的映射表**依赖 `image_size`**：换分辨率要重新 `rectify_maps()` 或重标定；`rectify_image(img, side)` 的 `side` 只能是 `"left"`/`"right"`，给 `"both"` 会去解包元组直接报错。
-② `disparity_sign()` **反直觉**：右相机在右 → **`-1`**（`stereoRectify` 的 `P2` 第四列实测 `= -f*T[0]`，同一物点在右图更靠右，`x1-x2` 为负）；不用自己记 —— `StereoReconstructor` 会自动取。
+② `disparity_sign()`：右相机在右 → **`+1`**（`T[0] < 0`，同一物点在右图更靠左，`x1-x2` 为正）；装反 → `-1`。不用自己记 —— `StereoReconstructor` 会自动取。
 ③ **左右装反时标定指标一样漂亮**：`baseline_side()=="left"` 时 `describe()` 会打印警告；三角测量**仍然正确**（P1/P2 自洽），但任何"假设视差为正"的匹配会 0% 配对，报错只有"配不上"。
 ④ `save()` 同时写 `.npz`（矩阵）和 `.json`（质量报告+元信息）；`load()` 只要求 `.npz` 存在，`.json` 缺失时 `quality/meta` 为空字典（不抛）。
+### 12.5 `calib/export.py`
+```python
+def build_camera(rig, side) -> dict      # side="left"/"right"；K 3x3；D 拉平成 5
+def build_rig(rig) -> dict               # R/T/E/F/R1/R2/P1/P2/Q + 基线 + 质量 + 元信息
+def build_export(rig) -> dict            # {"left": ..., "right": ..., "rig": ...}
+def write_export(rig, out_dir, formats=("json", "yaml", "toml")) -> list[Path]
+def toml_dumps(data: dict) -> str        # 最小 TOML 序列化器（stdlib 只有只读 tomllib）
+```
+**单位 / 约定**：`T` 拉平成 3 个分量、单位**米**；`D` 拉平成 5 个（k1,k2,p1,p2,k3）；三维点仍是校正后左相机系。
+**产物**：`left_camera.<ext>` / `right_camera.<ext>` / `stereo_rig.<ext>` + `summary.txt`。
+**格式**：JSON（stdlib）、YAML（PyYAML，可选）、TOML（自带 writer）。
+请求 YAML 但缺 PyYAML 时**一个文件都不写**（避免留下半套）；未知格式抛 `ValueError`。
 ## 13. `stereo/` —— 双目逐帧
 ### 13.1 `stereo/sync.py`
 ```python
