@@ -131,6 +131,8 @@ KNOWN_MENTIONS: dict[str, str] = {
         "P0 计划中的离线三维图，生成在会话 derived/ 下",
     "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:world_frame.json":
         "P4 计划中的世界系变换文件，尚未实现",
+    "docs/数据标准.md:world_frame.json":
+        "世界系变换文件，尚未实现（数据标准里明确标注）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
         "同上（`AGENTS.md:STC` 之外的简写形式）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":

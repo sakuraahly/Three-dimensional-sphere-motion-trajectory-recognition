@@ -48,6 +48,11 @@ from sphere_tracker.geometry import CameraModel              # noqa: E402
 from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
 from stereo import MatchConfig, PairSource, StereoReconstructor, savgol_trajectory  # noqa: E402
+from stereo.visualization import (  # noqa: E402
+    export_session_visualization,
+    load_seeds,
+    write_seeds,
+)
 from stereo.sessions import load_session, validate_session   # noqa: E402
 
 
@@ -120,6 +125,8 @@ def main() -> int:
                     help="specular 左路人工种子 x,y,r（1920 下 r 约 32~40）")
     ap.add_argument("--seed-right", default="",
                     help="specular 右路人工种子 x,y,r（不能用左路 seed 代替）")
+    ap.add_argument("--seed-json", default="",
+                    help="specular 的 seeds.json（默认自动用 <session>/derived/seeds.json）")
     ap.add_argument("--seed-frame", type=int, default=0,
                     help="specular 在第几帧初始化（默认 0；种子坐标要对应这一帧）")
     ap.add_argument("--detect-width", type=int, default=0,
@@ -195,22 +202,49 @@ def main() -> int:
                 return None
             return tuple(parts)
 
-        if not args.seed or not args.seed_right:
-            print("[错误] --method specular 需要人工种子：")
-            print("  --seed 左路x,y,r --seed-right 右路x,y,r")
-            print("  1920x1080 下球半径约 32~40 px；自动初始化不可靠，故意不猜。")
-            return 2
         if args.detect_width:
             print("[错误] --method specular 暂不支持 --detect-width："
                   "种子坐标是原图坐标，缩放会错位。")
             return 2
-        seed_l = _seed_arg(args.seed, "--seed")
-        seed_r = _seed_arg(args.seed_right, "--seed-right")
-        if seed_l is None or seed_r is None:
+        seed_path = Path(args.seed_json) if args.seed_json else (session_dir / "derived" / "seeds.json")
+        seed_json = None
+        if seed_path.exists():
+            seed_json = load_seeds(seed_path)
+        elif args.seed_json:
+            print(f"[错误] --seed-json 不存在：{seed_path}")
             return 2
-        pipe_l.detector.seed(*seed_l, frame_index=args.seed_frame)
-        pipe_r.detector.seed(*seed_r, frame_index=args.seed_frame)
-        print(f"[specular] 左 seed={seed_l} 右 seed={seed_r} 初始化帧={args.seed_frame}")
+        if args.seed or args.seed_right:
+            if not args.seed or not args.seed_right:
+                print("[错误] --seed 和 --seed-right 必须同时给。")
+                return 2
+            seed_l = _seed_arg(args.seed, "--seed")
+            seed_r = _seed_arg(args.seed_right, "--seed-right")
+            if seed_l is None or seed_r is None:
+                return 2
+            seed_frame = int(args.seed_frame)
+            try:
+                saved = write_seeds(session_dir, seed_l, seed_r, seed_frame=seed_frame,
+                                    image_size=tuple(src.image_size), source="cli",
+                                    note="命令行 --seed/--seed-right")
+                print(f"[specular] 已写标准 seed：{saved}")
+            except Exception as exc:                        # noqa: BLE001
+                print(f"[警告] seed 写入失败（继续跑）：{exc}")
+        elif seed_json is not None:
+            seed_l = (float(seed_json["left"]["x"]), float(seed_json["left"]["y"]),
+                      float(seed_json["left"]["radius"]))
+            seed_r = (float(seed_json["right"]["x"]), float(seed_json["right"]["y"]),
+                      float(seed_json["right"]["radius"]))
+            seed_frame = int(seed_json.get("seed_frame", args.seed_frame))
+            print(f"[specular] 读标准 seed：{seed_path}")
+        else:
+            print("[错误] --method specular 需要球心种子：")
+            print("  GUI：第 3 步「点选球（双目 seed）」；")
+            print("  或 CLI：--seed 左x,左y,左r --seed-right 右x,右y,右r")
+            print("  也可用 --seed-json <seeds.json>。自动初始化不可靠，故意不猜。")
+            return 2
+        pipe_l.detector.seed(*seed_l, frame_index=seed_frame)
+        pipe_r.detector.seed(*seed_r, frame_index=seed_frame)
+        print(f"[specular] 左 seed={seed_l} 右 seed={seed_r} 初始化帧={seed_frame}")
     elif args.seed or args.seed_right:
         print("[警告] 只有 --method specular 使用 --seed/--seed-right；已忽略。")
     if args.detect_width:
@@ -326,6 +360,13 @@ def main() -> int:
     print(f"CSV：{csv_path}")
     if writer is not None:
         print(f"标注视频：{video_path}")
+    if not partial:
+        try:
+            paths = export_session_visualization(session_dir, csv_name=csv_path.name)
+            print(f"标准轨迹 JSON：{paths['trajectory']}")
+            print(f"可视化 JSON：{paths['visualization']}")
+        except Exception as exc:                            # noqa: BLE001
+            print(f"[警告] 标准 JSON 导出失败：{exc}")
     return 0 if rec.n_matched else 2
 
 

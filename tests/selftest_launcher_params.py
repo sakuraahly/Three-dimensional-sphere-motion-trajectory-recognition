@@ -365,10 +365,28 @@ def main() -> int:
         ("调用 apps/run_stereo_video.py", "run_stereo_video.py" in off_s),
         ("带会话目录", "data\\sessions\\demo" in off_s or "data/sessions/demo" in off_s),
         ("带 --method", "--method" in off_s),
+        ("GUI 有「点选球」入口", hasattr(app, "_pick_stereo_seed")
+         and "点选球" in (ROOT / "启动程序.py").read_text(encoding="utf-8")),
+        ("GUI 方法列表包含 specular", "specular" in mod.METHODS),
     ]
     for label, good in checks_off:
         print(f"  [{'通过' if good else '不达标'}] {label}")
         results.append((label, good))
+
+    # specular + 已有 seeds.json -> 离线参数必须带 --seed-json
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="dsh_gui_seed_") as tmp:
+        sd = Path(tmp)
+        (sd / "derived").mkdir()
+        (sd / "session.json").write_text("{}", encoding="utf-8")
+        (sd / "derived" / "seeds.json").write_text("{}", encoding="utf-8")
+        old = app.method.get()
+        app.method.set("specular")
+        args_seed = app._offline_stereo_args(str(sd))
+        app.method.set(old)
+        good = "--seed-json" in args_seed
+        print(f"  [{'通过' if good else '不达标'}] specular 且已有 seeds.json 时传 --seed-json")
+        results.append(("specular 且已有 seeds.json 时传 --seed-json", good))
 
     # ---- 9. 可滚动布局（"新加的东西把原来的挤掉"是真实回归）----
     #

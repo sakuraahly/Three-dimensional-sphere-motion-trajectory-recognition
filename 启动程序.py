@@ -54,7 +54,7 @@ BG = "#eef2f8"
 # fusion 在真实纹理下 265 ms/帧（实测 loop 3.7 fps、丢帧 91%），
 # 而文档三处都写着"默认 color"。界面与命令行的默认值必须一致，
 # 否则"界面所见"与"文档所承诺"就是两份东西（同一个毛病在 `--target` 上犯过一次）。
-METHODS = ["color", "fusion", "hough", "motion", "yolo", "yolo_sam"]
+METHODS = ["color", "specular", "fusion", "hough", "motion", "yolo", "yolo_sam"]
 PRESETS = ["不使用", "white_ball", "orange_ball", "green_ball",
            "blue_ball", "red_ball", "yellow_ball"]
 # 左右下拉的默认项：直接给**角色名**（left/right），绑定的设备身份不随 USB 口漂移。
@@ -674,6 +674,8 @@ class Launcher(tk.Tk):
             row=2, column=0, padx=(0, 12), pady=4)
         ttk.Button(box, text="离线双目（会话）", command=self._start_offline_stereo).grid(
             row=2, column=1, padx=(0, 12), pady=4)
+        ttk.Button(box, text="点选球（双目 seed）", command=self._pick_stereo_seed).grid(
+            row=2, column=2, padx=(0, 12), pady=4)
         ttk.Button(box, text="快测（十几秒）", command=self._run_tests_fast).grid(
             row=1, column=2, padx=(0, 6), pady=4)
         ttk.Button(box, text="全套回归（7 分钟）", command=self._run_tests_full).grid(
@@ -735,6 +737,10 @@ class Launcher(tk.Tk):
 
     # ---------- 动作 ----------
     def _start_realtime(self) -> None:
+        if self.method.get() == "specular":
+            messagebox.showinfo(
+                "实时检测", "specular 需要先点选球心；请录制后用『离线双目（会话）』。")
+            return
         cmd = [PY, str(ROOT / "apps" / "run_realtime.py"),
                "--camera", _cam_arg(self.camera.get()),
                "--method", self.method.get()]
@@ -745,6 +751,10 @@ class Launcher(tk.Tk):
         self._run(cmd, "实时摄像头检测")
 
     def _start_video(self) -> None:
+        if self.method.get() == "specular":
+            messagebox.showinfo(
+                "离线视频", "specular 只支持双目会话，请用『离线双目（会话）』。")
+            return
         path = filedialog.askopenfilename(
             title="选择要分析的视频",
             initialdir=str(ROOT / "assets" / "videos"),
@@ -805,7 +815,34 @@ class Launcher(tk.Tk):
         preset = self.preset.get()
         if preset and preset != "不使用":
             args += ["--preset", preset]
+        if self.method.get() == "specular":
+            seed = Path(session_dir) / "derived" / "seeds.json"
+            if seed.exists():
+                args += ["--seed-json", str(seed)]
         return args
+
+    def _pick_stereo_seed(self, session_dir: str | None = None,
+                          offer_run: bool = True) -> bool:
+        """打开点选窗口；保存成功返回 True。"""
+        if session_dir is None:
+            session_dir = filedialog.askdirectory(
+                title="选择双目会话目录（含 session.json）",
+                initialdir=str(ROOT / "data" / "sessions"))
+        if not session_dir:
+            return False
+        if not (Path(session_dir) / "session.json").exists():
+            messagebox.showwarning("不是会话目录", "这个目录里没有 session.json。")
+            return False
+        from apps.seed_picker import SeedPicker
+        picker = SeedPicker(self, session_dir)
+        self.wait_window(picker)
+        if picker.result is None:
+            return False
+        self._append(f"seed 已保存：{picker.result}")
+        if offer_run and messagebox.askyesno(
+                "点选完成", "seed 已保存。现在运行离线双目三维？"):
+            self._run(self._offline_stereo_args(str(session_dir)), "离线双目三维")
+        return True
 
     def _start_offline_stereo(self) -> None:
         path = filedialog.askdirectory(
@@ -816,6 +853,13 @@ class Launcher(tk.Tk):
         if not (Path(path) / "session.json").exists():
             messagebox.showwarning("不是会话目录", "这个目录里没有 session.json。")
             return
+        if self.method.get() == "specular":
+            seed = Path(path) / "derived" / "seeds.json"
+            if not seed.exists():
+                messagebox.showinfo(
+                    "还需要 seed", "specular 需要先在左右画面点球心；现在打开点选窗口。")
+                if not self._pick_stereo_seed(path, offer_run=False):
+                    return
         self._run(self._offline_stereo_args(path), "离线双目三维")
 
     def _confirm_stereo_cameras(self, left: str, right: str) -> bool:

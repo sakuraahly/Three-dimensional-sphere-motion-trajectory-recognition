@@ -2,6 +2,7 @@
 numpy>=1.24
 opencv-contrib-python>=4.8
 matplotlib>=3.7
+Pillow>=9.0        # GUI 点选球心（apps/seed_picker.py）用 ImageTk 显示视频帧
 
 # 标定参数导出（可选）：只影响 --formats yaml；没有它仍可导出 json/toml。
 pyyaml>=6.0

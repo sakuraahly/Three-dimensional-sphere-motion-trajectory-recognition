@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +37,7 @@ from stereo import (
     stereo_depth,
     timestamp_offset,
 )
+from stereo.visualization import export_session_visualization, load_seeds, write_seeds
 from sphere_tracker.types import Detection
 
 
@@ -194,6 +197,45 @@ def test_trajectory_fusion() -> bool:
     return ok
 
 
+def test_visualization() -> bool:
+    """标准数据：seeds.json / traj3d.json / visualization.json 的契约。"""
+    print("----- 标准数据导出 -----")
+    ok = True
+    with tempfile.TemporaryDirectory(prefix="dsh_stereo_vis_") as tmp:
+        d = Path(tmp)
+        (d / "session.json").write_text(json.dumps({
+            "schema": "sphere-stereo-session", "version": 1, "id": "synthetic",
+            "left": {"width": 1920, "height": 1080},
+            "sync": {"method": "flash", "offset": 0, "confidence": 0.9},
+            "calibration": {"baseline_mm": 65.0, "created": "x", "verdict": "ok"},
+        }), encoding="utf-8")
+        (d / "derived").mkdir()
+        (d / "derived" / "traj3d.csv").write_text(
+            "frame,t,matched,X,Y,Z,u_left,v_left,u_right,v_right,epipolar_px,residual_px,confident,method_left,method_right\n"
+            "0,0.0,1,0.1,0.05,0.3,100,200,90,200,1.0,0.5,1,track,track\n"
+            "1,0.03,0,0,,,,,,,,,0,track,track\n", encoding="utf-8")
+        s = write_seeds(d, (100, 200, 30), (90, 200, 30), seed_frame=0)
+        loaded = load_seeds(s)
+        paths = export_session_visualization(d)
+        traj = json.loads(paths["trajectory"].read_text(encoding="utf-8"))
+        vis = json.loads(paths["visualization"].read_text(encoding="utf-8"))
+        checks = [
+            ("seeds schema/坐标", loaded["schema"] == "sphere-stereo-seeds"
+             and loaded["left"]["x"] == 100),
+            ("traj3d.json schema/单位", traj["schema"] == "sphere-stereo-trajectory"
+             and traj["unit"] == "m" and traj["n_matched"] == 1),
+            ("短行（未匹配）不破坏解析", len(traj["samples"]) == 2
+             and traj["samples"][1]["matched"] is False),
+            ("visualization.json 点数/bounds",
+             vis["schema"] == "sphere-stereo-visualization"
+             and vis["n_points"] == 1 and vis["bounds"]["max"][2] == 0.3),
+        ]
+        for name, passed in checks:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            ok = ok and passed
+    return ok
+
+
 def main() -> int:
     print("=" * 62)
     print("双目链路自测（合成真值）")
@@ -204,8 +246,10 @@ def main() -> int:
     print()
     c = test_trajectory_fusion()
     print()
-    print("判定结果：" + ("全部通过" if (a and b and c) else "有不达标项"))
-    return 0 if (a and b and c) else 1
+    d = test_visualization()
+    print()
+    print("判定结果：" + ("全部通过" if (a and b and c and d) else "有不达标项"))
+    return 0 if (a and b and c and d) else 1
 
 
 if __name__ == "__main__":

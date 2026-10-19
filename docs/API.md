@@ -548,6 +548,24 @@ def fuse_depth(z_stereo, sigma_stereo_m, z_mono, sigma_mono_m) -> tuple[float, f
 - `fuse_depth` 用逆方差加权；任一路无效就退化为另一路，两路都无效返回 `(inf, inf)`。
 - **当前接线**：`run_stereo_video.py --smooth` 已用 S-G；Kalman 与深度融合还是库，
   等镜面球检测稳定后再接主流程（不要在错检测上做平滑/预测）。
+
+### 13.6 `stereo/visualization.py` —— 标准数据
+```python
+SEEDS_SCHEMA = "sphere-stereo-seeds"; TRAJECTORY_SCHEMA = "sphere-stereo-trajectory"
+VISUALIZATION_SCHEMA = "sphere-stereo-visualization"; VERSION = 1
+def write_seeds(session_dir, left, right, *, seed_frame=0, image_size=None,
+                source="manual", note="") -> Path
+def load_seeds(path) -> dict                         # 也接受会话目录
+def read_trajectory_csv(path) -> list[dict]          # 补空列；短行不炸
+def build_trajectory_payload(session_dir, *, csv_name="traj3d.csv") -> dict
+def build_visualization_payload(trajectory) -> dict
+def export_session_visualization(session_dir, *, csv_name="traj3d.csv") -> dict[str, Path]
+```
+- 输出：`derived/traj3d.json` + `derived/visualization.json`；
+- `read_trajectory_csv` **按列名读、短行补空**：`matched=0` 的行历史上只有 14 列，
+  用 `csv.DictReader` 会把 `track` 错当 `residual_px`（本轮踩过）；
+- 坐标/单位/版本规则见 `docs/数据标准.md`；`run_stereo_video` 全片跑完会自动导出，
+  部分帧试跑（`_firstN`）不覆盖正式 JSON。
 ## 14. 依赖方向
 
 > **图与规则在根目录 `AGENTS.md` §5（唯一权威），这里不复制。**
