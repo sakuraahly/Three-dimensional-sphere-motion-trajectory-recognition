@@ -203,7 +203,7 @@ apps / tests                        （只调用，不被调用）
 ## 7. 质量底线：23 个回归测试
 
 ```powershell
-启动程序.bat test              # fast 档：跳过两个慢测试，十几秒~1 分钟
+启动程序.bat test              # fast 档：跳过三个慢测试（mutation_guards / stereo_calib / synthetic）
 启动程序.bat test full         # 全套 23 个（改代码后必跑，约 6 分钟）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
