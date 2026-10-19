@@ -30,7 +30,14 @@ from .sessions import (
     sha256_file,
     validate_session,
 )
-from .sync import SyncConfig, SyncResult, apply_offset, brightness_series, find_offset
+from .sync import (
+    SyncConfig,
+    SyncResult,
+    apply_offset,
+    brightness_jumps,
+    brightness_series,
+    find_offset,
+)
 from .trajectory import Kalman3D, savgol_trajectory
 from .depth_fusion import fuse_depth, mono_depth, stereo_depth
 from .triangulate import (
@@ -48,6 +55,7 @@ __all__ = [
     "SyncResult",
     "find_offset",
     "brightness_series",
+    "brightness_jumps",
     "apply_offset",
     "Kalman3D",
     "savgol_trajectory",

@@ -357,6 +357,10 @@ def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
 
     if abs(s.sync.offset) > 180:
         warnings.append(f"同步偏移 {s.sync.offset:+d} 超过默认搜索上限 ±180 帧")
+    if s.sync.method == "none":
+        warnings.append(
+            "未同步（sync.method=none）：没有闪光/拍手偏移，三维轨迹不能直接使用"
+            "（重录并在“开始”后闪光，或用 --sync-offset 手动指定）")
     if s.sync.method != "none" and s.sync.confidence <= 0:
         warnings.append(f"同步方法={s.sync.method} 但置信度={s.sync.confidence}（未真正算出偏移？）")
     if not s.lossless:

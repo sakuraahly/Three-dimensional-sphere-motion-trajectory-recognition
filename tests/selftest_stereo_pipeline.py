@@ -73,6 +73,14 @@ def test_sync() -> bool:
         ok = ok and good
         print(f"  人为平移 {k:+3d} 帧 -> 检出 {res.offset:+3d} 帧  "
               f"置信度 {res.confidence:.3f}  {'通过' if good else '不达标'}")
+    # 闪光只在一路明显时也要数得到（另一路曝光不同）
+    right_only = np.full(n, 120.0)
+    right_only[40] += 45.0
+    res = find_offset(np.full(n, 120.0), right_only, SyncConfig(max_offset=100))
+    good = res.peak_count >= 1
+    ok = ok and good
+    print(f"  仅右路有闪光 -> peak_count={res.peak_count}  "
+          f"{'通过' if good else '不达标'}")
     return ok
 
 

@@ -60,7 +60,7 @@ from stereo.sessions import (                                # noqa: E402
     sha256_file,
     validate_session,
 )
-from stereo.sync import SyncConfig, find_offset              # noqa: E402
+from stereo.sync import SyncConfig, brightness_jumps, find_offset  # noqa: E402
 
 LOG = logging.getLogger("record")
 # 1080p30 × 2 的实测吞吐（本机）：HFYU ≈ 34 fps/路；FFV1 ≈ 8 fps/路。
@@ -256,6 +256,30 @@ def _write_times(path: Path, times: list[tuple[int, float, float]]) -> None:
             w.writerow([idx, f"{perf:.6f}", f"{unix:.6f}"])
 
 
+def _plot_sync(lb, rb, stat_l: dict, stat_r: dict, path: Path) -> None:
+    """把两路亮度曲线和检测到的闪光位置画出来，供人一眼确认。"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(lb, label="left", linewidth=1.0)
+    ax.plot(rb, label="right", linewidth=1.0)
+    for stat, color in ((stat_l, "#ef4444"), (stat_r, "#3b82f6")):
+        for idx in stat.get("peak_indices", [])[:12]:
+            ax.axvline(int(idx) + 1, color=color, alpha=0.18, linewidth=1)
+    ax.set_xlabel("frame")
+    ax.set_ylabel("mean brightness")
+    ax.set_title(f"flash diagnosis: max|ΔL|={stat_l['max_jump']:.2f}, "
+                 f"max|ΔR|={stat_r['max_jump']:.2f}, "
+                 f"peaks L/R={stat_l['peak_count']}/{stat_r['peak_count']}")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+
 def _copy_calibration(session_dir: Path, calib_base: Path) -> tuple[Path, StereoRig]:
     calib_dir = session_dir / "calib"
     calib_dir.mkdir(parents=True, exist_ok=True)
@@ -396,7 +420,12 @@ def main() -> int:
         for i in range(int(max(0, args.countdown)), 0, -1):
             print(f"  {i}…", end="", flush=True)
             time.sleep(1.0)
-        print(" 开始！", flush=True)
+        print(" 开始！现在闪光！", flush=True)
+        try:
+            import winsound
+            winsound.Beep(1200, 200)
+        except Exception:                                   # noqa: BLE001
+            pass
 
         left_rec.start()
         right_rec.start()
@@ -449,24 +478,45 @@ def main() -> int:
         _write_times(session_dir / "left_times.csv", left_rec.times)
         _write_times(session_dir / "right_times.csv", right_rec.times)
 
-        # 同步：用逐帧亮度找闪光/拍手
+        # 同步：先诊断"有没有拍到闪光"，再谈偏移
         sync_note = ""
         try:
             lb = np.asarray(left_rec.brightness, dtype=np.float64)
             rb = np.asarray(right_rec.brightness, dtype=np.float64)
             np.save(session_dir / "derived" / "left_brightness.npy", lb)
             np.save(session_dir / "derived" / "right_brightness.npy", rb)
+            stat_l = brightness_jumps(lb)
+            stat_r = brightness_jumps(rb)
+            max_jump = max(stat_l["max_jump"], stat_r["max_jump"])
+            print(f"[同步诊断] 最大亮度跳变 左={stat_l['max_jump']:.2f} "
+                  f"右={stat_r['max_jump']:.2f}；明显事件 左={stat_l['peak_count']} "
+                  f"右={stat_r['peak_count']}；阈值≈{stat_l['threshold']:.2f}")
+            try:
+                _plot_sync(lb, rb, stat_l, stat_r,
+                           session_dir / "derived" / "sync_brightness.png")
+            except Exception as exc:                        # noqa: BLE001
+                print(f"[警告] 同步诊断图画不出来：{exc}")
+
             res = find_offset(lb, rb, SyncConfig(max_offset=180, min_overlap=30))
             if res.usable:
                 session.sync = SyncInfo(method="flash", offset=int(res.offset),
                                         confidence=float(res.confidence),
                                         note=str(res.note or ""))
+                sync_note = (f"flash {res.offset:+d} 帧，置信度 {res.confidence:.3f}，"
+                             f"事件 {res.peak_count} 个")
+                print(f"[同步] {res}")
             else:
+                if max_jump < 1.0:
+                    why = (f"没有拍到闪光：最大亮度跳变 {max_jump:.2f} < 1.0。"
+                           "请重录，并在“开始！现在闪光！”后立刻闪一次、结束前再闪一次。")
+                else:
+                    why = (f"有亮度变化但没形成可用闪光事件（最大跳变 {max_jump:.2f}，"
+                           f"事件 {max(stat_l['peak_count'], stat_r['peak_count'])} 个）。")
                 session.sync = SyncInfo(method="none", offset=0,
                                         confidence=float(res.confidence),
-                                        note=res.note or "没有检测到可用的闪光/拍手事件")
-            sync_note = str(res)
-            print(f"[同步] {res}")
+                                        note=why)
+                sync_note = f"未同步：{why}"
+                print(f"[同步] 未通过：{why}")
         except Exception as exc:                            # noqa: BLE001
             session.sync = SyncInfo(method="none", note=f"同步计算失败：{exc}")
             print(f"[警告] 同步计算失败：{exc}")

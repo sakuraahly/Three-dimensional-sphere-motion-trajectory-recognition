@@ -580,6 +580,14 @@ def test_sessions(base: Path) -> bool:
     checks.append(("干净会话：无错误", not errors))
     checks.append(("干净会话：无警告", not warnings))
 
+    session.sync = SyncInfo("none", 0, 0.0)
+    save_session(session, session_dir)
+    e_none, w_none = validate_session(session_dir)
+    checks.append(("未同步 -> 警告（三维不可直接用）",
+                   not e_none and any("未同步" in x for x in w_none)))
+    session.sync = SyncInfo("flash", 2, 0.9)
+    save_session(session, session_dir)
+
     _d, reloaded = load_session(session_dir)
     checks.append(("重新读回 label", reloaded.label == "selftest"))
     checks.append(("重新读回同步偏移", reloaded.sync.offset == 2))

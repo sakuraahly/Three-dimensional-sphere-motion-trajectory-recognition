@@ -94,6 +94,30 @@ def _corr_at(da: np.ndarray, db: np.ndarray, offset: int) -> tuple[float, int]:
     return float(np.dot(a, b) / (na * nb)), m
 
 
+def brightness_jumps(series, min_jump: float = 1.0) -> dict:
+    """逐帧亮度突变的诊断：最大跳变、阈值、明显事件数 / 位置。
+
+    为什么单独拿出来：`find_offset` 只能用"相关系数"回答"偏多少"，
+    但**没有闪光时它也会给出一个候选偏移**（普通场景变化也能相关）。
+    录制端需要先回答"到底有没有拍到闪光"，再谈偏移。
+    """
+    arr = np.asarray(series, np.float64)
+    if arr.size < 2:
+        return {"max_jump": 0.0, "median_abs_diff": 0.0, "threshold": min_jump,
+                "peak_count": 0, "peak_indices": np.zeros(0, dtype=int)}
+    d = np.diff(arr)
+    med = float(np.median(np.abs(d)))
+    threshold = max(4.0 * med, float(min_jump))
+    idx = np.flatnonzero(np.abs(d) > threshold)
+    return {
+        "max_jump": float(np.max(np.abs(d))),
+        "median_abs_diff": med,
+        "threshold": threshold,
+        "peak_count": int(idx.size),
+        "peak_indices": idx,
+    }
+
+
 def find_offset(
     series_left: np.ndarray,
     series_right: np.ndarray,
@@ -122,9 +146,10 @@ def find_offset(
         if c > best_c:
             best_off, best_c, best_m = off, c, m
 
-    # 数一数有几个明显的闪光事件：差分绝对值超过 4 倍中位绝对偏差的峰
-    med = float(np.median(np.abs(dl))) + 1e-9
-    peaks = int(np.sum(np.abs(dl) > max(4.0 * med, 1.0)))
+    # 数一数有几个明显的闪光事件：差分绝对值超过 4 倍中位绝对偏差的峰。
+    # 左右都数、取较大者：闪光可能只在一路里明显（另一路曝光/增益不同）。
+    peaks = max(brightness_jumps(l)["peak_count"],
+                brightness_jumps(r)["peak_count"])
     note = ""
     if best_c < 0.35:
         note = ("相关性偏低，可能没拍到闪光，或两路拍的不是同一段。"
