@@ -523,6 +523,24 @@ def list_sessions(root) -> list[Path];  def sha256_file(path) -> str
 （物理 vs 算法 >10% 警告、>20% 错误），**不抛异常**，坏会话一次列全。
 **基线**：`baseline_mm` 是算法结果（几何用它），`baseline_measured_mm` 只作交叉核对，不覆盖算法值。
 **路径**：视频/标定路径默认相对会话目录；也接受绝对路径。
+
+### 13.5 `stereo/trajectory.py` + `stereo/depth_fusion.py`
+```python
+def savgol_trajectory(t, xyz, *, window=11, polyorder=2) -> np.ndarray   # (N,3)
+class Kalman3D:
+    def __init__(self, process_var=1e-4, measure_var=1e-3)
+    def update(self, t, z) -> np.ndarray | None       # 滤波后的 (3,)
+    def predict(self, t) -> np.ndarray | None         # 不改状态
+    @property velocity -> np.ndarray | None
+
+def stereo_depth(disparity_px, fx_px, baseline_m) -> float
+def mono_depth(radius_px, fx_px, diameter_m) -> float
+def fuse_depth(z_stereo, sigma_stereo_m, z_mono, sigma_mono_m) -> tuple[float, float]
+```
+- `savgol_trajectory` 没装 scipy 时退化为滑动平均；`Kalman3D` 常速度模型。
+- `fuse_depth` 用逆方差加权；任一路无效就退化为另一路，两路都无效返回 `(inf, inf)`。
+- **当前接线**：`run_stereo_video.py --smooth` 已用 S-G；Kalman 与深度融合还是库，
+  等镜面球检测稳定后再接主流程（不要在错检测上做平滑/预测）。
 ## 14. 依赖方向
 
 > **图与规则在根目录 `AGENTS.md` §5（唯一权威），这里不复制。**

@@ -223,7 +223,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_camera_quality.py` | 相机画质会诊（蒙雾 / 过曝 / 残帧） |
 | `selftest_pair_source.py` | 成对取帧 + 同步偏移语义 |
 | `selftest_stereo_calib.py` | 双目标定 |
-| `selftest_stereo_pipeline.py` | 同步 + 配对 + 三角测量 |
+| `selftest_stereo_pipeline.py` | 同步 + 配对 + 三角测量；S-G 平滑 / 3D Kalman / 深度融合 |
 | `selftest_stereo_branch.py` | 双目整条链路 |
 | `selftest_preview_lib.py` | PPT 预览渲染 |
 | `selftest_config_wiring.py` | 配置接线（每个配置项都必须真的被读） |

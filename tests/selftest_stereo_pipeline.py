@@ -23,11 +23,16 @@ import numpy as np
 
 from calib import StereoRig
 from stereo import (
+    Kalman3D,
     MatchConfig,
     StereoReconstructor,
     SyncConfig,
     find_offset,
+    fuse_depth,
     match_epipolar,
+    mono_depth,
+    savgol_trajectory,
+    stereo_depth,
 )
 from sphere_tracker.types import Detection
 
@@ -126,6 +131,49 @@ def test_triangulate() -> bool:
     return ok
 
 
+def test_trajectory_fusion() -> bool:
+    """第 3 节：三维平滑 / Kalman / 深度融合的纯数学行为。"""
+    print("----- 三维平滑 / Kalman / 深度融合 -----")
+    rng = np.random.default_rng(7)
+    n, fps = 60, 30.0
+    t = np.arange(n) / fps
+    truth = np.column_stack([0.20 * t, 0.10 + 0.05 * t, 1.00 + 0.30 * t])
+    noisy = truth + rng.normal(0.0, 0.004, truth.shape)
+
+    smooth = savgol_trajectory(t, noisy, window=11, polyorder=2)
+    rmse_before = float(np.sqrt(np.mean((noisy - truth) ** 2)))
+    rmse_after = float(np.sqrt(np.mean((smooth - truth) ** 2)))
+
+    kf = Kalman3D(process_var=1e-5, measure_var=2e-5)
+    for ti, p in zip(t, noisy):
+        kf.update(float(ti), p)
+    t_ahead = t[-1] + 0.2
+    pred = kf.predict(float(t_ahead))
+    truth_ahead = np.array([0.20 * t_ahead, 0.10 + 0.05 * t_ahead, 1.00 + 0.30 * t_ahead])
+    pred_err = float(np.linalg.norm(pred - truth_ahead)) if pred is not None else 1e9
+
+    z_s = stereo_depth(90.0, 900.0, 0.100)          # 900*0.1/90 = 1.000
+    z_m = mono_depth(18.0, 900.0, 0.040)            # 900*0.04/(2*18) = 1.000
+    z_f, sig_f = fuse_depth(z_s, 0.010, z_m, 0.050)
+    z_bad, sig_bad = fuse_depth(float("inf"), 0.0, 1.2, 0.05)
+
+    checks = [
+        (f"Savitzky-Golay 降噪（RMSE {rmse_before:.4f} -> {rmse_after:.4f}）",
+         rmse_after < rmse_before * 0.8),
+        (f"Kalman 外推 0.2 s 误差 {pred_err*1000:.1f} mm", pred_err < 0.05),
+        (f"双目深度 Z={z_s:.3f} m / 单目 Z={z_m:.3f} m",
+         abs(z_s - 1.0) < 1e-6 and abs(z_m - 1.0) < 1e-6),
+        (f"逆方差融合 Z={z_f:.3f}，σ={sig_f*1000:.1f} mm",
+         abs(z_f - 1.0) < 0.02 and sig_f < 0.01),
+        ("单目无效时退化为双目", abs(z_bad - 1.2) < 1e-9 and abs(sig_bad - 0.05) < 1e-9),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     print("=" * 62)
     print("双目链路自测（合成真值）")
@@ -134,8 +182,10 @@ def main() -> int:
     print()
     b = test_triangulate()
     print()
-    print("判定结果：" + ("全部通过" if (a and b) else "有不达标项"))
-    return 0 if (a and b) else 1
+    c = test_trajectory_fusion()
+    print()
+    print("判定结果：" + ("全部通过" if (a and b and c) else "有不达标项"))
+    return 0 if (a and b and c) else 1
 
 
 if __name__ == "__main__":

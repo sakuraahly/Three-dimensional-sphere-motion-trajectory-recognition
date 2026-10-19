@@ -47,7 +47,7 @@ from sphere_tracker.config import AppConfig, ColorConfig     # noqa: E402
 from sphere_tracker.geometry import CameraModel              # noqa: E402
 from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
-from stereo import MatchConfig, PairSource, StereoReconstructor  # noqa: E402
+from stereo import MatchConfig, PairSource, StereoReconstructor, savgol_trajectory  # noqa: E402
 from stereo.sessions import load_session, validate_session   # noqa: E402
 
 
@@ -71,8 +71,11 @@ def _make_pipeline(cfg: AppConfig, rig: StereoRig, side: str) -> SpherePipeline:
     return pipe
 
 
-def _draw(frame: np.ndarray, res, label: str) -> np.ndarray:
+def _draw(frame: np.ndarray, res, label: str, trail: list[tuple[float, float]] | None = None) -> np.ndarray:
     out = frame.copy()
+    if trail and len(trail) >= 2:
+        pts = np.array([[int(round(x)), int(round(y))] for x, y in trail], np.int32)
+        cv2.polylines(out, [pts], False, (0, 255, 255), 2)
     d = res.detection
     if d is not None:
         cv2.circle(out, (int(round(d.x)), int(round(d.y))), int(round(d.radius)),
@@ -83,6 +86,28 @@ def _draw(frame: np.ndarray, res, label: str) -> np.ndarray:
         cv2.putText(out, f"{label} no detection", (12, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
     return out
+
+
+def _plot_trajectory(arr: np.ndarray, path: Path, smoothed: np.ndarray | None = None) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(arr[:, 1], arr[:, 2], arr[:, 3], ".-", color="#2563eb",
+            markersize=2, linewidth=1, label="raw")
+    if smoothed is not None:
+        ax.plot(smoothed[:, 0], smoothed[:, 1], smoothed[:, 2], "-",
+                color="#f97316", linewidth=1.6, label="S-G")
+    ax.set_xlabel("X right (m)")
+    ax.set_ylabel("Y forward (m)")
+    ax.set_zlabel("Z up (m)")
+    ax.set_title("Stereo 3D trajectory")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 def main() -> int:
@@ -100,6 +125,9 @@ def main() -> int:
     ap.add_argument("--sync-offset", type=int, default=None,
                     help="覆盖 session 的同步偏移（默认用 session.sync.offset）")
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
+    ap.add_argument("--smooth", action="store_true", help="另存 Savitzky-Golay 平滑后的三维 CSV")
+    ap.add_argument("--no-plot", action="store_true", help="不生成 traj3d.png")
     ap.add_argument("--no-video", action="store_true")
     args = ap.parse_args()
 
@@ -173,6 +201,8 @@ def main() -> int:
             writer = None
 
     rows: list[list] = []
+    trail_l: list[tuple[float, float]] = []
+    trail_r: list[tuple[float, float]] = []
     n_pairs = 0
     t0 = time.perf_counter()
     try:
@@ -195,6 +225,11 @@ def main() -> int:
                              "" if det_l is None else det_l.method,
                              "" if det_r is None else det_r.method])
             else:
+                trail_l.append(pt.u_left)
+                trail_r.append(pt.u_right)
+                if args.trail and len(trail_l) > args.trail:
+                    trail_l = trail_l[-args.trail:]
+                    trail_r = trail_r[-args.trail:]
                 rows.append([
                     n_pairs - 1, f"{t:.4f}", 1,
                     f"{pt.xyz[0]:.6f}", f"{pt.xyz[1]:.6f}", f"{pt.xyz[2]:.6f}",
@@ -206,8 +241,8 @@ def main() -> int:
                 ])
 
             if writer is not None:
-                vl = cv2.resize(_draw(left_frame, res_l, "L"), (960, 540))
-                vr = cv2.resize(_draw(right_frame, res_r, "R"), (960, 540))
+                vl = cv2.resize(_draw(left_frame, res_l, "L", trail_l), (960, 540))
+                vr = cv2.resize(_draw(right_frame, res_r, "R", trail_r), (960, 540))
                 cv2.putText(vr, f"f={n_pairs-1} matched={rec.n_matched}", (12, 500),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 writer.write(np.hstack([vl, vr]))
@@ -229,6 +264,7 @@ def main() -> int:
     print(f"处理：{n_pairs} 对，{elapsed:.1f}s（{n_pairs/max(elapsed,1e-6):.1f} 对/s）")
     print(f"匹配：{rec.n_matched}/{n_pairs}（{rec.match_rate*100:.1f}%）  "
           f"无左={rec.n_no_left} 无右={rec.n_no_right} 极线拒={rec.n_rejected}")
+    smoothed = None
     if rec.trajectory:
         arr = rec.as_array()
         print(f"三维范围：X {arr[:,1].min():.3f}~{arr[:,1].max():.3f} m  "
@@ -236,6 +272,19 @@ def main() -> int:
               f"Z {arr[:,3].min():.3f}~{arr[:,3].max():.3f} m")
         res = np.array([p.residual_px for p in rec.trajectory])
         print(f"交会残差：中位 {np.median(res):.3f} px，最大 {res.max():.3f} px")
+        if args.smooth and len(arr) >= 3:
+            smoothed = savgol_trajectory(arr[:, 0], arr[:, 1:4], window=11, polyorder=2)
+            sm_path = out_dir / f"traj3d_smoothed{partial}.csv"
+            with open(sm_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["t", "X", "Y", "Z"])
+                for ti, x, y, z in zip(arr[:, 0], smoothed[:, 0], smoothed[:, 1], smoothed[:, 2]):
+                    w.writerow([f"{ti:.4f}", f"{x:.6f}", f"{y:.6f}", f"{z:.6f}"])
+            print(f"平滑 CSV：{sm_path}")
+        if not args.no_plot:
+            plot_path = out_dir / f"traj3d{partial}.png"
+            _plot_trajectory(arr, plot_path, smoothed)
+            print(f"三维图：{plot_path}")
     print(f"CSV：{csv_path}")
     if writer is not None:
         print(f"标注视频：{video_path}")

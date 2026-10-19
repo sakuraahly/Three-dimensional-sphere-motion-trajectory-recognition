@@ -125,6 +125,12 @@ KNOWN_MENTIONS: dict[str, str] = {
         "P3 **计划新增**的离线双目入口，尚未实现",
     "docs/planbooks/2026-10-19_相机接入与数据采集.md:world_frame.json":
         "P6 计划中的世界系变换文件，尚未实现",
+    "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:sphere_tracker/detectors/specular.py":
+        "P0 **计划新增**的镜面球检测器，尚未实现",
+    "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:traj3d.png":
+        "P0 计划中的离线三维图，生成在会话 derived/ 下",
+    "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:world_frame.json":
+        "P4 计划中的世界系变换文件，尚未实现",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
         "同上（`AGENTS.md:STC` 之外的简写形式）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":

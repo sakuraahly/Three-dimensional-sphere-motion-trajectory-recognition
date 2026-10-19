@@ -31,6 +31,8 @@ from .sessions import (
     validate_session,
 )
 from .sync import SyncConfig, SyncResult, apply_offset, brightness_series, find_offset
+from .trajectory import Kalman3D, savgol_trajectory
+from .depth_fusion import fuse_depth, mono_depth, stereo_depth
 from .triangulate import (
     MatchConfig,
     StereoPoint,
@@ -47,6 +49,11 @@ __all__ = [
     "find_offset",
     "brightness_series",
     "apply_offset",
+    "Kalman3D",
+    "savgol_trajectory",
+    "fuse_depth",
+    "mono_depth",
+    "stereo_depth",
     "MatchConfig",
     "StereoPoint",
     "StereoReconstructor",
