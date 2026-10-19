@@ -672,6 +672,8 @@ class Launcher(tk.Tk):
                    command=self._start_video).grid(row=1, column=1, padx=(0, 12), pady=4)
         ttk.Button(box, text="录制双目（无损）", command=self._start_record).grid(
             row=2, column=0, padx=(0, 12), pady=4)
+        ttk.Button(box, text="离线双目（会话）", command=self._start_offline_stereo).grid(
+            row=2, column=1, padx=(0, 12), pady=4)
         ttk.Button(box, text="快测（十几秒）", command=self._run_tests_fast).grid(
             row=1, column=2, padx=(0, 6), pady=4)
         ttk.Button(box, text="全套回归（7 分钟）", command=self._run_tests_full).grid(
@@ -796,6 +798,25 @@ class Launcher(tk.Tk):
         cmd = self._record_args(str(duration), label)
         self._append(f"录制：{duration} 秒；开始后闪一次光，结束前再闪一次。")
         self._run(cmd, f"录制双目（{duration} 秒）")
+
+    def _offline_stereo_args(self, session_dir: str) -> list[str]:
+        args = [PY, str(ROOT / "apps" / "run_stereo_video.py"), session_dir,
+                "--method", self.method.get()]
+        preset = self.preset.get()
+        if preset and preset != "不使用":
+            args += ["--preset", preset]
+        return args
+
+    def _start_offline_stereo(self) -> None:
+        path = filedialog.askdirectory(
+            title="选择双目会话目录（含 session.json）",
+            initialdir=str(ROOT / "data" / "sessions"))
+        if not path:
+            return
+        if not (Path(path) / "session.json").exists():
+            messagebox.showwarning("不是会话目录", "这个目录里没有 session.json。")
+            return
+        self._run(self._offline_stereo_args(path), "离线双目三维")
 
     def _confirm_stereo_cameras(self, left: str, right: str) -> bool:
         """标定/复检前的相机检查。**弹窗报错就返回 False（拦住这次操作）**。

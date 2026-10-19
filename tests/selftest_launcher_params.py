@@ -359,6 +359,17 @@ def main() -> int:
         print(f"  [{'通过' if good else '不达标'}] {label}")
         results.append((label, good))
 
+    off = app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo"))
+    off_s = " ".join(off)
+    checks_off = [
+        ("调用 apps/run_stereo_video.py", "run_stereo_video.py" in off_s),
+        ("带会话目录", "data\\sessions\\demo" in off_s or "data/sessions/demo" in off_s),
+        ("带 --method", "--method" in off_s),
+    ]
+    for label, good in checks_off:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
+
     # ---- 9. 可滚动布局（"新加的东西把原来的挤掉"是真实回归）----
     #
     # 加标定参数区之后，第 1 步那张卡片的自然宽度一度到 **1941 px**
