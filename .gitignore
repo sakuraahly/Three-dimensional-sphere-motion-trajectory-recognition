@@ -91,3 +91,5 @@ assets/videos/*
 # 只保留 README；会话必须单独备份（外部硬盘 / 网盘），不要指望 git。
 data/sessions/*
 data/raw/*
+data/calib_pairs/*
+data/calib/*
