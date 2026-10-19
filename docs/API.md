@@ -426,7 +426,7 @@ def toml_dumps(data: dict) -> str        # 最小 TOML 序列化器（stdlib 只
 ## 13. `stereo/` —— 双目逐帧
 ### 13.1 `stereo/sync.py`
 ```python
-@dataclass SyncConfig:  max_offset=180; min_overlap=30; smooth=1
+@dataclass SyncConfig:  max_offset=180; min_overlap=30; smooth=1; flash_min_jump=2.0
 @dataclass SyncResult:
     offset: int          # left[i] 对应 right[i + offset]
     confidence: float    # 归一化互相关系数峰值

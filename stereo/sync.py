@@ -37,6 +37,7 @@ class SyncConfig:
     max_offset: int = 180        # 最多搜索多少帧的偏移
     min_overlap: int = 30        # 重叠帧数少于这个就不算数（否则相关性不可信）
     smooth: int = 1              # 亮度序列平滑窗口（1 = 不平滑）
+    flash_min_jump: float = 2.0  # 最大亮度跳变低于这个，不认成"闪光"（防弱光/噪声误判）
 
 
 @dataclass
@@ -148,10 +149,17 @@ def find_offset(
 
     # 数一数有几个明显的闪光事件：差分绝对值超过 4 倍中位绝对偏差的峰。
     # 左右都数、取较大者：闪光可能只在一路里明显（另一路曝光/增益不同）。
-    peaks = max(brightness_jumps(l)["peak_count"],
-                brightness_jumps(r)["peak_count"])
+    stat_l, stat_r = brightness_jumps(l), brightness_jumps(r)
+    max_jump = max(stat_l["max_jump"], stat_r["max_jump"])
+    peaks = max(stat_l["peak_count"], stat_r["peak_count"])
     note = ""
-    if best_c < 0.35:
+    if max_jump < cfg.flash_min_jump:
+        # 弱光/自动曝光/普通场景变化也能让相关系数很高；没有足够大的亮度跳变
+        # 就不认成闪光，否则会把 offset=0 的假同步写进 session。
+        peaks = 0
+        note = (f"最大亮度跳变 {max_jump:.2f} < {cfg.flash_min_jump:.1f}，"
+                "不像闪光；请重录并在“开始”后闪一次")
+    elif best_c < 0.35:
         note = ("相关性偏低，可能没拍到闪光，或两路拍的不是同一段。"
                 "建议重新录一段：先静止，中间打一次闪光/拍一次手。")
     return SyncResult(best_off, max(best_c, 0.0), peaks, note)

@@ -490,14 +490,16 @@ def main() -> int:
             max_jump = max(stat_l["max_jump"], stat_r["max_jump"])
             print(f"[同步诊断] 最大亮度跳变 左={stat_l['max_jump']:.2f} "
                   f"右={stat_r['max_jump']:.2f}；明显事件 左={stat_l['peak_count']} "
-                  f"右={stat_r['peak_count']}；阈值≈{stat_l['threshold']:.2f}")
+                  f"右={stat_r['peak_count']}；事件阈值≈{stat_l['threshold']:.2f}；"
+                  f"闪光门槛={SyncConfig().flash_min_jump:.2f}")
             try:
                 _plot_sync(lb, rb, stat_l, stat_r,
                            session_dir / "derived" / "sync_brightness.png")
             except Exception as exc:                        # noqa: BLE001
                 print(f"[警告] 同步诊断图画不出来：{exc}")
 
-            res = find_offset(lb, rb, SyncConfig(max_offset=180, min_overlap=30))
+            cfg_sync = SyncConfig(max_offset=180, min_overlap=30)
+            res = find_offset(lb, rb, cfg_sync)
             if res.usable:
                 session.sync = SyncInfo(method="flash", offset=int(res.offset),
                                         confidence=float(res.confidence),
@@ -506,9 +508,10 @@ def main() -> int:
                              f"事件 {res.peak_count} 个")
                 print(f"[同步] {res}")
             else:
-                if max_jump < 1.0:
-                    why = (f"没有拍到闪光：最大亮度跳变 {max_jump:.2f} < 1.0。"
-                           "请重录，并在“开始！现在闪光！”后立刻闪一次、结束前再闪一次。")
+                if max_jump < cfg_sync.flash_min_jump:
+                    why = (f"没有足够强的闪光：最大亮度跳变 {max_jump:.2f} < "
+                           f"{cfg_sync.flash_min_jump:.2f}。请重录，并在“开始！现在闪光！”后"
+                           "立刻闪一次、结束前再闪一次。")
                 else:
                     why = (f"有亮度变化但没形成可用闪光事件（最大跳变 {max_jump:.2f}，"
                            f"事件 {max(stat_l['peak_count'], stat_r['peak_count'])} 个）。")
