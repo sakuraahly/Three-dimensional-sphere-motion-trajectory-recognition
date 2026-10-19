@@ -1,8 +1,8 @@
 # SBOM — 软件物料清单
 
-> 生成时间：2026-10-19 10:48:33 +0800　项目提交：`7b78c88`
+> 生成时间：2026-10-19 10:58:21 +0800　生成时 HEAD：`c8fef88`（仅参考）
 > 环境：`myenv`（Python 3.14.7，Windows-11-10.0.26300-SP0）
-> 范围：本机运行环境里 **59 个 Python 发行版** + 原生运行时组件。
+> 范围：本机运行环境里 **59 个 Python 发行版** + **7 个原生运行时组件**。
 > 机器可读版本：[`docs/sbom.cdx.json`](sbom.cdx.json)（CycloneDX 1.5）。
 
 > ⚠️ **这是物料清单，不是法务审查。** 许可证优先取包元数据；元数据空白的项按上游常见许可证补全，并在表里标 `curated`。对外分发前请按 `curated` 项逐条复核。
@@ -89,13 +89,13 @@
 
 | 组件 | 版本 | 许可证 | 范围 | 说明 |
 | --- | --- | --- | --- | --- |
-| CPython | 3.14.7 | PSF-2.0 | required | 解释器；绝对路径 `%USERPROFILE%\miniforge3\envs\myenv\python.exe` |
-| FFmpeg（OpenCV wheel 内置） | prebuilt（版本未暴露） | LGPL-2.1-or-later OR GPL-2.0-or-later | required | OpenCV 的 FFMPEG 后端；许可证取决于 wheel 构建，分发前复核 |
+| CPython | 3.14.7 | PSF-2.0 | required | 解释器；绝对路径 %USERPROFILE%\miniforge3\envs\myenv\python.exe |
+| FFmpeg (OpenCV wheel bundled) | prebuilt-unknown | LGPL-2.1-or-later OR GPL-2.0-or-later | required | OpenCV 的 FFMPEG 后端；许可证取决于 wheel 构建，分发前复核 |
 | NVIDIA CUDA Runtime | 12.8 | NVIDIA proprietary (EULA) | optional | torch 2.11.0+cu128；AI 后端才需要 |
 | NVIDIA cuDNN | 9.19.0 | NVIDIA proprietary (EULA) | optional | torch.backends.cudnn 报 91900 |
-| NVIDIA Display Driver | 577.05 | NVIDIA proprietary (EULA) | required | RTX 5060 Laptop 8 GB；CUDA 12.8 的最低驱动 |
+| NVIDIA Display Driver | 577.05 | NVIDIA proprietary (EULA) | required | NVIDIA GeForce RTX 5060 Laptop GPU；CUDA 的最低驱动 |
 | Intel MKL | 2026.1.0 | Intel Simplified Software License | required | conda 环境里的 BLAS/LAPACK；numpy 使用 |
-| Windows | 11 10.0.26300 | Proprietary | required | 操作系统 |
+| Windows | 10.0.26300 | Proprietary | required | 操作系统 |
 
 ## 5. 许可证汇总
 
@@ -119,7 +119,7 @@
 ## 6. 风险与注意
 
 - **AGPL-3.0**：`ultralytics`、`ultralytics-thop`。只在使用 `--method yolo*` 时进入运行链路；若对外分发包含它们的产物，AGPL 义务需要单独评估。
-- **LGPL-3.0**：`pyside6`、`shiboken6`（conda Qt 绑定）。项目代码不直接 import；matplotlib 的 Qt 后端可能间接使用。分发二进制前按 LGPL 处理。
+- **LGPL / 商业**：`pyside6`、`shiboken6`（conda Qt 绑定，LGPLv3 / GPLv3 / 商业三重许可）。项目代码不直接 import；matplotlib 的 Qt 后端可能间接使用。
 - **NVIDIA 专有**：CUDA / cuDNN / 驱动不可再分发，受 NVIDIA EULA 约束。
 - **OpenCV wheel 内置 FFmpeg**：构建时可能启用 LGPL/GPL 组件；`cv2.getBuildInformation()` 只报 `FFMPEG: YES (prebuilt binaries)`，不暴露版本。
 - **不要同时装 `opencv-python`**：本环境只有 `opencv-contrib-python`；两者都提供 `cv2`，会互相覆盖（`requirements-ai.txt` 已写明 `--no-deps`）。
@@ -131,6 +131,6 @@
 - 直接依赖：`requirements.txt`、`requirements-ai.txt`、`docs/开发指南.md`（PPT 可选）、`docs/计划书.md`（scipy 规划）。
 - 传递闭包：从直接依赖按 `Requires-Dist` 做 BFS，只统计本环境已安装的包。
 - 原生组件：`cv2.getBuildInformation()`、`torch.version.cuda`、`torch.backends.cudnn.version()`、`nvidia-smi`、`environment.yml`。
-- 复现：`pip freeze` + `environment.yml`；本文件是一次性生成的快照，**换机器 / 升级依赖后必须重新生成**。
+- **更新**：`python apps/tools/build_sbom.py`；**检查是否过期**：`python apps/tools/build_sbom.py --check`（退出码 1 = 该更新）。
 - 边界：`environment.yml` 里还有约 90 个 conda 原生包（MKL / Qt / 字体等），本文只列了直接影响运行链路的原生组件；完整 conda 清单以 `environment.yml` 为准。
 

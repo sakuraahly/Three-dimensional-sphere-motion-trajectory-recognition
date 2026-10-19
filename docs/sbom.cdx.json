@@ -1,22 +1,22 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:50f83e22-6fb8-4942-9d29-4e756c685303",
+  "serialNumber": "urn:uuid:7efa523c-1ca9-4d67-b22d-476d5bddf7dd",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-19T10:48:33+08:00",
+    "timestamp": "2026-10-19T10:58:24+08:00",
     "tools": [
       {
         "vendor": "DeepSeek Harness",
-        "name": "manual SBOM builder",
+        "name": "build_sbom.py",
         "version": "1.0"
       }
     ],
     "component": {
       "type": "application",
-      "bom-ref": "pkg:generic/three-dimensional-sphere-motion-trajectory-recognition@7b78c88",
+      "bom-ref": "pkg:generic/three-dimensional-sphere-motion-trajectory-recognition@c8fef88",
       "name": "Three-dimensional-sphere-motion-trajectory-recognition",
-      "version": "7b78c88",
+      "version": "c8fef88",
       "properties": [
         {
           "name": "dsh:python",
@@ -25,6 +25,10 @@
         {
           "name": "dsh:platform",
           "value": "Windows-11-10.0.26300-SP0"
+        },
+        {
+          "name": "dsh:gpu",
+          "value": "NVIDIA GeForce RTX 5060 Laptop GPU"
         }
       ]
     }
@@ -1962,16 +1966,16 @@
         },
         {
           "name": "dsh:note",
-          "value": "解释器；绝对路径 `%USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe`"
+          "value": "解释器；绝对路径 %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe"
         }
       ]
     },
     {
       "type": "library",
-      "bom-ref": "pkg:generic/ffmpeg%EF%BC%88opencv-wheel-%E5%86%85%E7%BD%AE%EF%BC%89@prebuilt%EF%BC%88%E7%89%88%E6%9C%AC%E6%9C%AA%E6%9A%B4%E9%9C%B2%EF%BC%89",
-      "name": "FFmpeg（OpenCV wheel 内置）",
-      "version": "prebuilt（版本未暴露）",
-      "purl": "pkg:generic/ffmpeg%EF%BC%88opencv-wheel-%E5%86%85%E7%BD%AE%EF%BC%89@prebuilt%EF%BC%88%E7%89%88%E6%9C%AC%E6%9C%AA%E6%9A%B4%E9%9C%B2%EF%BC%89",
+      "bom-ref": "pkg:generic/ffmpeg-%28opencv-wheel-bundled%29@prebuilt-unknown",
+      "name": "FFmpeg (OpenCV wheel bundled)",
+      "version": "prebuilt-unknown",
+      "purl": "pkg:generic/ffmpeg-%28opencv-wheel-bundled%29@prebuilt-unknown",
       "scope": "required",
       "licenses": [
         {
@@ -2060,7 +2064,7 @@
         },
         {
           "name": "dsh:note",
-          "value": "RTX 5060 Laptop 8 GB；CUDA 12.8 的最低驱动"
+          "value": "NVIDIA GeForce RTX 5060 Laptop GPU；CUDA 的最低驱动"
         }
       ]
     },
@@ -2090,11 +2094,11 @@
       ]
     },
     {
-      "type": "platform",
-      "bom-ref": "pkg:generic/windows@11%2010.0.26300",
+      "type": "operating-system",
+      "bom-ref": "pkg:generic/windows@10.0.26300",
       "name": "Windows",
-      "version": "11 10.0.26300",
-      "purl": "pkg:generic/windows@11%2010.0.26300",
+      "version": "10.0.26300",
+      "purl": "pkg:generic/windows@10.0.26300",
       "scope": "required",
       "licenses": [
         {
@@ -2117,7 +2121,7 @@
   ],
   "dependencies": [
     {
-      "ref": "pkg:generic/three-dimensional-sphere-motion-trajectory-recognition@7b78c88",
+      "ref": "pkg:generic/three-dimensional-sphere-motion-trajectory-recognition@c8fef88",
       "dependsOn": [
         "pkg:pypi/lxml@6.1.3",
         "pkg:pypi/matplotlib@3.11.2",
@@ -2545,7 +2549,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:generic/ffmpeg%EF%BC%88opencv-wheel-%E5%86%85%E7%BD%AE%EF%BC%89@prebuilt%EF%BC%88%E7%89%88%E6%9C%AC%E6%9C%AA%E6%9A%B4%E9%9C%B2%EF%BC%89",
+      "ref": "pkg:generic/ffmpeg-%28opencv-wheel-bundled%29@prebuilt-unknown",
       "dependsOn": []
     },
     {
@@ -2565,7 +2569,7 @@
       "dependsOn": []
     },
     {
-      "ref": "pkg:generic/windows@11%2010.0.26300",
+      "ref": "pkg:generic/windows@10.0.26300",
       "dependsOn": []
     }
   ]

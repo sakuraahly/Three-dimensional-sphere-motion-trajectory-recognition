@@ -105,7 +105,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | -- | ---- | ---- |
 | **相机 / 标定**（8） | `cameras.py` `list_cameras.py` `camera_quality.py` `check_stereo_setup.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` | 课题主线 |
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
-| **文档与事实**（4） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落） |
+| **文档与事实**（5） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` `build_sbom.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落）、生成 / 更新 SBOM |
 | **数据 / 会话**（1） | `check_dataset.py` | 校验录制会话（视频 / 标定 / 同步） |
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
