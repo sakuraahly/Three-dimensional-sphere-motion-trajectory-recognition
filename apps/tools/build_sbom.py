@@ -653,6 +653,30 @@ def _norm_bom(bom: dict) -> str:
     return json.dumps(b, sort_keys=True, ensure_ascii=False)
 
 
+def _read_bom(path: Path) -> dict:
+    """读并做最小结构校验；坏文件要报人话，不是抛 traceback。"""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"读不了 {path.name}：{exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path.name} 不是合法 JSON：{exc}") from exc
+    if not isinstance(data, dict) or data.get("bomFormat") != "CycloneDX":
+        raise ValueError(f"{path.name} 不是 CycloneDX（bomFormat 缺失或不是对象）")
+    if not isinstance(data.get("components"), list):
+        raise ValueError(f"{path.name} 的 components 缺失或不是数组")
+    if any(not isinstance(c, dict) for c in data["components"]):
+        raise ValueError(f"{path.name} 的 components 里有非对象元素")
+    if not isinstance(data.get("metadata", {}), dict):
+        raise ValueError(f"{path.name} 的 metadata 不是对象")
+    deps = data.get("dependencies", [])
+    if not isinstance(deps, list) or any(not isinstance(d, dict) for d in deps):
+        raise ValueError(f"{path.name} 的 dependencies 不是对象数组")
+    return data
+
+
 def check(out_dir: Path, quiet: bool = False) -> int:
     md_path = out_dir / MD_FILE
     json_path = out_dir / SCHEMA_FILE
@@ -666,8 +690,13 @@ def check(out_dir: Path, quiet: bool = False) -> int:
     if not quiet:
         for w in warnings:
             print(f"  [警告] {w}")
-    old_md = md_path.read_text(encoding="utf-8")
-    old_bom = json.loads(json_path.read_text(encoding="utf-8"))
+    try:
+        old_md = md_path.read_text(encoding="utf-8")
+        old_bom = _read_bom(json_path)
+    except (OSError, ValueError) as exc:
+        print(f"[过期] 读不了现有 SBOM：{exc}")
+        print("  更新：python apps/tools/build_sbom.py")
+        return 1
     if _norm_md(old_md) == _norm_md(want_md) and _norm_bom(old_bom) == _norm_bom(want_bom):
         if not quiet:
             print("SBOM 已是最新（组件 / 版本 / 许可证 / 原生组件一致）")
@@ -697,15 +726,23 @@ def write(out_dir: Path, quiet: bool = False) -> int:
     if not quiet:
         for w in warnings:
             print(f"  [警告] {w}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"[错误] 建不了输出目录 {out_dir}：{exc}")
+        return 1
     md_text = build_markdown(data)
     bom_text = json.dumps(build_bom(data), indent=2, ensure_ascii=False) + "\n"
-    for path, text in ((out_dir / MD_FILE, md_text), (out_dir / SCHEMA_FILE, bom_text)):
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(path)
-        if not quiet:
-            print(f"已更新：{path}")
+    try:
+        for path, text in ((out_dir / MD_FILE, md_text), (out_dir / SCHEMA_FILE, bom_text)):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(path)
+            if not quiet:
+                print(f"已更新：{path}")
+    except OSError as exc:
+        print(f"[错误] 写 SBOM 失败：{exc}")
+        return 1
     if not quiet:
         print(f"  Python 发行版 {len(data['dists'])}；原生组件 {len(data['native'])}；"
               f"直接依赖 {len(data['direct_present'])}")
