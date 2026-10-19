@@ -41,7 +41,6 @@ class SpecularBallDetector(BaseDetector):
         self._template: np.ndarray | None = None
         self._prev_patch: np.ndarray | None = None
         self._prev_center: tuple[float, float] | None = None
-        self._prev_gray: np.ndarray | None = None
         self._started = False
         self._frames_since_seed = 0
         self._static_frames = 0
@@ -60,7 +59,6 @@ class SpecularBallDetector(BaseDetector):
         self._template = None
         self._prev_patch = None
         self._prev_center = None
-        self._prev_gray = None
         self._started = False
         self._frames_since_seed = 0
         self._static_frames = 0
@@ -74,7 +72,6 @@ class SpecularBallDetector(BaseDetector):
         self._template = None
         self._prev_patch = None
         self._prev_center = None
-        self._prev_gray = None
         self._started = False
         self._frames_since_seed = 0
         self._static_frames = 0
@@ -128,7 +125,7 @@ class SpecularBallDetector(BaseDetector):
     def detect(self, frame: np.ndarray, ctx=None) -> list[Detection]:
         c = self.cfg.specular
         # CSRT 在**彩色图**上明显更稳：实测左路灰度 1/11，BGR 10/11@15px。
-        track_frame = frame if frame.ndim == 3 else frame
+        track_frame = frame
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         # ctx.gray 可能是放大前的原图（pipeline 的 detect-width 坑），形状不符就不用
         if ctx is not None and getattr(ctx, "gray", None) is not None:
@@ -166,7 +163,6 @@ class SpecularBallDetector(BaseDetector):
                 self._tracker = tracker
                 self._bbox = bbox
                 self._template = self._patch(gray, bbox)
-                self._prev_gray = gray
                 self._prev_center = (x, y)
                 self._started = True
                 self._frames_since_seed = 0
@@ -228,7 +224,6 @@ class SpecularBallDetector(BaseDetector):
         self._bbox = (x, y, w, h)
         self._prev_patch = patch
         self._prev_center = (cx, cy)
-        self._prev_gray = gray
         self._recent.append((cx, cy))
         if len(self._recent) >= self._recent.maxlen:
             xs = [p[0] for p in self._recent]

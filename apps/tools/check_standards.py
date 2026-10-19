@@ -133,6 +133,14 @@ KNOWN_MENTIONS: dict[str, str] = {
         "P4 计划中的世界系变换文件，尚未实现",
     "docs/数据标准.md:world_frame.json":
         "世界系变换文件，尚未实现（数据标准里明确标注）",
+    "AGENTS.md:apps/view_3d.py":
+        "3D 查看器由子 agent 实现中，路径先在规则文档里登记",
+    "docs/交接文档.md:apps/view_3d.py":
+        "3D 查看器由子 agent 实现中，尚未合并",
+    "docs/交接文档.md:docs/3D查看器.md":
+        "3D 查看器文档由子 agent 实现中，尚未合并",
+    "docs/交接文档.md:world_frame.json":
+        "世界系变换文件，尚未实现（交接文档 §8 明确标注）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
         "同上（`AGENTS.md:STC` 之外的简写形式）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":

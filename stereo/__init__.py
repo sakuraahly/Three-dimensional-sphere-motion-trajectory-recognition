@@ -6,6 +6,7 @@
     sync.py         双路视频同步（闪光/拍手对齐），算出帧偏移
     pair_source.py  成对帧源：按 sync_offset 取到"同一时刻"的左右两帧
     triangulate.py  极线约束配对 + 三角测量 + 三维轨迹
+    visualization.py 标准数据：seeds / traj3d.json / visualization.json
     sessions.py     采集会话：session.json 的读写与校验（data/ 的契约）
 
 分工说明：
