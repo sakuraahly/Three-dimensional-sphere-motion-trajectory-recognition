@@ -252,10 +252,11 @@ def test_handover_section_13_claims() -> bool:
 
     # (说明, 文件, 必须出现的片段)
     FACTS = [
-        ("标定默认 25 / 10", "apps/calibrate_stereo.py",
-         ["default=25", "default=10"]),
+        ("标定默认 40 / 20", "apps/calibrate_stereo.py",
+         ["default=40", "default=20"]),
         ("GUI 把 --display-width 传下去", "启动程序.py", ["--display-width"]),
-        ("GUI 标定面板默认 25", "启动程序.py", ['"25"']),
+        ("GUI 标定面板默认 40 / 20 / 30", "启动程序.py",
+         ['"40"', '"20"', '"30"']),
         ("GUI 用 resolve_roles（两个角色不撞车）", "启动程序.py", ["resolve_roles"]),
         ("GUI 有任务管理器且杀进程树", "启动程序.py", ["def stop_task", "taskkill"]),
         ("同名相机歧义会被拦下", "sphere_tracker/camera_registry.py",

@@ -116,7 +116,7 @@ def add_stereo_source_args(
     *,
     width: int = 1920,
     height: int = 1080,
-    fps: int = 60,
+    fps: int = 30,
 ) -> argparse.ArgumentParser:
     """补上双目取帧参数 —— 字段名与 ``stereo.from_args()`` 读的一一对应。
 

@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "apps").is_dir() and ROOT.parent != ROOT:
@@ -492,11 +492,11 @@ class Launcher(tk.Tk):
         # ---- 基本 ----
         #
         # 分组标题也走 `_hint()`：**行号统一由游标分配**，一处手算都没有。
-        self._hint(basic, "① 收多少对（越多越准，25 对约需举板几分钟）")
+        self._hint(basic, "① 收多少对（越多越准，40 对约需举板几分钟）")
         self.calib_target = self._param_entry(
-            basic, "目标对数", "25", "收够就自动开始标定（默认 25 = 正式档）")
+            basic, "目标对数", "40", "收够就自动开始标定（默认 40 = 正式档）")
         self.calib_minpairs = self._param_entry(
-            basic, "最少对数", "10", "少于这么多不做标定；剔除离群后不足会直接拒绝")
+            basic, "最少对数", "20", "少于这么多不做标定；剔除离群后不足会直接拒绝")
 
         self._hint(basic, "② 标定板（必须和手上那张纸完全一致）")
         self.calib_cols = self._param_entry(
@@ -520,7 +520,7 @@ class Launcher(tk.Tk):
         ttk.Label(basic, text="帧率").grid(row=row, column=2, sticky="e",
                                           padx=(24, 6), pady=(4, 0))
         self.calib_fps = ttk.Entry(basic, width=6)
-        self.calib_fps.insert(0, "60")
+        self.calib_fps.insert(0, "30")
         self.calib_fps.grid(row=row, column=3, sticky="w", pady=(4, 0))
         self._hint(basic, "两台相机必须同分辨率、同后端，否则一对有效图像都收不到")
 
@@ -670,6 +670,8 @@ class Launcher(tk.Tk):
                    command=self._start_realtime).grid(row=1, column=0, padx=(0, 12), pady=4)
         ttk.Button(box, text="打开离线视频", style="Go.TButton",
                    command=self._start_video).grid(row=1, column=1, padx=(0, 12), pady=4)
+        ttk.Button(box, text="录制双目（无损）", command=self._start_record).grid(
+            row=2, column=0, padx=(0, 12), pady=4)
         ttk.Button(box, text="快测（十几秒）", command=self._run_tests_fast).grid(
             row=1, column=2, padx=(0, 6), pady=4)
         ttk.Button(box, text="全套回归（7 分钟）", command=self._run_tests_full).grid(
@@ -677,7 +679,7 @@ class Launcher(tk.Tk):
         ttk.Button(box, text="规范自查", command=self._run_standards).grid(
             row=1, column=4, pady=4)
         self.status = ttk.Label(box, text="就绪", style="Hint.TLabel")
-        self.status.grid(row=2, column=0, columnspan=5, sticky="w", padx=2)
+        self.status.grid(row=3, column=0, columnspan=5, sticky="w", padx=2)
 
     # ---------- 运行日志 ----------
     def _build_log(self) -> None:
@@ -757,6 +759,43 @@ class Launcher(tk.Tk):
         cmd += self._common_args()
         self._append(f"结果视频将保存到：{out}")
         self._run(cmd, "离线视频分析")
+
+    def _record_args(self, duration: str, label: str) -> list[str]:
+        """GUI「录制双目」按钮 -> record_stereo.py 的命令行。"""
+        width, height = self.calib_res.get().split("x")
+        return [
+            PY, str(ROOT / "apps" / "record_stereo.py"),
+            "--left", self.calib_left.get(),
+            "--right", self.calib_right.get(),
+            "--width", width, "--height", height, "--fps", "30",
+            "--duration", str(duration),
+            "--label", (label or "gui_record").strip(),
+            "--preview", "--notes", "GUI 录制",
+        ]
+
+    def _start_record(self) -> None:
+        if self.calib_left.get() == "auto" or self.calib_right.get() == "auto":
+            messagebox.showwarning(
+                "录制双目", "录制需要明确左/右相机，不能选 auto；请在「第 1 步」选 left / right。")
+            return
+        raw = simpledialog.askstring(
+            "录制双目", "录多久（秒，1–600）？", initialvalue="10", parent=self)
+        if raw is None:
+            return
+        try:
+            duration = int(raw.strip())
+            if not 1 <= duration <= 600:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("参数不对", f"时长要填 1–600 的整数，现在是「{raw}」。")
+            return
+        label = simpledialog.askstring(
+            "录制双目", "标签（可空；会写进 session.json）", initialvalue="", parent=self)
+        if label is None:
+            return
+        cmd = self._record_args(str(duration), label)
+        self._append(f"录制：{duration} 秒；开始后闪一次光，结束前再闪一次。")
+        self._run(cmd, f"录制双目（{duration} 秒）")
 
     def _confirm_stereo_cameras(self, left: str, right: str) -> bool:
         """标定/复检前的相机检查。**弹窗报错就返回 False（拦住这次操作）**。
@@ -909,7 +948,7 @@ class Launcher(tk.Tk):
             return None
 
         width, height = self.calib_res.get().split("x")
-        fps = self.calib_fps.get().strip() or "60"
+        fps = self.calib_fps.get().strip() or "30"
         args = ["--left", _cam_arg(self.calib_left.get()),
                 "--right", _cam_arg(self.calib_right.get()),
                 "--cols", str(cols), "--rows", str(rows), "--square", str(square),
@@ -960,7 +999,7 @@ class Launcher(tk.Tk):
             return
         left, right = _cam_arg(left_raw), _cam_arg(right_raw)
         width, height = self.calib_res.get().split("x")
-        fps = self.calib_fps.get().strip() or "60"
+        fps = self.calib_fps.get().strip() or "30"
         if mode == "calibrate":
             extra = self._calibrate_args()
             if extra is None:
@@ -1006,7 +1045,7 @@ class Launcher(tk.Tk):
             return
         left, right = _cam_arg(left_raw), _cam_arg(right_raw)
         width, height = self.calib_res.get().split("x")
-        fps = self.calib_fps.get().strip() or "60"
+        fps = self.calib_fps.get().strip() or "30"
         cmd = [PY, str(ROOT / "apps" / "tools" / "check_stereo_setup.py"),
                "--left", left, "--right", right,
                "--width", width, "--height", height, "--fps", fps]

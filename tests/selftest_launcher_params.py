@@ -2,7 +2,7 @@
 
 为什么需要它
 ------------
-用户要求的"标定要 25 张 + UI 里能设标定参数"落地时，暴露了一个**真缺陷**：
+用户要求的"标定要收足够多对 + UI 里能设标定参数"落地时，暴露了一个**真缺陷**：
 
 `启动程序.py` 原来把板参数**硬编码**在命令里（`--cols 8 --rows 5 --square 25`），
 而且**完全没有 `--target`** —— 于是从界面走标定，**永远用脚本默认的那一档**。
@@ -13,7 +13,7 @@
 
 本测试钉四件事：
 
-1. **默认值就是正式档**（`--target 25 --min-pairs 10`）；
+1. **默认值就是正式档**（`--target 40 --min-pairs 20`）；
 2. **可选项留空 = 不传该参数**（不留空才传，尤其 `--baseline-mm` 是基线护栏的开关）；
 3. **非法输入与参数矛盾必须被拦住**，并且给出可读的原因；
 4. 低目标档仍然可用（只是会在标定程序里打印显式警告）。
@@ -187,8 +187,8 @@ def main() -> int:
 
     # ---- 1. 默认就是正式档 ----
     print("----- 1. 默认值 = 正式档（这条是本测试存在的主要理由）-----")
-    expect("默认传 --target 25 --min-pairs 10", True,
-           contains="--target 25 --min-pairs 10")
+    expect("默认传 --target 40 --min-pairs 20", True,
+           contains="--target 40 --min-pairs 20")
 
     # ---- 2. 板参数真的来自面板 ----
     print("----- 2. 板参数来自面板，不是硬编码 -----")
@@ -252,8 +252,8 @@ def main() -> int:
     print(f"  清晰度  ：面板 {got_sharp!r} / CaptureConfig {expect_sharp}")
     for label, got, want in (("停稳上限 px", got_stationary, expect_stationary),
                              ("清晰度下限", got_sharp, expect_sharp),
-                             ("目标对数", app.calib_target.get().strip(), "25"),
-                             ("最少对数", app.calib_minpairs.get().strip(), "10"),
+                             ("目标对数", app.calib_target.get().strip(), "40"),
+                             ("最少对数", app.calib_minpairs.get().strip(), "20"),
                              ("内角点·列", app.calib_cols.get().strip(), "8"),
                              ("内角点·行", app.calib_rows.get().strip(), "5"),
                              ("方格边长 mm", app.calib_square.get().strip(), "25")):
@@ -301,7 +301,7 @@ def main() -> int:
     for bad, label in (("abc", "非数字"), ("0", "越界(0)"), ("999", "越界(999)")):
         _set(app.calib_target, bad)
         expect(f"目标对数={bad}（{label}）-> 拒绝", False)
-        _set(app.calib_target, "25")
+        _set(app.calib_target, "40")
     _set(app.calib_baseline, "xyz")
     expect("预期基线=xyz -> 拒绝", False)
     _set(app.calib_baseline, "")
@@ -311,16 +311,16 @@ def main() -> int:
     _set(app.calib_target, "5")
     _set(app.calib_minpairs, "10")
     expect("最少对数 > 目标对数 -> 拒绝（否则永远达不到下限）", False)
-    _set(app.calib_target, "25")
-    _set(app.calib_minpairs, "10")
+    _set(app.calib_target, "40")
+    _set(app.calib_minpairs, "20")
 
     # ---- 6. 试标定档仍合法 ----
     print("----- 6. 低目标档仍合法（只是标定程序会显式警告）-----")
     _set(app.calib_target, "8")
     _set(app.calib_minpairs, "8")
     expect("target=8 -> 允许（验证通信用）", True, contains="--target 8")
-    _set(app.calib_target, "25")
-    _set(app.calib_minpairs, "10")
+    _set(app.calib_target, "40")
+    _set(app.calib_minpairs, "20")
 
     # ---- 7. 分辨率/帧率 ----
     print("----- 7. 分辨率 / 帧率仍然生效 -----")
@@ -328,6 +328,7 @@ def main() -> int:
     expect("1280x720 -> --width 1280 --height 720", True,
            contains="--width 1280 --height 720")
     app.calib_res.set("1920x1080")
+    expect("默认帧率 30 -> --fps 30", True, contains="--fps 30")
     # ⚠️ **2026-10-14 改了这条断言**：它原来是
     #   `expect("两台相机必须同后端（backend 固定 msmf）", True, contains="--backend msmf")`
     # 也就是把"写死 msmf"当成契约。现在后端由面板决定（见第 2.5 节），
@@ -341,6 +342,22 @@ def main() -> int:
     results.append(("两台相机同后端：--backend 只出现一次", n_be == 1))
     print(f"  [{'通过' if n_be == 1 else '不达标'}] 两台相机同后端：--backend 只出现一次")
     app.calib_backend.set("auto")
+
+    # ---- 8. GUI 录制按钮 ----
+    print("----- 8. GUI「录制双目」按钮的参数 -----")
+    rec = app._record_args("10", "gui_test")
+    rec_s = " ".join(rec)
+    checks_rec = [
+        ("调用 apps/record_stereo.py", "record_stereo.py" in rec_s),
+        ("带 --duration 10", "--duration 10" in rec_s),
+        ("带 --preview", "--preview" in rec_s),
+        ("带 --label gui_test", "--label gui_test" in rec_s),
+        ("带 --left left --right right", "--left left --right right" in rec_s),
+        ("带 --fps 30", "--fps 30" in rec_s),
+    ]
+    for label, good in checks_rec:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
 
     # ---- 9. 可滚动布局（"新加的东西把原来的挤掉"是真实回归）----
     #
@@ -487,20 +504,26 @@ def main() -> int:
         print(f"  [{'通过' if good else '不达标'}] {name}")
         results.append((name, good))
 
+    panel_target = app.calib_target.get().strip()
+    panel_minp = app.calib_minpairs.get().strip()
+    panel_fps = app.calib_fps.get().strip()
     app.destroy()
 
     # ---- 8. 标定脚本自己的默认值也必须是正式档 ----
     #
-    # 面板默认 25 但脚本默认 8 的话，**从命令行走的人仍然会停在试标定档** ——
+    # 面板默认 40 但脚本默认 8 的话，**从命令行走的人仍然会停在试标定档** ——
     # 两处必须一致。改任何一处，这条都会红。
     #
     # ⚠️ 判据不能靠 `--help`：argparse 默认**不打印** default（除非用
     # `ArgumentDefaultsHelpFormatter`）。第一版就是这么写的，于是永远拿到
     # "(未打印 default)" 而报红 —— 那是**判据写错了**，不是代码错。
     # 改从源码里读 `add_argument("--target", ..., default=N)`。
-    print("----- 8. calibrate_stereo.py 的默认值（命令行入口）-----")
+    print("----- 8. calibrate_stereo.py / _common.py 的默认值（命令行入口）-----")
     import re as _re
     src = (ROOT / "apps" / "calibrate_stereo.py").read_text(encoding="utf-8")
+    common_src = (ROOT / "apps" / "_common.py").read_text(encoding="utf-8")
+    fps_m = _re.search(r"fps:\s*int\s*=\s*(\d+)", common_src)
+    common_fps = fps_m.group(1) if fps_m else "(找不到 fps 默认值)"
 
     def default_of(flag: str) -> str:
         """从 `add_argument("<flag>" ...)` 那一段里抠出 default 值。"""
@@ -514,10 +537,13 @@ def main() -> int:
 
     tgt = default_of("--target")
     mp = default_of("--min-pairs")
-    print(f"  源码里 --target 的 default = {tgt}；--min-pairs 的 default = {mp}")
+    print(f"  源码里 --target 的 default = {tgt}；--min-pairs 的 default = {mp}；"
+          f"_common.py 的 fps default = {common_fps}")
+    print(f"  面板默认：target={panel_target} minpairs={panel_minp} fps={panel_fps}")
     checks = [
-        ("--target 默认 25（与面板一致）", tgt == "25"),
-        ("--min-pairs 默认 10（与面板一致）", mp == "10"),
+        ("--target 默认 40（与面板一致）", tgt == panel_target == "40"),
+        ("--min-pairs 默认 20（与面板一致）", mp == panel_minp == "20"),
+        ("--fps 默认 30（与面板一致）", common_fps == panel_fps == "30"),
         ("试标定档的文字说明还在（让人知道可以显式给 8）",
          "8" in src and "试标定" in src),
     ]

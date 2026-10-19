@@ -137,14 +137,15 @@ def main() -> int:
     #   · 姿态覆盖必然不足，边角区域的畸变约束不住 —— 三维在画面边角会偏。
     # **拿它验证"通路能不能跑通"可以，拿它出正式三维结果不行。**
     #
-    # ⚠️ **默认值已从 8/8 改为 25/10**（2026-10-13，用户要求）。
+    # ⚠️ **默认值已从 8/8 -> 25/10 -> 40/20**（2026-10-19，按真机标定经验）。
     # 原来的 8/8 是"试标定档"，但用户从 GUI 走时根本不会去加参数，
     # 于是**永远停在试标定档**却以为在做正式标定 —— 那比没有默认值更糟。
-    # 现在默认就是正式档；只想验证通路请显式给 `--target 8`。
-    ap.add_argument("--target", type=int, default=25,
-                    help="目标收多少对（默认 25 = 正式；只想验证通路可给 8）")
-    ap.add_argument("--min-pairs", type=int, default=10,
-                    help="最少收多少对才尝试标定（默认 10）")
+    # 40 对是**输入**对数：真机约 1/3 会因移动/位姿重复被剔除，
+    # 留出余量后仍能剩 20+ 对参与求解。只想验证通路请显式给 `--target 8`。
+    ap.add_argument("--target", type=int, default=40,
+                    help="目标收多少对（默认 40 = 正式；只想验证通路可给 8）")
+    ap.add_argument("--min-pairs", type=int, default=20,
+                    help="最少收多少对才尝试标定（默认 20）")
     ap.add_argument("--baseline-mm", type=float, default=None, help="预期基线（毫米），用于核对")
     ap.add_argument("--out", default="config/stereo_calibration", help="输出前缀")
     ap.add_argument("--save-pairs", default=None, help="把收下的图像对另存到这个目录（便于复查）")
@@ -182,11 +183,11 @@ def main() -> int:
     if args.target < 15:
         # 低目标数必须**显式可见**，不能悄悄用：否则以后看到一份差标定，
         # 没人知道是因为只收了几对。
-        print(f"⚠ 试标定档：只收 {args.target} 对（默认/正式档 25 对）。")
+        print(f"⚠ 试标定档：只收 {args.target} 对（默认/正式档 40 对）。")
         print("   内参是固定的，少几对也能解出外参，但姿态覆盖不足、离群剔除会被下限卡住 ——")
-        print("   **够验证通路，不够出正式三维结果**。要正式标定去掉 --target（默认 25）")
+        print("   **够验证通路，不够出正式三维结果**。要正式标定去掉 --target（默认 40）")
         print()
-        log.warning("试标定档：target=%d（正式档 25）", args.target)
+        log.warning("试标定档：target=%d（正式档 40）", args.target)
     log.info("标定板：%s", spec.describe())
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
     print()

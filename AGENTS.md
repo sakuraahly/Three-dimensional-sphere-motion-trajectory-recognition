@@ -236,7 +236,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_viz_scale.py` | `viz.scale`：整张图的**所有叠加**都随画布一起缩放（不只是预测线） |
 | `selftest_capture_health.py` | 采集健康度：**「相机没了」必须与「球没动」分得开**（`read_errors` / `stalled()`） |
 | `selftest_camera_presence.py` | 没有相机时**必须立刻说清并指对方向**（判定可注入，沙箱里可跑全分支） |
-| `selftest_launcher_params.py` | 启动器标定参数面板：**默认是正式档**（25/10）、留空不传、非法输入被拦住 |
+| `selftest_launcher_params.py` | 启动器标定参数面板：**默认是正式档**（40/20）、留空不传、非法输入被拦住 |
 | `selftest_task_manager.py` | 任务管理器：能中断、**子进程树一起收干净**（「看着停了其实还在」是最难发现的） |
 | `selftest_window_mode.py` | 窗口全屏：**所有**视频窗口都接上 `apps/_window.py`；Esc 在全屏时只退全屏、不关程序；不抢已用的键 |
 | `selftest_mutation_guards.py` | **变异自证总集**：把 13 处"当初的缺陷"逐个放回去，证明对应判据**真的会红**（改源码前有备份/恢复 + SHA256 校验；锚点不唯一就跳过）。**慢**，属 full 档 |
@@ -267,8 +267,8 @@ apps / tests                        （只调用，不被调用）
 - **三维可视化不完整**：已有内嵌 2D 面板（`viz.draw_3d_panel`），
   缺 plotly / Unity 真三维视图；3D 平滑、双目接实时主流程同样未做，见 `docs/计划书.md`。
 - **真机标定**：已跑通并落盘 `config/stereo_calibration.*`。
-  最新一次 **2026-10-18 11:25**：基线 67.98 mm、整体 RMS 0.939 px、
-  极线 0.908 px，判定"**勉强可用**"。
+  最新一次 **2026-10-19 19:02**：基线 64.60 mm、整体 RMS 0.950 px、
+  极线 1.182 px、有效 25/40 对、板占 3.7%，判定"**勉强可用**"。
   **数值随每次重标而变 —— 以 `config/stereo_calibration.json` 为准，别抄这里的。**
   极线离验收线（0.3 px）还差一倍，**要提精度得按报告建议重拍** ——
   这是当前最值得做的一件事，细节见 `docs/交接文档.md` §13.2。
