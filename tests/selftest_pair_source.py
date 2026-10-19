@@ -32,6 +32,7 @@ import argparse
 import shutil
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -421,17 +422,61 @@ def test_from_args(base: Path) -> bool:
                    "_explicit_index" in body))
 
     # 守卫：角色名 + dshow 必须被拒绝（这是"静默用错相机"的唯一入口）
+    #
+    # ⚠️ **2026-10-19 修假红**：这一段原来直接调 `from_args`，它会去查**真实的**
+    # `config/cameras.json` 与真实设备表。没插相机时，角色解析（`resolve_camera_arg`）
+    # 在 `from_args` 里就先抛"没有为「left」选定相机"，**走不到后面的后端守卫**
+    # —— 判据要的"不能一起用 / PnP"当然对不上，于是 fast 档在没有相机的机器上必红。
+    # 这是项目记过的坑 24（"替身测试必须断言替身真的走到了那一步"）的同型问题。
+    #
+    # 现在只替身**输入**（角色解析 + PairSource 构造）：
+    #   - 守卫本身仍走产品代码，不是把判据改写成源码字符串；
+    #   - 两条"非空转"判据见下面：left/right 各解析一次 + 桩没被构造；
+    #   - PairSource 换成桩，万一守卫没抛，也不会真的去开相机。
+    from stereo import pair_source as _pair_source
+
+    real_resolve = _pair_source.resolve_camera_arg
+    real_pair_source = _pair_source.PairSource
+    resolved: list[str] = []
+    built: list[tuple] = []
+
+    class _StubPairSource:
+        """守卫没拦住时才会被构造 —— 只记录参数，绝不碰相机。"""
+
+        def __init__(self, *args, **kwargs) -> None:
+            built.append((args, kwargs))
+
+    def _fake_resolve(value):
+        resolved.append(str(value))
+        return {"left": 0, "right": 1}.get(str(value), 0)
+
+    _pair_source.resolve_camera_arg = _fake_resolve
+    _pair_source.PairSource = _StubPairSource
     try:
-        from_args(ns(left="left", right="right", backend="dshow"))
-        checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", False))
-    except RuntimeError as exc:
-        msg = str(exc)
-        ok_guard = ("不能一起用" in msg) and ("PnP" in msg)
-        print(f"  守卫拒绝：{msg.splitlines()[0][:74]}")
-        checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", ok_guard))
-    except Exception as exc:                         # noqa: BLE001
-        checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", False))
-        print(f"  守卫抛了非 RuntimeError：{type(exc).__name__}: {exc}")
+        try:
+            from_args(ns(left="left", right="right", backend="dshow"))
+        except RuntimeError as exc:
+            msg = str(exc)
+            ok_guard = ("不能一起用" in msg) and ("PnP" in msg)
+            print(f"  守卫拒绝：{msg.splitlines()[0][:74]}")
+            checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", ok_guard))
+        except Exception as exc:                     # noqa: BLE001
+            checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", False))
+            print(f"  守卫抛了非 RuntimeError：{type(exc).__name__}: {exc}")
+        else:
+            checks.append(("角色名 + --backend dshow -> **拒绝**（否则静默用错相机）", False))
+            print("  守卫没有拒绝：from_args 成功返回了（已用桩，没有真开相机）")
+    finally:
+        _pair_source.resolve_camera_arg = real_resolve
+        _pair_source.PairSource = real_pair_source
+
+    # 两条"非空转"判据，分工不同：
+    #   ① 角色解析被调用了 left/right **各一次**（顺序不算契约，用 Counter 抹掉）；
+    #   ② 守卫在**构造 PairSource 之前**就拒绝 —— 否则守卫若被挪到构造之后，
+    #      真机会先开相机、而异常照样让测试变绿（`built` 非空才抓得住）。
+    checks.append(("替身确实被调用：left/right 各一次",
+                   Counter(resolved) == Counter({"left": 1, "right": 1})))
+    checks.append(("守卫在构造 PairSource 之前就拒绝（没真开相机）", built == []))
 
     try:
         from_args(ns())
