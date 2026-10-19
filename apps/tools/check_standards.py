@@ -119,6 +119,12 @@ KNOWN_MENTIONS: dict[str, str] = {
         "P1 **计划新增**的双路录制入口，等相机接上再做",
     "docs/planbooks/2026-10-19_数据采集与结构整理.md:apps/run_stereo_video.py":
         "P2 **计划新增**的离线双目入口，尚未实现",
+    "docs/planbooks/2026-10-19_相机接入与数据采集.md:apps/record_stereo.py":
+        "P2 **计划新增**的双路录制入口，相机已接但尚未实现",
+    "docs/planbooks/2026-10-19_相机接入与数据采集.md:apps/run_stereo_video.py":
+        "P3 **计划新增**的离线双目入口，尚未实现",
+    "docs/planbooks/2026-10-19_相机接入与数据采集.md:world_frame.json":
+        "P6 计划中的世界系变换文件，尚未实现",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
         "同上（`AGENTS.md:STC` 之外的简写形式）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":
