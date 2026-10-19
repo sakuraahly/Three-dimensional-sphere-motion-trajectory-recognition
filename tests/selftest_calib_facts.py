@@ -67,8 +67,11 @@ RANSAC 的随机性 —— `cv2.setRNGSeed()` **管不住它**（已实测）。
 from __future__ import annotations
 
 import copy
+import json
 import re
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
@@ -78,6 +81,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
+from calib.export import build_export, write_export
 from calib.params import StereoRig
 from calib.stereo_calib import CalibConfig, StereoCalibrationResult, calibrate_stereo
 
@@ -519,6 +523,89 @@ def test_board_area_and_tiered_verdict() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def _fake_rig_for_export() -> StereoRig:
+    """一个 65 mm 基线的合成装置，专门用来测导出（不碰真实标定文件）。"""
+    K = np.array([[800.0, 0.0, 320.0],
+                  [0.0, 800.0, 240.0],
+                  [0.0, 0.0, 1.0]])
+    D = np.zeros((1, 5))
+    T = np.array([[-0.065], [0.0], [0.0]])
+    P1 = np.hstack([K, np.zeros((3, 1))])
+    P2 = P1.copy()
+    P2[0, 3] = -800.0 * 0.065
+    return StereoRig(
+        K1=K, D1=D, K2=K.copy(), D2=D.copy(), R=np.eye(3), T=T,
+        image_size=(640, 480), E=np.eye(3), F=np.eye(3),
+        R1=np.eye(3), R2=np.eye(3), P1=P1, P2=P2, Q=np.eye(4),
+        quality={"rms": 0.5, "epipolar_rms": 0.4,
+                 "fx_sigma_px": float("nan"), "verdict": "测试"},
+        meta={"board": "8x5 25mm", "created": "2026-01-01 00:00:00",
+              "source": "synthetic"},
+    )
+
+
+def test_export_formats() -> bool:
+    """导出 JSON / YAML / TOML：数值必须与 rig 一致，且三种格式都能读回。
+
+    为什么值得测：导出是"给外部工具用"的唯一出口。数值差一位、单位写成毫米、
+    TOML 里漏掉嵌套表 —— 都不会让主链路变红，但会让别人拿着错参数跑。
+    """
+    print("----- 标定参数导出（JSON / YAML / TOML） -----")
+    checks: list[tuple[str, bool]] = []
+    rig = _fake_rig_for_export()
+    data = build_export(rig)
+
+    checks.append(("左相机 K 与 rig.K1 一致", np.allclose(data["left"]["K"], rig.K1)))
+    checks.append(("D 拉平成 5 个系数", len(data["left"]["D"]) == 5))
+    checks.append(("rig.T 为 3 个分量（米）",
+                   np.allclose(data["rig"]["T"], np.ravel(rig.T))))
+    checks.append(("基线 65 mm", abs(data["rig"]["baseline_mm"] - 65.0) < 1e-9))
+    checks.append(("非有限质量指标 -> None（JSON 可序列化）",
+                   data["rig"]["quality"]["fx_sigma_px"] is None))
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        paths = write_export(rig, out, ["json", "yaml", "toml"])
+        names = {p.name for p in paths}
+        checks.append(("9 个参数文件 + summary", len(paths) == 10 and "summary.txt" in names))
+        checks.append(("三种格式齐全",
+                       all(f"stereo_rig.{ext}" in names for ext in ("json", "yaml", "toml"))))
+
+        j = json.loads((out / "stereo_rig.json").read_text(encoding="utf-8"))
+        checks.append(("JSON 读回 T 一致", np.allclose(j["T"], np.ravel(rig.T))))
+
+        t = tomllib.loads((out / "stereo_rig.toml").read_text(encoding="utf-8"))
+        checks.append(("TOML 读回 T 一致", np.allclose(t["T"], np.ravel(rig.T))))
+        checks.append(("TOML 读回嵌套表 quality", abs(t["quality"]["rms"] - 0.5) < 1e-12))
+        t_left = tomllib.loads((out / "left_camera.toml").read_text(encoding="utf-8"))
+        checks.append(("TOML 读回 K 一致", np.allclose(t_left["K"], rig.K1)))
+        checks.append(("TOML 不含 null",
+                       "null" not in (out / "stereo_rig.toml").read_text(encoding="utf-8")))
+
+        try:
+            import yaml
+        except ImportError:
+            print("  [跳过] PyYAML 未安装，跳过 YAML 读回校验")
+        else:
+            y = yaml.safe_load((out / "stereo_rig.yaml").read_text(encoding="utf-8"))
+            checks.append(("YAML 读回 T 一致", np.allclose(y["T"], np.ravel(rig.T))))
+
+        summary = (out / "summary.txt").read_text(encoding="utf-8")
+        checks.append(("summary 含基线与坐标系说明",
+                       "基线" in summary and "校正后左相机系" in summary))
+
+        try:
+            write_export(rig, out, ["xml"])
+        except ValueError:
+            checks.append(("未知格式被拒绝（不会写出半套文件）", True))
+        else:
+            checks.append(("未知格式被拒绝（不会写出半套文件）", False))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定）")
@@ -528,7 +615,8 @@ def main() -> int:
                test_mono_ok_but_stereo_explodes,
                test_unusable_result_is_never_saved,
                test_baseline_anchor_is_optional_and_therefore_silent,
-               test_board_area_and_tiered_verdict):
+               test_board_area_and_tiered_verdict,
+               test_export_formats):
         results.append(fn())
         print()
     ok = all(results)

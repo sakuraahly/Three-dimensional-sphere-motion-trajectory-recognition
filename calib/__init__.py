@@ -2,6 +2,7 @@
 
 from .board import BoardObservation, BoardSpec, detect_board, pose_distance
 from .capture import AutoPairCollector, CaptureConfig, CapturedPair
+from .export import build_camera, build_export, build_rig, write_export
 from .params import StereoRig, load_stereo_rig, save_stereo_rig
 from .stereo_calib import CalibConfig, StereoCalibrationResult, calibrate_stereo
 
@@ -19,4 +20,8 @@ __all__ = [
     "StereoRig",
     "load_stereo_rig",
     "save_stereo_rig",
+    "build_camera",
+    "build_rig",
+    "build_export",
+    "write_export",
 ]

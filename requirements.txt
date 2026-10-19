@@ -3,6 +3,9 @@ numpy>=1.24
 opencv-contrib-python>=4.8
 matplotlib>=3.7
 
+# 标定参数导出（可选）：只影响 --formats yaml；没有它仍可导出 json/toml。
+pyyaml>=6.0
+
 # 说明：opencv-contrib-python 已包含 cv2.cuda / 各种 tracker / HoughCircles 等，
 # 不要再去装 opencv-python（两者会互相覆盖）。
 #
