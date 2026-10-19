@@ -154,12 +154,19 @@ def main() -> int:
     rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=args.max_epipolar))
     out_dir = session_dir / "derived"
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / "traj3d.csv"
+    # 部分帧试跑不要把正式的 traj3d.csv / annotated.mp4 覆盖成 0.17 s
+    partial = f"_first{args.max_frames}" if args.max_frames else ""
+    csv_path = out_dir / f"traj3d{partial}.csv"
+    video_path = out_dir / f"annotated{partial}.mp4"
+
+    if args.max_frames:
+        print(f"[部分帧] 只处理前 {args.max_frames} 对；输出加 {partial} 后缀，"
+              "不会覆盖正式文件。")
 
     writer = None
     if not args.no_video:
         writer = cv2.VideoWriter(
-            str(out_dir / "annotated.mp4"),
+            str(video_path),
             cv2.VideoWriter_fourcc(*"mp4v"), fps, (1920, 540))
         if not writer.isOpened():
             print("[警告] 打不开标注视频 writer，继续只写 CSV")
@@ -231,7 +238,7 @@ def main() -> int:
         print(f"交会残差：中位 {np.median(res):.3f} px，最大 {res.max():.3f} px")
     print(f"CSV：{csv_path}")
     if writer is not None:
-        print(f"标注视频：{out_dir / 'annotated.mp4'}")
+        print(f"标注视频：{video_path}")
     return 0 if rec.n_matched else 2
 
 
