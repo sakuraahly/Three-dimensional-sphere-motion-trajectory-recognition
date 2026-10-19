@@ -42,9 +42,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
+import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -55,6 +60,7 @@ if str(ROOT) not in sys.path:
 
 AGENTS_MD = ROOT / "AGENTS.md"
 CHECKER = ROOT / "apps" / "tools" / "check_standards.py"
+SBOM_TOOL = ROOT / "apps" / "tools" / "build_sbom.py"
 SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 
 # 本测试自己也是测试，也要被数进去。
@@ -293,6 +299,114 @@ def test_handover_section_13_claims() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_sbom_builder() -> bool:
+    """第 6 节：SBOM 生成器能生成、能检查、坏输入不崩。
+
+    为什么放在这里：SBOM 是"文档与事实"的一部分，且它是**当前机器环境**的快照，
+    不适合要求别的机器也一致；所以这里测**结构 / 行为**，不钉死 59 或 66。
+    """
+    print("----- 6. SBOM 生成器（build_sbom.py） -----")
+    checks: list[tuple[str, bool]] = [
+        ("build_sbom.py 存在", SBOM_TOOL.exists()),
+    ]
+    if not SBOM_TOOL.exists():
+        for name, ok in checks:
+            print(f"  [{'通过' if ok else '不达标'}] {name}")
+        return False
+
+    with tempfile.TemporaryDirectory() as td:
+        out_dir = Path(td)
+        spec = importlib.util.spec_from_file_location("sbom_builder", SBOM_TOOL)
+        sbom = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sbom)
+
+        code, _out = _run(SBOM_TOOL, "--help")
+        checks.append(("--help 退出码 0", code == 0))
+        code, _out = _run(SBOM_TOOL, "--out-dir", td, "--quiet")
+        checks.append(("生成退出码 0", code == 0))
+        md_path = out_dir / "SBOM.md"
+        json_path = out_dir / "sbom.cdx.json"
+        checks.append(("两份产物都存在", md_path.exists() and json_path.exists()))
+
+        if md_path.exists() and json_path.exists():
+            bom = json.loads(json_path.read_text(encoding="utf-8"))
+            refs = [c.get("bom-ref") for c in bom.get("components", [])]
+            checks.append((
+                "CycloneDX 1.5",
+                bom.get("bomFormat") == "CycloneDX" and bom.get("specVersion") == "1.5",
+            ))
+            checks.append(("bom-ref 唯一且非空",
+                           bool(refs) and len(refs) == len(set(refs)) and all(refs)))
+            checks.append((
+                "依赖引用都指向已存在的 component",
+                all(x in set(refs) for d in bom.get("dependencies", [])
+                    for x in d.get("dependsOn", [])),
+            ))
+            md = md_path.read_text(encoding="utf-8")
+            counts = [int(x) for x in re.findall(
+                r"^## [123]\..*?（(?:[^（）]*，)?(\d+)）", md, re.M)]
+            pypi = sum(1 for c in bom.get("components", [])
+                       if str(c.get("purl", "")).startswith("pkg:pypi/"))
+            checks.append(("Markdown 三类计数之和 = pypi 组件数",
+                           len(counts) == 3 and sum(counts) == pypi))
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_q = sbom.check(out_dir, quiet=True)
+            checks.append(("刚生成时 --check 退出 0", code_q == 0))
+            checks.append(("--quiet 且最新时无输出", buf.getvalue().strip() == ""))
+
+            # 再生成一次：时间戳 / serial 会变，但语义未变 -> --check 仍应 0
+            code_r = sbom.write(out_dir, quiet=True)
+            code_c = sbom.check(out_dir, quiet=True)
+            checks.append(("重新生成（时间戳/serial 变化）后 --check 仍 0",
+                           code_r == 0 and code_c == 0))
+
+            # 只改 Markdown 也应报过期（不是只看 JSON）
+            md_path.write_text(md + "\n<!-- stale -->\n", encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code_m = sbom.check(out_dir, quiet=True)
+            checks.append(("只改 Markdown -> --check 退出 1",
+                           code_m == 1 and "[过期]" in buf.getvalue()))
+            sbom.write(out_dir, quiet=True)     # 恢复
+
+            numpy = next((c for c in bom.get("components", [])
+                          if c.get("name") == "numpy"), None)
+            if numpy is None:
+                checks.append(("能找到 numpy component 以注入漂移", False))
+            else:
+                numpy["version"] = "9.9.9"
+                json_path.write_text(
+                    json.dumps(bom, indent=2, ensure_ascii=False), encoding="utf-8")
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code3 = sbom.check(out_dir)
+                out3 = buf.getvalue()
+                checks.append(("版本漂移 -> --check 退出 1", code3 == 1))
+                checks.append(("漂移输出指出 numpy / 9.9.9",
+                               "numpy" in out3 and "9.9.9" in out3))
+
+            json_path.write_text("{not json", encoding="utf-8")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code4 = sbom.check(out_dir)
+            out4 = buf.getvalue()
+            checks.append(("坏 JSON -> 退出 1，且不抛 traceback",
+                           code4 == 1 and "Traceback" not in out4))
+
+            json_path.unlink()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code5 = sbom.check(out_dir, quiet=True)
+            checks.append(("缺文件 -> 退出 1 且提示更新",
+                           code5 == 1 and "更新" in buf.getvalue()))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("文档事实自测（外壳：调用 check_standards.py 这个权威实现）")
@@ -302,7 +416,8 @@ def main() -> int:
                test_tests_are_registered_in_agents_md,
                test_authoritative_checker_passes,
                test_checker_catches_a_brand_new_drift,
-               test_handover_section_13_claims):
+               test_handover_section_13_claims,
+               test_sbom_builder):
         results.append(fn())
         print()
     ok = all(results)
@@ -319,7 +434,8 @@ def main() -> int:
     # 所以把结论行放在最后、并且逐节重述 —— 下次至少能一眼看出该查哪一节。
     if not ok:
         names = ("1 测试清单与数量", "2 登记一致", "3 权威实现可用",
-                 "4 反向自证能抓新漂移", "5 交接文档 §13 断言 vs 代码")
+                 "4 反向自证能抓新漂移", "5 交接文档 §13 断言 vs 代码",
+                 "6 SBOM 生成器")
         print("红的节：")
         for name, good in zip(names, results):
             print(f"  [{'通过' if good else '不达标'}] {name}")

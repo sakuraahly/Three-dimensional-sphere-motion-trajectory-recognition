@@ -229,7 +229,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_config_wiring.py` | 配置接线（每个配置项都必须真的被读） |
 | `selftest_board_corner_order.py` | SB/经典检测器的角点顺序（= `rot180`）+ 标定守卫该盯物理量而非 RMS |
 | `selftest_calib_facts.py` | 真机标定日志口径（拒收分布 / 基线 199.67 mm）+ 不可用不得保存 |
-| `selftest_doc_facts.py` | 测试清单与登记不退化；并跑一遍 `check_standards.py`（引用 / 来源 / 计数） |
+| `selftest_doc_facts.py` | 测试清单与登记不退化；并跑一遍 `check_standards.py`（引用 / 来源 / 计数）；SBOM 生成器结构 / 过期检测 |
 | `selftest_health_stats.py` | 运行健康度指标：采集 / 主循环 / 检测三个帧率分得开，`dropped` / `frame_age_ms` 语义 |
 | `selftest_calib_provenance.py` | 角点出身：检测器可辨识 + 回退必须显式 + 一对之内禁止混用（两道守卫） |
 | `selftest_entrypoints.py` | 三个启动入口（`.bat` / 图形 / 命令行）都调**同一个**测试运行器与规范检查器 |
