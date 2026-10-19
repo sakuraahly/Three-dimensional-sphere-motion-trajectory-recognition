@@ -33,6 +33,7 @@ from stereo import (
     mono_depth,
     savgol_trajectory,
     stereo_depth,
+    timestamp_offset,
 )
 from sphere_tracker.types import Detection
 
@@ -81,6 +82,17 @@ def test_sync() -> bool:
     ok = ok and good
     print(f"  仅右路有闪光 -> peak_count={res.peak_count}  "
           f"{'通过' if good else '不达标'}")
+
+    # 没有闪光时的自动兜底：右路整体晚 3 帧（时间戳晚 3/fps），
+    # left[i] 应配 right[i-3]，即 offset=-3。
+    t0 = 1000.0
+    left_t = t0 + np.arange(n) / 30.0
+    right_t = t0 + 3.0 / 30.0 + np.arange(n) / 30.0 + rng.normal(0, 0.001, n)
+    ts = timestamp_offset(left_t, right_t, 30.0)
+    good = ts.offset == -3 and ts.usable
+    ok = ok and good
+    print(f"  时间戳兜底：右路晚 3 帧 -> offset={ts.offset:+d}，"
+          f"中位差 {ts.median_abs_ms:.2f} ms  {'通过' if good else '不达标'}")
     return ok
 
 

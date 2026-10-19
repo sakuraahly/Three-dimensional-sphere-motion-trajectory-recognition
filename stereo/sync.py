@@ -95,6 +95,56 @@ def _corr_at(da: np.ndarray, db: np.ndarray, offset: int) -> tuple[float, int]:
     return float(np.dot(a, b) / (na * nb)), m
 
 
+@dataclass
+class TimestampSync:
+    """主机时间戳对齐结果（不是硬件同步，只是"两路帧到达时间"的近似）。"""
+
+    offset: int
+    median_abs_ms: float
+    confidence: float
+    usable: bool
+    note: str = ""
+
+
+def timestamp_offset(
+    left_times,
+    right_times,
+    fps: float,
+    *,
+    max_offset: int = 5,
+) -> TimestampSync:
+    """用每帧 `perf_counter` 时间戳对齐两路，作为"没有闪光"时的自动兜底。
+
+    语义与 `find_offset` 一致：`left[i]` 对应 `right[i+offset]`。
+    时间戳是**主机读帧完成时刻**，不是曝光时刻，所以只适合慢速场景的近似对齐；
+    真正精确同步仍然要靠闪光/硬件触发。`median_abs_ms` 超过半帧就不接受。
+    """
+    L = np.asarray(left_times, dtype=np.float64)
+    R = np.asarray(right_times, dtype=np.float64)
+    period = 1.0 / max(float(fps), 1e-9)
+    if L.size < 5 or R.size < 5:
+        return TimestampSync(0, float("inf"), 0.0, False, "时间戳太少")
+
+    best_off, best_med = 0, float("inf")
+    for off in range(-max_offset, max_offset + 1):
+        if off >= 0:
+            a, b = L[: L.size - off], R[off: off + (L.size - off)]
+        else:
+            a, b = L[-off:], R[: R.size + off]
+        m = min(len(a), len(b))
+        if m < 5:
+            continue
+        med = float(np.median(np.abs(a[:m] - b[:m])))
+        if med < best_med:
+            best_off, best_med = off, med
+    half = period / 2.0
+    conf = max(0.0, min(1.0, 1.0 - best_med / max(half, 1e-9)))
+    usable = best_med < half and conf >= 0.35
+    note = (f"主机时间戳近似对齐：中位差 {best_med*1000:.1f} ms"
+            f"（半帧 {half*1000:.1f} ms）；非硬件触发")
+    return TimestampSync(best_off, best_med * 1000.0, conf, usable, note)
+
+
 def brightness_jumps(series, min_jump: float = 1.0) -> dict:
     """逐帧亮度突变的诊断：最大跳变、阈值、明显事件数 / 位置。
 

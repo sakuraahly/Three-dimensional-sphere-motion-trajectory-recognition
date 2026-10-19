@@ -259,6 +259,27 @@ def _video_facts(path: Path) -> tuple[bool, int, int, int, float]:
         cap.release()
 
 
+def _video_brightness_mean(path: Path, samples: int = 5) -> float:
+    """抽几帧算平均亮度；打不开/没帧返回 0。"""
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return 0.0
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n <= 0:
+            return 0.0
+        vals = []
+        for k in range(max(1, samples)):
+            idx = int((n - 1) * k / max(1, samples - 1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                vals.append(float(frame.mean()))
+        return sum(vals) / len(vals) if vals else 0.0
+    finally:
+        cap.release()
+
+
 def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
     """校验一个会话，返回 `(errors, warnings)`。
 
@@ -307,6 +328,11 @@ def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
                 warnings.append(
                     f"{side}: 容器 fps={fps:.2f} 与实测 {cam.fps_measured:.2f} 差 {ratio*100:.0f}%"
                     "（容器 fps 可能只是标称值，不一定是错）")
+        mean_brightness = _video_brightness_mean(video_path)
+        if mean_brightness < 20.0:
+            warnings.append(
+                f"{side}: 视频几乎全黑（抽样平均亮度 {mean_brightness:.1f} < 20）"
+                "—— 检查镜头盖/灯光/曝光；黑视频不能做检测")
 
     if len(frame_counts) == 2 and abs(frame_counts["left"] - frame_counts["right"]) > 1:
         warnings.append(

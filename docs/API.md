@@ -433,12 +433,15 @@ def toml_dumps(data: dict) -> str        # 最小 TOML 序列化器（stdlib 只
     peak_count=0; note="";  def __str__(self) -> str;  @property usable -> bool      # confidence >= 0.35 且 peak_count >= 1
 def brightness_series(frames, smooth=1) -> np.ndarray
 def brightness_jumps(series, min_jump=1.0) -> dict   # max_jump / threshold / peak_count / peak_indices
+@dataclass TimestampSync:  offset; median_abs_ms; confidence; usable; note
+def timestamp_offset(left_times, right_times, fps, max_offset=5) -> TimestampSync
 def find_offset(series_left, series_right, cfg: SyncConfig | None = None) -> SyncResult
 def apply_offset(offset: int) -> str      # 把偏移翻译成"取帧"的人话，用来核对正负号
 ```
 **坑**：① `find_offset` 在**亮度差分**上做归一化互相关（突变被放大）；序列短于 3 帧返回 `SyncResult(0, 0.0, 0, "序列太短")`；若所有候选偏移都因 `min_overlap` 被跳过，返回的也是 `offset=0, confidence=0.0` —— **别把 `offset=0` 当成"对齐了"**，看 `usable`/`confidence`。`peak_count` 取左右两路较大者（闪光可能只在一路明显）。
 ② `brightness_series` **会跳过 `None` 帧**，返回序列的下标**不一定等于帧号**，别拿它当帧索引；搜索范围受 `max_offset=180` 限制，偏移正负语义统一是 `left[i] ↔ right[i+offset]`。
 ③ **没有闪光时也会有一个候选 offset**（普通场景变化也能相关）。录制端先用 `brightness_jumps` 看 `max_jump/peak_count`；`sync.method=none` 的会话三维不可直接用。
+④ 录制器在没有闪光时会用 `timestamp_offset` 自动兜底：用每帧 `perf_counter` 时间戳估计 offset，`method=timestamp`。它只是**主机读帧时间**的近似（非硬件触发），中位差超过半帧就拒绝；慢速场景可用，快速球仍应闪光/硬件同步。
 ### 13.2 `stereo/pair_source.py`
 ```python
 class PairSource:

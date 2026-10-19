@@ -60,7 +60,12 @@ from stereo.sessions import (                                # noqa: E402
     sha256_file,
     validate_session,
 )
-from stereo.sync import SyncConfig, brightness_jumps, find_offset  # noqa: E402
+from stereo.sync import (                                   # noqa: E402
+    SyncConfig,
+    brightness_jumps,
+    find_offset,
+    timestamp_offset,
+)
 
 LOG = logging.getLogger("record")
 # 1080p30 × 2 的实测吞吐（本机）：HFYU ≈ 34 fps/路；FFV1 ≈ 8 fps/路。
@@ -480,11 +485,16 @@ def main() -> int:
 
         # 同步：先诊断"有没有拍到闪光"，再谈偏移
         sync_note = ""
+        mean_l = mean_r = 0.0
         try:
             lb = np.asarray(left_rec.brightness, dtype=np.float64)
             rb = np.asarray(right_rec.brightness, dtype=np.float64)
             np.save(session_dir / "derived" / "left_brightness.npy", lb)
             np.save(session_dir / "derived" / "right_brightness.npy", rb)
+            mean_l, mean_r = float(lb.mean()), float(rb.mean())
+            print(f"[画面] 平均亮度 左={mean_l:.1f} 右={mean_r:.1f}")
+            if min(mean_l, mean_r) < 20.0:
+                print("[警告] 画面几乎全黑：检查镜头盖 / 灯光 / 曝光；这条数据不能做检测")
             stat_l = brightness_jumps(lb)
             stat_r = brightness_jumps(rb)
             max_jump = max(stat_l["max_jump"], stat_r["max_jump"])
@@ -508,18 +518,32 @@ def main() -> int:
                              f"事件 {res.peak_count} 个")
                 print(f"[同步] {res}")
             else:
-                if max_jump < cfg_sync.flash_min_jump:
-                    why = (f"没有足够强的闪光：最大亮度跳变 {max_jump:.2f} < "
-                           f"{cfg_sync.flash_min_jump:.2f}。请重录，并在“开始！现在闪光！”后"
-                           "立刻闪一次、结束前再闪一次。")
+                # 没有闪光时，用录制时逐帧时间戳做自动兜底（近似，不是硬件同步）
+                ts = timestamp_offset(
+                    [t[1] for t in left_rec.times],
+                    [t[1] for t in right_rec.times],
+                    fps=left_fps, max_offset=5)
+                if ts.usable:
+                    session.sync = SyncInfo(
+                        method="timestamp", offset=int(ts.offset),
+                        confidence=float(ts.confidence), note=ts.note)
+                    sync_note = (f"timestamp {ts.offset:+d} 帧，置信度 "
+                                 f"{ts.confidence:.3f}（主机时间戳近似）")
+                    print(f"[同步] 没有闪光，改用时间戳兜底：{ts.note}")
                 else:
-                    why = (f"有亮度变化但没形成可用闪光事件（最大跳变 {max_jump:.2f}，"
-                           f"事件 {max(stat_l['peak_count'], stat_r['peak_count'])} 个）。")
-                session.sync = SyncInfo(method="none", offset=0,
-                                        confidence=float(res.confidence),
-                                        note=why)
-                sync_note = f"未同步：{why}"
-                print(f"[同步] 未通过：{why}")
+                    if max_jump < cfg_sync.flash_min_jump:
+                        why = (f"没有足够强的闪光：最大亮度跳变 {max_jump:.2f} < "
+                               f"{cfg_sync.flash_min_jump:.2f}。请重录，并在“开始！现在闪光！”后"
+                               "立刻闪一次、结束前再闪一次。")
+                    else:
+                        why = (f"有亮度变化但没形成可用闪光事件（最大跳变 {max_jump:.2f}，"
+                               f"事件 {max(stat_l['peak_count'], stat_r['peak_count'])} 个）。")
+                    why += f"；时间戳兜底也不可用（中位差 {ts.median_abs_ms:.1f} ms）"
+                    session.sync = SyncInfo(method="none", offset=0,
+                                            confidence=float(res.confidence),
+                                            note=why)
+                    sync_note = f"未同步：{why}"
+                    print(f"[同步] 未通过：{why}")
         except Exception as exc:                            # noqa: BLE001
             session.sync = SyncInfo(method="none", note=f"同步计算失败：{exc}")
             print(f"[警告] 同步计算失败：{exc}")
@@ -528,8 +552,11 @@ def main() -> int:
             f"{msg}",
             f"帧数：left={left_rec.frame_count} right={right_rec.frame_count}",
             f"实测 fps：left={left_fps:.2f} right={right_fps:.2f}",
+            f"平均亮度：left={mean_l:.1f} right={mean_r:.1f}",
             "时间戳 sidecar：left_times.csv / right_times.csv",
         ]
+        if min(mean_l, mean_r) < 20.0:
+            session.checks.append("画面几乎全黑（<20）：检查镜头盖/灯光/曝光")
         if sync_note:
             session.checks.append(f"同步：{sync_note}")
         save_session(session, session_dir)
