@@ -458,6 +458,12 @@ def main() -> int:
 
     # ---- 10. 日志自动滚动的约定 ----
     print("----- 10. 日志：贴底才自动滚（不许把正在读历史的用户拽走）-----")
+    # 前置条件：先把日志滚到底。
+    # 启动器初始化会写若干行（环境/设备），刚起来时 yview 不一定已在底部；
+    # 2026-10-19 full 档偶发 at_bottom=False（实测 after2=(0.56, 0.77)）——
+    # 这是**测试假设**错了，不是自动滚动坏了：用户没贴底时本来就不该被拽走。
+    app.log.see("end")
+    app.update()
     app._append("第一行")
     app._append("第二行")
     app.update()
@@ -466,6 +472,7 @@ def main() -> int:
         app._append(f"填充 {i}")
     app.update()
     app.log.yview_moveto(0.0)                 # 模拟用户往上翻
+    app.update()                              # 让 moveto 真正生效再读 yview
     reading_from = app.log.yview()[1] < 0.99
     before = app.log.yview()[1]
     app._append("读历史时来的新行")
