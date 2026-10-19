@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import cv2
 import numpy as np
 
@@ -42,6 +44,8 @@ class SpecularBallDetector(BaseDetector):
         self._prev_gray: np.ndarray | None = None
         self._started = False
         self._frames_since_seed = 0
+        self._static_frames = 0
+        self._recent = deque(maxlen=25)
         self.last_error = ""
         self._snapshot: dict = {}
 
@@ -59,6 +63,8 @@ class SpecularBallDetector(BaseDetector):
         self._prev_gray = None
         self._started = False
         self._frames_since_seed = 0
+        self._static_frames = 0
+        self._recent.clear()
         self.last_error = ""
 
     def reset(self) -> None:
@@ -71,6 +77,8 @@ class SpecularBallDetector(BaseDetector):
         self._prev_gray = None
         self._started = False
         self._frames_since_seed = 0
+        self._static_frames = 0
+        self._recent.clear()
         self._frame_idx = -1
 
     # ------------------------------------------------------------------
@@ -159,6 +167,8 @@ class SpecularBallDetector(BaseDetector):
                 self._prev_center = (x, y)
                 self._started = True
                 self._frames_since_seed = 0
+                self._recent.clear()
+                self._recent.append((x, y))
                 self.last_error = ""
                 return [Detection(x=x, y=y, radius=r, score=1.0, method=self.name,
                                   extra={"state": "seed", "bbox": bbox})]
@@ -191,6 +201,15 @@ class SpecularBallDetector(BaseDetector):
         motion = 0.0
         if self._prev_patch is not None and patch is not None:
             motion = float(cv2.absdiff(patch, self._prev_patch).mean())
+        if motion < c.static_motion_eps and jump < 1.0:
+            self._static_frames += 1
+        else:
+            self._static_frames = 0
+        if self._static_frames > c.max_static_frames:
+            self.last_error = (f"连续 {self._static_frames} 帧中心/局部都不动，"
+                               "判为丢了（不再报背景）")
+            self._tracker = None
+            return []
         if c.min_ncc > 0 and ncc < c.min_ncc:
             self.last_error = f"模板 NCC {ncc:.2f} < {c.min_ncc:.2f}，判为跟丢"
             self._tracker = None
@@ -207,6 +226,15 @@ class SpecularBallDetector(BaseDetector):
         self._prev_patch = patch
         self._prev_center = (cx, cy)
         self._prev_gray = gray
+        self._recent.append((cx, cy))
+        if len(self._recent) >= self._recent.maxlen:
+            xs = [p[0] for p in self._recent]
+            ys = [p[1] for p in self._recent]
+            if max(xs) - min(xs) < 5.0 and max(ys) - min(ys) < 5.0:
+                self.last_error = (f"最近 {self._recent.maxlen} 帧中心跨度 <5px，"
+                                   "判为丢了（不再报静止背景）")
+                self._tracker = None
+                return []
         self._snapshot = {
             "center": (round(cx, 1), round(cy, 1)), "radius": round(radius, 1),
             "ncc": round(ncc, 3), "motion": round(motion, 2), "jump": round(jump, 2),

@@ -71,6 +71,8 @@ class SpecularConfig:
     min_ncc: float = 0.0       # 仅记录；实测镜面反射下 0.30 会把真球误杀
     min_motion: float = 0.0    # 仅记录；顶点附近球几乎静止，硬门控会误杀
     motion_grace_frames: int = 5
+    max_static_frames: int = 20  # 连续这么多帧中心/局部都不动 -> 判为丢了，别继续报背景
+    static_motion_eps: float = 1.0
 
 
 @dataclass
