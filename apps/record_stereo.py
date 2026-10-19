@@ -261,6 +261,21 @@ def _write_times(path: Path, times: list[tuple[int, float, float]]) -> None:
             w.writerow([idx, f"{perf:.6f}", f"{unix:.6f}"])
 
 
+def _hud(img: np.ndarray, lines: list[tuple[str, tuple[int, int, int]]]) -> np.ndarray:
+    """在预览画面上叠 HUD；只影响预览，不写进录制的原始视频。"""
+    if not lines:
+        return img
+    out = img.copy()
+    band = min(out.shape[0], 10 + 28 * len(lines))
+    overlay = out.copy()
+    cv2.rectangle(overlay, (0, 0), (out.shape[1], band), (0, 0, 0), -1)
+    out = cv2.addWeighted(overlay, 0.55, out, 0.45, 0.0)
+    for i, (text, color) in enumerate(lines):
+        cv2.putText(out, text, (12, 24 + i * 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.72, color, 2, cv2.LINE_AA)
+    return out
+
+
 def _plot_sync(lb, rb, stat_l: dict, stat_r: dict, path: Path) -> None:
     """把两路亮度曲线和检测到的闪光位置画出来，供人一眼确认。"""
     import matplotlib
@@ -424,7 +439,26 @@ def main() -> int:
         print(f"本次录 {args.duration:.0f} 秒；按 q / Esc 可提前结束。")
         for i in range(int(max(0, args.countdown)), 0, -1):
             print(f"  {i}…", end="", flush=True)
-            time.sleep(1.0)
+            t_end = time.perf_counter() + 1.0
+            while time.perf_counter() < t_end:
+                if args.preview:
+                    ok_l, lf, _ = left_src.read()
+                    ok_r, rf, _ = right_src.read()
+                    if ok_l and ok_r and lf is not None and rf is not None:
+                        canvas = np.hstack([
+                            cv2.resize(lf, (640, 360), interpolation=cv2.INTER_AREA),
+                            cv2.resize(rf, (640, 360), interpolation=cv2.INTER_AREA)])
+                    else:
+                        canvas = np.zeros((360, 1280, 3), np.uint8)
+                    canvas = _hud(canvas, [
+                        (f"READY  {max(0.0, t_end - time.perf_counter()):.1f}s", (0, 255, 255)),
+                        ("FLASH NOW after the beep; flash again before the end", (200, 200, 200)),
+                    ])
+                    cv2.imshow("record left | right", canvas)
+                    cv2.waitKey(1)
+                else:
+                    time.sleep(0.02)
+            print()
         print(" 开始！现在闪光！", flush=True)
         try:
             import winsound
@@ -436,6 +470,7 @@ def main() -> int:
         right_rec.start()
         start_evt.set()
         t0 = time.perf_counter()
+        flash_seen = False
         try:
             while time.perf_counter() - t0 < args.duration:
                 if args.preview:
@@ -445,7 +480,26 @@ def main() -> int:
                     if lf is not None and rf is not None:
                         thumb_l = cv2.resize(lf, (640, 360), interpolation=cv2.INTER_AREA)
                         thumb_r = cv2.resize(rf, (640, 360), interpolation=cv2.INTER_AREA)
-                        cv2.imshow("record left | right", np.hstack([thumb_l, thumb_r]))
+                        elapsed = time.perf_counter() - t0
+                        remain = max(0.0, args.duration - elapsed)
+                        # 实时提示：前 2 秒提示闪，最后 2 秒提示再闪
+                        if len(left_rec.brightness) >= 2:
+                            jump = abs(left_rec.brightness[-1] - left_rec.brightness[-2])
+                            if jump >= 2.0:
+                                flash_seen = True
+                        lines = [
+                            (f"REC {elapsed:.1f}/{args.duration:.1f}s   "
+                             f"L {left_rec.frame_count}  R {right_rec.frame_count}",
+                             (0, 255, 0)),
+                        ]
+                        if elapsed < 2.0:
+                            lines.append(("FLASH NOW!", (0, 0, 255)))
+                        elif remain < 2.0:
+                            lines.append(("FLASH AGAIN BEFORE END", (0, 215, 255)))
+                        if flash_seen:
+                            lines.append(("FLASH DETECTED", (0, 255, 0)))
+                        cv2.imshow("record left | right",
+                                   _hud(np.hstack([thumb_l, thumb_r]), lines))
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord("q")):
                         break
