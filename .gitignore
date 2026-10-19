@@ -84,3 +84,10 @@ config/*
 # assets/videos/ 放的是待处理视频（几百 MB 起步），不入库，只保留目录说明。
 assets/videos/*
 !assets/videos/README.md
+
+# ---------- 真机录制会话 ----------
+# data/ 与 outputs/ 的区别：outputs/ 删了能重跑，data/ 删了就没了。
+# 一次采集 = 一个目录（两路无损视频 + session.json + 标定快照），体积大、不可再生。
+# 只保留 README；会话必须单独备份（外部硬盘 / 网盘），不要指望 git。
+data/sessions/*
+data/raw/*

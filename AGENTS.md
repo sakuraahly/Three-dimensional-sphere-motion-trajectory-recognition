@@ -82,10 +82,10 @@ stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角�
 apps/             可执行程序；tools/ 放一次性设置与诊断
 tests/            回归测试（23 个，改动后必跑）
 docs/             文档
-assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
+assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / 运行期产物
 ```
 
-### 五条放置规则
+### 六条放置规则
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
@@ -95,14 +95,18 @@ assets/ config/ outputs/ models/ legacy/   静态素材与运行期产物
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
 5. **根目录只放那三个启动脚本**（有意例外：唯一价值是双击即用）。
    **不要再加第四个**；要"只做某一步"就给 `启动程序.bat` 加参数。
+6. **不可再生的录制数据放 `data/`**，不要放 `outputs/`（语义是"删了能再生"），
+   也不要放 `assets/`（那是入库的静态素材）。`data/` 默认不入库，
+   **必须单独备份**；一次采集 = 一个目录 + `session.json`。
 
-### `apps/tools/` 里其实是两组东西
+### `apps/tools/` 里其实是四组东西
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
 | **相机 / 标定**（8） | `cameras.py` `list_cameras.py` `camera_quality.py` `check_stereo_setup.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` | 课题主线 |
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
 | **文档与事实**（4） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落） |
+| **数据 / 会话**（1） | `check_dataset.py` | 校验录制会话（视频 / 标定 / 同步） |
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。

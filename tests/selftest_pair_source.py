@@ -9,7 +9,7 @@
 做法：把每一帧的**帧号编进画面**（左下、右下两个色块分别存帧号的低字节和高字节），
 于是"取到的是第几帧"可以直接从像素里读回来比对，不依赖任何相机或标定。
 
-验证六件事：
+验证七件事：
   1. `sync_offset=0`：左第 i 帧 配 右第 i 帧；
   2. `sync_offset=+k`：左第 i 帧 配 右第 i+k 帧；
   3. `sync_offset=-k`：左第 i 帧 配 右第 i-k 帧；
@@ -17,7 +17,8 @@
      让 find_offset 自己算出偏移，再拿它去取帧 —— 取出来的必须是同一物理时刻。
      第 4 条才是真正要保证的契约，前三条是它的分解；
   5. 参数校验与"短的那路读完了"能干净结束；
-  6. `from_args` 的命令行参数映射（重构最易漏的是调用点，不是库）。
+  6. `from_args` 的命令行参数映射（重构最易漏的是调用点，不是库）；
+  7. **采集会话**（`session.json`）：写→读→校验；坏会话必须逐条报错。
 
 图片文件夹与视频两条路径都测（两者的取帧实现完全不同：
 文件夹是随机访问，视频要按帧号定位）。
@@ -44,7 +45,20 @@ if str(ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from stereo import PairSource, SyncConfig, find_offset
+from stereo import (
+    CameraInfo,
+    CalibrationInfo,
+    PairSource,
+    SyncConfig,
+    SyncInfo,
+    create_session,
+    find_offset,
+    load_session,
+    save_session,
+    sha256_file,
+    validate_session,
+)
+from calib.params import StereoRig
 
 W, H = 96, 64
 N = 40             # 合成多少帧
@@ -525,6 +539,82 @@ def test_short_side(base: Path) -> bool:
     return ok
 
 
+def test_sessions(base: Path) -> bool:
+    """采集会话：写→读→校验；坏会话必须逐条报错（不能静默通过）。
+
+    为什么值得测：`session.json` 是数据采集的唯一契约。schema 少一个字段、
+    校验把"分辨率不一致"放过，都会让后面几十次采集白录。
+    """
+    print("----- 采集会话（session.json 读写与校验） -----")
+    checks: list[tuple[str, bool]] = []
+
+    session_dir, session = create_session(base / "sessions", label="selftest")
+    for side in ("left", "right"):
+        path = session_dir / f"{side}.avi"
+        wr = cv2.VideoWriter(str(path), cv2.VideoWriter.fourcc(*"FFV1"), 30.0, (W, H))
+        if wr.isOpened():
+            for i in range(5):
+                wr.write(make_frame(i))
+            wr.release()
+        checks.append((f"{side}.avi 用 FFV1 写出", path.exists()))
+
+    K = np.array([[100.0, 0.0, W / 2], [0.0, 100.0, H / 2], [0.0, 0.0, 1.0]])
+    D = np.zeros((1, 5))
+    T = np.array([[-0.065], [0.0], [0.0]])
+    rig = StereoRig(K1=K, D1=D, K2=K.copy(), D2=D.copy(), R=np.eye(3), T=T,
+                    image_size=(W, H), quality={"rms": 0.5},
+                    meta={"created": "2026-01-01 00:00:00"})
+    rig.save(session_dir / "calib" / "stereo_calibration")
+
+    session.left = CameraInfo("left", "left.avi", W, H, 5, 30.0, 30.0)
+    session.right = CameraInfo("right", "right.avi", W, H, 5, 30.0, 30.0)
+    session.calibration = CalibrationInfo(
+        "calib/stereo_calibration.npz",
+        sha256_file(session_dir / "calib" / "stereo_calibration.npz"),
+        [W, H], 65.0, 65.0, "2026-01-01 00:00:00", "测试",
+    )
+    session.sync = SyncInfo("flash", 2, 0.9)
+    save_session(session, session_dir)
+
+    errors, warnings = validate_session(session_dir)
+    checks.append(("干净会话：无错误", not errors))
+    checks.append(("干净会话：无警告", not warnings))
+
+    _d, reloaded = load_session(session_dir)
+    checks.append(("重新读回 label", reloaded.label == "selftest"))
+    checks.append(("重新读回同步偏移", reloaded.sync.offset == 2))
+
+    # 坏会话必须报错，不能静默通过
+    session.left.width = W + 1
+    save_session(session, session_dir)
+    e, _w = validate_session(session_dir)
+    checks.append(("分辨率不一致 -> 报错", any("不一致" in x for x in e)))
+    session.left.width = W
+    save_session(session, session_dir)
+
+    session.calibration.sha256 = "deadbeef"
+    save_session(session, session_dir)
+    e, _w = validate_session(session_dir)
+    checks.append(("标定 sha256 不对 -> 报错", any("sha256" in x for x in e)))
+    session.calibration.sha256 = sha256_file(session_dir / "calib" / "stereo_calibration.npz")
+    save_session(session, session_dir)
+
+    session.calibration.baseline_measured_mm = 100.0
+    save_session(session, session_dir)
+    e, _w = validate_session(session_dir)
+    checks.append(("物理基线差 >20% -> 报错", any("物理基线" in x for x in e)))
+    session.calibration.baseline_measured_mm = 65.0
+    save_session(session, session_dir)
+
+    (session_dir / "right.avi").unlink()
+    e, _w = validate_session(session_dir)
+    checks.append(("缺右路视频 -> 报错", any("视频不存在" in x for x in e)))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_live_camera_skipped() -> bool:
     """实时相机只做一次试探：没有相机就跳过（不算不达标）。"""
     print("----- 实时相机（有相机才测） -----")
@@ -567,6 +657,7 @@ def main() -> int:
             test_end_to_end(base),
             test_guards(base),
             test_from_args(base),
+            test_sessions(base),
             test_short_side(base),
         ]
         print()

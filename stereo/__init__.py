@@ -6,6 +6,7 @@
     sync.py         双路视频同步（闪光/拍手对齐），算出帧偏移
     pair_source.py  成对帧源：按 sync_offset 取到"同一时刻"的左右两帧
     triangulate.py  极线约束配对 + 三角测量 + 三维轨迹
+    sessions.py     采集会话：session.json 的读写与校验（data/ 的契约）
 
 分工说明：
     calib/    负责"标定出参数"（离线、一次）
@@ -16,6 +17,19 @@
 from __future__ import annotations
 
 from .pair_source import PairSource, from_args
+from .sessions import (
+    CameraInfo,
+    CalibrationInfo,
+    Session,
+    SessionError,
+    SyncInfo,
+    create_session,
+    list_sessions,
+    load_session,
+    save_session,
+    sha256_file,
+    validate_session,
+)
 from .sync import SyncConfig, SyncResult, apply_offset, brightness_series, find_offset
 from .triangulate import (
     MatchConfig,
@@ -38,4 +52,15 @@ __all__ = [
     "StereoReconstructor",
     "match_epipolar",
     "triangulate_one",
+    "CameraInfo",
+    "CalibrationInfo",
+    "Session",
+    "SessionError",
+    "SyncInfo",
+    "create_session",
+    "save_session",
+    "load_session",
+    "validate_session",
+    "list_sessions",
+    "sha256_file",
 ]

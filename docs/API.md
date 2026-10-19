@@ -498,6 +498,31 @@ pt = rec.update(t, left=det_left, right_dets=dets_right)    # left 是【单个�
 **坑**：① `update()` 的 `left` 是**单个 Detection 或 `None`**，`right_dets` 才是列表；返回 `None` 的三种原因分别计入 `n_no_left`/`n_no_right`/`n_rejected`（`summary()` 会报出来）。
 ② `match_epipolar` 选的是极线偏差 `dy` **最小**的候选（`cost = dy`），不是"最像球"的那个；`require_radius_ratio=False` 时不比较左右半径（同型号相机才该开）；`triangulate_one` 的 `epipolar_px` 默认 `nan`（想要值就传 `match_epipolar` 的第二个返回值）。
 ③ `as_array()` 无配对点时返回 `(0,4)` 零数组 —— 形状和内容都要判。
+### 13.4 `stereo/sessions.py`
+```python
+SCHEMA = "sphere-stereo-session"; VERSION = 1; SESSION_FILE = "session.json"
+@dataclass CameraInfo:
+    role, video, width, height, frame_count=0, fps_requested=0.0, fps_measured=0.0,
+    backend="", identity="", name="", port=""
+@dataclass CalibrationInfo:
+    path, sha256="", image_size=[], baseline_mm=0.0, baseline_measured_mm=None,
+    created="", verdict=""
+@dataclass SyncInfo: method="none", offset=0, confidence=0.0, note=""
+@dataclass Session:
+    id, created, label="", notes="", left=None, right=None, calibration=None,
+    sync=SyncInfo(), codec="FFV1", container="mkv", lossless=True,
+    environment={}, checks=[]
+def create_session(root, *, label="", notes="") -> tuple[Path, Session]
+def save_session(session, session_dir) -> Path
+def load_session(path) -> tuple[Path, Session]              # 目录或 session.json
+def validate_session(path) -> tuple[list[str], list[str]]   # (errors, warnings)，不抛
+def list_sessions(root) -> list[Path];  def sha256_file(path) -> str
+```
+**契约**：一次采集 = `data/sessions/<id>/`（`session.json` + 两路视频 + `calib/` 快照 + `derived/`）。
+`validate_session` 检查视频可打开 / 分辨率 / 帧数 / 标定 sha256 / 基线偏差
+（物理 vs 算法 >10% 警告、>20% 错误），**不抛异常**，坏会话一次列全。
+**基线**：`baseline_mm` 是算法结果（几何用它），`baseline_measured_mm` 只作交叉核对，不覆盖算法值。
+**路径**：视频/标定路径默认相对会话目录；也接受绝对路径。
 ## 14. 依赖方向
 
 > **图与规则在根目录 `AGENTS.md` §5（唯一权威），这里不复制。**
