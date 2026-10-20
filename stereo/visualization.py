@@ -206,7 +206,7 @@ def build_visualization_payload(trajectory: dict) -> dict:
             "line_color": "#2563eb",
             "point_color": "#f97316",
             "background": "#ffffff",
-            "axes": {"x": "X right", "y": "Y forward", "z": "Z up"},
+            "axes": {"x": "X right", "y": "Y down", "z": "Z forward"},
         },
         "samples": [
             {"frame": s["frame"], "t": s["t"], "xyz": s["xyz"],

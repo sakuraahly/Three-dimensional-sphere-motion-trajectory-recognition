@@ -6,7 +6,7 @@
     python apps/view_3d.py data/sessions/20261019-221550 --check
 
 只依赖 matplotlib + Tkinter（环境已有），不依赖网络、不依赖 stereo 包。
-坐标系是**校正后左相机系**：X 右 / Y 前 / Z 上，单位米。
+坐标系是**校正后左相机系**：X 右 / Y 下 / Z 前（光轴 / 深度），单位米。
 """
 
 from __future__ import annotations
@@ -247,8 +247,8 @@ class Viewer3D:
         self.ax.scatter([cur["xyz"][0]], [cur["xyz"][1]], [cur["xyz"][2]],
                         color="#f97316", s=80, depthshade=False, label="ball")
         self.ax.set_xlabel("X right (m)")
-        self.ax.set_ylabel("Y forward (m)")
-        self.ax.set_zlabel("Z up (m)")
+        self.ax.set_ylabel("Y down (m)")
+        self.ax.set_zlabel("Z forward (m)")
         self.ax.set_title(f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
         self.canvas.draw_idle()

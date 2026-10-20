@@ -165,8 +165,8 @@ def _plot_trajectory(arr: np.ndarray, path: Path, smoothed: np.ndarray | None = 
         ax.plot(smoothed[:, 0], smoothed[:, 1], smoothed[:, 2], "-",
                 color="#f97316", linewidth=1.6, label="S-G")
     ax.set_xlabel("X right (m)")
-    ax.set_ylabel("Y forward (m)")
-    ax.set_zlabel("Z up (m)")
+    ax.set_ylabel("Y down (m)")
+    ax.set_zlabel("Z forward (m)")
     ax.set_title("Stereo 3D trajectory")
     ax.legend(loc="upper right")
     fig.tight_layout()
