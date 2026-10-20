@@ -224,7 +224,14 @@ class Viewer3D:
             h = max(2, label.winfo_height())
             if w <= 4 or h <= 4:
                 w, h = 640, 360
-            img = cv2.resize(raw, (w, h), interpolation=cv2.INTER_AREA)
+            # 填满 pane 且不拉伸：等比放大到覆盖，再中心裁剪。
+            rh, rw = raw.shape[:2]
+            scale = max(w / rw, h / rh)
+            nw, nh = max(w, int(round(rw * scale))), max(h, int(round(rh * scale)))
+            img = cv2.resize(raw, (nw, nh), interpolation=cv2.INTER_AREA)
+            x0 = max(0, (nw - w) // 2)
+            y0 = max(0, (nh - h) // 2)
+            img = img[y0:y0 + h, x0:x0 + w]
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
             setattr(self, attr, photo)
