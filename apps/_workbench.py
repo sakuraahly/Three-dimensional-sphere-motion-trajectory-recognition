@@ -163,13 +163,15 @@ def summarize_session(path: str | Path) -> SessionSummary:
     return s
 
 
-def button_states(s: SessionSummary, specular: bool) -> dict[str, bool]:
+def button_states(s: SessionSummary, specular: bool,
+                  check_ok: bool | None = None) -> dict[str, bool]:
     """工作台按钮的启用规则；放在纯逻辑层，GUI 只套用。"""
     data_ok = s.status != "bad"
     return {
         "check": s.can_check,
-        "seed": s.can_seed and data_ok,
-        "run": data_ok and s.can_check and (s.has_seeds or not specular),
+        "seed": s.can_seed and data_ok and check_ok is not False,
+        "run": data_ok and s.can_check and check_ok is not False
+               and (s.has_seeds or not specular),
         "view": s.can_view,
         "export": s.has_traj,
         "open": s.path.exists(),

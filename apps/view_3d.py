@@ -76,7 +76,8 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
 
 
 class Viewer3D:
-    def __init__(self, root: tk.Tk, data: dict, video_path: str | Path | None = None) -> None:
+    def __init__(self, root: tk.Tk, data: dict, video_path: str | Path | None = None,
+                 auto_video: bool = True) -> None:
         self.root = root
         self.data = data
         self.points = data["trajectory"]
@@ -84,18 +85,33 @@ class Viewer3D:
         self.idx = 0
         self.playing = False
         self.speed = 1.0
+        self._syncing = False
+        self.video_error = ""
+        self.video_disabled = (video_path is None or video_path == "") and not auto_video
         self.lo, self.hi = bounds_of(self.points)
-        self.video_path = self._resolve_video(video_path)
+        self.video_path = self._resolve_video(video_path, auto_video)
         self.cap = cv2.VideoCapture(str(self.video_path)) if self.video_path else None
-        self._video_photo = None
+        if self.cap is not None and not self.cap.isOpened():
+            self.video_error = f"视频打不开：{self.video_path}"
+            self.cap.release()
+            self.cap = None
+        if self.cap is not None:
+            vw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            vh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if vw > 0 and vh > 0 and vw < vh * 1.8:
+                self.video_error = f"视频不是左右并排（{vw}x{vh}），按 2:1 切分会错"
+                self.cap.release()
+                self.cap = None
         self.root.title(f"3D 轨迹 · {data.get('session', '')} · {self.n} points")
         self._build()
         self._redraw()
 
-    def _resolve_video(self, explicit: str | Path | None) -> Path | None:
+    def _resolve_video(self, explicit: str | Path | None, auto: bool) -> Path | None:
         if explicit:
             p = Path(explicit)
             return p if p.exists() else None
+        if not auto:
+            return None
         p = Path(self.data.get("_path", ""))
         if p.is_file():
             session = p.parent.parent if p.parent.name == "derived" else p.parent
@@ -108,15 +124,23 @@ class Viewer3D:
     def _build(self) -> None:
         # 2×2：左上左视频 / 右上右视频 / 左下 3D / 右下待定
         grid = ttk.Frame(self.root)
-        for r in (0, 1):
-            grid.rowconfigure(r, weight=1)
+        self._grid = grid
+        grid.rowconfigure(0, weight=0)
+        grid.rowconfigure(1, weight=1)
         for c in (0, 1):
-            grid.columnconfigure(c, weight=1)
+            grid.columnconfigure(c, weight=1, uniform="pane")
+        grid.bind("<Configure>", self._fit_video_rows)
 
         self.video_l = tk.Label(grid, bg="#0f172a", fg="#94a3b8",
-                                text="未找到 annotated.mp4", anchor="center")
+                                text=self.video_error or ("视频已关闭（--no-video）"
+                                                          if self.video_disabled
+                                                          else "未找到 annotated.mp4"),
+                                anchor="center")
         self.video_r = tk.Label(grid, bg="#0f172a", fg="#94a3b8",
-                                text="未找到 annotated.mp4", anchor="center")
+                                text=self.video_error or ("视频已关闭（--no-video）"
+                                                          if self.video_disabled
+                                                          else "未找到 annotated.mp4"),
+                                anchor="center")
         self.video_l.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
         self.video_r.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
         self._left_raw = None
@@ -157,15 +181,38 @@ class Viewer3D:
         self.speed_box.bind("<<ComboboxSelected>>", self._on_speed)
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
-        self.status.pack(fill="x")
+        self.status.pack(side="bottom", fill="x")
         # 先给控制条/状态栏留位置，再把四宫格填满剩余空间；
         # 否则 grid 的 expand 会把后面的 pack 控件压成 1px。
         grid.pack(fill="both", expand=True, padx=4, pady=4)
-        self.root.bind("<space>", lambda _e: self._toggle_play())
-        self.root.bind("<Left>", lambda _e: self._step(-1))
-        self.root.bind("<Right>", lambda _e: self._step(1))
+        self.root.after(0, self._fit_video_rows)
+        self.root.minsize(900, 700)
+        self.root.bind("<space>", self._on_space)
+        self.root.bind("<Left>", self._on_left)
+        self.root.bind("<Right>", self._on_right)
         self.root.bind("<Home>", lambda _e: self._reset_view())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _fit_video_rows(self, _event=None) -> None:
+        """顶上两格锁 16:9，避免 cover-crop 切掉左右叠加文字。"""
+        width = max(100, self._grid.winfo_width() - 8)
+        pane_w = max(80, width // 2)
+        self._grid.rowconfigure(0, minsize=max(90, int(round(pane_w * 9 / 16))))
+
+    def _on_space(self, event) -> None:
+        if isinstance(event.widget, (ttk.Button, ttk.Entry, ttk.Combobox, ttk.Scale)):
+            return
+        self._toggle_play()
+
+    def _on_left(self, event) -> None:
+        if isinstance(event.widget, (ttk.Entry, ttk.Combobox, ttk.Scale)):
+            return
+        self._step(-1)
+
+    def _on_right(self, event) -> None:
+        if isinstance(event.widget, (ttk.Entry, ttk.Combobox, ttk.Scale)):
+            return
+        self._step(1)
 
     def _on_close(self) -> None:
         if self.cap is not None:
@@ -218,7 +265,9 @@ class Viewer3D:
             (self._right_raw, self.video_r, "_right_photo"),
         ):
             if raw is None:
-                label.configure(image="", text="未找到 annotated.mp4")
+                label.configure(image="", text=self.video_error or (
+                    "视频已关闭（--no-video）" if getattr(self, "video_disabled", False)
+                    else "未找到 annotated.mp4"))
                 continue
             w = max(2, label.winfo_width())
             h = max(2, label.winfo_height())
@@ -246,7 +295,11 @@ class Viewer3D:
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
         ok, img = self.cap.read()
         if not ok or img is None:
+            self.video_error = f"frame {frame} 解码失败"
+            self._left_raw = self._right_raw = None
+            self._render_video()
             return
+        self.video_error = ""
         h, w = img.shape[:2]
         self._left_raw = img[:, : w // 2].copy()
         self._right_raw = img[:, w // 2:].copy()
@@ -264,12 +317,21 @@ class Viewer3D:
 
     # ------------------------------------------------------------------
     def _on_slider(self, value: str) -> None:
+        if self._syncing:
+            return
         self.idx = max(0, min(self.n - 1, int(round(float(value)))))
         self._redraw()
 
+    def _set_slider(self, idx: int) -> None:
+        self._syncing = True
+        try:
+            self.slider.set(idx)
+        finally:
+            self._syncing = False
+
     def _step(self, delta: int) -> None:
         self.idx = max(0, min(self.n - 1, self.idx + delta))
-        self.slider.set(self.idx)
+        self._set_slider(self.idx)
         self._redraw()
 
     def _on_speed(self, _event=None) -> None:
@@ -286,7 +348,7 @@ class Viewer3D:
         if not self.playing:
             return
         self.idx = (self.idx + 1) % self.n
-        self.slider.set(self.idx)
+        self._set_slider(self.idx)
         self._redraw()
         self.root.after(max(16, int(33 / max(self.speed, 1e-6))), self._tick)
 
@@ -310,14 +372,35 @@ def main() -> int:
         print(f"session={data.get('session')} points={len(data['trajectory'])}")
         print(f"coordinate_system={data.get('coordinate_system')} unit={data.get('unit')}")
         print(f"bounds min={lo} max={hi}")
-        p = Path(data["_path"])
-        session = p.parent.parent if p.parent.name == "derived" else p.parent
-        video = session / "derived" / "annotated.mp4"
-        print(f"video={video if video.exists() else '(none)'}")
+        if args.no_video:
+            print("video=disabled (--no-video)")
+        else:
+            p = Path(data["_path"])
+            session = p.parent.parent if p.parent.name == "derived" else p.parent
+            video = Path(args.video) if args.video else (session / "derived" / "annotated.mp4")
+            print(f"video={video}")
+            cap = cv2.VideoCapture(str(video)) if video.exists() else None
+            if cap is None or not cap.isOpened():
+                print("[错误] 视频打不开或不存在")
+                if cap is not None:
+                    cap.release()
+                return 1
+            vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            vn = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            max_frame = max(int(p.get("frame", 0)) for p in data["trajectory"])
+            print(f"video_frames={vn} size={vw}x{vh} max_point_frame={max_frame}")
+            if vw < vh * 1.8:
+                print("[错误] 视频不是左右并排（需要约 2:1）")
+                return 1
+            if max_frame >= vn:
+                print(f"[错误] 轨迹帧 {max_frame} 超出视频 {vn} 帧")
+                return 1
         return 0
     root = tk.Tk()
-    root.geometry("1100x900")
-    Viewer3D(root, data, None if args.no_video else (args.video or None))
+    root.geometry("1500x950")
+    Viewer3D(root, data, args.video or None, auto_video=not args.no_video)
     root.mainloop()
     return 0
 

@@ -219,6 +219,10 @@ class Launcher(tk.Tk):
         self.tasks: list[Task] = []
         self._tid = 0
         self._sel_tid: int | None = None
+        self._wb_check_result: dict[str, bool] = {}
+        self._wb_check_inflight: set[str] = set()
+        self._wb_auto_after: str | None = None
+        self._record_before: set[str] = set()
 
         self._init_style()
         self._build_header()
@@ -768,18 +772,43 @@ class Launcher(tk.Tk):
             self.after(2500, self._wb_tick)
 
     def _after_record_task(self, task: Task) -> None:
-        """录制结束 -> 自动选中新会话并跑校验（P2）。"""
-        if task.stop_reason:
-            self._append("[工作台] 录制被中断，跳过自动校验。")
+        """录制结束 -> 只对新目录自动校验（P2）。"""
+        if task.exit_code != 0:
+            self._append(f"[工作台] 录制失败（返回码 {task.exit_code}），不自动校验旧会话。")
+            self._wb_refresh()
             return
-        self._wb_refresh(select_latest=True)
-        self.after(800, self._wb_auto_check)
+        from apps._workbench import scan_sessions
+        now = scan_sessions(ROOT / "data" / "sessions", limit=50)
+        new = [s for s in now if s.path.name not in self._record_before]
+        if not new:
+            self._append("[工作台] 录制结束但没有发现新会话目录；跳过自动校验。")
+            self._wb_refresh()
+            return
+        target = new[0]
+        self._wb_refresh(select_latest=False)
+        self._wb_select_id(target.id)
+        if self._wb_auto_after:
+            try:
+                self.after_cancel(self._wb_auto_after)
+            except Exception:                               # noqa: BLE001
+                pass
+        self._wb_auto_after = self.after(
+            800, lambda sid=target.id: self._wb_auto_check(sid))
 
-    def _wb_auto_check(self) -> None:
+    def _wb_select_id(self, sid: str) -> None:
+        for label, path in self._wb_paths.items():
+            if path.name == sid:
+                self.wb_var.set(label)
+                self._wb_show()
+                return
+
+    def _wb_auto_check(self, sid: str) -> None:
+        self._wb_auto_after = None
+        self._wb_select_id(sid)
         s = self._wb_selected()
-        if s is not None and s.can_check:
-            self._append(f"[工作台] 录制完成，自动校验 {s.id}。")
-            self._wb_check()
+        if s is not None and s.id == sid and s.can_check:
+            self._append(f"[工作台] 录制完成，自动校验 {sid}。")
+            self._wb_check(sid)
 
     def _wb_show(self) -> None:
         s = self._wb_selected()
@@ -799,16 +828,20 @@ class Launcher(tk.Tk):
             z = f"  Z {s.z_min:.3f}–{s.z_max:.3f} m"
         res = f"  残差中位 {s.residual_median:.2f} px" if s.residual_median is not None else ""
         problems = ("\n问题：" + "；".join(s.problems)) if s.problems else ""
+        checked = self._wb_check_result.get(s.id)
+        check_text = "—" if checked is None else ("✓" if checked else "✗")
         self.wb_info.configure(
             text=(f"会话 {s.id}  {s.created}\n"
                   f"帧数 {s.frames_left}/{s.frames_right}  "
                   f"sync {s.sync_method}{s.sync_offset:+d} (置信度 {s.sync_confidence:.2f})"
                   f"{means}\n"
-                  f"seed {'✓' if s.has_seeds else '—'}   "
+                  f"校验 {check_text}   seed {'✓' if s.has_seeds else '—'}   "
                   f"轨迹 {traj}{z}{res}{problems}"))
         next_step = {
             "bad": "先按上面的问题重录/修数据；坏数据不要进三维。",
-            "recorded": "下一步：② 点选球心。",
+            "recorded": ("校验未通过，按问题重录。" if checked is False
+                         else "下一步：① 校验数据。" if checked is None
+                         else "下一步：② 点选球心。"),
             "seeded": "下一步：③ 跑离线双目。",
             "traj": "下一步：④ 打开 3D 查看器；⑤ 可重新导出标准 JSON。",
         }.get(s.status, "")
@@ -818,17 +851,42 @@ class Launcher(tk.Tk):
 
         specular = self.method.get() == "specular"
         from apps._workbench import button_states
-        states = button_states(s, specular)
+        states = button_states(s, specular, checked)
+        if s.id in self._wb_check_inflight:
+            states["check"] = False
         for key, enabled in states.items():
             self._wb_buttons[key].configure(state="normal" if enabled else "disabled")
 
-    def _wb_check(self) -> None:
-        s = self._wb_selected()
-        if s is None:
+    def _wb_check(self, sid: str | None = None) -> None:
+        if sid is None:
+            s = self._wb_selected()
+        else:
+            s = next((x for x in (self._wb_selected(),) if x and x.id == sid), None)
+            if s is None:
+                self._wb_select_id(sid)
+                s = self._wb_selected()
+        if s is None or not s.can_check or s.id in self._wb_check_inflight:
             return
+        if self._wb_auto_after:
+            try:
+                self.after_cancel(self._wb_auto_after)
+            except Exception:                               # noqa: BLE001
+                pass
+            self._wb_auto_after = None
+        self._wb_check_inflight.add(s.id)
+        self._wb_show()
         self._run([PY, str(ROOT / "apps" / "tools" / "check_dataset.py"),
-                   str(s.path), "--strict"], f"校验数据 {s.id}")
-        self.after(1200, self._wb_refresh)
+                   str(s.path), "--strict"], f"校验数据 {s.id}",
+                  on_done=lambda task, xid=s.id: self._wb_check_done(task, xid))
+
+    def _wb_check_done(self, task: Task, sid: str) -> None:
+        self._wb_check_inflight.discard(sid)
+        ok = task.exit_code == 0
+        self._wb_check_result[sid] = ok
+        self._append(f"[工作台] 校验 {sid}：{'通过' if ok else f'失败（码 {task.exit_code}）'}")
+        s = self._wb_selected()
+        if s is not None and s.id == sid:
+            self._wb_show()
 
     def _wb_seed(self) -> None:
         s = self._wb_selected()
@@ -1046,6 +1104,8 @@ class Launcher(tk.Tk):
             return
         cmd = self._record_args(str(duration), label)
         self._append(f"录制：{duration} 秒；开始后闪一次光，结束前再闪一次。")
+        from apps._workbench import scan_sessions
+        self._record_before = {s.path.name for s in scan_sessions(ROOT / "data" / "sessions", limit=50)}
         self._run(cmd, f"录制双目（{duration} 秒）",
                   on_done=self._after_record_task)
 

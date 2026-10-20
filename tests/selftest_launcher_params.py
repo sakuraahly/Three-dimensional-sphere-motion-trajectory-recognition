@@ -59,6 +59,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -630,10 +631,34 @@ def main() -> int:
              button_states(good, True)["seed"]
              and button_states(good, True)["run"]
              and button_states(good, True)["view"]),
+            ("校验失败时禁用 seed/run",
+             not button_states(good, True, False)["seed"]
+             and not button_states(good, True, False)["run"]),
         ]
         for name, passed in checks_wb:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))
+
+    # ---- 12. Task.on_done：完成回调恰好一次（P2 基础）----
+    print("----- 12. 任务完成回调（P2）-----")
+    hits: list[int] = []
+    app2 = mod.Launcher()
+    app2.withdraw()
+    task = app2.start_task(
+        [sys.executable, "-c", "print('on_done_ok')"], "on_done-selftest",
+        on_done=lambda t: hits.append(t.tid))
+    deadline = time.time() + 8.0
+    while time.time() < deadline and not hits:
+        app2.update()
+        time.sleep(0.03)
+    checks_cb = [
+        ("任务完成后 on_done 恰好调用一次",
+         hits == [task.tid] and not task.running),
+    ]
+    for name, passed in checks_cb:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        results.append((name, passed))
+    app2.destroy()
 
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
