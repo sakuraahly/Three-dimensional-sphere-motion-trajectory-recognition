@@ -711,7 +711,7 @@ class Launcher(tk.Tk):
             ("check", "① 校验数据", self._wb_check),
             ("seed", "② 点选球心", self._wb_seed),
             ("run", "③ 跑离线双目", self._wb_run),
-            ("view", "④ 打开 3D", self._wb_view),
+            ("view", "④ 3D + 视频", self._wb_view),
             ("export", "⑤ 导出 JSON", self._wb_export),
             ("open", "打开会话目录", self._wb_open),
         ]
