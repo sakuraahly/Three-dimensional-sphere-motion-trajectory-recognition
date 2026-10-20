@@ -59,8 +59,8 @@ class SeedPicker(tk.Toplevel):
     def _build(self) -> None:
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
-        ttk.Label(top, text="在左图点球心，再在右图点球心；圆会自动估半径，"
-                            "滚轮可微调。").pack(side="left")
+        ttk.Label(top, text="在左图点球心，再在右图点球心；圆心=你点击的位置，"
+                            "半径自动估、可滚轮/输入框微调。").pack(side="left")
         ttk.Label(top, text="seed 帧").pack(side="left", padx=(18, 4))
         self.frame_var = tk.StringVar(value=str(self.frame_index))
         ttk.Spinbox(top, from_=0, to=99999, width=6,
@@ -152,11 +152,10 @@ class SeedPicker(tk.Toplevel):
 
     # ------------------------------------------------------------------
     def _estimate_circle(self, frame: np.ndarray, x: float, y: float) -> tuple[float, float, float] | None:
-        """点击点附近找圆；返回 Hough 圆心和半径（不是原始点击点）。
+        """在点击点附近找圆，**只用于估半径**；圆心仍取用户点击位置。
 
-        为什么必须返回圆心：CSRT 的初始框以 seed 为中心。用户点偏几像素，
-        框就偏；左右两路各偏一点，极线配对会直接拒掉。Hough 找到的圆心
-        比裸点击更接近球心，这里在 60px 内取**最大**的合理外径。
+        用户明确要求“我点哪就是哪”，所以这里虽然返回 Hough 圆心，
+        调用方只使用第三个返回值（半径），不自动吸附。
         """
         h, w = frame.shape[:2]
         r = 150
@@ -214,7 +213,9 @@ class SeedPicker(tk.Toplevel):
         y = float(event.y) * h / PREVIEW_H
         circle = self._estimate_circle(frame, x, y)
         if circle is not None:
-            x, y, radius = circle
+            # 圆心必须严格等于用户点击位置，不自动吸附 Hough 圆心；
+            # Hough 只用来估半径（用户明确要求“我点哪就是哪”）。
+            radius = float(circle[2])
         else:
             radius = float(max(12, min(300, round(w / 32.0))))
         if side == "left":
@@ -280,7 +281,7 @@ class SeedPicker(tk.Toplevel):
                 seed_frame=self.frame_index,
                 image_size=(self.left_frame.shape[1], self.left_frame.shape[0]),
                 source="gui_click",
-                note="GUI 点选球心；Hough 圆心 + 半径（滚轮可微调）",
+                note="GUI 点选球心；圆心=点击位置，半径由 Hough 估计、可微调",
             )
         except Exception as exc:                            # noqa: BLE001
             messagebox.showerror("保存 seed", f"保存失败：{exc}", parent=self)
