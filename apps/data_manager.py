@@ -75,13 +75,18 @@ class DataManager(tk.Tk):
         self.items: list[SessionItem] = []
         self.selected: set[str] = set()
         self._anchor_id: str | None = None
+        self._last_focus: str | None = None
         self._running = False
         self._current_out: Path | None = None
+        self._worker: threading.Thread | None = None
+        self._closing = False
+        self._cancel = threading.Event()
         self._cat_vars: dict[str, tk.BooleanVar] = {}
         self._redact_vars: dict[str, tk.BooleanVar] = {}
         self._ui_queue: queue.Queue = queue.Queue()
         self._build()
         self.refresh()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_ui)
 
     # ------------------------------------------------------------------
@@ -102,6 +107,7 @@ class DataManager(tk.Tk):
         ttk.Button(toolbar, text="全不选", command=self.select_none).pack(side="left", padx=4)
         ttk.Button(toolbar, text="反选", command=self.invert).pack(side="left", padx=4)
         ttk.Button(toolbar, text="选到此处", command=self.select_to_here).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="设为起点", command=self.set_anchor).pack(side="left", padx=4)
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Label(toolbar, text="从").pack(side="left")
         self.from_var = tk.StringVar()
@@ -138,7 +144,7 @@ class DataManager(tk.Tk):
         self.tree.bind("<Button-1>", self._tree_click)
         self.tree.bind("<Double-1>", lambda _e: self.toggle_focus())
 
-        tip = ttk.Label(left, text="点第一列勾选；Shift+点行做区间勾选；双击也可切换。",
+        tip = ttk.Label(left, text="点第一列勾选；勾起点→点终点→『选到此处』；Shift+点行也可区间。",
                         foreground=MUTED)
         tip.pack(side="bottom", anchor="w", pady=(4, 0))
 
@@ -252,19 +258,33 @@ class DataManager(tk.Tk):
         col = self.tree.identify_column(event.x)
         if not row:
             return None
+        shift = bool(event.state & 0x0001)
+        if shift:
+            start = self._anchor_id or self._last_focus
+            if start:
+                self.tree.focus(row)
+                self._anchor_id = start
+                self._select_range(start, row)
+            else:
+                self._anchor_id = row
+                self.tree.focus(row)
+                self._last_focus = row
+            return "break"
         if col == "#1":
+            self.tree.focus(row)
+            self._last_focus = row
             self.toggle_key(row)
             self._anchor_id = row
             return "break"
-        if event.state & 0x0001 and self._anchor_id:      # Shift
-            self._select_range(self._anchor_id, row)
-            return "break"
-        self._anchor_id = row
+        # 普通点行只移动焦点，不改区间起点；起点由 checkbox / 『设为起点』决定
+        self.tree.focus(row)
+        self._last_focus = row
         return None
 
     def toggle_focus(self) -> None:
         row = self.tree.focus()
         if row:
+            self._last_focus = row
             self.toggle_key(row)
 
     def toggle_key(self, key: str) -> None:
@@ -287,16 +307,28 @@ class DataManager(tk.Tk):
 
     def select_all(self) -> None:
         self.selected = {it.key for it in self.items}
+        self._anchor_id = None
         self._refresh_count()
 
     def select_none(self) -> None:
         self.selected.clear()
+        self._anchor_id = None
         self._refresh_count()
 
     def invert(self) -> None:
         all_keys = {it.key for it in self.items}
         self.selected = all_keys - self.selected
+        self._anchor_id = None
         self._refresh_count()
+
+    def set_anchor(self) -> None:
+        row = self.tree.focus()
+        if not row:
+            messagebox.showinfo("设为起点", "先点一行作为起点。", parent=self)
+            return
+        self._anchor_id = row
+        self._last_focus = row
+        self.status.configure(text=f"区间起点：{row}")
 
     def select_to_here(self) -> None:
         row = self.tree.focus()
@@ -304,12 +336,24 @@ class DataManager(tk.Tk):
             messagebox.showinfo("选到此处", "先点一行作为终点。", parent=self)
             return
         if not self._anchor_id:
-            self._anchor_id = row
+            messagebox.showinfo("选到此处", "先点第一列勾起点，或先按『设为起点』。",
+                                parent=self)
+            return
         self._select_range(self._anchor_id, row)
 
     def select_time(self) -> None:
-        start = _parse_dt(self.from_var.get())
-        end = _parse_dt(self.to_var.get(), end=True)
+        raw_from = self.from_var.get().strip()
+        raw_to = self.to_var.get().strip()
+        start = _parse_dt(raw_from)
+        end = _parse_dt(raw_to, end=True)
+        if raw_from and start is None:
+            messagebox.showwarning("按时间选择", f"开始时间解析不了：{raw_from}",
+                                   parent=self)
+            return
+        if raw_to and end is None:
+            messagebox.showwarning("按时间选择", f"结束时间解析不了：{raw_to}",
+                                   parent=self)
+            return
         if start is None and end is None:
             messagebox.showinfo("按时间选择", "填一个开始或结束时间，例如 2026-10-20。",
                                 parent=self)
@@ -329,6 +373,7 @@ class DataManager(tk.Tk):
                 continue
             chosen.add(it.key)
         self.selected = chosen
+        self._anchor_id = None
         self._refresh_count()
 
     def clear_time(self) -> None:
@@ -366,9 +411,13 @@ class DataManager(tk.Tk):
             return
         if ("raw" in opts.categories or "annotated" in opts.categories) and not messagebox.askyesno(
                 "视频隐私", "视频画面没有自动打码，房间/人物会被一起交付。\n继续导出？",
-                parent=self):
+                parent=self, default=messagebox.NO):
             return
-        out = normalize_output(self.out_var.get())
+        try:
+            out = normalize_output(self.out_var.get())
+        except ValueError as exc:
+            messagebox.showerror("输出路径", str(exc), parent=self)
+            return
         self.out_var.set(str(out))
         if out.exists() and not messagebox.askyesno(
                 "覆盖", f"文件已存在，覆盖？\n{out}", parent=self):
@@ -380,6 +429,8 @@ class DataManager(tk.Tk):
                 messagebox.showerror("导出", f"删不掉旧文件：{exc}", parent=self)
                 return
         self._running = True
+        self._closing = False
+        self._cancel.clear()
         self._current_out = out
         self.export_btn.configure(state="disabled")
         self.progress["value"] = 0
@@ -387,17 +438,53 @@ class DataManager(tk.Tk):
         self._log_line(f"开始导出 {len(chosen)} 个会话 → {out}")
 
         def work() -> None:
+            def report(done: int, total: int, name: str) -> None:
+                if self._cancel.is_set():
+                    raise RuntimeError("用户取消导出")
+                self._ui_queue.put(("progress", done, total, name))
+
             try:
-                result = export_zip(
-                    chosen, opts, out,
-                    progress=lambda done, total, name: self._ui_queue.put(
-                        ("progress", done, total, name)))
+                result = export_zip(chosen, opts, out, progress=report)
             except Exception as exc:                        # noqa: BLE001
+                if self._cancel.is_set():
+                    return
                 self._ui_queue.put(("error", exc))
             else:
-                self._ui_queue.put(("done", result))
+                if not self._cancel.is_set():
+                    self._ui_queue.put(("done", result))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
+
+    def _cleanup_partial(self) -> None:
+        if self._current_out is not None:
+            part = self._current_out.with_name(self._current_out.name + ".part")
+            try:
+                if part.exists():
+                    part.unlink()
+            except OSError:
+                pass
+
+    def _on_close(self) -> None:
+        if not self._running:
+            self.destroy()
+            return
+        if not messagebox.askyesno(
+                "退出", "正在导出。退出会取消导出，等当前文件写完再关闭。继续？",
+                parent=self):
+            return
+        self._cancel.set()
+        self._closing = True
+        self.export_btn.configure(state="disabled")
+        self.status.configure(text="正在取消导出，等待当前文件收尾…")
+        self._wait_close()
+
+    def _wait_close(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            self.after(100, self._wait_close)
+            return
+        self._cleanup_partial()
+        self.destroy()
 
     def _poll_ui(self) -> None:
         """后台线程不能碰 Tk；只把消息放进队列，这里在主线程消费。"""
@@ -426,6 +513,10 @@ class DataManager(tk.Tk):
 
     def _on_error(self, exc: Exception) -> None:
         self._running = False
+        self._worker = None
+        if self._closing:
+            return
+        self._cleanup_partial()
         self.export_btn.configure(state="normal")
         if self._current_out is not None:
             try:
@@ -440,6 +531,9 @@ class DataManager(tk.Tk):
 
     def _on_done(self, result: ExportResult) -> None:
         self._running = False
+        self._worker = None
+        if self._closing:
+            return
         self._current_out = None
         self.export_btn.configure(state="normal")
         self.progress["value"] = self.progress["maximum"]

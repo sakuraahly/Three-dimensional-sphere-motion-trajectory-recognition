@@ -58,6 +58,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -677,7 +678,8 @@ def main() -> int:
     # ---- 13. 数据导出：脱敏 + 类别 + zip ----
     print("----- 13. 数据管理导出 -----")
     from apps._data_export import (
-        ExportOptions, estimate_bytes, export_zip, redact_session, scan_items,
+        DEFAULT_CATEGORIES, ExportOptions, estimate_bytes, export_zip,
+        normalize_output, redact_session, scan_items,
     )
     from apps.data_manager import DataManager
     with tempfile.TemporaryDirectory(prefix="dsh_export_") as tmp:
@@ -711,6 +713,35 @@ def main() -> int:
             red_zip = json.loads(zf.read(sj))
             has_raw = any("/videos/raw/" in n for n in names)
             has_manifest = any(n.endswith("/manifest.json") for n in names)
+
+        # 默认类别 + manifest 契约
+        default_opts = ExportOptions()
+        default_zip = export_zip(items, default_opts, Path(tmp) / "default.zip")
+        with zipfile.ZipFile(default_zip.output) as zf:
+            default_names = zf.namelist()
+            default_manifest = json.loads(
+                zf.read([n for n in default_names if n.endswith("/manifest.json")][0]))
+        default_has_raw = any("/videos/raw/" in n for n in default_names)
+        default_has_annotated = any("/videos/annotated" in n for n in default_names)
+        root = default_names[0].split("/")[0]
+        all_under_root = all(n.startswith(root + "/") for n in default_names)
+        paths = [n for n in default_names if not n.endswith("/")]
+        no_abs = not any((":" in p or p.startswith("/")) for p in paths)
+        unique = len(paths) == len(set(paths))
+        manifest_paths = ([default_manifest.get("root", "")]
+                          + [f.get("path", "") for f in default_manifest.get("files", [])]
+                          + [s.get("folder", "") for s in default_manifest.get("sessions", [])]
+                          + [s.get("id", "") for s in default_manifest.get("sessions", [])])
+        no_abs_manifest = not any(
+            re.match(r"^[A-Za-z]:[\\/]", p) or p.startswith("\\\\") or p.startswith("/")
+            for p in manifest_paths if p)
+        manifest_ok = (
+            default_manifest.get("n_sessions") == len(items)
+            and default_manifest.get("root") == root
+            and set(default_manifest.get("categories") or []) == set(DEFAULT_CATEGORIES)
+            and default_manifest.get("redaction", {}).get("camera_identity") is True
+            and no_abs_manifest
+        )
         checks_data = [
             ("脱敏移除相机身份/名称/端口",
              all(k not in red["left"] for k in ("identity", "name", "port"))
@@ -718,14 +749,134 @@ def main() -> int:
             ("脱敏移除 label/notes/platform",
              "label" not in red and "notes" not in red
              and "platform" not in red.get("environment", {})),
-            ("默认类别不含原始视频", not has_raw),
+            ("默认类别不含视频", not default_has_raw and not default_has_annotated),
             ("zip 内 session.json 是脱敏后的",
              "identity" not in red_zip["left"] and red_zip.get("label") is None),
             ("zip 有 manifest.json", has_manifest),
-            ("estimate_bytes 非零", estimate_bytes(items, opts) > 0),
-            ("导出结果有文件", res.n_files >= 3 and out_zip.exists()),
+            ("manifest/目录：单根、无绝对路径、无重复",
+             all_under_root and no_abs and no_abs_manifest and unique and manifest_ok),
+            ("n_files 与实际 zip 条目一致",
+             default_zip.n_files == len(default_names)),
+            ("estimate_bytes 非零", estimate_bytes(items, default_opts) > 0),
+            ("导出结果有文件", default_zip.n_files >= 3 and default_zip.output.exists()),
         ]
         for name, passed in checks_data:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
+
+        # 全部类别 + 项目自己写的 _first / brightness 文件
+        (sd / "derived" / "traj3d_first1.csv").write_text("x", encoding="utf-8")
+        (sd / "derived" / "traj3d_first1.png").write_bytes(b"png")
+        (sd / "derived" / "annotated_first1.mp4").write_bytes(b"mp4")
+        (sd / "derived" / "left_brightness.npy").write_bytes(b"npy")
+        all_opts = ExportOptions(categories=frozenset({
+            "metadata", "derived", "plots", "annotated", "raw", "calibration"}))
+        all_zip = export_zip(items, all_opts, Path(tmp) / "all.zip")
+        with zipfile.ZipFile(all_zip.output) as zf:
+            all_names = zf.namelist()
+        checks_extra = [
+            ("_first/_brightness/annotated 变体进入包",
+             any("traj3d_first1.csv" in n for n in all_names)
+             and any("traj3d_first1.png" in n for n in all_names)
+             and any("annotated_first1.mp4" in n for n in all_names)
+             and any("left_brightness.npy" in n for n in all_names)),
+        ]
+
+        # 坏/缺 metadata 必须报错，不能静默消失
+        bad_dir = sroot / "20260103-120000"
+        bad_dir.mkdir()
+        (bad_dir / "session.json").write_text("{", encoding="utf-8")
+        bad_item = [it for it in scan_items(sroot) if it.key == bad_dir.name][0]
+        non_dict_dir = sroot / "20260104-120000"
+        non_dict_dir.mkdir()
+        (non_dict_dir / "session.json").write_text("[]", encoding="utf-8")
+        non_dict_item = [it for it in scan_items(sroot) if it.key == non_dict_dir.name][0]
+        try:
+            export_zip([non_dict_item], ExportOptions(categories=frozenset({"metadata"})),
+                       Path(tmp) / "non_dict.zip")
+            non_dict_raises = False
+        except ValueError:
+            non_dict_raises = True
+        try:
+            export_zip([bad_item], ExportOptions(categories=frozenset({"metadata"})),
+                       Path(tmp) / "bad.zip")
+            bad_meta_raises = False
+        except ValueError:
+            bad_meta_raises = True
+        try:
+            export_zip(items, opts, out_zip)
+            overwrite_raises = False
+        except FileExistsError:
+            overwrite_raises = True
+        try:
+            normalize_output("")
+            empty_raises = False
+        except ValueError:
+            empty_raises = True
+        off = redact_session(sensitive, ExportOptions(
+            redact_camera=False, redact_labels=False, redact_platform=False))
+        checks_extra += [
+            ("坏 metadata 明确报错", bad_meta_raises),
+            ("非对象 JSON 标为坏会话且导出报错",
+             non_dict_item.status == "✗" and non_dict_raises),
+            ("重复输出报 FileExistsError", overwrite_raises),
+            ("空输出路径报 ValueError", empty_raises),
+            ("脱敏关闭时不谎称已移除",
+             "identity" in off["left"] and "已移除" not in off["redacted"]["note"]),
+        ]
+        cancel_zip = Path(tmp) / "cancel.zip"
+        try:
+            export_zip(
+                items, opts, cancel_zip,
+                progress=lambda _d, _t, _n: (_ for _ in ()).throw(RuntimeError("cancel")))
+            cancel_ok = False
+        except RuntimeError:
+            cancel_ok = not cancel_zip.exists() and not (cancel_zip.with_name(
+                cancel_zip.name + ".part").exists())
+        checks_extra.append(("取消/失败不留半成品", cancel_ok))
+
+        # GUI 选择：起点→终点区间；全选/反选
+        try:
+            dm = DataManager(sroot)
+            dm.withdraw()
+            dm.update()
+            rows = dm.tree.get_children()
+            dm.tree.focus(rows[0])
+            dm.set_anchor()
+            dm.tree.focus(rows[-1])
+            dm.select_to_here()
+            range_ok = len(dm.selected) == len(rows)
+            dm.select_none()
+            dm.select_all()
+            all_ok = len(dm.selected) == len(rows)
+            dm.invert()
+            invert_ok = len(dm.selected) == 0
+            dm.select_none()
+            dm._last_focus = rows[0]
+            dm._anchor_id = None
+            dm._select_range(rows[0], rows[-1])
+            shift_ok = len(dm.selected) == len(rows)
+            dm.select_none()
+            warn_before = set(dm.selected)
+            import apps.data_manager as dmmod
+            old_warn = dmmod.messagebox.showwarning
+            warnings: list = []
+            dmmod.messagebox.showwarning = lambda *a, **k: warnings.append(a)
+            try:
+                dm.from_var.set("bogus")
+                dm.to_var.set("2026-01-02")
+                dm.select_time()
+            finally:
+                dmmod.messagebox.showwarning = old_warn
+            time_bad_ok = set(dm.selected) == warn_before and bool(warnings)
+            dm.destroy()
+            gui_ok = range_ok and all_ok and invert_ok and shift_ok and time_bad_ok
+        except Exception as exc:                            # noqa: BLE001
+            print(f"    DataManager 选择测试失败：{exc}")
+            gui_ok = False
+        checks_extra.append(("GUI 起点→终点/全选/反选", gui_ok))
+
+        for name, passed in checks_extra:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))
 
@@ -751,7 +902,7 @@ def main() -> int:
             dm.update()
             n_rows = len(dm.tree.get_children())
             dm.destroy()
-            dm_ok = n_rows == 3
+            dm_ok = n_rows == len([p for p in sroot.iterdir() if p.is_dir()])
         except Exception as exc:                            # noqa: BLE001
             print(f"    DataManager 构造失败：{exc}")
             dm_ok = False

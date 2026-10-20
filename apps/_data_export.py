@@ -7,6 +7,7 @@ GUI 只负责勾选和展示，真正的文件收集/脱敏/zip 都在这里，�
 from __future__ import annotations
 
 import json
+import os
 import re
 import zipfile
 from dataclasses import dataclass, field, replace
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 CATEGORIES: dict[str, str] = {
-    "metadata": "会话元数据（脱敏 session.json + 时间戳）",
+    "metadata": "会话元数据（session.json + 时间戳）",
     "derived": "标准派生数据（seeds / traj3d / visualization / CSV）",
     "plots": "派生图（traj3d.png / sync_brightness.png）",
     "annotated": "标注视频（有画面，含隐私风险）",
@@ -38,6 +39,7 @@ class SessionItem:
     n_matched: int
     status: str
     size_bytes: int
+    error: str = ""
 
     @property
     def key(self) -> str:
@@ -74,7 +76,9 @@ class ExportResult:
 
 def _read_session(path: Path) -> dict:
     try:
-        return json.loads((path / "session.json").read_text(encoding="utf-8"))
+        data = json.loads((path / "session.json").read_text(encoding="utf-8"))
+        # [] / "oops" / 42 都是合法 JSON，但不是会话对象；不能让 .get 崩掉扫描
+        return data if isinstance(data, dict) else {}
     except Exception:                                       # noqa: BLE001
         return {}
 
@@ -115,7 +119,13 @@ def scan_items(root: str | Path) -> list[SessionItem]:
     dirs.sort(key=key, reverse=True)
     items: list[SessionItem] = []
     for p in dirs:
+        sess_path = p / "session.json"
         data = _read_session(p)
+        error = ""
+        if not sess_path.exists():
+            error = "缺 session.json"
+        elif not data:
+            error = "session.json 解析失败"
         left = data.get("left") or {}
         right = data.get("right") or {}
         n_matched = 0
@@ -127,13 +137,14 @@ def scan_items(root: str | Path) -> list[SessionItem]:
                                 if s.get("matched") and s.get("xyz"))
             except Exception:                               # noqa: BLE001
                 pass
-        status = "✓" if n_matched else ("✗" if not (p / "session.json").exists() else "○")
+        status = "✗" if error else ("✓" if n_matched else "○")
         items.append(SessionItem(
             path=p, id=str(data.get("id") or p.name),
             created=_session_created(data, p.name),
             frames_left=int(left.get("frame_count") or 0),
             frames_right=int(right.get("frame_count") or 0),
-            n_matched=n_matched, status=status, size_bytes=_dir_size(p)))
+            n_matched=n_matched, status=status, size_bytes=_dir_size(p),
+            error=error))
     return items
 
 
@@ -153,33 +164,59 @@ def redact_session(data: dict, options: ExportOptions) -> dict:
         env = out.get("environment")
         if isinstance(env, dict):
             env.pop("platform", None)
+    removed = []
+    if options.redact_camera:
+        removed.append("相机 identity/name/port")
+    if options.redact_labels:
+        removed.append("会话 label/notes")
+    if options.redact_platform:
+        removed.append("OS platform")
     out["redacted"] = {
         "camera_identity": bool(options.redact_camera),
         "labels_notes": bool(options.redact_labels),
         "platform": bool(options.redact_platform),
-        "note": "相机身份/端口/标签/备注/OS 平台已移除；时间、帧数、标定与轨迹保留",
+        "note": ("已移除：" + "、".join(removed)) if removed else "未移除标识字段",
     }
     return out
 
 
 def _cat_files(session: Path, category: str) -> Iterable[tuple[Path, str]]:
-    """返回该类别下 (源文件, 包内相对路径) 列表。"""
+    """返回该类别下 (源文件, 包内相对路径) 列表。
+
+    除了标准文件，也要带上 `_first<N>` 的部分结果和 `*_brightness.npy`，
+    否则“只跑过部分帧”的会话在导出包里会看起来像空会话。
+    """
     derived = session / "derived"
     if category == "derived":
-        for name in ("seeds.json", "traj3d.json", "visualization.json",
-                     "traj3d.csv", "traj3d_smoothed.csv"):
+        names = ("seeds.json", "traj3d.json", "visualization.json",
+                 "traj3d.csv", "traj3d_smoothed.csv",
+                 "left_brightness.npy", "right_brightness.npy")
+        for name in names:
             p = derived / name
             if p.is_file():
                 yield p, f"derived/{name}"
+        for p in sorted(derived.glob("traj3d_first*.csv")):
+            if p.is_file():
+                yield p, f"derived/{p.name}"
+        for p in sorted(derived.glob("traj3d_smoothed_first*.csv")):
+            if p.is_file():
+                yield p, f"derived/{p.name}"
+        for p in sorted(derived.glob("traj3d_first*.json")):
+            if p.is_file():
+                yield p, f"derived/{p.name}"
     elif category == "plots":
-        for name in ("traj3d.png", "sync_brightness.png"):
+        names = ("traj3d.png", "sync_brightness.png")
+        for name in names:
             p = derived / name
             if p.is_file():
                 yield p, f"derived/plots/{name}"
+        for p in sorted(derived.glob("traj3d_first*.png")):
+            if p.is_file():
+                yield p, f"derived/plots/{p.name}"
     elif category == "annotated":
-        p = derived / "annotated.mp4"
-        if p.is_file():
-            yield p, "videos/annotated.mp4"
+        for p in sorted(derived.glob("annotated*.mp4")):
+            if p.is_file():
+                yield p, f"videos/{p.name}"
     elif category == "raw":
         for name in ("left.mkv", "right.mkv", "left.mp4", "right.mp4"):
             p = session / name
@@ -250,6 +287,8 @@ def _manifest(items: list[SessionItem], options: ExportOptions,
 
 def _readme(items: list[SessionItem], options: ExportOptions) -> str:
     cats = "\n".join(f"- `{k}`：{CATEGORIES[k]}" for k in sorted(options.categories))
+    meta = ("脱敏 session.json" if (options.redact_camera or options.redact_labels
+                                     or options.redact_platform) else "session.json")
     return f"""# 球形双目轨迹数据包
 
 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -259,7 +298,7 @@ def _readme(items: list[SessionItem], options: ExportOptions) -> str:
 
 ```text
 sessions/<会话ID>/
-  metadata/      脱敏 session.json + 左右时间戳
+  metadata/      {meta} + 左右时间戳
   derived/       标准 JSON / CSV
   derived/plots/ 轨迹图 / 同步图
   calibration/   标定 JSON / NPZ（若勾选）
@@ -286,7 +325,16 @@ manifest.json    会话清单、类别、文件大小
 
 def normalize_output(output: str | Path) -> Path:
     """统一补 .zip；GUI 的 overwrite 检查必须和 export_zip 用同一条路径。"""
-    out = Path(output)
+    raw = str(output).strip()
+    if not raw:
+        raise ValueError("输出路径为空")
+    if raw.endswith(("/", "\\")):
+        raise ValueError(f"输出路径是目录，不是 zip：{raw}")
+    out = Path(raw)
+    if out.name in ("", ".", ".."):
+        raise ValueError(f"输出路径不是文件名：{raw}")
+    if out.exists() and out.is_dir():
+        raise ValueError(f"输出路径是目录，不是 zip：{out}")
     return out.with_suffix(".zip") if out.suffix.lower() != ".zip" else out
 
 
@@ -300,6 +348,13 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
     if out.exists():
         raise FileExistsError(f"输出已存在：{out}")
     root = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", out.stem) or "export"
+
+    if "metadata" in options.categories:
+        bad = [it.key for it in items if not _read_session(it.path)]
+        if bad:
+            raise ValueError(
+                "这些会话缺/坏 session.json：" + "、".join(bad) +
+                "；取消 metadata 类别或先修好会话")
 
     # 先按会话列出文件，便于进度与 manifest
     planned: list[tuple[SessionItem, list[tuple[Path, str]]]] = []
@@ -339,55 +394,68 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
     written = 0
     total = 0
     out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".part")
+    if tmp.exists():
+        tmp.unlink()
     manifest_files: list[dict] = []
 
-    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED,
-                         compresslevel=6) as zf:
-        # README
-        readme = _readme(items, options).encode("utf-8")
-        zf.writestr(f"{root}/README.md", readme)
-        total += len(readme)
-        written += 1
-        if progress:
-            progress(written, file_count, "README.md")
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED,
+                             compresslevel=6) as zf:
+            # README
+            readme = _readme(items, options).encode("utf-8")
+            zf.writestr(f"{root}/README.md", readme)
+            total += len(readme)
+            written += 1
+            if progress:
+                progress(written, file_count, "README.md")
 
-        for it, rows in planned:
-            sid = folders[it.key]
-            prefix = f"{root}/sessions/{sid}"
-            for src, rel in rows:
-                if src == it.path / "session.json":
-                    if "metadata" not in options.categories:
+            for it, rows in planned:
+                sid = folders[it.key]
+                prefix = f"{root}/sessions/{sid}"
+                for src, rel in rows:
+                    if src == it.path / "session.json":
+                        if "metadata" not in options.categories:
+                            continue
+                        data = _read_session(it.path)
+                        if not data:
+                            raise ValueError(f"{it.key} 的 session.json 不可读")
+                        payload = json.dumps(redact_session(data, options),
+                                             ensure_ascii=False, indent=2).encode("utf-8")
+                        arc = f"{prefix}/metadata/session.json"
+                        zf.writestr(arc, payload)
+                        total += len(payload)
+                        written += 1
+                        manifest_files.append({"path": arc, "bytes": len(payload)})
+                        if progress:
+                            progress(written, file_count, arc)
                         continue
-                    data = _read_session(it.path)
-                    if not data:
+                    if not src.is_file():
                         continue
-                    payload = json.dumps(redact_session(data, options),
-                                         ensure_ascii=False, indent=2).encode("utf-8")
-                    arc = f"{prefix}/metadata/session.json"
-                    zf.writestr(arc, payload)
-                    total += len(payload)
+                    arc = f"{prefix}/{rel}"
+                    zf.write(src, arc)
+                    size = src.stat().st_size
+                    total += size
                     written += 1
-                    manifest_files.append({"path": arc, "bytes": len(payload)})
+                    manifest_files.append({"path": arc, "bytes": size})
                     if progress:
                         progress(written, file_count, arc)
-                    continue
-                if not src.is_file():
-                    continue
-                arc = f"{prefix}/{rel}"
-                zf.write(src, arc)
-                size = src.stat().st_size
-                total += size
-                written += 1
-                manifest_files.append({"path": arc, "bytes": size})
-                if progress:
-                    progress(written, file_count, arc)
 
-        manifest = _manifest(items, options, manifest_files, root, folders)
-        zf.writestr(f"{root}/manifest.json",
-                    json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
-        written += 1
-        if progress:
-            progress(written, file_count, "manifest.json")
+            manifest = _manifest(items, options, manifest_files, root, folders)
+            zf.writestr(f"{root}/manifest.json",
+                        json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+            written += 1
+            if progress:
+                progress(written, file_count, "manifest.json")
+        os.replace(tmp, out)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
 
+    archive_size = out.stat().st_size if out.exists() else total
     return ExportResult(output=out, n_sessions=len(items), n_files=file_count,
-                        bytes_written=total, sessions=[s.id for s in items])
+                        bytes_written=archive_size, sessions=[s.id for s in items])
