@@ -32,6 +32,7 @@ from apps._data_export import (  # noqa: E402
     SessionItem,
     estimate_bytes,
     export_zip,
+    normalize_output,
     scan_items,
 )
 
@@ -196,20 +197,20 @@ class DataManager(tk.Tk):
         except Exception as exc:                            # noqa: BLE001
             messagebox.showerror("扫描失败", str(exc), parent=self)
             return
-        valid = {it.id for it in self.items}
+        valid = {it.key for it in self.items}
         self.selected &= valid
         self.tree.delete(*self.tree.get_children())
         for it in self.items:
             size = _fmt_bytes(it.size_bytes)
-            self.tree.insert("", "end", iid=it.id,
-                             values=("☑" if it.id in self.selected else "☐",
+            self.tree.insert("", "end", iid=it.key,
+                             values=("☑" if it.key in self.selected else "☐",
                                      it.id, it.created,
                                      f"{it.frames_left}/{it.frames_right}",
                                      it.status, size))
         self._refresh_count()
 
     def _refresh_count(self) -> None:
-        chosen = [it for it in self.items if it.id in self.selected]
+        chosen = [it for it in self.items if it.key in self.selected]
         try:
             opts = self._options()
             size = estimate_bytes(chosen, opts)
@@ -225,16 +226,16 @@ class DataManager(tk.Tk):
         if not hasattr(self, "tree"):
             return
         try:
-            ids = [it.id for it in self.items if it.id in self.selected
-                   and self.tree.exists(it.id)]
+            ids = [it.key for it in self.items if it.key in self.selected
+                   and self.tree.exists(it.key)]
             self.tree.selection_set(ids)
         except tk.TclError:
             pass
 
     def _set_row_checks(self) -> None:
         for it in self.items:
-            if self.tree.exists(it.id):
-                self.tree.set(it.id, "sel", "☑" if it.id in self.selected else "☐")
+            if self.tree.exists(it.key):
+                self.tree.set(it.key, "sel", "☑" if it.key in self.selected else "☐")
 
     def _options(self) -> ExportOptions:
         cats = frozenset(k for k, v in self._cat_vars.items() if v.get())
@@ -252,7 +253,7 @@ class DataManager(tk.Tk):
         if not row:
             return None
         if col == "#1":
-            self.toggle_id(row)
+            self.toggle_key(row)
             self._anchor_id = row
             return "break"
         if event.state & 0x0001 and self._anchor_id:      # Shift
@@ -264,28 +265,28 @@ class DataManager(tk.Tk):
     def toggle_focus(self) -> None:
         row = self.tree.focus()
         if row:
-            self.toggle_id(row)
+            self.toggle_key(row)
 
-    def toggle_id(self, sid: str) -> None:
-        if sid in self.selected:
-            self.selected.remove(sid)
+    def toggle_key(self, key: str) -> None:
+        if key in self.selected:
+            self.selected.remove(key)
         else:
-            self.selected.add(sid)
+            self.selected.add(key)
         self._refresh_count()
 
     def _select_range(self, a: str, b: str) -> None:
-        ids = [it.id for it in self.items]
+        keys = [it.key for it in self.items]
         try:
-            i, j = ids.index(a), ids.index(b)
+            i, j = keys.index(a), keys.index(b)
         except ValueError:
             return
         lo, hi = sorted((i, j))
-        for sid in ids[lo:hi + 1]:
-            self.selected.add(sid)
+        for key in keys[lo:hi + 1]:
+            self.selected.add(key)
         self._refresh_count()
 
     def select_all(self) -> None:
-        self.selected = {it.id for it in self.items}
+        self.selected = {it.key for it in self.items}
         self._refresh_count()
 
     def select_none(self) -> None:
@@ -293,8 +294,8 @@ class DataManager(tk.Tk):
         self._refresh_count()
 
     def invert(self) -> None:
-        all_ids = {it.id for it in self.items}
-        self.selected = all_ids - self.selected
+        all_keys = {it.key for it in self.items}
+        self.selected = all_keys - self.selected
         self._refresh_count()
 
     def select_to_here(self) -> None:
@@ -326,7 +327,7 @@ class DataManager(tk.Tk):
                 continue
             if end and created > end:
                 continue
-            chosen.add(it.id)
+            chosen.add(it.key)
         self.selected = chosen
         self._refresh_count()
 
@@ -351,7 +352,7 @@ class DataManager(tk.Tk):
     def start_export(self) -> None:
         if self._running:
             return
-        chosen = [it for it in self.items if it.id in self.selected]
+        chosen = [it for it in self.items if it.key in self.selected]
         if not chosen:
             messagebox.showinfo("导出", "先勾选至少一个会话。", parent=self)
             return
@@ -367,7 +368,8 @@ class DataManager(tk.Tk):
                 "视频隐私", "视频画面没有自动打码，房间/人物会被一起交付。\n继续导出？",
                 parent=self):
             return
-        out = Path(self.out_var.get())
+        out = normalize_output(self.out_var.get())
+        self.out_var.set(str(out))
         if out.exists() and not messagebox.askyesno(
                 "覆盖", f"文件已存在，覆盖？\n{out}", parent=self):
             return

@@ -679,6 +679,7 @@ def main() -> int:
     from apps._data_export import (
         ExportOptions, estimate_bytes, export_zip, redact_session, scan_items,
     )
+    from apps.data_manager import DataManager
     with tempfile.TemporaryDirectory(prefix="dsh_export_") as tmp:
         sroot = Path(tmp) / "sessions"
         sd = sroot / "20260101-120000"
@@ -725,6 +726,41 @@ def main() -> int:
             ("导出结果有文件", res.n_files >= 3 and out_zip.exists()),
         ]
         for name, passed in checks_data:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
+
+        # 重复 session id + 清洗后同名目录：不能崩、不能互相覆盖
+        for dn, sid in (("a_dup_1", "same-id"), ("a_dup_2", "same-id")):
+            d = sroot / dn
+            (d / "derived").mkdir(parents=True)
+            (d / "session.json").write_text(json.dumps({
+                "schema": "sphere-stereo-session", "version": 1, "id": sid,
+                "created": "2026-01-02 12:00:00",
+                "left": {"frame_count": 1}, "right": {"frame_count": 1},
+            }), encoding="utf-8")
+        dup_items = [it for it in scan_items(sroot) if it.key.startswith("a_dup_")]
+        dup_zip = export_zip(dup_items, ExportOptions(categories=frozenset({"metadata"})),
+                             Path(tmp) / "dup")
+        with zipfile.ZipFile(dup_zip.output) as zf:
+            dup_names = zf.namelist()
+        folders = {n.split("/sessions/")[1].split("/")[0]
+                   for n in dup_names if "/sessions/" in n}
+        try:
+            dm = DataManager(sroot)
+            dm.withdraw()
+            dm.update()
+            n_rows = len(dm.tree.get_children())
+            dm.destroy()
+            dm_ok = n_rows == 3
+        except Exception as exc:                            # noqa: BLE001
+            print(f"    DataManager 构造失败：{exc}")
+            dm_ok = False
+        checks_dup = [
+            ("重复 id 的会话在 zip 里各有独立目录", len(folders) == 2),
+            ("无后缀输出自动补 .zip", str(dup_zip.output).endswith(".zip")),
+            ("DataManager 能打开重复 id 会话", dm_ok),
+        ]
+        for name, passed in checks_dup:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))
 

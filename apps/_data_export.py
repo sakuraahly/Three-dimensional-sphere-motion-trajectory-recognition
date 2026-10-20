@@ -40,6 +40,11 @@ class SessionItem:
     size_bytes: int
 
     @property
+    def key(self) -> str:
+        """目录名唯一；session.json 的 id 不保证唯一，UI/选择必须用它。"""
+        return self.path.name
+
+    @property
     def label(self) -> str:
         return f"{self.id}  {self.created}  {self.frames_left}/{self.frames_right}帧"
 
@@ -217,7 +222,9 @@ def estimate_bytes(items: Iterable[SessionItem], options: ExportOptions) -> int:
 
 
 def _manifest(items: list[SessionItem], options: ExportOptions,
-              files: list[dict], root: str) -> dict:
+              files: list[dict], root: str,
+              folders: dict[str, str] | None = None) -> dict:
+    folders = folders or {}
     return {
         "schema": "sphere-stereo-export",
         "version": 1,
@@ -231,7 +238,7 @@ def _manifest(items: list[SessionItem], options: ExportOptions,
             "platform": bool(options.redact_platform),
         },
         "sessions": [
-            {"id": s.id, "created": s.created,
+            {"id": s.id, "folder": folders.get(s.key, s.key), "created": s.created,
              "frames_left": s.frames_left, "frames_right": s.frames_right,
              "n_matched": s.n_matched}
             for s in items
@@ -277,15 +284,19 @@ manifest.json    会话清单、类别、文件大小
 """
 
 
+def normalize_output(output: str | Path) -> Path:
+    """统一补 .zip；GUI 的 overwrite 检查必须和 export_zip 用同一条路径。"""
+    out = Path(output)
+    return out.with_suffix(".zip") if out.suffix.lower() != ".zip" else out
+
+
 def export_zip(items: list[SessionItem], options: ExportOptions, output: str | Path,
                progress: Callable[[int, int, str], None] | None = None) -> ExportResult:
     """把选中的会话写成一个带顶层目录的 zip。"""
     options = options.normalized()
     if not items:
         raise ValueError("没有选择任何会话")
-    out = Path(output)
-    if out.suffix.lower() != ".zip":
-        out = out.with_suffix(".zip")
+    out = normalize_output(output)
     if out.exists():
         raise FileExistsError(f"输出已存在：{out}")
     root = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", out.stem) or "export"
@@ -311,6 +322,19 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
                     rows.append((p, rel))
         planned.append((it, rows))
 
+    # 目录名可能相同/清洗后相同；保证 zip 内 folder 唯一，不能只依赖 id
+    folders: dict[str, str] = {}
+    used_folders: set[str] = set()
+    for it in items:
+        base = re.sub(r"[^0-9A-Za-z._\-]+", "_", it.path.name) or "session"
+        name = base
+        n = 2
+        while name in used_folders:
+            name = f"{base}_{n}"
+            n += 1
+        used_folders.add(name)
+        folders[it.key] = name
+
     file_count = sum(len(rows) for _it, rows in planned) + 2
     written = 0
     total = 0
@@ -328,7 +352,7 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
             progress(written, file_count, "README.md")
 
         for it, rows in planned:
-            sid = re.sub(r"[^0-9A-Za-z._\-]+", "_", it.id) or it.path.name
+            sid = folders[it.key]
             prefix = f"{root}/sessions/{sid}"
             for src, rel in rows:
                 if src == it.path / "session.json":
@@ -358,7 +382,7 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
                 if progress:
                     progress(written, file_count, arc)
 
-        manifest = _manifest(items, options, manifest_files, root)
+        manifest = _manifest(items, options, manifest_files, root, folders)
         zf.writestr(f"{root}/manifest.json",
                     json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
         written += 1
