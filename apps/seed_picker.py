@@ -60,7 +60,7 @@ class SeedPicker(tk.Toplevel):
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
         ttk.Label(top, text="在左图点球心，再在右图点球心；圆心=你点击的位置，"
-                            "半径自动估、可滚轮/输入框微调。").pack(side="left")
+                            "需要时再点『吸附Hough圆心』；半径可微调。").pack(side="left")
         ttk.Label(top, text="seed 帧").pack(side="left", padx=(18, 4))
         self.frame_var = tk.StringVar(value=str(self.frame_index))
         ttk.Spinbox(top, from_=0, to=99999, width=6,
@@ -96,7 +96,9 @@ class SeedPicker(tk.Toplevel):
                             textvariable=self.right_r_var)
         rspin.pack(side="left", padx=(2, 6))
         ttk.Button(rf, text="应用半径", command=self._apply_radius_vars).pack(side="left")
-        ttk.Label(rf, text="（或滚轮粗调，8–300）").pack(side="left", padx=(8, 0))
+        ttk.Button(rf, text="吸附Hough圆心", command=self._snap_to_hough).pack(
+            side="left", padx=(6, 0))
+        ttk.Label(rf, text="（圆心默认=点击位置；滚轮 8–300）").pack(side="left", padx=(8, 0))
         for spin in (lspin, rspin):
             spin.bind("<Return>", lambda _e: self._apply_radius_vars())
             spin.bind("<FocusOut>", lambda _e: self._apply_radius_vars())
@@ -152,10 +154,10 @@ class SeedPicker(tk.Toplevel):
 
     # ------------------------------------------------------------------
     def _estimate_circle(self, frame: np.ndarray, x: float, y: float) -> tuple[float, float, float] | None:
-        """在点击点附近找圆，**只用于估半径**；圆心仍取用户点击位置。
+        """在点击点附近找圆，返回 (圆心x, 圆心y, 半径)。
 
-        用户明确要求“我点哪就是哪”，所以这里虽然返回 Hough 圆心，
-        调用方只使用第三个返回值（半径），不自动吸附。
+        默认点击只取半径，圆心保持用户点击位置；『吸附Hough圆心』按钮
+        才会显式采用返回的圆心。
         """
         h, w = frame.shape[:2]
         r = 150
@@ -203,6 +205,35 @@ class SeedPicker(tk.Toplevel):
         self.left_r_var.set(f"{self.left_radius:.0f}")
         self.right_r_var.set(f"{self.right_radius:.0f}")
         self._redraw()
+
+    def _snap_to_hough(self) -> None:
+        """显式按钮：把当前左右圆吸附到附近 Hough 圆心。
+
+        默认不自动吸附；只有用户点这个按钮才改圆心，保留“我点哪就是哪”的
+        默认语义，同时不丢掉 Hough 辅助。
+        """
+        changed = 0
+        for side in ("left", "right"):
+            click = self.left_click if side == "left" else self.right_click
+            frame = self.left_frame if side == "left" else self.right_frame
+            if click is None or frame is None:
+                continue
+            circle = self._estimate_circle(frame, click[0], click[1])
+            if circle is None:
+                continue
+            cx, cy, radius = circle
+            if side == "left":
+                self.left_click, self.left_radius = (cx, cy), radius
+                self.left_r_var.set(f"{radius:.0f}")
+            else:
+                self.right_click, self.right_radius = (cx, cy), radius
+                self.right_r_var.set(f"{radius:.0f}")
+            changed += 1
+        self._redraw()
+        if changed:
+            self.status.configure(text=f"已吸附 {changed} 侧到 Hough 圆心；可再手动点回")
+        else:
+            self.status.configure(text="附近没找到可用的 Hough 圆；保持点击位置")
 
     def _on_click(self, side: str, event) -> None:
         frame = self.left_frame if side == "left" else self.right_frame
