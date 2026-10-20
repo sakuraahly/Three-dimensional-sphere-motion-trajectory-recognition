@@ -816,12 +816,18 @@ class Launcher(tk.Tk):
         s = self._wb_selected()
         if s is None:
             return
+        if self.method.get() != "specular":
+            self.method.set("specular")
+            self._append("[工作台] 点选球心属于金属球路径，已切换到 specular。")
         self._pick_stereo_seed(str(s.path), offer_run=False)
 
     def _wb_run(self) -> None:
         s = self._wb_selected()
         if s is None:
             return
+        if s.has_seeds and self.method.get() != "specular":
+            self.method.set("specular")
+            self._append("[工作台] 检测到 seeds.json，使用 specular 跑离线双目。")
         if self.method.get() == "specular" and not s.has_seeds:
             messagebox.showinfo("跑离线双目", "还没有点选球心；先点『② 点选球心』。")
             return
