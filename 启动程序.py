@@ -756,18 +756,25 @@ class Launcher(tk.Tk):
             self.wb_info.configure(text=f"扫描会话失败：{exc}")
             return
         labels = [s.label for s in summaries]
+        old_label = self.wb_var.get()
+        old_path = self._wb_paths.get(old_label)
+        old_id = old_path.name if old_path is not None else ""
         self._wb_paths = {s.label: s.path for s in summaries}
-        old = self.wb_var.get()
-        old_first = self._wb_last_first
+        by_id = {s.id: s for s in summaries}
         self.wb_combo.configure(values=labels)
-        first = labels[0] if labels else ""
-        if select_latest or not old or old not in labels:
-            if first:
-                self.wb_var.set(first)
-        elif first and first != old_first and old == old_first:
+        first = summaries[0] if summaries else None
+        selected = None
+        if select_latest or not old_id or old_id not in by_id:
+            selected = first
+        elif first is not None and first.id != self._wb_last_first and old_id == self._wb_last_first:
             # 刚录完/刚出现新会话：原来停在最新那条，就跟着切到新的
-            self.wb_var.set(first)
-        self._wb_last_first = first
+            selected = first
+        else:
+            selected = by_id.get(old_id, first)
+        if selected is not None:
+            # 用 id 保留选择；状态标记（◐/✓/✗）变化时 label 会变，不能拿 label 当主键
+            self.wb_var.set(selected.label)
+        self._wb_last_first = first.id if first is not None else ""
         self._wb_show()
 
     def _wb_tick(self) -> None:

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import time
@@ -616,6 +617,16 @@ def main() -> int:
         good = summarize_session(_make_session(base, 302, 303, True, True))
         bad = summarize_session(_make_session(base, 302, 304, False, False))
         rec = summarize_session(_make_session(base, 302, 303, False, False))
+        # 目录 mtime 不能决定默认会话：处理旧会话会刷新 mtime。
+        from apps._workbench import scan_sessions
+        newer = base / "20261021-120000"
+        older = base / "20261020-120000"
+        for d in (newer, older):
+            (d / "derived").mkdir(parents=True)
+        now = time.time()
+        os.utime(newer, (now - 1000, now - 1000))   # 故意让“更新”的会话 mtime 更旧
+        os.utime(older, (now, now))
+        scan_order = [s.id for s in scan_sessions(base, limit=2)]
         checks_wb = [
             ("好会话 -> traj，n_matched=1，Z=0.25",
              good.status == "traj" and good.n_matched == 1 and abs((good.z_min or 0) - 0.25) < 1e-9),
@@ -635,6 +646,7 @@ def main() -> int:
              not button_states(good, True, False)["seed"]
              and not button_states(good, True, False)["run"]),
             ("文件菜单按钮有对应状态", button_states(good, True)["files"]),
+            ("默认会话按时间名排序，不按 mtime", scan_order[:1] == ["20261021-120000"]),
         ]
         for name, passed in checks_wb:
             print(f"  [{'通过' if passed else '不达标'}] {name}")

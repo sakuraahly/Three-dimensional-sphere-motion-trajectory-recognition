@@ -180,10 +180,21 @@ def button_states(s: SessionSummary, specular: bool,
 
 
 def scan_sessions(root: str | Path, limit: int = 12) -> list[SessionSummary]:
-    """按修改时间倒序扫描会话目录；坏目录也返回摘要，不静默跳过。"""
+    """按会话时间倒序扫描；坏目录也返回摘要，不静默跳过。
+
+    排序用目录名里的 `YYYYMMDD-HHMMSS`，**不用目录 mtime**：
+    跑一次离线双目会写 derived/，把旧会话的目录 mtime 刷新到今天，
+    结果“昨天刚处理过的会话”会跳到第一条，默认选中就漂了。
+    名字不是标准时间戳的目录，退回用 mtime。
+    """
     root = Path(root)
     if not root.exists():
         return []
     dirs = [p for p in root.iterdir() if p.is_dir()]
-    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def sort_key(p: Path) -> tuple[str, float]:
+        m = re.match(r"(\d{8}-\d{6})", p.name)
+        return (m.group(1) if m else "", p.stat().st_mtime)
+
+    dirs.sort(key=sort_key, reverse=True)
     return [summarize_session(p) for p in dirs[:max(1, limit)]]
