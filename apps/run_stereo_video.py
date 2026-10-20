@@ -325,6 +325,9 @@ def main() -> int:
         pipe_l.detector.seed(*seed_l, frame_index=seed_frame)
         pipe_r.detector.seed(*seed_r, frame_index=seed_frame)
         print(f"[specular] 左 seed={seed_l} 右 seed={seed_r} 初始化帧={seed_frame}")
+        if seed_frame > 0:
+            print(f"[提示] seed_frame={seed_frame}：前 {seed_frame} 对按设计不会初始化检测；"
+                  "除非第 0 帧看不清球，否则建议改成 0")
     elif args.seed or args.seed_right:
         print("[警告] 只有 --method specular 使用 --seed/--seed-right；已忽略。")
     if args.detect_width:
