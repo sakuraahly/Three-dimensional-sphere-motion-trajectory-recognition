@@ -141,6 +141,8 @@ KNOWN_MENTIONS: dict[str, str] = {
         "3D 查看器文档由子 agent 实现中，尚未合并",
     "docs/交接文档.md:world_frame.json":
         "世界系变换文件，尚未实现（交接文档 §8 明确标注）",
+    "docs/planbooks/2026-10-20_GUI工作台升级.md:apps/_workbench.py":
+        "P0 计划新增的 GUI 会话摘要层，尚未实现",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
         "同上（`AGENTS.md:STC` 之外的简写形式）",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":
