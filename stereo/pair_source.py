@@ -39,6 +39,16 @@
   只能靠硬件同步或"等两路都出新帧"降低（而非消除）时间差。传了会给出警告并忽略；
 - 图片文件夹逐张配成"时刻"，文件夹内的整段偏移同样支持。
 
+配对策略（2026-10-20 加）
+------------------------
+- `pairing="index"`（默认）：保留原行为，左 i 配右 i+sync_offset；
+- `pairing="timestamp"`：读 `*_times.csv`，按时间戳一对一配对；掉帧处跳过，
+  不再让后续帧整体错位；
+- `pairing="canary"`：先算时间戳计划；覆盖率 ≥75% 且残差在容差内才接管，
+  否则回退 index。默认仍走 index，便于保留旧结果做 A/B 对比。
+
+时间戳配对不改变 `read()` 的返回形状；它只改变“取哪两帧”。
+
 用法::
 
     from stereo import PairSource
@@ -68,6 +78,13 @@ from sphere_tracker.camera_registry import (
     select_cameras,
 )
 from sphere_tracker.sources import CameraSource, LatestFrameCamera
+
+from .timestamp_pair import (
+    canary_safe,
+    plan_timestamp_pairs,
+    read_time_sidecar,
+    sidecar_for_video,
+)
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 CAMERA_WAIT_TIMEOUT = 5.0        # 等相机出新帧的上限（秒），超时就用已有帧继续
@@ -466,6 +483,8 @@ class PairSource:
         fps: int = 60,
         backup_camera: int | None = None,
         backend: int | None = None,
+        pairing: str = "index",
+        timestamp_tolerance_s: float = 0.033,
     ) -> None:
         given = [name for name, v in
                  (("camera", camera), ("video", video), ("directory", directory)) if v]
@@ -478,8 +497,13 @@ class PairSource:
         self.kind = ""
         self.n = 0                    # 已经返回了多少对
         self.warnings: list[str] = []
+        self.pairing_policy = pairing
+        self._pair_plan = None
+        self._pair_pos = 0
         self._left: FrameReader
         self._right: FrameReader
+        if pairing not in {"index", "timestamp", "canary"}:
+            raise ValueError(f"pairing 必须是 index/timestamp/canary，收到 {pairing!r}")
 
         if camera is not None:
             if self.sync_offset:
@@ -501,6 +525,7 @@ class PairSource:
             if n_l and n_r and abs(n_l - n_r) > 1:
                 self.warnings.append(
                     f"两段视频帧数不一致（{n_l} vs {n_r}）：会一直取到短的那路结束为止")
+            self._build_timestamp_plan(video[0], video[1], float(timestamp_tolerance_s))
         else:
             self._left = _make_reader(directory[0], "左路")
             self._right = _make_reader(directory[1], "右路")
@@ -514,6 +539,40 @@ class PairSource:
             self._describe_offset()
 
     # ------------------------------------------------------------------
+    def _build_timestamp_plan(self, left_video, right_video, tolerance_s: float) -> None:
+        """金丝雀 / 时间戳配对的计划构建；失败只告警，不改变旧方案。"""
+        if self.pairing_policy == "index":
+            return
+        lc = sidecar_for_video(left_video)
+        rc = sidecar_for_video(right_video)
+        if lc is None or rc is None:
+            self.warnings.append(
+                f"时间戳配对需要 {Path(left_video).stem}_times.csv / "
+                f"{Path(right_video).stem}_times.csv；缺文件，回退索引配对")
+            return
+        try:
+            lt = read_time_sidecar(lc)
+            rt = read_time_sidecar(rc)
+            plan = plan_timestamp_pairs(lt, rt, tolerance_s)
+        except Exception as exc:                            # noqa: BLE001
+            self.warnings.append(f"时间戳配对失败（{exc}），回退索引配对")
+            return
+        print(f"[时间戳配对] {plan.summary()}")
+        if self.pairing_policy == "canary":
+            safe, why = canary_safe(plan)
+            if not safe:
+                self.warnings.append(f"金丝雀未接管：{why}；回退索引配对")
+                return
+            print(f"[金丝雀] 接管：{why}")
+        elif not plan.pairs:
+            self.warnings.append("时间戳配对为空，回退索引配对")
+            return
+        self._pair_plan = plan
+        if self.sync_offset:
+            self.warnings.append(
+                f"时间戳配对已启用，忽略常数 sync_offset={self.sync_offset:+d} 帧")
+            self.sync_offset = 0
+
     def _describe_offset(self) -> None:
         """把偏移量翻译成人话打出来 —— 正负号最容易搞反，必须可见。
 
@@ -550,6 +609,20 @@ class PairSource:
             # 相机分支：_left 和 _right 是同一个对象，两路由它一起取
             return self._left.read()                    # type: ignore[return-value]
 
+        if self._pair_plan is not None:
+            while self._pair_pos < len(self._pair_plan.pairs):
+                li, ri = self._pair_plan.pairs[self._pair_pos]
+                self._pair_pos += 1
+                ok, left = self._left.seek(li)
+                if not ok or left is None:
+                    return False, None, None
+                ok, right = self._right.seek(ri)
+                if not ok or right is None:
+                    continue
+                self.n += 1
+                return True, left, right
+            return False, None, None
+
         li = self.n + max(0, -self.sync_offset)         # 本对应给的左路帧号
         ri = self.n + max(0, self.sync_offset)          # 本对应给的右路帧号
         ok, left = self._left.seek(li)
@@ -568,6 +641,9 @@ class PairSource:
         """一行说清当前帧源（打印用）。"""
         if self.kind == "camera":
             return f"两台实时相机：{self._left.label}（不支持同步偏移）"
+        if self._pair_plan is not None:
+            return (f"{self.kind}：{self._left.label} + {self._right.label}"
+                    f"（时间戳配对，{len(self._pair_plan.pairs)} 对）")
         off = f"，同步偏移 {self.sync_offset:+d} 帧" if self.sync_offset else ""
         return f"{self.kind}：{self._left.label} + {self._right.label}{off}"
 
@@ -723,7 +799,10 @@ def from_args(args) -> PairSource:
                           backup_camera=getattr(args, "backup_camera", None),
                           backend=api)
     if getattr(args, "left_video", None) and getattr(args, "right_video", None):
-        return PairSource(video=(args.left_video, args.right_video))
+        return PairSource(video=(args.left_video, args.right_video),
+                          pairing=getattr(args, "pairing", "index"),
+                          timestamp_tolerance_s=float(
+                              getattr(args, "timestamp_tolerance", 0.020)))
     if getattr(args, "left_dir", None) and getattr(args, "right_dir", None):
         return PairSource(directory=(args.left_dir, args.right_dir))
     raise RuntimeError("请指定 --left/--right 或 --left-video/--right-video "

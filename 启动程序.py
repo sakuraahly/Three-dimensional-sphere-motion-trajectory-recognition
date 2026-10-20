@@ -728,9 +728,15 @@ class Launcher(tk.Tk):
             btn.grid(row=3, column=i, padx=(0, 6), pady=4, sticky="w")
             self._wb_buttons[key] = btn
 
+        self.wb_canary = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            box, text="实验：时间戳配对（金丝雀，失败自动回退旧方案）",
+            variable=self.wb_canary).grid(row=4, column=0, columnspan=6,
+                                         sticky="w", pady=(0, 2))
+
         self.wb_hint = ttk.Label(box, text="", style="Hint.TLabel",
                                  wraplength=CARD_HINT_WRAP)
-        self.wb_hint.grid(row=4, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        self.wb_hint.grid(row=5, column=0, columnspan=6, sticky="w", pady=(2, 0))
         self._wrapped.append((self.wb_hint, "card"))
         self._wb_paths: dict[str, Path] = {}
         self._wb_last_first = ""
@@ -907,7 +913,10 @@ class Launcher(tk.Tk):
         if self.method.get() == "specular" and not s.has_seeds:
             messagebox.showinfo("跑离线双目", "还没有点选球心；先点『② 点选球心』。")
             return
-        self._run(self._offline_stereo_args(str(s.path)), f"离线双目 {s.id}")
+        args = self._offline_stereo_args(str(s.path))
+        if self.wb_canary.get():
+            args += ["--pairing", "canary"]
+        self._run(args, f"离线双目 {s.id}")
         self.after(1500, self._wb_refresh)
 
     def _wb_view(self) -> None:

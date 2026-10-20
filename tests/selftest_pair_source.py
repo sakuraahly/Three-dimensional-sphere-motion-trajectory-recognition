@@ -51,9 +51,11 @@ from stereo import (
     PairSource,
     SyncConfig,
     SyncInfo,
+    canary_safe,
     create_session,
     find_offset,
     load_session,
+    plan_timestamp_pairs,
     save_session,
     sha256_file,
     validate_session,
@@ -646,6 +648,72 @@ def test_live_camera_skipped() -> bool:
 
 
 # --------------------------------------------------------------------------
+def test_timestamp_pairing(base: Path) -> bool:
+    """时间戳配对（金丝雀路径）：掉帧要跳过，不能拿常数偏移硬配。"""
+    print("----- 时间戳配对 / 金丝雀 -----")
+    checks: list[tuple[str, bool]] = []
+
+    lt = np.arange(40, dtype=np.float64) / 30.0
+    rt = (np.arange(40, dtype=np.float64) + 0.001) / 30.0
+    rt = np.delete(rt, 10)                       # 右路第 10 帧丢了
+    plan = plan_timestamp_pairs(lt, rt, tolerance_s=0.02)
+    pairs = list(plan.pairs)
+    checks.append(("掉帧后仍能配对，且左 10 被跳过",
+                   len(pairs) == 39 and all(a != 10 for a, _b in pairs)))
+    checks.append(("配对严格一一对应、单调递增",
+                   len({a for a, _b in pairs}) == len(pairs)
+                   and len({b for _a, b in pairs}) == len(pairs)
+                   and all(pairs[i][1] < pairs[i + 1][1]
+                           for i in range(len(pairs) - 1))))
+    checks.append(("残差不超过容差",
+                   plan.max_residual_ms <= 20.0))
+    checks.append(("金丝雀允许接管", canary_safe(plan)[0]))
+    low = plan_timestamp_pairs(lt, rt[:10], tolerance_s=0.02)
+    checks.append(("覆盖率太低时金丝雀拒绝接管", not canary_safe(low)[0]))
+    print(f"  {plan.summary()}")
+
+    # 视频 + sidecar 集成：左 40 帧 / 右 40 帧，但右路时间戳缺第 10 帧
+    left = write_video(base / "ts_left.mp4", N)
+    right = write_video(base / "ts_right.mp4", N)
+    t0 = 1000.0
+    write_times(base / "ts_left_times.csv", [t0 + i / 30.0 for i in range(N)])
+    write_times(base / "ts_right_times.csv",
+                [t0 + 0.001 + i / 30.0 for i in range(N) if i != 10])
+    src = PairSource(video=(left, right), pairing="timestamp")
+    got = []
+    while len(got) < 12:
+        good, a, b = src.read()
+        if not good:
+            break
+        got.append((read_index(a), read_index(b)))
+    src.release()
+    checks.append(("PairSource 用 timestamp 计划取帧",
+                   got[:10] == [(i, i) for i in range(10)]
+                   and got[10][0] == 11 and got[10][1] == 10))
+    print(f"  前 10 对：{got}")
+
+    # 缺 sidecar -> 金丝雀必须回退，而不是静默改变输出
+    no_ts_left = write_video(base / "no_ts_left.mp4", 6)
+    no_ts_right = write_video(base / "no_ts_right.mp4", 6)
+    fallback = PairSource(video=(no_ts_left, no_ts_right), pairing="canary")
+    fallback_ok = fallback._pair_plan is None
+    fallback.release()
+    checks.append(("缺时间戳时金丝雀回退索引", fallback_ok))
+
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+    return all(p for _n, p in checks)
+
+
+def write_times(path: Path, times: list[float]) -> None:
+    """写 sidecar，格式与 record_stereo.py 一致。"""
+    lines = ["frame,perf_counter_s,unix_time_s"]
+    for i, t in enumerate(times):
+        lines.append(f"{i},{t:.9f},{t:.9f}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="成对帧源自测")
     ap.add_argument("--keep", action="store_true",
@@ -667,6 +735,7 @@ def main() -> int:
             test_from_args(base),
             test_sessions(base),
             test_short_side(base),
+            test_timestamp_pairing(base),
         ]
         print()
         results.append(test_live_camera_skipped())

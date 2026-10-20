@@ -198,6 +198,12 @@ def main() -> int:
     ap.add_argument("--max-epipolar", type=float, default=2.5)
     ap.add_argument("--sync-offset", type=int, default=None,
                     help="覆盖 session 的同步偏移（默认用 session.sync.offset）")
+    ap.add_argument("--pairing", choices=("index", "timestamp", "canary"),
+                    default="index",
+                    help="配对策略：index=原方案；timestamp=时间戳；"
+                         "canary=先验证时间戳计划，安全才接管（默认 index）")
+    ap.add_argument("--timestamp-tolerance", type=float, default=0.033,
+                    help="时间戳配对容差（秒），默认 0.033（约一帧@30fps）")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
     ap.add_argument("--smooth", action="store_true", help="另存 Savitzky-Golay 平滑后的三维 CSV")
@@ -238,9 +244,15 @@ def main() -> int:
         print("[警告] session 的同步方法是 none（没检测到闪光/拍手）—— 3D 可能错位；"
               "可先用 --sync-offset 手动试。")
     print(f"同步偏移：{offset:+d} 帧；fps={fps:.2f}")
+    print(f"配对策略：{args.pairing}")
     print(f"视频：{left_video.name} + {right_video.name}")
 
-    src = PairSource(video=(left_video, right_video), sync_offset=offset)
+    src = PairSource(video=(left_video, right_video), sync_offset=offset,
+                     pairing=args.pairing,
+                     timestamp_tolerance_s=args.timestamp_tolerance)
+    src.report_warnings()
+    if args.pairing != "index":
+        print(f"实际配对：{src.describe()}")
     if tuple(src.image_size) != tuple(rig.image_size):
         print(f"[错误] 视频 {src.image_size} 与标定 {rig.image_size} 不一致")
         src.release()

@@ -41,6 +41,13 @@ from .sync import (
     find_offset,
     timestamp_offset,
 )
+from .timestamp_pair import (
+    TimestampPairPlan,
+    canary_safe,
+    plan_timestamp_pairs,
+    read_time_sidecar,
+    sidecar_for_video,
+)
 from .trajectory import Kalman3D, savgol_trajectory
 from .depth_fusion import fuse_depth, mono_depth, stereo_depth
 from .triangulate import (
@@ -69,6 +76,11 @@ __all__ = [
     "brightness_jumps",
     "timestamp_offset",
     "TimestampSync",
+    "TimestampPairPlan",
+    "plan_timestamp_pairs",
+    "canary_safe",
+    "read_time_sidecar",
+    "sidecar_for_video",
     "apply_offset",
     "Kalman3D",
     "savgol_trajectory",
