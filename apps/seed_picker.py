@@ -132,8 +132,13 @@ class SeedPicker(tk.Toplevel):
         self._load()
 
     # ------------------------------------------------------------------
-    def _estimate_radius(self, frame: np.ndarray, x: float, y: float) -> float:
-        """点击点附近找圆；圆中心允许偏 60px，取**最大**的合理外径。"""
+    def _estimate_circle(self, frame: np.ndarray, x: float, y: float) -> tuple[float, float, float] | None:
+        """点击点附近找圆；返回 Hough 圆心和半径（不是原始点击点）。
+
+        为什么必须返回圆心：CSRT 的初始框以 seed 为中心。用户点偏几像素，
+        框就偏；左右两路各偏一点，极线配对会直接拒掉。Hough 找到的圆心
+        比裸点击更接近球心，这里在 60px 内取**最大**的合理外径。
+        """
         h, w = frame.shape[:2]
         r = 150
         x0, y0 = max(0, int(x - r)), max(0, int(y - r))
@@ -142,25 +147,26 @@ class SeedPicker(tk.Toplevel):
         roi = cv2.GaussianBlur(roi, (7, 7), 1.5)
         circles = cv2.HoughCircles(
             roi, cv2.HOUGH_GRADIENT, dp=1.2, minDist=20,
-            param1=120, param2=22, minRadius=15, maxRadius=110)
+            param1=120, param2=22, minRadius=15, maxRadius=105)
         if circles is not None:
             cand = []
             for cx, cy, cr in circles[0]:
-                d = float(np.hypot((x0 + cx) - x, (y0 + cy) - y))
+                gx, gy = float(x0 + cx), float(y0 + cy)
+                d = float(np.hypot(gx - x, gy - y))
                 if d <= 60.0 and 15.0 <= cr <= 105.0:
-                    cand.append(float(cr))
+                    cand.append((float(cr), gx, gy))
             if cand:
-                # 金属球内部有高光小圆；取最大外径，避免只圈到内部反射
-                return max(8.0, min(130.0, max(cand)))
-        return float(max(12, min(110, round(w / 32.0))))
+                cr, gx, gy = max(cand, key=lambda t: t[0])
+                return gx, gy, float(max(8.0, min(110.0, cr)))
+        return None
 
     def _on_wheel(self, side: str, event) -> None:
         """滚轮微调半径：Hough 估偏时不用重录/重开。"""
         if side == "left" and self.left_click:
-            self.left_radius = float(max(8, min(130, self.left_radius * (1.05 if event.delta > 0 else 0.95))))
+            self.left_radius = float(max(8, min(110, self.left_radius * (1.05 if event.delta > 0 else 0.95))))
             self._redraw()
         elif side == "right" and self.right_click:
-            self.right_radius = float(max(8, min(130, self.right_radius * (1.05 if event.delta > 0 else 0.95))))
+            self.right_radius = float(max(8, min(110, self.right_radius * (1.05 if event.delta > 0 else 0.95))))
             self._redraw()
 
     def _on_click(self, side: str, event) -> None:
@@ -170,7 +176,11 @@ class SeedPicker(tk.Toplevel):
         h, w = frame.shape[:2]
         x = float(event.x) * w / PREVIEW_W
         y = float(event.y) * h / PREVIEW_H
-        radius = self._estimate_radius(frame, x, y)
+        circle = self._estimate_circle(frame, x, y)
+        if circle is not None:
+            x, y, radius = circle
+        else:
+            radius = float(max(12, min(110, round(w / 32.0))))
         if side == "left":
             self.left_click, self.left_radius = (x, y), radius
         else:
@@ -199,10 +209,14 @@ class SeedPicker(tk.Toplevel):
                 canvas.create_text(sx + 8, sy - 8, text=f"{side} ({click[0]:.0f},{click[1]:.0f}) r={radius:.0f}",
                                    fill="#22c55e", anchor="sw", font=("Consolas", 9))
         if self.left_click and self.right_click:
-            self.status.configure(text=f"左 ({self.left_click[0]:.0f},{self.left_click[1]:.0f}) "
-                                       f"r={self.left_radius:.0f}  |  右 "
-                                       f"({self.right_click[0]:.0f},{self.right_click[1]:.0f}) "
-                                       f"r={self.right_radius:.0f}  → 可以保存")
+            warn = ""
+            if max(self.left_radius, self.right_radius) > 90:
+                warn = "  ⚠ 半径偏大：向下滚轮贴合球边缘"
+            self.status.configure(
+                text=f"左 ({self.left_click[0]:.0f},{self.left_click[1]:.0f}) "
+                     f"r={self.left_radius:.0f}  |  右 "
+                     f"({self.right_click[0]:.0f},{self.right_click[1]:.0f}) "
+                     f"r={self.right_radius:.0f}  → 可以保存{warn}")
         elif self.left_click:
             self.status.configure(text="左已点；现在点右图球心")
         else:
@@ -226,7 +240,7 @@ class SeedPicker(tk.Toplevel):
                 seed_frame=self.frame_index,
                 image_size=(self.left_frame.shape[1], self.left_frame.shape[0]),
                 source="gui_click",
-                note="GUI 点选球心；半径由点击点附近 Hough 估计",
+                note="GUI 点选球心；Hough 圆心 + 半径（滚轮可微调）",
             )
         except Exception as exc:                            # noqa: BLE001
             messagebox.showerror("保存 seed", f"保存失败：{exc}", parent=self)

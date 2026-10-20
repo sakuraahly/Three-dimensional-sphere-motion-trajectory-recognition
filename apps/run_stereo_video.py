@@ -419,6 +419,24 @@ def main() -> int:
     print(f"处理：{n_pairs} 对，{elapsed:.1f}s（{n_pairs/max(elapsed,1e-6):.1f} 对/s）")
     print(f"匹配：{rec.n_matched}/{n_pairs}（{rec.match_rate*100:.1f}%）  "
           f"无左={rec.n_no_left} 无右={rec.n_no_right} 极线拒={rec.n_rejected}")
+    if n_pairs and rec.n_matched == 0:
+        print("[诊断] 0 匹配，先别继续调 pairing；按下面顺序查：")
+        if args.method == "specular" and "seed_l" in locals() and "seed_r" in locals():
+            print(f"  1) seed 半径：左 {seed_l[2]:.1f} / 右 {seed_r[2]:.1f}；"
+                  "CSRT 框会按 1.8×半径放大，过大时框进衣服/背景")
+            print("     重开『② 点选球心』，点球心后滚轮把圆贴到球边缘；"
+                  "1080p 下这颗球通常 r≈45~70，不是 130")
+        if rec.n_no_left > rec.n_no_right:
+            print(f"  2) 左路跟丢为主；左检测器："
+                  f"{getattr(pipe_l.detector, 'last_error', '') or '(无错误信息)'}")
+        elif rec.n_no_right > rec.n_no_left:
+            print(f"  2) 右路跟丢为主；右检测器："
+                  f"{getattr(pipe_r.detector, 'last_error', '') or '(无错误信息)'}")
+        else:
+            print("  2) 左右都检测到了，但极线拒掉：检查两路 seed 是否都在球心、"
+                  "是否同一时刻；可先用 --pairing index 对照")
+        print("  3) 当前会话若继续 0 匹配，建议重录并在第 0 帧重新点选，"
+              "不要靠放大 --max-epipolar 硬吃错配")
     smoothed = None
     if rec.trajectory:
         arr = rec.as_array()
