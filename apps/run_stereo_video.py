@@ -76,8 +76,66 @@ def _make_pipeline(cfg: AppConfig, rig: StereoRig, side: str) -> SpherePipeline:
     return pipe
 
 
-def _draw(frame: np.ndarray, res, label: str, trail: list[tuple[float, float]] | None = None) -> np.ndarray:
+def _project_left(rig, xyz) -> tuple[int, int] | None:
+    """把校正左相机系的三维点投到**原始左图**。"""
+    try:
+        p = np.asarray(xyz, np.float64).reshape(1, 3)
+        rvec, _ = cv2.Rodrigues(rig.R1.T)
+        uv, _ = cv2.projectPoints(p, rvec, np.zeros(3), rig.K1, rig.D1)
+        return int(round(float(uv[0, 0, 0]))), int(round(float(uv[0, 0, 1])))
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
+def _draw_reference(frame: np.ndarray, rig, origin: tuple[float, float, float],
+                    axis_m: float = 0.10) -> None:
+    """在左图标出坐标原点 + X/Y/Z 轴（原点默认 = 校正左相机光心投影）。"""
+    o = _project_left(rig, origin)
+    if o is None:
+        return
+    h, w = frame.shape[:2]
+    if not (0 <= o[0] < w and 0 <= o[1] < h):
+        return
+    axes = [
+        ((origin[0] + axis_m, origin[1], origin[2]), (0, 0, 255), "X"),
+        ((origin[0], origin[1] + axis_m, origin[2]), (0, 255, 0), "Y"),
+        ((origin[0], origin[1], origin[2] + axis_m), (255, 0, 0), "Z"),
+    ]
+    cv2.circle(frame, o, 7, (0, 255, 255), -1)
+    cv2.putText(frame, "O left-cam", (o[0] + 8, o[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    for xyz, color, name in axes:
+        p = _project_left(rig, xyz)
+        if p is None:
+            continue
+        # 相机光心附近的坐标轴端点可能投到画面外/数值爆炸；跳过，别画到画布外
+        if not (0 <= p[0] < w and 0 <= p[1] < h):
+            continue
+        cv2.arrowedLine(frame, o, p, color, 3, tipLength=0.18)
+        cv2.putText(frame, name, (p[0] + 4, p[1] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+
+def _draw_xyz(frame: np.ndarray, res, xyz, label: str) -> None:
+    d = res.detection
+    if d is None:
+        return
+    if xyz is None:
+        text = f"{label} no 3D"
+        color = (0, 0, 255)
+    else:
+        text = f"{label} X={xyz[0]:.3f} Y={xyz[1]:.3f} Z={xyz[2]:.3f} m"
+        color = (0, 255, 255)
+    org = (int(round(d.x)) + 12, int(round(d.y)) - 12)
+    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5)
+    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+
+def _draw(frame: np.ndarray, res, label: str, trail: list[tuple[float, float]] | None = None,
+          *, xyz=None, rig=None, origin=None, draw_reference: bool = False) -> np.ndarray:
     out = frame.copy()
+    if draw_reference and rig is not None and origin is not None:
+        _draw_reference(out, rig, origin)
     if trail and len(trail) >= 2:
         pts = np.array([[int(round(x)), int(round(y))] for x, y in trail], np.int32)
         cv2.polylines(out, [pts], False, (0, 255, 255), 2)
@@ -87,6 +145,7 @@ def _draw(frame: np.ndarray, res, label: str, trail: list[tuple[float, float]] |
                    (0, 0, 255), 2)
         cv2.putText(out, f"{label} r={d.radius:.1f} {d.method}", (12, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        _draw_xyz(out, res, xyz, label)
     else:
         cv2.putText(out, f"{label} no detection", (12, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
@@ -121,6 +180,8 @@ def main() -> int:
     ap.add_argument("--method", default="color",
                     choices=("color", "hough", "fusion", "motion", "specular"))
     ap.add_argument("--preset", default="", help="color 预设，如 white_ball；空=默认")
+    ap.add_argument("--origin", default="0,0,0",
+                    help="视频里标出的参照原点（校正左相机系，x,y,z 米；默认相机光心投影）")
     ap.add_argument("--seed", default="",
                     help="specular 左路人工种子 x,y,r（1920 下 r 约 32~40）")
     ap.add_argument("--seed-right", default="",
@@ -145,6 +206,13 @@ def main() -> int:
     args = ap.parse_args()
 
     session_dir, s = load_session(args.session)
+    try:
+        origin = tuple(float(v) for v in args.origin.split(","))
+        if len(origin) != 3:
+            raise ValueError
+    except ValueError:
+        print(f"[错误] --origin 要写成 x,y,z 三个数，现在是 {args.origin!r}")
+        return 2
     errors, warnings = validate_session(session_dir)
     print(f"会话：{session_dir}")
     for w in warnings:
@@ -313,8 +381,11 @@ def main() -> int:
                 ])
 
             if writer is not None:
-                vl = cv2.resize(_draw(left_frame, res_l, "L", trail_l), (960, 540))
-                vr = cv2.resize(_draw(right_frame, res_r, "R", trail_r), (960, 540))
+                vl = cv2.resize(_draw(left_frame, res_l, "L", trail_l,
+                                      xyz=None if pt is None else pt.xyz,
+                                      rig=rig, origin=origin, draw_reference=True), (960, 540))
+                vr = cv2.resize(_draw(right_frame, res_r, "R", trail_r,
+                                      xyz=None if pt is None else pt.xyz), (960, 540))
                 cv2.putText(vr, f"f={n_pairs-1} matched={rec.n_matched}", (12, 500),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 writer.write(np.hstack([vl, vr]))

@@ -16,12 +16,14 @@ import json
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk
 
+import cv2
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from PIL import Image, ImageTk
 
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
@@ -74,7 +76,7 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
 
 
 class Viewer3D:
-    def __init__(self, root: tk.Tk, data: dict) -> None:
+    def __init__(self, root: tk.Tk, data: dict, video_path: str | Path | None = None) -> None:
         self.root = root
         self.data = data
         self.points = data["trajectory"]
@@ -83,13 +85,33 @@ class Viewer3D:
         self.playing = False
         self.speed = 1.0
         self.lo, self.hi = bounds_of(self.points)
+        self.video_path = self._resolve_video(video_path)
+        self.cap = cv2.VideoCapture(str(self.video_path)) if self.video_path else None
+        self._video_photo = None
         self.root.title(f"3D 轨迹 · {data.get('session', '')} · {self.n} points")
         self._build()
         self._redraw()
 
+    def _resolve_video(self, explicit: str | Path | None) -> Path | None:
+        if explicit:
+            p = Path(explicit)
+            return p if p.exists() else None
+        p = Path(self.data.get("_path", ""))
+        if p.is_file():
+            session = p.parent.parent if p.parent.name == "derived" else p.parent
+            cand = session / "derived" / "annotated.mp4"
+            if cand.exists():
+                return cand
+        return None
+
     # ------------------------------------------------------------------
     def _build(self) -> None:
-        self.fig = plt.Figure(figsize=(8.6, 6.2), dpi=100)
+        # 视频在上、3D 在下：同一个 idx 同时驱动两边
+        self.video_label = tk.Label(self.root, bg="#0f172a", fg="#94a3b8",
+                                    text="未找到 annotated.mp4（只显示 3D）",
+                                    height=15)
+        self.video_label.pack(fill="x", padx=8, pady=(8, 0))
+        self.fig = plt.Figure(figsize=(8.6, 4.6), dpi=100)
         self.ax = self.fig.add_subplot(111, projection="3d")
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -116,6 +138,12 @@ class Viewer3D:
         self.root.bind("<Left>", lambda _e: self._step(-1))
         self.root.bind("<Right>", lambda _e: self._step(1))
         self.root.bind("<Home>", lambda _e: self._reset_view())
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+        self.root.destroy()
 
     # ------------------------------------------------------------------
     def _limits(self):
@@ -154,7 +182,22 @@ class Viewer3D:
         self.ax.set_title(f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
         self.canvas.draw_idle()
+        self._update_video()
         self._status()
+
+    def _update_video(self) -> None:
+        """按当前三维点的 frame 号取 annotated.mp4 的同帧，和 3D 同步。"""
+        if self.cap is None:
+            return
+        frame = int(self.points[self.idx].get("frame", self.idx))
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
+        ok, img = self.cap.read()
+        if not ok or img is None:
+            return
+        img = cv2.resize(img, (960, 270), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        self._video_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.video_label.configure(image=self._video_photo, text="", height=270)
 
     def _status(self) -> None:
         p = self.points[self.idx]
@@ -199,6 +242,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="离线 3D 轨迹查看器（读 visualization.json）")
     ap.add_argument("source", help="会话目录或 visualization.json / traj3d.json")
     ap.add_argument("--check", action="store_true", help="只校验数据，不开窗口")
+    ap.add_argument("--video", default="", help="同步视频（默认找 derived/annotated.mp4）")
+    ap.add_argument("--no-video", action="store_true", help="不加载追踪视频")
     args = ap.parse_args()
     try:
         data = load_view(args.source)
@@ -212,10 +257,14 @@ def main() -> int:
         print(f"session={data.get('session')} points={len(data['trajectory'])}")
         print(f"coordinate_system={data.get('coordinate_system')} unit={data.get('unit')}")
         print(f"bounds min={lo} max={hi}")
+        p = Path(data["_path"])
+        session = p.parent.parent if p.parent.name == "derived" else p.parent
+        video = session / "derived" / "annotated.mp4"
+        print(f"video={video if video.exists() else '(none)'}")
         return 0
     root = tk.Tk()
-    root.geometry("1100x760")
-    Viewer3D(root, data)
+    root.geometry("1100x900")
+    Viewer3D(root, data, None if args.no_video else (args.video or None))
     root.mainloop()
     return 0
 
