@@ -56,7 +56,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -579,6 +581,59 @@ def main() -> int:
     for name, good in checks:
         print(f"  [{'通过' if good else '不达标'}] {name}")
         results.append((name, good))
+
+    # ---- 11. 工作台会话摘要（P0 事实层）----
+    print("----- 11. 工作台会话摘要（通过 / 坏帧数 / 未点选）-----")
+    from apps._workbench import button_states, summarize_session
+
+    def _make_session(base: Path, frames_l: int, frames_r: int,
+                      with_seeds: bool, with_traj: bool = False) -> Path:
+        d = base / f"s_{frames_l}_{frames_r}_{int(with_seeds)}_{int(with_traj)}"
+        (d / "derived").mkdir(parents=True)
+        (d / "session.json").write_text(json.dumps({
+            "schema": "sphere-stereo-session", "version": 1, "id": d.name,
+            "created": "2026-10-20 10:00:00",
+            "left": {"frame_count": frames_l, "fps_measured": 30.0},
+            "right": {"frame_count": frames_r, "fps_measured": 30.0},
+            "sync": {"method": "flash", "offset": 1, "confidence": 0.84},
+            "checks": ["平均亮度：left=120.0 right=110.0"],
+        }), encoding="utf-8")
+        if with_seeds:
+            (d / "derived" / "seeds.json").write_text("{}", encoding="utf-8")
+        if with_traj:
+            (d / "derived" / "traj3d.json").write_text(json.dumps({
+                "schema": "sphere-stereo-trajectory", "version": 1,
+                "samples": [
+                    {"matched": True, "xyz": [0.1, 0.05, 0.25], "residual_px": 1.5},
+                    {"matched": False},
+                ],
+            }), encoding="utf-8")
+        return d
+
+    with tempfile.TemporaryDirectory(prefix="dsh_wb_") as tmp:
+        base = Path(tmp)
+        good = summarize_session(_make_session(base, 302, 303, True, True))
+        bad = summarize_session(_make_session(base, 302, 304, False, False))
+        rec = summarize_session(_make_session(base, 302, 303, False, False))
+        checks_wb = [
+            ("好会话 -> traj，n_matched=1，Z=0.25",
+             good.status == "traj" and good.n_matched == 1 and abs((good.z_min or 0) - 0.25) < 1e-9),
+            ("帧数 302/304 -> bad，并给出原因",
+             bad.status == "bad" and any("帧数不一致" in p for p in bad.problems)),
+            ("未点选 -> recorded，按钮层能据此禁用三维",
+             rec.status == "recorded" and not rec.can_view),
+            ("坏会话在 specular 下禁用 seed/run/view",
+             not button_states(bad, True)["seed"]
+             and not button_states(bad, True)["run"]
+             and not button_states(bad, True)["view"]),
+            ("好会话在 specular 下启用 seed/run/view",
+             button_states(good, True)["seed"]
+             and button_states(good, True)["run"]
+             and button_states(good, True)["view"]),
+        ]
+        for name, passed in checks_wb:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
 
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]

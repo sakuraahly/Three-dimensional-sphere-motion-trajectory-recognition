@@ -226,6 +226,7 @@ class Launcher(tk.Tk):
         self._build_step1()
         self._build_step2()
         self._build_step3()
+        self._build_workbench()
         self._build_tasks()      # 任务管理器：看得见、停得掉
         self._build_log()
         self._bind_scroll()
@@ -684,6 +685,178 @@ class Launcher(tk.Tk):
             row=1, column=4, pady=4)
         self.status = ttk.Label(box, text="就绪", style="Hint.TLabel")
         self.status.grid(row=3, column=0, columnspan=5, sticky="w", padx=2)
+
+    # ---------- 双目工作台 ----------
+    def _build_workbench(self) -> None:
+        """把录制→校验→seed→三维→查看器串成一条可见的路径。"""
+        box = self._card(
+            "双目工作台",
+            "选一条会话，按 ①→⑥ 做。校验/离线/查看器都走「任务」管理器，可单独中断。")
+        ttk.Label(box, text="最近会话").grid(row=1, column=0, sticky="e", pady=4)
+        self.wb_var = tk.StringVar()
+        self.wb_combo = ttk.Combobox(box, textvariable=self.wb_var, width=32,
+                                     state="readonly")
+        self.wb_combo.grid(row=1, column=1, columnspan=3, sticky="w", padx=(4, 8), pady=4)
+        self.wb_combo.bind("<<ComboboxSelected>>", lambda _e: self._wb_show())
+        ttk.Button(box, text="刷新", command=self._wb_refresh, width=6).grid(
+            row=1, column=4, sticky="w", pady=4)
+
+        self.wb_info = ttk.Label(box, text="还没有会话", style="Hint.TLabel",
+                                 justify="left", wraplength=CARD_HINT_WRAP)
+        self.wb_info.grid(row=2, column=0, columnspan=6, sticky="w", pady=(2, 6))
+        self._wrapped.append((self.wb_info, "card"))
+
+        self._wb_buttons: dict[str, ttk.Button] = {}
+        specs = [
+            ("check", "① 校验数据", self._wb_check),
+            ("seed", "② 点选球心", self._wb_seed),
+            ("run", "③ 跑离线双目", self._wb_run),
+            ("view", "④ 打开 3D", self._wb_view),
+            ("export", "⑤ 导出 JSON", self._wb_export),
+            ("open", "打开会话目录", self._wb_open),
+        ]
+        for i, (key, text, cmd) in enumerate(specs):
+            btn = ttk.Button(box, text=text, command=cmd, width=13)
+            btn.grid(row=3, column=i, padx=(0, 6), pady=4, sticky="w")
+            self._wb_buttons[key] = btn
+
+        self.wb_hint = ttk.Label(box, text="", style="Hint.TLabel",
+                                 wraplength=CARD_HINT_WRAP)
+        self.wb_hint.grid(row=4, column=0, columnspan=6, sticky="w", pady=(2, 0))
+        self._wrapped.append((self.wb_hint, "card"))
+        self._wb_paths: dict[str, Path] = {}
+        self._wb_last_first = ""
+        self.after(300, self._wb_refresh)
+        self.after(2500, self._wb_tick)
+
+    def _wb_selected(self):
+        from apps._workbench import summarize_session
+        path = self._wb_paths.get(self.wb_var.get())
+        return summarize_session(path) if path else None
+
+    def _wb_refresh(self, select_latest: bool = False) -> None:
+        from apps._workbench import scan_sessions
+        try:
+            summaries = scan_sessions(ROOT / "data" / "sessions", limit=12)
+        except Exception as exc:                            # noqa: BLE001
+            self.wb_info.configure(text=f"扫描会话失败：{exc}")
+            return
+        labels = [s.label for s in summaries]
+        self._wb_paths = {s.label: s.path for s in summaries}
+        old = self.wb_var.get()
+        old_first = self._wb_last_first
+        self.wb_combo.configure(values=labels)
+        first = labels[0] if labels else ""
+        if select_latest or not old or old not in labels:
+            if first:
+                self.wb_var.set(first)
+        elif first and first != old_first and old == old_first:
+            # 刚录完/刚出现新会话：原来停在最新那条，就跟着切到新的
+            self.wb_var.set(first)
+        self._wb_last_first = first
+        self._wb_show()
+
+    def _wb_tick(self) -> None:
+        # 任务跑完后按钮/状态要自己更新；不依赖用户手动点刷新
+        try:
+            self._wb_refresh()
+        finally:
+            self.after(2500, self._wb_tick)
+
+    def _wb_show(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            self.wb_info.configure(text="还没有会话。先在「第 3 步」录制一条双目。")
+            for b in getattr(self, "_wb_buttons", {}).values():
+                b.configure(state="disabled")
+            return
+        means = ""
+        if s.mean_left is not None and s.mean_right is not None:
+            means = f"  亮度 {s.mean_left:.0f}/{s.mean_right:.0f}"
+        traj = "—"
+        if s.has_traj:
+            traj = f"{s.n_matched}/{s.n_samples}"
+        z = ""
+        if s.z_min is not None and s.z_max is not None:
+            z = f"  Z {s.z_min:.3f}–{s.z_max:.3f} m"
+        res = f"  残差中位 {s.residual_median:.2f} px" if s.residual_median is not None else ""
+        problems = ("\n问题：" + "；".join(s.problems)) if s.problems else ""
+        self.wb_info.configure(
+            text=(f"会话 {s.id}  {s.created}\n"
+                  f"帧数 {s.frames_left}/{s.frames_right}  "
+                  f"sync {s.sync_method}{s.sync_offset:+d} (置信度 {s.sync_confidence:.2f})"
+                  f"{means}\n"
+                  f"seed {'✓' if s.has_seeds else '—'}   "
+                  f"轨迹 {traj}{z}{res}{problems}"))
+        next_step = {
+            "bad": "先按上面的问题重录/修数据；坏数据不要进三维。",
+            "recorded": "下一步：② 点选球心。",
+            "seeded": "下一步：③ 跑离线双目。",
+            "traj": "下一步：④ 打开 3D 查看器；⑤ 可重新导出标准 JSON。",
+        }.get(s.status, "")
+        if s.sync_method == "none" and s.status != "bad":
+            next_step = "未同步：优先重录并闪光；三维结果只作参考。"
+        self.wb_hint.configure(text=next_step)
+
+        specular = self.method.get() == "specular"
+        from apps._workbench import button_states
+        states = button_states(s, specular)
+        for key, enabled in states.items():
+            self._wb_buttons[key].configure(state="normal" if enabled else "disabled")
+
+    def _wb_check(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            return
+        self._run([PY, str(ROOT / "apps" / "tools" / "check_dataset.py"),
+                   str(s.path), "--strict"], f"校验数据 {s.id}")
+        self.after(1200, self._wb_refresh)
+
+    def _wb_seed(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            return
+        self._pick_stereo_seed(str(s.path), offer_run=False)
+
+    def _wb_run(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            return
+        if self.method.get() == "specular" and not s.has_seeds:
+            messagebox.showinfo("跑离线双目", "还没有点选球心；先点『② 点选球心』。")
+            return
+        self._run(self._offline_stereo_args(str(s.path)), f"离线双目 {s.id}")
+        self.after(1500, self._wb_refresh)
+
+    def _wb_view(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            return
+        if not s.can_view:
+            messagebox.showinfo("打开 3D", "这条会话还没有可用的三维轨迹。")
+            return
+        self._run([PY, str(ROOT / "apps" / "view_3d.py"), str(s.path)],
+                  f"3D 查看器 {s.id}")
+
+    def _wb_export(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            return
+        if not s.has_traj:
+            messagebox.showinfo("导出 JSON", "还没有 traj3d.json；先跑离线双目。")
+            return
+        self._run([PY, str(ROOT / "apps" / "export_visualization.py"),
+                   str(s.path), "--plot"], f"导出标准数据 {s.id}")
+        self.after(1500, self._wb_refresh)
+
+    def _wb_open(self) -> None:
+        s = self._wb_selected()
+        if s is None or not s.path.exists():
+            return
+        try:
+            os.startfile(str(s.path))                       # type: ignore[attr-defined]
+        except Exception:                                   # noqa: BLE001
+            subprocess.Popen(["explorer", str(s.path)])
 
     # ---------- 运行日志 ----------
     def _build_log(self) -> None:

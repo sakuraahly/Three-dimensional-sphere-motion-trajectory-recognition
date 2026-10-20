@@ -42,7 +42,7 @@
 | **数据采集会话层**                                   | ✅ 完成（2026-10-19） | `data/` + `stereo/sessions.py` + `check_dataset.py`；双路录制器 `apps/record_stereo.py` 已完成（HFYU 1080p 实测 30.1 fps） |
 | **金属球检测（specular）**                            | ✅ 原型可用（2026-10-19） | 人工 seed + CSRT（BGR）；24 帧人工标签 **86.4% @15 px / 100% @20 px**；自动初始化不可靠 |
 | **标准数据（seeds/traj3d/visualization）**             | ✅ 完成（2026-10-19） | `stereo/visualization.py` + `apps/export_visualization.py`；schema/坐标/单位见 `docs/数据标准.md` |
-| **GUI 点选球心 seed**                                 | ✅ 完成（2026-10-19） | 第 3 步『点选球（双目 seed）』，左右各点一次，写 `derived/seeds.json` |
+| **GUI 点选球心 seed + 双目工作台**                    | ✅ 完成（2026-10-19/20） | 第 3 步『点选球（双目 seed）』写 `seeds.json`；下方工作台显示最近会话、校验/点选/跑双目/看 3D/导出 |
 | **金属球双目轨迹（221550）**                          | ✅ 单条会话可用 | seed 左 `(1260,830,65)` / 右 `(920,830,65)`；293/301 = **97.3%** 匹配；Z 0.235–0.348 m；尚无独立三维真值 |
 | 双目接进实时主流程                                    | ⬜ 待做       | `stereo/` 模块已就绪，缺采集与显示编排                                                                  |
 | Savitzky-Golay / 3D 轨迹平滑                          | ⚙️ 库完成，未接主流程 | `stereo/trajectory.py` 有合成测试；`--smooth` 只写平滑 CSV；预测按用户要求暂停 |
