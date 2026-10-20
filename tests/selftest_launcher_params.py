@@ -634,6 +634,7 @@ def main() -> int:
             ("校验失败时禁用 seed/run",
              not button_states(good, True, False)["seed"]
              and not button_states(good, True, False)["run"]),
+            ("文件菜单按钮有对应状态", button_states(good, True)["files"]),
         ]
         for name, passed in checks_wb:
             print(f"  [{'通过' if passed else '不达标'}] {name}")

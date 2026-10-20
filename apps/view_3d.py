@@ -131,16 +131,12 @@ class Viewer3D:
             grid.columnconfigure(c, weight=1, uniform="pane")
         grid.bind("<Configure>", self._fit_video_rows)
 
-        self.video_l = tk.Label(grid, bg="#0f172a", fg="#94a3b8",
-                                text=self.video_error or ("视频已关闭（--no-video）"
-                                                          if self.video_disabled
-                                                          else "未找到 annotated.mp4"),
-                                anchor="center")
-        self.video_r = tk.Label(grid, bg="#0f172a", fg="#94a3b8",
-                                text=self.video_error or ("视频已关闭（--no-video）"
-                                                          if self.video_disabled
-                                                          else "未找到 annotated.mp4"),
-                                anchor="center")
+        # Canvas 的 request size 固定为 1×1：图像只作为 item 画进去，
+        # 不会反过来把 grid 撑大（之前用 Label + PhotoImage 会正反馈放大到全屏）。
+        self.video_l = tk.Canvas(grid, bg="#0f172a", highlightthickness=0,
+                                 width=1, height=1)
+        self.video_r = tk.Canvas(grid, bg="#0f172a", highlightthickness=0,
+                                 width=1, height=1)
         self.video_l.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
         self.video_r.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
         self._left_raw = None
@@ -168,7 +164,7 @@ class Viewer3D:
         bar.pack(fill="x")
         self.play_btn = ttk.Button(bar, text="播放", command=self._toggle_play, width=8)
         self.play_btn.pack(side="left")
-        ttk.Button(bar, text="重置视角", command=self._reset_view, width=9).pack(side="left", padx=4)
+        ttk.Button(bar, text="重置3D视角", command=self._reset_view, width=10).pack(side="left", padx=4)
         ttk.Label(bar, text="帧").pack(side="left", padx=(10, 2))
         self.slider = ttk.Scale(bar, from_=0, to=max(0, self.n - 1),
                                 command=self._on_slider, orient="horizontal")
@@ -260,19 +256,22 @@ class Viewer3D:
         self._status()
 
     def _render_video(self) -> None:
-        for raw, label, attr in (
+        for raw, canvas, attr in (
             (self._left_raw, self.video_l, "_left_photo"),
             (self._right_raw, self.video_r, "_right_photo"),
         ):
-            if raw is None:
-                label.configure(image="", text=self.video_error or (
-                    "视频已关闭（--no-video）" if getattr(self, "video_disabled", False)
-                    else "未找到 annotated.mp4"))
-                continue
-            w = max(2, label.winfo_width())
-            h = max(2, label.winfo_height())
+            canvas.delete("all")
+            w = max(2, canvas.winfo_width())
+            h = max(2, canvas.winfo_height())
             if w <= 4 or h <= 4:
                 w, h = 640, 360
+            if raw is None:
+                canvas.create_text(
+                    w // 2, h // 2, fill="#94a3b8", anchor="center",
+                    text=self.video_error or (
+                        "视频已关闭（--no-video）" if getattr(self, "video_disabled", False)
+                        else "未找到 annotated.mp4"))
+                continue
             # 填满 pane 且不拉伸：等比放大到覆盖，再中心裁剪。
             rh, rw = raw.shape[:2]
             scale = max(w / rw, h / rh)
@@ -284,7 +283,7 @@ class Viewer3D:
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             photo = ImageTk.PhotoImage(Image.fromarray(rgb))
             setattr(self, attr, photo)
-            label.configure(image=photo, text="")
+            canvas.create_image(0, 0, anchor="nw", image=photo)
 
     def _update_video(self) -> None:
         """按当前三维点的 frame 号取 annotated.mp4 的同帧，切成左右两格。"""
