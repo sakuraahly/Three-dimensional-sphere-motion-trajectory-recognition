@@ -61,6 +61,7 @@ import os
 import sys
 import tempfile
 import time
+import zipfile
 from collections import Counter
 from pathlib import Path
 
@@ -672,6 +673,60 @@ def main() -> int:
         print(f"  [{'通过' if passed else '不达标'}] {name}")
         results.append((name, passed))
     app2.destroy()
+
+    # ---- 13. 数据导出：脱敏 + 类别 + zip ----
+    print("----- 13. 数据管理导出 -----")
+    from apps._data_export import (
+        ExportOptions, estimate_bytes, export_zip, redact_session, scan_items,
+    )
+    with tempfile.TemporaryDirectory(prefix="dsh_export_") as tmp:
+        sroot = Path(tmp) / "sessions"
+        sd = sroot / "20260101-120000"
+        (sd / "derived").mkdir(parents=True)
+        (sd / "calib").mkdir()
+        sensitive = {
+            "schema": "sphere-stereo-session", "version": 1, "id": sd.name,
+            "created": "2026-01-01 12:00:00", "label": "secret-label",
+            "notes": "private notes",
+            "left": {"frame_count": 3, "identity": "USB\\SECRET", "name": "cam-left",
+                     "port": "p1"},
+            "right": {"frame_count": 3, "identity": "USB\\SECRET2", "name": "cam-right",
+                      "port": "p2"},
+            "environment": {"platform": "Windows-private", "python": "3.14"},
+        }
+        (sd / "session.json").write_text(json.dumps(sensitive), encoding="utf-8")
+        (sd / "left_times.csv").write_text("frame,perf_counter_s\n0,1\n", encoding="utf-8")
+        (sd / "derived" / "traj3d.json").write_text('{"samples": []}', encoding="utf-8")
+        (sd / "derived" / "traj3d.png").write_bytes(b"png")
+        (sd / "left.mkv").write_bytes(b"raw")
+        items = scan_items(sroot)
+        opts = ExportOptions(categories=frozenset({"metadata", "derived"}))
+        red = redact_session(sensitive, opts)
+        out_zip = Path(tmp) / "export.zip"
+        res = export_zip(items, opts, out_zip)
+        with zipfile.ZipFile(out_zip) as zf:
+            names = zf.namelist()
+            sj = [n for n in names if n.endswith("metadata/session.json")][0]
+            red_zip = json.loads(zf.read(sj))
+            has_raw = any("/videos/raw/" in n for n in names)
+            has_manifest = any(n.endswith("/manifest.json") for n in names)
+        checks_data = [
+            ("脱敏移除相机身份/名称/端口",
+             all(k not in red["left"] for k in ("identity", "name", "port"))
+             and all(k not in red["right"] for k in ("identity", "name", "port"))),
+            ("脱敏移除 label/notes/platform",
+             "label" not in red and "notes" not in red
+             and "platform" not in red.get("environment", {})),
+            ("默认类别不含原始视频", not has_raw),
+            ("zip 内 session.json 是脱敏后的",
+             "identity" not in red_zip["left"] and red_zip.get("label") is None),
+            ("zip 有 manifest.json", has_manifest),
+            ("estimate_bytes 非零", estimate_bytes(items, opts) > 0),
+            ("导出结果有文件", res.n_files >= 3 and out_zip.exists()),
+        ]
+        for name, passed in checks_data:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
 
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]

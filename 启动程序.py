@@ -377,6 +377,13 @@ class Launcher(tk.Tk):
         tk.Label(head, text="检测 → 跟踪 → 三维定位 → 轨迹预测    三步即可开始",
                  bg=ACCENT, fg="#dbeafe",
                  font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=22, pady=(0, 14))
+        tk.Button(head, text="数据管理", command=self._open_data_manager,
+                  bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
+                  font=("Microsoft YaHei UI", 10, "bold")).place(
+            relx=1.0, x=-18, y=12, anchor="ne")
+
+    def _open_data_manager(self) -> None:
+        self._run([PY, str(ROOT / "apps" / "data_manager.py")], "数据管理")
 
     def _card(self, title: str, hint: str) -> ttk.Frame:
         """一张卡片。**hint 必须换行**，否则它会按整行文字的自然宽度撑开整张卡片。
