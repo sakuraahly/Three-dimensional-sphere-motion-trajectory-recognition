@@ -82,6 +82,25 @@ class SeedPicker(tk.Toplevel):
         self.left_canvas.bind("<MouseWheel>", lambda e: self._on_wheel("left", e))
         self.right_canvas.bind("<MouseWheel>", lambda e: self._on_wheel("right", e))
 
+        # 滚轮只适合粗调；直接输入半径才能精确到像素。
+        rf = ttk.Frame(self, padding=(10, 0, 10, 4))
+        rf.pack(fill="x")
+        ttk.Label(rf, text="半径(px)：左").pack(side="left")
+        self.left_r_var = tk.StringVar(value="0")
+        self.right_r_var = tk.StringVar(value="0")
+        lspin = ttk.Spinbox(rf, from_=8, to=300, increment=1, width=6,
+                            textvariable=self.left_r_var)
+        lspin.pack(side="left", padx=(2, 13))
+        ttk.Label(rf, text="右").pack(side="left")
+        rspin = ttk.Spinbox(rf, from_=8, to=300, increment=1, width=6,
+                            textvariable=self.right_r_var)
+        rspin.pack(side="left", padx=(2, 6))
+        ttk.Button(rf, text="应用半径", command=self._apply_radius_vars).pack(side="left")
+        ttk.Label(rf, text="（或滚轮粗调，8–300）").pack(side="left", padx=(8, 0))
+        for spin in (lspin, rspin):
+            spin.bind("<Return>", lambda _e: self._apply_radius_vars())
+            spin.bind("<FocusOut>", lambda _e: self._apply_radius_vars())
+
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
         self.status = ttk.Label(bottom, text="等待点击")
@@ -161,13 +180,30 @@ class SeedPicker(tk.Toplevel):
         return None
 
     def _on_wheel(self, side: str, event) -> None:
-        """滚轮微调半径：Hough 估偏时不用重录/重开。"""
+        """滚轮粗调半径；精确值用上面的输入框。"""
+        delta = 1.02 if event.delta > 0 else 0.98
         if side == "left" and self.left_click:
-            self.left_radius = float(max(8, min(110, self.left_radius * (1.05 if event.delta > 0 else 0.95))))
+            self.left_radius = float(max(8, min(300, self.left_radius * delta)))
+            self.left_r_var.set(f"{self.left_radius:.0f}")
             self._redraw()
         elif side == "right" and self.right_click:
-            self.right_radius = float(max(8, min(110, self.right_radius * (1.05 if event.delta > 0 else 0.95))))
+            self.right_radius = float(max(8, min(300, self.right_radius * delta)))
+            self.right_r_var.set(f"{self.right_radius:.0f}")
             self._redraw()
+
+    def _apply_radius_vars(self) -> None:
+        """把输入框里的精确半径写回两侧圆。"""
+        try:
+            lr = float(self.left_r_var.get())
+            rr = float(self.right_r_var.get())
+        except ValueError:
+            self.status.configure(text="半径要填数字，例如 60")
+            return
+        self.left_radius = float(max(8, min(300, lr)))
+        self.right_radius = float(max(8, min(300, rr)))
+        self.left_r_var.set(f"{self.left_radius:.0f}")
+        self.right_r_var.set(f"{self.right_radius:.0f}")
+        self._redraw()
 
     def _on_click(self, side: str, event) -> None:
         frame = self.left_frame if side == "left" else self.right_frame
@@ -180,11 +216,13 @@ class SeedPicker(tk.Toplevel):
         if circle is not None:
             x, y, radius = circle
         else:
-            radius = float(max(12, min(110, round(w / 32.0))))
+            radius = float(max(12, min(300, round(w / 32.0))))
         if side == "left":
             self.left_click, self.left_radius = (x, y), radius
+            self.left_r_var.set(f"{radius:.0f}")
         else:
             self.right_click, self.right_radius = (x, y), radius
+            self.right_r_var.set(f"{radius:.0f}")
         self._redraw()
 
     def _redraw(self) -> None:
@@ -211,7 +249,7 @@ class SeedPicker(tk.Toplevel):
         if self.left_click and self.right_click:
             warn = ""
             if max(self.left_radius, self.right_radius) > 90:
-                warn = "  ⚠ 半径偏大：向下滚轮贴合球边缘"
+                warn = "  ⚠ 半径偏大：向下滚轮或直接输入更小值"
             self.status.configure(
                 text=f"左 ({self.left_click[0]:.0f},{self.left_click[1]:.0f}) "
                      f"r={self.left_radius:.0f}  |  右 "
@@ -225,6 +263,8 @@ class SeedPicker(tk.Toplevel):
     def _reset(self) -> None:
         self.left_click = self.right_click = None
         self.left_radius = self.right_radius = 0.0
+        self.left_r_var.set("0")
+        self.right_r_var.set("0")
         self._redraw()
 
     def _save(self) -> None:
