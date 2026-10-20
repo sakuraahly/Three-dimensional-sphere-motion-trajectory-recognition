@@ -219,6 +219,17 @@ class DataManager(tk.Tk):
             text=f"已选 {len(chosen)} / {len(self.items)} 个会话\n"
                  f"预计原始数据 {_fmt_bytes(size)}")
         self._set_row_checks()
+        self._sync_highlight()
+
+    def _sync_highlight(self) -> None:
+        if not hasattr(self, "tree"):
+            return
+        try:
+            ids = [it.id for it in self.items if it.id in self.selected
+                   and self.tree.exists(it.id)]
+            self.tree.selection_set(ids)
+        except tk.TclError:
+            pass
 
     def _set_row_checks(self) -> None:
         for it in self.items:
