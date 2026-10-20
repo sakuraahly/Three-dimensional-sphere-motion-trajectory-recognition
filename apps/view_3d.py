@@ -106,15 +106,39 @@ class Viewer3D:
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
-        # 视频在上、3D 在下：同一个 idx 同时驱动两边
-        self.video_label = tk.Label(self.root, bg="#0f172a", fg="#94a3b8",
-                                    text="未找到 annotated.mp4（只显示 3D）",
-                                    height=15)
-        self.video_label.pack(fill="x", padx=8, pady=(8, 0))
-        self.fig = plt.Figure(figsize=(8.6, 4.6), dpi=100)
+        # 2×2：左上左视频 / 右上右视频 / 左下 3D / 右下待定
+        grid = ttk.Frame(self.root)
+        for r in (0, 1):
+            grid.rowconfigure(r, weight=1)
+        for c in (0, 1):
+            grid.columnconfigure(c, weight=1)
+
+        self.video_l = tk.Label(grid, bg="#0f172a", fg="#94a3b8",
+                                text="未找到 annotated.mp4", anchor="center")
+        self.video_r = tk.Label(grid, bg="#0f172a", fg="#94a3b8",
+                                text="未找到 annotated.mp4", anchor="center")
+        self.video_l.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.video_r.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
+        self._left_raw = None
+        self._right_raw = None
+        self._left_photo = None
+        self._right_photo = None
+        self.video_l.bind("<Configure>", lambda _e: self._render_video())
+        self.video_r.bind("<Configure>", lambda _e: self._render_video())
+
+        plot_frame = ttk.Frame(grid)
+        plot_frame.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        self.fig = plt.Figure(figsize=(5.5, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111, projection="3d")
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.90)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        reserved = ttk.LabelFrame(grid, text="右下 · 待定", padding=10)
+        reserved.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+        ttk.Label(reserved, text="预留区（下一阶段再定）\n\n"
+                                "候选：误差曲线 / 速度 / 预测 / 多会话对比",
+                  style="Hint.TLabel", justify="left").pack(anchor="nw")
 
         bar = ttk.Frame(self.root, padding=(8, 4))
         bar.pack(fill="x")
@@ -134,6 +158,9 @@ class Viewer3D:
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
         self.status.pack(fill="x")
+        # 先给控制条/状态栏留位置，再把四宫格填满剩余空间；
+        # 否则 grid 的 expand 会把后面的 pack 控件压成 1px。
+        grid.pack(fill="both", expand=True, padx=4, pady=4)
         self.root.bind("<space>", lambda _e: self._toggle_play())
         self.root.bind("<Left>", lambda _e: self._step(-1))
         self.root.bind("<Right>", lambda _e: self._step(1))
@@ -185,19 +212,38 @@ class Viewer3D:
         self._update_video()
         self._status()
 
+    def _render_video(self) -> None:
+        for raw, label, attr in (
+            (self._left_raw, self.video_l, "_left_photo"),
+            (self._right_raw, self.video_r, "_right_photo"),
+        ):
+            if raw is None:
+                label.configure(image="", text="未找到 annotated.mp4")
+                continue
+            w = max(2, label.winfo_width())
+            h = max(2, label.winfo_height())
+            if w <= 4 or h <= 4:
+                w, h = 640, 360
+            img = cv2.resize(raw, (w, h), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+            setattr(self, attr, photo)
+            label.configure(image=photo, text="")
+
     def _update_video(self) -> None:
-        """按当前三维点的 frame 号取 annotated.mp4 的同帧，和 3D 同步。"""
+        """按当前三维点的 frame 号取 annotated.mp4 的同帧，切成左右两格。"""
         if self.cap is None:
+            self._render_video()
             return
         frame = int(self.points[self.idx].get("frame", self.idx))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
         ok, img = self.cap.read()
         if not ok or img is None:
             return
-        img = cv2.resize(img, (960, 270), interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        self._video_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.video_label.configure(image=self._video_photo, text="", height=270)
+        h, w = img.shape[:2]
+        self._left_raw = img[:, : w // 2].copy()
+        self._right_raw = img[:, w // 2:].copy()
+        self._render_video()
 
     def _status(self) -> None:
         p = self.points[self.idx]

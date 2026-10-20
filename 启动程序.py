@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 import tkinter as tk
@@ -137,6 +138,7 @@ class Task:
     stop_reason: str = ""
     kill_note: str = ""          # 停止失败的原因（"没杀干净"必须有出口，见 stop_task）
     lines: int = 0
+    on_done: Callable[["Task"], None] | None = None
 
     @property
     def running(self) -> bool:
@@ -210,6 +212,7 @@ class Launcher(tk.Tk):
 
         self.proc: subprocess.Popen | None = None
         self.log_queue: queue.Queue = queue.Queue()
+        self.done_queue: queue.Queue = queue.Queue()
         # 要跟着视口宽度重新换行的标签：(控件, "卡片说明"|"参数说明")
         self._wrapped: list[tuple[ttk.Label, str]] = []
         # 任务表：所有跑过的程序（在跑的 + 历史）。`_tid` 只增不减。
@@ -714,6 +717,7 @@ class Launcher(tk.Tk):
             ("view", "④ 3D + 视频", self._wb_view),
             ("export", "⑤ 导出 JSON", self._wb_export),
             ("open", "打开会话目录", self._wb_open),
+            ("files", "文件…", self._wb_files),
         ]
         for i, (key, text, cmd) in enumerate(specs):
             btn = ttk.Button(box, text=text, command=cmd, width=13)
@@ -762,6 +766,20 @@ class Launcher(tk.Tk):
             self._wb_refresh()
         finally:
             self.after(2500, self._wb_tick)
+
+    def _after_record_task(self, task: Task) -> None:
+        """录制结束 -> 自动选中新会话并跑校验（P2）。"""
+        if task.stop_reason:
+            self._append("[工作台] 录制被中断，跳过自动校验。")
+            return
+        self._wb_refresh(select_latest=True)
+        self.after(800, self._wb_auto_check)
+
+    def _wb_auto_check(self) -> None:
+        s = self._wb_selected()
+        if s is not None and s.can_check:
+            self._append(f"[工作台] 录制完成，自动校验 {s.id}。")
+            self._wb_check()
 
     def _wb_show(self) -> None:
         s = self._wb_selected()
@@ -863,6 +881,48 @@ class Launcher(tk.Tk):
             os.startfile(str(s.path))                       # type: ignore[attr-defined]
         except Exception:                                   # noqa: BLE001
             subprocess.Popen(["explorer", str(s.path)])
+
+    def _open_path(self, path: Path) -> None:
+        if not path.exists():
+            messagebox.showinfo("文件", f"文件不存在：\n{path}")
+            return
+        try:
+            os.startfile(str(path))                         # type: ignore[attr-defined]
+        except Exception:                                   # noqa: BLE001
+            subprocess.Popen(["explorer", str(path)])
+
+    def _wb_files(self) -> None:
+        """P4：逐文件打开/复制路径。"""
+        s = self._wb_selected()
+        if s is None:
+            return
+        derived = s.path / "derived"
+        menu = tk.Menu(self, tearoff=0)
+        items = [
+            ("打开 seeds.json", derived / "seeds.json"),
+            ("打开 traj3d.json", derived / "traj3d.json"),
+            ("打开 visualization.json", derived / "visualization.json"),
+            ("打开 annotated.mp4", derived / "annotated.mp4"),
+            ("打开 traj3d.png", derived / "traj3d.png"),
+        ]
+        for label, path in items:
+            if path.exists():
+                menu.add_command(label=label, command=lambda p=path: self._open_path(p))
+            else:
+                menu.add_command(label=label + "（无）", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="复制会话路径",
+                         command=lambda: (self.clipboard_clear(),
+                                          self.clipboard_append(str(s.path))))
+        menu.add_command(label="复制 seeds.json 路径",
+                         command=lambda: (self.clipboard_clear(),
+                                          self.clipboard_append(str(derived / "seeds.json"))))
+        btn = self._wb_buttons.get("files")
+        if btn is not None:
+            try:
+                menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height())
+            finally:
+                menu.grab_release()
 
     # ---------- 运行日志 ----------
     def _build_log(self) -> None:
@@ -986,7 +1046,8 @@ class Launcher(tk.Tk):
             return
         cmd = self._record_args(str(duration), label)
         self._append(f"录制：{duration} 秒；开始后闪一次光，结束前再闪一次。")
-        self._run(cmd, f"录制双目（{duration} 秒）")
+        self._run(cmd, f"录制双目（{duration} 秒）",
+                  on_done=self._after_record_task)
 
     def _offline_stereo_args(self, session_dir: str) -> list[str]:
         args = [PY, str(ROOT / "apps" / "run_stereo_video.py"), session_dir,
@@ -1387,7 +1448,8 @@ class Launcher(tk.Tk):
                   "规范落差自查（引用 / 来源 / 计数）")
 
     # ---------- 子进程与日志 ----------
-    def _run(self, cmd: list[str], title: str) -> None:
+    def _run(self, cmd: list[str], title: str,
+             on_done: Callable[[Task], None] | None = None) -> Task:
         """跑一个外部程序。
 
         ## 与原来的区别
@@ -1400,7 +1462,7 @@ class Launcher(tk.Tk):
         - 每个任务都能在「任务」卡片里**单独中断**、看耗时、看返回码。
         - 关窗口时会**先把任务收干净**（原来不会，相机因此可能一直被占着）。
         """
-        task = self.start_task(cmd, title)
+        task = self.start_task(cmd, title, on_done=on_done)
         self.status.configure(text=f"运行中（{len(self.running_tasks())} 个任务）")
         self._refresh_tasks()
         return task
@@ -1448,13 +1510,14 @@ class Launcher(tk.Tk):
             kw["start_new_session"] = True
         return subprocess.Popen(cmd, **kw)
 
-    def start_task(self, cmd: list[str], title: str) -> Task:
+    def start_task(self, cmd: list[str], title: str,
+                   on_done: Callable[[Task], None] | None = None) -> Task:
         """起一个新任务并登记。**允许多个同时跑**（相机冲突由用户自己负责）。"""
         self._tid += 1
         proc = self._spawn(cmd)
         log_path = self._task_log_path(self._tid, title)
         task = Task(tid=self._tid, title=title, cmd=list(cmd), proc=proc,
-                    log_path=log_path)
+                    log_path=log_path, on_done=on_done)
         self.tasks.append(task)
         self._sel_tid = task.tid
         self._append(f"\n===== [{task.tid}] {title} =====\n> {task.cmdline()}")
@@ -1650,6 +1713,7 @@ class Launcher(tk.Tk):
             self._task_log(task, f"日志文件：{task.log_path}")
         self.log_queue.put(tail)
         self.log_queue.put(None)
+        self.done_queue.put(task.tid)
 
     def _poll(self) -> None:
         while True:
@@ -1666,6 +1730,17 @@ class Launcher(tk.Tk):
             self._append(line)
         # 计时列要跟着走。**只在真的有任务在跑时刷** ——
         # 空转时每 500ms 重画一次表格纯属浪费。
+        while True:
+            try:
+                tid = self.done_queue.get_nowait()
+            except queue.Empty:
+                break
+            task = next((t for t in self.tasks if t.tid == tid), None)
+            if task is not None and task.on_done is not None:
+                try:
+                    task.on_done(task)
+                except Exception as exc:                    # noqa: BLE001
+                    self._append(f"[任务 {task.tid}] 完成回调失败：{exc}")
         if self.running_tasks():
             self._refresh_tasks()
         self.after(POLL_MS, self._poll)

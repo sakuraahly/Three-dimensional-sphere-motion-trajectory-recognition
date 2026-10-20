@@ -173,6 +173,7 @@ def button_states(s: SessionSummary, specular: bool) -> dict[str, bool]:
         "view": s.can_view,
         "export": s.has_traj,
         "open": s.path.exists(),
+        "files": s.path.exists(),
     }
 
 
