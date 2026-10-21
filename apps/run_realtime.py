@@ -42,7 +42,7 @@ import numpy as np
 
 from sphere_tracker import camera_registry as cr
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
-from sphere_tracker.detect import build_detector
+from sphere_tracker.detectors import build_detector
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import (
     INDEX_BACKEND,

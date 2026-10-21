@@ -692,6 +692,20 @@ def test_timestamp_pairing(base: Path) -> bool:
                    and got[10][0] == 11 and got[10][1] == 10))
     print(f"  前 10 对：{got}")
 
+    # 转正：不显式传 pairing 时也应走 canary（有 sidecar 就接管）
+    default_src = PairSource(video=(left, right))
+    default_pairs = default_src._pair_plan
+    default_ok = default_pairs is not None and len(default_pairs.pairs) == 39
+    default_got = []
+    while len(default_got) < 3:
+        good, _a, _b = default_src.read()
+        if not good:
+            break
+        default_got.append(1)
+    default_src.release()
+    checks.append(("默认 pairing=canary 会接管时间戳计划",
+                   default_ok and len(default_got) == 3))
+
     # 缺 sidecar -> 金丝雀必须回退，而不是静默改变输出
     no_ts_left = write_video(base / "no_ts_left.mp4", 6)
     no_ts_right = write_video(base / "no_ts_right.mp4", 6)

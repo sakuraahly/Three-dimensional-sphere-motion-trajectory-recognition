@@ -32,7 +32,7 @@ import numpy as np
 
 from apps._window import WindowManager  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
-from sphere_tracker.detect import build_detector
+from sphere_tracker.detectors import build_detector
 from sphere_tracker.geometry import estimate_focal_from_known_ball
 from sphere_tracker.sources import open_source
 

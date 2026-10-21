@@ -41,11 +41,11 @@
 
 配对策略（2026-10-20 加）
 ------------------------
-- `pairing="index"`（默认）：保留原行为，左 i 配右 i+sync_offset；
+- `pairing="index"`：旧行为，左 i 配右 i+sync_offset；
 - `pairing="timestamp"`：读 `*_times.csv`，按时间戳一对一配对；掉帧处跳过，
   不再让后续帧整体错位；
-- `pairing="canary"`：先算时间戳计划；覆盖率 ≥75% 且残差在容差内才接管，
-  否则回退 index。默认仍走 index，便于保留旧结果做 A/B 对比。
+- `pairing="canary"`（2026-10-21 转正为默认）：先算时间戳计划；覆盖率 ≥75%
+  且残差在容差内才接管，否则回退 index。仍可用 `--pairing index` 强制旧行为。
 
 时间戳配对不改变 `read()` 的返回形状；它只改变“取哪两帧”。
 
@@ -483,7 +483,7 @@ class PairSource:
         fps: int = 60,
         backup_camera: int | None = None,
         backend: int | None = None,
-        pairing: str = "index",
+        pairing: str = "canary",
         timestamp_tolerance_s: float = 0.033,
     ) -> None:
         given = [name for name, v in
@@ -800,7 +800,7 @@ def from_args(args) -> PairSource:
                           backend=api)
     if getattr(args, "left_video", None) and getattr(args, "right_video", None):
         return PairSource(video=(args.left_video, args.right_video),
-                          pairing=getattr(args, "pairing", "index"),
+                          pairing=getattr(args, "pairing", "canary"),
                           timestamp_tolerance_s=float(
                               getattr(args, "timestamp_tolerance", 0.020)))
     if getattr(args, "left_dir", None) and getattr(args, "right_dir", None):

@@ -44,6 +44,7 @@
 | **标准数据（seeds/traj3d/visualization）**             | ✅ 完成（2026-10-19） | `stereo/visualization.py` + `apps/export_visualization.py`；schema/坐标/单位见 `docs/数据标准.md` |
 | **GUI 点选球心 seed + 双目工作台**                    | ✅ 完成（2026-10-19/20） | 第 3 步『点选球（双目 seed）』写 `seeds.json`；下方工作台显示最近会话、校验/点选/跑双目/看 3D/导出 |
 | **数据管理 · 脱敏批量导出**                            | ✅ 完成（2026-10-20） | 主界面右上角『数据管理』；会话勾选/全选/时间/区间；默认不含视频；自动去相机身份/标签/平台；输出按会话分类的 zip |
+| **时间戳配对（金丝雀转正）**                          | ✅ 默认（2026-10-21） | `PairSource(pairing="canary")` 默认；覆盖率 <75% 或 sidecar 缺失时回退 `index`；A 会话 299 对 / 295 匹配 |
 | **金属球双目轨迹（221550）**                          | ✅ 单条会话可用 | seed 左 `(1260,830,65)` / 右 `(920,830,65)`；293/301 = **97.3%** 匹配；Z 0.235–0.348 m；尚无独立三维真值 |
 | 双目接进实时主流程                                    | ⬜ 待做       | `stereo/` 模块已就绪，缺采集与显示编排                                                                  |
 | Savitzky-Golay / 3D 轨迹平滑                          | ⚙️ 库完成，未接主流程 | `stereo/trajectory.py` 有合成测试；`--smooth` 只写平滑 CSV；预测按用户要求暂停 |
@@ -275,7 +276,7 @@ edges = cv2.Canny(blurred, 50, 150)
 | `fusion`            | 上面几种投票融合（**默认**）                                  | 通用，最稳                   | 27-35 FPS      |
 | `yolo` / `yolo_sam` | AI 检测 / 分割（可选依赖）                                    | 复杂背景、遮挡、多球         | 见第六节       |
 
-**筛选"是不是球"靠四个几何指标**，缺一不可（`sphere_tracker/detect.py`）：
+**筛选"是不是球"靠四个几何指标**，缺一不可（`sphere_tracker/detectors/`）：
 
 - **圆度** `4πA/P²` —— 排除锯齿状、细长目标
 - **填充率** `A / (π·r_外接²)` —— 方块只能填满外接圆的 61%，球体能填满 90%+
@@ -555,7 +556,7 @@ python apps/run_realtime.py --method yolo_sam    # YOLO 给框 + SAM 分割出�
 python tests/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否就绪
 ```
 
-代码里已经写好这两个后端（`sphere_tracker/detect.py` 的 `YoloDetector` / `YoloSamDetector`），
+代码里已经写好这两个后端（`sphere_tracker/detectors/neural.py` 的 `YoloDetector` / `YoloSamDetector`），
 未安装时会打印清晰的安装提示而不是崩掉。相关参数在 `DetectorConfig`：
 `yolo_weights`（默认 `models/yolo11n.pt`，可换 `models/yolo26n-seg.pt`）、`yolo_conf`、`yolo_imgsz`、
 `yolo_classes`（默认 `[32]` = sports ball）、`sam_model`（默认 `sam2.1_t.pt`）。
@@ -628,7 +629,6 @@ sphere_tracker/          单目核心库（可被任意脚本 import）
     motion.py            背景差分（含相机运动补偿）
     fusion.py            多线索投票融合
     neural.py            YOLO / SAM（可选，需要 torch）
-  detect.py              兼容垫片：旧导入路径仍可用，新代码请用 detectors/
 
 calib/                   双目标定（离线、一次）
   board.py               标定板检测与质量指标（清晰度/大小/贴边/曝光）

@@ -32,7 +32,7 @@ import numpy as np
 
 from apps._window import WindowManager  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig, save_config
-from sphere_tracker.detect import ColorBlobDetector
+from sphere_tracker.detectors import ColorBlobDetector
 from sphere_tracker.sources import open_source
 
 WINDOW = "calibrate color"

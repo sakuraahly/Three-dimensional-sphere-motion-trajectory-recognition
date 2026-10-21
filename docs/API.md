@@ -116,7 +116,7 @@ class YoloDetector / YoloSamDetector  # "yolo" / "yolo_sam"；def refine_circle_
 ② `build_single_detector` 只认三个名字：把 `"yolo"` 写进 `fusion_members` 会被**静默忽略**（不报错，少一路票）。
 ③ fusion：每票 +0.12；**只有一票且总分 <0.55 返回空**（硬编码，见 §1 坑②）；docstring 里的 `vote_single_min` **并不存在**；子检测器抛 `cv2.error` 被吞掉当"没检测到"。
 ④ motion：**换源必须 `reset()`**（重建 MOG2）；`_frames<5` 恒返回 `[]`；从"相机在动"回到"静止"时会用 `learningRate=1.0` 连喂 3 帧重建背景（这 3 帧的检测不可信）。
-⑤ AI 后端的失败是**运行时**的：`build_detector` 不报错，`detect()` 抛 `RuntimeError`，`SpherePipeline` 捕获它、只打印一次 `[检测器不可用]`，之后按"没检测到"继续跑（**不中断视频**）；SAM 只处理前 3 个种子框。`sphere_tracker/detect.py` 只是**兼容垫片**，新代码从 `sphere_tracker.detectors` 导入。
+⑤ AI 后端的失败是**运行时**的：`build_detector` 不报错，`detect()` 抛 `RuntimeError`，`SpherePipeline` 捕获它、只打印一次 `[检测器不可用]`，之后按"没检测到"继续跑（**不中断视频**）；SAM 只处理前 3 个种子框。旧 sphere_tracker/detect.py 垫片已于 2026-10-21 删除，一律从 `sphere_tracker.detectors` 导入。
 ## 5. `sphere_tracker/camera_motion.py` —— 相机自运动
 ```python
 @dataclass MotionEstimate:

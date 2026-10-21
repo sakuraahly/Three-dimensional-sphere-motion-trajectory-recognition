@@ -111,8 +111,8 @@ MUTATIONS: list[dict[str, str]] = [
         "target": "启动程序.py",
         "test": "tests/selftest_launcher_params.py",
         "why": "METHODS 首项换回 fusion —— 默认值又变成最慢的那个",
-        "old": 'METHODS = ["color", "fusion", "hough", "motion", "yolo", "yolo_sam"]',
-        "new": 'METHODS = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]',
+        "old": 'METHODS = ["color", "specular", "fusion", "hough", "motion", "yolo", "yolo_sam"]',
+        "new": 'METHODS = ["fusion", "specular", "color", "hough", "motion", "yolo", "yolo_sam"]',
     },
     {
         "key": "backend-wiring",

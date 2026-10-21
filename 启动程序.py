@@ -735,9 +735,9 @@ class Launcher(tk.Tk):
             btn.grid(row=3, column=i, padx=(0, 6), pady=4, sticky="w")
             self._wb_buttons[key] = btn
 
-        self.wb_canary = tk.BooleanVar(value=False)
+        self.wb_canary = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            box, text="实验：时间戳配对（金丝雀，失败自动回退旧方案）",
+            box, text="时间戳配对（默认；失败自动回退旧方案）",
             variable=self.wb_canary).grid(row=4, column=0, columnspan=6,
                                          sticky="w", pady=(0, 2))
 
@@ -928,8 +928,7 @@ class Launcher(tk.Tk):
             messagebox.showinfo("跑离线双目", "还没有点选球心；先点『② 点选球心』。")
             return
         args = self._offline_stereo_args(str(s.path))
-        if self.wb_canary.get():
-            args += ["--pairing", "canary"]
+        args += ["--pairing", "canary" if self.wb_canary.get() else "index"]
         self._run(args, f"离线双目 {s.id}")
         self.after(1500, self._wb_refresh)
 

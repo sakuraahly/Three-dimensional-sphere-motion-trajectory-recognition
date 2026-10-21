@@ -24,7 +24,7 @@ import numpy as np
 
 from .camera_motion import GlobalMotionEstimator
 from .config import AppConfig
-from .detect import build_detector
+from .detectors import build_detector
 from .geometry import CameraModel
 from .predict import TrajectoryPredictor
 from .track import BallTracker

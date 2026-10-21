@@ -473,7 +473,7 @@ Three-dimensional-sphere-motion-trajectory-recognition/
 ├── sphere_tracker/            # ✔ 已完成：2D 感知与跟踪（两路视频各自调用一次）
 │   ├── config.py              #   全部可调参数（含颜色预设）
 │   ├── geometry.py            #   亚像素圆拟合、径向一致性、单目测深
-│   ├── detect.py              #   颜色/梯度/背景差分/融合检测 + YOLO 接口
+│   ├── detectors/            #   颜色/梯度/背景差分/融合检测 + YOLO 接口
 │   ├── track.py               #   卡尔曼滤波 + 机动检测
 │   └── pipeline.py            #   单路视频的检测-跟踪总流程
 ├── apps/                      # ✔ 已完成：可运行程序与自测
@@ -935,7 +935,7 @@ pred = kf.predict()                  # 下一帧位置预测
 
 | 技术路线阶段 | 对应代码 | 状态 |
 |---|---|---|
-| 多线索检测（颜色 / 梯度几何 / 背景差分 / 融合） | `sphere_tracker/detect.py`（垫片）→ 实体在 `sphere_tracker/detectors/` | ✔ 已完成 |
+| 多线索检测（颜色 / 梯度几何 / 背景差分 / 融合） | `sphere_tracker/detectors/`（颜色/几何/运动/融合分文件） | ✔ 已完成 |
 | **与颜色无关的几何判据**（泛化核心） | `sphere_tracker/geometry.py`：`radial_consistency`、`circle_radial_gradient_stats` | ✔ 已完成 |
 | 亚像素边缘细化 | `sphere_tracker/geometry.py`：`refine_circle_subpixel` | ✔ 已完成 |
 | 2D 卡尔曼跟踪（含机动检测） | `sphere_tracker/track.py` | ✔ 已完成 |

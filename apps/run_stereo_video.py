@@ -199,9 +199,9 @@ def main() -> int:
     ap.add_argument("--sync-offset", type=int, default=None,
                     help="覆盖 session 的同步偏移（默认用 session.sync.offset）")
     ap.add_argument("--pairing", choices=("index", "timestamp", "canary"),
-                    default="index",
-                    help="配对策略：index=原方案；timestamp=时间戳；"
-                         "canary=先验证时间戳计划，安全才接管（默认 index）")
+                    default="canary",
+                    help="配对策略：canary=默认（时间戳安全接管，失败回退）；"
+                         "index=旧常数偏移；timestamp=强制时间戳")
     ap.add_argument("--timestamp-tolerance", type=float, default=0.033,
                     help="时间戳配对容差（秒），默认 0.033（约一帧@30fps）")
     ap.add_argument("--max-frames", type=int, default=0)
