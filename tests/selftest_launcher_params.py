@@ -719,6 +719,10 @@ def main() -> int:
         (sd / "derived" / "traj3d.png").write_bytes(b"png")
         (sd / "left.mkv").write_bytes(b"raw")
         items = scan_items(sroot)
+        from apps._workbench import summarize_session as _summarize
+        status_same = all(it.status == _summarize(it.path).status
+                          and it.symbol == _summarize(it.path).symbol
+                          for it in items)
         opts = ExportOptions(categories=frozenset({"metadata", "derived"}))
         red = redact_session(sensitive, opts)
         out_zip = Path(tmp) / "export.zip"
@@ -834,7 +838,9 @@ def main() -> int:
         checks_extra += [
             ("坏 metadata 明确报错", bad_meta_raises),
             ("非对象 JSON 标为坏会话且导出报错",
-             non_dict_item.status == "✗" and non_dict_raises),
+             non_dict_item.status == "bad" and non_dict_item.symbol == "✗"
+             and non_dict_raises),
+            ("数据管理与工作台状态/符号一致", status_same),
             ("重复输出报 FileExistsError", overwrite_raises),
             ("空输出路径报 ValueError", empty_raises),
             ("脱敏关闭时不谎称已移除",

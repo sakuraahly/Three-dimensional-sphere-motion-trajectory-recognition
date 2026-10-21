@@ -15,6 +15,15 @@ from pathlib import Path
 
 SESSION_SCHEMA = "sphere-stereo-session"
 
+# 所有面板共用的状态符号：工作台、数据管理都从这里取，避免两套图标各说各话
+STATUS_SYMBOLS = {
+    "empty": "—",
+    "bad": "✗",
+    "recorded": "○",
+    "seeded": "◐",
+    "traj": "✓",
+}
+
 
 @dataclass
 class SessionSummary:
@@ -43,9 +52,11 @@ class SessionSummary:
 
     @property
     def label(self) -> str:
-        mark = {"empty": "—", "bad": "✗", "recorded": "○",
-                "seeded": "◐", "traj": "✓"}.get(self.status, "?")
-        return f"{mark} {self.id or self.path.name}"
+        return f"{self.symbol} {self.id or self.path.name}"
+
+    @property
+    def symbol(self) -> str:
+        return STATUS_SYMBOLS.get(self.status, "?")
 
     @property
     def can_check(self) -> bool:
@@ -107,6 +118,10 @@ def summarize_session(path: str | Path) -> SessionSummary:
     except Exception as exc:                                # noqa: BLE001
         s.status = "bad"
         s.problems.append(f"session.json 读不了：{exc}")
+        return s
+    if not isinstance(data, dict):
+        s.status = "bad"
+        s.problems.append("session.json 不是对象")
         return s
     s.id = str(data.get("id") or path.name)
     s.created = str(data.get("created") or "")

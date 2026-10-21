@@ -153,6 +153,8 @@ class DataManager(tk.Tk):
 
         self.count_label = ttk.Label(right, text="", font=("Microsoft YaHei UI", 10, "bold"))
         self.count_label.pack(anchor="w", pady=(0, 6))
+        ttk.Label(right, text="状态：✓ 有3D   ◐ 已点选   ○ 已录制   ✗ 坏   — 空",
+                  foreground=MUTED, wraplength=310).pack(anchor="w", pady=(0, 6))
 
         cats = ttk.LabelFrame(right, text="导出类别", padding=8)
         cats.pack(fill="x", pady=(0, 8))
@@ -223,7 +225,7 @@ class DataManager(tk.Tk):
                              values=("☑" if it.key in self.selected else "☐",
                                      it.id, it.created,
                                      f"{it.frames_left}/{it.frames_right}",
-                                     it.status, size))
+                                     it.symbol, size))
         self._refresh_count()
 
     def _refresh_count(self) -> None:

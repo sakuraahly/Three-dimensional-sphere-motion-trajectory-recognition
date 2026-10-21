@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
+from ._workbench import STATUS_SYMBOLS, summarize_session
+
 CATEGORIES: dict[str, str] = {
     "metadata": "会话元数据（session.json + 时间戳）",
     "derived": "标准派生数据（seeds / traj3d / visualization / CSV）",
@@ -47,8 +49,12 @@ class SessionItem:
         return self.path.name
 
     @property
+    def symbol(self) -> str:
+        return STATUS_SYMBOLS.get(self.status, "?")
+
+    @property
     def label(self) -> str:
-        return f"{self.id}  {self.created}  {self.frames_left}/{self.frames_right}帧"
+        return f"{self.symbol} {self.id}  {self.created}  {self.frames_left}/{self.frames_right}帧"
 
 
 @dataclass(frozen=True)
@@ -83,17 +89,6 @@ def _read_session(path: Path) -> dict:
         return {}
 
 
-def _session_created(data: dict, fallback: str) -> str:
-    created = str(data.get("created") or "").strip()
-    if created:
-        return created
-    # 目录名就是时间戳时，至少给出可读时间
-    m = re.match(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})", fallback)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)}"
-    return ""
-
-
 def _dir_size(path: Path) -> int:
     total = 0
     for p in path.rglob("*"):
@@ -119,32 +114,16 @@ def scan_items(root: str | Path) -> list[SessionItem]:
     dirs.sort(key=key, reverse=True)
     items: list[SessionItem] = []
     for p in dirs:
-        sess_path = p / "session.json"
-        data = _read_session(p)
-        error = ""
-        if not sess_path.exists():
-            error = "缺 session.json"
-        elif not data:
-            error = "session.json 解析失败"
-        left = data.get("left") or {}
-        right = data.get("right") or {}
-        n_matched = 0
-        traj = p / "derived" / "traj3d.json"
-        if traj.exists():
-            try:
-                td = json.loads(traj.read_text(encoding="utf-8"))
-                n_matched = sum(1 for s in (td.get("samples") or [])
-                                if s.get("matched") and s.get("xyz"))
-            except Exception:                               # noqa: BLE001
-                pass
-        status = "✗" if error else ("✓" if n_matched else "○")
+        # 状态判定只保留一份：和工作台共用 summarize_session / STATUS_SYMBOLS
+        summary = summarize_session(p)
+        error = "；".join(summary.problems) if summary.status == "bad" else ""
         items.append(SessionItem(
-            path=p, id=str(data.get("id") or p.name),
-            created=_session_created(data, p.name),
-            frames_left=int(left.get("frame_count") or 0),
-            frames_right=int(right.get("frame_count") or 0),
-            n_matched=n_matched, status=status, size_bytes=_dir_size(p),
-            error=error))
+            path=p, id=summary.id or p.name,
+            created=summary.created,
+            frames_left=summary.frames_left,
+            frames_right=summary.frames_right,
+            n_matched=summary.n_matched, status=summary.status,
+            size_bytes=_dir_size(p), error=error))
     return items
 
 
