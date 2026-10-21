@@ -12,7 +12,8 @@
     traj3d.json         标准三维轨迹（元数据 + 逐帧 samples）
     visualization.json  给可视化程序用的精简数据（trajectory + bounds + style）
 
-坐标系：`rectified_left_camera`，单位米；XYZ 轴定义见 `docs/数据标准.md`。
+坐标系：parallel 用 `rectified_left_camera`；angled 用 `left_camera`，
+单位米；XYZ 轴定义见 `docs/数据标准.md`。
 """
 
 from __future__ import annotations
@@ -139,6 +140,7 @@ def build_trajectory_payload(
     session_dir: str | Path,
     *,
     csv_name: str = "traj3d.csv",
+    stereo_mode: str | None = None,
 ) -> dict:
     """把 session + seeds + CSV 合成标准轨迹 JSON。"""
     session_dir = Path(session_dir)
@@ -157,6 +159,15 @@ def build_trajectory_payload(
         bounds = {"min": [min(xs), min(ys), min(zs)],
                   "max": [max(xs), max(ys), max(zs)]}
     calib = session.get("calibration") or {}
+    rig_data = session.get("rig")
+    raw_mode = stereo_mode
+    if not raw_mode:
+        raw_mode = session.get("stereo_mode") or (
+            rig_data.get("stereo_mode") if isinstance(rig_data, dict) else None)
+    mode = str(raw_mode or "parallel").strip().lower()
+    mode = "angled" if mode in ("angled", "auto", "90", "90deg",
+                                "orthogonal", "angle") else "parallel"
+    coordinate = "left_camera" if mode == "angled" else "rectified_left_camera"
     return {
         "schema": TRAJECTORY_SCHEMA,
         "version": VERSION,
@@ -164,7 +175,8 @@ def build_trajectory_payload(
         "created": _now(),
         "source_csv": f"derived/{csv_name}",
         "unit": "m",
-        "coordinate_system": "rectified_left_camera",
+        "stereo_mode": mode,
+        "coordinate_system": coordinate,
         "image_size": [int(session.get("left", {}).get("width", 0)),
                        int(session.get("left", {}).get("height", 0))],
         "sync": session.get("sync") or {},
@@ -198,6 +210,7 @@ def build_visualization_payload(trajectory: dict) -> dict:
         "created": _now(),
         "source": "traj3d.json",
         "unit": trajectory.get("unit", "m"),
+        "stereo_mode": trajectory.get("stereo_mode", "parallel"),
         "coordinate_system": trajectory.get("coordinate_system"),
         "bounds": trajectory.get("bounds"),
         "n_points": len(points),
@@ -220,10 +233,12 @@ def export_session_visualization(
     session_dir: str | Path,
     *,
     csv_name: str = "traj3d.csv",
+    stereo_mode: str | None = None,
 ) -> dict[str, Path]:
     """写 `traj3d.json` + `visualization.json`，返回路径。"""
     session_dir = Path(session_dir)
-    trajectory = build_trajectory_payload(session_dir, csv_name=csv_name)
+    trajectory = build_trajectory_payload(
+        session_dir, csv_name=csv_name, stereo_mode=stereo_mode)
     vis = build_visualization_payload(trajectory)
     derived = session_dir / "derived"
     derived.mkdir(parents=True, exist_ok=True)

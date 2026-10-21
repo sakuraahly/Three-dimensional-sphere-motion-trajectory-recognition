@@ -360,17 +360,30 @@ def main() -> int:
         ("带 --label gui_test", "--label gui_test" in rec_s),
         ("带 --left left --right right", "--left left --right right" in rec_s),
         ("带 --fps 30", "--fps 30" in rec_s),
+        ("默认双目模式 auto", "--stereo-mode auto" in rec_s),
     ]
     for label, good in checks_rec:
         print(f"  [{'通过' if good else '不达标'}] {label}")
         results.append((label, good))
 
+    app.stereo_mode_var.set("angled")
+    rec_ang = " ".join(app._record_args("10", "gui_test"))
+    cal_ang = " ".join(app._calibrate_args() or [])
+    mode_ok = "--stereo-mode angled" in rec_ang and "--stereo-mode angled" in cal_ang
+    print(f"  [{'通过' if mode_ok else '不达标'}] 切换大角度模式后录制/标定都传 angled")
+    results.append(("切换大角度模式后录制/标定都传 angled", mode_ok))
+    app.stereo_mode_var.set("parallel")
+
     off = app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo"))
     off_s = " ".join(off)
+    app.stereo_mode_var.set("angled")
+    off_ang = " ".join(app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo")))
+    app.stereo_mode_var.set("auto")
     checks_off = [
         ("调用 apps/run_stereo_video.py", "run_stereo_video.py" in off_s),
         ("带会话目录", "data\\sessions\\demo" in off_s or "data/sessions/demo" in off_s),
         ("带 --method", "--method" in off_s),
+        ("显式 angled 时离线也带 --stereo-mode angled", "--stereo-mode angled" in off_ang),
         ("GUI 有「点选球」入口", hasattr(app, "_pick_stereo_seed")
          and "点选球" in (ROOT / "启动程序.py").read_text(encoding="utf-8")),
         ("GUI 方法列表包含 specular", "specular" in mod.METHODS),
@@ -707,6 +720,8 @@ def main() -> int:
             "schema": "sphere-stereo-session", "version": 1, "id": sd.name,
             "created": "2026-01-01 12:00:00", "label": "secret-label",
             "notes": "private notes",
+            "stereo_mode": "angled",
+            "rig": {"stereo_mode": "angled", "angle_deg": 90.0},
             "left": {"frame_count": 3, "identity": "USB\\SECRET", "name": "cam-left",
                      "port": "p1"},
             "right": {"frame_count": 3, "identity": "USB\\SECRET2", "name": "cam-right",
@@ -760,6 +775,8 @@ def main() -> int:
             and default_manifest.get("root") == root
             and set(default_manifest.get("categories") or []) == set(DEFAULT_CATEGORIES)
             and default_manifest.get("redaction", {}).get("camera_identity") is True
+            and any(s.get("stereo_mode") == "angled"
+                    for s in default_manifest.get("sessions", []))
             and no_abs_manifest
         )
         checks_data = [

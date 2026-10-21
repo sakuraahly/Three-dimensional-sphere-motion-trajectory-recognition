@@ -42,6 +42,7 @@ from typing import Any
 import cv2
 
 from calib.params import StereoRig
+from .stereo_mode import optical_axes_angle_deg
 
 SCHEMA = "sphere-stereo-session"
 VERSION = 1
@@ -99,6 +100,8 @@ class Session:
     left: CameraInfo | None = None
     right: CameraInfo | None = None
     calibration: CalibrationInfo | None = None
+    stereo_mode: str = "parallel"
+    rig: dict[str, Any] = field(default_factory=dict)
     sync: SyncInfo = field(default_factory=SyncInfo)
     codec: str = "FFV1"
     container: str = "mkv"
@@ -225,6 +228,8 @@ def load_session(path: str | Path) -> tuple[Path, Session]:
         left=_from_dict(CameraInfo, raw.get("left")),
         right=_from_dict(CameraInfo, raw.get("right")),
         calibration=_from_dict(CalibrationInfo, raw.get("calibration")),
+        stereo_mode=str(raw.get("stereo_mode") or "parallel"),
+        rig=dict(raw.get("rig") or {}),
         sync=_from_dict(SyncInfo, raw.get("sync")) or SyncInfo(),
         codec=str(raw.get("codec") or "FFV1"),
         container=str(raw.get("container") or "mkv"),
@@ -380,6 +385,15 @@ def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
                         warnings.append(
                             f"物理基线 {cal.baseline_measured_mm:.2f} mm 与算法 "
                             f"{rig.baseline_mm:.2f} mm 差 {ratio*100:.0f}%（>10%）")
+                if str(getattr(s, "stereo_mode", "parallel")) != rig.stereo_mode:
+                    warnings.append(
+                        f"会话模式 {getattr(s, 'stereo_mode', 'parallel')} 与标定 meta "
+                        f"{rig.stereo_mode} 不一致；分析前请核对")
+                angle = optical_axes_angle_deg(rig.R)
+                if getattr(s, "stereo_mode", "parallel") == "parallel" and angle >= 40.0:
+                    warnings.append(
+                        f"标定光轴夹角 {angle:.1f}° 很大，但会话按 parallel 记录；"
+                        "如果这是大角度装置，请用 angled 模式重录/显式覆盖")
 
     if abs(s.sync.offset) > 180:
         warnings.append(f"同步偏移 {s.sync.offset:+d} 超过默认搜索上限 ±180 帧")

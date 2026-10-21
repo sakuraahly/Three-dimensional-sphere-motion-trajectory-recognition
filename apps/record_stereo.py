@@ -42,6 +42,9 @@ if str(ROOT) not in sys.path:
 
 from apps._common import setup_logging                      # noqa: E402
 from calib.params import StereoRig                           # noqa: E402
+from stereo.stereo_mode import (                             # noqa: E402
+    infer_mode, normalize_mode, optical_axes_angle_deg,
+)
 from sphere_tracker.camera_registry import (                 # noqa: E402
     load_registry,
     resolve_camera_arg,
@@ -349,6 +352,9 @@ def main() -> int:
                     help="物理基线（只作核对；不填则会话里不记）")
     ap.add_argument("--label", default="")
     ap.add_argument("--notes", default="")
+    ap.add_argument("--stereo-mode", choices=("auto", "parallel", "angled"),
+                    default="auto",
+                    help="写入会话的双目模式；auto=按标定 meta 推断，缺省 parallel")
     ap.add_argument("--preview", action="store_true", help="显示两路预览（会略增负载）")
     ap.add_argument("--self-check-only", action="store_true",
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
@@ -411,6 +417,20 @@ def main() -> int:
             created=str(rig.meta.get("created") or ""),
             verdict=str((rig.quality or {}).get("verdict") or ""),
         )
+        if args.stereo_mode == "auto":
+            mode = infer_mode(calibration={"meta": rig.meta})
+        else:
+            mode = normalize_mode(args.stereo_mode)
+        session.stereo_mode = mode
+        session.rig = {
+            "stereo_mode": mode,
+            "angle_deg": float(optical_axes_angle_deg(rig.R)),
+            "baseline_mm": float(rig.baseline_mm),
+        }
+        if mode != rig.stereo_mode:
+            print(f"[警告] 会话模式 {mode} 与标定 meta {rig.stereo_mode} 不一致；"
+                  "请确认这份标定确实对应当前机械装置。")
+            LOG.warning("会话 stereo_mode=%s，标定 meta=%s", mode, rig.stereo_mode)
         session.codec = tag
         session.container = "mkv"
         session.lossless = True

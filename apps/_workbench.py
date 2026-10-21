@@ -47,12 +47,14 @@ class SessionSummary:
     z_min: float | None = None
     z_max: float | None = None
     residual_median: float | None = None
+    stereo_mode: str = "parallel"
     status: str = "empty"       # empty / bad / recorded / seeded / traj
     problems: list[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
-        return f"{self.symbol} {self.id or self.path.name}"
+        tag = "  [大角度]" if self.stereo_mode == "angled" else ""
+        return f"{self.symbol} {self.id or self.path.name}{tag}"
 
     @property
     def symbol(self) -> str:
@@ -125,6 +127,12 @@ def summarize_session(path: str | Path) -> SessionSummary:
         return s
     s.id = str(data.get("id") or path.name)
     s.created = str(data.get("created") or "")
+    mode = data.get("stereo_mode")
+    rig_data = data.get("rig")
+    if not mode and isinstance(rig_data, dict):
+        mode = rig_data.get("stereo_mode")
+    s.stereo_mode = "angled" if str(mode or "parallel").strip().lower() in (
+        "angled", "auto", "90", "90deg", "orthogonal", "angle") else "parallel"
     left = data.get("left") or {}
     right = data.get("right") or {}
     s.frames_left = int(left.get("frame_count") or 0)

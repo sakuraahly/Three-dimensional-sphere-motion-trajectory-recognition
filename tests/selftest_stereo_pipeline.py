@@ -37,7 +37,9 @@ from stereo import (
     stereo_depth,
     timestamp_offset,
 )
-from stereo.visualization import export_session_visualization, load_seeds, write_seeds
+from stereo.visualization import (
+    build_trajectory_payload, export_session_visualization, load_seeds, write_seeds,
+)
 from sphere_tracker.types import Detection
 
 
@@ -197,6 +199,69 @@ def test_trajectory_fusion() -> bool:
     return ok
 
 
+def test_angled() -> bool:
+    """大角度模式：F 匹配 + 原始像素射线交会，与平行模式隔离。"""
+    print("----- 大角度（近似直角）合成真值 -----")
+    from types import SimpleNamespace
+    from sphere_tracker.types import Detection
+    from stereo.angled import AngledMatchConfig, AngledReconstructor
+    from stereo.stereo_mode import geometry_advice, infer_mode, normalize_mode
+    import cv2
+    import numpy as np
+
+    K = np.array([[800.0, 0, 320.0], [0, 800.0, 240.0], [0, 0, 1.0]])
+    D = np.zeros(5)
+    R = cv2.Rodrigues(np.array([0.0, np.pi / 2, 0.0]))[0]
+    # 右相机在左相机 +X 0.4 m：X_right = R X_left + T
+    T = -R @ np.array([0.4, 0.0, 0.0])
+    rig = SimpleNamespace(K1=K, D1=D, K2=K, D2=D, R=R, T=T, F=None,
+                          stereo_mode="angled")
+    pts = np.array([[0.10, 0.02, 1.00],
+                    [0.20, -0.05, 1.10],
+                    [0.15, 0.08, 0.95]], np.float64)
+    rvec = cv2.Rodrigues(R)[0]
+    uv_l, _ = cv2.projectPoints(pts, np.zeros(3), np.zeros(3), K, D)
+    uv_r, _ = cv2.projectPoints(pts, rvec, T, K, D)
+    rec = AngledReconstructor(rig, AngledMatchConfig(max_epipolar_px=3.0))
+    errors = []
+    for i, p in enumerate(pts):
+        dl = Detection(x=float(uv_l[i, 0, 0]), y=float(uv_l[i, 0, 1]), radius=20)
+        dr = Detection(x=float(uv_r[i, 0, 0]), y=float(uv_r[i, 0, 1]), radius=20)
+        out = rec.update(float(i), dl, [dr])
+        if out is not None:
+            errors.append(float(np.linalg.norm(out.xyz - p)))
+    checks = [
+        ("F 匹配 + 射线交会，3/3 点误差 <1e-5 m",
+         len(errors) == len(pts) and max(errors) < 1e-5),
+        ("模式别名/旧数据默认 parallel",
+         normalize_mode("orthogonal") == "angled"
+         and infer_mode({}) == "parallel"),
+        ("旧会话无字段 + angled 标定 -> auto=angled",
+         infer_mode(session={}, calibration={"meta": {"stereo_mode": "angled"}})
+         == "angled"),
+        ("显式 session=parallel 不被标定覆盖",
+         infer_mode(session={"stereo_mode": "parallel"},
+                    calibration={"meta": {"stereo_mode": "angled"}})
+         == "parallel"),
+        ("B=600mm/D=0.3m 估算约 90°",
+         abs(geometry_advice(600.0, 0.30)["angle_deg"] - 90.0) < 1e-6),
+        ("大角度统计计数器",
+         rec.n_matched == len(pts) and rec.match_rate > 0.99),
+    ]
+    from calib.angled_quality import evaluate_angled, grade_angled
+    q = evaluate_angled(K, D, K, D, R, T,
+                        uv_l.reshape(-1, 2), uv_r.reshape(-1, 2))
+    grade, verdict = grade_angled(q, min_pairs=3, min_angle=5)
+    checks.append(("F 线距离/交会角质量评估",
+                   q.line_rms_px < 1e-5 and "极线" in verdict
+                   and q.n_pairs == len(pts)))
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
 def test_visualization() -> bool:
     """标准数据：seeds.json / traj3d.json / visualization.json 的契约。"""
     print("----- 标准数据导出 -----")
@@ -207,6 +272,8 @@ def test_visualization() -> bool:
             "schema": "sphere-stereo-session", "version": 1, "id": "synthetic",
             "left": {"width": 1920, "height": 1080},
             "sync": {"method": "flash", "offset": 0, "confidence": 0.9},
+            "stereo_mode": "angled",
+            "rig": {"stereo_mode": "angled", "angle_deg": 90.0},
             "calibration": {"baseline_mm": 65.0, "created": "x", "verdict": "ok"},
         }), encoding="utf-8")
         (d / "derived").mkdir()
@@ -229,6 +296,13 @@ def test_visualization() -> bool:
             ("visualization.json 点数/bounds",
              vis["schema"] == "sphere-stereo-visualization"
              and vis["n_points"] == 1 and vis["bounds"]["max"][2] == 0.3),
+            ("大角度轨迹坐标/模式透传",
+             traj["stereo_mode"] == "angled"
+             and traj["coordinate_system"] == "left_camera"
+             and vis["stereo_mode"] == "angled"),
+            ("显式 parallel 覆盖不会沿用旧 session 的 angled",
+             build_trajectory_payload(d, stereo_mode="parallel")["coordinate_system"]
+             == "rectified_left_camera"),
         ]
         for name, passed in checks:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
@@ -248,8 +322,10 @@ def main() -> int:
     print()
     d = test_visualization()
     print()
-    print("判定结果：" + ("全部通过" if (a and b and c and d) else "有不达标项"))
-    return 0 if (a and b and c and d) else 1
+    e = test_angled()
+    print()
+    print("判定结果：" + ("全部通过" if (a and b and c and d and e) else "有不达标项"))
+    return 0 if (a and b and c and d and e) else 1
 
 
 if __name__ == "__main__":

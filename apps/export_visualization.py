@@ -40,8 +40,8 @@ def _plot(session_dir: Path, json_path: Path, out: Path) -> None:
     ax.plot([p["xyz"][0] for p in pts], [p["xyz"][1] for p in pts],
             [p["xyz"][2] for p in pts], ".-", color="#2563eb", markersize=2)
     ax.set_xlabel("X right (m)")
-    ax.set_ylabel("Y forward (m)")
-    ax.set_zlabel("Z up (m)")
+    ax.set_ylabel("Y down (m)")
+    ax.set_zlabel("Z forward (m)")
     ax.set_title(f"3D trajectory · {data.get('session', session_dir.name)}")
     fig.tight_layout()
     fig.savefig(out, dpi=150)
@@ -53,13 +53,18 @@ def main() -> int:
     ap.add_argument("session", help="data/sessions/<id> 或 session.json")
     ap.add_argument("--csv", default="traj3d.csv", help="derived 下的轨迹 CSV 文件名")
     ap.add_argument("--plot", action="store_true", help="另存 visualization.png")
+    ap.add_argument("--stereo-mode", choices=("auto", "parallel", "angled"),
+                    default="auto",
+                    help="auto=读 session/标定；angled=大角度（left_camera）")
     args = ap.parse_args()
 
     session_dir = Path(args.session)
     if session_dir.is_file():
         session_dir = session_dir.parent
     try:
-        paths = export_session_visualization(session_dir, csv_name=args.csv)
+        mode = None if args.stereo_mode == "auto" else args.stereo_mode
+        paths = export_session_visualization(
+            session_dir, csv_name=args.csv, stereo_mode=mode)
     except Exception as exc:                                # noqa: BLE001
         print(f"[错误] 导出失败：{exc}")
         return 1

@@ -41,6 +41,7 @@ class SessionItem:
     n_matched: int
     status: str
     size_bytes: int
+    stereo_mode: str = "parallel"
     error: str = ""
 
     @property
@@ -123,7 +124,8 @@ def scan_items(root: str | Path) -> list[SessionItem]:
             frames_left=summary.frames_left,
             frames_right=summary.frames_right,
             n_matched=summary.n_matched, status=summary.status,
-            size_bytes=_dir_size(p), error=error))
+            size_bytes=_dir_size(p), stereo_mode=summary.stereo_mode,
+            error=error))
     return items
 
 
@@ -256,7 +258,7 @@ def _manifest(items: list[SessionItem], options: ExportOptions,
         "sessions": [
             {"id": s.id, "folder": folders.get(s.key, s.key), "created": s.created,
              "frames_left": s.frames_left, "frames_right": s.frames_right,
-             "n_matched": s.n_matched}
+             "stereo_mode": s.stereo_mode, "n_matched": s.n_matched}
             for s in items
         ],
         "files": files,
@@ -272,6 +274,7 @@ def _readme(items: list[SessionItem], options: ExportOptions) -> str:
 
 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 会话数：{len(items)}
+模式：{", ".join(sorted({s.stereo_mode for s in items})) or "-"}（parallel=平行，angled=大角度）
 
 ## 目录
 

@@ -505,6 +505,29 @@ pt = rec.update(t, left=det_left, right_dets=dets_right)    # left 是【单个�
 **坑**：① `update()` 的 `left` 是**单个 Detection 或 `None`**，`right_dets` 才是列表；返回 `None` 的三种原因分别计入 `n_no_left`/`n_no_right`/`n_rejected`（`summary()` 会报出来）。
 ② `match_epipolar` 选的是极线偏差 `dy` **最小**的候选（`cost = dy`），不是"最像球"的那个；`require_radius_ratio=False` 时不比较左右半径（同型号相机才该开）；`triangulate_one` 的 `epipolar_px` 默认 `nan`（想要值就传 `match_epipolar` 的第二个返回值）。
 ③ `as_array()` 无配对点时返回 `(0,4)` 零数组 —— 形状和内容都要判。
+### 13.3b `stereo/angled.py` + `stereo/angled_geometry.py`（大角度）
+
+```python
+@dataclass AngledMatchConfig:
+    max_epipolar_px=8.0; min_angle_deg=5.0; max_reproj_px=3.0
+@dataclass AngledPoint:
+    t, xyz, u_left, u_right, epipolar_px, residual_px, angle_deg, radius_left
+class AngledReconstructor:
+    def __init__(rig, cfg=None)
+    def update(t, det_left, right_dets) -> AngledPoint | None
+    # counters: n_matched / n_no_left / n_no_right / n_rejected
+    # as_array() -> (N,4) [t,X,Y,Z]; match_rate; summary()
+```
+
+- 用原始像素 + K/D/R/T，不通过 `stereoRectify`；
+- 左点算 F 极线，右候选按**到极线距离**匹配；
+- 两射线最近点交会，`xyz` 在**原始左相机系**；
+- `stereo_mode=angled` 时 `coordinate_system=left_camera`；
+- 平行模式仍走 `13.3` 的 `StereoReconstructor`，两套坐标不能混。
+
+`stereo/stereo_mode.py`：`normalize_mode/infer_mode/mode_label/optical_axes_angle_deg/geometry_advice`；
+旧 session/标定无字段 → `parallel`。
+
 ### 13.4 `stereo/sessions.py`
 ```python
 SCHEMA = "sphere-stereo-session"; VERSION = 1; SESSION_FILE = "session.json"
@@ -517,6 +540,7 @@ SCHEMA = "sphere-stereo-session"; VERSION = 1; SESSION_FILE = "session.json"
 @dataclass SyncInfo: method="none", offset=0, confidence=0.0, note=""
 @dataclass Session:
     id, created, label="", notes="", left=None, right=None, calibration=None,
+    stereo_mode="parallel", rig={},               # 2026-10-21；旧文件缺省 parallel
     sync=SyncInfo(), codec="FFV1", container="mkv", lossless=True,
     environment={}, checks=[]
 def create_session(root, *, label="", notes="") -> tuple[Path, Session]

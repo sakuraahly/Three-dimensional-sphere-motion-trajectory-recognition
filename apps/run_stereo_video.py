@@ -4,7 +4,8 @@
 
     左路 SpherePipeline（检测 + 跟踪）
     右路 SpherePipeline（检测 + 跟踪）
-    StereoReconstructor（极线配对 + 三角测量）
+    StereoReconstructor（平行：极线配对 + 三角测量）
+    或 AngledReconstructor（大角度：F 极线 + 原始射线交会）
 
 为什么先写离线入口
 ------------------
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 import time
 from pathlib import Path
@@ -48,12 +50,17 @@ from sphere_tracker.geometry import CameraModel              # noqa: E402
 from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
 from stereo import MatchConfig, PairSource, StereoReconstructor, savgol_trajectory  # noqa: E402
+from stereo.stereo_mode import (  # noqa: E402
+    infer_mode, mode_label, normalize_mode, optical_axes_angle_deg,
+)
 from stereo.visualization import (  # noqa: E402
     export_session_visualization,
     load_seeds,
     write_seeds,
 )
-from stereo.sessions import load_session, validate_session   # noqa: E402
+from stereo.sessions import (  # noqa: E402
+    load_session, save_session, validate_session,
+)
 
 
 def _as_detection(res) -> Detection | None:
@@ -76,11 +83,14 @@ def _make_pipeline(cfg: AppConfig, rig: StereoRig, side: str) -> SpherePipeline:
     return pipe
 
 
-def _project_left(rig, xyz) -> tuple[int, int] | None:
-    """把校正左相机系的三维点投到**原始左图**。"""
+def _project_left(rig, xyz, mode: str = "parallel") -> tuple[int, int] | None:
+    """把左相机系的三维点投到**原始左图**；mode 决定是否用 R1。"""
     try:
         p = np.asarray(xyz, np.float64).reshape(1, 3)
-        rvec, _ = cv2.Rodrigues(rig.R1.T)
+        if mode == "angled":
+            rvec = np.zeros((3, 1))          # 原始左相机系，不做 rectified 旋转
+        else:
+            rvec, _ = cv2.Rodrigues(rig.R1.T)
         uv, _ = cv2.projectPoints(p, rvec, np.zeros(3), rig.K1, rig.D1)
         return int(round(float(uv[0, 0, 0]))), int(round(float(uv[0, 0, 1])))
     except Exception:                                       # noqa: BLE001
@@ -88,9 +98,9 @@ def _project_left(rig, xyz) -> tuple[int, int] | None:
 
 
 def _draw_reference(frame: np.ndarray, rig, origin: tuple[float, float, float],
-                    axis_m: float = 0.10) -> None:
-    """在左图标出坐标原点 + X/Y/Z 轴（原点默认 = 校正左相机光心投影）。"""
-    o = _project_left(rig, origin)
+                    axis_m: float = 0.10, mode: str = "parallel") -> None:
+    """在左图标出坐标原点 + X/Y/Z 轴（原点默认 = 相机光心投影）。"""
+    o = _project_left(rig, origin, mode)
     if o is None:
         return
     h, w = frame.shape[:2]
@@ -105,7 +115,7 @@ def _draw_reference(frame: np.ndarray, rig, origin: tuple[float, float, float],
     cv2.putText(frame, "O left-cam", (o[0] + 8, o[1] - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
     for xyz, color, name in axes:
-        p = _project_left(rig, xyz)
+        p = _project_left(rig, xyz, mode)
         if p is None:
             continue
         # 相机光心附近的坐标轴端点可能投到画面外/数值爆炸；跳过，别画到画布外
@@ -132,10 +142,11 @@ def _draw_xyz(frame: np.ndarray, res, xyz, label: str) -> None:
 
 
 def _draw(frame: np.ndarray, res, label: str, trail: list[tuple[float, float]] | None = None,
-          *, xyz=None, rig=None, origin=None, draw_reference: bool = False) -> np.ndarray:
+          *, xyz=None, rig=None, origin=None, draw_reference: bool = False,
+          mode: str = "parallel") -> np.ndarray:
     out = frame.copy()
     if draw_reference and rig is not None and origin is not None:
-        _draw_reference(out, rig, origin)
+        _draw_reference(out, rig, origin, mode=mode)
     if trail and len(trail) >= 2:
         pts = np.array([[int(round(x)), int(round(y))] for x, y in trail], np.int32)
         cv2.polylines(out, [pts], False, (0, 255, 255), 2)
@@ -181,7 +192,8 @@ def main() -> int:
                     choices=("color", "hough", "fusion", "motion", "specular"))
     ap.add_argument("--preset", default="", help="color 预设，如 white_ball；空=默认")
     ap.add_argument("--origin", default="0,0,0",
-                    help="视频里标出的参照原点（校正左相机系，x,y,z 米；默认相机光心投影）")
+                    help="视频里标出的参照原点（parallel=校正左相机系，"
+                         "angled=原始左相机系；x,y,z 米；默认相机光心投影）")
     ap.add_argument("--seed", default="",
                     help="specular 左路人工种子 x,y,r（1920 下 r 约 32~40）")
     ap.add_argument("--seed-right", default="",
@@ -195,7 +207,8 @@ def main() -> int:
     ap.add_argument("--min-radius", type=float, default=8.0)
     ap.add_argument("--max-radius", type=float, default=200.0)
     ap.add_argument("--hough-max-radius", type=float, default=80.0)
-    ap.add_argument("--max-epipolar", type=float, default=2.5)
+    ap.add_argument("--max-epipolar", type=float, default=None,
+                    help="极线门限（px）；缺省平行 2.5 / angled 8，显式值不被覆盖")
     ap.add_argument("--sync-offset", type=int, default=None,
                     help="覆盖 session 的同步偏移（默认用 session.sync.offset）")
     ap.add_argument("--pairing", choices=("index", "timestamp", "canary"),
@@ -204,6 +217,9 @@ def main() -> int:
                          "index=旧常数偏移；timestamp=强制时间戳")
     ap.add_argument("--timestamp-tolerance", type=float, default=0.033,
                     help="时间戳配对容差（秒），默认 0.033（约一帧@30fps）")
+    ap.add_argument("--stereo-mode", choices=("auto", "parallel", "angled"),
+                    default="auto",
+                    help="auto=读 session/标定；angled=大角度（近似直角）")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
     ap.add_argument("--smooth", action="store_true", help="另存 Savitzky-Golay 平滑后的三维 CSV")
@@ -235,6 +251,49 @@ def main() -> int:
     if not calib_path.is_absolute():
         calib_path = session_dir / calib_path
     rig = StereoRig.load(calib_path)
+    if args.stereo_mode == "auto":
+        # 只有 session.json 真的写了 stereo_mode/rig.stereo_mode 才让它优先；
+        # Session 对象的默认值 "parallel" 不能把标定里的 angled 盖掉。
+        try:
+            raw_session = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
+        except Exception:                                   # noqa: BLE001
+            raw_session = {}
+        session_hint = {}
+        if isinstance(raw_session, dict):
+            if "stereo_mode" in raw_session:
+                session_hint["stereo_mode"] = raw_session["stereo_mode"]
+            rig_hint = raw_session.get("rig")
+            if isinstance(rig_hint, dict) and "stereo_mode" in rig_hint:
+                session_hint["rig"] = {"stereo_mode": rig_hint["stereo_mode"]}
+        mode = infer_mode(session=session_hint,
+                          calibration={"meta": rig.meta})
+    else:
+        mode = normalize_mode(args.stereo_mode)
+    angle = optical_axes_angle_deg(rig.R)
+    print(f"双目模式：{mode_label(mode)}（{mode}）；标定实测光轴夹角 {angle:.1f}°；"
+          f"基线 {rig.baseline_mm:.1f} mm")
+    if mode == "angled" and angle < 15.0:
+        print("[警告] 标定夹角 <15°：这份参数更像平行双目，"
+              "请确认 --stereo-mode 与标定文件是否对应。")
+    elif mode == "parallel" and angle >= 40.0:
+        print(f"[警告] 标定夹角 {angle:.1f}° 已经很大，但当前按 parallel 跑；"
+              "如果这是大角度装置，请在会话/标定里标 angled，或显式 --stereo-mode angled。")
+    if args.stereo_mode == "auto" and (
+            (mode == "parallel" and angle >= 40.0)
+            or (mode == "angled" and angle < 15.0)):
+        print("[错误] auto 推断出的模式与标定实测夹角矛盾，拒绝静默继续；"
+              "请显式 --stereo-mode parallel 或 angled。")
+        return 2
+    # 把本次实际使用的模式写回 session，避免之后 export_visualization 按旧字段
+    # 把 angled 的 traj3d.json 又改回 rectified_left_camera
+    if getattr(s, "stereo_mode", "parallel") != mode:
+        s.stereo_mode = mode
+        rig_info = dict(getattr(s, "rig", {}) or {})
+        rig_info.update({"stereo_mode": mode, "angle_deg": angle,
+                         "baseline_mm": float(rig.baseline_mm)})
+        s.rig = rig_info
+        save_session(s, session_dir)
+        print(f"[会话] 已记录实际双目模式：{mode}（{mode_label(mode)}）")
     left_video = session_dir / s.left.video
     right_video = session_dir / s.right.video
     fps = float(s.left.fps_measured or s.left.fps_requested or 30.0)
@@ -260,7 +319,7 @@ def main() -> int:
 
     cfg = AppConfig()
     cfg.detector.method = args.method
-    if args.method == "specular" and abs(args.max_epipolar - 2.5) < 1e-9:
+    if args.method == "specular" and args.max_epipolar is None:
         args.max_epipolar = 8.0
         print("[specular] 极线门限 2.5px 对人工 seed/CSRT 太紧，默认放宽到 8px")
     cfg.detector.min_radius = float(args.min_radius)
@@ -334,7 +393,15 @@ def main() -> int:
         pipe_l.set_detect_width(args.detect_width)
         pipe_r.set_detect_width(args.detect_width)
 
-    rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=args.max_epipolar))
+    if mode == "angled":
+        from stereo.angled import AngledMatchConfig, AngledReconstructor
+        epi = 8.0 if args.max_epipolar is None else args.max_epipolar
+        if args.max_epipolar is None:
+            print("[angled] 极线门限默认放宽到 8px（大角度下候选像素偏差更大）")
+        rec = AngledReconstructor(rig, AngledMatchConfig(max_epipolar_px=epi))
+    else:
+        epi = 2.5 if args.max_epipolar is None else args.max_epipolar
+        rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=epi))
     out_dir = session_dir / "derived"
     out_dir.mkdir(parents=True, exist_ok=True)
     # 部分帧试跑不要把正式的 traj3d.csv / annotated.mp4 覆盖成 0.17 s
@@ -391,14 +458,17 @@ def main() -> int:
                     f"{pt.u_left[0]:.2f}", f"{pt.u_left[1]:.2f}",
                     f"{pt.u_right[0]:.2f}", f"{pt.u_right[1]:.2f}",
                     f"{pt.epipolar_px:.3f}", f"{pt.residual_px:.3f}",
-                    1, "" if det_l is None else det_l.method,
+                    (1 if mode == "parallel"
+                     else int(bool(getattr(pt, "confident", pt.residual_px <= 2.0)))),
+                    "" if det_l is None else det_l.method,
                     "" if det_r is None else det_r.method,
                 ])
 
             if writer is not None:
                 vl = cv2.resize(_draw(left_frame, res_l, "L", trail_l,
                                       xyz=None if pt is None else pt.xyz,
-                                      rig=rig, origin=origin, draw_reference=True), (960, 540))
+                                      rig=rig, origin=origin, draw_reference=True,
+                                      mode=mode), (960, 540))
                 vr = cv2.resize(_draw(right_frame, res_r, "R", trail_r,
                                       xyz=None if pt is None else pt.xyz), (960, 540))
                 cv2.putText(vr, f"f={n_pairs-1} matched={rec.n_matched}", (12, 500),
@@ -421,7 +491,8 @@ def main() -> int:
     print()
     print(f"处理：{n_pairs} 对，{elapsed:.1f}s（{n_pairs/max(elapsed,1e-6):.1f} 对/s）")
     print(f"匹配：{rec.n_matched}/{n_pairs}（{rec.match_rate*100:.1f}%）  "
-          f"无左={rec.n_no_left} 无右={rec.n_no_right} 极线拒={rec.n_rejected}")
+          f"无左={rec.n_no_left} 无右={rec.n_no_right} "
+          f"拒绝={rec.n_rejected}（极线/交会角/残差）")
     if n_pairs and rec.n_matched == 0:
         print("[诊断] 0 匹配，先别继续调 pairing；按下面顺序查：")
         if args.method == "specular" and "seed_l" in locals() and "seed_r" in locals():
@@ -436,8 +507,9 @@ def main() -> int:
             print(f"  2) 右路跟丢为主；右检测器："
                   f"{getattr(pipe_r.detector, 'last_error', '') or '(无错误信息)'}")
         else:
-            print("  2) 左右都检测到了，但极线拒掉：检查两路 seed 是否都在球心、"
-                  "是否同一时刻；可先用 --pairing index 对照")
+            print("  2) 左右都检测到了，但被极线/交会角/残差拒绝："
+                  "检查两路 seed 是否都在球心、是否同一时刻；"
+                  "可先用 --pairing index 对照")
         print("  3) 当前会话若继续 0 匹配，建议重录并在第 0 帧重新点选，"
               "不要靠放大 --max-epipolar 硬吃错配")
     smoothed = None
@@ -466,7 +538,8 @@ def main() -> int:
         print(f"标注视频：{video_path}")
     if not partial:
         try:
-            paths = export_session_visualization(session_dir, csv_name=csv_path.name)
+            paths = export_session_visualization(
+                session_dir, csv_name=csv_path.name, stereo_mode=mode)
             print(f"标准轨迹 JSON：{paths['trajectory']}")
             print(f"可视化 JSON：{paths['visualization']}")
         except Exception as exc:                            # noqa: BLE001

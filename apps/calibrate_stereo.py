@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -56,6 +57,7 @@ from apps._common import (
     setup_logging,
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
+from stereo.stereo_mode import infer_mode, optical_axes_angle_deg
 from sphere_tracker.sources import quiet_repeated_grab_warnings
 
 WINDOW = "stereo calibration"
@@ -147,6 +149,10 @@ def main() -> int:
     ap.add_argument("--min-pairs", type=int, default=20,
                     help="最少收多少对才尝试标定（默认 20）")
     ap.add_argument("--baseline-mm", type=float, default=None, help="预期基线（毫米），用于核对")
+    ap.add_argument("--stereo-mode", choices=("auto", "parallel", "angled"),
+                    default="auto",
+                    help="双目模式：auto=沿用旧输出模式（无旧文件则 parallel）；"
+                         "angled=大角度（近似直角）。实际夹角由标定 R 计算，不写死 90°")
     ap.add_argument("--out", default="config/stereo_calibration", help="输出前缀")
     ap.add_argument("--save-pairs", default=None, help="把收下的图像对另存到这个目录（便于复查）")
     ap.add_argument("--report-png", default=None, help="输出验证图路径")
@@ -441,13 +447,71 @@ def main() -> int:
         log.warning("标定未通过质量判定，未保存")
         return 1
 
+    mode = "parallel"
+    if args.stereo_mode == "angled":
+        mode = "angled"
+    elif args.stereo_mode == "auto":
+        # 重新标定同一装置时保留旧输出里的模式；新文件默认 parallel。
+        try:
+            old = json.loads(Path(args.out).with_suffix(".json").read_text(encoding="utf-8"))
+            mode = infer_mode(calibration={"meta": old})
+        except Exception:                                   # noqa: BLE001
+            mode = "parallel"
+    measured_angle = float(optical_axes_angle_deg(res.R))
+    if args.stereo_mode == "auto" and (
+            (mode == "parallel" and measured_angle >= 40.0)
+            or (mode == "angled" and measured_angle < 15.0)):
+        print(f"[错误] auto 沿用的模式 {mode} 与本次实测夹角 {measured_angle:.1f}° 矛盾；"
+              "请显式 --stereo-mode parallel 或 angled 后重标。")
+        log.warning("auto 模式与实测夹角矛盾：%s / %.1f°", mode, measured_angle)
+        return 1
+    if mode == "angled" and measured_angle < 15.0:
+        print(f"[警告] 标为 angled，但实测夹角只有 {measured_angle:.1f}°，更像平行双目。")
     rig = StereoRig.from_result(res, meta={
         "board": spec.describe(),
         "source": src.kind,
         "left": args.left if args.left is not None else (args.left_video or args.left_dir),
         "right": args.right if args.right is not None else (args.right_video or args.right_dir),
         "image_size": list(img_size),
+        "stereo_mode": mode,
+        "angle_deg": measured_angle,
     })
+    print(f"[标定] 实测光轴夹角 {measured_angle:.2f}°（模式 {mode}）")
+    if mode == "angled":
+        try:
+            from calib.angled_quality import evaluate_angled, grade_angled
+            used = [collector.pairs[i] for i in getattr(res, "used_index", [])
+                    if 0 <= i < len(collector.pairs)]
+            if not used:
+                used = collector.pairs
+            if used:
+                left_px = np.vstack([p.corners_left.reshape(-1, 2) for p in used])
+                right_px = np.vstack([p.corners_right.reshape(-1, 2) for p in used])
+            else:
+                left_px = np.zeros((0, 2), np.float64)
+                right_px = np.zeros((0, 2), np.float64)
+            q = evaluate_angled(rig.K1, rig.D1, rig.K2, rig.D2, rig.R, rig.T,
+                                left_px, right_px, reproj_rms_px=res.rms)
+            grade, verdict = grade_angled(q)
+            rig.quality["angled"] = q.as_dict()
+            rig.quality["angled_grade"] = grade
+            rig.quality["angle_deg"] = float(optical_axes_angle_deg(rig.R))
+            # 进入录制/数据管理的 verdict 必须是 angled 的判定，不能沿用平行门限
+            rig.quality["verdict"] = verdict
+            print(f"[angled] 标定质量：{grade} —— {verdict}")
+            for warning in q.warnings:
+                print(f"  [警告] {warning}")
+            log.info("angled 质量：%s / %s / %s", grade, verdict, q.as_dict())
+            if grade == "不可用":
+                print("大角度质量判定为『不可用』，未保存结果；请调整夹角/标定板后重拍。")
+                log.warning("angled 质量不可用，未保存")
+                return 1
+        except Exception as exc:                            # noqa: BLE001
+            rig.quality["angled_grade"] = "未评估"
+            rig.quality["verdict"] = f"angled 质量评估失败，未验证：{exc}"
+            print(f"[错误] angled 质量评估失败，未保存：{exc}")
+            log.warning("angled 质量评估失败，未保存：%s", exc)
+            return 1
     npz, js = rig.save(args.out)
     print(f"已保存：{npz}")
     print(f"        {js}")

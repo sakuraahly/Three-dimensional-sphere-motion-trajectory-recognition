@@ -131,9 +131,9 @@ class DataManager(tk.Tk):
         body.add(left, weight=4)
         body.add(right, weight=1)
 
-        cols = ("sel", "id", "created", "frames", "status", "size")
-        heads = ("选", "会话", "时间", "帧", "状态", "大小")
-        widths = (34, 170, 145, 75, 50, 95)
+        cols = ("sel", "id", "created", "frames", "mode", "status", "size")
+        heads = ("选", "会话", "时间", "帧", "模式", "状态", "大小")
+        widths = (34, 170, 145, 75, 70, 50, 95)
         self.tree = ttk.Treeview(left, columns=cols, show="headings",
                                  selectmode="extended", height=18)
         for c, h, w in zip(cols, heads, widths):
@@ -225,6 +225,7 @@ class DataManager(tk.Tk):
                              values=("☑" if it.key in self.selected else "☐",
                                      it.id, it.created,
                                      f"{it.frames_left}/{it.frames_right}",
+                                     "大角度" if it.stereo_mode == "angled" else "平行",
                                      it.symbol, size))
         self._refresh_count()
 

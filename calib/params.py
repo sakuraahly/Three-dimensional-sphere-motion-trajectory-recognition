@@ -52,10 +52,31 @@ class StereoRig:
     def baseline_mm(self) -> float:
         return float(np.linalg.norm(self.T)) * 1000.0
 
+    @property
+    def stereo_mode(self) -> str:
+        """旧标定没有该字段 -> parallel。"""
+        value = str(self.meta.get("stereo_mode") or "parallel").strip().lower()
+        return "angled" if value in ("angled", "auto", "90", "90deg",
+                                     "orthogonal", "angle") else "parallel"
+
+    @property
+    def angle_deg(self) -> float:
+        """两光轴夹角（度），从 R 计算；不修改/伪造 90.0。"""
+        try:
+            z2 = self.R.T @ np.array([0.0, 0.0, 1.0])
+            n = float(np.linalg.norm(z2))
+            if n <= 0:
+                return 0.0
+            c = float(np.clip(z2[2] / n, -1.0, 1.0))
+            return float(np.degrees(np.arccos(c)))
+        except Exception:                                   # noqa: BLE001
+            return 0.0
+
     def describe(self) -> str:
         q = self.quality
         lines = [
-            f"双目装置  基线 {self.baseline_mm:.2f} mm   图像 {self.image_size[0]}x{self.image_size[1]}",
+            f"双目装置  模式 {self.stereo_mode}  基线 {self.baseline_mm:.2f} mm   "
+            f"光轴夹角 {self.angle_deg:.1f}°   图像 {self.image_size[0]}x{self.image_size[1]}",
             f"  重投影 RMS {q.get('rms', float('nan')):.3f} px   "
             f"极线误差 {q.get('epipolar_rms', float('nan')):.3f} px",
         ]

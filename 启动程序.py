@@ -223,6 +223,7 @@ class Launcher(tk.Tk):
         self._wb_check_inflight: set[str] = set()
         self._wb_auto_after: str | None = None
         self._record_before: set[str] = set()
+        self.stereo_mode_var = tk.StringVar(value="auto")
 
         self._init_style()
         self._build_header()
@@ -381,6 +382,46 @@ class Launcher(tk.Tk):
                   bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
                   font=("Microsoft YaHei UI", 10, "bold")).place(
             relx=1.0, x=-18, y=12, anchor="ne")
+        mode_box = tk.Frame(head, bg=ACCENT)
+        mode_box.place(relx=1.0, x=-128, y=14, anchor="ne")
+        tk.Label(mode_box, text="双目模式", bg=ACCENT, fg="#dbeafe",
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 6))
+        ttk.Combobox(mode_box, textvariable=self.stereo_mode_var, width=9,
+                     state="readonly",
+                     values=("auto", "parallel", "angled")).pack(side="left")
+        tk.Label(mode_box, text="auto=按标定/会话",
+                 bg=ACCENT, fg="#bfdbfe",
+                 font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
+        tk.Button(mode_box, text="几何…", command=self._show_geometry,
+                  bg="#1d4ed8", fg="white", relief="flat", padx=6,
+                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
+
+    def _show_geometry(self) -> None:
+        """输入 B/D，算真实光轴夹角；不替用户假定 90°。"""
+        from stereo.stereo_mode import geometry_advice
+        try:
+            baseline = simpledialog.askfloat(
+                "双目几何", "基线 B（毫米）：", initialvalue=65.0, parent=self)
+            if baseline is None:
+                return
+            distance = simpledialog.askfloat(
+                "双目几何", "工作距离 D（米）：", initialvalue=0.30, parent=self)
+            if distance is None:
+                return
+        except Exception as exc:                            # noqa: BLE001
+            messagebox.showwarning("双目几何", f"输入不合法：{exc}", parent=self)
+            return
+        advice = geometry_advice(baseline, distance)
+        if not advice["warning"]:
+            messagebox.showwarning("双目几何", "基线和距离要为正数。", parent=self)
+            return
+        messagebox.showinfo(
+            "双目几何",
+            f"B={baseline:.1f} mm, D={distance:.3f} m\n"
+            f"对称交会角 = {advice['angle_deg']:.2f}°\n"
+            f"判断：{advice['warning']}\n\n"
+            "90° 对称双目需要 B = 2·D；当前装置是否满足，要按实测 B/D 判断。",
+            parent=self)
 
     def _open_data_manager(self) -> None:
         self._run([PY, str(ROOT / "apps" / "data_manager.py")], "数据管理")
@@ -1160,6 +1201,7 @@ class Launcher(tk.Tk):
             "--width", width, "--height", height, "--fps", "30",
             "--duration", str(duration),
             "--label", (label or "gui_record").strip(),
+            "--stereo-mode", self.stereo_mode_var.get(),
             "--preview", "--notes", "GUI 录制",
         ]
 
@@ -1200,6 +1242,9 @@ class Launcher(tk.Tk):
             seed = Path(session_dir) / "derived" / "seeds.json"
             if seed.exists():
                 args += ["--seed-json", str(seed)]
+        mode = self.stereo_mode_var.get()
+        if mode != "auto":
+            args += ["--stereo-mode", mode]
         return args
 
     def _pick_stereo_seed(self, session_dir: str | None = None,
@@ -1397,6 +1442,7 @@ class Launcher(tk.Tk):
         fps = self.calib_fps.get().strip() or "30"
         args = ["--left", _cam_arg(self.calib_left.get()),
                 "--right", _cam_arg(self.calib_right.get()),
+                "--stereo-mode", self.stereo_mode_var.get(),
                 "--cols", str(cols), "--rows", str(rows), "--square", str(square),
                 "--target", str(target), "--min-pairs", str(minp),
                 "--width", width, "--height", height, "--fps", fps]

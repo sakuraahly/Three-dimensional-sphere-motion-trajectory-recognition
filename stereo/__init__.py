@@ -57,6 +57,16 @@ from .triangulate import (
     match_epipolar,
     triangulate_one,
 )
+from .angled import AngledMatchConfig, AngledPoint, AngledReconstructor
+from .angled_geometry import AngledTriangulation, triangulate_pixels
+from .stereo_mode import (
+    MODES,
+    geometry_advice,
+    infer_mode,
+    mode_label,
+    normalize_mode,
+    optical_axes_angle_deg,
+)
 from .visualization import (
     build_trajectory_payload,
     build_visualization_payload,
@@ -92,6 +102,17 @@ __all__ = [
     "StereoReconstructor",
     "match_epipolar",
     "triangulate_one",
+    "AngledMatchConfig",
+    "AngledPoint",
+    "AngledReconstructor",
+    "AngledTriangulation",
+    "triangulate_pixels",
+    "MODES",
+    "infer_mode",
+    "normalize_mode",
+    "mode_label",
+    "optical_axes_angle_deg",
+    "geometry_advice",
     "write_seeds",
     "load_seeds",
     "read_trajectory_csv",

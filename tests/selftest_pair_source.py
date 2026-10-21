@@ -565,7 +565,8 @@ def test_sessions(base: Path) -> bool:
     T = np.array([[-0.065], [0.0], [0.0]])
     rig = StereoRig(K1=K, D1=D, K2=K.copy(), D2=D.copy(), R=np.eye(3), T=T,
                     image_size=(W, H), quality={"rms": 0.5},
-                    meta={"created": "2026-01-01 00:00:00"})
+                    meta={"created": "2026-01-01 00:00:00",
+                          "stereo_mode": "angled", "angle_deg": 90.0})
     rig.save(session_dir / "calib" / "stereo_calibration")
 
     session.left = CameraInfo("left", "left.avi", W, H, 5, 30.0, 30.0)
@@ -576,11 +577,22 @@ def test_sessions(base: Path) -> bool:
         [W, H], 65.0, 65.0, "2026-01-01 00:00:00", "测试",
     )
     session.sync = SyncInfo("flash", 2, 0.9)
+    session.stereo_mode = "angled"
+    session.rig = {"stereo_mode": "angled", "angle_deg": 90.0,
+                   "baseline_mm": 65.0}
     save_session(session, session_dir)
 
     errors, warnings = validate_session(session_dir)
     checks.append(("干净会话：无错误", not errors))
     checks.append(("干净会话：无警告", not warnings))
+
+    session.stereo_mode = "parallel"
+    save_session(session, session_dir)
+    e_mix, w_mix = validate_session(session_dir)
+    checks.append(("会话 parallel + 标定 angled -> 警告",
+                   not e_mix and any("不一致" in x for x in w_mix)))
+    session.stereo_mode = "angled"
+    save_session(session, session_dir)
 
     session.sync = SyncInfo("none", 0, 0.0)
     save_session(session, session_dir)
@@ -593,6 +605,9 @@ def test_sessions(base: Path) -> bool:
     _d, reloaded = load_session(session_dir)
     checks.append(("重新读回 label", reloaded.label == "selftest"))
     checks.append(("重新读回同步偏移", reloaded.sync.offset == 2))
+    checks.append(("重新读回双目模式/夹角",
+                   reloaded.stereo_mode == "angled"
+                   and reloaded.rig.get("angle_deg") == 90.0))
 
     # 坏会话必须报错，不能静默通过
     session.left.width = W + 1

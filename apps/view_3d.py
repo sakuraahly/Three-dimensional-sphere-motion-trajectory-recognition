@@ -6,7 +6,8 @@
     python apps/view_3d.py data/sessions/20261019-221550 --check
 
 只依赖 matplotlib + Tkinter（环境已有），不依赖网络、不依赖 stereo 包。
-坐标系是**校正后左相机系**：X 右 / Y 下 / Z 前（光轴 / 深度），单位米。
+坐标系由 `visualization.json` 的 `coordinate_system` 决定：**X 右 / Y 下 / Z 前**
+（单位米）；parallel 是校正后左相机系，angled 是原始左相机系。
 """
 
 from __future__ import annotations
@@ -312,6 +313,7 @@ class Viewer3D:
         self.status.configure(
             text=f"frame {frame}   t={float(t):.3f}s   "
                  f"X={float(x):.4f}  Y={float(y):.4f}  Z={float(z):.4f} m   "
+                 f"模式={self.data.get('stereo_mode', 'parallel')}   "
                  f"坐标={self.data.get('coordinate_system', '?')}")
 
     # ------------------------------------------------------------------
