@@ -414,7 +414,7 @@ class Launcher(tk.Tk):
         tk.Label(mode_box, text="auto=按会话/标定",
                  bg=ACCENT, fg="#bfdbfe",
                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
-        tk.Button(mode_box, text="几何…", command=self._show_geometry,
+        tk.Button(mode_box, text="几何计算", command=self._show_geometry,
                   bg="#1d4ed8", fg="white", relief="flat", padx=6,
                   font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
         tk.Button(actions, text="数据管理", command=self._open_data_manager,

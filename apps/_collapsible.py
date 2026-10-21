@@ -85,11 +85,11 @@ class CollapsibleSection(ttk.Frame):
         # 只在按钮上绑定 Return（不是 bind_all）。Space 由 ttk.Button 自带。
         self.header_button.bind("<Return>", self._on_return, add="+")
 
-        # padding 是 content 的内部留白，和头部按钮无关。
+        # 给展开内容加一圈边框：否则用户分不清哪些控件属于这个折叠区。
+        frame_kw = {"relief": "solid", "borderwidth": 1}
         if padding:
-            self.content = ttk.Frame(self, padding=padding)
-        else:
-            self.content = ttk.Frame(self)
+            frame_kw["padding"] = padding
+        self.content = ttk.Frame(self, **frame_kw)
 
         if self.expanded:
             self.content.pack(side="top", fill="x")

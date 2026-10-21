@@ -489,6 +489,10 @@ def main() -> int:
                           and "基本设置" in section_names[0]
                           and "高级设置" in section_names[1]))
     checks_layout.append(("默认基本展开、高级收起", defaults_ok))
+    checks_layout.append(("展开后的设置区有可见边框", all(
+        int(s.content.cget("borderwidth") or 0) >= 1
+        and str(s.content.cget("relief")) not in ("", "flat")
+        for s in sections)))
     checks_layout.append(("窗口完整落在屏幕内（不再固定 980x780）", screen_ok))
     checks_layout.append(("头部标题与右侧操作不重叠", head_ok))
     checks_layout.append(("第 2 步单目参数默认收起且标注作用域",
