@@ -183,6 +183,12 @@ class DataManager(tk.Tk):
         self.export_btn.pack(fill="x", pady=(2, 4))
         ttk.Button(right, text="查看 3D + 视频", command=self._open_viewer).pack(
             fill="x", pady=(0, 4))
+        clean_bar = ttk.Frame(right)
+        clean_bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(clean_bar, text="清理…", command=self._clean_selected).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(clean_bar, text="回收站…", command=self._open_trash).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
         self.progress = ttk.Progressbar(right, mode="determinate")
         self.progress.pack(fill="x", pady=(0, 4))
         self.status = ttk.Label(right, text="等待选择", foreground=MUTED,
@@ -434,6 +440,22 @@ class DataManager(tk.Tk):
             messagebox.showerror("3D + 视频", f"打不开查看器：{exc}", parent=self)
             return
         self._log_line(f"打开 3D + 视频：{it.id}")
+
+    def _open_trash(self) -> None:
+        from apps.cleanup_dialog import TrashDialog
+        TrashDialog(self, self.root_dir, on_done=self.refresh)
+
+    def _clean_selected(self) -> None:
+        from apps.cleanup_dialog import CleanupDialog
+        chosen = [it for it in self.items if it.key in self.selected]
+        if not chosen:
+            it = self._focused_item()
+            chosen = [it] if it else []
+        if not chosen:
+            messagebox.showinfo("清理", "先勾选或选中至少一个会话。", parent=self)
+            return
+        CleanupDialog(self, self.root_dir, [it.path for it in chosen],
+                      on_done=self.refresh)
 
     # ------------------------------------------------------------------
     def browse_output(self) -> None:

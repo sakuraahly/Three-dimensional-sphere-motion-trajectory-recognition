@@ -946,6 +946,49 @@ def main() -> int:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))
 
+    # ---- 14. 清理/回收站：软删除、恢复、彻底删除、路径安全 ----
+    print("----- 14. 清理与回收站 -----")
+    from apps._cleanup import (
+        list_trash, move_to_trash, plan_cleanup, purge_batch, restore_batch,
+    )
+    with tempfile.TemporaryDirectory(prefix="dsh_cleanup_") as tmp:
+        root = Path(tmp) / "sessions"
+        for i in range(1, 4):
+            d = root / f"2026010{i}-120000"
+            (d / "derived").mkdir(parents=True)
+            (d / "session.json").write_text("{}", encoding="utf-8")
+            (d / "left.mkv").write_bytes(b"raw")
+            (d / "derived" / "traj3d.json").write_text("{}", encoding="utf-8")
+        s1 = root / "20260101-120000"
+        plan = plan_cleanup(root, [s1], mode="derived")
+        batch = move_to_trash(root, plan)
+        derived_gone = not (s1 / "derived").exists() and (s1 / "left.mkv").exists()
+        restored = restore_batch(root, batch)
+        derived_back = (s1 / "derived").exists()
+        plan_all = plan_cleanup(root, sorted(root.iterdir()), mode="session",
+                                keep_latest=1)
+        keep_ok = len(plan_all.items) == 2 and len(plan_all.skipped) == 1
+        outside_ok = False
+        try:
+            plan_cleanup(root, [Path(tmp) / "outside"], mode="session")
+        except ValueError:
+            outside_ok = True
+        s3 = root / "20260103-120000"
+        b3 = move_to_trash(root, plan_cleanup(root, [s3], mode="session"))
+        purge_batch(root, b3)
+        purge_ok = not s3.exists() and not any(
+            b.path.name == b3.name for b in list_trash(root))
+        checks_cleanup = [
+            ("只清 derived 不动原始视频", derived_gone),
+            ("回收站恢复 derived", restored == 1 and derived_back),
+            ("保留最新 N 个", keep_ok),
+            ("拒绝 sessions 根目录之外的目标", outside_ok),
+            ("彻底删除只发生在回收站批次", purge_ok),
+        ]
+        for name, passed in checks_cleanup:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:

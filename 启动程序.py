@@ -716,6 +716,8 @@ class Launcher(tk.Tk):
             row=1, column=4, sticky="w", pady=4)
         ttk.Button(box, text="浏览会话…", command=self._wb_browse, width=11).grid(
             row=1, column=5, sticky="w", padx=(4, 0), pady=4)
+        ttk.Button(box, text="清理…", command=self._wb_clean, width=7).grid(
+            row=1, column=6, sticky="w", padx=(4, 0), pady=4)
 
         self.wb_info = ttk.Label(box, text="还没有会话", style="Hint.TLabel",
                                  justify="left", wraplength=CARD_HINT_WRAP)
@@ -776,6 +778,16 @@ class Launcher(tk.Tk):
         self._wb_refresh()
         self._wb_select_path(p)
         self._append(f"[工作台] 已加入任意会话：{p}")
+
+    def _wb_clean(self) -> None:
+        s = self._wb_selected()
+        if s is None:
+            messagebox.showinfo("清理", "先在工作台选一条会话。", parent=self)
+            return
+        from apps.cleanup_dialog import CleanupDialog
+        standard = (ROOT / "data" / "sessions").resolve()
+        root = standard if s.path.resolve().is_relative_to(standard) else s.path.parent
+        CleanupDialog(self, root, [s.path], on_done=self._wb_refresh)
 
     def _wb_select_path(self, path: Path) -> None:
         target = Path(path).resolve()
