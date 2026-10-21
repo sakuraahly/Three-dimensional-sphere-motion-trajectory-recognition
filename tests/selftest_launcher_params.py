@@ -131,6 +131,14 @@ def main() -> int:
     mod.messagebox = box                          # type: ignore[assignment]
     app = mod.Launcher()
     app.update_idletasks()
+    app.update()
+    screen_ok = (
+        0 <= app.winfo_x() and 0 <= app.winfo_y()
+        and app.winfo_x() + app.winfo_width() <= app.winfo_screenwidth()
+        and app.winfo_y() + app.winfo_height() <= app.winfo_screenheight()
+    )
+    head_ok = (app._header_brand.winfo_x() + app._header_brand.winfo_width()
+               <= app._header_actions.winfo_x() + 1)
 
     results: list[tuple[str, bool]] = []
 
@@ -372,13 +380,31 @@ def main() -> int:
     mode_ok = "--stereo-mode angled" in rec_ang and "--stereo-mode angled" in cal_ang
     print(f"  [{'通过' if mode_ok else '不达标'}] 切换大角度模式后录制/标定都传 angled")
     results.append(("切换大角度模式后录制/标定都传 angled", mode_ok))
-    app.stereo_mode_var.set("parallel")
+    app.stereo_mode_var.set("auto")
+    app.calib_backend.set("dshow")
+    rec_backend = " ".join(app._record_args("10", "gui_test"))
+    app.calib_backend.set("auto")
+    backend_ok = "--backend dshow" in rec_backend
+    print(f"  [{'通过' if backend_ok else '不达标'}] 录制也读取相机后端（不再只影响标定）")
+    results.append(("录制也读取相机后端（不再只影响标定）", backend_ok))
 
     off = app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo"))
     off_s = " ".join(off)
     app.stereo_mode_var.set("angled")
     off_ang = " ".join(app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo")))
     app.stereo_mode_var.set("auto")
+    vid_args = " ".join(app._common_args(for_video=True))
+    checks_video = [
+        ("离线视频不传 run_video 不认的 --display-width",
+         "--display-width" not in vid_args),
+        ("离线视频不传 run_video 不认的 --no-3d",
+         "--no-3d" not in vid_args),
+        ("离线视频仍传 --ball-diameter/--horizon 支持的参数",
+         "--ball-diameter" in vid_args and "--horizon" in vid_args),
+    ]
+    for label, good in checks_video:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
     checks_off = [
         ("调用 apps/run_stereo_video.py", "run_stereo_video.py" in off_s),
         ("带会话目录", "data\\sessions\\demo" in off_s or "data/sessions/demo" in off_s),
@@ -417,7 +443,9 @@ def main() -> int:
     app.update()
     vw0 = app._canvas.winfo_width()
     pw0 = app._page.winfo_reqwidth()
-    page_w, canvas_w = pw0, vw0
+    # “有没有右边空一片”看**实际页面宽度**；reqwidth 是卡片自然宽度，
+    # 卡片 pack(fill=x) 后实际会被拉到视口宽，不能拿 reqwidth 当裁切判据。
+    page_w, canvas_w = app._page.winfo_width(), vw0
     page_h = app._page.winfo_reqheight()
     canvas_h = app._canvas.winfo_height()
     print(f"  页面需要 {page_w}x{page_h}；滚动区可见 {canvas_w}x{canvas_h}")
@@ -452,34 +480,40 @@ def main() -> int:
     #
     # 根因是"手算行号"这种做法；现在改成每个 parent 一个游标、辅助函数自己分配。
     # 所以这里钉的是**没有同格重复、没有同列竖向重叠**。
-    def _tabs() -> list[tuple[str, object]]:
-        found, out = [], []
-        stack = [app]
-        while stack:
-            w = stack.pop()
-            for c in w.winfo_children():
-                if c.winfo_class() == "TNotebook":
-                    found.append(c)
-                stack.append(c)
-        for nb in found:
-            for tid in nb.tabs():
-                out.append((str(nb.tab(tid, "text")).strip(), nb.nametowidget(tid)))
-        return out
-
-    tabs = _tabs()
-    print(f"  找到 {len(tabs)} 个参数页签：{[n for n, _ in tabs]}")
-    checks_layout.append(("参数区确实是「基本设置 / 高级设置」两个页签",
-                          [n for n, _ in tabs] == ["基本设置", "高级设置"]))
+    sections = list(getattr(app, "_calib_sections", ()))
+    defaults_ok = (len(sections) == 2
+                   and sections[0].expanded and not sections[1].expanded)
+    section_names = [s.header_button.cget("text") for s in sections]
+    checks_layout.append(("参数区是「基本设置 / 高级设置」两个可折叠区",
+                          len(sections) == 2
+                          and "基本设置" in section_names[0]
+                          and "高级设置" in section_names[1]))
+    checks_layout.append(("默认基本展开、高级收起", defaults_ok))
+    checks_layout.append(("窗口完整落在屏幕内（不再固定 980x780）", screen_ok))
+    checks_layout.append(("头部标题与右侧操作不重叠", head_ok))
+    checks_layout.append(("第 2 步单目参数默认收起且标注作用域",
+                          not app._step2_advanced.expanded
+                          and "单目" in app.step2_scope.cget("text")
+                          and "双目" in app.step2_scope.cget("text")))
+    checks_layout.append(("所有注册换行标签都有有效 wraplength（防空串崩溃）",
+                          all(int(lab.cget("wraplength") or 0) > 0
+                              for lab, _kind in app._wrapped)))
+    for section in sections:
+        section.expand()
+    app.update()
     dup_any, overlap_any, too_wide_any = [], [], []
-    for name, tab in tabs:
-        kids = tab.winfo_children()
+    for section in sections:
+        name = section.header_button.cget("text")
+        kids = section.content.winfo_children()
         cells = [(c.grid_info().get("row"), c.grid_info().get("column", 0))
-                 for c in kids]
+                 for c in kids if c.winfo_manager() == "grid"]
         dup = [k for k, v in Counter(cells).items() if v > 1]
         # ⚠️ 必须**按列分组**再比 y 区间：同一行不同列的控件 y 区间天然重叠，
         # 那不是冲突。第一版没分组，报了一堆假阳性（「TEntry 与 目标对数 重叠」）。
         by_col: dict[int, list] = {}
         for c in kids:
+            if c.winfo_manager() != "grid":
+                continue
             by_col.setdefault(c.grid_info().get("column", 0), []).append(c)
         ov = []
         for _col, group in by_col.items():
@@ -495,11 +529,15 @@ def main() -> int:
         overlap_any += [(name, o) for o in ov]
         if widest > app._canvas.winfo_width():
             too_wide_any.append((name, widest))
-    checks_layout.append((f"页签内没有同格重复（实际 {len(dup_any)} 处）", not dup_any))
-    checks_layout.append((f"页签内没有同列竖向重叠（实际 {len(overlap_any)} 处）"
+    checks_layout.append((f"折叠区内没有同格重复（实际 {len(dup_any)} 处）", not dup_any))
+    checks_layout.append((f"折叠区内没有同列竖向重叠（实际 {len(overlap_any)} 处）"
                           f"—— 这就是「文字被遮挡」的判据", not overlap_any))
-    checks_layout.append((f"页签内容不超出视口（实际 {len(too_wide_any)} 处）",
+    checks_layout.append((f"折叠区内容不超出视口（实际 {len(too_wide_any)} 处）",
                           not too_wide_any))
+    for section in sections:
+        section.collapse()
+    sections[0].expand()
+    app.update()
     # 窗口改宽度后，换行宽度必须跟着变（这才是"动态"的证据）
     wraps: list[tuple[int, int, int]] = []
     for w in (980, 1180, 900):

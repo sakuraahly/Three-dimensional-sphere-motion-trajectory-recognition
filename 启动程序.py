@@ -205,10 +205,27 @@ class Launcher(tk.Tk):
         super().__init__()
         self.title("球形物体三维运动轨迹识别 · 启动器")
         self.configure(bg=BG)
-        self.geometry("980x780")
-        # 最小宽度要**保证内容不被横向截断**：卡片内容按 wraplength 换行后
-        # 实测约需 860 px，低于它就会出现横向裁切。
-        self.minsize(880, 560)
+        from apps._gui_geometry import fit_window
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        screen_x = screen_y = 0
+        # winfo_screenheight() 包含任务栏；用 Windows 工作区避免窗口底边被盖住。
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                rect = wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(
+                        0x0030, 0, ctypes.byref(rect), 0):   # SPI_GETWORKAREA
+                    screen_x, screen_y = int(rect.left), int(rect.top)
+                    screen_w = int(rect.right - rect.left)
+                    screen_h = int(rect.bottom - rect.top)
+            except Exception:                               # noqa: BLE001
+                pass
+        win_w, win_h, win_x, win_y = fit_window(screen_w, screen_h)
+        self.geometry(f"{win_w}x{win_h}+{win_x + screen_x}+{win_y + screen_y}")
+        # 屏幕小于原设计时，最小尺寸也跟着缩小，绝不把窗口顶出屏幕。
+        self.minsize(min(900, win_w), min(600, win_h))
 
         self.proc: subprocess.Popen | None = None
         self.log_queue: queue.Queue = queue.Queue()
@@ -227,6 +244,7 @@ class Launcher(tk.Tk):
 
         self._init_style()
         self._build_header()
+        self._build_nav()
         # 滚动页是**所有卡片与日志的父容器**（在 header 之后创建，
         # 于是它在 pack 顺序里排在 header 下面）。窗口再高也只显示一屏，
         # 其余靠滚轮 / PageUp·PageDown 浏览 —— 像浏览器一样。
@@ -299,13 +317,14 @@ class Launcher(tk.Tk):
             viewport = self._canvas.winfo_width()
         if viewport <= 1:                      # 首帧还没量出来
             return
-        avail = max(240, viewport - CHROME_PX)
+        from apps._gui_geometry import wrap_width
+        avail = wrap_width(viewport, chrome=CHROME_PX, minimum=240)
         card = max(200, avail)
         # 参数说明在输入框右侧起，再让出标签列与内边距
         param = max(200, avail - 150)
         for lab, kind in self._wrapped:
             want = card if kind == "card" else param
-            if int(lab.cget("wraplength")) != want:
+            if int(lab.cget("wraplength") or 0) != want:
                 lab.configure(wraplength=want)
 
     def _on_scrollbar(self, first: str, last: str) -> None:
@@ -372,29 +391,36 @@ class Launcher(tk.Tk):
     def _build_header(self) -> None:
         head = tk.Frame(self, bg=ACCENT)
         head.pack(fill="x")
-        tk.Label(head, text="球形物体三维运动轨迹识别",
+        brand = tk.Frame(head, bg=ACCENT)
+        brand.pack(side="left", fill="x", expand=True, padx=20, pady=(12, 10))
+        self._header_brand = brand
+        tk.Label(brand, text="球形物体三维运动轨迹识别",
                  bg=ACCENT, fg="white",
-                 font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w", padx=20, pady=(14, 2))
-        tk.Label(head, text="检测 → 跟踪 → 三维定位 → 轨迹预测    三步即可开始",
+                 font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
+        tk.Label(brand, text="检测 → 跟踪 → 三维定位 → 轨迹预测    三步即可开始",
                  bg=ACCENT, fg="#dbeafe",
-                 font=("Microsoft YaHei UI", 10)).pack(anchor="w", padx=22, pady=(0, 14))
-        tk.Button(head, text="数据管理", command=self._open_data_manager,
-                  bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
-                  font=("Microsoft YaHei UI", 10, "bold")).place(
-            relx=1.0, x=-18, y=12, anchor="ne")
-        mode_box = tk.Frame(head, bg=ACCENT)
-        mode_box.place(relx=1.0, x=-128, y=14, anchor="ne")
+                 font=("Microsoft YaHei UI", 10)).pack(anchor="w", pady=(2, 0))
+
+        actions = tk.Frame(head, bg=ACCENT)
+        actions.pack(side="right", padx=(8, 16), pady=10)
+        self._header_actions = actions
+        mode_box = tk.Frame(actions, bg=ACCENT)
+        mode_box.pack(anchor="e")
         tk.Label(mode_box, text="双目模式", bg=ACCENT, fg="#dbeafe",
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 6))
         ttk.Combobox(mode_box, textvariable=self.stereo_mode_var, width=9,
                      state="readonly",
                      values=("auto", "parallel", "angled")).pack(side="left")
-        tk.Label(mode_box, text="auto=按标定/会话",
+        tk.Label(mode_box, text="auto=按会话/标定",
                  bg=ACCENT, fg="#bfdbfe",
                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
         tk.Button(mode_box, text="几何…", command=self._show_geometry,
                   bg="#1d4ed8", fg="white", relief="flat", padx=6,
                   font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
+        tk.Button(actions, text="数据管理", command=self._open_data_manager,
+                  bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(
+            anchor="e", pady=(6, 0))
 
     def _show_geometry(self) -> None:
         """输入 B/D，算真实光轴夹角；不替用户假定 90°。"""
@@ -422,6 +448,37 @@ class Launcher(tk.Tk):
             f"判断：{advice['warning']}\n\n"
             "90° 对称双目需要 B = 2·D；当前装置是否满足，要按实测 B/D 判断。",
             parent=self)
+
+    def _build_nav(self) -> None:
+        """固定快速跳转条：页面很长，但用户不必先猜“下面还有什么”。"""
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=16, pady=(6, 0))
+        ttk.Label(bar, text="快速跳转", style="Hint.TLabel").pack(
+            side="left", padx=(0, 8))
+        for label, prefix in (
+                ("① 标定", "第 1 步"), ("② 参数", "第 2 步"),
+                ("③ 开始", "第 3 步"), ("工作台", "双目工作台"),
+                ("任务", "任务"), ("日志", "运行日志")):
+            ttk.Button(bar, text=label, width=8,
+                       command=lambda p=prefix: self._scroll_to_card(p)).pack(
+                side="left", padx=(0, 4))
+        ttk.Label(bar, text="页面较长：滚轮 / PageDown / 右侧滚动条",
+                  style="Hint.TLabel").pack(side="right")
+
+    def _scroll_to_card(self, prefix: str) -> None:
+        self.update_idletasks()
+        target = None
+        for card in self._page.winfo_children():
+            if card.winfo_class() == "TLabelframe" and str(
+                    card.cget("text")).startswith(prefix):
+                target = card
+                break
+        if target is None:
+            return
+        y = max(0, target.winfo_y())
+        total = max(1, self._page.winfo_height())
+        self._canvas.yview_moveto(min(1.0, y / total))
+        self._canvas.focus_set()
 
     def _open_data_manager(self) -> None:
         self._run([PY, str(ROOT / "apps" / "data_manager.py")], "数据管理")
@@ -530,20 +587,25 @@ class Launcher(tk.Tk):
             self._hint(parent, hint)
         return ent
 
-    def _calib_params(self) -> ttk.Frame:
-        """标定参数区：**基本设置 / 高级设置** 两个页签。
+    def _calib_params(self) -> tuple:
+        """标定参数区：**基本设置 / 高级设置** 两个可折叠区。
 
         为什么分区（全局 §四「渐进式展示」）：标定有十几个可调项，
-        全铺在第一屏会让人不知道哪些真的必须改。分成两页之后：
+        全铺在第一屏会让人不知道哪些真的必须改。分成两块之后：
           · 基本 = **改错就白做**的那几项（板参数、收多少对、分辨率）；
           · 高级 = **用精度换成功率**的开关（停稳/清晰度/放宽/基线核对）。
+        高级默认收起，需要时展开；控件不销毁，值不丢。
         """
-        nb = ttk.Notebook(self.param_holder)
-        nb.pack(fill="x", pady=(2, 0))
-        basic = ttk.Frame(nb, padding=(10, 8))
-        adv = ttk.Frame(nb, padding=(10, 8))
-        nb.add(basic, text="  基本设置  ")
-        nb.add(adv, text="  高级设置  ")
+        from apps._collapsible import CollapsibleSection
+        basic_section = CollapsibleSection(
+            self.param_holder, "基本设置（常用）", expanded=True, padding=(10, 8))
+        basic_section.pack(fill="x", pady=(2, 4))
+        adv_section = CollapsibleSection(
+            self.param_holder, "高级设置（精度 / 排障）", expanded=False, padding=(10, 8))
+        adv_section.pack(fill="x", pady=(0, 4))
+        self._calib_sections = (basic_section, adv_section)
+        basic = basic_section.content
+        adv = adv_section.content
 
         # ---- 基本 ----
         #
@@ -620,7 +682,7 @@ class Launcher(tk.Tk):
             is_dir=True)
         self.calib_report = self._param_path(
             adv, "验证图", "标定后出一张可视化验证图", is_dir=False)
-        return nb
+        return basic_section, adv_section
 
     # ---------- 第 1 步：标定 ----------
     def _build_step1(self) -> None:
@@ -654,8 +716,8 @@ class Launcher(tk.Tk):
                   style="Hint.TLabel").grid(row=4, column=4, columnspan=4,
                                             sticky="w", pady=(8, 0))
 
-        # 参数区分两个页签。放 `param_holder` 里是为了让「运行标定」按钮
-        # 排在参数**之后** —— 按阅读顺序：选相机 → 调参数 → 点运行。
+        # 参数区放 `param_holder` 里，让「运行标定」按钮排在参数**之后**
+        # 按阅读顺序：选相机 → 调参数 → 点运行。
         self.param_holder = ttk.Frame(box)
         self.param_holder.grid(row=5, column=0, columnspan=8, sticky="we", pady=(8, 4))
         self._calib_params()
@@ -682,41 +744,83 @@ class Launcher(tk.Tk):
 
     # ---------- 第 2 步：参数 ----------
     def _build_step2(self) -> None:
-        box = self._card("第 2 步 · 选择参数",
-                         "不确定就保持默认。三维测距必须填对球直径——填错多少，距离就错多少。")
-        ttk.Label(box, text="摄像头编号").grid(row=1, column=0, sticky="e", pady=4)
-        self.camera = ttk.Combobox(box, values=MONO_CAMERAS, width=8, state="readonly")
-        self.camera.set("auto")
-        self.camera.grid(row=1, column=1, sticky="w", padx=(4, 20), pady=4)
-
-        ttk.Label(box, text="球直径(米)").grid(row=1, column=2, sticky="e", pady=4)
-        self.diameter = ttk.Entry(box, width=8)
-        self.diameter.insert(0, "0.04")
-        self.diameter.grid(row=1, column=3, sticky="w", padx=(4, 20), pady=4)
-
-        ttk.Label(box, text="检测方法").grid(row=1, column=4, sticky="e", pady=4)
+        box = self._card(
+            "第 2 步 · 检测与测距参数",
+            "检测方法/颜色预设对实时、离线视频、双目会话都生效。"
+            "球直径/预测视野/焦距只用于单目；双目深度来自标定，不读这些值。")
+        ttk.Label(box, text="检测方法").grid(row=1, column=0, sticky="e", pady=4)
         self.method = ttk.Combobox(box, values=METHODS, width=10, state="readonly")
         self.method.set(METHODS[0])          # 取列表首项 = 与命令行/文档同一个默认值
-        self.method.grid(row=1, column=5, sticky="w", padx=(4, 4), pady=4)
+        self.method.grid(row=1, column=1, sticky="w", padx=(4, 20), pady=4)
 
-        ttk.Label(box, text="颜色预设").grid(row=2, column=0, sticky="e", pady=4)
-        self.preset = ttk.Combobox(box, values=PRESETS, width=5, state="readonly")
+        ttk.Label(box, text="颜色预设").grid(row=1, column=2, sticky="e", pady=4)
+        self.preset = ttk.Combobox(box, values=PRESETS, width=8, state="readonly")
         self.preset.set("不使用")
-        self.preset.grid(row=2, column=1, sticky="w", padx=(4, 20), pady=4)
+        self.preset.grid(row=1, column=3, sticky="w", padx=(4, 4), pady=4)
 
-        ttk.Label(box, text="预测视野(秒)").grid(row=2, column=2, sticky="e", pady=4)
-        self.horizon = ttk.Entry(box, width=8)
+        self.step2_scope = ttk.Label(
+            box, text="常用：单目实时 / 离线视频 / 双目会话都会读取",
+            style="Hint.TLabel", wraplength=CARD_HINT_WRAP)
+        self.step2_scope.grid(row=2, column=0, columnspan=6, sticky="w", pady=(0, 2))
+        self._wrapped.append((self.step2_scope, "card"))
+
+        from apps._collapsible import CollapsibleSection
+        self._step2_advanced = CollapsibleSection(
+            box, "高级（仅单目实时 / 离线视频）", expanded=False, padding=(8, 4))
+        self._step2_advanced.grid(row=3, column=0, columnspan=6, sticky="we",
+                                  pady=(4, 2))
+        mono = self._step2_advanced.content
+
+        ttk.Label(mono, text="摄像头编号").grid(row=0, column=0, sticky="e", pady=3)
+        self.camera = ttk.Combobox(mono, values=MONO_CAMERAS, width=8,
+                                   state="readonly")
+        self.camera.set("auto")
+        self.camera.grid(row=0, column=1, sticky="w", padx=(4, 8), pady=3)
+        ttk.Label(mono, text="仅实时", style="Hint.TLabel").grid(
+            row=0, column=2, sticky="w")
+
+        ttk.Label(mono, text="球直径(米)").grid(row=1, column=0, sticky="e", pady=3)
+        self.diameter = ttk.Entry(mono, width=8)
+        self.diameter.insert(0, "0.04")
+        self.diameter.grid(row=1, column=1, sticky="w", padx=(4, 8), pady=3)
+        ttk.Label(mono, text="仅单目三维", style="Hint.TLabel").grid(
+            row=1, column=2, sticky="w")
+
+        ttk.Label(mono, text="预测视野(秒)").grid(row=2, column=0, sticky="e", pady=3)
+        self.horizon = ttk.Entry(mono, width=8)
         self.horizon.insert(0, "0.6")
-        self.horizon.grid(row=2, column=3, sticky="w", padx=(4, 20), pady=4)
+        self.horizon.grid(row=2, column=1, sticky="w", padx=(4, 8), pady=3)
+        ttk.Label(mono, text="仅单目预测", style="Hint.TLabel").grid(
+            row=2, column=2, sticky="w")
 
-        ttk.Label(box, text="焦距fx(留空自动)").grid(row=2, column=4, sticky="e", pady=4)
-        self.focal = ttk.Entry(box, width=10)
-        self.focal.grid(row=2, column=5, sticky="w", padx=(4, 4), pady=4)
+        ttk.Label(mono, text="焦距fx(留空自动)").grid(row=3, column=0, sticky="e", pady=3)
+        self.focal = ttk.Entry(mono, width=10)
+        self.focal.grid(row=3, column=1, sticky="w", padx=(4, 8), pady=3)
+        ttk.Label(mono, text="仅单目测距", style="Hint.TLabel").grid(
+            row=3, column=2, sticky="w")
 
         self.show_3d = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text="启用三维估计（需填球直径）",
-                        variable=self.show_3d).grid(row=3, column=0, columnspan=3,
-                                                    sticky="w", pady=(6, 0))
+        ttk.Checkbutton(mono, text="启用三维估计（需填球直径）",
+                        variable=self.show_3d).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(mono, text="仅单目；双目始终输出标定三维",
+                  style="Hint.TLabel").grid(row=5, column=0, columnspan=3,
+                                            sticky="w")
+
+        ttk.Button(box, text="这些参数用在哪？", command=self._show_param_scope).grid(
+            row=4, column=0, sticky="w", pady=(4, 2))
+
+    def _show_param_scope(self) -> None:
+        messagebox.showinfo(
+            "参数用在哪",
+            "检测方法、颜色预设：\n"
+            "  实时摄像头 / 离线视频 / 双目会话都用。\n\n"
+            "摄像头编号：仅实时摄像头。\n"
+            "球直径：仅单目三维估计；双目深度来自标定。\n"
+            "预测视野：仅单目预测；双目预测已关闭。\n"
+            "焦距 fx：仅单目测距；双目用标定内参。\n"
+            "启用三维估计：仅单目；双目始终输出三维。",
+            parent=self)
 
     # ---------- 第 3 步：开始 ----------
     def _build_step3(self) -> None:
@@ -1130,8 +1234,12 @@ class Launcher(tk.Tk):
             side="bottom", anchor="e", pady=(6, 0))
 
     # ---------- 参数收集 ----------
-    def _common_args(self) -> list[str]:
+    def _common_args(self, *, for_video: bool = False) -> list[str]:
         """实时/离线共用的参数。
+
+        `for_video=True` 时不要追加 `run_video.py` 不认识的 `--display-width`
+        和 `--no-3d`；这两个只属于实时窗口。否则“打开离线视频”会直接
+        argparse 报 unrecognized arguments 起不来。
 
         ⚠️ **`--display-width` 必须在这里传下去**（2026-10-14 加）。
         它默认 960，实测把显示耗时从 17.7 ms 降到 1.8 ms ——
@@ -1149,9 +1257,10 @@ class Launcher(tk.Tk):
             args += ["--horizon", self.horizon.get().strip()]
         if self.focal.get().strip():
             args += ["--focal", self.focal.get().strip()]
-        if not self.show_3d.get():
-            args += ["--no-3d"]
-        args += ["--display-width", str(DISPLAY_WIDTH)]
+        if not for_video:
+            if not self.show_3d.get():
+                args += ["--no-3d"]
+            args += ["--display-width", str(DISPLAY_WIDTH)]
         return args
 
     # ---------- 动作 ----------
@@ -1187,7 +1296,7 @@ class Launcher(tk.Tk):
                "--out", str(out),
                "--csv", str(ROOT / "outputs" / f"{stamp}_traj.csv"),
                "--method", self.method.get()]
-        cmd += self._common_args()
+        cmd += self._common_args(for_video=True)
         self._append(f"结果视频将保存到：{out}")
         self._run(cmd, "离线视频分析")
 
@@ -1198,12 +1307,14 @@ class Launcher(tk.Tk):
             PY, str(ROOT / "apps" / "record_stereo.py"),
             "--left", self.calib_left.get(),
             "--right", self.calib_right.get(),
-            "--width", width, "--height", height, "--fps", "30",
+            "--width", width, "--height", height,
+            "--fps", (self.calib_fps.get().strip() or "30"),
             "--duration", str(duration),
             "--label", (label or "gui_record").strip(),
             "--stereo-mode", self.stereo_mode_var.get(),
             "--preview", "--notes", "GUI 录制",
-        ]
+        ] + ([] if self.calib_backend.get() == "auto"
+             else ["--backend", self.calib_backend.get()])
 
     def _start_record(self) -> None:
         if self.calib_left.get() == "auto" or self.calib_right.get() == "auto":
