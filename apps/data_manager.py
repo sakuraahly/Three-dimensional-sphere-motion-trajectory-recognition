@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import subprocess
 import sys
 import threading
 from datetime import datetime, time
@@ -99,7 +100,9 @@ class DataManager(tk.Tk):
         tk.Label(head, text="勾选会话 → 选类别 → 自动去标识 → 打成有目录的 zip",
                  bg=ACCENT, fg="#dbeafe",
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 8), pady=(10, 2))
-        ttk.Button(head, text="刷新", command=self.refresh).pack(side="right", padx=12, pady=8)
+        ttk.Button(head, text="数据目录…", command=self.choose_root).pack(
+            side="right", padx=(4, 12), pady=8)
+        ttk.Button(head, text="刷新", command=self.refresh).pack(side="right", pady=8)
 
         toolbar = ttk.Frame(self, padding=(12, 8))
         toolbar.pack(fill="x")
@@ -142,7 +145,7 @@ class DataManager(tk.Tk):
         sb.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<Button-1>", self._tree_click)
-        self.tree.bind("<Double-1>", lambda _e: self.toggle_focus())
+        self.tree.bind("<Double-1>", lambda _e: self._open_viewer())
 
         tip = ttk.Label(left, text="点第一列勾选；勾起点→点终点→『选到此处』；Shift+点行也可区间。",
                         foreground=MUTED)
@@ -178,6 +181,8 @@ class DataManager(tk.Tk):
 
         self.export_btn = ttk.Button(right, text="开始导出", command=self.start_export)
         self.export_btn.pack(fill="x", pady=(2, 4))
+        ttk.Button(right, text="查看 3D + 视频", command=self._open_viewer).pack(
+            fill="x", pady=(0, 4))
         self.progress = ttk.Progressbar(right, mode="determinate")
         self.progress.pack(fill="x", pady=(0, 4))
         self.status = ttk.Label(right, text="等待选择", foreground=MUTED,
@@ -379,6 +384,56 @@ class DataManager(tk.Tk):
     def clear_time(self) -> None:
         self.from_var.set("")
         self.to_var.set("")
+
+    # ------------------------------------------------------------------
+    def choose_root(self) -> None:
+        path = filedialog.askdirectory(
+            parent=self, title="选择数据目录（sessions 的父目录）",
+            initialdir=str(self.root_dir))
+        if not path:
+            return
+        root = Path(path)
+        if not root.is_dir():
+            messagebox.showerror("数据目录", f"不是目录：{root}", parent=self)
+            return
+        self.root_dir = root
+        self.selected.clear()
+        self.refresh()
+
+    def _focused_item(self) -> SessionItem | None:
+        row = self.tree.focus()
+        if row:
+            return next((it for it in self.items if it.key == row), None)
+        if len(self.selected) == 1:
+            key = next(iter(self.selected))
+            return next((it for it in self.items if it.key == key), None)
+        return None
+
+    def _open_viewer(self) -> None:
+        it = self._focused_item()
+        if it is None:
+            messagebox.showinfo("3D + 视频", "先在列表里选中一条会话。", parent=self)
+            return
+        viz = it.path / "derived" / "visualization.json"
+        traj = it.path / "derived" / "traj3d.json"
+        if not viz.exists() and not traj.exists():
+            messagebox.showinfo("3D + 视频", f"这条会话还没有可读的三维数据：\n{it.path}",
+                                parent=self)
+            return
+        annotated = it.path / "derived" / "annotated.mp4"
+        args = [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(it.path)]
+        if not annotated.exists():
+            if not messagebox.askyesno(
+                    "没有标注视频", "这条会话没有 annotated.mp4。\n只打开 3D 查看器？",
+                    parent=self):
+                return
+            args.append("--no-video")
+        try:
+            subprocess.Popen(args)
+        except Exception as exc:                            # noqa: BLE001
+            messagebox.showerror("3D + 视频", f"打不开查看器：{exc}", parent=self)
+            return
+        self._log_line(f"打开 3D + 视频：{it.id}")
 
     # ------------------------------------------------------------------
     def browse_output(self) -> None:

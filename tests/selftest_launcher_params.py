@@ -673,6 +673,22 @@ def main() -> int:
     for name, passed in checks_cb:
         print(f"  [{'通过' if passed else '不达标'}] {name}")
         results.append((name, passed))
+
+    with tempfile.TemporaryDirectory(prefix="dsh_any_session_") as tmp:
+        p = Path(tmp) / "20260101-120000"
+        p.mkdir()
+        (p / "session.json").write_text(json.dumps({
+            "schema": "sphere-stereo-session", "version": 1, "id": p.name,
+            "created": "2026-01-01 12:00:00",
+            "left": {"frame_count": 1}, "right": {"frame_count": 1},
+        }), encoding="utf-8")
+        app2._wb_add_custom(p)
+        app2.update()
+        selected = app2._wb_selected()
+        any_ok = (selected is not None and selected.path.resolve() == p.resolve()
+                  and "[任意]" in app2.wb_var.get())
+        print(f"  [{'通过' if any_ok else '不达标'}] 工作台可加入任意会话目录")
+        results.append(("工作台可加入任意会话目录", any_ok))
     app2.destroy()
 
     # ---- 13. 数据导出：脱敏 + 类别 + zip ----
@@ -869,12 +885,27 @@ def main() -> int:
             finally:
                 dmmod.messagebox.showwarning = old_warn
             time_bad_ok = set(dm.selected) == warn_before and bool(warnings)
+
+            old_ask = dmmod.messagebox.askyesno
+            old_popen = dmmod.subprocess.Popen
+            calls: list[list[str]] = []
+            dmmod.messagebox.askyesno = lambda *a, **k: True
+            dmmod.subprocess.Popen = lambda args: calls.append(args)
+            try:
+                dm.tree.focus(sd.name)
+                dm._open_viewer()
+            finally:
+                dmmod.messagebox.askyesno = old_ask
+                dmmod.subprocess.Popen = old_popen
+            viewer_ok = (bool(calls) and "view_3d.py" in calls[0][1]
+                         and "--no-video" in calls[0])
             dm.destroy()
-            gui_ok = range_ok and all_ok and invert_ok and shift_ok and time_bad_ok
+            gui_ok = (range_ok and all_ok and invert_ok and shift_ok
+                      and time_bad_ok and viewer_ok)
         except Exception as exc:                            # noqa: BLE001
             print(f"    DataManager 选择测试失败：{exc}")
             gui_ok = False
-        checks_extra.append(("GUI 起点→终点/全选/反选", gui_ok))
+        checks_extra.append(("GUI 起点→终点/全选/反选/查看3D", gui_ok))
 
         for name, passed in checks_extra:
             print(f"  [{'通过' if passed else '不达标'}] {name}")

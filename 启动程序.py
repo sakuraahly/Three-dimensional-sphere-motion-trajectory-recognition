@@ -714,6 +714,8 @@ class Launcher(tk.Tk):
         self.wb_combo.bind("<<ComboboxSelected>>", lambda _e: self._wb_show())
         ttk.Button(box, text="刷新", command=self._wb_refresh, width=6).grid(
             row=1, column=4, sticky="w", pady=4)
+        ttk.Button(box, text="浏览会话…", command=self._wb_browse, width=11).grid(
+            row=1, column=5, sticky="w", padx=(4, 0), pady=4)
 
         self.wb_info = ttk.Label(box, text="还没有会话", style="Hint.TLabel",
                                  justify="left", wraplength=CARD_HINT_WRAP)
@@ -746,6 +748,7 @@ class Launcher(tk.Tk):
         self.wb_hint.grid(row=5, column=0, columnspan=6, sticky="w", pady=(2, 0))
         self._wrapped.append((self.wb_hint, "card"))
         self._wb_paths: dict[str, Path] = {}
+        self._wb_custom: dict[Path, bool] = {}
         self._wb_last_first = ""
         self.after(300, self._wb_refresh)
         self.after(2500, self._wb_tick)
@@ -755,32 +758,76 @@ class Launcher(tk.Tk):
         path = self._wb_paths.get(self.wb_var.get())
         return summarize_session(path) if path else None
 
+    def _wb_browse(self) -> None:
+        path = filedialog.askdirectory(
+            parent=self, title="选择任意双目会话目录",
+            initialdir=str(ROOT / "data" / "sessions"))
+        if not path:
+            return
+        self._wb_add_custom(Path(path))
+
+    def _wb_add_custom(self, path: Path) -> None:
+        p = Path(path).resolve()
+        if not (p / "session.json").is_file():
+            messagebox.showerror(
+                "会话", f"这个目录没有 session.json：\n{p}", parent=self)
+            return
+        self._wb_custom[p] = True
+        self._wb_refresh()
+        self._wb_select_path(p)
+        self._append(f"[工作台] 已加入任意会话：{p}")
+
+    def _wb_select_path(self, path: Path) -> None:
+        target = Path(path).resolve()
+        for label, p in self._wb_paths.items():
+            if p.resolve() == target:
+                self.wb_var.set(label)
+                self._wb_show()
+                return
+
     def _wb_refresh(self, select_latest: bool = False) -> None:
-        from apps._workbench import scan_sessions
+        from apps._workbench import scan_sessions, summarize_session
         try:
-            summaries = scan_sessions(ROOT / "data" / "sessions", limit=12)
+            scanned = scan_sessions(ROOT / "data" / "sessions", limit=200)
         except Exception as exc:                            # noqa: BLE001
             self.wb_info.configure(text=f"扫描会话失败：{exc}")
             return
-        labels = [s.label for s in summaries]
+        scanned_paths = {s.path.resolve() for s in scanned}
+        custom_paths = [p for p in self._wb_custom if p.exists()]
+        self._wb_custom = {p: True for p in custom_paths}
+        custom = [summarize_session(p) for p in custom_paths
+                  if p.resolve() not in scanned_paths]
+        summaries = scanned + custom
+        labels: list[str] = []
+        for idx, s in enumerate(summaries):
+            label = s.label
+            if s.path.resolve() in set(custom_paths):
+                label += "  [任意]"
+            if label in labels:
+                label = f"{label}  [{idx}]"
+            labels.append(label)
         old_label = self.wb_var.get()
         old_path = self._wb_paths.get(old_label)
         old_id = old_path.name if old_path is not None else ""
-        self._wb_paths = {s.label: s.path for s in summaries}
-        by_id = {s.id: s for s in summaries}
+        self._wb_paths = {lab: s.path for lab, s in zip(labels, summaries)}
         self.wb_combo.configure(values=labels)
         first = summaries[0] if summaries else None
         selected = None
-        if select_latest or not old_id or old_id not in by_id:
+        if select_latest or old_path is None or old_path.resolve() not in {
+                s.path.resolve() for s in summaries}:
             selected = first
         elif first is not None and first.id != self._wb_last_first and old_id == self._wb_last_first:
             # 刚录完/刚出现新会话：原来停在最新那条，就跟着切到新的
             selected = first
         else:
-            selected = by_id.get(old_id, first)
+            selected = next((s for s in summaries
+                             if s.path.resolve() == old_path.resolve()), first)
         if selected is not None:
             # 用 id 保留选择；状态标记（◐/✓/✗）变化时 label 会变，不能拿 label 当主键
-            self.wb_var.set(selected.label)
+            for lab, s in zip(labels, summaries):
+                if s.path.resolve() == selected.path.resolve():
+                    self.wb_var.set(lab)
+                    break
         self._wb_last_first = first.id if first is not None else ""
         self._wb_show()
 
