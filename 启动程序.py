@@ -1847,12 +1847,18 @@ class Launcher(tk.Tk):
         cols = ("id", "title", "pid", "elapsed", "status")
         heads = ("#", "任务", "PID", "已运行", "状态")
         widths = (4, 34, 8, 9, 12)
-        self.task_tree = ttk.Treeview(box, columns=cols, show="headings",
+        tree_frame = ttk.Frame(box)
+        tree_frame.grid(row=1, column=0, columnspan=8, sticky="we", pady=(4, 4))
+        self.task_tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                                       height=5, selectmode="browse")
         for c, h, w in zip(cols, heads, widths):
             self.task_tree.heading(c, text=h)
             self.task_tree.column(c, width=w * 8, anchor="w", stretch=(c == "title"))
-        self.task_tree.grid(row=1, column=0, columnspan=8, sticky="we", pady=(4, 4))
+        self.task_tree.pack(side="left", fill="both", expand=True)
+        task_sb = ttk.Scrollbar(tree_frame, orient="vertical",
+                                command=self.task_tree.yview)
+        task_sb.pack(side="right", fill="y")
+        self.task_tree.configure(yscrollcommand=task_sb.set)
         self.task_tree.bind("<<TreeviewSelect>>", self._on_task_select)
 
         ttk.Button(box, text="中断选中", command=self._stop_selected).grid(
@@ -1867,10 +1873,32 @@ class Launcher(tk.Tk):
             row=2, column=4, sticky="w", padx=(6, 0), pady=2)
         ttk.Button(box, text="清理已结束", command=self._prune_tasks).grid(
             row=2, column=5, sticky="w", padx=(6, 0), pady=2)
+
+        # 任务多时既能滚，也能直接拖滑块调整可见行数
+        box.columnconfigure(1, weight=1)
+        ttk.Label(box, text="显示行数").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self.task_rows_var = tk.DoubleVar(value=5)
+        ttk.Scale(box, from_=3, to=20, orient="horizontal",
+                  variable=self.task_rows_var,
+                  command=self._set_task_rows).grid(
+            row=3, column=1, columnspan=4, sticky="we", padx=(6, 6), pady=(4, 0))
+        self.task_rows_label = ttk.Label(box, text="5 行", style="Hint.TLabel")
+        self.task_rows_label.grid(row=3, column=5, sticky="w", pady=(4, 0))
+
         self.task_hint = ttk.Label(box, text="", style="Hint.TLabel",
                                    wraplength=CARD_HINT_WRAP)
-        self.task_hint.grid(row=3, column=0, columnspan=9, sticky="w", pady=(4, 0))
+        self.task_hint.grid(row=4, column=0, columnspan=9, sticky="w", pady=(4, 0))
         self._wrapped.append((self.task_hint, "card"))
+
+    def _set_task_rows(self, value) -> None:
+        """拖动滑块调整任务表可见高度；行数越多，卡片越高。"""
+        try:
+            rows = int(round(float(value)))
+        except (TypeError, ValueError):
+            return
+        rows = max(3, min(20, rows))
+        self.task_tree.configure(height=rows)
+        self.task_rows_label.configure(text=f"{rows} 行")
 
     def _refresh_tasks(self) -> None:
         """重画任务表。**保留选中行**（否则每次刷新都把用户的选择弄丢）。"""
