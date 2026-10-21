@@ -414,7 +414,7 @@ class Launcher(tk.Tk):
         tk.Label(mode_box, text="auto=按会话/标定",
                  bg=ACCENT, fg="#bfdbfe",
                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
-        tk.Button(mode_box, text="几何计算", command=self._show_geometry,
+        tk.Button(mode_box, text="基线夹角估算", command=self._show_geometry,
                   bg="#1d4ed8", fg="white", relief="flat", padx=6,
                   font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
         tk.Button(actions, text="数据管理", command=self._open_data_manager,
@@ -423,29 +423,34 @@ class Launcher(tk.Tk):
             anchor="e", pady=(6, 0))
 
     def _show_geometry(self) -> None:
-        """输入 B/D，算真实光轴夹角；不替用户假定 90°。"""
+        """用镜头中心距和工作距离估算两光轴夹角；不替用户假定 90°。"""
         from stereo.stereo_mode import geometry_advice
         try:
             baseline = simpledialog.askfloat(
-                "双目几何", "基线 B（毫米）：", initialvalue=65.0, parent=self)
+                "用基线算夹角",
+                "两镜头中心距（基线 B，毫米）：",
+                initialvalue=65.0, parent=self)
             if baseline is None:
                 return
             distance = simpledialog.askfloat(
-                "双目几何", "工作距离 D（米）：", initialvalue=0.30, parent=self)
+                "用基线算夹角",
+                "球到相机的工作距离（D，米）：",
+                initialvalue=0.30, parent=self)
             if distance is None:
                 return
         except Exception as exc:                            # noqa: BLE001
-            messagebox.showwarning("双目几何", f"输入不合法：{exc}", parent=self)
+            messagebox.showwarning("用基线算夹角", f"输入不合法：{exc}", parent=self)
             return
         advice = geometry_advice(baseline, distance)
         if not advice["warning"]:
-            messagebox.showwarning("双目几何", "基线和距离要为正数。", parent=self)
+            messagebox.showwarning("用基线算夹角", "基线和距离要为正数。", parent=self)
             return
         messagebox.showinfo(
-            "双目几何",
+            "用基线算夹角",
             f"B={baseline:.1f} mm, D={distance:.3f} m\n"
-            f"对称交会角 = {advice['angle_deg']:.2f}°\n"
+            f"两光轴夹角 ≈ {advice['angle_deg']:.2f}°\n"
             f"判断：{advice['warning']}\n\n"
+            "这是“两相机对称看向同一工作点”的估算。\n"
             "90° 对称双目需要 B = 2·D；当前装置是否满足，要按实测 B/D 判断。",
             parent=self)
 
