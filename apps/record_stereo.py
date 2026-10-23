@@ -354,8 +354,9 @@ def main() -> int:
     ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
     ap.add_argument("--width", type=int, default=RECORD_DEFAULT.width,
-                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时短测约30fps、"
-                         "10秒约2.2GB，但长录/目标机型/主循环未验证）")
+                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时"
+                         "主循环实测约 24.1fps（242/300），HFYU 1440p@30 会丢帧，"
+                         "可降到 24fps 或改 1080p；长录/其他机型未验证）")
     ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
                     help=f"录制高度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时见 --width 提示）")
     ap.add_argument("--fps", type=int, default=30, help="请求帧率（相机实测只有约 27–30）")
@@ -378,8 +379,10 @@ def main() -> int:
     args = ap.parse_args()
 
     if (args.width, args.height) == (2560, 1440):
-        print("[警告] 1440p 双路短测约30fps、10秒约2.2GB；长录/目标机型/主循环未验证。")
-        LOG.warning("显式 2560x1440：短测约30fps、10秒约2.2GB；长录/目标机型/主循环未验证")
+        print("[警告] 1440p 主循环实测约 24.1fps（242/300 帧·10 秒·HFYU，两路一致）；"
+              "HFYU 1440p@30 会丢帧，可降到 --fps 24 或改 1080p。长录/其他机型未验证。")
+        LOG.warning("显式 2560x1440：主循环实测约 24.1fps（242/300），"
+                    "HFYU 1440p@30 会丢帧；可降到 24fps 或改 1080p；长录/其他机型未验证")
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")

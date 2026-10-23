@@ -713,17 +713,18 @@ class Launcher(tk.Tk):
     def _refresh_res_note(self) -> None:
         """选了 >1080p 的档时，把"录制吞吐要实测"写在界面上 —— 不静默承诺 30 fps。
 
-        依据（2026-10-23 实测）：HFYU 双路短测可在 1440p 跑满 30fps，
-        但 10 秒约 2.2GB，长录/目标机型/主循环未验证；达不到 30 就是丢帧，
-        而画面上/日志里都不一定看得出来，所以必须在**选择时**就说清；
-        1080p 及以下不显示（少一点噪音）。
+        依据（2026-10-23 团队实测）：`record_stereo` 1440p@30 的**主循环**只有
+        约 24.1 fps（10 秒 242/300 帧/路，HFYU，两路一致）；裸采集短测能到 30，
+        但主循环跟不上 —— 也就是说 HFYU 1440p@30 会丢帧。长录/其他机型未验证。
+        这类差距画面上不一定看得出来，所以必须在**选择时**就说清；
+        1080p 及以下不显示（没这个代价，少一点噪音）。
         """
         profile = parse_video_profile(self.calib_res.get(),
                                       default=DEFAULT_VIDEO_PROFILE)
         if profile.width > 1920:
-            text = (f"⚠ {profile.label}：录制吞吐需实测 —— HFYU 双路短测约 30fps、"
-                    f"10 秒约 2.2GB；长录/目标机型未验证，达不到 30 会丢帧；"
-                    f"标定 / 录制 / 实时都用这一档，请先录 10 秒看实际帧率。")
+            text = (f"⚠ {profile.label}：record_stereo 主循环实测约 24.1 fps"
+                    f"（242/300 帧·10 秒·HFYU，两路一致），HFYU 1440p@30 会丢帧；"
+                    f"可把帧率降到 24 或改 1080p。长录/其他机型未验证。")
         else:
             text = ""
         self.res_note.configure(text=text)
