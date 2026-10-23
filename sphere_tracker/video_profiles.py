@@ -19,8 +19,13 @@
 
 ## 默认档
 
-``DEFAULT = 1920x1080``。在真机两路 1440p/4K 稳定之前不把 4K 设为默认
-（决策记录 2026-10-23 决策 3）。
+``DEFAULT = 1920x1080``。**暂不把 1440 设为默认**：实测 HFYU 2560x1440
+随机帧只有 ~10.4 fps（1080p 约 34），1440@30 的无损录制吞吐未证明；
+而且旧标定/旧录制都是 1080，默认切 1440 会直接错配。
+
+2560x1440 仍是**合法可选档**（相机支持 @30），1080 也可显式指定。
+以后要改默认值，必须同步 GUI/CLI/录制，并解决旧 1080 标定的兼容；
+4K 仍不默认 —— 带宽/存储都还没验证。
 """
 
 from __future__ import annotations
@@ -79,8 +84,8 @@ class VideoProfile:
 
 PROFILES: tuple[VideoProfile, ...] = (
     VideoProfile(3840, 2160),   # 4K，可选、不默认
-    VideoProfile(2560, 1440),   # 2.5K
-    VideoProfile(1920, 1080),   # 默认
+    VideoProfile(2560, 1440),   # 合法可选；HFYU 实测 ~10.4 fps，不默认
+    VideoProfile(1920, 1080),   # 默认（与旧标定/录制一致）
     VideoProfile(1280, 720),
     VideoProfile(960, 540),
     VideoProfile(640, 480),
@@ -88,6 +93,11 @@ PROFILES: tuple[VideoProfile, ...] = (
 
 # 默认档直接引用 PROFILES 里的同一个对象，避免出现"两个 1920x1080"。
 DEFAULT: VideoProfile = PROFILES[2]
+
+# 录制默认档：**独立于 DEFAULT**。相机支持 2560x1440，但 HFYU 1440 的持续
+# 写入吞吐尚未证明；即使以后把 DEFAULT 调到 1440，录制也不能自动跟过去。
+# 两个名字都指向 PROFILES 里的同一对象，不存在第二份 1920x1080 字面量。
+RECORD_DEFAULT: VideoProfile = PROFILES[2]
 
 # 接受 "1920x1080" / "1920 X 1080" / " 1920 x 1080 "。
 # 文档里常写 "1920×1080"，顺手也认这个乘号，避免用户从手册复制后解析失败。
@@ -200,11 +210,12 @@ def _selftest() -> int:
     # ---- 档位 / properties ----
     assert DEFAULT == VideoProfile(1920, 1080)
     assert DEFAULT is p1080
+    assert p1440 in PROFILES and parse("2560x1440") is p1440   # 1440 仍是合法档
     assert p4k.label == "3840x2160" and p4k.pixels == 3840 * 2160
     assert p4k.high_res and p1440.high_res
     assert not p1080.high_res and not p720.high_res
     assert p1080.pixels == 1920 * 1080
-    print("PASS profiles: 6 档有序，DEFAULT=1920x1080，high_res 阈值正确")
+    print("PASS profiles: 6 档有序，DEFAULT=1920x1080，1440 仍合法，high_res 阈值正确")
 
     # ---- options / labels ----
     assert options() == expected_labels
@@ -214,6 +225,7 @@ def _selftest() -> int:
 
     # ---- parse：合法 / 大小写 / 空格 / 非标准档 ----
     assert parse("3840x2160") is p4k
+    assert parse("2560x1440") is p1440
     assert parse(" 1280 X 720 ") is p720
     assert parse(" 960 x 540 ") is p540
     assert parse("1024x768") == VideoProfile(1024, 768)
@@ -228,14 +240,18 @@ def _selftest() -> int:
     assert parse("bad", default=p720) is p720
     print("PASS parse invalid: 非法输入全部回退默认档")
 
-    # ---- resolve：4K -> 1080p 必须标记回退 ----
+    # ---- resolve：4K / 1440p 掉到 1080p 必须标记回退；默认 1080 精确命中 ----
     got, fallback = resolve(p4k, 1920, 1080)
-    assert got is DEFAULT and fallback is True
+    assert got is p1080 and fallback is True
+    got, fallback = resolve(p1440, 1920, 1080)
+    assert got is p1080 and fallback is True
+    got, fallback = resolve(DEFAULT, 1920, 1080)
+    assert got is p1080 and fallback is False
     got, fallback = resolve(p4k, 3840, 2160)
     assert got is p4k and fallback is False
     got, fallback = resolve(p1080, 1024, 768)
     assert (got.width, got.height) == (1024, 768) and fallback is True
-    print("PASS resolve: 4K->1080p fallback=True，命中请求 fallback=False")
+    print("PASS resolve: 4K/1440p->1080p fallback=True，默认 1080 命中 fallback=False")
 
     # ---- resolve：实际尺寸为 0 / 负数 -> requested, False ----
     for aw, ah in ((0, 0), (0, 1080), (1920, 0), (-1, 1080)):

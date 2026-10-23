@@ -31,6 +31,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT / "outputs" / "logs"
 
+from sphere_tracker import video_profiles  # noqa: E402  (ROOT 已就绪)
+
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _LOG_DATEFMT = "%H:%M:%S"
 
@@ -114,8 +116,8 @@ def log_environment(log: logging.Logger) -> None:
 def add_stereo_source_args(
     ap: argparse.ArgumentParser,
     *,
-    width: int = 1920,
-    height: int = 1080,
+    width: int = video_profiles.DEFAULT.width,
+    height: int = video_profiles.DEFAULT.height,
     fps: int = 30,
 ) -> argparse.ArgumentParser:
     """补上双目取帧参数 —— 字段名与 ``stereo.from_args()`` 读的一一对应。
@@ -138,9 +140,9 @@ def add_stereo_source_args(
     ap.add_argument("--left-dir", default=None, help="左路图片文件夹")
     ap.add_argument("--right-dir", default=None, help="右路图片文件夹")
     ap.add_argument("--width", type=int, default=width,
-                    help="相机采集宽度（两路一致）")
+                    help=f"相机采集宽度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
     ap.add_argument("--height", type=int, default=height,
-                    help="相机采集高度（两路一致）")
+                    help=f"相机采集高度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
     ap.add_argument("--fps", type=int, default=fps, help="相机采集帧率")
     return ap
 

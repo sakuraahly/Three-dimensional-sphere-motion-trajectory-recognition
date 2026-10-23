@@ -41,6 +41,7 @@ import cv2
 import numpy as np
 
 from sphere_tracker import camera_registry as cr
+from sphere_tracker import video_profiles
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detectors import build_detector
 from sphere_tracker.pipeline import SpherePipeline
@@ -83,8 +84,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera", default=None,
                    help="摄像头：索引(0) / 角色名(main，查 config/cameras.json)；"
                         "默认自动挑最优（优先外接、避开内置/红外、非全黑）")
-    p.add_argument("--width", type=int, default=1280)
-    p.add_argument("--height", type=int, default=720)
+    p.add_argument("--width", type=int, default=video_profiles.DEFAULT.width,
+                   help=f"采集宽度（默认档 {video_profiles.DEFAULT.label}）")
+    p.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
+                   help=f"采集高度（默认档 {video_profiles.DEFAULT.label}）")
     p.add_argument("--fps", type=int, default=60)
     p.add_argument(
         "--method",

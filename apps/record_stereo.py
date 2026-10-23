@@ -53,6 +53,7 @@ from sphere_tracker.sources import (                         # noqa: E402
     INDEX_BACKEND,
     CameraSource,
 )
+from sphere_tracker.video_profiles import RECORD_DEFAULT      # noqa: E402
 from stereo.sessions import (                                # noqa: E402
     CalibrationInfo,
     CameraInfo,
@@ -318,6 +319,19 @@ def _copy_calibration(session_dir: Path, calib_base: Path) -> tuple[Path, Stereo
     return npz_dst, rig
 
 
+def validate_capture_size(rig: StereoRig, width: int, height: int) -> None:
+    """录制分辨率必须与标定内参一致；不一致直接报错，不能静默缩放。"""
+    actual = tuple(int(v) for v in getattr(rig, "image_size", ()) or ())
+    requested = (int(width), int(height))
+    if len(actual) != 2:
+        raise ValueError("标定缺少 image_size，无法核对录制分辨率；请重新标定")
+    if actual != requested:
+        raise ValueError(
+            f"标定内参基于 {actual[0]}x{actual[1]}，当前录制请求 {requested[0]}x{requested[1]}；"
+            "请用同一分辨率重标，或把录制分辨率改成标定值（不要混用）"
+        )
+
+
 def _camera_info(side: str, idx: int, src: CameraSource, args, role_spec) -> CameraInfo:
     return CameraInfo(
         role=side,
@@ -339,8 +353,11 @@ def main() -> int:
     ap.add_argument("--left", default="left", help="左路：角色名 / 编号 / name:...")
     ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
+    ap.add_argument("--width", type=int, default=RECORD_DEFAULT.width,
+                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时 1440 录制吞吐需实测，"
+                         "HFYU 可能达不到 30fps）")
+    ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
+                    help=f"录制高度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时见 --width 提示）")
     ap.add_argument("--fps", type=int, default=30, help="请求帧率（相机实测只有约 27–30）")
     ap.add_argument("--codec", choices=tuple(CODECS), default="hfyuv",
                     help="无损编码器：hfyuv（默认，1080p30 能跟上）/ ffv1（更通用但很慢）")
@@ -359,6 +376,10 @@ def main() -> int:
     ap.add_argument("--self-check-only", action="store_true",
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
     args = ap.parse_args()
+
+    if (args.width, args.height) == (2560, 1440):
+        print("[警告] 1440 录制吞吐需实测，HFYU 可能达不到 30fps；确认后继续。")
+        LOG.warning("显式 2560x1440：1440 录制吞吐需实测，HFYU 可能达不到 30fps")
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")
@@ -408,6 +429,11 @@ def main() -> int:
         except Exception as exc:                            # noqa: BLE001
             print(f"[错误] 标定快照失败：{exc}")
             return 1
+        try:
+            validate_capture_size(rig, args.width, args.height)
+        except ValueError as exc:
+            print(f"[错误] {exc}")
+            return 2
         session.calibration = CalibrationInfo(
             path=str(calib_path.relative_to(session_dir)).replace("\\", "/"),
             sha256=sha256_file(calib_path),

@@ -132,6 +132,7 @@ def main() -> int:
     app = mod.Launcher()
     app.update_idletasks()
     app.update()
+    res_default = app.calib_res.get()      # 建窗后立刻记下默认档，后面 7b 要断言
     screen_ok = (
         0 <= app.winfo_x() and 0 <= app.winfo_y()
         and app.winfo_x() + app.winfo_width() <= app.winfo_screenwidth()
@@ -343,6 +344,83 @@ def main() -> int:
            contains="--width 1280 --height 720")
     app.calib_res.set("1920x1080")
     expect("默认帧率 30 -> --fps 30", True, contains="--fps 30")
+
+    # ---- 7b. 分辨率档位来自 video_profiles（唯一来源），默认 1920x1080 ----
+    # 守的是"GUI 与录制/标定/实时共用同一份档位表"：
+    # 原来 RESOLUTIONS 与实时入口的 1280x720 默认值是两份独立数字，
+    # 面板选 1080p 而实时按 720p 开，界面上看不出来。
+    # 默认**就是** video_profiles.DEFAULT（当前 1920x1080）：HFYU 1440p 实测
+    # 只有约 10.4 fps，1440p@30 无损录制未证明，所以默认不调到 1440p；
+    # 档位表仍包含 2560x1440，GUI 选它时显式提示吞吐风险。
+    print("----- 7b. 分辨率唯一来源 / 默认 1080p / 实时检测宽度 -----")
+    from types import SimpleNamespace
+    from apps import record_stereo as record_app
+    from sphere_tracker.video_profiles import RECORD_DEFAULT
+    from sphere_tracker.video_profiles import options as video_options
+    record_src = (ROOT / "apps" / "record_stereo.py").read_text(encoding="utf-8")
+    fake_rig = SimpleNamespace(image_size=[1920, 1080])
+    try:
+        record_app.validate_capture_size(fake_rig, 1920, 1080)
+        record_same_ok = True
+    except ValueError:
+        record_same_ok = False
+    try:
+        record_app.validate_capture_size(fake_rig, 2560, 1440)
+        record_mismatch_blocked = False
+    except ValueError:
+        record_mismatch_blocked = True
+    app.calib_res.set("2560x1440")
+    rec_hd = " ".join(app._record_args("10", "gui_test"))
+    rt_hd = " ".join(app._realtime_args())
+    app._refresh_res_note()
+    note_hd = app.res_note.cget("text")
+    app.calib_res.set("1920x1080")
+    rt_1080 = " ".join(app._realtime_args())
+    rec_1080 = " ".join(app._record_args("10", "gui_test"))
+    app._refresh_res_note()
+    note_1080 = app.res_note.cget("text")
+    app.calib_res.set("1280x720")
+    rt_720 = " ".join(app._realtime_args())
+    app.calib_res.set(res_default)
+    app._refresh_res_note()
+    mod_src = (ROOT / "启动程序.py").read_text(encoding="utf-8")
+    checks_res = [
+        ("默认分辨率 = 1920x1080（1440p@30 录制未证明，不默认）",
+         res_default == mod.DEFAULT_RESOLUTION == "1920x1080"),
+        ("录制默认档来自 video_profiles.RECORD_DEFAULT（不写死 1920）",
+         RECORD_DEFAULT.label == "1920x1080"
+         and "default=RECORD_DEFAULT.width" in record_src
+         and "default=RECORD_DEFAULT.height" in record_src),
+        ("录制前校验标定分辨率：1080 标定 + 1080 录制放行", record_same_ok),
+        ("录制前校验标定分辨率：1080 标定 + 1440 录制报错", record_mismatch_blocked),
+        ("档位表来自 video_profiles.options()（含 2560x1440 / 1080p / 720p）",
+         list(mod.RESOLUTIONS) == list(video_options())
+         and "2560x1440" in mod.RESOLUTIONS
+         and "1920x1080" in mod.RESOLUTIONS and "1280x720" in mod.RESOLUTIONS),
+        ("录制在 2560x1440 档传 --width 2560 --height 1440（与标定同源）",
+         "--width 2560 --height 1440" in rec_hd),
+        ("录制在默认档传 --width 1920 --height 1080",
+         "--width 1920 --height 1080" in rec_1080),
+        ("实时在 2560x1440 档传 --width 2560 --height 1440（不再固定 720p）",
+         "--width 2560 --height 1440" in rt_hd),
+        ("实时在默认档传 --width 1920 --height 1080",
+         "--width 1920 --height 1080" in rt_1080),
+        ("实时传面板帧率（默认 30，不再让 run_realtime 用 60）",
+         "--fps 30" in rt_1080),
+        ("高分辨率实时加 --detect-width 1280",
+         "--detect-width 1280" in rt_hd),
+        ("1080p 不加 --detect-width（不强制降采样）",
+         "--detect-width" not in rt_1080),
+        ("720p 不加 --detect-width", "--detect-width" not in rt_720),
+        ("选 2560 时界面提示录制吞吐要实测（不静默承诺 30fps）",
+         "实测" in note_hd and "10.4" in note_hd and "丢帧" in note_hd),
+        ("1080p 不显示吞吐警告（少噪音）", note_1080 == ""),
+        ("_start_realtime 复用 _realtime_args（不是两套拼法）",
+         "cmd += self._realtime_args()" in mod_src),
+    ]
+    for label, good in checks_res:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
     # ⚠️ **2026-10-14 改了这条断言**：它原来是
     #   `expect("两台相机必须同后端（backend 固定 msmf）", True, contains="--backend msmf")`
     # 也就是把"写死 msmf"当成契约。现在后端由面板决定（见第 2.5 节），

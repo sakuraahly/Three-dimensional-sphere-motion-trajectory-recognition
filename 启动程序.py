@@ -66,7 +66,18 @@ CAMERAS = ["left", "right", "auto", "0", "1", "2"]
 # config/cameras.json 的「无关」清单，角色 main 也不再存在；留着这个选项
 # 只会让用户选到一个必定报错的项。
 MONO_CAMERAS = ["auto", "0", "1", "2"]
-RESOLUTIONS = ["1920x1080", "1280x720", "960x540", "640x480"]
+# 分辨率档位**只在 `sphere_tracker/video_profiles.py` 定义一次**：
+# 这里再写一遍就是下一次"标定 1080p、录制 1440p"静默混用的种子。
+from sphere_tracker.video_profiles import (  # noqa: E402  （要等 ROOT 进 sys.path）
+    DEFAULT as DEFAULT_VIDEO_PROFILE,
+    detection_width,
+    options as _video_profile_options,
+    parse as parse_video_profile,
+)
+RESOLUTIONS = _video_profile_options()
+# `video_profiles` 是分辨率档位的唯一来源；默认档也只用它的 DEFAULT，
+# 不在 GUI 另写一个 1080p。是否把 DEFAULT 调到 1440p，由录制吞吐/真机实测决定。
+DEFAULT_RESOLUTION = DEFAULT_VIDEO_PROFILE.label
 
 # ---- 换行宽度：**跟着视口动态算，不写死** ----
 #
@@ -638,7 +649,7 @@ class Launcher(tk.Tk):
                                             pady=(4, 0))
         self.calib_res = ttk.Combobox(basic, values=RESOLUTIONS, width=10,
                                       state="readonly")
-        self.calib_res.set("1920x1080")
+        self.calib_res.set(DEFAULT_RESOLUTION)
         self.calib_res.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
         ttk.Label(basic, text="帧率").grid(row=row, column=2, sticky="e",
                                           padx=(24, 6), pady=(4, 0))
@@ -646,6 +657,16 @@ class Launcher(tk.Tk):
         self.calib_fps.insert(0, "30")
         self.calib_fps.grid(row=row, column=3, sticky="w", pady=(4, 0))
         self._hint(basic, "两台相机必须同分辨率、同后端，否则一对有效图像都收不到")
+        # 选到 >1920 的档时**必须当场说清代价**，不能让人以为"相机支持就一定能录"。
+        # 用单独一行而不是塞进上面的说明：1080p 用户不需要看这段噪音。
+        self.res_note = ttk.Label(basic, text="", style="Hint.TLabel",
+                                  wraplength=PARAM_HINT_WRAP)
+        self.res_note.grid(row=self._next_row(basic), column=0, columnspan=4,
+                           sticky="w", pady=(0, 4))
+        self._wrapped.append((self.res_note, "param"))
+        self.calib_res.bind("<<ComboboxSelected>>",
+                            lambda _e: self._refresh_res_note())
+        self._refresh_res_note()
 
         # ---- 高级 ----
         self._hint(adv, "这几项**都是拿精度换成功率**，不确定就别动")
@@ -688,6 +709,23 @@ class Launcher(tk.Tk):
         self.calib_report = self._param_path(
             adv, "验证图", "标定后出一张可视化验证图", is_dir=False)
         return basic_section, adv_section
+
+    def _refresh_res_note(self) -> None:
+        """选了 >1080p 的档时，把"录制吞吐要实测"写在界面上 —— 不静默承诺 30 fps。
+
+        依据（实测）：HFYU 双路无损在 1080p 约 34 fps/路，2560x1440 只有约 10.4 fps。
+        达不到 30 就是丢帧，而画面上/日志里都不一定看得出来，所以必须在**选择时**
+        就说清；1080p 及以下不显示（没这个代价，少一点噪音）。
+        """
+        profile = parse_video_profile(self.calib_res.get(),
+                                      default=DEFAULT_VIDEO_PROFILE)
+        if profile.width > 1920:
+            text = (f"⚠ {profile.label}：录制吞吐需实测 —— HFYU 在 1080p 约 34 fps、"
+                    f"2560x1440 实测约 10.4 fps，达不到 30 会丢帧；"
+                    f"标定 / 录制 / 实时都用这一档，请先录 10 秒看实际帧率。")
+        else:
+            text = ""
+        self.res_note.configure(text=text)
 
     # ---------- 第 1 步：标定 ----------
     def _build_step1(self) -> None:
@@ -1269,6 +1307,25 @@ class Launcher(tk.Tk):
         return args
 
     # ---------- 动作 ----------
+    def _realtime_args(self) -> list[str]:
+        """实时窗口的采集参数：分辨率取面板的「分辨率」，高分辨率时限制检测宽度。
+
+        **不能像原来那样让 `run_realtime.py` 吃自己的 1280x720 默认值**：
+        面板上写着 2560x1440、实时却按 720p 开，等于"界面能设的东西与真实取值脱节"。
+
+        高分辨率（宽 > 1920）才加 `--detect-width`：4K/1440p 直接做检测会成倍变慢，
+        降到 1280 与 `video_profiles.detection_width()` 的规则一致；1080p 及以下
+        **不传**，避免把本来就不大的图再缩小。`display-width` 仍由 `_common_args()`
+        负责（那是显示，不是检测）。
+        """
+        profile = parse_video_profile(self.calib_res.get(),
+                                      default=DEFAULT_VIDEO_PROFILE)
+        args = ["--width", str(profile.width), "--height", str(profile.height),
+                "--fps", (self.calib_fps.get().strip() or "30")]
+        if profile.width > 1920:
+            args += ["--detect-width", str(detection_width(profile.width, 1280))]
+        return args
+
     def _start_realtime(self) -> None:
         if self.method.get() == "specular":
             messagebox.showinfo(
@@ -1277,6 +1334,7 @@ class Launcher(tk.Tk):
         cmd = [PY, str(ROOT / "apps" / "run_realtime.py"),
                "--camera", _cam_arg(self.camera.get()),
                "--method", self.method.get()]
+        cmd += self._realtime_args()
         cfg = ROOT / "config" / "sphere_config.json"
         if cfg.exists():
             cmd += ["--config", str(cfg)]

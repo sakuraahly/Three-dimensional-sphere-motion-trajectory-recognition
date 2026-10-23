@@ -40,6 +40,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker import camera_registry as cr  # noqa: E402
+from sphere_tracker import video_profiles  # noqa: E402
 from apps._window import WindowManager  # noqa: E402
 
 from sphere_tracker.sources import (  # noqa: E402
@@ -1075,9 +1076,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     pd = sub.add_parser(
         "doctor", help="**真开相机**体检一遍：现在能不能跑双目（只报告，不改配置）")
-    pd.add_argument("--width", type=int, default=1920,
-                    help="目标宽度（默认 1920 —— 本机实测只有这个值两路才可能一致）")
-    pd.add_argument("--height", type=int, default=1080, help="目标高度（默认 1080）")
+    pd.add_argument("--width", type=int, default=video_profiles.DEFAULT.width,
+                    help=f"目标宽度（默认档 {video_profiles.DEFAULT.label}）")
+    pd.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
+                    help=f"目标高度（默认档 {video_profiles.DEFAULT.label}）")
     pd.set_defaults(func=cmd_doctor)
     return p
 
