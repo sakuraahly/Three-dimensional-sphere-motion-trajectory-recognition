@@ -378,6 +378,31 @@ apps / tests                        （只调用，不被调用）
 本会话没有 `teams` 插件；用 `subagent` / `workflow` 实现并行。
 没有子 agent 工具时主 agent 自己做，**不许假装调用**。
 
+### 11.6 团队角色（全局 §十五 的项目落地）
+
+所有派发必须遵守全局 `~/.dsh/AGENTS.md` §十五；本项目只补充映射，不复制：
+
+| 角色 | 本项目默认谁 |
+| --- | --- |
+| **Leader** | 主 agent（拆任务、定接口、集成、验收、commit） |
+| **Executor / Specialist** | 子 agent（GUI、标定/几何、录制、检测、文档各一条线） |
+| **Critic / Verifier** | 独立子 agent，默认只读；**不能由实现者兼** |
+| **Arbiter** | 低/中风险主 agent；硬件/4K/数据/权限风险交给用户 |
+| **Human** | 用户；全局规则、删除数据、换硬件、标定/采集策略变更必须批准 |
+| **Memory** | 负责更新 `docs/交接文档.md` / `docs/决策记录.md` 的子 agent |
+
+硬规则：
+
+- 每次派发写清 `Role / Goal / Allowed / Forbidden / Acceptance / Deadline / Conflict / Reuse / Return`；
+- 同一文件同一时间只有一个写者；Critic 只读；Critic 不得与实现者合并，即使极小文案也要非实现者签字；
+- 代码/契约变更的“通过”必须由独立 Critic 给出 `PASS/FAIL/BLOCKED`；Critic 若参与修复，必须换另一个 Critic 复评；
+- 主 agent 不把“子 agent 说完成”当验收，必须看产物、跑集成测试、自己提交；
+- 复用已有 agent：同一领域/上下文优先用原 id，记录“复用/新建 + 理由”；
+- 高风险/不可逆操作先问用户，不转嫁给子 agent。
+
+> 2026-10-23 用户明确指定主 agent 为 Leader，并批准把本规则写入全局 §十五。
+
+
 ---
 
 ## 附：`.bat` 正文的两条硬约定（踩过，别再来一次）
