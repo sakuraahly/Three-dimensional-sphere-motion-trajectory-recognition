@@ -122,6 +122,9 @@ class RoleSpec:
     name: str = ""
     index: int | None = None
     verified: bool = False
+    # OpenCV/MSMF 实际设备索引（与 PnP 枚举序号可能不同）。
+    # 只有 identity/port/name 仍匹配到设备后才覆盖 entry.order；None = 旧逻辑。
+    capture_index: int | None = None
 
 
 @dataclass
@@ -1016,12 +1019,15 @@ def load_registry(path: str | Path | None = None) -> Registry:
             if not isinstance(spec, dict):
                 continue
             idx = spec.get("index")
+            cap = spec.get("capture_index")
             roles[str(name)] = RoleSpec(
                 identity=str(spec.get("identity") or ""),
                 port=str(spec.get("port") or ""),
                 name=str(spec.get("name") or ""),
                 index=int(idx) if isinstance(idx, (int, float)) else None,
                 verified=bool(spec.get("verified", False)),
+                capture_index=(int(cap) if isinstance(cap, (int, float))
+                               and not isinstance(cap, bool) and int(cap) >= 0 else None),
             )
     settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
     return Registry(v=int(data.get("v") or 1), roles=roles,
@@ -1040,12 +1046,15 @@ def _parse_spec_list(raw) -> list[RoleSpec]:
         if not isinstance(spec, dict):
             continue
         idx = spec.get("index")
+        cap = spec.get("capture_index")
         out.append(RoleSpec(
             identity=str(spec.get("identity") or ""),
             port=str(spec.get("port") or ""),
             name=str(spec.get("name") or ""),
             index=int(idx) if isinstance(idx, (int, float)) else None,
             verified=bool(spec.get("verified", False)),
+            capture_index=(int(cap) if isinstance(cap, (int, float))
+                           and not isinstance(cap, bool) and int(cap) >= 0 else None),
         ))
     return out
 
@@ -1085,12 +1094,21 @@ def set_role(
     **不变量要留在拥有数据的模块里。** 这里按 identity/port/编号三种口径
     都清一遍，任何调用顺序都不会留下矛盾状态。
     """
+    old = reg.roles.get(str(role))
+    new_identity = entry.identity if entry else ""
+    old_capture = old.capture_index if old is not None else None
+    same_identity = bool(old and old.identity and new_identity
+                         and old.identity == new_identity)
+    if old_capture is not None and not same_identity:
+        print(f"[警告] 「{role}」的 identity 已变化，原 capture_index="
+              f"{old_capture} 已清空；请重新确认本机 MSMF 索引。")
     spec = RoleSpec(
-        identity=entry.identity if entry else "",
+        identity=new_identity,
         port=entry.port if entry else "",
         name=entry.name if entry else "",
         index=index if index is not None else (entry.order if entry else None),
         verified=verified,
+        capture_index=old_capture if same_identity else None,
     )
     reg.roles[str(role)] = spec
 
@@ -1375,25 +1393,41 @@ def resolve_roles(
     if devices is None:
         devices = list_devices()
     out: dict[str, ResolvedCamera] = {}
+    # taken 记录**实际生效**的索引（capture_index 优先于 entry.order），
+    # 用于拒绝两个角色落到同一路；claimed_pnp 只用于 _match_entry 排除
+    # 已被认领的 PnP 设备，避免把实际索引和 PnP 序号混在一起。
     taken: set[int] = set()
+    claimed_pnp: set[int] = set()
     for role in roles:
         spec = reg.roles.get(str(role))
         if spec is None:
             continue
-        entry, how = _match_entry(spec, devices, taken=taken)
+        entry, how = _match_entry(spec, devices, taken=claimed_pnp)
         if entry is not None:
-            taken.add(entry.order)
+            index = spec.capture_index if spec.capture_index is not None else entry.order
+            if index in taken:
+                raise RuntimeError(
+                    f"「{role}」的实际采集索引 #{index} 与其他角色冲突；"
+                    f"检查 capture_index 是否重复，或重新 identify。")
+            taken.add(index)
+            claimed_pnp.add(entry.order)
             warns = ()
             if is_device_ignored(entry, reg):
                 warns = (f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
                          f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。",)
-            out[str(role)] = ResolvedCamera(role=str(role), index=entry.order, how=how,
+            out[str(role)] = ResolvedCamera(role=str(role), index=index, how=how,
                                             entry=entry, warnings=warns)
         else:
-            out[str(role)] = resolve_role(role, reg=reg, devices=devices,
-                                          interactive=interactive)
-            if out[str(role)].index is not None:
-                taken.add(int(out[str(role)].index))
+            resolved = resolve_role(role, reg=reg, devices=devices,
+                                    interactive=interactive)
+            if resolved.index is not None:
+                if int(resolved.index) in taken:
+                    raise RuntimeError(
+                        f"「{role}」的实际采集索引 #{resolved.index} 与其他角色冲突；"
+                        f"检查 capture_index / 索引配置，或重新 identify。")
+                taken.add(int(resolved.index))
+                claimed_pnp.add(int(resolved.index))
+            out[str(role)] = resolved
     return out
 
 
@@ -1490,7 +1524,8 @@ def resolve_role(
         if is_device_ignored(entry, reg):
             warns = (f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
                      f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。",)
-        return ResolvedCamera(role=str(role), index=entry.order, how=how, entry=entry,
+        index = spec.capture_index if spec.capture_index is not None else entry.order
+        return ResolvedCamera(role=str(role), index=index, how=how, entry=entry,
                               warnings=warns)
 
     expected = []

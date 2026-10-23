@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +48,7 @@ from sphere_tracker.camera_registry import (  # noqa: E402
     rank_candidates,
     resolve_camera_arg,
     resolve_role,
+    resolve_roles,
     role_of_device,
     save_registry,
     select_cameras,
@@ -72,9 +75,10 @@ def sample_devices():
     ]
 
 
-def role(identity="", port="", name="", index=None, verified=False):
+def role(identity="", port="", name="", index=None, verified=False,
+         capture_index=None):
     return RoleSpec(identity=identity, port=port, name=name, index=index,
-                    verified=verified)
+                    verified=verified, capture_index=capture_index)
 
 
 def registry_with(left: RoleSpec | None = None, right: RoleSpec | None = None,
@@ -347,6 +351,52 @@ def test_resolve_camera_arg() -> bool:
                    resolve_camera_arg("port:Port_#0002", devices=devs) == 2))
     checks.append(("'id:USB\\B' -> 2",
                    resolve_camera_arg("id:USB\\B", devices=devs) == 2))
+    checks.append(("旧配置无 capture_index = None",
+                   reg.roles["left"].capture_index is None))
+
+    cap_reg = registry_with(left=role(identity="USB\\A", capture_index=2))
+    cap_role = resolve_role("left", cap_reg, devs, interactive=False)
+    checks.append(("capture_index 覆盖 identity 命中的 PnP 索引",
+                   cap_role.index == 2 and cap_role.entry is not None
+                   and cap_role.entry.order == 1 and cap_role.how == "identity"))
+    checks.append(("resolve_camera_arg 使用 capture_index",
+                   resolve_camera_arg("left", reg=cap_reg, devices=devs) == 2))
+
+    both = registry_with(left=role(identity="USB\\A", capture_index=2),
+                         right=role(identity="USB\\B", capture_index=0))
+    resolved = resolve_roles(["left", "right"], both, devs, interactive=False)
+    checks.append(("resolve_roles 使用 capture_index (left=2/right=0)",
+                   resolved["left"].index == 2 and resolved["right"].index == 0))
+    checks.append(("left/right capture index 不相等",
+                   resolved["left"].index != resolved["right"].index))
+
+    miss = registry_with(left=role(identity="USB\\ZZZ", index=1,
+                                   verified=False, capture_index=2))
+    miss_role = resolve_role("left", miss, devs, interactive=False)
+    checks.append(("identity 不匹配时 capture_index 不生效",
+                   miss_role.index == 1 and miss_role.how == "index-fallback"))
+
+    collide = registry_with(left=role(identity="USB\\A", capture_index=2),
+                            right=role(identity="USB\\B", capture_index=2))
+    try:
+        resolve_roles(["left", "right"], collide, devs, interactive=False)
+        checks.append(("capture_index 冲突 -> 报错", False))
+    except RuntimeError as exc:
+        checks.append(("capture_index 冲突 -> 报错",
+                       "冲突" in str(exc) and "#2" in str(exc)))
+
+    pin_reg = Registry()
+    set_role(pin_reg, "left", entry=devs[1], index=1, verified=True)
+    pin_reg.roles["left"].capture_index = 2
+    set_role(pin_reg, "left", entry=devs[1], index=1, verified=True)
+    checks.append(("set_role 同 identity 保留 capture_index",
+                   pin_reg.roles["left"].capture_index == 2))
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        set_role(pin_reg, "left", entry=devs[2], index=2, verified=True)
+    checks.append(("set_role 换 identity 清空并警告",
+                   pin_reg.roles["left"].capture_index is None
+                   and "capture_index" in buf.getvalue()))
 
     try:
         resolve_camera_arg("nosuchrole", reg=reg, devices=devs, interactive=False)
@@ -383,6 +433,7 @@ def test_config_roundtrip(tmp: Path) -> bool:
     reg = Registry(settings={"prefer_external": True, "min_width": 640})
     set_role(reg, "left", entry=sample_devices()[1], index=1, verified=True)
     set_role(reg, "right", entry=sample_devices()[2], index=2, verified=False)
+    reg.roles["left"].capture_index = 2
     save_registry(reg, path)
 
     back = load_registry(path)
@@ -394,6 +445,9 @@ def test_config_roundtrip(tmp: Path) -> bool:
          and back.roles["left"].index == 1),
         ("verified 往返一致（left 确认 / right 未确认）",
          back.roles["left"].verified and not back.roles["right"].verified),
+        ("capture_index 往返一致（left=2 / right=None）",
+         back.roles["left"].capture_index == 2
+         and back.roles["right"].capture_index is None),
         ("settings 保留", back.settings.get("min_width") == 640),
         ("文件不存在 -> 空 Registry 不抛", len(load_registry(tmp / "nope.json").roles) == 0),
     ]
