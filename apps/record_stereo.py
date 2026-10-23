@@ -354,8 +354,8 @@ def main() -> int:
     ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
     ap.add_argument("--width", type=int, default=RECORD_DEFAULT.width,
-                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时 1440 录制吞吐需实测，"
-                         "HFYU 可能达不到 30fps）")
+                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时短测约30fps、"
+                         "10秒约2.2GB，但长录/目标机型/主循环未验证）")
     ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
                     help=f"录制高度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时见 --width 提示）")
     ap.add_argument("--fps", type=int, default=30, help="请求帧率（相机实测只有约 27–30）")
@@ -378,8 +378,8 @@ def main() -> int:
     args = ap.parse_args()
 
     if (args.width, args.height) == (2560, 1440):
-        print("[警告] 1440 录制吞吐需实测，HFYU 可能达不到 30fps；确认后继续。")
-        LOG.warning("显式 2560x1440：1440 录制吞吐需实测，HFYU 可能达不到 30fps")
+        print("[警告] 1440p 双路短测约30fps、10秒约2.2GB；长录/目标机型/主循环未验证。")
+        LOG.warning("显式 2560x1440：短测约30fps、10秒约2.2GB；长录/目标机型/主循环未验证")
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")
