@@ -115,6 +115,24 @@ def _cam_arg(raw: str) -> str:
     return m.group(1) if m else (raw or "").strip()
 
 
+def _resolved_entry(resolved, by_order):
+    """`ResolvedCamera` 对应的 PnP 设备（`DeviceEntry`）；拿不到返回 None。
+
+    ## 为什么必须有这一层（2026-10-23 修的真实误报）
+    `ResolvedCamera.index` 现在是**采集索引**（OpenCV/MSMF 实际索引），
+    而 `ResolvedCamera.entry` 才是 PnP 设备 —— 两者**可以不同**。
+    本机实测：`Web Camera Left` 是采集 #2，但它的 PnP 序号是 #0。
+    按采集索引去 `by_order` 里查，会拿到 PnP #2 `Integrated IR Camera`，
+    于是外接相机被误报成「内置/红外」，用户差点去换相机。
+
+    所以**优先用 `entry`**；只有 `entry is None`（索引兜底 / 手动编号）时，
+    才退回按 `index` 查 —— 那是旧行为，也是唯一没有 PnP 身份可用的场景。
+    """
+    if resolved.entry is not None:
+        return resolved.entry
+    return by_order.get(resolved.index)
+
+
 # --------------------------------------------------------------------------- #
 # 任务：启动器跑起来的每一个外部程序
 # --------------------------------------------------------------------------- #
@@ -1507,12 +1525,18 @@ class Launcher(tk.Tk):
                 continue
             for w in (r.warnings or ()):
                 self._append(f"[相机] {w}")
-            entry = by_order.get(r.index)
+            entry = _resolved_entry(r, by_order)
             name = entry.name if entry else ""
+            # 采集索引 ≠ PnP 序号时**两个都写出来**：只写一个会被读成
+            # `Web Camera Left（采集 #2）` 就是 `PnP #2 Integrated IR Camera`。
+            if entry is not None and entry.order != r.index:
+                where = f"{name or '未知名'}（PnP #{entry.order}；采集 #{r.index}）"
+            else:
+                where = f"{name or '未知名'}（编号 {r.index}）"
             if cr.is_avoided(name):
                 return messagebox.askyesno(
                     "确认用内置 / 红外相机？",
-                    f"{role}相机（编号 {r.index}，{name or '未知名'}）看起来是笔记本内置或红外相机，"
+                    f"{role}相机 {where}看起来是笔记本内置或红外相机，"
                     "不适合做双目：它没法固定在同一根横梁上，装置一动标定结果就作废。\n\n"
                     "双目请用外接相机。确定仍要继续吗？")
 
@@ -1522,7 +1546,7 @@ class Launcher(tk.Tk):
             r = resolved.get(role)
             if r is None:
                 continue
-            e = by_order.get(r.index)
+            e = _resolved_entry(r, by_order)
             sizes[role] = (e.name if e else "", r.index)
         if len({v[1] for v in sizes.values()}) < len(sizes):
             messagebox.showerror(

@@ -1132,6 +1132,40 @@ def main() -> int:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))
 
+    # ---- 15. 相机角色解析：采集索引 ≠ PnP 序号（2026-10-23 修的真实误报）----
+    #
+    # 真实缺陷：`Web Camera Left` 的**采集索引**是 2，而它的 **PnP 序号是 0**。
+    # 旧代码拿采集 #2 去 `by_order` 里查 PnP 设备，命中的是 PnP #2
+    # `Integrated IR Camera`，于是**外接相机被误报成「内置/红外」**，
+    # 用户差点去换一台好相机。这里钉两层：有 entry 时**必须**用 entry；
+    # 只有 entry 缺失（索引兜底 / 手动编号）时才按 index 查（旧行为）。
+    print("----- 15. 相机角色解析：采集索引 ≠ PnP 序号（不许混用）-----")
+    from sphere_tracker.camera_registry import DeviceEntry, ResolvedCamera
+
+    pnp_left = DeviceEntry(order=0, name="Web Camera Left")
+    pnp_ir = DeviceEntry(order=2, name="Integrated IR Camera")
+    by_order = {pnp_left.order: pnp_left, pnp_ir.order: pnp_ir}
+    resolved_real = ResolvedCamera(role="left", index=2, how="identity",
+                                   entry=pnp_left)
+    got_real = mod._resolved_entry(resolved_real, by_order)
+    resolved_fallback = ResolvedCamera(role="left", index=2, how="index-fallback")
+    got_fallback = mod._resolved_entry(resolved_fallback, {2: pnp_left})
+    checks_entry = [
+        ("采集 #2 且带 entry -> 返回 entry（不是 PnP #2）",
+         got_real is pnp_left),
+        ("名字取 entry.name（Web Camera Left，不是 Integrated IR Camera）",
+         (got_real.name if got_real else "") == "Web Camera Left"
+         and "Integrated" not in (got_real.name if got_real else "")),
+        ("entry 缺失 -> 按 index 兜底（旧行为仍可用）",
+         got_fallback is pnp_left),
+        ("_confirm_stereo_cameras 已改走 helper（不再按采集索引查 PnP）",
+         "by_order.get(r.index)" not in launcher_src
+         and launcher_src.count("_resolved_entry(r, by_order)") >= 2),
+    ]
+    for name, passed in checks_entry:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        results.append((name, passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
