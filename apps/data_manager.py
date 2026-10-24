@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -64,6 +66,131 @@ def _parse_dt(text: str, end: bool = False) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+# ----------------------------------------------------------------------
+# 会话元数据编辑（改名 / 改备注）
+#
+# 与 `apps/_cleanup.py` 同一套安全习惯：只认 sessions 根目录的**直接子目录**，
+# 拒绝 `..`、绝对路径与符号链接逃逸；写之前**必须**留一份备份，
+# 再写同目录临时文件 `os.replace` 原子替换。**绝不**直接 `json.dump` 覆盖。
+# ----------------------------------------------------------------------
+SESSIONS_ROOT = ROOT / "data" / "sessions"
+BAK_PREFIX = "session.json.bak-"
+
+
+def _sessions_root(sessions_root: Path | str | None) -> Path:
+    root = Path(sessions_root) if sessions_root is not None else SESSIONS_ROOT
+    root = root.resolve()
+    if not root.is_dir():
+        raise ValueError(f"sessions 根目录不存在：{root}；先用『数据目录…』确认位置")
+    return root
+
+
+def _resolve_session_dir(session_dir: Path | str,
+                         sessions_root: Path | str | None = None) -> tuple[Path, Path]:
+    """校验并返回 (会话目录, session.json)；越界/符号链接一律 ValueError。"""
+    root = _sessions_root(sessions_root)
+    raw = Path(session_dir)
+    if raw.is_symlink():
+        raise ValueError(f"拒绝编辑符号链接：{raw}")
+    p = raw.resolve()
+    if p == root or not p.is_relative_to(root):
+        raise ValueError(f"只能编辑 {root} 下的会话，收到：{p}")
+    if p.parent != root:
+        raise ValueError(f"只支持 sessions 根目录的直接子目录（不许嵌套/`..`）：{p}")
+    if not p.is_dir():
+        raise ValueError(f"会话目录不存在：{p}")
+    jf = p / "session.json"
+    if jf.is_symlink():
+        raise ValueError(f"拒绝编辑符号链接：{jf}")
+    if not jf.is_file():
+        raise ValueError(f"这条会话没有 session.json：{jf}")
+    return p, jf
+
+
+def latest_backup(session_dir: Path | str) -> Path | None:
+    """返回该会话最近一次 `session.json.bak-*`，没有就 None。"""
+    try:
+        cands = sorted(Path(session_dir).glob(BAK_PREFIX + "*"),
+                       key=lambda q: q.stat().st_mtime)
+    except OSError:
+        return None
+    return cands[-1] if cands else None
+
+
+def _backup_file(jf: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = jf.with_name(f"{BAK_PREFIX}{stamp}")
+    n = 2
+    while dest.exists():
+        dest = jf.with_name(f"{BAK_PREFIX}{stamp}-{n}")
+        n += 1
+    try:
+        shutil.copy2(jf, dest)
+    except OSError as exc:
+        raise OSError(
+            f"备份失败，文件名未改动：{dest}（{exc}）；"
+            "检查磁盘空间/文件是否被占用后重试") from exc
+    return dest
+
+
+def update_session_meta(session_dir: Path, *, label: str | None = None,
+                        notes: str | None = None,
+                        sessions_root: Path | str | None = None) -> dict:
+    """改 `session.json` 的 label / notes，其余键原样保留。
+
+    - `label=None` 表示不改；`label=""`（或全是空白）**拒绝**：会话必须有名字；
+    - `notes=""` 合法：清空备注；
+    - 写前备份成 `session.json.bak-<YYYYmmdd-HHMMSS>`，再原子替换；
+    - 失败抛 ValueError/OSError，消息里带原因与下一步。
+    """
+    if label is not None:
+        if not isinstance(label, str):
+            raise ValueError(f"label 必须是字符串，收到 {type(label).__name__}")
+        if not label.strip():
+            raise ValueError("会话名称不能为空；填一个能认出来的名字再保存"
+                             "（比如『金属球-左路虚』）")
+    if notes is not None and not isinstance(notes, str):
+        raise ValueError(f"notes 必须是字符串，收到 {type(notes).__name__}")
+
+    _dir, jf = _resolve_session_dir(session_dir, sessions_root)
+    try:
+        text = jf.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise OSError(f"读不了 {jf}：{exc}；文件未改动") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{jf} 不是合法 JSON（第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}）；"
+            "文件未做任何改动，先修好它或从 session.json.bak-* 恢复再改") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{jf} 顶层不是 JSON 对象，拒绝改动")
+
+    if label is not None:
+        data["label"] = label
+    if notes is not None:
+        data["notes"] = notes
+
+    backup = _backup_file(jf)
+    tmp = jf.with_name(f"{jf.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, allow_nan=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, jf)
+    except (OSError, ValueError) as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise type(exc)(
+            f"写入 {jf} 失败：{exc}；原文件还在，备份在 {backup}") from exc
+    return data
 
 
 class DataManager(tk.Tk):
@@ -120,6 +247,9 @@ class DataManager(tk.Tk):
         ttk.Entry(toolbar, textvariable=self.to_var, width=17).pack(side="left", padx=(2, 4))
         ttk.Button(toolbar, text="按时间选择", command=self.select_time).pack(side="left")
         ttk.Button(toolbar, text="清除时间", command=self.clear_time).pack(side="left", padx=4)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(toolbar, text="编辑名称/备注…", command=self._edit_selected).pack(
+            side="left")
         ttk.Label(toolbar, text="格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS",
                   foreground=MUTED).pack(side="left", padx=8)
 
@@ -131,15 +261,15 @@ class DataManager(tk.Tk):
         body.add(left, weight=4)
         body.add(right, weight=1)
 
-        cols = ("sel", "id", "created", "frames", "mode", "status", "size")
-        heads = ("选", "会话", "时间", "帧", "模式", "状态", "大小")
-        widths = (34, 170, 145, 75, 70, 50, 95)
+        cols = ("sel", "id", "name", "created", "frames", "mode", "status", "size")
+        heads = ("选", "会话", "名称", "时间", "帧", "模式", "状态", "大小")
+        widths = (34, 150, 150, 140, 70, 66, 46, 90)
         self.tree = ttk.Treeview(left, columns=cols, show="headings",
                                  selectmode="extended", height=18)
         for c, h, w in zip(cols, heads, widths):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, minwidth=w, anchor="w",
-                             stretch=(c in {"id", "created"}))
+                             stretch=(c in {"id", "name", "created"}))
         self.tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         sb.pack(side="right", fill="y")
@@ -223,11 +353,22 @@ class DataManager(tk.Tk):
             size = _fmt_bytes(it.size_bytes)
             self.tree.insert("", "end", iid=it.key,
                              values=("☑" if it.key in self.selected else "☐",
-                                     it.id, it.created,
+                                     it.id, self._session_name(it),
+                                     it.created,
                                      f"{it.frames_left}/{it.frames_right}",
                                      "大角度" if it.stereo_mode == "angled" else "平行",
                                      it.symbol, size))
         self._refresh_count()
+
+    @staticmethod
+    def _session_name(it: SessionItem) -> str:
+        """列表里显示 session.json 的 label；坏文件就留空，不挡住列表。"""
+        try:
+            meta = json.loads((it.path / "session.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        label = meta.get("label") if isinstance(meta, dict) else None
+        return label if isinstance(label, str) else ""
 
     def _refresh_count(self) -> None:
         chosen = [it for it in self.items if it.key in self.selected]
@@ -459,6 +600,67 @@ class DataManager(tk.Tk):
             return
         CleanupDialog(self, self.root_dir, [it.path for it in chosen],
                       on_done=self.refresh)
+
+    # ------------------------------------------------------------------
+    def _edit_selected(self) -> None:
+        it = self._focused_item()
+        if it is None:
+            self.status.configure(text="先在列表里选一个会话")
+            return
+        jf = it.path / "session.json"
+        try:
+            meta = json.loads(jf.read_text(encoding="utf-8"))
+            if not isinstance(meta, dict):
+                raise ValueError("session.json 顶层不是 JSON 对象")
+        except (OSError, ValueError) as exc:
+            self.status.configure(text=f"读不了 {it.id}/session.json：{exc}")
+            messagebox.showerror("编辑名称/备注", f"{jf}\n\n{exc}", parent=self)
+            return
+        cur_label = meta.get("label") if isinstance(meta.get("label"), str) else ""
+        cur_notes = meta.get("notes") if isinstance(meta.get("notes"), str) else ""
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"编辑名称/备注 · {it.id}")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=f"会话 {it.id}（{it.path}）", foreground=MUTED,
+                  wraplength=430).pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, text="名称（必填）").pack(anchor="w")
+        label_var = tk.StringVar(value=cur_label)
+        label_entry = ttk.Entry(body, textvariable=label_var, width=52)
+        label_entry.pack(fill="x", pady=(2, 8))
+        ttk.Label(body, text="备注（可留空）").pack(anchor="w")
+        notes_var = tk.StringVar(value=cur_notes)
+        ttk.Entry(body, textvariable=notes_var, width=52).pack(fill="x", pady=(2, 8))
+        ttk.Label(body, text="保存前自动备份成 session.json.bak-<时间>。",
+                  foreground=MUTED).pack(anchor="w", pady=(0, 8))
+        bar = ttk.Frame(body)
+        bar.pack(fill="x")
+
+        def save() -> None:
+            try:
+                update_session_meta(it.path, label=label_var.get(),
+                                    notes=notes_var.get(),
+                                    sessions_root=self.root_dir)
+            except (ValueError, OSError) as exc:
+                # 原始原因照实显示，不吞
+                self.status.configure(text=f"没改成 {it.id}：{exc}")
+                messagebox.showerror("编辑名称/备注", str(exc), parent=dlg)
+                return
+            bak = latest_backup(it.path)
+            dlg.destroy()
+            self.refresh()
+            self.tree.focus(it.key)
+            self.status.configure(
+                text=f"已更新 {it.id}（备份：{bak.name if bak else '未找到'}）")
+            self._log_line(f"改元数据：{it.id}  名称={label_var.get()!r}")
+
+        ttk.Button(bar, text="确定", command=save).pack(side="right")
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=(0, 6))
+        label_entry.focus_set()
+        dlg.grab_set()
 
     # ------------------------------------------------------------------
     def browse_output(self) -> None:

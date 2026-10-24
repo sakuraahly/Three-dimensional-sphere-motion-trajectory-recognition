@@ -1221,6 +1221,87 @@ def main() -> int:
         print(f"  [{'通过' if passed else '不达标'}] {name}")
         results.append((name, passed))
 
+    print("----- 17. 会话改名/改备注（备份 + 原子替换 + 路径安全）-----")
+    import hashlib
+
+    from apps.data_manager import latest_backup, update_session_meta
+    with tempfile.TemporaryDirectory(prefix="dsh_meta_") as tmp:
+        mroot = Path(tmp) / "sessions"
+        md = mroot / "20260102-120000"
+        md.mkdir(parents=True)
+        original = {
+            "schema": "sphere-stereo-session", "version": 1, "id": md.name,
+            "created": "2026-01-02 12:00:00", "label": "GUI 录制",
+            "notes": "GUI 录制", "left": {"frame_count": 7},
+            "right": {"frame_count": 7}, "checks": ["a", "b"],
+        }
+        mjf = md / "session.json"
+        mjf.write_text(json.dumps(original, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        md5_before = hashlib.md5(mjf.read_bytes()).hexdigest()
+        bak_before = set(p.name for p in md.glob("session.json.bak-*"))
+
+        renamed = update_session_meta(md, label="金属球-左路虚", notes="90度装置",
+                                      sessions_root=mroot)
+        after = json.loads(mjf.read_text(encoding="utf-8"))
+        other_keys_same = all(after.get(k) == v for k, v in original.items()
+                              if k not in ("label", "notes"))
+        key_order_same = list(after.keys()) == list(original.keys())
+        bak = latest_backup(md)
+        bak_ok = (bak is not None and bak.name.startswith("session.json.bak-")
+                  and bak.name not in bak_before
+                  and bak.read_text(encoding="utf-8") == json.dumps(
+                      original, ensure_ascii=False, indent=2))
+        cleared = update_session_meta(md, notes="", sessions_root=mroot)
+        notes_cleared = json.loads(mjf.read_text(encoding="utf-8")).get("notes") == ""
+        empty_rejected = False
+        try:
+            update_session_meta(md, label="", sessions_root=mroot)
+        except ValueError:
+            empty_rejected = True
+        broke = md.parent / "20260103-120000"
+        broke.mkdir()
+        (broke / "session.json").write_text('{"label": "坏了",}', encoding="utf-8")
+        md5_bad_before = hashlib.md5((broke / "session.json").read_bytes()).hexdigest()
+        bad_json_kept = False
+        try:
+            update_session_meta(broke, label="x", sessions_root=mroot)
+        except ValueError:
+            bad_json_kept = (hashlib.md5(
+                (broke / "session.json").read_bytes()).hexdigest() == md5_bad_before)
+        escape_rejected = False
+        try:
+            update_session_meta(mroot / ".." / "outside", label="x",
+                                sessions_root=mroot)
+        except ValueError:
+            escape_rejected = True
+        outside_dir = Path(tmp) / "outside"
+        outside_dir.mkdir()
+        absolute_rejected = False
+        try:
+            update_session_meta(outside_dir, label="x", sessions_root=mroot)
+        except ValueError:
+            absolute_rejected = True
+        checks_meta = [
+            ("改名成功且 label/notes 落盘",
+             renamed.get("label") == "金属球-左路虚"
+             and renamed.get("notes") == "90度装置" and after["label"] == "金属球-左路虚"),
+            ("其它键逐键不变、顺序不变", other_keys_same and key_order_same),
+            ("备注清空（空串）成功", notes_cleared),
+            ("空 label 被拒", empty_rejected),
+            ("坏 JSON 被拒且文件一字未改（md5 相同）", bad_json_kept),
+            (f"备份已生成且内容=原件（{bak.name if bak else '无'}）", bak_ok),
+            ("`../xxx` 路径逃逸被拒", escape_rejected),
+            ("sessions 根之外绝对路径被拒", absolute_rejected),
+        ]
+        for name, passed in checks_meta:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
+        print(f"    改名前 md5={md5_before}  现在 md5="
+              f"{hashlib.md5(mjf.read_bytes()).hexdigest()}")
+        print(f"    备注清空后 notes={json.loads(mjf.read_text(encoding='utf-8'))['notes']!r}")
+        print(f"    备份文件：{[p.name for p in sorted(md.glob('session.json.bak-*'))]}")
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:

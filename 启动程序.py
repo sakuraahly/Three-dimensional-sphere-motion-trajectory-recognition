@@ -459,6 +459,11 @@ class Launcher(tk.Tk):
                   bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
                   font=("Microsoft YaHei UI", 10, "bold")).pack(
             anchor="e", pady=(6, 0))
+        # 改名/改备注只在『数据管理』里做（那里能选中会话、看到当前值），
+        # 启动器不再摆第二套入口 —— 这里只负责把"能做什么"说清楚。
+        tk.Label(actions, text="可改名 / 改备注 · 清理 · 脱敏导出",
+                 bg=ACCENT, fg="#bfdbfe", wraplength=220, justify="right",
+                 font=("Microsoft YaHei UI", 8)).pack(anchor="e", pady=(2, 0))
 
         # ---- 常驻装置状态条（P0-1）----
         # 为什么单开一行而不是塞进标题右侧：这一行会随档案变化（名称 / 模式 /
