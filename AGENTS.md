@@ -250,13 +250,20 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 8. 提交规范
+## 8. 提交与分支规范（LTS）
 
 - **commit message 用英文**，`type: 简洁描述变更意图`。
   type ∈ `feat` / `fix` / `refactor` / `test` / `perf` / `docs` / `chore` / `style`。
 - **一个 bug 一个提交**；重构与修 bug 不混。
+- **`main` 只放已验收的 LTS**：禁止直接开发/直接提交。
+  - 旧成熟版 = `v1.0-lts` / `2945252`（`lts/1080`）；
+  - 新相机开发 = `dev/hd-camera`（当前分支）；
+  - 功能/修复从 dev 切 `feature/*` / `fix/*`，合回 dev；
+  - 发布候选走 `release/*`，验收通过后**必须征询用户批准**，才能合并 `main` 并打 `vX.Y.Z-lts`。
+- 合并前门禁：全量测试 23/23、`check_standards`、独立 Critic、真机证据、交接/决策文档。
 - **`git push` 只在用户明确要求时执行**（仅用于跨设备同步）。
 - 提交前必须：跑验证 → 工作区干净 → 无密钥。
+- 详细规则：`docs/Git分支与发布规范.md`。
 
 ---
 
