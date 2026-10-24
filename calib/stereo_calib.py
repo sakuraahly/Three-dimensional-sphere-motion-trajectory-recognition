@@ -22,12 +22,36 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from . import relative_pose
 from .board import BoardSpec
+
+# 联合求解（`stereoCalibrate`）在 angled 下**至少**需要这么多对共视数据。
+#
+# 依据：外参只有 6 个自由度（3 旋转 + 3 平移），3 对共视数据在代数上"勉强可解"，
+# 但宽基线（90°、几十厘米）从零优化时，代价面的谷底极窄 —— 3 对的角点噪声
+# 足以把解推到完全不同的局部极小，而重投影 RMS 仍然好看（合成实验里 3 px 的
+# 真实误差可以报成 0.24 px）。8 对是"每个自由度至少有一个以上独立观测"的
+# 最低经验线；低于它必须拒绝出数，而不是加一条警告继续跑。
+MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED = 8
+
+# chain 方法的重复性门限（T_AB 多次测量的离散度）
+CHAIN_ROT_GOOD_DEG = 0.5      # 优秀
+CHAIN_ROT_OK_DEG = 1.5        # 可用
+CHAIN_TRANS_GOOD_MM = 2.0
+CHAIN_TRANS_OK_MM = 5.0
 
 
 @dataclass
 class CalibConfig:
     """标定配置。默认值按"20-30 对图像、普通 USB 相机"调好的。"""
+
+    # ---- 外参求解方法（2026-10-24 加）----
+    #
+    # joint：`cv2.stereoCalibrate` 联合求解。前提是**同一块板同时出现在两路**，
+    #        只对平行/有充分共视的装置成立。
+    # chain：独立单目 + 刚性双板公共参考（T_{C_R←C_L} = T_{C_R←B}·T_{B←A}·T_{A←C_L}）。
+    #        不需要双目共视，90° 装置用它。
+    method: str = "joint"
 
     refine_intrinsics: bool = True     # 第 3 步：放开内参整体精化
     rational_model: bool = False       # 用 8 参数畸变模型（视角很广、畸变很大时再开）
@@ -66,6 +90,15 @@ class CalibConfig:
     expected_baseline_mm: float | None = None   # 若提供，用于检查标定是否离谱
     baseline_tolerance: float = 0.20            # 允许的相对偏差
 
+    def __post_init__(self) -> None:
+        # 非法方法名必须**立刻**报错：否则拼错成 "chna" 会悄悄走 joint 分支，
+        # 在 90° 装置上跑出一个看起来正常、其实无意义的解。
+        if self.method not in ("joint", "chain"):
+            raise ValueError(
+                f"CalibConfig.method={self.method!r} 非法：只支持 'joint' / 'chain'"
+                f"（joint=双目联合求解，需两路共视；chain=独立单目+刚性双板公共参考）"
+            )
+
 
 @dataclass
 class StereoCalibrationResult:
@@ -103,6 +136,28 @@ class StereoCalibrationResult:
     verdict: str = ""
     warnings: list[str] = field(default_factory=list)
     board_desc: str = ""
+    # ---- 外参求解方法（2026-10-24 加）----
+    method: str = "joint"
+    # "stereo_rectify"：R1/R2/P1/P2 由 cv2.stereoRectify 产出；
+    # "none_raw"：chain 产物 —— **未做极线校正**，R1=R2=I、P1/P2 只是
+    #             "去畸变 + 原坐标系"的投影矩阵，`Q` 为 None。
+    #
+    # ## 为什么不是 None（2026-10-24 改）
+    #
+    # 上一版把 chain 的 `P1/P2` 置 None，结果 `calib/params.py:rectify_maps()`
+    # 与 `stereo/triangulate.py` 一读就越界 —— "标出来了但三角化用不了"。
+    # 90° 下 stereoRectify 本来就不成立（重投影到共面会把图像拉成极端梯形），
+    # 但**三角化并不需要共面极线**：只要给出一致的 (K, R, T) 投影矩阵，
+    # `cv2.triangulatePoints` 直接可用。所以这里输出"未校正坐标系"的 P。
+    #
+    # ⚠️ 用它的地方必须知道：**极线不是水平的、视差与深度不是简单反比**，
+    #    任何依赖极线水平对齐/视差的逻辑（SGBM、`epipolar_error` 的 y 差口径）
+    #    都不适用。
+    rectification: str = "stereo_rectify"
+    consistency: dict = field(default_factory=dict)   # T_AB 重复性（仅 chain）
+    n_views_left: int = 0                              # chain：左路姿态数
+    n_views_right: int = 0                             # chain：右路姿态数
+    T_AB: np.ndarray | None = None                     # chain：两板刚性相对位姿 T_{B←A}
     # ---- 板占画面比例（2026-10-14 加）----
     # 为什么要有：实测那次标定**板只占画面 1.2%**，角点像素少、定位精度低，
     # 于是 RMS 0.91 px 超过 ok 门限 0.80 —— 而当时的判定只说
@@ -176,7 +231,46 @@ class StereoCalibrationResult:
             return float("nan")
         return float(np.sqrt(rel) * z_m * 1000.0)
 
+    def _report_chain(self) -> str:
+        """chain 的报告：**不写校正后极线 RMS**（90° 下这个数没有几何意义）。
+
+        取而代之的是 chain 真正能自查的三件事：
+        `||T||`（与卷尺值对照）、`T_AB` 的重复性、每路单目 RMS。
+        """
+        c = self.consistency or {}
+        lines = [
+            "=" * 62,
+            "双目标定结果（chain：独立单目 + 刚性双板公共参考）",
+            "=" * 62,
+            f"标定板        : {self.board_desc}",
+            f"图像尺寸      : {self.image_size[0]}x{self.image_size[1]}",
+            f"姿态数        : 左 {self.n_views_left} / 右 {self.n_views_right}"
+            f"（chain 不要求两路成对，也不要求共视）",
+            f"左目重投影 RMS: {self.err_left:.4f} px",
+            f"右目重投影 RMS: {self.err_right:.4f} px",
+            f"基线 ||T||    : {self.baseline_mm:.2f} mm",
+            f"T_AB 重复性   : n={c.get('n', 0)}  "
+            f"旋转最大偏离 {c.get('rot_max_deg', float('nan')):.3f}°  "
+            f"平移最大偏离 {c.get('trans_max_mm', float('nan')):.3f} mm",
+            f"两板间距      : {c.get('baseline_mm', float('nan')):.2f} mm"
+            f"（||T_AB||，用卷尺核对）",
+            "立体校正      : none_raw —— 未做极线校正；坐标即原始 left_camera 系；"
+            "任何依赖极线水平对齐/视差的方法都不适用",
+            "投影矩阵      : P1 = K1·[I|0]  P2 = K2·[R|T]（T 与三维点同单位，"
+            "本项目为 m；Q 为 None）",
+            "-" * 62,
+            f"判定          : {self.verdict}",
+        ]
+        for w in self.warnings:
+            lines.append(f"  ! {w}")
+        for s in self.suggestions:
+            lines.append(f"  → {s}")
+        lines.append("=" * 62)
+        return "\n".join(lines)
+
     def report(self) -> str:
+        if self.method == "chain":
+            return self._report_chain()
         lines = []
         lines.append("=" * 62)
         lines.append("双目标定结果")
@@ -333,6 +427,216 @@ def _as_imgpoints(pts: list[np.ndarray]) -> list[np.ndarray]:
     return [np.asarray(p, np.float32).reshape(-1, 1, 2) for p in pts]
 
 
+def calibrate_mono_points(objp, imgpoints, image_size, cfg: CalibConfig | None = None) -> dict:
+    """**单路**内参标定（chain 方法的左/右两支，GUI 侧也复用它）。
+
+    返回 dict：`K, D, rms, rvecs, tvecs, per_view, std`。
+    `per_view` 是逐图重投影 RMS，用来挑"这一路最可信的那一帧"作为链上的位姿。
+    """
+    cfg = cfg or CalibConfig()
+    n = len(imgpoints)
+    if n < 3:
+        raise ValueError(f"单目标定至少要 3 个姿态，实际只有 {n} 个")
+    obj = _as_objpoints(objp, n)
+    pts = _as_imgpoints(imgpoints)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-7)
+    flags = 0
+    if cfg.rational_model:
+        flags |= cv2.CALIB_RATIONAL_MODEL
+    if cfg.fix_principal_point:
+        flags |= cv2.CALIB_FIX_PRINCIPAL_POINT
+    out = cv2.calibrateCameraExtended(obj, pts, image_size, None, None,
+                                      criteria=criteria, flags=flags)
+    _ret, K, D, rvecs, tvecs, sdi, _sde, per_view = out
+    per_view = np.asarray(per_view, np.float64).ravel()
+    return {
+        "K": K, "D": D,
+        "rms": _rms(per_view),
+        "rvecs": [np.asarray(r, np.float64).reshape(3) for r in rvecs],
+        "tvecs": [np.asarray(t, np.float64).reshape(3) for t in tvecs],
+        "per_view": per_view,
+        "std": np.asarray(sdi, np.float64).ravel(),
+    }
+
+
+def board_pose_from_points(objp, corners, K, D) -> np.ndarray:
+    """由已检测的角点 + 内参，求**板在相机系**的位姿 `T_cam_A`（4x4）。"""
+    obj = np.asarray(objp, np.float64).reshape(-1, 3)
+    img = np.asarray(corners, np.float64).reshape(-1, 1, 2)
+    ok, rvec, tvec = cv2.solvePnP(obj, img, K, D, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok:
+        raise ValueError("solvePnP 失败：角点与板模型不匹配（检查行列数/角点顺序）")
+    R, _ = cv2.Rodrigues(rvec)
+    return relative_pose.rt_to_T(R, tvec.reshape(3))
+
+
+def _essential_fundamental(K1, K2, R, T) -> tuple[np.ndarray, np.ndarray]:
+    tx = np.array([[0.0, -T[2, 0], T[1, 0]],
+                   [T[2, 0], 0.0, -T[0, 0]],
+                   [-T[1, 0], T[0, 0], 0.0]], np.float64)
+    E = tx @ R
+    F = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+    return E, F
+
+
+def _calibrate_chain(
+    objp,
+    imgpoints1: list[np.ndarray],
+    imgpoints2: list[np.ndarray],
+    image_size: tuple[int, int],
+    cfg: CalibConfig,
+    spec: BoardSpec,
+    res: StereoCalibrationResult,
+    *,
+    stereo_mode: str,
+    T_camL_A: np.ndarray | None,
+    T_AB: np.ndarray | None,
+    T_camR_B: np.ndarray | None,
+    T_AB_samples: Sequence[np.ndarray] | None,
+) -> StereoCalibrationResult:
+    """chain 分支：独立单目 + 刚性双板公共参考。
+
+    ## 数学（不需要两路共视）
+
+        T_{C_R←C_L} = T_{C_R←B} · T_{B←A} · T_{A←C_L}
+
+    `T_{B←A}`（`T_AB`）**必须由调用方实测提供**：它是"两块板刚性固定在同一支架"
+    这一物理事实的唯一来源。缺它时整条链不可解 —— 这里直接报错，
+    **绝不猜一个值、也不回退到 joint**（静默的错数比明确失败更贵）。
+    """
+    if T_AB is None:
+        raise ValueError(
+            "chain 方法缺少 T_AB（两板刚性相对位姿）：这台装置的外参在数学上不可解。\n"
+            "  下一步：用**一块刚性双板靶标**，让任一单相机同时拍到 A、B 两板拍一张，\n"
+            "          再调用 apps/calibrate_stereo.py --method chain --pair-frame <目录> "
+            "--pair-camera left|right。\n"
+            "  注意：不能回退到 joint —— 90° 装置两路几乎不共视，联合求解不成立。"
+        )
+    T_AB = relative_pose._as_T(T_AB, "T_AB")
+
+    res.method = "chain"
+    res.n_views_left = len(imgpoints1)
+    res.n_views_right = len(imgpoints2)
+    res.n_pairs_in = len(imgpoints1) + len(imgpoints2)
+    res.n_pairs_used = res.n_pairs_in
+    res.rectification = "none_raw"
+    res.T_AB = T_AB
+    if not imgpoints1 or not imgpoints2:
+        res.verdict = "数据不足：左/右路至少各需要 3 个姿态"
+        return res
+
+    left = calibrate_mono_points(objp, imgpoints1, image_size, cfg)
+    right = calibrate_mono_points(objp, imgpoints2, image_size, cfg)
+    res.K1, res.D1, res.K2, res.D2 = left["K"], left["D"], right["K"], right["D"]
+    res.err_left, res.err_right = left["rms"], right["rms"]
+    res.std1, res.std2 = left["std"], right["std"]
+
+    # 若调用方没显式给两路板位姿，就用同一批角点 solvePnP 求（同一份观测，
+    # 不引入新假设）；挑**重投影最小**的那一帧 —— 链上的位姿只该用最可信的一帧。
+    if T_camL_A is None:
+        i = int(np.argmin(left["per_view"]))
+        T_camL_A = relative_pose.rt_to_T(
+            cv2.Rodrigues(left["rvecs"][i])[0], left["tvecs"][i])
+    if T_camR_B is None:
+        j = int(np.argmin(right["per_view"]))
+        T_camR_B = relative_pose.rt_to_T(
+            cv2.Rodrigues(right["rvecs"][j])[0], right["tvecs"][j])
+
+    R, T, T_camR_camL = relative_pose.relative_extrinsics(T_camL_A, T_AB, T_camR_B)
+    res.R, res.T = R, T
+    res.E, res.F = _essential_fundamental(res.K1, res.K2, R, T)
+    # ---- 未校正投影矩阵（2026-10-24）----
+    #
+    # 90° 下不能跑 stereoRectify（两光轴夹角接近直角，重投影会把画面拉成极端
+    # 梯形、有效像素所剩无几），但**三角测量不需要共面极线**：
+    # 只要 P1/P2 与 (K, R, T) 自洽，`cv2.triangulatePoints` 就能直接给出
+    # 原始 left_camera 系下的三维点。所以这里给"去畸变、不校正"的那一对：
+    #
+    #     P1 = K1 · [I | 0]       -> 左图去畸变后仍在 K1 像素系
+    #     P2 = K2 · [R | T]       -> 右图去畸变后仍在 K2 像素系，R/T 是真实的
+    #
+    # `T` 在这里**保持与三维点相同的单位**（本项目为米）：若把 T 换算成 mm
+    # 而三维点仍是米，三角化出的点会被整体放大 1000 倍（尺度必须一致）。
+    #
+    # R1=R2=I 让 `initUndistortRectifyMap` / `undistortPoints` 退化成纯去畸变，
+    # 这正是"none_raw"的语义：坐标 = 原始 left_camera 系。
+    res.R1 = np.eye(3)
+    res.R2 = np.eye(3)
+    res.P1 = res.K1 @ np.hstack([np.eye(3), np.zeros((3, 1))])
+    res.P2 = res.K2 @ np.hstack([R, T.reshape(3, 1)])
+    res.Q = None
+    res.roi1 = res.roi2 = ()
+    # 90° 下"校正后 y 差"没有意义：显式置 nan，报告里也不写这一行。
+    res.epipolar_rms = float("nan")
+    res.epipolar_max = float("nan")
+    res.rms = float("nan")
+    res.baseline_mm = float(np.linalg.norm(T)) * 1000.0
+
+    samples = list(T_AB_samples) if T_AB_samples else [T_AB]
+    res.consistency = relative_pose.consistency(samples)
+
+    # ---- 判定 ----
+    warns: list[str] = []
+    sugg: list[str] = []
+    if cfg.expected_baseline_mm:
+        rel = abs(res.baseline_mm - cfg.expected_baseline_mm) / cfg.expected_baseline_mm
+        if rel > cfg.baseline_tolerance:
+            warns.append(
+                f"基线 {res.baseline_mm:.1f} mm 与预期 {cfg.expected_baseline_mm:.1f} mm "
+                f"相差 {rel * 100:.0f}% —— 物理上对不上（先查两镜头中心距、"
+                f"两板是否真的刚性固定、同框图 A/B 是否分配反了）")
+    c = res.consistency
+    if res.n_views_left < 15:
+        warns.append(f"左路只有 {res.n_views_left} 个姿态（建议 ≥15），内参/位姿精度受限")
+    if res.n_views_right < 15:
+        warns.append(f"右路只有 {res.n_views_right} 个姿态（建议 ≥15），内参/位姿精度受限")
+    if res.err_left > cfg.ok_rms:
+        warns.append(f"左目重投影 RMS {res.err_left:.2f} px 偏大（ok 门限 {cfg.ok_rms}）")
+    if res.err_right > cfg.ok_rms:
+        warns.append(f"右目重投影 RMS {res.err_right:.2f} px 偏大（ok 门限 {cfg.ok_rms}）")
+    if c["n"] < 2:
+        warns.append("T_AB 只测了 1 次：**无法评估重复性**，"
+                     "block 的刚性/角点精度都没有证据（建议同框图拍 3~5 张）")
+        sugg.append("--pair-frame 给一个含 3~5 张同框图的目录（板不要动），"
+                    "程序会给出旋转/平移离散度。")
+    if T_AB_samples and len(T_AB_samples) >= 2:
+        if c["rot_max_deg"] > CHAIN_ROT_OK_DEG or c["trans_max_mm"] > CHAIN_TRANS_OK_MM:
+            warns.append(
+                f"T_AB 重复性差：旋转最大偏离 {c['rot_max_deg']:.2f}°、"
+                f"平移 {c['trans_max_mm']:.2f} mm —— 两板可能没真正刚性固定，"
+                f"或同框图角点检测不可靠")
+        elif c["rot_max_deg"] > CHAIN_ROT_GOOD_DEG or c["trans_max_mm"] > CHAIN_TRANS_GOOD_MM:
+            warns.append(f"T_AB 重复性一般：旋转 {c['rot_max_deg']:.2f}° / "
+                         f"平移 {c['trans_max_mm']:.2f} mm")
+
+    bad_mono = (not np.isfinite(res.err_left) or not np.isfinite(res.err_right)
+                or res.err_left > cfg.ok_rms or res.err_right > cfg.ok_rms)
+    bad_rep = (c["n"] >= 2 and
+               (c["rot_max_deg"] > CHAIN_ROT_OK_DEG or c["trans_max_mm"] > CHAIN_TRANS_OK_MM))
+    if bad_mono or bad_rep:
+        res.grade = "不可用"
+        why = ("单目重投影超门限" if bad_mono else "T_AB 重复性超门限")
+        res.verdict = f"不可用 —— {why}；chain 链上的误差会被直接放大到外参"
+        res.ok = False
+    elif (res.err_left <= cfg.good_rms and res.err_right <= cfg.good_rms
+          and c["n"] >= 2 and c["rot_max_deg"] <= CHAIN_ROT_GOOD_DEG
+          and c["trans_max_mm"] <= CHAIN_TRANS_GOOD_MM):
+        res.grade = "优秀"
+        res.verdict = "优秀 —— 链式外参 + 可复现的 T_AB 重复性证据"
+        res.ok = True
+    else:
+        res.grade = "可用"
+        res.verdict = ("可用 —— 链式外参已解出；T_AB 重复性或单目精度只到「可用」档，"
+                       "报告里有具体数字")
+        res.ok = True
+    if stereo_mode == "angled" and res.ok:
+        sugg.append("这组 P1/P2 是 none_raw（未做极线校正）；三角测量可直接用，"
+                    "但任何依赖极线水平对齐/视差的方法都不适用。")
+    res.warnings = warns
+    res.suggestions = sugg
+    return res
+
+
 def calibrate_stereo(
     objp,
     imgpoints1: list[np.ndarray],
@@ -340,15 +644,53 @@ def calibrate_stereo(
     image_size: tuple[int, int],
     cfg: CalibConfig | None = None,
     spec: BoardSpec | None = None,
+    *,
+    stereo_mode: str = "parallel",
+    T_camL_A: np.ndarray | None = None,
+    T_AB: np.ndarray | None = None,
+    T_camR_B: np.ndarray | None = None,
+    T_AB_samples: Sequence[np.ndarray] | None = None,
 ) -> StereoCalibrationResult:
     """从已配对的角点做完整双目标定（含离群剔除与质量判定）。
 
     objp 可以是单个 (N,3) 数组（所有视图共用一块板），也可以是逐视图列表。
+
+    外参解法由 `cfg.method` 选择：
+
+    - ``joint``（默认）：`cv2.stereoCalibrate` 联合求解。**要求两路共视**。
+      `stereo_mode="angled"` 且共视对 < `MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED`
+      时**抛 ValueError**（拒绝出数，见该常量的注释）。
+    - ``chain``：`T_{C_R←C_L} = T_{C_R←B}·T_{B←A}·T_{A←C_L}`，不需要共视。
+      `T_AB`（= `T_{B←A}`）必须由调用方实测传入；`T_camL_A`/`T_camR_B` 可传入，
+      缺省时由本函数对 `imgpoints1/2` 做单目标定 + `solvePnP` 求得
+      （同一份观测，不引入新假设）。chain **不调用** `stereoRectify`，
+      而是给出 `rectification="none_raw"` 的一对投影矩阵
+      （`R1=R2=I`、`P1=K1·[I|0]`、`P2=K2·[R|T]`、`Q=None`）——它们等价于
+      "只去畸变、不校正"，三角测量直接可用，但极线不水平。
     """
     cfg = cfg or CalibConfig()
     spec = spec or BoardSpec()
+
+    # ---- 护栏：angular + joint + 共视不足 -> 拒绝出数 ----
+    # 必须在"数据不足就 return 空结果"**之前**：否则 3 对数据会得到一个
+    # 静默的 ok=False，用户看不出这是"方法不成立"还是"手滑少收了两对"。
+    n_covis = min(len(imgpoints1), len(imgpoints2))
+    if (cfg.method == "joint" and stereo_mode == "angled"
+            and n_covis < MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED):
+        raise ValueError(
+            f"angled 且只有 {n_covis} 对共视数据：宽基线从零优化会被噪声主导，拒绝出数。"
+            f"下一步：用 --method chain（需刚性双板靶标），"
+            f"或补足 ≥{MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED} 对两路同时可见的板。")
+
     res = StereoCalibrationResult(image_size=image_size, board_desc=spec.describe(),
-                                  n_pairs_in=len(imgpoints1))
+                                  n_pairs_in=len(imgpoints1), method=cfg.method)
+    if cfg.method == "chain":
+        return _calibrate_chain(
+            objp, list(imgpoints1), list(imgpoints2), image_size, cfg, spec, res,
+            stereo_mode=stereo_mode, T_camL_A=T_camL_A, T_AB=T_AB,
+            T_camR_B=T_camR_B, T_AB_samples=T_AB_samples,
+        )
+
     if len(imgpoints1) < 4 or len(imgpoints1) != len(imgpoints2):
         res.verdict = "数据不足或左右数量不一致"
         return res

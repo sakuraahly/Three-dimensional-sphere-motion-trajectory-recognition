@@ -57,6 +57,9 @@ from apps._common import (
     setup_logging,
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
+from calib import detect_board
+from calib.relative_pose import rotation_angle_deg
+from calib.stereo_calib import board_pose_from_points, calibrate_mono_points
 from stereo.fov_align import (
     estimate_fov_alignment,
     fov_confidence_problem,
@@ -68,6 +71,9 @@ from sphere_tracker.sources import quiet_repeated_grab_warnings
 WINDOW = "stereo calibration"
 PREVIEW_W = 720          # 单路预览宽度的**上限**（实际按屏幕与文字条带反推，见主循环）
 FOOTER_LINE_H = 19       # 文字条带每行高度（像素）
+# chain（90°）产物的口径提示，必须与报告一起打印：这份参数**不能**喂给视差逻辑。
+NONE_RAW_NOTE = ("未做极线校正：坐标即原始 left_camera 系；"
+                 "任何依赖极线水平/视差（SGBM、y 差口径）的方法都不适用。")
 
 
 def _screen_size() -> tuple[int, int]:
@@ -122,6 +128,312 @@ def _fov_or_none(estimate_fn, *, mode: str, require_fov: bool):
         if require_fov or mode != "parallel":
             raise
         return None, f"{type(exc).__name__}: {exc}"
+
+
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+
+
+def _list_images(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path] if path.suffix.lower() in _IMAGE_SUFFIXES else []
+    if not path.is_dir():
+        return []
+    return sorted(p for p in path.iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES)
+
+
+def _detect_two_boards(gray: np.ndarray, spec: BoardSpec):
+    """一张图里检出**两块**同名标定板（L 形双板靶标）。
+
+    做法：先检第一块，把它占的凸包**填白**（棋盘的黑格被抹掉，检测器就不会
+    在同一位置再报一次），再检第二块。返回 `(obs_a, obs_b)` 或 `None`。
+    这里**不做 A/B 语义分配** —— 谁是被左相机看到的 A，由调用方用几何一致性判定。
+    """
+    first = detect_board(gray, spec, exhaustive=True)
+    if not first.found or first.corners is None:
+        return None
+    masked = gray.copy()
+    pts = first.corners.reshape(-1, 2).astype(np.float32)
+    center = pts.mean(axis=0)
+    grown = ((pts - center) * 1.12 + center).astype(np.int32)   # 外扩一点，避免留下边
+    cv2.fillConvexPoly(masked, cv2.convexHull(grown), 255)
+    second = detect_board(masked, spec, exhaustive=True)
+    if not second.found or second.corners is None:
+        return None
+    if float(np.linalg.norm(first.corners.reshape(-1, 2)
+                            - second.corners.reshape(-1, 2))) < 1.0:
+        return None                                    # 同一块被检了两次
+    return first, second
+
+
+def _pnp_reproj_rms(objp, corners, K, D) -> tuple[np.ndarray, float]:
+    """`solvePnP` 求板位姿，并返回 (4x4 位姿, 重投影 RMS px)。"""
+    T = board_pose_from_points(objp, corners, K, D)
+    rvec, _ = cv2.Rodrigues(T[:3, :3])
+    uv, _ = cv2.projectPoints(np.asarray(objp, np.float64).reshape(-1, 3),
+                              rvec, T[:3, 3].reshape(3, 1), K, D)
+    err = np.asarray(corners, np.float64).reshape(-1, 2) - uv.reshape(-1, 2)
+    return T, float(np.sqrt(np.mean(np.sum(err * err, axis=1))))
+
+
+def _assign_ab(pose1: np.ndarray, pose2: np.ndarray,
+               ref_rots: list[np.ndarray], pair_cam: str):
+    """判定两板里哪一块是 A、哪一块是 B（**静默判错会直接给出反的 T_AB**）。
+
+    依据：A 板是左相机视野里的那块，B 是右相机视野里的那块（两板刚性固定在
+    同一支架上）。所以**同框图中某块板的姿态**，应当落在"该路目录里那块板的
+    姿态簇"附近；另一块与它相差约两板夹角（90° 装置≈90°）。
+
+    返回 `(T_A, T_B, d1, d2)`；若两块的姿态距离太接近（差 <5°），**报错**而不是猜。
+    """
+    d1 = min(rotation_angle_deg(pose1[:3, :3], r) for r in ref_rots)
+    d2 = min(rotation_angle_deg(pose2[:3, :3], r) for r in ref_rots)
+    if abs(d1 - d2) < 5.0:
+        raise ValueError(
+            f"同框图中两块板的姿态无法区分（到参考姿态簇的距离 "
+            f"{d1:.1f}° vs {d2:.1f}°，差 <5°）。\n"
+            f"  原因：两板夹角太小，或拍同框图时支架姿态与目录里的差异太大。\n"
+            f"  下一步：让 A 板更正面朝向 --pair-camera 重拍同框图；"
+            f"或把 --pair-frame 换成夹角更清楚的拍摄位置。")
+    if pair_cam == "left":                    # 参考簇 = A 板
+        return (pose1, pose2, d1, d2) if d1 < d2 else (pose2, pose1, d2, d1)
+    # 参考簇 = B 板：更接近的那个是 B，另一块才是 A（返回顺序固定为 A, B, d_A, d_B）
+    return (pose2, pose1, d2, d1) if d1 < d2 else (pose1, pose2, d1, d2)
+
+
+def _chain_input_error(args) -> str | None:
+    """检查 chain 的输入是否齐全；返回**可执行**的错误说明（None 表示齐全）。"""
+    if args.left is not None or args.right is not None \
+            or args.left_video or args.right_video:
+        return ("--method chain 本轮只支持**离线目录**（链上用单目位姿，不做实时采集）。\n"
+                "  请改用：--left-dir <A 板目录> --right-dir <B 板目录> "
+                "--pair-frame <同框图目录> --pair-camera left|right\n"
+                "  实时采集 chain 的 GUI 流程属于下一阶段（见计划书阶段 B）。")
+    missing = []
+    if not args.left_dir:
+        missing.append("--left-dir <左相机拍 A 板的图像目录>")
+    if not (args.board_b_dir or args.right_dir):
+        missing.append("--right-dir（或 --board-b-dir）<右相机拍 B 板的图像目录>")
+    if not args.pair_frame:
+        missing.append("--pair-frame <单相机**同时**拍到 A、B 两板的图或目录>")
+    if not args.pair_camera:
+        missing.append("--pair-camera left|right（同框图是哪一路拍的）")
+    if missing:
+        return ("chain 需要三样输入（本轮只支持离线目录）：\n"
+                "  1) 左相机看 A 板的图像  -> --left-dir\n"
+                "  2) 右相机看 B 板的图像  -> --right-dir（或 --board-b-dir）\n"
+                "  3) 一台相机同时看到 A、B 两板的同框图 -> --pair-frame + --pair-camera\n"
+                "  缺少：" + "；".join(missing) + "\n"
+                "  完整用法：python apps/calibrate_stereo.py --method chain "
+                "--left-dir imgs/A --right-dir imgs/B --pair-frame imgs/pair "
+                "--pair-camera left --stereo-mode angled\n"
+                "  （没有同框图就无法求 T_AB，外参在数学上不可解——本程序不会猜一个值）")
+    return None
+
+
+def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
+    """chain 落盘的 meta。**`stereo_mode` 由方法决定 = angled，不跟 auto。**
+
+    单独成函数是为了让"落盘值"能被自测直接断言。以前这里写的是 `mode`
+    （来自 `resolve_auto`）：新装置没有旧 JSON 时 auto 落到 parallel，于是
+    `stereo_mode="parallel"` 与 `angle_deg=90` 被写进同一个文件 —— 下游按
+    parallel 重建，`dy ≤ 2.5 px` 门限把**全部候选**拒掉且不报错。
+
+    `rectification` 如实写标定产出的口径（chain -> `none_raw`）：以前这里
+    写死 `"not_applicable"`，把真正的口径盖掉了，下游既分不清"能不能用视差"，
+    也让历史文件里的写法与新代码对不上。
+    """
+    return {
+        "board": spec.describe(),
+        "source": "dir",
+        "method": "chain",
+        "rectification": res.rectification,
+        "left": args.left_dir,
+        "right": args.board_b_dir or args.right_dir,
+        "pair_frame": args.pair_frame,
+        "pair_camera": args.pair_camera,
+        "image_size": list(image_size),
+        # 模式 = 方法决定：none_raw 的产物只可能走 angled 重建。
+        "stereo_mode": "angled",
+        "angle_deg": float(rig_angle(res.R)),
+    }
+
+
+def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
+    """chain 的离线流程：三份图 → 单目内参/位姿 → T_AB → 链式外参。"""
+    problem = _chain_input_error(args)
+    if problem:
+        print(f"\n[错误] {problem}")
+        log.error("chain 输入不全：%s", problem.replace("\n", " "))
+        return 1
+
+    from calib import relative_pose
+
+    left_paths = _list_images(Path(args.left_dir))
+    right_paths = _list_images(Path(args.board_b_dir or args.right_dir))
+    pair_paths = _list_images(Path(args.pair_frame))
+    for label, paths in (("--left-dir", left_paths), ("B 板目录", right_paths),
+                         ("--pair-frame", pair_paths)):
+        if not paths:
+            print(f"\n[错误] {label} 里没有图像（支持 "
+                  f"{'/'.join(sorted(_IMAGE_SUFFIXES))}）。")
+            log.error("chain：%s 无图", label)
+            return 1
+
+    def _read_corners(paths: list[Path], label: str):
+        corners, size, failed = [], None, 0
+        for p in paths:
+            gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                failed += 1
+                continue
+            if size is None:
+                size = (gray.shape[1], gray.shape[0])
+            elif (gray.shape[1], gray.shape[0]) != size:
+                print(f"\n[错误] {label} 内图像尺寸不一致：{p.name} 是 "
+                      f"{gray.shape[1]}x{gray.shape[0]}，之前是 {size[0]}x{size[1]}。")
+                log.error("chain：%s 尺寸不一致", label)
+                return None, None, 0
+            obs = detect_board(gray, spec, exhaustive=True)
+            if obs.found and obs.corners is not None:
+                corners.append(obs.corners.reshape(-1, 2).astype(np.float32))
+            else:
+                failed += 1
+        return corners, size, failed
+
+    c_left, size_left, fail_l = _read_corners(left_paths, "--left-dir")
+    c_right, size_right, fail_r = _read_corners(right_paths, "B 板目录")
+    if c_left is None or c_right is None:
+        return 1
+    print(f"[chain] 检出：左 {len(c_left)}/{len(left_paths)}（{fail_l} 张未检出），"
+          f"右 {len(c_right)}/{len(right_paths)}（{fail_r} 张未检出）；"
+          f"尺寸 左 {size_left[0]}x{size_left[1]} / 右 {size_right[0]}x{size_right[1]}")
+    if len(c_left) < 3 or len(c_right) < 3:
+        print("\n[错误] chain 每路至少需要 3 个姿态才能标内参；"
+              "建议各 ≥15 个并覆盖画面四角。")
+        log.error("chain：姿态太少 左%d 右%d", len(c_left), len(c_right))
+        return 1
+
+    cfg_mono = CalibConfig()
+    objp = spec.object_points()
+    try:
+        mono_l = calibrate_mono_points(objp, c_left, size_left, cfg_mono)
+        mono_r = calibrate_mono_points(objp, c_right, size_right, cfg_mono)
+    except Exception as exc:                          # noqa: BLE001
+        print(f"\n[错误] 单目标定失败：{type(exc).__name__}: {exc}")
+        log.error("chain 单目标定失败：%s", exc)
+        return 1
+    print(f"[chain] 单目 RMS：左 {mono_l['rms']:.3f} px / 右 {mono_r['rms']:.3f} px")
+
+    # 同框图的参考姿态簇：由 --pair-camera 那一路的目录决定
+    ref_mono = mono_l if args.pair_camera == "left" else mono_r
+    ref_rots = [cv2.Rodrigues(r)[0] for r in ref_mono["rvecs"]]
+    K_pair, D_pair = ref_mono["K"], ref_mono["D"]
+    pair_cam_size = size_left if args.pair_camera == "left" else size_right
+
+    samples, pair_rows = [], []
+    for p in pair_paths:
+        gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            continue
+        if (gray.shape[1], gray.shape[0]) != pair_cam_size:
+            print(f"\n[错误] 同框图 {p.name} 尺寸 {gray.shape[1]}x{gray.shape[0]} "
+                  f"与 --pair-camera {args.pair_camera} 的标定尺寸 {pair_cam_size} 不一致。")
+            log.error("chain：同框图尺寸不一致 %s", p)
+            return 1
+        found = _detect_two_boards(gray, spec)
+        if found is None:
+            print(f"  [跳过] {p.name}：没有同时检出两块板")
+            continue
+        try:
+            T1, e1 = _pnp_reproj_rms(objp, found[0].corners, K_pair, D_pair)
+            T2, e2 = _pnp_reproj_rms(objp, found[1].corners, K_pair, D_pair)
+            T_A, T_B, d_a, d_b = _assign_ab(T1, T2, ref_rots, args.pair_camera)
+        except ValueError as exc:
+            print(f"\n[错误] 同框图 {p.name} 无法分配 A/B 板：{exc}")
+            log.error("chain：A/B 分配失败 %s", exc)
+            return 1
+        T_ab = relative_pose.board_to_board_from_single_camera(T_A, T_B)
+        samples.append(T_ab)
+        pair_rows.append((p.name, e1, e2, d_a, d_b))
+
+    if not samples:
+        print("\n[错误] --pair-frame 里没有一张图能**同时**检出 A、B 两块板。\n"
+              "  下一步：把双板靶标放到 --pair-camera 那一路的画面中央、光照均匀、"
+              "两块板都完整入画，重拍 3~5 张。")
+        log.error("chain：没有可用的同框图")
+        return 1
+    for name, e1, e2, d_a, d_b in pair_rows:
+        print(f"  同框图 {name}: 重投影 {e1:.2f}/{e2:.2f} px，"
+              f"到参考姿态簇 {d_a:.1f}°/{d_b:.1f}°")
+    cons = relative_pose.consistency(samples)
+    print(f"[chain] T_AB：n={cons['n']}  旋转最大偏离 {cons['rot_max_deg']:.3f}°  "
+          f"平移最大偏离 {cons['trans_max_mm']:.3f} mm  两板间距 "
+          f"{cons['baseline_mm']:.1f} mm")
+
+    # 链上用的两路板位姿：挑各自重投影最小的那一帧
+    i = int(np.argmin(mono_l["per_view"]))
+    j = int(np.argmin(mono_r["per_view"]))
+    T_camL_A = relative_pose.rt_to_T(cv2.Rodrigues(mono_l["rvecs"][i])[0],
+                                     mono_l["tvecs"][i])
+    T_camR_B = relative_pose.rt_to_T(cv2.Rodrigues(mono_r["rvecs"][j])[0],
+                                     mono_r["tvecs"][j])
+
+    # chain 的产物是 none_raw（未做极线校正）的链式外参，只可能用 angled 重建。
+    # 以前这里跟 auto 走：新装置没有旧 JSON 时 auto 落到 parallel，于是把
+    # meta["stereo_mode"] 写成 parallel，而本函数下面已算出 angle_deg=90 ——
+    # 下游按 parallel 跑，dy≤2.5px 门限把**全部候选**拒掉且不报错。
+    mode = "angled"
+    print("[模式] chain → stereo_mode=angled（由方法决定，不跟 auto）")
+    log.info("chain -> stereo_mode=angled（由方法决定，不跟 auto）")
+    cfg = CalibConfig(method="chain", expected_baseline_mm=args.baseline_mm)
+    try:
+        res = calibrate_stereo(
+            objp, c_left, c_right, size_left, cfg, spec, stereo_mode=mode,
+            T_camL_A=T_camL_A, T_AB=samples[0], T_camR_B=T_camR_B,
+            T_AB_samples=samples)
+    except ValueError as exc:
+        print(f"\n[错误] {exc}")
+        log.error("chain 标定被拒绝：%s", exc)
+        return 1
+
+    print(res.report())
+    log.info("chain 结果：\n%s", res.report())
+    if not res.ok:
+        print("标定未通过质量判定，未保存结果。")
+        log.warning("chain 标定未通过质量判定，未保存")
+        return 1
+
+    rig = StereoRig.from_result(res, meta=_chain_meta(args, spec, res, size_left))
+    rig.quality["method"] = "chain"
+    rig.quality["rectification"] = res.rectification
+    rig.quality["consistency"] = res.consistency
+    rig.quality["t_ab_mm"] = res.consistency.get("baseline_mm", float("nan"))
+    # 90° 下 F 极线指标需要"同名点"，而 chain 的左右角点**不是对应点**
+    # （各自看各自的板），所以这里不做 angled 质量评估，并写清原因。
+    rig.quality["angled_grade"] = "未评估"
+    rig.quality["verdict"] = res.verdict
+    print(f"[chain] 实测光轴夹角 {rig.angle_deg:.2f}°（由链式 R 计算，不写死 90°）")
+    if rig.rectification == "none_raw":
+        # 必须在报告里明说：这份参数**不能**拿去喂视差逻辑。
+        # 不说的话，下游会看到 R1/R2/P1/P2 齐全就以为"已校正"，
+        # 而 none_raw 下 y 差/视差都没有几何意义（见 calib/params.py 的说明）。
+        print(f"[chain] {NONE_RAW_NOTE}")
+        log.warning("chain 产物为 none_raw：%s", NONE_RAW_NOTE)
+    npz, js = rig.save(args.out)
+    print(f"已保存：{npz}")
+    print(f"        {js}")
+    print("注意：chain 的 R1/R2=I、P1/P2 是「只去畸变」的投影矩阵（未做极线校正），"
+          "三角测量可直接用；但校正图像/视差接口不适用。")
+    return 0
+
+
+def rig_angle(R) -> float:
+    """两光轴夹角（度），只用 R；与 `StereoRig.angle_deg` 同一公式。"""
+    z2 = np.asarray(R, np.float64).T @ np.array([0.0, 0.0, 1.0])
+    n = float(np.linalg.norm(z2))
+    if n <= 0:
+        return 0.0
+    return float(np.degrees(np.arccos(np.clip(z2[2] / n, -1.0, 1.0))))
 
 
 # --------------------------------------------------------------------------
@@ -191,6 +503,18 @@ def main() -> int:
                     default="auto",
                     help="双目模式：auto=沿用旧输出模式（无旧文件则 parallel）；"
                          "angled=大角度（近似直角）。实际夹角由标定 R 计算，不写死 90°")
+    ap.add_argument("--method", choices=("joint", "chain"), default="joint",
+                    help="外参求解方法：joint=两路联合求解（需充分共视，平行装置用）；"
+                         "chain=独立单目 + 刚性双板公共参考（90° 用，不需要共视）。"
+                         "angled + joint 且共视<8 对会被拒绝出数")
+    # ---- chain 的三样输入（本轮只支持离线目录）----
+    ap.add_argument("--board-b-dir", default=None,
+                    help="chain：右路那块 B 板的图像目录（省略则用 --right-dir）")
+    ap.add_argument("--pair-frame", default=None,
+                    help="chain：**单相机同时拍到 A、B 两板**的图（文件或目录），"
+                         "用来求两板刚性相对位姿 T_AB")
+    ap.add_argument("--pair-camera", choices=("left", "right"), default=None,
+                    help="chain：--pair-frame 是哪一路相机拍的（left/right）")
     fov = ap.add_mutually_exclusive_group()
     fov.add_argument("--skip-fov", action="store_true",
                      help="跳过两路视场（FOV）对齐：不估单应、不裁剪不缩放，"
@@ -220,6 +544,12 @@ def main() -> int:
     if args.skip_fov and args.require_fov:
         ap.error("--skip-fov 与 --require-fov 矛盾：前者不做 FOV 对齐，后者要求"
                  "「估不出来就失败」")
+    # chain 产出的是 none_raw（未做极线校正）的链式外参；parallel 重建依赖
+    # 校正后的极线与视差（`stereo/triangulate.py` 的 dy 门限/视差范围），90° 下
+    # 两者都不成立。允许标成 parallel = 让下游静默 0 配对，所以入口就拒绝。
+    if args.method == "chain" and args.stereo_mode == "parallel":
+        ap.error("chain 产出的是未校正标定（none_raw），不能标成 parallel："
+                 "parallel 重建依赖校正后的极线与视差，90° 下不成立。")
 
     # 日志要在**做任何事之前**起来：标定失败时最有价值的证据（拒绝了什么、
     # 各拒了多少帧）现在只在内存里，进程一退就没了。
@@ -247,6 +577,12 @@ def main() -> int:
         print()
         log.warning("试标定档：target=%d（正式档 40）", args.target)
     log.info("标定板：%s", spec.describe())
+    # ---- chain：离线目录流程（不打开相机/视频，也不做 FOV 对齐）----
+    if args.method == "chain":
+        print("方法：chain（独立单目 + 刚性双板公共参考，不需要两路共视）")
+        log.info("method=chain")
+        return _run_chain(args, spec, log)
+
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
     print()
 
@@ -670,7 +1006,14 @@ def main() -> int:
         return 1
 
     cfg = CalibConfig(expected_baseline_mm=args.baseline_mm)
-    res = calibrate_stereo(objp, ip1, ip2, img_size, cfg, spec)
+    try:
+        res = calibrate_stereo(objp, ip1, ip2, img_size, cfg, spec, stereo_mode=mode)
+    except ValueError as exc:
+        # 护栏的原文必须原样打出来：它包含"下一步怎么做"，
+        # 被包装成一句"标定失败"就等于把最有用的信息扔了。
+        print(f"\n[错误] {exc}")
+        log.error("标定被拒绝：%s", exc)
+        return 1
     print(res.report())
     log.info("标定结果：\n%s", res.report())
 

@@ -26,6 +26,17 @@ from sphere_tracker.geometry import (
 
 _MAT_KEYS = ("K1", "D1", "K2", "D2", "R", "T", "E", "F", "R1", "R2", "P1", "P2", "Q")
 
+#: 表示"**没有做过极线校正**"的 rectification 取值。两种都要认：
+#: ``none_raw`` 是现在的 chain 输出，``not_applicable`` 是更早的 chain 落盘值
+#: （那时还没定这个字符串）。只认一种的话，旧标定文件就会绕过护栏、在第 20 帧
+#: 才以"0 配对"的形式炸掉——兼容意图落空，报错也更难读。
+UNCORRECTED_RECTIFICATIONS: tuple[str, ...] = ("none_raw", "not_applicable")
+
+
+def is_uncorrected(rectification: object) -> bool:
+    """``rectification`` 是否表示"未做极线校正"（见 :data:`UNCORRECTED_RECTIFICATIONS`）。"""
+    return str(rectification or "").strip().lower() in UNCORRECTED_RECTIFICATIONS
+
 
 @dataclass
 class StereoRig:
@@ -63,6 +74,27 @@ class StereoRig:
         value = str(self.meta.get("stereo_mode") or "parallel").strip().lower()
         return "angled" if value in ("angled", "auto", "90", "90deg",
                                      "orthogonal", "angle") else "parallel"
+
+    @property
+    def rectification(self) -> str:
+        """这套参数是怎么来的：``"stereo_rectify"`` / ``"none_raw"``。
+
+        - ``stereo_rectify``：`R1/R2/P1/P2` 由 `cv2.stereoRectify` 产出，
+          极线被摆成水平，（平行装置的）y 差才有几何意义；
+        - ``none_raw``：chain（90°）产物 —— **未做极线校正**，
+          `R1=R2=I`、`P1=K1·[I|0]`、`P2=K2·[R|T]`、`Q=None`。
+          三角测量可用（坐标就在原始 left_camera 系），
+          但"校正后 y 差"没有意义。
+
+        旧标定文件没有这个字段：`parallel` 装置按 ``"stereo_rectify"`` 处理；
+        chain 在 2026-10-24 之前的落盘值是 ``"not_applicable"``（当时 P1/P2
+        还是 None），语义上同样是"未校正"，所以一并按未校正对待。
+        """
+        for src in (self.meta, self.quality):
+            value = src.get("rectification") if isinstance(src, dict) else None
+            if value:
+                return str(value).strip().lower()
+        return "stereo_rectify"
 
     @property
     def angle_deg(self) -> float:
@@ -109,6 +141,7 @@ class StereoRig:
         所以换分辨率要么重新生成映射，要么重新标定。
         """
         def _maps(K, D, R, P):
+            R, P = self._undistort_target(R, P, K)
             return cv2.initUndistortRectifyMap(K, D, R, P, self.image_size, cv2.CV_32FC1)
 
         if side == "left":
@@ -123,17 +156,57 @@ class StereoRig:
         return cv2.remap(img, mx, my, cv2.INTER_LINEAR)
 
     # ------------------------------------------------------------------
+    def _undistort_target(self, R, P, K):
+        """去畸变后的目标 (R, newCameraMatrix)。
+
+        ## 为什么需要这一步（2026-10-24，none_raw）
+
+        `undistortPoints(..., R=, P=)` / `initUndistortRectifyMap` 里，`P` 的
+        **3x3 块必须是"目标相机的内参"**，旋转只从 `R` 进来。`stereoRectify`
+        正是这么产出的（`P` 的 3x3 = 新的 K_rect）。
+
+        而 `none_raw` 的 `P2 = K2·[R|T]` 的 3x3 块是 **K2·R（真实外参）**，
+        不是新内参：把它当 newCameraMatrix 用，右图会被**多转一次 R**。
+        实测（合成 90° 装置）：右路像素 828 px 被映射到 -9155 px，三角化直接爆掉。
+        所以 `none_raw` 下必须让目标回到**各自的原始像素系**（R=I、P=K），
+        R/T 只由 `P1/P2` 在三角化那一步承担 —— 这与
+        `triangulatePoints(P1, P2, x1_raw, x2_raw)` 的约定完全一致。
+        """
+        if is_uncorrected(self.rectification):
+            return np.eye(3), K
+        return R, P
+
+    def _side_target(self, side: str):
+        """该路的 (K, D, R, P) —— **原始**参数，尚未按 `rectification` 分流。"""
+        if side == "left":
+            return self.K1, self.D1, self.R1, self.P1
+        if side == "right":
+            return self.K2, self.D2, self.R2, self.P2
+        raise ValueError(f"未知的 side：{side!r}（只支持 'left' / 'right'）")
+
+    def undistort_points(self, side: str, pts: np.ndarray) -> np.ndarray:
+        """把某一路的原始像素去畸变，并映射到 `rectification` 对应的目标像素系。
+
+        **"原始像素 → 三角化用的像素"只有这一个入口**：按 `rectification` 的
+        分流只发生在 :meth:`_undistort_target` 里。调用方（如
+        `stereo/triangulate.py`）**不要**自己再判一次模式 ——
+        两处各判一次，早晚会有一处漏改，而症状是"残差偏大"这种不指向根因的错。
+
+        - ``stereo_rectify``：`R=R*, P=P*`（极线被摆平；`P` 的 3x3 是新内参）；
+        - ``none_raw``：`R=I, P=K`（只去畸变，留在各自原始像素系；
+          `R/T` 由 `P1/P2` 在三角化那一步承担）。
+
+        返回 (N, 2) float64，单位像素。
+        """
+        K, D, R, P = self._side_target(side)
+        R, P = self._undistort_target(R, P, K)
+        src = np.asarray(pts, np.float64).reshape(-1, 1, 2)
+        return cv2.undistortPoints(src, K, D, R=R, P=P).reshape(-1, 2)
+
     def rectify_points(self, pts_left: np.ndarray, pts_right: np.ndarray):
         """把原始像素坐标校正到共面极线坐标系（三角测量前必做）。"""
-        p1 = cv2.undistortPoints(
-            np.asarray(pts_left, np.float64).reshape(-1, 1, 2), self.K1, self.D1,
-            R=self.R1, P=self.P1,
-        ).reshape(-1, 2)
-        p2 = cv2.undistortPoints(
-            np.asarray(pts_right, np.float64).reshape(-1, 1, 2), self.K2, self.D2,
-            R=self.R2, P=self.P2,
-        ).reshape(-1, 2)
-        return p1, p2
+        return (self.undistort_points("left", pts_left),
+                self.undistort_points("right", pts_right))
 
     def triangulate(self, pts_left: np.ndarray, pts_right: np.ndarray) -> np.ndarray:
         """由左右像素坐标三角测量出三维点（米），返回 (N,3)。"""
@@ -147,7 +220,18 @@ class StereoRig:
         return (pts4d[:3] / w).T
 
     def epipolar_error(self, pts_left: np.ndarray, pts_right: np.ndarray) -> float:
-        """校正后同名点的 y 之差（RMS，像素）。这是检验装置有没有被碰动的直接指标。"""
+        """校正后同名点的 y 之差（RMS，像素）。这是检验装置有没有被碰动的直接指标。
+
+        ## 只对 ``stereo_rectify`` 成立（2026-10-24 加防御）
+
+        "y 差 = 点到极线的距离"依赖**极线已被摆成水平**。``none_raw``（chain/90°）
+        下极线是斜的，斜线上的两点 y 差可以很大而几何误差为零 —— 这个数字会
+        又好看又错。与其给一个骗人的数，不如直接报错并指路。
+        """
+        if is_uncorrected(self.rectification):
+            raise ValueError(
+                "该标定未做极线校正（none_raw），y 差口径不适用；"
+                "请改用 epipolar_error_by_mode('angled')")
         p1, p2 = self.rectify_points(pts_left, pts_right)
         n = min(len(p1), len(p2))
         if n == 0:
@@ -372,6 +456,9 @@ class StereoRig:
                 # 所以只看 RMS 会误判。存下来，事后复盘才有依据。
                 "grade": res.grade,
                 "board_area": res.board_area,
+                # 落盘这一步必须带上：`none_raw` 与 `stereo_rectify` 的
+                # `epipolar_error()` 语义不同，丢了它下游就分不清口径。
+                "rectification": res.rectification,
                 "fx_sigma_px": res.fx_sigma(),
                 "depth_sigma_mm_at_0_6m": res.depth_sigma_mm(0.6),
             },
