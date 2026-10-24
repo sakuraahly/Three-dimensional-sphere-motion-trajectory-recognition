@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -38,9 +40,17 @@ import numpy as np
 from apps._common import add_stereo_source_args, open_pair_source
 from apps._window import WindowManager
 from calib import BoardSpec, detect_board
+from stereo import profiles as rig_profiles
 
 WINDOW = "stereo setup check"
 PREVIEW_W = 620          # 单路预览宽度
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CALIBRATION_PATH = REPO_ROOT / "config" / "stereo_calibration.json"
+
+# 与 stereo/sessions.py 的基线交叉核对口径一致：>10% 提醒、>30% 报警。
+BASELINE_WARN_RATIO = 0.10
+BASELINE_ERROR_RATIO = 0.30
 
 
 # --------------------------------------------------------------------------
@@ -88,6 +98,93 @@ def _mean(points) -> tuple[float, float]:
 
 
 # --------------------------------------------------------------------------
+def _calibration_baseline(path: Path | None = None) -> float | None:
+    """读实际标定文件的算法基线（mm）；读不到返回 ``None``（不抛）。"""
+    target = Path(path) if path is not None else CALIBRATION_PATH
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("baseline_mm")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _print_profile_section() -> tuple[list[str], list[str]]:
+    """打印"当前装置档案"，返回 (warnings, errors)。
+
+    档案是可选项：没设置就一行提示，不改变 precheck 的判定；设置了才做
+    "期望基线 vs 实际标定基线"的交叉核对（>10% 警告、>30% 错误）。
+    """
+    print("-" * 62)
+    print("当前装置档案")
+    warnings: list[str] = []
+    errors: list[str] = []
+    try:
+        active = rig_profiles.get_active()
+    except rig_profiles.ProfileError as exc:
+        print(f"  读不了档案        : {exc}")
+        errors.append(f"装置档案读不了：{exc}")
+        return warnings, errors
+
+    if active is None:
+        print("  未设置装置档案（可选）：配置后可让 precheck/录制带出正确几何预期")
+        return warnings, errors
+
+    label = rig_profiles.mode_label(active.stereo_mode)
+    print(f"  名称              : {active.name}")
+    print(f"  双目模式          : {label}（{active.stereo_mode}）")
+    if active.width and active.height:
+        fps = f"@{active.fps}" if active.fps else ""
+        print(f"  分辨率 / 帧率     : {active.width}x{active.height}{fps}")
+
+    if active.expected_baseline_mm is None:
+        print("  期望基线          : 未填（无法与实际标定交叉核对）")
+    else:
+        print(f"  期望基线          : {active.expected_baseline_mm:.2f} mm")
+        actual = _calibration_baseline()
+        if actual is None:
+            print("  实际标定基线      : 读不到"
+                  "（config/stereo_calibration.json 缺失或无 baseline_mm）")
+        else:
+            ratio = abs(active.expected_baseline_mm - actual) / actual
+            print(f"  实际标定基线      : {actual:.2f} mm（差 {100 * ratio:.1f}%）")
+            if ratio > BASELINE_ERROR_RATIO:
+                errors.append(
+                    f"装置档案期望基线 {active.expected_baseline_mm:.2f} mm 与标定 "
+                    f"{actual:.2f} mm 差 {100 * ratio:.0f}%（>30%：多半不是同一套装置，"
+                    "先核对左右相机与标定文件）")
+            elif ratio > BASELINE_WARN_RATIO:
+                warnings.append(
+                    f"装置档案期望基线 {active.expected_baseline_mm:.2f} mm 与标定 "
+                    f"{actual:.2f} mm 差 {100 * ratio:.0f}%（>10%）")
+
+    if active.working_distance_m is not None:
+        print(f"  工作距离          : {active.working_distance_m:.2f} m")
+    print(f"  几何提示          : {rig_profiles.geometry_hint(active)}")
+
+    if active.calibration_path:
+        print(f"  配套标定          : {active.calibration_path}")
+        if not (REPO_ROOT / active.calibration_path).exists():
+            warnings.append(
+                f"档案指向的标定文件不存在：{active.calibration_path}"
+                "（可能已被清理；标定后请重新设置档案）")
+    if active.stereo_mode == "angled":
+        print("  写盘/坐标系       : 按 docs/数据标准.md §1.5 为原始 left_camera，"
+              "不做 FOV 裁剪")
+
+    for w in warnings:
+        print(f"  ! {w}")
+    for e in errors:
+        print(f"  × {e}")
+    return warnings, errors
+
+
+# --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="标定前置检查（两路是否都看到棋盘）")
     add_stereo_source_args(ap)
@@ -100,7 +197,14 @@ def main() -> int:
     ap.add_argument("--min-both-ratio", type=float, default=0.5,
                     help="两路同时看到棋盘的最低帧比例，达到才判为通过")
     ap.add_argument("--no-show", action="store_true", help="不弹窗（批处理）")
+    ap.add_argument("--profiles-only", action="store_true",
+                    help="只打印当前装置档案（不开相机，便于核对参数/标定配对）")
     args = ap.parse_args()
+
+    if args.profiles_only:
+        _warnings, errors = _print_profile_section()
+        print("=" * 62)
+        return 1 if errors else 0
 
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
     print(f"标定板：{spec.describe()}")
@@ -254,8 +358,10 @@ def _report(args, total, n_l, n_r, n_both, area_l, area_r, sharp_l, sharp_r,
 
     for w in warnings:
         print(f"  ! {w}")
+    print()
+    _prof_warnings, prof_errors = _print_profile_section()
     print("=" * 62)
-    return code
+    return 1 if prof_errors else code
 
 
 if __name__ == "__main__":

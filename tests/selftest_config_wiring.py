@@ -415,6 +415,113 @@ def test_coast_window_is_frame_rate_independent() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_rig_profiles_are_validated_and_persisted() -> bool:
+    """装置档案层：空 store 可读、往返一致、非法值被拒、几何提示、active 持久化。
+
+    ## 守的是什么
+
+    多套双目装置需要"这套参数 + 这份标定 + 几何预期"能一起存下来
+    （`stereo/profiles.py`）。这一层最容易出的错不是算错，而是：
+
+    - 文件不存在时抛异常 -> 首次使用就崩（所以必须**返回空 store**）；
+    - 存进去的 `stereo_mode` 是别名或 `auto` -> 读回来歧义（必须**只收 canonical**）；
+    - `calibration_path` 写成 `../x.json` -> 指向仓库外（必须**拒绝逃逸**）；
+    - 几何提示把"估算夹角"说成标定值 -> 用户拿估算当真相（必须**标注非标定值**，
+      并在 B/D 明显不满足 90° 时说"不支持"）。
+
+    全部用临时目录，不碰真 `config/`（那是运行期产物，且已被 git 忽略）。
+    """
+    print("----- 装置档案：读写 / 校验 / 几何提示 / active -----")
+    import tempfile
+
+    from stereo import profiles as rp
+
+    checks: list[tuple[str, bool]] = []
+
+    def rejects(fn) -> bool:
+        try:
+            fn()
+        except ValueError:
+            return True
+        return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "profiles.json"
+
+        # 1) 文件不存在 -> 空 store，不抛（首次使用要能跑）
+        empty = rp.load_store(path)
+        checks.append(("文件不存在时返回空 store（active=None、profiles={}）",
+                       empty["active"] is None and empty["profiles"] == {}))
+        checks.append(("空 store 上 get_active()/list_profiles() 分别为 None/[]",
+                       rp.get_active(path) is None and rp.list_profiles(path) == []))
+
+        # 2) 写 -> 读往返一致
+        profile = rp.RigProfile(
+            name="parallel-desk",
+            stereo_mode="parallel",
+            expected_baseline_mm=124.0,
+            working_distance_m=0.30,
+            width=2560,
+            height=1440,
+            fps=24,
+            calibration_path="config/stereo_calibration.json",
+            notes="近平行装置",
+        )
+        rp.upsert(profile, path=path)
+        back = rp.get_profile("parallel-desk", path)
+        checks.append(("写->读往返一致（含 calibration_path / notes / created）",
+                       back is not None and back.to_dict() == profile.to_dict()))
+
+        # 3) 非法输入必须被拒
+        checks.append(("重名被拒", rejects(lambda: rp.upsert(profile, path=path))))
+        checks.append(("stereo_mode='auto' 被拒", rejects(lambda: rp.upsert(
+            rp.RigProfile(name="auto-rig", stereo_mode="auto"), path=path))))
+        checks.append(("stereo_mode='orthogonal'（别名）被拒", rejects(lambda: rp.upsert(
+            rp.RigProfile(name="alias-rig", stereo_mode="orthogonal"), path=path))))
+        checks.append(("calibration_path='../x.json' 被拒", rejects(lambda: rp.upsert(
+            rp.RigProfile(name="escape", calibration_path="../x.json"), path=path))))
+        checks.append(("expected_baseline_mm=-1 被拒", rejects(lambda: rp.upsert(
+            rp.RigProfile(name="neg", expected_baseline_mm=-1.0), path=path))))
+        checks.append(("被拒后 store 未被污染（仍只有 1 个档案）",
+                       [p.name for p in rp.list_profiles(path)] == ["parallel-desk"]))
+
+        # 4) 几何提示：124/0.3 远小于 90°，600/0.3 ≈ 90°
+        small = rp.RigProfile(name="angled-124", stereo_mode="angled",
+                              expected_baseline_mm=124.0, working_distance_m=0.30)
+        good = rp.RigProfile(name="angled-600", stereo_mode="angled",
+                             expected_baseline_mm=600.0, working_distance_m=0.30)
+        hint_small = rp.geometry_hint(small)
+        hint_good = rp.geometry_hint(good)
+        print(f"  B=124 mm / D=0.30 m -> {hint_small}")
+        print(f"  B=600 mm / D=0.30 m -> {hint_good}")
+        checks.append(("B=124/D=0.3（远小于 90°）-> 提示「不支持 90°」",
+                       "不支持 90°" in hint_small))
+        checks.append(("B=600/D=0.3（≈90°）-> 不提示「不支持」",
+                       "不支持" not in hint_good))
+        checks.append(("两种提示都标注「非标定值」（不许把估算当标定）",
+                       "非标定值" in hint_small and "非标定值" in hint_good))
+
+        # 5) active 持久化（重开程序要能记住用哪套装置）
+        rp.set_active("parallel-desk", path)
+        reloaded = rp.load_store(path)
+        checks.append(("set_active 落盘（重新 load 后 active 仍是它）",
+                       reloaded["active"] == "parallel-desk"
+                       and rp.get_active(path).name == "parallel-desk"))
+        checks.append(("set_active 指向不存在的档案被拒",
+                       rejects(lambda: rp.set_active("nope", path))))
+        rp.set_active(None, path)
+        checks.append(("set_active(None) 可清除", rp.get_active(path) is None))
+
+        # 6) 删除档案例（含引用计数清零）
+        checks.append(("delete 已存在档案返回 True", rp.delete("parallel-desk", path)))
+        checks.append(("delete 后列表为空、active 已清",
+                       rp.list_profiles(path) == [] and rp.active_name(path) is None))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -431,7 +538,9 @@ def main() -> int:
     print()
     f = test_coast_window_is_frame_rate_independent()
     print()
-    ok = a and b and c and d and e and f
+    g = test_rig_profiles_are_validated_and_persisted()
+    print()
+    ok = a and b and c and d and e and f and g
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 
