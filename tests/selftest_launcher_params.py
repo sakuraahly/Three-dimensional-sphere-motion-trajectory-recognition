@@ -1169,6 +1169,21 @@ def main() -> int:
         print(f"  [{'通过' if passed else '不达标'}] {name}")
         results.append((name, passed))
 
+    print("----- 16. 容器帧率取相机协商值（--fps 只是请求提示）-----")
+    from apps.record_stereo import _container_fps
+    checks_container = [
+        ("协商 30 + 请求 24 -> 30（容器头不许照抄请求值）",
+         _container_fps(30.0, 24) == 30.0),
+        ("协商 0 -> 退回请求 24", _container_fps(0.0, 24) == 24.0),
+        ("协商 NaN -> 退回请求 24", _container_fps(float("nan"), 24) == 24.0),
+        ("协商负数 -> 退回请求 24", _container_fps(-1.0, 24) == 24.0),
+        ("保留 3 位小数", _container_fps(29.9999, 24) == 30.0
+         and _container_fps(29.12349, 24) == 29.123),
+    ]
+    for name, passed in checks_container:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        results.append((name, passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:

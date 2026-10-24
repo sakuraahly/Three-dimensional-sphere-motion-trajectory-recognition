@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -265,7 +266,25 @@ class _SideRecorder(threading.Thread):
                 self.preview[self.side] = frame
 
 
-def _make_writer(path: Path, width: int, height: int, fps: int, tag: str):
+def _container_fps(info_fps: float, requested: float) -> float:
+    """容器（MKV）标称帧率：优先用相机协商值，取不到才退回请求值。
+
+    ``info_fps`` 来自 ``CameraSource.info.fps``（``sources.py`` 里由
+    ``cap.get(CAP_PROP_FPS)`` 协商/实测得到，见 ``SourceInfo(... real_fps ...)``）。
+    ``--fps`` 只是给相机的**请求提示**，相机可能给别的值；容器头若照抄请求值，
+    播放器与 ``FileSource`` 的秒数换算会系统性偏差（2026-10-24 实录 301 帧 /
+    10.002 s ≈ 29.99 fps，而容器头被写成 24，慢了 25%）。
+    """
+    try:
+        v = float(info_fps)
+    except (TypeError, ValueError):
+        v = float("nan")
+    if not math.isfinite(v) or v < 1.0:
+        v = float(requested)
+    return round(v, 3)
+
+
+def _make_writer(path: Path, width: int, height: int, fps: float, tag: str):
     vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*tag),
                          float(fps), (width, height))
     if not vw.isOpened():
@@ -387,15 +406,17 @@ def main() -> int:
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
     ap.add_argument("--width", type=int, default=RECORD_DEFAULT.width,
                     help=f"录制宽度（默认 {RECORD_DEFAULT.label}）。真机实测：两台外接"
-                         "相机无视 1920/1280 请求、恒给 2560x1440；1440p 主循环"
-                         "实测约 24.07fps（242/300 帧/路），24 是稳定目标，"
-                         "请求 30 会丢帧。长录/其他机型未验证")
+                         "相机无视 1920/1280 请求、恒给 2560x1440。2026-10-24 复测："
+                         "写盘 1718x972（FOV 对齐后）时 30fps 稳定（301 帧/10s）；"
+                         "1440p 全尺寸未复测")
     ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
                     help=f"录制高度（默认 {RECORD_DEFAULT.label}；说明见 --width）")
     ap.add_argument("--fps", type=int, default=24,
-                    help="请求帧率（默认 24；1440p 主循环实测约 24.07fps，30 会丢帧）")
+                    help="请求相机的帧率（提示值），**不是**容器标称帧率；容器帧率"
+                         "取相机协商值（取不到才退回本值）。默认 24")
     ap.add_argument("--codec", choices=tuple(CODECS), default="hfyuv",
-                    help="无损编码器：hfyuv（默认，1440p@24 能跟上）/ ffv1（更通用但很慢）")
+                    help="无损编码器：hfyuv（默认，FOV 对齐后 1718x972@30 稳定）/ "
+                         "ffv1（更通用但很慢）")
     ap.add_argument("--duration", type=float, default=10.0, help="录制秒数")
     ap.add_argument("--countdown", type=float, default=3.0)
     ap.add_argument("--out", default=str(ROOT / "data" / "sessions"))
@@ -411,14 +432,6 @@ def main() -> int:
     ap.add_argument("--self-check-only", action="store_true",
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
     args = ap.parse_args()
-
-    if (args.width, args.height) == (2560, 1440) and args.fps > 24:
-        print(f"[警告] 1440p 主循环实测约 24.07fps（242/300 帧·10 秒·HFYU，"
-              f"两路一致）——这是目标值；请求 {args.fps}fps 会丢帧。"
-              f"建议 --fps 24（默认已 24）。长录/其他机型未验证。")
-        LOG.warning("2560x1440 + %dfps：主循环实测约 24.07fps（242/300），"
-                    "请求 >24fps 会丢帧；24fps 是稳定目标；长录/其他机型未验证",
-                    args.fps)
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")
@@ -484,6 +497,17 @@ def main() -> int:
         out_w, out_h = ((int(fov.target_size[0]), int(fov.target_size[1]))
                         if fov is not None and fov.active
                         else (int(args.width), int(args.height)))
+        # 依据是 **1440p 全尺寸（3.68MP）** 的历史实测（约 24.07fps，242/300 帧）；
+        # 现在 FOV 对齐后写盘只有 1718x972（1.67MP，约 45% 像素），30fps 稳定
+        # （2026-10-24：301 帧/10.002s）。只有写盘像素数真的很大时才提示。
+        if out_w * out_h > 2_500_000 and args.fps > 24:
+            print(f"[警告] 写盘 {out_w}x{out_h}（{out_w * out_h / 1e6:.2f}MP）"
+                  f"请求 {args.fps}fps：这是按 1440p 全尺寸（3.68MP）历史实测"
+                  "（约 24.07fps，242/300 帧·10 秒·HFYU）推断的风险，"
+                  "当前尺寸未实测；建议先短录确认不丢帧。")
+            LOG.warning("写盘 %sx%s（%.2fMP）请求 %dfps：依据 1440p 全尺寸的历史"
+                        "实测（约 24.07fps）提示可能丢帧；当前尺寸未实测",
+                        out_w, out_h, out_w * out_h / 1e6, args.fps)
         try:
             validate_capture_size(rig, out_w, out_h)
         except ValueError as exc:
@@ -570,9 +594,20 @@ def main() -> int:
 
         left_path = session_dir / "left.mkv"
         right_path = session_dir / "right.mkv"
+        # 容器标称帧率取相机协商值（`--fps` 只是请求提示）。两路容器头必须一致，
+        # 所以取两路协商值里较小的那个；都不合法才退回请求值。
+        negotiated = [float(left_src.info.fps), float(right_src.info.fps)]
+        usable = [v for v in negotiated if math.isfinite(v) and v >= 1.0]
+        container_fps = _container_fps(min(usable) if usable else float("nan"), args.fps)
+        fps_src = (f"相机协商 L/R={negotiated[0]:.1f}/{negotiated[1]:.1f}"
+                   if usable else "相机未报出有效帧率")
+        print(f"[容器] 标称帧率 {container_fps:g} fps（{fps_src}；请求 --fps "
+              f"{args.fps}）")
+        LOG.info("容器标称帧率 %.3f fps（%s；请求 %d fps）",
+                 container_fps, fps_src, args.fps)
         try:
-            left_writer = _make_writer(left_path, out_w, out_h, args.fps, tag)
-            right_writer = _make_writer(right_path, out_w, out_h, args.fps, tag)
+            left_writer = _make_writer(left_path, out_w, out_h, container_fps, tag)
+            right_writer = _make_writer(right_path, out_w, out_h, container_fps, tag)
         except Exception as exc:                            # noqa: BLE001
             print(f"[错误] {exc}")
             return 1
