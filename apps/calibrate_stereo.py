@@ -57,6 +57,7 @@ from apps._common import (
     setup_logging,
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
+from stereo.fov_align import estimate_fov_alignment
 from stereo.stereo_mode import infer_mode, optical_axes_angle_deg
 from sphere_tracker.sources import quiet_repeated_grab_warnings
 
@@ -207,6 +208,83 @@ def main() -> int:
     src.report_warnings()
     for w in getattr(src, "warnings", []) or []:
         log.warning("取帧源告警：%s", w)
+
+    # ---- 启动时一次性估计 FOV 对齐（之后逐帧复用，绝不重估） ----
+    #
+    # 为什么必须在这里做、而且失败就退出：
+    #   左相机比右相机放大 ~1.5x，直接按原生分辨率标定，两路像素尺度不一致，
+    #   视差与深度会被系统性污染，而标定报告本身看不出来。
+    #   所以宁可在启动时明确失败，也不允许"没对齐就继续"（fail-closed）。
+    #
+    # 相机刚打开的前几帧可能是黑帧/坏帧，这里最多读 30 帧或约 5 秒；
+    # 一旦拿到成对帧就**只估计一次**，并把这帧对留给主循环（不丢弃）。
+    fov = None
+    first_pair = None
+    read_attempts = 0
+    probe_deadline = time.perf_counter() + 5.0
+    while read_attempts < 30 and time.perf_counter() < probe_deadline:
+        ok, left0, right0 = src.read()
+        if not ok or left0 is None or right0 is None:
+            if not src.is_live:
+                break
+            read_attempts += 1
+            time.sleep(0.05)
+            continue
+        first_pair = (left0, right0)
+        break
+
+    if first_pair is None:
+        print("\n[错误] 启动后读不到可用的成对画面，无法自动估计 FOV 对齐。")
+        if src.is_live:
+            print("       请先确认两路相机都能出图："
+                  "python apps/tools/cameras.py doctor")
+            print("       然后重试；本次不会在未对齐的情况下继续标定。")
+        else:
+            print("       两路视频/图片序列没有同时有效的帧：检查左右文件是否成对、"
+                  "长度是否一致。")
+        log.error("启动阶段取不到成对帧，无法估计 FOV，退出（%s）", src.kind)
+        src.release()
+        return 1
+
+    try:
+        print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
+        fov = estimate_fov_alignment(first_pair[0], first_pair[1])
+    except ValueError as exc:
+        print("\n[错误] 无法自动估计两路 FOV 对齐，已停止（不会按原生分辨率继续）。")
+        print(f"       原因：{exc}")
+        print("       请把**有纹理的物体或标定板**同时放进两路画面、光照均匀、"
+              "对焦清晰，然后重试。")
+        print("       空白墙/纯色桌面/严重欠曝都会让特征匹配失败。")
+        log.error("FOV 估计失败，退出（不静默继续）：%s", exc)
+        src.release()
+        return 1
+
+    mag = max(fov.scale, 1.0 / fov.scale)
+    print("[FOV] 自动视场对齐（启动时只估计一次，之后逐帧复用）")
+    print(f"      参考（较窄、不缩放）：{fov.reference_side}    "
+          f"裁剪：{fov.crop_side}")
+    print(f"      裁剪区 (x, y, w, h) = {fov.crop_rect}    "
+          f"归一化尺寸 {fov.target_size[0]}x{fov.target_size[1]}")
+    print(f"      较窄一侧相对较广一侧放大 ~{mag:.2f}x    "
+          f"尺度 left->right={fov.scale:.4f}    "
+          f"质量 {fov.quality:.2f}（{fov.method}，内点 {fov.inliers}）")
+    if fov.active:
+        wide_frame = first_pair[0] if fov.crop_side == "left" else first_pair[1]
+        wide_h, wide_w = wide_frame.shape[:2]
+        x, y, w, h = fov.crop_rect
+        keep = (w * h) / float(max(1, wide_w * wide_h))
+        print(f"      ⚠ 较广的一侧（{fov.crop_side}）会损失视场：只保留 {keep:.0%} "
+              f"原画面（{w}x{h} / {wide_w}x{wide_h}），其余会被裁掉；")
+        print(f"        录制的两路视频会统一为 {fov.target_size[0]}x"
+              f"{fov.target_size[1]} 并沿用这份对齐参数。")
+    else:
+        print("      两路视场基本一致：不裁剪、不缩放（crop_side=none）。")
+    log.info("FOV 对齐：参考 %s / 裁剪 %s / 裁剪区 %s / 放大 %.3fx / "
+             "质量 %.3f（%s，内点 %d）",
+             fov.reference_side, fov.crop_side, fov.crop_rect, mag,
+             fov.quality, fov.method, fov.inliers)
+    print()
+
     from calib import CaptureConfig
     cap_kw: dict = dict(
         target_pairs=args.target,
@@ -259,9 +337,17 @@ def main() -> int:
     # 让**已经收下的图像对不白收**。
     miss = 0
     miss_reported = False
+    # 启动时估计 FOV 用的那帧对**不能丢**：第一轮直接用它喂 collector。
+    pending_pair = first_pair
+    first_pair = None
     try:
         while True:
-            ok, left, right = src.read()
+            if pending_pair is not None:
+                left, right = pending_pair
+                pending_pair = None
+                ok = True
+            else:
+                ok, left, right = src.read()
             if not ok or left is None or right is None:
                 if not src.is_live:
                     break
@@ -287,6 +373,10 @@ def main() -> int:
             frames += 1
             if args.max_frames and frames > args.max_frames:
                 break
+
+            # 逐帧复用启动时得到的同一份 FOV 参数（不重估）；两路归一化后再
+            # 送进 collector / 存图，所以 collector.image_size 就是归一化尺寸。
+            left, right = fov.apply(left, right)
 
             t0 = time.perf_counter()
             gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
@@ -429,6 +519,15 @@ def main() -> int:
     ip1 = [p.corners_left for p in collector.pairs]
     ip2 = [p.corners_right for p in collector.pairs]
     img_size = collector.image_size
+    # image_size 必须是 FOV 归一化后的尺寸（录制端会拿它核对分辨率）；
+    # 不一致说明采集中途分辨率变了，继续标定只会得到错误内参。
+    if fov.active and tuple(img_size) != tuple(fov.target_size):
+        print(f"\n[错误] 采集帧尺寸 {img_size} 与 FOV 归一化尺寸 "
+              f"{fov.target_size} 不一致，停止标定。")
+        print("       通常是相机中途重连 / 分辨率被改变；请重新标定。")
+        log.error("image_size %s 与 fov.target_size %s 不一致", img_size,
+                  fov.target_size)
+        return 1
 
     cfg = CalibConfig(expected_baseline_mm=args.baseline_mm)
     res = calibrate_stereo(objp, ip1, ip2, img_size, cfg, spec)
@@ -473,6 +572,7 @@ def main() -> int:
         "left": args.left if args.left is not None else (args.left_video or args.left_dir),
         "right": args.right if args.right is not None else (args.right_video or args.right_dir),
         "image_size": list(img_size),
+        "fov": fov.to_dict(),
         "stereo_mode": mode,
         "angle_deg": measured_angle,
     })

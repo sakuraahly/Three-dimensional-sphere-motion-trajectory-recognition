@@ -118,12 +118,15 @@ def add_stereo_source_args(
     *,
     width: int = video_profiles.DEFAULT.width,
     height: int = video_profiles.DEFAULT.height,
-    fps: int = 30,
+    fps: int = 24,
 ) -> argparse.ArgumentParser:
     """补上双目取帧参数 —— 字段名与 ``stereo.from_args()`` 读的一一对应。
 
     参数名/默认值集中在这里，三个双目 app 就永远同步，不会出现
     "这个脚本能用、那个不能"。
+
+    默认帧率 **24**（2026-10-24 真机实测）：默认档 2560x1440 下
+    ``record_stereo`` 主循环约 24.07fps，请求 30 会丢帧；24 是稳定目标。
     """
     ap.add_argument("--left", default=None,
                     help="左相机：索引(0) / 角色名(left，查 config/cameras.json) / auto")
@@ -143,7 +146,9 @@ def add_stereo_source_args(
                     help=f"相机采集宽度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
     ap.add_argument("--height", type=int, default=height,
                     help=f"相机采集高度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
-    ap.add_argument("--fps", type=int, default=fps, help="相机采集帧率")
+    ap.add_argument("--fps", type=int, default=fps,
+                    help=f"相机采集帧率（默认 {fps}；1440p 主循环实测约 "
+                         f"24.07fps，请求 30 会丢帧）")
     return ap
 
 

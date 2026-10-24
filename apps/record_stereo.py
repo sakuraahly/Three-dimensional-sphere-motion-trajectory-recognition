@@ -42,6 +42,7 @@ if str(ROOT) not in sys.path:
 
 from apps._common import setup_logging                      # noqa: E402
 from calib.params import StereoRig                           # noqa: E402
+from stereo.fov_align import FovAlignment                    # noqa: E402
 from stereo.stereo_mode import (                             # noqa: E402
     infer_mode, normalize_mode, optical_axes_angle_deg,
 )
@@ -209,7 +210,8 @@ def _lossless_selfcheck(width: int, height: int, fps: int, tag: str) -> tuple[bo
 
 class _SideRecorder(threading.Thread):
     def __init__(self, side: str, src: CameraSource, writer, start_evt: threading.Event,
-                 stop_evt: threading.Event, preview: dict, lock: threading.Lock):
+                 stop_evt: threading.Event, preview: dict, lock: threading.Lock,
+                 fov: FovAlignment | None = None):
         super().__init__(daemon=True, name=f"record-{side}")
         self.side = side
         self.src = src
@@ -218,6 +220,7 @@ class _SideRecorder(threading.Thread):
         self.stop_evt = stop_evt
         self.preview = preview
         self.lock = lock
+        self.fov = fov
         self.times: list[tuple[int, float, float]] = []
         self.brightness: list[float] = []
         self.frame_count = 0
@@ -236,6 +239,14 @@ class _SideRecorder(threading.Thread):
                 time.sleep(0.005)
                 continue
             self.errors = 0
+            # 先按标定里的 FOV 参数归一化，再写盘 / 统计 / 预览 ——
+            # 这样录出的两路视频与标定 image_size 一致，不会写入原生视场。
+            if self.fov is not None:
+                try:
+                    frame = self.fov.apply_side(frame, self.side)
+                except ValueError as exc:
+                    self.error = f"FOV 归一化失败（{self.side}）：{exc}"
+                    return
             try:
                 self.writer.write(frame)
             except Exception as exc:                        # noqa: BLE001
@@ -332,6 +343,19 @@ def validate_capture_size(rig: StereoRig, width: int, height: int) -> None:
         )
 
 
+def _load_calib_fov(raw: object) -> FovAlignment | None:
+    """标定 ``meta["fov"]`` -> :class:`FovAlignment`；缺失 / None 返回 None。
+
+    **只有** 缺失 / ``None`` 才代表旧标定（按原生画面工作）。``{}`` / ``[]`` /
+    非 mapping 等是**损坏的记录**：``FovAlignment.from_dict()`` 会抛
+    ``ValueError``，调用方必须按损坏退出 2 —— 绝不能因为“假值”就把损坏当成
+    旧标定静默跳过（那样会按原生画面录制，尺度错了却不报错）。
+    """
+    if raw is None:
+        return None
+    return FovAlignment.from_dict(raw)                      # type: ignore[arg-type]
+
+
 def _camera_info(side: str, idx: int, src: CameraSource, args, role_spec) -> CameraInfo:
     return CameraInfo(
         role=side,
@@ -354,14 +378,16 @@ def main() -> int:
     ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
     ap.add_argument("--width", type=int, default=RECORD_DEFAULT.width,
-                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时"
-                         "主循环实测约 24.1fps（242/300），HFYU 1440p@30 会丢帧，"
-                         "可降到 24fps 或改 1080p；长录/其他机型未验证）")
+                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}）。真机实测：两台外接"
+                         "相机无视 1920/1280 请求、恒给 2560x1440；1440p 主循环"
+                         "实测约 24.07fps（242/300 帧/路），24 是稳定目标，"
+                         "请求 30 会丢帧。长录/其他机型未验证")
     ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
-                    help=f"录制高度（默认 {RECORD_DEFAULT.label}；显式 2560x1440 时见 --width 提示）")
-    ap.add_argument("--fps", type=int, default=30, help="请求帧率（相机实测只有约 27–30）")
+                    help=f"录制高度（默认 {RECORD_DEFAULT.label}；说明见 --width）")
+    ap.add_argument("--fps", type=int, default=24,
+                    help="请求帧率（默认 24；1440p 主循环实测约 24.07fps，30 会丢帧）")
     ap.add_argument("--codec", choices=tuple(CODECS), default="hfyuv",
-                    help="无损编码器：hfyuv（默认，1080p30 能跟上）/ ffv1（更通用但很慢）")
+                    help="无损编码器：hfyuv（默认，1440p@24 能跟上）/ ffv1（更通用但很慢）")
     ap.add_argument("--duration", type=float, default=10.0, help="录制秒数")
     ap.add_argument("--countdown", type=float, default=3.0)
     ap.add_argument("--out", default=str(ROOT / "data" / "sessions"))
@@ -378,11 +404,13 @@ def main() -> int:
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
     args = ap.parse_args()
 
-    if (args.width, args.height) == (2560, 1440):
-        print("[警告] 1440p 主循环实测约 24.1fps（242/300 帧·10 秒·HFYU，两路一致）；"
-              "HFYU 1440p@30 会丢帧，可降到 --fps 24 或改 1080p。长录/其他机型未验证。")
-        LOG.warning("显式 2560x1440：主循环实测约 24.1fps（242/300），"
-                    "HFYU 1440p@30 会丢帧；可降到 24fps 或改 1080p；长录/其他机型未验证")
+    if (args.width, args.height) == (2560, 1440) and args.fps > 24:
+        print(f"[警告] 1440p 主循环实测约 24.07fps（242/300 帧·10 秒·HFYU，"
+              f"两路一致）——这是目标值；请求 {args.fps}fps 会丢帧。"
+              f"建议 --fps 24（默认已 24）。长录/其他机型未验证。")
+        LOG.warning("2560x1440 + %dfps：主循环实测约 24.07fps（242/300），"
+                    "请求 >24fps 会丢帧；24fps 是稳定目标；长录/其他机型未验证",
+                    args.fps)
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")
@@ -437,6 +465,51 @@ def main() -> int:
         except ValueError as exc:
             print(f"[错误] {exc}")
             return 2
+
+        # 新标定在 meta 里带 FOV 对齐参数；**只有** 缺失 / None 才是旧标定 ->
+        # fov=None，行为不变。{} / [] / 非 mapping 是损坏记录，必须像 verify
+        # 一样退出 2：不能把“解析不出来”静默当成“没有 FOV”。
+        raw_fov = rig.meta.get("fov") if isinstance(rig.meta, dict) else None
+        try:
+            fov = _load_calib_fov(raw_fov)
+        except ValueError as exc:
+            print(f"[错误] 标定 meta.fov 无法解析：{exc}")
+            print("       旧标定本来没有该字段；这份标定的 FOV 记录损坏，"
+                  "请重新标定后再录。")
+            LOG.error("标定 meta.fov 解析失败，拒绝录制：%s", exc)
+            return 2
+        if fov is not None:
+            if fov.active and tuple(fov.target_size) != tuple(rig.image_size):
+                print(f"[错误] 标定 meta.fov.target_size {fov.target_size} 与 "
+                      f"image_size {rig.image_size} 不一致，拒绝录制。")
+                print("       这份标定的 FOV 记录与内参不匹配，请重新标定。")
+                LOG.error("fov.target_size %s 与 rig.image_size %s 不一致，拒绝录制",
+                          fov.target_size, rig.image_size)
+                return 2
+            if fov.active:
+                # 预检：crop_rect 必须落在该路原生采集帧内。apply_side() 也会
+                # 在采集线程里报同样的错，但那时 writer 已打开、会话目录已建；
+                # 这里提前拒绝，不产出半截会话。
+                cap_w, cap_h = int(rig.image_size[0]), int(rig.image_size[1])
+                cx, cy, cw, ch = fov.crop_rect
+                if cx < 0 or cy < 0 or cx + cw > cap_w or cy + ch > cap_h:
+                    print(f"[错误] 标定 meta.fov.crop_rect {fov.crop_rect} 超出"
+                          f"采集帧 {cap_w}x{cap_h}（裁剪路 {fov.crop_side}），"
+                          "拒绝录制。")
+                    print("       这份标定的 FOV 裁剪区与当前分辨率不匹配，"
+                          "请重新标定。")
+                    LOG.error("fov.crop_rect %s 超出采集帧 %sx%s，拒绝录制",
+                              fov.crop_rect, cap_w, cap_h)
+                    return 2
+                print(f"[FOV] 沿用标定对齐：参考 {fov.reference_side} / "
+                      f"裁剪 {fov.crop_side} / 裁剪区 {fov.crop_rect} -> "
+                      f"{fov.target_size[0]}x{fov.target_size[1]}")
+                LOG.info("沿用标定 FOV 对齐：%s", fov.to_dict())
+            else:
+                print("[FOV] 标定记录两路视场一致（crop_side=none），不裁剪")
+        else:
+            print("[FOV] 旧标定没有 fov 记录：按原生画面录制（行为与以前一致）")
+
         session.calibration = CalibrationInfo(
             path=str(calib_path.relative_to(session_dir)).replace("\\", "/"),
             sha256=sha256_file(calib_path),
@@ -456,6 +529,9 @@ def main() -> int:
             "angle_deg": float(optical_axes_angle_deg(rig.R)),
             "baseline_mm": float(rig.baseline_mm),
         }
+        # 只在真的发生裁剪/缩放时写入，旧会话 schema 与旧标定记录的字段不变。
+        if fov is not None and fov.active:
+            session.rig["fov"] = fov.to_dict()
         if mode != rig.stereo_mode:
             print(f"[警告] 会话模式 {mode} 与标定 meta {rig.stereo_mode} 不一致；"
                   "请确认这份标定确实对应当前机械装置。")
@@ -478,9 +554,9 @@ def main() -> int:
         preview: dict = {}
         lock = threading.Lock()
         left_rec = _SideRecorder("left", left_src, left_writer, start_evt, stop_evt,
-                                 preview, lock)
+                                 preview, lock, fov=fov)
         right_rec = _SideRecorder("right", right_src, right_writer, start_evt, stop_evt,
-                                  preview, lock)
+                                  preview, lock, fov=fov)
 
         print()
         print("准备好后看倒计时。录制开始后 **1 秒内闪一次光**（或拍一次手），")
@@ -494,6 +570,16 @@ def main() -> int:
                     ok_l, lf, _ = left_src.read()
                     ok_r, rf, _ = right_src.read()
                     if ok_l and ok_r and lf is not None and rf is not None:
+                        if fov is not None:
+                            try:
+                                lf = fov.apply_side(lf, "left")
+                                rf = fov.apply_side(rf, "right")
+                            except ValueError as exc:
+                                print(f"[错误] 倒计时预览 FOV 归一化失败：{exc}")
+                                LOG.error("倒计时预览 FOV 归一化失败：%s", exc)
+                                left_writer.release()
+                                right_writer.release()
+                                return 2
                         canvas = np.hstack([
                             cv2.resize(lf, (640, 360), interpolation=cv2.INTER_AREA),
                             cv2.resize(rf, (640, 360), interpolation=cv2.INTER_AREA)])

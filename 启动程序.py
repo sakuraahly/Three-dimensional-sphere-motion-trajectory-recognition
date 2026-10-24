@@ -76,8 +76,10 @@ from sphere_tracker.video_profiles import (  # noqa: E402  （要等 ROOT 进 sy
 )
 RESOLUTIONS = _video_profile_options()
 # `video_profiles` 是分辨率档位的唯一来源；默认档也只用它的 DEFAULT，
-# 不在 GUI 另写一个 1080p。是否把 DEFAULT 调到 1440p，由录制吞吐/真机实测决定。
+# 不在 GUI 另写一个 1080p。默认 2560x1440@24：真机实测两台外接相机无视
+# 1920/1280 请求、恒给 2560x1440，且 1440p@30 主循环只有 24.07fps（会丢帧）。
 DEFAULT_RESOLUTION = DEFAULT_VIDEO_PROFILE.label
+CALIB_FPS_DEFAULT = "24"
 
 # ---- 换行宽度：**跟着视口动态算，不写死** ----
 #
@@ -672,10 +674,10 @@ class Launcher(tk.Tk):
         ttk.Label(basic, text="帧率").grid(row=row, column=2, sticky="e",
                                           padx=(24, 6), pady=(4, 0))
         self.calib_fps = ttk.Entry(basic, width=6)
-        self.calib_fps.insert(0, "30")
+        self.calib_fps.insert(0, CALIB_FPS_DEFAULT)
         self.calib_fps.grid(row=row, column=3, sticky="w", pady=(4, 0))
         self._hint(basic, "两台相机必须同分辨率、同后端，否则一对有效图像都收不到")
-        # 选到 >1920 的档时**必须当场说清代价**，不能让人以为"相机支持就一定能录"。
+        # 选到 >1080p 的档时**必须当场说清代价**，不能让人以为"相机支持就一定能录"。
         # 用单独一行而不是塞进上面的说明：1080p 用户不需要看这段噪音。
         self.res_note = ttk.Label(basic, text="", style="Hint.TLabel",
                                   wraplength=PARAM_HINT_WRAP)
@@ -729,20 +731,21 @@ class Launcher(tk.Tk):
         return basic_section, adv_section
 
     def _refresh_res_note(self) -> None:
-        """选了 >1080p 的档时，把"录制吞吐要实测"写在界面上 —— 不静默承诺 30 fps。
+        """选了 >1080p 的档时，把"1440@30 会丢帧、24 才是目标"写在界面上。
 
-        依据（2026-10-23 团队实测）：`record_stereo` 1440p@30 的**主循环**只有
-        约 24.1 fps（10 秒 242/300 帧/路，HFYU，两路一致）；裸采集短测能到 30，
-        但主循环跟不上 —— 也就是说 HFYU 1440p@30 会丢帧。长录/其他机型未验证。
+        依据（2026-10-24 真机实测，取代 2026-10-23 的短测）：`record_stereo`
+        2560x1440@30 的**主循环**实测约 24.07fps（10 秒 242/300 帧/路，HFYU，
+        两路一致）；**24fps 就是稳定目标**，请求 30 会丢帧 —— 裸采集能到 30
+        不等于主循环能到 30。长录/其他机型未验证。
         这类差距画面上不一定看得出来，所以必须在**选择时**就说清；
         1080p 及以下不显示（没这个代价，少一点噪音）。
         """
         profile = parse_video_profile(self.calib_res.get(),
                                       default=DEFAULT_VIDEO_PROFILE)
         if profile.width > 1920:
-            text = (f"⚠ {profile.label}：record_stereo 主循环实测约 24.1 fps"
-                    f"（242/300 帧·10 秒·HFYU，两路一致），HFYU 1440p@30 会丢帧；"
-                    f"可把帧率降到 24 或改 1080p。长录/其他机型未验证。")
+            text = (f"⚠ {profile.label}：record_stereo 主循环实测约 24.07 fps"
+                    f"（242/300 帧·10 秒·HFYU，两路一致），24 fps 是稳定目标；"
+                    f"请求 30 会丢帧，帧率已默认 24。长录/其他机型未验证。")
         else:
             text = ""
         self.res_note.configure(text=text)
@@ -1341,7 +1344,7 @@ class Launcher(tk.Tk):
         profile = parse_video_profile(self.calib_res.get(),
                                       default=DEFAULT_VIDEO_PROFILE)
         args = ["--width", str(profile.width), "--height", str(profile.height),
-                "--fps", (self.calib_fps.get().strip() or "30")]
+                "--fps", (self.calib_fps.get().strip() or CALIB_FPS_DEFAULT)]
         if profile.width > 1920:
             args += ["--detect-width", str(detection_width(profile.width, 1280))]
         return args
@@ -1391,7 +1394,7 @@ class Launcher(tk.Tk):
             "--left", self.calib_left.get(),
             "--right", self.calib_right.get(),
             "--width", width, "--height", height,
-            "--fps", (self.calib_fps.get().strip() or "30"),
+            "--fps", (self.calib_fps.get().strip() or CALIB_FPS_DEFAULT),
             "--duration", str(duration),
             "--label", (label or "gui_record").strip(),
             "--stereo-mode", self.stereo_mode_var.get(),
@@ -1639,7 +1642,7 @@ class Launcher(tk.Tk):
             return None
 
         width, height = self.calib_res.get().split("x")
-        fps = self.calib_fps.get().strip() or "30"
+        fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
         args = ["--left", _cam_arg(self.calib_left.get()),
                 "--right", _cam_arg(self.calib_right.get()),
                 "--stereo-mode", self.stereo_mode_var.get(),
@@ -1691,7 +1694,7 @@ class Launcher(tk.Tk):
             return
         left, right = _cam_arg(left_raw), _cam_arg(right_raw)
         width, height = self.calib_res.get().split("x")
-        fps = self.calib_fps.get().strip() or "30"
+        fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
         if mode == "calibrate":
             extra = self._calibrate_args()
             if extra is None:
@@ -1737,7 +1740,7 @@ class Launcher(tk.Tk):
             return
         left, right = _cam_arg(left_raw), _cam_arg(right_raw)
         width, height = self.calib_res.get().split("x")
-        fps = self.calib_fps.get().strip() or "30"
+        fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
         cmd = [PY, str(ROOT / "apps" / "tools" / "check_stereo_setup.py"),
                "--left", left, "--right", right,
                "--width", width, "--height", height, "--fps", fps]

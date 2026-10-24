@@ -5,7 +5,7 @@
     conda activate myenv
     python apps/run_realtime.py                     # 默认摄像头，融合检测
     python apps/run_realtime.py --method color --preset orange_ball
-    python apps/run_realtime.py --camera 1 --width 1920 --height 1080 --fps 60
+    python apps/run_realtime.py --camera 1 --width 2560 --height 1440 --fps 24
     python apps/run_realtime.py --record outputs/videos/session.mp4
 
 快捷键：
@@ -88,7 +88,9 @@ def parse_args() -> argparse.Namespace:
                    help=f"采集宽度（默认档 {video_profiles.DEFAULT.label}）")
     p.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
                    help=f"采集高度（默认档 {video_profiles.DEFAULT.label}）")
-    p.add_argument("--fps", type=int, default=60)
+    p.add_argument("--fps", type=int, default=24,
+                   help="相机采集帧率（默认 24；默认档 2560x1440 主循环实测约 "
+                        "24.07fps，请求 30 会丢帧）")
     p.add_argument(
         "--method",
         default=None,

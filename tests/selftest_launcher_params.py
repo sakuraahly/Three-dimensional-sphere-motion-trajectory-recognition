@@ -343,16 +343,16 @@ def main() -> int:
     expect("1280x720 -> --width 1280 --height 720", True,
            contains="--width 1280 --height 720")
     app.calib_res.set("1920x1080")
-    expect("默认帧率 30 -> --fps 30", True, contains="--fps 30")
+    expect("默认帧率 24 -> --fps 24", True, contains="--fps 24")
 
-    # ---- 7b. 分辨率档位来自 video_profiles（唯一来源），默认 1920x1080 ----
+    # ---- 7b. 分辨率档位来自 video_profiles（唯一来源），默认 2560x1440@24 ----
     # 守的是"GUI 与录制/标定/实时共用同一份档位表"：
     # 原来 RESOLUTIONS 与实时入口的 1280x720 默认值是两份独立数字，
     # 面板选 1080p 而实时按 720p 开，界面上看不出来。
-    # 默认**就是** video_profiles.DEFAULT（当前 1920x1080）：1440 裸采集短测可 30fps，
-    # 但 record_stereo 主循环实测只有 24.1fps（242/300，会丢帧），长录未验证，
-    # 所以默认不调到 1440p；档位表仍包含 2560x1440，GUI 选它时显式提示 24.1fps。
-    print("----- 7b. 分辨率唯一来源 / 默认 1080p / 实时检测宽度 -----")
+    # 默认**就是** video_profiles.DEFAULT（当前 2560x1440）：真机实测两台外接
+    # 相机无视 1920/1280 请求、恒给 2560x1440；record_stereo 1440p@30 主循环
+    # 只有 24.07fps，所以帧率默认 24。旧 1080 档仍在表里、仍可显式选择。
+    print("----- 7b. 分辨率唯一来源 / 默认 1440p@24 / 实时检测宽度 -----")
     from types import SimpleNamespace
     from apps import record_stereo as record_app
     from sphere_tracker.video_profiles import RECORD_DEFAULT
@@ -385,35 +385,38 @@ def main() -> int:
     app._refresh_res_note()
     mod_src = (ROOT / "启动程序.py").read_text(encoding="utf-8")
     checks_res = [
-        ("默认分辨率 = 1920x1080（1440p@30 录制未证明，不默认）",
-         res_default == mod.DEFAULT_RESOLUTION == "1920x1080"),
-        ("录制默认档来自 video_profiles.RECORD_DEFAULT（不写死 1920）",
-         RECORD_DEFAULT.label == "1920x1080"
+        ("默认分辨率 = 2560x1440（真机恒给 1440，1080 请求必失败）",
+         res_default == mod.DEFAULT_RESOLUTION == "2560x1440"),
+        ("录制默认档来自 video_profiles.RECORD_DEFAULT（不写死 1080）",
+         RECORD_DEFAULT.label == "2560x1440"
          and "default=RECORD_DEFAULT.width" in record_src
          and "default=RECORD_DEFAULT.height" in record_src),
-        ("录制前校验标定分辨率：1080 标定 + 1080 录制放行", record_same_ok),
-        ("录制前校验标定分辨率：1080 标定 + 1440 录制报错", record_mismatch_blocked),
+        ("录制前校验标定分辨率：旧 1080 标定 + 1080 录制仍放行（旧会话可读）",
+         record_same_ok),
+        ("录制前校验标定分辨率：1080 标定 + 1440 录制报错（不静默混用）",
+         record_mismatch_blocked),
         ("档位表来自 video_profiles.options()（含 2560x1440 / 1080p / 720p）",
          list(mod.RESOLUTIONS) == list(video_options())
          and "2560x1440" in mod.RESOLUTIONS
          and "1920x1080" in mod.RESOLUTIONS and "1280x720" in mod.RESOLUTIONS),
         ("录制在 2560x1440 档传 --width 2560 --height 1440（与标定同源）",
          "--width 2560 --height 1440" in rec_hd),
-        ("录制在默认档传 --width 1920 --height 1080",
+        ("旧 1080 档仍可显式选择：录制传 --width 1920 --height 1080",
          "--width 1920 --height 1080" in rec_1080),
         ("实时在 2560x1440 档传 --width 2560 --height 1440（不再固定 720p）",
          "--width 2560 --height 1440" in rt_hd),
-        ("实时在默认档传 --width 1920 --height 1080",
+        ("实时在 1080 档传 --width 1920 --height 1080",
          "--width 1920 --height 1080" in rt_1080),
-        ("实时传面板帧率（默认 30，不再让 run_realtime 用 60）",
-         "--fps 30" in rt_1080),
+        ("实时传面板帧率（默认 24，不再让 run_realtime 用 60）",
+         app.calib_fps.get().strip() == "24" and "--fps 24" in rt_1080),
         ("高分辨率实时加 --detect-width 1280",
          "--detect-width 1280" in rt_hd),
         ("1080p 不加 --detect-width（不强制降采样）",
          "--detect-width" not in rt_1080),
         ("720p 不加 --detect-width", "--detect-width" not in rt_720),
-        ("选 2560 时界面提示主循环实测 24.1fps 且会丢帧（不静默承诺 30fps）",
-         "24.1" in note_hd and "丢帧" in note_hd and "242/300" in note_hd),
+        ("选 2560 时界面提示主循环 24.07fps 是目标、30 会丢帧（不静默承诺 30fps）",
+         "24.07" in note_hd and "丢帧" in note_hd and "242/300" in note_hd
+         and "24 fps 是稳定目标" in note_hd),
         ("1080p 不显示吞吐警告（少噪音）", note_1080 == ""),
         ("_start_realtime 复用 _realtime_args（不是两套拼法）",
          "cmd += self._realtime_args()" in mod_src),
@@ -445,7 +448,7 @@ def main() -> int:
         ("带 --preview", "--preview" in rec_s),
         ("带 --label gui_test", "--label gui_test" in rec_s),
         ("带 --left left --right right", "--left left --right right" in rec_s),
-        ("带 --fps 30", "--fps 30" in rec_s),
+        ("带 --fps 24", "--fps 24" in rec_s),
         ("默认双目模式 auto", "--stereo-mode auto" in rec_s),
     ]
     for label, good in checks_rec:
@@ -711,7 +714,7 @@ def main() -> int:
     checks = [
         ("--target 默认 40（与面板一致）", tgt == panel_target == "40"),
         ("--min-pairs 默认 20（与面板一致）", mp == panel_minp == "20"),
-        ("--fps 默认 30（与面板一致）", common_fps == panel_fps == "30"),
+        ("--fps 默认 24（与面板一致）", common_fps == panel_fps == "24"),
         ("试标定档的文字说明还在（让人知道可以显式给 8）",
          "8" in src and "试标定" in src),
     ]

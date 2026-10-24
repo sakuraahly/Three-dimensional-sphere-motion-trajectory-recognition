@@ -172,12 +172,12 @@ def _try_open(index: int, api: int):
     search_budget_s 默认 60 s —— 遇到打不开的相机会干等一分钟。两者叠加
     就是用户看到的"卡顿"。
     """
-    # ⚠️ **请求 1920x1080（原生）而不是 640x480**。
+    # ⚠️ **请求 1920x1080（兼容档）而不是 640x480**。
     #
-    # 2026-10-18 实测这台 aoni：MSMF 下**只认 1920x1080** ——
-    # 请求 640x480 / 1280x720 都是"打开成功但一帧都不给"（10.6 s 后判死），
-    # 而 1920x1080 能出帧（约 23 s；另一台约 2 s）。
-    # 旧代码请求 640x480，于是那台在识别界面里**彻底消失**。
+    # 2026-10-18 实测这台 aoni：MSMF 下请求 640x480 / 1280x720 会"打开成功但
+    # 一帧都不给"（10.6 s 后判死），而 1920x1080 能出帧（约 23 s；另一台约 2 s）。
+    # 2026-10-24 复测：两台外接相机**都无视 1920/1280 请求、恒给 2560x1440**，
+    # 所以这里请求 1920 只是兼容旧机型；实际分辨率以 `src.info` 为准，不假设。
     return CameraSource(index=index, width=1920, height=1080, backend=api,
                         optimize=False, search_budget_s=PREVIEW_BUDGET_S,
                         first_frame_timeout_s=PREVIEW_FIRST_FRAME_S)
@@ -280,9 +280,9 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                     import cv2
                     # ⚠️ **显示前先降采样**（2026-10-18，用户反馈"画面依然很卡顿"）。
                     #
-                    # 这台相机只肯给 1920x1080；而识别只需要"能看出这是哪台"。
-                    # 每帧直接 imshow 1080p（约 6 MB/帧）在中低端核显上会明显掉帧，
-                    # 再加上 putText 也在全尺寸上做，就更慢。
+                    # 外接相机实际给 2560x1440（请求被无视）；而识别只需要
+                    # "能看出这是哪台"。每帧直接 imshow 1440p 在中低端核显上会
+                    # 明显掉帧，再加上 putText 也在全尺寸上做，就更慢。
                     # 降到 960 宽后，imshow 的拷贝量降到 1/4。
                     disp = frame
                     if frame.shape[1] > PREVIEW_DISPLAY_W:
@@ -911,6 +911,7 @@ def cmd_doctor(args) -> int:
     print("=" * 68)
     print("相机体检（真开相机；只报告，不改配置）")
     print("=" * 68)
+    print(f"目标采集档：{want_w}x{want_h}（来自 video_profiles.DEFAULT）")
     if not devices:
         print("枚举不到任何相机设备（非 Windows / 注册表不可读 / 真的没插）。")
         return 1
@@ -1009,8 +1010,8 @@ def cmd_doctor(args) -> int:
         else:
             fail = True
             print(f"    ✘ 两路**不一致** —— 标定会直接失败。"
-                  f"本机实测：只有请求 **1920x1080** 时两路才可能一致"
-                  f"（`#0` 那台无视请求恒给 1920x1080）。")
+                  f"本机实测：两台外接相机都无视请求、恒给 2560x1440"
+                  f"（请求 1920/1280 也一样）；不一致先查是不是混进了内置/红外。")
 
     # ---- ⑤ 结论 ----
     print("\n" + "=" * 68)

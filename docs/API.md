@@ -528,6 +528,39 @@ class AngledReconstructor:
 `stereo/stereo_mode.py`：`normalize_mode/infer_mode/mode_label/optical_axes_angle_deg/geometry_advice`；
 旧 session/标定无字段 → `parallel`。
 
+### 13.3c `stereo/fov_align.py` —— 自动视场对齐
+
+```python
+@dataclass(frozen=True)
+class FovAlignment:
+    reference_side: str                    # "left"/"right"：较窄、更放大的一路；永不裁剪/缩放
+    crop_side: str                         # "left"/"right"/"none"：被裁剪的一路
+    crop_rect: tuple[int, int, int, int]   # (x, y, w, h)，在 crop_side 的像素系里
+    target_size: tuple[int, int]           # (w, h) = 参考帧尺寸；裁剪后缩放到此
+    scale: float                           # left -> right 像素尺度；1.0 = 视场基本一致
+    method: str                            # "sift"/"orb"
+    inliers: int;  quality: float          # quality ∈ [0, 1]
+    @property active -> bool               # crop_side != "none"
+    def apply_side(self, frame: np.ndarray, side: str) -> np.ndarray
+    def apply(self, left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]
+    def to_dict(self) -> dict[str, Any]
+    @classmethod from_dict(cls, data: Mapping[str, Any]) -> "FovAlignment"
+
+def estimate_fov_alignment(left: np.ndarray, right: np.ndarray, *,
+                           min_inliers: int = 30,
+                           max_scale: float = 2.5) -> FovAlignment
+```
+
+**输入 / 边界**：`left`/`right` 支持 BGR / BGRA / 灰度 `np.ndarray`（uint8 最稳）；模块是纯函数 / 纯数据，不读配置、不碰相机、不写文件。
+
+**做法**：SIFT 优先、ORB 兜底；Lowe ratio + 双向交叉校验；RANSAC homography（失败退仿射）。由内点拟合 `left->right` 尺度：`scale <= 1` 以左为参考裁右（视场接近时通常先判 `none`），`scale > 1` 以右为参考裁左。`|scale-1| <= 0.05`、中心偏移 `<= 10%` 短边、参考帧可见面积 `>= 90%` 时返回 `crop_side="none"`。参考帧永远原样返回；只对 `crop_side` 做 `crop_rect` 裁剪 + `INTER_LINEAR` 缩放到 `target_size`。
+
+**失败语义（不会静默退化）**：参数非法或估计失败都抛 `ValueError`；估计失败时错误串带 SIFT/ORB 各自的失败原因 —— 帧非法 / 太小（短边 < 16）、没有足够特征或匹配、内点 `< min_inliers`、尺度超出 `[1/max_scale, max_scale]`、参考帧四角映射失败或退化（含非有限坐标、宽或高 < 2）、参考帧映射后的包围盒只占广角帧 `< 20%` 面积、**参考帧四角映射后任一维越出广角帧 > 1 px**（参考帧未完整落在广角帧内 = 共同视场不足；只容忍浮点 / 取整误差，**不会**裁掉越界角按“部分重叠”继续主动对齐）。`crop_side="none"` 只在近同视场判据通过时出现，**不是失败兜底**；`min_inliers` 至少 4，`max_scale` 必须 > 1.0。构造 / `from_dict()` 还会校验字段（`reference_side`/`crop_side` 取值、`crop_side != reference_side`、`crop_rect` 为 4 个整数且非负/宽高为正、`target_size` 为正、`scale` 有限正数、`quality` 在 `[0, 1]`）；应用对齐时，`apply()` 检查参考帧尺寸是否等于 `target_size`，`apply_side()` 检查裁剪区是否越界。
+
+**接线**：`apps/calibrate_stereo.py` 启动时只估计一次（实时相机路径最多读 30 帧 / 5 秒），把 `fov.to_dict()` 写进 `StereoRig.meta["fov"]`（落盘后是标定 JSON 顶层的 `fov`），之后每帧 `fov.apply()` 后再检测角点（`--save-pairs` 另存的也是归一化画面）；`record_stereo.py` 在写盘 / 预览前按路 `apply_side()` 裁剪，且只有 `meta["fov"]` **缺失 / `None`** 才按旧标定原生画面录，`{}` / `[]` / 非 mapping 一律视为记录损坏退出 2；启用对齐时 `crop_rect` 越出采集帧也在打开 writer 前退出 2。`verify_stereo.py` 只对实时相机输入应用 `fov.apply()`；视频 / 图片不二次裁剪，但会在**首对帧**调用 `estimate_fov_alignment()` 证明输入确实已归一化 —— 仍需要主动对齐（原生画面）、尺度不在 `0.9–1.1` 或纹理不足估不出来都退出 2，显式加 `--fov-input-normalized` 才跳过校验（不静默假定）。旧标定没有 `fov` 键（`rig.meta.get("fov")` 为 `None`）→ 调用方拿到 `None`，按原生画面工作；`session.rig["fov"]` 只在对齐生效（`active=True`）时写入。
+
+**当前真机样例（模块级，不是完整标定 E2E）**：2026-10-24 两路 2560×1440 MSMF 帧，左路（较窄）为参考、右路裁剪 `(409,126,1717,986)`（只保留 45.9% 画面）、`scale≈0.651`；对齐后重估残余尺度 `≈0.966`（目标 1.0）。换机 / 换镜头 / 换分辨率后以启动估计为准，不要写死。
+
 ### 13.4 `stereo/sessions.py`
 ```python
 SCHEMA = "sphere-stereo-session"; VERSION = 1; SESSION_FILE = "session.json"
@@ -540,7 +573,7 @@ SCHEMA = "sphere-stereo-session"; VERSION = 1; SESSION_FILE = "session.json"
 @dataclass SyncInfo: method="none", offset=0, confidence=0.0, note=""
 @dataclass Session:
     id, created, label="", notes="", left=None, right=None, calibration=None,
-    stereo_mode="parallel", rig={},               # 2026-10-21；旧文件缺省 parallel
+    stereo_mode="parallel", rig={},               # 2026-10-21；旧文件缺省 parallel；rig["fov"] 仅对齐生效时写入
     sync=SyncInfo(), codec="FFV1", container="mkv", lossless=True,
     environment={}, checks=[]
 def create_session(root, *, label="", notes="") -> tuple[Path, Session]
@@ -603,7 +636,7 @@ def export_session_visualization(session_dir, *, csv_name="traj3d.csv") -> dict[
 >
 > 反向依赖（比如 `geometry.py` 去 import `pipeline`）会立刻把项目变成一团乱麻。
 ## 15. 核对记录与本文边界
-**已用 `inspect.signature` 复核的 36 个签名**：`geometry` 的 `refine_circle_subpixel`/`fit_circle_robust`/`circle_radial_gradient_stats`/`CameraModel.__init__`/`estimate_focal_from_known_ball`；`camera_motion` 的 `GlobalMotionEstimator.__init__`/`.estimate`/`warp_to_current`；`detectors.base._score_candidate`；`track` 的 `KalmanFilter.__init__`/`Track.__init__`；`predict` 的 `predict_quadratic`/`TrajectoryPredictor.predict`；`sources` 的 `CameraSource.__init__`/`open_source`/`LatestFrameCamera.latest`；`viz` 的 `draw_prediction`/`draw_3d_panel`/`hud_lines`；`pipeline` 的 `SpherePipeline.process`/`.render`；`calib` 的 `detect_board`/`detect_board_in_roi`/`pose_distance`/`AutoPairCollector.offer`/`calibrate_stereo`/`StereoRig.rectify_maps`/`StereoRig.triangulate`；`stereo` 的 `find_offset`/`brightness_series`/`match_epipolar`/`triangulate_one`/`StereoReconstructor.update`/`PairSource.__init__`/`from_args`/`resolve_backend`。
+**已用 `inspect.signature` 复核的 38 个签名**：`geometry` 的 `refine_circle_subpixel`/`fit_circle_robust`/`circle_radial_gradient_stats`/`CameraModel.__init__`/`estimate_focal_from_known_ball`；`camera_motion` 的 `GlobalMotionEstimator.__init__`/`.estimate`/`warp_to_current`；`detectors.base._score_candidate`；`track` 的 `KalmanFilter.__init__`/`Track.__init__`；`predict` 的 `predict_quadratic`/`TrajectoryPredictor.predict`；`sources` 的 `CameraSource.__init__`/`open_source`/`LatestFrameCamera.latest`；`viz` 的 `draw_prediction`/`draw_3d_panel`/`hud_lines`；`pipeline` 的 `SpherePipeline.process`/`.render`；`calib` 的 `detect_board`/`detect_board_in_roi`/`pose_distance`/`AutoPairCollector.offer`/`calibrate_stereo`/`StereoRig.rectify_maps`/`StereoRig.triangulate`；`stereo` 的 `find_offset`/`brightness_series`/`match_epipolar`/`triangulate_one`/`StereoReconstructor.update`/`PairSource.__init__`/`from_args`/`resolve_backend`；以及 §13.3c 的 `estimate_fov_alignment`/`FovAlignment.from_dict`（2 个，2026-10-24 补）。
 
 **边界（诚实标注）**：① 本文**不覆盖** `apps/`、`tests/`、启动器与 PPT 工具链的内部实现（只在 §13.2 提了一句 `apps/_common.py` 的参数约定）。
 ② 文中所有"实测数字"（300/93/12/40 ms、~0.1 s vs ~10 s、圆度 0.61~0.63…）**引自源码注释**，我**没有**重跑那 6 个 `tests/selftest_*.py`。

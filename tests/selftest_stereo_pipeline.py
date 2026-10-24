@@ -2,7 +2,8 @@
 
 用已知真值的合成双目装置验证 stereo/ 包：
   1. 同步：造一段带闪光的亮度序列，把其中一路人为平移 k 帧，看能不能找回来；
-  2. 配对 + 三角测量：把已知三维点投到两路，再让程序反算回去，看误差。
+  2. 配对 + 三角测量：把已知三维点投到两路，再让程序反算回去，看误差；
+  3. FOV 自动对齐：1.5x 合成视场差、同视场、空白帧、序列化往返。
 
     python tests/selftest_stereo_pipeline.py
 """
@@ -37,6 +38,7 @@ from stereo import (
     stereo_depth,
     timestamp_offset,
 )
+from stereo.fov_align import FovAlignment, estimate_fov_alignment
 from stereo.visualization import (
     build_trajectory_payload, export_session_visualization, load_seeds, write_seeds,
 )
@@ -310,6 +312,223 @@ def test_visualization() -> bool:
     return ok
 
 
+def _fov_texture(seed: int = 42):
+    """合成随机纹理：低频色块 + 几何/文字标记，保证 SIFT 有足够稳定特征。"""
+    rng = np.random.default_rng(seed)
+    h, w = 1350, 2400
+    low = rng.normal(0.0, 1.0, (h // 16 + 2, w // 16 + 2, 3)).astype(np.float32)
+    base = cv2.resize(low, (w, h), interpolation=cv2.INTER_CUBIC)
+    base = cv2.normalize(base, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    for _ in range(900):
+        x, y = int(rng.integers(0, w)), int(rng.integers(0, h))
+        radius = int(rng.integers(4, 50))
+        color = tuple(int(v) for v in rng.integers(0, 256, 3))
+        kind = int(rng.integers(0, 4))
+        if kind == 0:
+            cv2.circle(base, (x, y), radius, color, -1)
+        elif kind == 1:
+            cv2.rectangle(base, (x, y), (x + radius, y + radius), color, 2)
+        elif kind == 2:
+            cv2.line(base, (x, y),
+                     (x + int(rng.integers(-80, 80)), y + int(rng.integers(-80, 80))),
+                     color, int(rng.integers(1, 4)))
+        else:
+            cv2.putText(base, str(int(rng.integers(0, 1000))), (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, float(rng.uniform(0.4, 1.1)),
+                        color, 2, cv2.LINE_AA)
+    return base
+
+
+def _fov_pair(size=(2560, 1440)):
+    """左=纹理中央 1600x900（放大 1.5x），右=整幅 2400x1350。"""
+    master = _fov_texture()
+    width, height = size
+    left = cv2.resize(master[225:1125, 400:2000], (width, height),
+                      interpolation=cv2.INTER_LINEAR)
+    right = cv2.resize(master, (width, height), interpolation=cv2.INTER_LINEAR)
+    return left, right
+
+
+def test_fov_alignment() -> bool:
+    """FOV 自动对齐：已知 1.5x 合成视场差、同视场、空白帧、序列化。"""
+    print("----- 双目 FOV 自动对齐 -----")
+    cv2.setRNGSeed(20261024)
+    left, right = _fov_pair()
+    checks = []
+    align = None
+
+    try:
+        align = estimate_fov_alignment(left, right)
+        aligned_left, aligned_right = align.apply(left, right)
+        x, y, w, h = align.crop_rect
+        checks.extend([
+            (f"1.5x 视场差 -> 参考 {align.reference_side} / 裁剪 {align.crop_side}，"
+             f"尺度 {align.scale:.3f}",
+             align.active and align.reference_side == "left"
+             and align.crop_side == "right"
+             and abs(align.scale - 1.0 / 1.5) <= 0.05),
+            (f"裁剪区 {align.crop_rect}（内点 {align.inliers}、"
+             f"质量 {align.quality:.2f}、方法 {align.method}）",
+             align.method == "sift" and align.inliers >= 30
+             and 0.0 <= align.quality <= 1.0
+             and align.target_size == (2560, 1440)
+             and 0 <= x and 0 <= y and x + w <= 2560 and y + h <= 1440
+             and abs(x - 426) <= 25 and abs(y - 240) <= 25
+             and abs(w - 1707) <= 25 and abs(h - 960) <= 25),
+            ("参考帧原样保留；广角帧裁剪后缩放到参考尺寸",
+             np.array_equal(aligned_left, left)
+             and aligned_right.shape == (1440, 2560, 3)
+             and not np.shares_memory(aligned_right, right)),
+        ])
+        ref_only = align.apply_side(left, "left")
+        crop_only = align.apply_side(right, "right")
+        checks.append((
+            "apply_side：只归一化裁剪路，参考路原样、两路尺寸一致",
+            ref_only is left and ref_only.shape == left.shape
+            and crop_only.shape == aligned_right.shape
+            and np.array_equal(crop_only, aligned_right),
+        ))
+        post = estimate_fov_alignment(left, aligned_right)
+        checks.append((f"对齐后残余尺度 {post.scale:.4f}（目标 1±0.1）",
+                       abs(post.scale - 1.0) <= 0.10))
+    except ValueError as exc:
+        checks.append((f"1.5x 合成帧对估计失败：{exc}", False))
+
+    try:
+        mirror = estimate_fov_alignment(right, left)
+        checks.append((f"交换左右（右更窄）-> 参考 {mirror.reference_side} / "
+                       f"裁剪 {mirror.crop_side}，尺度 {mirror.scale:.3f}",
+                       mirror.reference_side == "right"
+                       and mirror.crop_side == "left"
+                       and abs(mirror.scale - 1.5) <= 0.075))
+    except ValueError as exc:
+        checks.append((f"右窄左宽估计失败：{exc}", False))
+
+    try:
+        same = estimate_fov_alignment(left, left.copy())
+        same_l, same_r = same.apply(left, left.copy())
+        checks.append(("相同画面 -> crop_side='none'，不缩放",
+                       same.crop_side == "none" and not same.active
+                       and np.array_equal(same_l, left)
+                       and np.array_equal(same_r, left)))
+    except ValueError as exc:
+        checks.append((f"相同画面被误判为需要对齐：{exc}", False))
+
+    blank = np.full((480, 640, 3), 127, np.uint8)
+    try:
+        estimate_fov_alignment(blank, blank.copy())
+    except ValueError as exc:
+        checks.append((f"空白无特征 -> ValueError（{str(exc)[:32]}…）", True))
+    else:
+        checks.append(("空白无特征必须报错，不能静默返回对齐", False))
+
+    # 参考帧四角越界的判定：<=1 px 只容忍取整/浮点误差；>1 px 即共同视场不足。
+    try:
+        from stereo.fov_align import _mapped_rect
+
+        corners = np.float32(
+            [[0, 0], [100, 0], [100, 100], [0, 100]]).reshape(-1, 1, 2)
+        h_tol = np.array([[1.0, 0.0, -0.5], [0.0, 1.0, -0.5], [0.0, 0.0, 1.0]])
+        rect = _mapped_rect(corners, h_tol, 100, 100)
+        h_bad = np.array([[1.0, 0.0, -1.5], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        try:
+            _mapped_rect(corners, h_bad, 100, 100)
+        except ValueError:
+            bad_raised = True
+        else:
+            bad_raised = False
+        checks.append(("四角越界 <=1 px 容忍取整；>1 px 报共同视场不足",
+                       rect == (0, 0, 100, 100) and bad_raised))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"_mapped_rect 越界判定异常：{exc}", False))
+
+    # 参考帧没有完整落在广角帧内（共同视场不足）：不能把越界角裁掉、
+    # 拿“部分重叠”继续做主动对齐。
+    try:
+        partial_right = cv2.resize(right[0:1080, 0:1920], (2560, 1440),
+                                   interpolation=cv2.INTER_LINEAR)
+        estimate_fov_alignment(left, partial_right)
+    except ValueError as exc:
+        text = str(exc)
+        checks.append((f"参考帧未完整落在广角帧内 -> ValueError（{text[:32]}…）",
+                       "共同视场不足" in text and "完整" in text))
+    else:
+        checks.append(("参考帧未完整落在广角帧内必须报错，不能被静默裁剪", False))
+
+    # 损坏的 fov 记录必须被当成“损坏”，而不是被“空值 = 旧标定”静默跳过。
+    try:
+        from apps.record_stereo import _load_calib_fov
+
+        bad_rejected = True
+        for bad in ({}, [], "fov", 3):
+            try:
+                _load_calib_fov(bad)
+            except ValueError:
+                continue
+            bad_rejected = False
+        valid_ok = align is None or _load_calib_fov(align.to_dict()) == align
+        checks.append(("record：fov 缺失/None=旧标定，{} / [] / 非 mapping=损坏",
+                       _load_calib_fov(None) is None and bad_rejected and valid_ok))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"record 的 fov 读取接线异常：{exc}", False))
+
+    # verify：视频/图片首对帧的一次性“是否已归一化”判定（用桩替代 SIFT）。
+    try:
+        import io
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+
+        import apps.verify_stereo as verify_app
+
+        def _probe(active, scale):
+            return SimpleNamespace(active=active, scale=scale,
+                                   crop_side="right" if active else "none",
+                                   crop_rect=(10, 20, 30, 40))
+
+        def _raise(*_a, **_k):
+            raise ValueError("特征不足")
+
+        probe_cases = [
+            ("原生画面（scale 0.667）-> 退出 2",
+             lambda *_a, **_k: _probe(True, 0.667), 2, False),
+            ("已归一化（无需对齐）-> 放行",
+             lambda *_a, **_k: _probe(False, 1.0), 0, False),
+            ("低纹理估不出来 -> 退出 2（不静默假定）", _raise, 2, False),
+            ("--fov-input-normalized -> 跳过校验", _raise, 0, True),
+            ("仍需要对齐但尺度在 0.9–1.1 -> 退出 2（fail closed）",
+             lambda *_a, **_k: _probe(True, 0.98), 2, False),
+        ]
+        original = verify_app.estimate_fov_alignment
+        verdicts = []
+        try:
+            with redirect_stdout(io.StringIO()):
+                for name, stub, want, assume in probe_cases:
+                    verify_app.estimate_fov_alignment = stub
+                    got = verify_app._check_normalized_input(
+                        blank, blank.copy(), assume_normalized=assume)
+                    verdicts.append((name, got == want))
+        finally:
+            verify_app.estimate_fov_alignment = original
+        checks.extend(verdicts)
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"verify 的输入归一化校验接线异常：{exc}", False))
+
+    roundtrip_ok = False
+    if align is not None:
+        try:
+            payload = json.loads(json.dumps(align.to_dict()))
+            roundtrip_ok = FovAlignment.from_dict(payload) == align
+        except (TypeError, ValueError) as exc:
+            print(f"  序列化往返异常：{exc}")
+    checks.append(("to_dict/from_dict 往返一致", roundtrip_ok))
+
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     print("=" * 62)
     print("双目链路自测（合成真值）")
@@ -324,8 +543,10 @@ def main() -> int:
     print()
     e = test_angled()
     print()
-    print("判定结果：" + ("全部通过" if (a and b and c and d and e) else "有不达标项"))
-    return 0 if (a and b and c and d and e) else 1
+    f = test_fov_alignment()
+    print()
+    print("判定结果：" + ("全部通过" if (a and b and c and d and e and f) else "有不达标项"))
+    return 0 if (a and b and c and d and e and f) else 1
 
 
 if __name__ == "__main__":
