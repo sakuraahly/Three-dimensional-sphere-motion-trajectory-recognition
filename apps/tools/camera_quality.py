@@ -80,6 +80,49 @@ class Quality:
         return not self.error
 
 
+@dataclass
+class FrameMetrics:
+    """一组成片的画质指标（中位数）。
+
+    抽成独立纯函数是为了让**只有一套清晰度算法**：校验器（``stereo/sessions.py``）
+    也要给"清晰度"提示，若各写一份，两个工具迟早给出两个数。
+    """
+    sharp: float = 0.0
+    bright: float = 0.0
+    contrast: float = 0.0
+    over: float = 0.0
+    under: float = 0.0
+
+
+def frames_quality(grays: list[np.ndarray]) -> FrameMetrics:
+    """中景（避开边缘暗角）的清晰度 / 亮度 / 反差 / 过曝 / 死黑，各取中位数。
+
+    纯计算：只吃灰度帧，不碰相机、不读文件。空输入返回全 0。
+    """
+    if not grays:
+        return FrameMetrics()
+    h, w = grays[0].shape[:2]
+    cy0, cy1 = int(h * 0.25), int(h * 0.75)
+    cx0, cx1 = int(w * 0.25), int(w * 0.75)
+    sharps, brights, contrasts, overs, unders = [], [], [], [], []
+    for g in grays:
+        crop = g[cy0:cy1, cx0:cx1]
+        if crop.size < 100:
+            crop = g
+        sharps.append(float(cv2.Laplacian(crop, cv2.CV_64F).var()))
+        brights.append(float(crop.mean()))
+        contrasts.append(float(crop.std()))
+        overs.append(float((crop > 245).mean()))
+        unders.append(float((crop < 12).mean()))
+    return FrameMetrics(
+        sharp=float(np.median(sharps)),
+        bright=float(np.median(brights)),
+        contrast=float(np.median(contrasts)),
+        over=float(np.median(overs)),
+        under=float(np.median(unders)),
+    )
+
+
 def _is_partial(gray: np.ndarray) -> bool:
     """下半幅是不是"常量"？—— 典型的 USB 传输没传完 / 驱动给了半帧。
 
@@ -159,24 +202,9 @@ def measure(index: int, *, seconds: float = 2.0, width: int = 1920,
         return q
 
     # 画质指标：取中景（避开边缘暗角与贴边物体）
-    h, w = shots[0].shape[:2]
-    cy0, cy1 = int(h * 0.25), int(h * 0.75)
-    cx0, cx1 = int(w * 0.25), int(w * 0.75)
-    sharps, brights, contrasts, overs, unders = [], [], [], [], []
-    for g in shots:
-        crop = g[cy0:cy1, cx0:cx1]
-        if crop.size < 100:
-            crop = g
-        sharps.append(float(cv2.Laplacian(crop, cv2.CV_64F).var()))
-        brights.append(float(crop.mean()))
-        contrasts.append(float(crop.std()))
-        overs.append(float((crop > 245).mean()))
-        unders.append(float((crop < 12).mean()))
-    q.sharp = float(np.median(sharps))
-    q.bright = float(np.median(brights))
-    q.contrast = float(np.median(contrasts))
-    q.over = float(np.median(overs))
-    q.under = float(np.median(unders))
+    m = frames_quality(shots)
+    q.sharp, q.bright, q.contrast, q.over, q.under = (
+        m.sharp, m.bright, m.contrast, m.over, m.under)
     return q
 
 

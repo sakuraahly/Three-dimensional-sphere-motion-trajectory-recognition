@@ -14,6 +14,10 @@
 - 标定文件是不是 session 记录的那一份（sha256）；
 - 物理基线 vs 算法基线是不是差得离谱（>10% 警告，>20% 报错）。
 
+判定分三档：`[错误]` 硬失败 / `[警告]`（`--strict` 下也失败）/ `[提示]` 只是告知、
+永不影响退出码。典型提示：容器标称 fps 与 sidecar 真实帧率不符（sidecar 齐全时
+按它分析即可，只是播放器换算会偏），以及两路清晰度对比。
+
 它**只读**，不改任何文件；退出码 0/1 供采集脚本或手工检查使用。
 """
 
@@ -37,12 +41,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("paths", nargs="*", help="会话目录（默认扫描 --root）")
     ap.add_argument("--root", default=str(ROOT / "data" / "sessions"),
                     help="会话根目录（默认 data/sessions）")
-    ap.add_argument("--strict", action="store_true", help="warning 也当失败")
+    ap.add_argument("--strict", action="store_true",
+                    help="warning 也当失败（[提示] 只是告知，永不影响退出码）")
     return ap.parse_args()
 
 
-def check_one(session_dir: Path, *, strict: bool) -> tuple[int, int]:
-    errors, warnings = validate_session(session_dir)
+def check_one(session_dir: Path, *, strict: bool) -> tuple[int, int, int]:
+    errors, warnings, notes = validate_session(session_dir, with_notes=True)
     try:
         _d, session = load_session(session_dir)
         print(describe(session))
@@ -52,9 +57,13 @@ def check_one(session_dir: Path, *, strict: bool) -> tuple[int, int]:
         print(f"  [错误] {msg}")
     for msg in warnings:
         print(f"  [警告] {msg}")
+    # 提示永不导致失败：它是"知道就好"，不是"必须改"
+    for msg in notes:
+        print(f"  [提示] {msg}")
     ok = not errors and not (strict and warnings)
-    print(f"  → {'通过' if ok else '不通过'}（错误 {len(errors)}，警告 {len(warnings)}）")
-    return len(errors), len(warnings)
+    print(f"  → {'通过' if ok else '不通过'}"
+          f"（错误 {len(errors)}，警告 {len(warnings)}，提示 {len(notes)}）")
+    return len(errors), len(warnings), len(notes)
 
 
 def main() -> int:
@@ -67,19 +76,21 @@ def main() -> int:
             print("下一步：先录制一次（P1 录制器），或把已有会话放进 data/sessions/<id>/")
             return 0
 
-    total_e = total_w = 0
+    total_e = total_w = total_n = 0
     bad = 0
     for i, path in enumerate(paths, 1):
         print("=" * 74)
         print(f"[{i}/{len(paths)}] {path}")
-        e, w = check_one(path, strict=args.strict)
+        e, w, n = check_one(path, strict=args.strict)
         total_e += e
         total_w += w
+        total_n += n
         bad += int(e > 0 or (args.strict and w > 0))
         print()
 
     print("=" * 74)
-    print(f"合计 {len(paths)} 个会话：不通过 {bad}，错误 {total_e}，警告 {total_w}")
+    print(f"合计 {len(paths)} 个会话：不通过 {bad}，错误 {total_e}，"
+          f"警告 {total_w}，提示 {total_n}")
     print("判定结果：" + ("全部通过" if bad == 0 else "有不通过项"))
     return 0 if bad == 0 else 1
 

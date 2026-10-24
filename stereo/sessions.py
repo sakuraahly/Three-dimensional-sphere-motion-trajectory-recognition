@@ -33,6 +33,7 @@ import dataclasses
 import hashlib
 import json
 import platform
+import statistics
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -285,18 +286,105 @@ def _video_brightness_mean(path: Path, samples: int = 5) -> float:
         cap.release()
 
 
-def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
-    """校验一个会话，返回 `(errors, warnings)`。
+def _sidecar_fps(
+    video_path: Path, frame_count: int,
+) -> tuple[float | None, str, bool]:
+    """用逐帧时间戳算**真实帧率**；返回 `(fps 或 None, 说明, sidecar 是否坏了)`。
+
+    第三项区分"**没有** sidecar"（旧会话，合法）与"**有但坏**"（不完整/不单调，
+    必须独立上报）：前者只是无法独立校准，后者说明这份 sidecar 本身不能信。
+
+    为什么不能只看容器 fps：容器头里的 fps 是写入时给的值（曾经直接抄 ``--fps``
+    默认 24），而相机实际跑 29.99。播放器按容器 fps 换算秒数就会系统性偏慢。
+    sidecar 是逐帧的主机时间，是唯一能独立校准时间基的证据 ——
+    但它必须**完整**（行数对上视频帧数、时间戳严格递增），否则不能当时间基用。
+    """
+    from .timestamp_pair import read_time_sidecar, sidecar_for_video
+
+    sidecar = sidecar_for_video(video_path)
+    if sidecar is None:
+        return None, "缺 sidecar，无法独立校准时间基", False
+    try:
+        times = read_time_sidecar(sidecar)
+    except Exception as exc:                    # noqa: BLE001 —— 坏 sidecar 只降级，不许抛
+        return None, f"sidecar 不可用（{exc}），时间基不可靠", True
+    if times.size < 2:
+        return None, f"sidecar 不完整（{times.size} 行 / {frame_count} 帧），时间基不可靠", True
+    if frame_count > 0 and abs(int(times.size) - frame_count) > 1:
+        return None, (f"sidecar 不完整（{times.size} 行 / {frame_count} 帧），时间基不可靠"
+                      "（按容器 fps 分析会算错秒数）"), True
+    dts = [float(b - a) for a, b in zip(times[:-1], times[1:])]
+    span = float(times[-1] - times[0])
+    if span <= 0 or statistics.median(dts) <= 0:
+        return None, "sidecar 时间戳没有推进，时间基不可靠", True
+    # 用**总跨度**算持续帧率，而不是 1/中位间隔：USB 抖动不对称（偶发长间隔多、
+    # 短的重复读少），中位数会把 29.99 压成 29.3；而"播放会慢多少"取决于总时长，
+    # 正好就是 (帧数-1)/跨度。
+    return (len(times) - 1) / span, "", False
+
+
+def _sharpness(
+    video_path: Path, *, warmup: int = 30, shots: int = 8,
+) -> tuple[float, float] | None:
+    """算 `(Laplacian 方差中位数, 平均亮度)`；读不到返回 None。
+
+    口径**完全对齐** `apps/tools/camera_quality.py::measure()`：同一个
+    `frames_quality()`、同一 25–75% 中心裁切、同一"跳过预热再连取若干帧"的采样
+    （那里是预热 30 帧、留最多 8 张；这里照抄这两个数）。差别只有输入：
+    本函数吃录像，那个吃实时相机 —— 所以**数值只能在同分辨率/同场景下互相比较**，
+    换个分辨率（Live 2560x1440 vs 录像 1718x972）这个绝对值没有可比性。
+    导入失败（比如没装相机后端）只是不打这条提示，绝不影响判定。
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return None
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n <= 0:
+            return None
+        start = min(max(0, warmup), max(0, n - 1))
+        if start > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+        grays = []
+        while len(grays) < max(1, shots):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        if not grays:
+            return None
+    finally:
+        cap.release()
+    try:
+        from apps.tools.camera_quality import frames_quality
+    except Exception:                            # noqa: BLE001 —— 提示功能，不许影响判定
+        return None
+    m = frames_quality(grays)
+    return float(m.sharp), float(m.bright)
+
+
+def validate_session(
+    path: str | Path, *, with_notes: bool = False,
+) -> tuple[list[str], list[str]] | tuple[list[str], list[str], list[str]]:
+    """校验一个会话，返回 `(errors, warnings[, notes])`。
 
     **不抛异常**：坏会话要能一次列出所有问题，而不是停在第一个。
     是否把 warning 当失败由调用方决定（CLI 的 `--strict`）。
+
+    三档语义：
+    - `errors`：硬失败，数据不可用；
+    - `warnings`：可疑，`--strict` 下算失败；
+    - `notes`：只是告知（例如容器标称 fps 不准但 sidecar 齐全），**永不导致失败**，
+      要 `with_notes=True` 才返回（保持老调用方的二元组不变）。
     """
     errors: list[str] = []
     warnings: list[str] = []
+    notes: list[str] = []
     try:
         session_dir, s = load_session(path)
     except SessionError as exc:
-        return [str(exc)], warnings
+        bad = [str(exc)]
+        return (bad, warnings, notes) if with_notes else (bad, warnings)
 
     if s.left is None:
         errors.append("缺少 left 相机信息")
@@ -304,6 +392,7 @@ def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
         errors.append("缺少 right 相机信息")
 
     frame_counts: dict[str, int] = {}
+    sharpness: dict[str, tuple[float, float]] = {}
     for side, cam in (("left", s.left), ("right", s.right)):
         if cam is None:
             continue
@@ -327,17 +416,71 @@ def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
         if cam.frame_count and abs(n - cam.frame_count) > 1:
             errors.append(
                 f"{side}: 实际 {n} 帧，session 记录 {cam.frame_count} 帧（差 >1）")
-        if cam.fps_measured and fps > 0:
+        # 容器 fps 是录制时写的标称值（两路取协商值的 min，见 record_stereo）；
+        # 两路差 2% 只影响播放器观感，真正的时间基是 sidecar，所以这里只跟它比。
+        real_fps, why, bad_sidecar = _sidecar_fps(video_path, cam.frame_count or n)
+        if bad_sidecar:
+            # sidecar 存在但坏了：独立上报，不依赖 fps_measured 是否存在
+            # （否则 fps_measured 缺失时这条会完全静默）
+            warnings.append(f"{side}: {why}")
+        if real_fps is not None:
+            # sidecar 齐全 = 有自己的时间基，容器标称不准只影响播放器观感
+            if fps > 0:
+                ratio = abs(fps - real_fps) / real_fps
+                speed = (real_fps / fps - 1.0) * 100.0
+                word = "慢" if speed > 0 else "快"
+                if ratio > 0.25:
+                    # 差这么多不可能是"标称记法"，是容器头真的写错了时间基，
+                    # 下游按容器换算秒数会系统性出错，必须拦
+                    warnings.append(
+                        f"{side}: 容器 fps={fps:.2f} 与 sidecar 实测 {real_fps:.2f} 差 "
+                        f"{ratio*100:.0f}%（>25% 不是标称偏差，是时间基错误：容器头写错，"
+                        "播放器/FileSource 会按错误秒数换算）")
+                elif ratio > 0.10:
+                    notes.append(
+                        f"{side}: 容器标称 {fps:.1f} fps，sidecar 实测 {real_fps:.2f} fps"
+                        f"（差 {ratio*100:.0f}%，标称偏差；按 sidecar 分析即可，"
+                        f"用播放器看会{word} {abs(speed):.0f}%）")
+            if cam.fps_measured:
+                drift = abs(cam.fps_measured - real_fps) / real_fps
+                if drift > 0.05:
+                    notes.append(
+                        f"{side}: 主循环实测 {cam.fps_measured:.2f} fps 与 sidecar "
+                        f"{real_fps:.2f} fps 差 {drift*100:.0f}%"
+                        "（主循环节奏与写盘节奏不一致，分析以 sidecar 为准）")
+        elif cam.fps_measured and fps > 0 and not bad_sidecar:
+            # 没有 sidecar（不是坏了）时，容器 fps 就是唯一时间基，标称错会真的算错秒数。
             ratio = abs(fps - cam.fps_measured) / max(cam.fps_measured, 1e-9)
             if ratio > 0.10:
                 warnings.append(
-                    f"{side}: 容器 fps={fps:.2f} 与实测 {cam.fps_measured:.2f} 差 {ratio*100:.0f}%"
-                    "（容器 fps 可能只是标称值，不一定是错）")
+                    f"{side}: 容器 fps={fps:.2f} 与实测 {cam.fps_measured:.2f} 差 "
+                    f"{ratio*100:.0f}%（{why}）")
         mean_brightness = _video_brightness_mean(video_path)
         if mean_brightness < 20.0:
             warnings.append(
                 f"{side}: 视频几乎全黑（抽样平均亮度 {mean_brightness:.1f} < 20）"
                 "—— 检查镜头盖/灯光/曝光；黑视频不能做检测")
+        sharp = _sharpness(video_path)
+        if sharp is not None:
+            sharpness[side] = sharp
+
+    if len(sharpness) == 2:
+        (l_sharp, l_bright), (r_sharp, r_bright) = sharpness["left"], sharpness["right"]
+        ratio = max(l_sharp, r_sharp) / max(min(l_sharp, r_sharp), 1e-6)
+        res = f"{s.left.width}x{s.left.height}" if s.left else "录像原生分辨率"
+        line = (f"清晰度（Laplacian 方差中位数，中心 25–75% 区，{res}）"
+                f"left={l_sharp:.1f}（亮度 {l_bright:.0f}） "
+                f"right={r_sharp:.1f}（亮度 {r_bright:.0f}）（比值 {ratio:.2f}")
+        # 只做提示、不进 warnings：`check_dataset` 是**数据有效性**闸门，清晰度差
+        # 不等于数据无效（三维精度由下游实测），而且这条判据会让已入库的旧会话被
+        # 追溯定罪。清晰度的权威判据留在 `camera_quality.py`（它自己的入口）。
+        if ratio >= 1.8:
+            notes.append(
+                line + "，≥1.8 建议查对焦/曝光，详见 apps\\tools\\camera_quality.py）")
+        elif ratio >= 1.3:
+            notes.append(line + "，1.3–1.8 属同型号个体差异，不影响录球）")
+        else:
+            notes.append(line + "，<1.3 视为两路相当）")
 
     if len(frame_counts) == 2 and abs(frame_counts["left"] - frame_counts["right"]) > 1:
         warnings.append(
@@ -405,7 +548,7 @@ def validate_session(path: str | Path) -> tuple[list[str], list[str]]:
         warnings.append(f"同步方法={s.sync.method} 但置信度={s.sync.confidence}（未真正算出偏移？）")
     if not s.lossless:
         warnings.append(f"会话标记为有损录制（codec={s.codec}）；分析前请确认这是有意的")
-    return errors, warnings
+    return (errors, warnings, notes) if with_notes else (errors, warnings)
 
 
 def describe(session: Session) -> str:

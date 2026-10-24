@@ -631,6 +631,55 @@ def test_sessions(base: Path) -> bool:
     session.calibration.baseline_measured_mm = 65.0
     save_session(session, session_dir)
 
+    # 判定分三档：容器 fps 标称偏差（≤25%）只是提示；差 >25% 是时间基真错，
+    # 必须警告；缺 sidecar 时容器是唯一时间基，差 >10% 就警告。
+    session.left.fps_measured = 60.0        # 容器写的是 30 fps，主循环实测 60
+    save_session(session, session_dir)
+
+    def _write_sidecars(fps: float) -> None:
+        for side in ("left", "right"):
+            with (session_dir / f"{side}_times.csv").open(
+                    "w", encoding="utf-8", newline="") as f:
+                f.write("frame,perf_counter_s,unix_time_s\n")
+                for i in range(5):              # 5 帧 @ fps，容器写的是 30 fps
+                    f.write(f"{i},{100.0 + i / fps:.6f},"
+                            f"{1700000000.0 + i / fps:.6f}\n")
+
+    _write_sidecars(36.0)                   # |30-36|/36 = 17% -> 标称偏差
+    e_n, w_n, notes = validate_session(session_dir, with_notes=True)
+    checks.append(("容器 fps 与 sidecar 差 17% -> 只算提示，不算警告",
+                   not e_n and not any("容器 fps" in x for x in w_n)
+                   and any("sidecar 实测" in x for x in notes)))
+
+    _write_sidecars(60.0)                   # |30-60|/60 = 50% -> 时间基错误
+    e_r, w_r, n_r = validate_session(session_dir, with_notes=True)
+    checks.append(("容器 fps 与 sidecar 差 50% -> 警告（时间基错误）",
+                   not e_r and any("时间基错误" in x for x in w_r)
+                   and not any("sidecar 实测" in x for x in n_r)))
+
+    _write_sidecars(30.0)
+    (session_dir / "left_times.csv").rename(session_dir / "left_times.csv.off")
+    e_s, w_s, _no = validate_session(session_dir, with_notes=True)
+    checks.append(("缺 sidecar -> fps 差回到警告（时间基不可信）",
+                   not e_s and any("容器 fps" in x for x in w_s)))
+    (session_dir / "left_times.csv.off").rename(session_dir / "left_times.csv")
+
+    # sidecar 不完整必须独立上报：fps_measured 缺失时也不能静默
+    session.left.fps_measured = 0.0
+    save_session(session, session_dir)
+    with (session_dir / "left_times.csv").open("w", encoding="utf-8", newline="") as f:
+        f.write("frame,perf_counter_s,unix_time_s\n")
+        for i in range(3):                      # 5 帧视频只写 3 行
+            f.write(f"{i},{100.0 + i / 30.0:.6f},{1700000000.0 + i / 30.0:.6f}\n")
+    e_i, w_i, _ni = validate_session(session_dir, with_notes=True)
+    checks.append(("sidecar 不完整 -> 独立警告（含行数/帧数）",
+                   not e_i and any("sidecar 不完整（3 行 / 5 帧）" in x for x in w_i)))
+
+    for side in ("left", "right"):
+        (session_dir / f"{side}_times.csv").unlink()
+    session.left.fps_measured = 30.0
+    save_session(session, session_dir)
+
     (session_dir / "right.avi").unlink()
     e, _w = validate_session(session_dir)
     checks.append(("缺右路视频 -> 报错", any("视频不存在" in x for x in e)))
