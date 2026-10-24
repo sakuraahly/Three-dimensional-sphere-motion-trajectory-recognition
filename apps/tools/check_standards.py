@@ -70,6 +70,17 @@ SELF_DOC_NOTES = {
 #  13 条白名单里 4 条一改文档就失配、工具开始误报）。
 # --------------------------------------------------------------------------
 KNOWN_MENTIONS: dict[str, str] = {
+    # ✅ 2026-10-24：**清掉了 23 条死条目。** 原因是它们承诺的文件真的补上了：
+    # `apps/record_stereo.py`、`apps/run_stereo_video.py`、`apps/view_3d.py`、
+    # `apps/_workbench.py`、`docs/3D查看器.md`、`sphere_tracker/detectors/specular.py`、
+    # `config/camera_modes.json`、`config/stereo_calibration.npz` 都已落盘
+    #（标定那两条是 2026-10-14 真机成功保存）。既然引用不再失效，豁免就没有对象了 ——
+    # 留着就是**永久豁免**。这也是从这版起 `KNOWN_MENTIONS` 有了 vanished 检测的原因：
+    # 它和 `KNOWN_DRIFT` 一样，**必须有人来删，不许自己沉默**。
+    # ⚠️ 2026-10-24 二次修正：其中 `config/` 的那几条**删错了** —— 它是可再生产物，
+    # "文件此刻存在"不代表"引用是承诺"。已改由 `RUNTIME_REPRO_MARK` 按**路径类别**
+    # 分类（见上方注释）。存不存在都不影响结论，所以不需要、也不允许回到白名单里。
+    # ---- 历史说明 / 表格里指认旧路径（"谈及"而非"承诺"） ----
     "AGENTS.md:_overflow_lib.py":
         "在讲「它曾经叫这个名字、后来改名了」—— 历史说明，不是引用",
     "docs/交接文档.md:apps/calibrate_camera.py":
@@ -84,8 +95,6 @@ KNOWN_MENTIONS: dict[str, str] = {
         "同上，指认规划中的路径从未落地",
     "docs/开发指南.md:apps/calibrate_camera.py":
         "在「原来写的 / 实际」表格里（表内提及）",
-    "docs/交接文档.md:session.json":
-        "§12.6 在讲**计划中**的会话目录字段（P0-4 还没做），不是已存在的文件",
     # ---- 计划书：**按具体引用豁免，不整份放过** ----
     # 第一版把计划书整个放进 `SELF_DOCS`，结果它自己 10 处失效引用
     # （含指向"已被删掉的临时探针"的）**一声不响地过去了**。
@@ -94,79 +103,32 @@ KNOWN_MENTIONS: dict[str, str] = {
         "P0-1 **计划新建**的模块（时间层），尚未实现",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:frames.py":
         "同上，§9 执行记录里的简写",
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo/sessions.py":
-        "P0-4 **计划新建**的模块（会话读写），尚未实现",
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:sessions.py":
-        "同上，§5.1 职能表里的简写",
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:session.json":
-        "P0-4 计划中的会话元数据文件名",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:apps/tools/zzz_tmp.py":
         "§9.5 反向自证的**注入示例**，举例说明用的假文件名",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:New-Project.ps1":
         "§2.1 在陈述「`STC/scripts/` 里只有 New-Project.ps1」——是在讲仓库外有什么",
+    # ---- 仓库外（`STC/`）：两处都是在**陈述"这个脚本不存在"** ----
+    # 2026-10-24 前 `STC/` 引用从不进 problems，这条豁免等于空转；
+    # 现在按 `ROOT.parent` 解析后它真的会被判失效，所以必须给出理由。
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:STC\\scripts\\Check-Standards.ps1":
         "§2.1 在陈述**这个脚本不存在**（这是那条发现的结论本身）",
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:config/stereo_calibration.npz":
-        "§2.1 在陈述「`config/` 里**从来没有过**这两个文件」",
-    # ---- 2026-10-19 离线双目视频计划：P0/P1 **尚未实现**的入口 ----
-    "docs/planbooks/2026-10-19_离线双目视频与标定导出.md:apps/run_stereo_video.py":
-        "P0 **计划新增**的离线双目入口，尚未实现",
-    "docs/planbooks/2026-10-19_离线双目视频与标定导出.md:apps/record_stereo.py":
-        "P1 **计划新增**的双路录制入口，等相机接上再做",
-    "docs/planbooks/2026-10-19_离线双目视频与标定导出.md:session.json":
-        "P1 计划中的会话元数据文件名",
-    "docs/planbooks/2026-10-19_数据采集与结构整理.md:apps/record_stereo.py":
-        "P1 **计划新增**的双路录制入口，等相机接上再做",
-    "docs/planbooks/2026-10-19_数据采集与结构整理.md:apps/run_stereo_video.py":
-        "P2 **计划新增**的离线双目入口，尚未实现",
-    "docs/planbooks/2026-10-19_相机接入与数据采集.md:apps/record_stereo.py":
-        "P2 **计划新增**的双路录制入口，相机已接但尚未实现",
-    "docs/planbooks/2026-10-19_相机接入与数据采集.md:apps/run_stereo_video.py":
-        "P3 **计划新增**的离线双目入口，尚未实现",
+    "docs/交接文档.md:STC/scripts/Check-Standards.ps1":
+        "§历史小记在讲「`AGENTS.md` 原先写着…并称它负责落差检测」，是在归档旧说法",
+    # ---- 2026-10-19 计划：世界系变换文件**尚未实现** ----
     "docs/planbooks/2026-10-19_相机接入与数据采集.md:world_frame.json":
         "P6 计划中的世界系变换文件，尚未实现",
-    "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:sphere_tracker/detectors/specular.py":
-        "P0 **计划新增**的镜面球检测器，尚未实现",
-    "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:traj3d.png":
-        "P0 计划中的离线三维图，生成在会话 derived/ 下",
     "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:world_frame.json":
         "P4 计划中的世界系变换文件，尚未实现",
     "docs/数据标准.md:world_frame.json":
         "世界系变换文件，尚未实现（数据标准里明确标注）",
-    "AGENTS.md:apps/view_3d.py":
-        "3D 查看器由子 agent 实现中，路径先在规则文档里登记",
-    "docs/交接文档.md:apps/view_3d.py":
-        "3D 查看器由子 agent 实现中，尚未合并",
-    "docs/交接文档.md:docs/3D查看器.md":
-        "3D 查看器文档由子 agent 实现中，尚未合并",
     "docs/交接文档.md:world_frame.json":
         "世界系变换文件，尚未实现（交接文档 §8 明确标注）",
-    "docs/planbooks/2026-10-20_GUI工作台升级.md:apps/_workbench.py":
-        "P0 计划新增的 GUI 会话摘要层，尚未实现",
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.npz":
-        "同上（`AGENTS.md:STC` 之外的简写形式）",
-    "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:stereo_calibration.json":
-        "同上",
     "README.md:video_edge_detect.py": "在「历史遗留脚本」说明表格里",
     "README.md:test.py": "同上",
     "docs/开题报告_研究思路四页文稿.md:calib/calibrate_stereo.py":
         "在路径对照表里（旧路径 vs 实际路径）",
     "docs/开题报告_研究思路四页文稿.md:stereo/match.py":
         "同表的旧路径列（模块路径 -> 实际为 apps/...）",
-    # ---- config/ 是**运行期可再生产物**，被"谈及"不等于被承诺 ----
-    #
-    # `config/camera_modes.json` 是"上次探测出的后端+分辨率"的备忘录：
-    # 只在启用 `CameraSource(optimize=True)`（实时单目那条路）时才生成。
-    # 2026-10-14 起**立体路径刻意不生成它**（`PairSource` 传 `optimize=False`，
-    # 因为"各自优化"会把两路分辨率拉开、让标定直接失败），
-    # 所以这个文件可能**合理地不存在**。而文档里提到的三处都不是"承诺它存在"：
-    # 一处讲打开很重、一处是**历史记录**（"一度被钉在 640x480"）、
-    # 一处是"参考基线（缓存随插口/协商变化，必须当场复测）"。
-    # 教训与 `KNOWN_MENTIONS` 开头那句一致：**"引用"与"谈及"要分开**，
-    # 而"可再生的运行期产物"属于谈及。
-    "docs/API.md:config/camera_modes.json": "讲 CameraSource 打开很重（缓存的用途），非承诺存在",
-    "docs/交接文档.md:config/camera_modes.json": "坑 35 的**历史记录**（一度被钉在 640x480）",
-    "docs/用户手册.md:config\\camera_modes.json": "「参考基线」并自己写明缓存会变、须当场复测",
 }
 
 # --------------------------------------------------------------------------
@@ -189,6 +151,24 @@ KNOWN_DRIFT: dict[str, str] = {}
 # 指向**仓库外**（`..\STC\`，属用户的其他资产）：文件在磁盘上确实存在，
 # 只是不在本仓库内 —— 单独归类、如实计数。这是 `AGENTS.md` §6 规范第 3 层的边界。
 OUTSIDE_REPO_MARK = "STC"
+
+# --------------------------------------------------------------------------
+# **运行期可再生产物**（`config/`）：刻意单独归类，**显式报出但绝不阻断**。
+#
+# 依据三条，缺一不可：
+# 1. `.gitignore:59-73` 把 `config/` **整个目录**忽略，只跟踪 `config/.gitkeep` ——
+#    它压根不进版本库；
+# 2. `AGENTS.md` §3 规则 3：**"能重新生成的东西不进版本库"（`outputs/`、`config/`）**；
+# 3. 与 `_src_literals()` 里"运行时生成的路径属于谈及、不属于承诺"是**同一口径**。
+#
+# 为什么必须按**路径类别**豁免、而不是按单条 mention 豁免：
+# 2026-10-24 那轮把 3 条 `config/camera_modes.json` 的白名单条目当成"死条目"删了
+# （只因那一刻文件恰好存在），于是**一份可再生产物被升级成了硬承诺** ——
+# 实测 `mv config/camera_modes.json` 后本工具报"实际失效 3 处"、exit 1。
+# 换台机器、清一次缓存、重标一次，就会误红。豁免挂在单条 mention 上时，
+# 它的寿命取决于"此刻磁盘上有没有那个文件"，这本身就是漂移。
+# --------------------------------------------------------------------------
+RUNTIME_REPRO_MARK = "config"
 
 
 def doc_files() -> list[Path]:
@@ -217,10 +197,21 @@ def _src_literals() -> set[str]:
     return out
 
 
-def collect_stale_refs() -> dict[str, str]:
-    """扫全库文档，返回 {「文档:引用原文」: 「L行号: 该行」}。"""
-    literals = _src_literals()
-    found: dict[str, str] = {}
+def _outside_path(cand: str) -> Path | None:
+    """`STC/...` 引用 → 它在**仓库外**的真实位置；不是 `STC/` 引用则返回 None。
+
+    `STC/` 是用户的其他资产，实际在 `..\\STC\\`（即 `ROOT.parent` 下）。
+    只在仓库内找它必然找不到 —— 这就是 P2 那个假阳性的根因。
+    这里与 `check_sources()` 用**同一个**解析根，避免"同一件事两套口径"。
+    """
+    parts = cand.split("/")
+    if parts[0] != OUTSIDE_REPO_MARK:
+        return None
+    return ROOT.parent / cand
+
+
+def _iter_refs():
+    """逐条产出文档里的路径引用：(文档相对路径, 引用原文, 行号, 该行, 候选路径, 分段)。"""
     for doc in doc_files():
         rel = doc.relative_to(ROOT).as_posix()
         for lineno, line in enumerate(
@@ -231,34 +222,104 @@ def collect_stale_refs() -> dict[str, str]:
                 parts = cand.split("/")
                 if len(parts) > 1 and parts[0] not in KNOWN_TOP:
                     continue
-                if (ROOT / cand).exists() or cand in literals:
-                    continue
-                if len(parts) == 1:
-                    hits = [p for p in ROOT.rglob(parts[0])
-                            if p.is_file() and ".git" not in p.parts
-                            and "__pycache__" not in p.parts]
-                    if hits:
-                        continue
-                found[f"{rel}:{raw}"] = f"L{lineno}: {line.strip()[:100]}"
-    return found
+                yield rel, raw, lineno, line, cand, parts
+
+
+def _is_runtime_reproducible(parts: list[str]) -> bool:
+    """候选路径首段是 `config/` → 属**运行期可再生产物**，不参与"承诺/失效"判定。"""
+    return parts[0] == RUNTIME_REPRO_MARK
+
+
+def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """扫一遍文档，返回 (失效引用, 仓库外但确实存在的引用, 运行期可再生产物)。
+
+    三者的差别就是 P1 那条自相矛盾的修法：
+    **存在的不算失效**，只有"不存在"的才进第一个返回值 —— 于是
+    "扫到的失效数"与"进入 problems 的条数"天然同口径。
+
+    第三类（`config/`）**先于存在性判定**分流，所以它**永远**不进第一个返回值：
+    文件在不在都不影响结论。这正是 2026-10-24 那个回归的修法 ——
+    豁免挂在"路径类别"上，而不是挂在"此刻文件是否存在"上。
+    """
+    literals = _src_literals()
+    found: dict[str, str] = {}
+    outside_present: dict[str, str] = {}
+    runtime_repro: dict[str, str] = {}
+    for rel, raw, lineno, line, cand, parts in _iter_refs():
+        key = f"{rel}:{raw}"
+        detail = f"L{lineno}: {line.strip()[:100]}"
+        outside = _outside_path(cand)
+        if outside is not None:
+            # 仓库外：按父目录解析。存在 → 归类"仓库外（存在）"，**不计入失效**；
+            # 不存在 → 计入失效（白名单之外的会进 problems）。
+            if outside.exists():
+                outside_present[key] = outside.relative_to(ROOT.parent).as_posix()
+            else:
+                found[key] = detail
+            continue
+        if _is_runtime_reproducible(parts):
+            # 可再生产物：**不做存在性判定**，直接归类、如实计数、不进 problems。
+            runtime_repro[key] = cand
+            continue
+        if (ROOT / cand).exists() or cand in literals:
+            continue
+        if len(parts) == 1:
+            hits = [p for p in ROOT.rglob(parts[0])
+                    if p.is_file() and ".git" not in p.parts
+                    and "__pycache__" not in p.parts]
+            if hits:
+                continue
+        found[key] = detail
+    return found, outside_present, runtime_repro
+
+
+def collect_stale_refs() -> dict[str, str]:
+    """扫全库文档，返回 {「文档:引用原文」: 「L行号: 该行」}（= 第一个返回值）。"""
+    return collect_refs()[0]
+
+
+def outer_mentions(stale: dict[str, str]) -> dict[str, str]:
+    """从失效集合里挑出"仓库外（`STC/`）且不存在"的那些。"""
+    return {k: v for k, v in stale.items()
+            if OUTSIDE_REPO_MARK in k.split(":")[1].replace("\\", "/").split("/")[0]}
 
 
 # --------------------------------------------------------------------------
 def check_refs(verbose: bool) -> list[str]:
-    """A 类：引用 vs 谈及。"""
-    print("----- A. 文档里的仓库路径引用 -----")
-    found = collect_stale_refs()
-    outside = {k: v for k, v in found.items() if OUTSIDE_REPO_MARK in k.split(":")[1]}
-    inside = {k: v for k, v in found.items() if k not in outside}
-    known = set(KNOWN_MENTIONS) | set(KNOWN_DRIFT)
-    unexpected = {k: v for k, v in inside.items() if k not in known}
+    """A 类：引用 vs 谈及。
 
-    print(f"  扫到 {len(found)} 处失效引用 = 仓库外 {len(outside)} + 仓库内 {len(inside)}")
+    ⚠️ **口径必须唯一**：这里打印的"实际失效引用 N 处"就是进入 problems 的条数。
+    第一版把 `outside` 算出来却从不放进 problems，于是出现
+    "报告 23 处失效 / 同时判定全部通过"这种自相矛盾的输出 —— 守漂移的工具自己漂了。
+    """
+    print("----- A. 文档里的仓库路径引用 -----")
+    stale, outside_present, runtime_repro = collect_refs()
+    outside_missing = outer_mentions(stale)
+    inside = {k: v for k, v in stale.items() if k not in outside_missing}
+    known = set(KNOWN_MENTIONS) | set(KNOWN_DRIFT)
+    unexpected = {k: v for k, v in stale.items() if k not in known}
+    exempted = len(stale) - len(unexpected)
+
+    print(f"  STC/ 引用（仓库外，按 {ROOT.parent.name}/ 解析）："
+          f"存在 {len(outside_present)} 处（不计失效）、不存在 {len(outside_missing)} 处（计入失效）")
     if verbose:
-        for k in sorted(outside):
-            print(f"    [仓库外] {k}")
-    print(f"  仓库内 {len(inside)} 处：白名单（有意保留的历史信息）"
-          f"{len(KNOWN_MENTIONS)} 条、已知真漂移 {len(KNOWN_DRIFT)} 条")
+        for k in sorted(outside_present):
+            print(f"    [仓库外（存在）] {k} -> {outside_present[k]}")
+        for k in sorted(outside_missing):
+            print(f"    [仓库外（不存在）] {k}\n        {outside_missing[k]}")
+    print(f"  运行期可再生产物（config/，不阻断）{len(runtime_repro)} 处"
+          f" —— 由运行/重标生成、整目录不入库，缺了不算漂移")
+    if verbose:
+        for k in sorted(runtime_repro):
+            print(f"    [可再生产物] {k} -> {runtime_repro[k]}")
+    print(f"  候选失效引用 {len(stale)} 处 = 仓库外（不存在）{len(outside_missing)}"
+          f" + 仓库内 {len(inside)}")
+    # 这个数字**不因 config 降级而变**：那批引用改动前就靠"文件恰好存在"通过，
+    # 改动后靠"路径类别"通过 —— 都是不进 stale。真正的差别只在**文件缺失时**：
+    # 改动前会涨（于是误红），改动后恒定。
+    print(f"  其中白名单豁免 {exempted} 处（KNOWN_MENTIONS {len(KNOWN_MENTIONS)} 条命中 "
+          f"{len(set(KNOWN_MENTIONS) & set(stale))} 条、已知真漂移 {len(KNOWN_DRIFT)} 条）")
+    print(f"  实际失效引用 {len(unexpected)} 处 —— 与 problems 同口径（这些全部进入 problems）")
     for k in sorted(KNOWN_DRIFT):
         print(f"    [真漂移，待修] {k}")
 
@@ -267,13 +328,31 @@ def check_refs(verbose: bool) -> list[str]:
         problems.append(f"白名单之外出现 {len(unexpected)} 处新失效引用：")
         for k, v in sorted(unexpected.items()):
             problems.append(f"    · {k}\n        {v}")
-    vanished = [k for k in KNOWN_DRIFT if k not in found]
+    vanished = [k for k in KNOWN_DRIFT if k not in stale]
     if vanished:
         # 修好了是好消息，但必须**把白名单同步删掉**，否则它变成"永久豁免"
         problems.append("已知真漂移里有条目已不再出现（修好了？）——"
                         "请从 check_standards.py 的 KNOWN_DRIFT 里删掉，"
                         "否则它会变成永久豁免：\n"
                         + "\n".join(f"    · {k}" for k in vanished))
+    dead_mentions = sorted(k for k in KNOWN_MENTIONS if k not in stale)
+    if dead_mentions:
+        # 与 KNOWN_DRIFT 同理：白名单只增不减就会变成永久豁免。
+        # 条目为什么"死"通常是好理由（文档删了那句、或那个文件真的补上了），
+        # 但**必须有人来删**，不能靠它自己沉默。
+        problems.append(f"KNOWN_MENTIONS 里有 {len(dead_mentions)} 条已不再命中任何失效引用"
+                        "（文档改了？还是那个文件补上了？）"
+                        "——请从 check_standards.py 的 KNOWN_MENTIONS 里删掉，"
+                        "否则它会变成永久豁免：\n"
+                        + "\n".join(f"    · {k}" for k in dead_mentions))
+
+    # 内部口径不变式：凡被计为"实际失效"的，必须真的出现在 problems 里。
+    # 这条**自己会红**，用来钉住 P1 那种"算了却不用"的回潮。
+    for k in unexpected:
+        if not any(k in msg for msg in problems):
+            raise RuntimeError(
+                f"内部口径不一致：`{k}` 被计为失效引用，却没有进入 problems —— "
+                f"这就是 2026-10-24 那版「报 23 处失效却判定全部通过」的缺陷形态")
     return problems
 
 

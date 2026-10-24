@@ -22,6 +22,9 @@
 **2. 清单与登记的一致性** —— 新加测试却忘了登记，会在这一条红。
 **3. 权威实现可用**：`check_standards.py` 存在、退出码 0、三类检查都真的跑了。
 **4. 权威实现**真的**能抓到新漂移**（就地造一处失效引用，跑完删掉）。
+**5. 权威实现的两条**自身**纪律**（2026-10-24 补）：`KNOWN_MENTIONS` 没有死条目、
+   `STC/` 引用按仓库外（`..\\STC\\`）解析 —— 否则白名单会变成永久豁免、
+   而仓库外引用会被误判成失效。
 
 反向自证（改了就会红）
 --------------------
@@ -33,6 +36,9 @@
 新增一个未登记的测试文件              在 `tests/` 放一个 `selftest_zzz.py`        exit=1
 白名单之外新增失效引用                在 `docs/` 里写一个不存在的路径             exit=1
 把权威实现改名 / 删掉                 `apps/tools/check_standards.py` -> 别的名   exit=1
+白名单里挂一条永不命中的条目          `KNOWN_MENTIONS` 加一条假 key              exit=1
+`STC/` 解析根改回仓库内               `_outside_path` 返回 `ROOT / cand`         exit=1
+`STC/` 引用一律跳过（漏报）           在 `_outside_path` 后直接 `continue`        exit=1
 ====================================  ==========================================  ========
 
 用法::
@@ -82,6 +88,12 @@ PROBE_DOC = ROOT / "docs" / "_zz_tmp_drift_probe.md"
 # 如果这里写成完整字面量，检查器就会认为它是合法路径、不再报红 ——
 # **反向自证会静默失效，测试反而报"不达标"**（第一版就是这样，查了一轮才定位）。
 PROBE_REF = "apps/tools/" + "zz_" + "not_a_real_file.py"
+# 仓库外（`STC/`）探针：同样**必须拼出来**，理由同上（别让检查器把它当合法字面量）。
+STC_PROBE_DOC = ROOT / "docs" / "_zz_tmp_stc_probe.md"
+STC_PROBE_REF = "STC/scripts/zz_" + "not_a_real_stc.ps1"
+# 运行期可再生产物（`config/`）探针：同样拼出来，理由同上。
+CFG_PROBE_DOC = ROOT / "docs" / "_zz_tmp_cfg_probe.md"
+CFG_PROBE_REF = "config/zz_" + "phantom.json"
 
 
 def _test_files() -> list[Path]:
@@ -228,6 +240,131 @@ def test_checker_catches_a_brand_new_drift() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def _load_checker():
+    """把权威实现当模块加载（要直接看它的白名单与解析结果，不只跑 subprocess）。"""
+    spec = importlib.util.spec_from_file_location("check_standards_under_test", CHECKER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_whitelist_vanish_and_outside_repo() -> bool:
+    """第 5 节：白名单不许变成永久豁免；`STC/` 引用按仓库外解析。
+
+    这两条钉的是 2026-10-24 那轮修掉的**检查器自身缺陷**：
+
+    - `KNOWN_MENTIONS` 原先只增不减：文档改了、或那个文件真的补上了，
+      白名单条目就永远沉默（`KNOWN_DRIFT` 有 vanished 检测，它没有）；
+    - `STC/...` 原先只在仓库内解析，实际在 `..\\STC\\`，于是**真实存在的文件被判失效**
+      （假阳性），而这批假阳性又因为"算出 `outside` 却从不进 problems"被静默吞掉。
+
+    ## 这些断言怎么才能红（想清楚再改）
+
+    | 断言 | 什么改动会让它红 |
+    | ---- | ---------------- |
+    | 白名单无死条目 | 往 `KNOWN_MENTIONS` 加一条不命中的键（或删掉 vanished 检测） |
+    | 死条目检测真的生效 | 删掉 `check_refs` 里的 `dead_mentions` 分支（下面就地注入一条假条目验证） |
+    | `STC/` 存在的引用不算失效 | 把解析根改回 `ROOT`（存在的文件会被判失效，假阳性回来了） |
+    | `STC/` 不存在的引用必须报错 | 改成"`STC/` 一律跳过"（漏报回来了） |
+    | `config/` 引用不阻断 | 删掉 `collect_refs` 里的 `_is_runtime_reproducible` 分支（它回落进 stale，探针那条会让 exit 1） |
+    | `config/` 引用仍被归类 | 改成"`config/` 直接 `continue`"（静默吞掉，`cfg_classified` 变 False） |
+    """
+    print("----- 5. 白名单 vanished 检测 + STC/ 仓库外解析 -----")
+    if not CHECKER.exists():
+        print("  [不达标] check_standards.py 不存在")
+        return False
+    cs = _load_checker()
+    stale, outside_present, runtime_repro = cs.collect_refs()
+
+    # ---- ① 白名单无死条目 ----
+    dead = sorted(k for k in cs.KNOWN_MENTIONS if k not in stale)
+    print(f"  KNOWN_MENTIONS {len(cs.KNOWN_MENTIONS)} 条，命中 {len(cs.KNOWN_MENTIONS) - len(dead)} 条，"
+          f"死条目 {len(dead)} 条")
+    for k in dead[:10]:
+        print(f"    [死条目，请删] {k}")
+
+    # ---- ② 死条目检测本身必须活着（就地注入一条假条目，看检查器报不报） ----
+    fake = "docs/__zz_no_such_doc__.md:" + "zz_" + "phantom.py"
+    cs.KNOWN_MENTIONS[fake] = "反向自证：这条永远不命中，探 vanished 检测还活着"
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            probs = cs.check_refs(verbose=False)
+        caught_vanished = any(fake in p for p in probs)
+    finally:
+        cs.KNOWN_MENTIONS.pop(fake, None)
+    print(f"  注入一条假白名单条目后：检查器{'报出来了' if caught_vanished else '**没报**'}")
+
+    # ---- ③ `STC/` 引用按 `ROOT.parent` 解析 ----
+    stc_present = {k: v for k, v in outside_present.items() if v.startswith("STC/")}
+    leaked = sorted(k for k in stc_present if k in stale)          # 存在却被判失效 = 假阳性
+    ghost = sorted(k for k in stale                                # 不存在却没人管 = 漏报
+                   if k.split(":")[1].replace("\\", "/").startswith("STC/"))
+    print(f"  仓库外（存在）{len(stc_present)} 处、被判失效 {len(leaked)} 处、"
+          f"不存在的 `STC/` 引用 {len(ghost)} 处（应由白名单或 problems 接住）")
+    for k in leaked:
+        print(f"    [假阳性] {k}")
+
+    # ---- ④ 反向自证：造一处不存在的 `STC/` 引用，检查器必须报红 ----
+    STC_PROBE_DOC.write_text(f"# 临时探针（本测试创建，跑完就删）\n\n见 `{STC_PROBE_REF}`。\n",
+                             encoding="utf-8")
+    try:
+        code, out = _run(CHECKER, "--quiet")
+    finally:
+        STC_PROBE_DOC.unlink(missing_ok=True)
+    caught_stc = "zz_not_a_real_stc.ps1" in out
+    code2, _out2 = _run(CHECKER, "--quiet")
+    print(f"  造一处不存在的 STC 引用：退出码 {code}、被抓到 {caught_stc}；删掉后退出码 {code2}")
+
+    # ---- ⑤ `config/` 属运行期可再生产物：**显式归类、但绝不阻断** ----
+    #
+    # 钉的是 2026-10-24 那个回归：`config/` 整目录被 `.gitignore` 忽略
+    #（`AGENTS.md` §3 规则 3：能重新生成的东西不进版本库），
+    # 一段时间里它的 3 条 white-list 条目被当成"死条目"删了，
+    # 于是这份可再生产物被**升级成硬承诺** —— 删掉那个 json 就 exit 1。
+    # 修法是让豁免挂在**路径类别**上：不管文件在不在，都不进 stale。
+    CFG_PROBE_DOC.write_text(f"# 临时探针（本测试创建，跑完就删）\n\n见 `{CFG_PROBE_REF}`。\n",
+                             encoding="utf-8")
+    try:
+        code_cfg, out_cfg = _run(CHECKER, "--quiet")
+        # 必须**出现在分类里**（不是被静默吞掉 —— 那和"白名单永久豁免"同样坏）
+        _s, _o, repro_cfg = cs.collect_refs()
+        cfg_key = f"docs/{CFG_PROBE_DOC.name}:{CFG_PROBE_REF}"
+        cfg_classified = cfg_key in repro_cfg
+        cfg_in_stale = cfg_key in _s
+    finally:
+        CFG_PROBE_DOC.unlink(missing_ok=True)
+    code_cfg2, _out_cfg2 = _run(CHECKER, "--quiet")
+    print(f"  造一处不存在的 config 引用：退出码 {code_cfg}（必须 0）、"
+          f"归入「运行期可再生产物」{cfg_classified}、误进 stale {cfg_in_stale}；"
+          f"删掉后退出码 {code_cfg2}")
+
+    checks = [
+        ("KNOWN_MENTIONS 没有死条目（白名单不会变成永久豁免）", not dead),
+        ("死条目会被 check_refs 报出来（不是只算不用）", caught_vanished),
+        ("仓库外 `STC/` 引用确实按父目录解析到了（不是空集，断言没空跑）",
+         len(stc_present) > 0),
+        ("`STC/` 里存在的引用**不被**判为失效（P2 假阳性已修）", not leaked),
+        ("不存在的 `STC/` 引用没有漏网（要么进 problems，要么在白名单里）",
+         all(k in cs.KNOWN_MENTIONS or k in cs.KNOWN_DRIFT for k in ghost)),
+        ("新造一处不存在的 `STC/` 引用会让检查器报红", code != 0),
+        ("并且指出了那个路径（不只是「有错」）", caught_stc),
+        ("删掉探针后恢复通过（不是靠永久豁免过的）", code2 == 0),
+        ("`config/` 是不存在的路径时**也不阻断**（可再生产物不升级成硬承诺）",
+         code_cfg == 0),
+        ("但它**必须被显式归类**为「运行期可再生产物」（不是静默吞掉）",
+         cfg_classified),
+        ("并且没有掉进 stale（豁免挂在路径类别上，不挂在文件是否存在上）",
+         not cfg_in_stale and any(
+             k.split(":")[1].replace("\\", "/").startswith("config/")
+             for k in runtime_repro)),
+        ("删掉 config 探针后仍通过", code_cfg2 == 0),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def test_handover_section_13_claims() -> bool:
     """交接文档 §13 里写的具体事实，必须与代码一致。
 
@@ -243,7 +380,7 @@ def test_handover_section_13_claims() -> bool:
     **只钉"文档与代码一致"，不钉具体数值本身** —— 数值可以改，
     但改了就必须同时改文档，否则这条会红。这正是我们要的。
     """
-    print("----- 交接文档 §13 的断言 vs 代码 -----")
+    print("----- 6. 交接文档 §13 的断言 vs 代码 -----")
     handover = (ROOT / "docs" / "交接文档.md").read_text(encoding="utf-8")
     # §13 必须存在（否则下面那些核对是在"文档被删了"的情况下空跑）
     checks: list[tuple[str, bool]] = [
@@ -301,12 +438,12 @@ def test_handover_section_13_claims() -> bool:
 
 
 def test_sbom_builder() -> bool:
-    """第 6 节：SBOM 生成器能生成、能检查、坏输入不崩。
+    """第 7 节：SBOM 生成器能生成、能检查、坏输入不崩。
 
     为什么放在这里：SBOM 是"文档与事实"的一部分，且它是**当前机器环境**的快照，
     不适合要求别的机器也一致；所以这里测**结构 / 行为**，不钉死 59 或 66。
     """
-    print("----- 6. SBOM 生成器（build_sbom.py） -----")
+    print("----- 7. SBOM 生成器（build_sbom.py） -----")
     checks: list[tuple[str, bool]] = [
         ("build_sbom.py 存在", SBOM_TOOL.exists()),
     ]
@@ -417,6 +554,7 @@ def main() -> int:
                test_tests_are_registered_in_agents_md,
                test_authoritative_checker_passes,
                test_checker_catches_a_brand_new_drift,
+               test_whitelist_vanish_and_outside_repo,
                test_handover_section_13_claims,
                test_sbom_builder):
         results.append(fn())
@@ -425,7 +563,7 @@ def main() -> int:
 
     # ⚠️ 失败了就把"是哪一节红的"再打一遍。
     #
-    # 为什么需要：本测试有 **5 节、几十条检查**，而运行器
+    # 为什么需要：本测试有 **7 节、几十条检查**，而运行器
     # （`apps/run_tests.py`）失败时只回显**最后几行** —— 于是"哪一节红的"
     # 恰好被截掉，只剩一个孤零零的 `有不达标项`。
     # 2026-10-14 就撞上过一次：整套里红、单独跑连跑 8 次全绿、
@@ -435,8 +573,8 @@ def main() -> int:
     # 所以把结论行放在最后、并且逐节重述 —— 下次至少能一眼看出该查哪一节。
     if not ok:
         names = ("1 测试清单与数量", "2 登记一致", "3 权威实现可用",
-                 "4 反向自证能抓新漂移", "5 交接文档 §13 断言 vs 代码",
-                 "6 SBOM 生成器")
+                 "4 反向自证能抓新漂移", "5 白名单 vanished + STC 仓库外解析",
+                 "6 交接文档 §13 断言 vs 代码", "7 SBOM 生成器")
         print("红的节：")
         for name, good in zip(names, results):
             print(f"  [{'通过' if good else '不达标'}] {name}")
