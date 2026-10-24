@@ -350,7 +350,7 @@ def _fov_pair(size=(2560, 1440)):
 
 
 def test_fov_alignment() -> bool:
-    """FOV 自动对齐：已知 1.5x 合成视场差、同视场、空白帧、序列化。"""
+    """FOV 自动对齐：已知 1.5x 合成视场差、共同不放大目标、同视场、空白帧、序列化。"""
     print("----- 双目 FOV 自动对齐 -----")
     cv2.setRNGSeed(20261024)
     left, right = _fov_pair()
@@ -361,6 +361,9 @@ def test_fov_alignment() -> bool:
         align = estimate_fov_alignment(left, right)
         aligned_left, aligned_right = align.apply(left, right)
         x, y, w, h = align.crop_rect
+        # 共同输出尺寸 = 参考帧与裁剪区逐轴取小、再向下取偶（无损 MKV 要偶数）。
+        want_w, want_h = min(2560, w), min(1440, h)
+        want_target = (want_w - want_w % 2, want_h - want_h % 2)
         checks.extend([
             (f"1.5x 视场差 -> 参考 {align.reference_side} / 裁剪 {align.crop_side}，"
              f"尺度 {align.scale:.3f}",
@@ -371,43 +374,77 @@ def test_fov_alignment() -> bool:
              f"质量 {align.quality:.2f}、方法 {align.method}）",
              align.method == "sift" and align.inliers >= 30
              and 0.0 <= align.quality <= 1.0
-             and align.target_size == (min(2560, w), min(1440, h))
              and 0 <= x and 0 <= y and x + w <= 2560 and y + h <= 1440
              and abs(x - 426) <= 25 and abs(y - 240) <= 25
              and abs(w - 1707) <= 25 and abs(h - 960) <= 25),
-            ("两路都缩到不放大裁剪区的共同尺寸；裁剪/参考尺寸一致",
-             aligned_left.shape == aligned_right.shape == (h, w, 3)
-             and aligned_left.shape[0] <= 1440 and aligned_left.shape[1] <= 2560),
+            (f"target_size {align.target_size} 取共同（不放大）尺寸并取偶，"
+             f"不是参考帧 2560x1440",
+             align.target_size == want_target
+             and align.target_size[0] % 2 == 0 and align.target_size[1] % 2 == 0
+             and align.target_size[0] <= w and align.target_size[1] <= h
+             and align.target_size[0] <= 2560 and align.target_size[1] <= 1440
+             and align.target_size != (2560, 1440)),
+            ("两路都缩到共同 target_size；参考路下采样、广角裁剪区不放大",
+             aligned_left.shape == aligned_right.shape
+             == (want_target[1], want_target[0], 3)
+             and not np.shares_memory(aligned_left, left)
+             and not np.shares_memory(aligned_right, right)),
         ])
         ref_only = align.apply_side(left, "left")
         crop_only = align.apply_side(right, "right")
         checks.append((
-            "apply_side：参考路降采样、裁剪路裁剪，两路尺寸一致",
+            "apply_side：参考路与裁剪路都到 target_size，单路结果与成对 apply 一致",
             ref_only.shape == crop_only.shape == aligned_left.shape
-            and not np.shares_memory(ref_only, left)
+            and np.array_equal(ref_only, aligned_left)
             and np.array_equal(crop_only, aligned_right),
         ))
         post = estimate_fov_alignment(aligned_left, aligned_right)
-        checks.append((f"对齐后残余尺度 {post.scale:.4f}（目标 1±0.1）",
-                       abs(post.scale - 1.0) <= 0.10))
+        checks.append((f"对齐后残余尺度 {post.scale:.4f}（目标 1±0.1），target 为原生尺寸",
+                       abs(post.scale - 1.0) <= 0.10
+                       and post.target_size == (want_target[0], want_target[1])))
     except ValueError as exc:
         checks.append((f"1.5x 合成帧对估计失败：{exc}", False))
 
+    # 根因守卫：target_size 大于裁剪区 / 参考帧时必须拒绝，绝不静默放大
+    # （旧实现把 1685x979 放大到 2560x1440，Laplacian 清晰度塌到 ~20）。
+    try:
+        bad = FovAlignment(reference_side="left", crop_side="right",
+                           crop_rect=(0, 0, 160, 90), target_size=(320, 180),
+                           scale=0.5, method="sift", inliers=40, quality=0.9)
+        rejected = []
+        for side in ("right", "left"):
+            try:
+                bad.apply_side(np.zeros((90, 160, 3), np.uint8), side)
+            except ValueError:
+                rejected.append(True)
+            else:
+                rejected.append(False)
+        checks.append(("target_size 大于裁剪区 / 参考帧 -> 拒绝放大",
+                       rejected == [True, True]))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"放大守卫异常：{exc}", False))
+
     try:
         mirror = estimate_fov_alignment(right, left)
+        mw, mh = mirror.crop_rect[2], mirror.crop_rect[3]
         checks.append((f"交换左右（右更窄）-> 参考 {mirror.reference_side} / "
                        f"裁剪 {mirror.crop_side}，尺度 {mirror.scale:.3f}",
                        mirror.reference_side == "right"
                        and mirror.crop_side == "left"
-                       and abs(mirror.scale - 1.5) <= 0.075))
+                       and abs(mirror.scale - 1.5) <= 0.075
+                       and mirror.target_size[0] <= min(2560, mw)
+                       and mirror.target_size[1] <= min(1440, mh)
+                       and mirror.target_size[0] % 2 == 0
+                       and mirror.target_size[1] % 2 == 0))
     except ValueError as exc:
         checks.append((f"右窄左宽估计失败：{exc}", False))
 
     try:
         same = estimate_fov_alignment(left, left.copy())
         same_l, same_r = same.apply(left, left.copy())
-        checks.append(("相同画面 -> crop_side='none'，不缩放",
+        checks.append(("相同画面 -> crop_side='none'，target=参考原生尺寸，不缩放",
                        same.crop_side == "none" and not same.active
+                       and same.target_size == (2560, 1440)
                        and np.array_equal(same_l, left)
                        and np.array_equal(same_r, left)))
     except ValueError as exc:

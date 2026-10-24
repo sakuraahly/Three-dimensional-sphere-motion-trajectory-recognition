@@ -20,11 +20,15 @@
 坐标约定
 --------
 - ``crop_rect = (x, y, w, h)``，坐标在被裁剪那一路的像素系里；
-- ``target_size = (width, height)``，两路共同输出尺寸；取参考帧与裁剪区的较小尺寸，
-  **不把广角裁剪区上采样**（当前硬件约 1685x979）；
+- ``target_size = (width, height)``，两路共同输出尺寸；取参考帧与裁剪区的
+  较小尺寸并**向下取偶**，**不把广角裁剪区上采样**（无损 MKV 只支持偶数宽高，
+  实测 1685x979 写回读成 1684x978；当前硬件此对约为 1684x978）；
 - ``scale`` 是估计出的 left->right 像素尺度（右图像素 / 左图像素）：
-  1.0 表示两路视场基本一致，当前硬件约为 1/1.5 ≈ 0.667。
-- **参考帧永远不缩放**；只裁剪较广的一路，再用 ``INTER_LINEAR`` 缩放到参考帧尺寸。
+  1.0 表示两路视场基本一致，当前硬件约为 1/1.5 ≈ 0.667；
+- 两路最终都缩放到 ``target_size``：参考帧可能被下采样，较广一路的裁剪区
+  保持原生或下采样；**任何一路都不放大**。取参考帧原生尺寸会把更广一路的
+  裁剪区（如 1685x979）放大 1.5x，重采样显著压低该路 Laplacian 清晰度
+  （实测 ~103 -> ~20），标定的清晰度门限会整批拒帧。
 
 本模块是纯函数 / 纯数据模块：不读配置、不碰相机、不写文件。
 """
@@ -73,7 +77,9 @@ class FovAlignment:
     crop_side      : 被裁剪的一路（较广的一路），或 ``"none"`` 表示无需对齐。
     crop_rect      : ``(x, y, w, h)``，在 ``crop_side`` 那一路的像素系里；
                      ``crop_side == "none"`` 时记参考帧全幅 ``(0, 0, w, h)``，仅作占位。
-    target_size    : ``(width, height)``，两路共同输出尺寸；不放大裁剪区，通常小于参考帧。
+    target_size    : ``(width, height)``，两路共同输出尺寸；= 参考帧与裁剪区
+                     逐轴取小、再向下取偶（**不放大**，无损 MKV 要求偶数），
+                     通常小于参考帧；``crop_side == "none"`` 时为参考帧原生尺寸。
     scale          : 估计出的 left->right 像素尺度。
     method         : ``"sift"`` / ``"orb"``，实际使用的特征检测器。
     inliers        : 几何模型（homography / 仿射）的 RANSAC 内点数。
@@ -552,7 +558,10 @@ def _estimate_with(method: str, gray_l: np.ndarray, gray_r: np.ndarray,
     # 共同输出分辨率取“不放大”的交集：参考帧与裁剪区都不被 upscale。
     # 只把较窄/参考帧 downscale 到广角裁剪区的原生像素规模；若参考更小则不放大宽帧。
     # 这样既保持同一视场，又不把 1685x979 的裁剪硬拉到 2560x1440 导致模糊。
-    target_size = (min(ref_w, w), min(ref_h, h))
+    target_w, target_h = min(ref_w, w), min(ref_h, h)
+    # 无损 MKV（HFYU / FFV1）只支持偶数宽高：实测写 1685x979 读回是 1684x978，
+    # 会让 session 校验与实际视频不一致、内参也差 1 px。向下取偶，仍然不放大。
+    target_size = (target_w - target_w % 2, target_h - target_h % 2)
 
     # 尺度接近 1 且中心偏移小、参考帧几乎完整可见 -> 视场基本一致，不裁不缩。
     if abs(scale - 1.0) <= _NEAR_UNITY:
@@ -565,11 +574,12 @@ def _estimate_with(method: str, gray_l: np.ndarray, gray_r: np.ndarray,
         overlap = min(1.0, (w * h) / float(ref_w * ref_h))
         if (offset <= _NEAR_CENTER_FRAC * min(wide_w, wide_h)
                 and overlap >= _NEAR_OVERLAP):
+            # 不裁不缩：target 就是参考帧原生尺寸，apply() 原样返回。
             return FovAlignment(
                 reference_side=reference_side,
                 crop_side="none",
                 crop_rect=(0, 0, ref_w, ref_h),
-                target_size=target_size,
+                target_size=(ref_w, ref_h),
                 scale=float(scale),
                 method=method,
                 inliers=n_inliers,
@@ -602,6 +612,8 @@ def estimate_fov_alignment(left: np.ndarray, right: np.ndarray, *,
     返回
     ----
     :class:`FovAlignment`。``active`` 为 False 时两路视场基本一致。
+    ``target_size`` 是两路统一的**共同（不放大）输出尺寸**：参考帧与裁剪区
+    逐轴取小、再向下取偶（无损 MKV 只支持偶数宽高）；参考帧可能因此被下采样。
 
     异常
     ----

@@ -6,6 +6,12 @@
 但**录制要每一帧都留下**。所以这里自己开两路 `CameraSource`，各跑一个采集线程、
 各写一个 writer，主线程只负责计时 / 预览 / 停止。
 
+FOV 生效时（标定 meta 带 `fov`）写盘 / 预览用的是标定的 `fov.target_size`
+（两路共同、**不放大**，当前一对约 1684x978），**不是** `--width/--height`：
+相机仍按 `--width/--height`（2560x1440）打开，再在采集线程里逐帧归一化。
+`session.json` 的 `left/right.width/height`、`calibration.image_size` 都记
+写盘尺寸；无损 MKV 只接受偶数宽高，奇数 target 会在录制前退出 2。
+
 录完做什么
 ----------
 - 写 `session.json`（分辨率 / 实测 fps / 帧数 / 标定快照 + sha256 / 同步偏移）；
@@ -356,12 +362,14 @@ def _load_calib_fov(raw: object) -> FovAlignment | None:
     return FovAlignment.from_dict(raw)                      # type: ignore[arg-type]
 
 
-def _camera_info(side: str, idx: int, src: CameraSource, args, role_spec) -> CameraInfo:
+def _camera_info(side: str, idx: int, src: CameraSource, args, role_spec,
+                 out_width: int, out_height: int) -> CameraInfo:
+    """会话 left/right 记录的是**写盘分辨率**（FOV 生效时 = fov.target_size）。"""
     return CameraInfo(
         role=side,
         video=f"{side}.mkv",
-        width=int(src.info.width),
-        height=int(src.info.height),
+        width=int(out_width),
+        height=int(out_height),
         frame_count=0,
         fps_requested=float(args.fps),
         fps_measured=0.0,
@@ -504,10 +512,27 @@ def main() -> int:
                     LOG.error("fov.crop_rect %s 超出采集帧 %sx%s，拒绝录制",
                               fov.crop_rect, cap_w, cap_h)
                     return 2
+                if out_w > cw or out_h > ch:
+                    print(f"[错误] 标定 meta.fov.target_size {fov.target_size} 大于"
+                          f"裁剪区 {(cw, ch)}：该记录要求放大较广一路。")
+                    print("       放大会压低该路清晰度（旧版本的做法）；请重新标定，"
+                          "让 target_size 取共同（不放大）尺寸。")
+                    LOG.error("fov.target_size %s 大于裁剪区 %s，拒绝录制"
+                              "（拒绝会放大的旧记录）", fov.target_size, (cw, ch))
+                    return 2
+                if out_w % 2 or out_h % 2:
+                    print(f"[错误] 标定 meta.fov.target_size {fov.target_size} 含"
+                          "奇数宽高：无损 MKV 只支持偶数。")
+                    print("       奇数尺寸写盘后会被取整，视频与 session / 内参对不上；"
+                          "请重新标定。")
+                    LOG.error("fov.target_size %s 含奇数宽高，拒绝录制",
+                              fov.target_size)
+                    return 2
                 print(f"[FOV] 沿用标定对齐：参考 {fov.reference_side} / "
                       f"裁剪 {fov.crop_side} / 裁剪区 {fov.crop_rect} -> "
-                      f"{fov.target_size[0]}x{fov.target_size[1]}")
-                LOG.info("沿用标定 FOV 对齐：%s", fov.to_dict())
+                      f"{out_w}x{out_h}（采集 {cap_w}x{cap_h}，不放大）")
+                LOG.info("沿用标定 FOV 对齐：%s；写盘 %sx%s（采集 %sx%s）",
+                         fov.to_dict(), out_w, out_h, cap_w, cap_h)
             else:
                 print("[FOV] 标定记录两路视场一致（crop_side=none），不裁剪")
         else:
@@ -666,8 +691,12 @@ def main() -> int:
         left_fps = left_rec.frame_count / elapsed
         right_fps = right_rec.frame_count / elapsed
 
-        session.left = _camera_info("left", left_idx, left_src, args, _role_spec(load_registry(), args.left))
-        session.right = _camera_info("right", right_idx, right_src, args, _role_spec(load_registry(), args.right))
+        session.left = _camera_info("left", left_idx, left_src, args,
+                                    _role_spec(load_registry(), args.left),
+                                    out_w, out_h)
+        session.right = _camera_info("right", right_idx, right_src, args,
+                                     _role_spec(load_registry(), args.right),
+                                     out_w, out_h)
         session.left.frame_count = left_rec.frame_count
         session.right.frame_count = right_rec.frame_count
         session.left.fps_measured = left_fps

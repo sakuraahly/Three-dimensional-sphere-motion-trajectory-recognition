@@ -261,7 +261,7 @@ def main() -> int:
 
     mag = max(fov.scale, 1.0 / fov.scale)
     print("[FOV] 自动视场对齐（启动时只估计一次，之后逐帧复用）")
-    print(f"      参考（较窄、不缩放）：{fov.reference_side}    "
+    print(f"      参考（较窄；必要时降采样，不裁剪）：{fov.reference_side}    "
           f"裁剪：{fov.crop_side}")
     print(f"      裁剪区 (x, y, w, h) = {fov.crop_rect}    "
           f"归一化尺寸 {fov.target_size[0]}x{fov.target_size[1]}")

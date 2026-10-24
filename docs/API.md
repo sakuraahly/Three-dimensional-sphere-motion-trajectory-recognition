@@ -536,7 +536,7 @@ class FovAlignment:
     reference_side: str                    # "left"/"right"：较窄、更放大的一路；不裁剪，必要时降采样
     crop_side: str                         # "left"/"right"/"none"：被裁剪的一路
     crop_rect: tuple[int, int, int, int]   # (x, y, w, h)，在 crop_side 的像素系里
-    target_size: tuple[int, int]           # 两路共同输出尺寸；不放大裁剪区，通常小于参考帧
+    target_size: tuple[int, int]           # 两路共同输出尺寸 = 参考帧/裁剪区逐轴取小，再向下取偶（不放大）
     scale: float                           # left -> right 像素尺度；1.0 = 视场基本一致
     method: str                            # "sift"/"orb"
     inliers: int;  quality: float          # quality ∈ [0, 1]
@@ -553,13 +553,13 @@ def estimate_fov_alignment(left: np.ndarray, right: np.ndarray, *,
 
 **输入 / 边界**：`left`/`right` 支持 BGR / BGRA / 灰度 `np.ndarray`（uint8 最稳）；模块是纯函数 / 纯数据，不读配置、不碰相机、不写文件。
 
-**做法**：SIFT 优先、ORB 兜底；Lowe ratio + 双向交叉校验；RANSAC homography（失败退仿射）。由内点拟合 `left->right` 尺度：`scale <= 1` 以左为参考裁右（视场接近时通常先判 `none`），`scale > 1` 以右为参考裁左。`|scale-1| <= 0.05`、中心偏移 `<= 10%` 短边、参考帧可见面积 `>= 90%` 时返回 `crop_side="none"`。`target_size` 取参考帧与裁剪区的较小尺寸（不放大裁剪区）；`apply()` 对裁剪路做 `crop_rect` 裁剪 + 缩放，对参考路只降采样到 `target_size`，两路最终同尺寸。
+**做法**：SIFT 优先、ORB 兜底；Lowe ratio + 双向交叉校验；RANSAC homography（失败退仿射）。由内点拟合 `left->right` 尺度：`scale <= 1` 以左为参考裁右（视场接近时通常先判 `none`），`scale > 1` 以右为参考裁左。`|scale-1| <= 0.05`、中心偏移 `<= 10%` 短边、参考帧可见面积 `>= 90%` 时返回 `crop_side="none"`。`target_size` = 参考帧与裁剪区**逐轴取小、再向下取偶**（无损 MKV 只支持偶数宽高；**任何一路都不放大**）；`apply()` 对裁剪路做 `crop_rect` 裁剪 + 缩放，对参考路只降采样到 `target_size`，两路最终同尺寸；`crop_side="none"` 时 `target_size` = 参考帧原生尺寸、不裁不缩。取参考帧原生尺寸会把裁剪区放大 1.5x（实测 Laplacian 清晰度 ~103 -> ~20，标定 55 门限整批拒帧），所以这里优先保证不放大。
 
-**失败语义（不会静默退化）**：参数非法或估计失败都抛 `ValueError`；估计失败时错误串带 SIFT/ORB 各自的失败原因 —— 帧非法 / 太小（短边 < 16）、没有足够特征或匹配、内点 `< min_inliers`、尺度超出 `[1/max_scale, max_scale]`、参考帧四角映射失败或退化（含非有限坐标、宽或高 < 2）、参考帧映射后的包围盒只占广角帧 `< 20%` 面积、**参考帧四角映射后任一维越出广角帧 > 16 px**（参考帧未完整落在广角帧内 = 共同视场不足；容忍轻微旋转/取整误差（最多 16 px），**不会**裁掉越界角按“部分重叠”继续主动对齐）。`crop_side="none"` 只在近同视场判据通过时出现，**不是失败兜底**；`min_inliers` 至少 4，`max_scale` 必须 > 1.0。构造 / `from_dict()` 还会校验字段（`reference_side`/`crop_side` 取值、`crop_side != reference_side`、`crop_rect` 为 4 个整数且非负/宽高为正、`target_size` 为正、`scale` 有限正数、`quality` 在 `[0, 1]`）；应用对齐时，`apply()` 检查参考帧尺寸是否等于 `target_size`，`apply_side()` 检查裁剪区是否越界。
+**失败语义（不会静默退化）**：参数非法或估计失败都抛 `ValueError`；估计失败时错误串带 SIFT/ORB 各自的失败原因 —— 帧非法 / 太小（短边 < 16）、没有足够特征或匹配、内点 `< min_inliers`、尺度超出 `[1/max_scale, max_scale]`、参考帧四角映射失败或退化（含非有限坐标、宽或高 < 2）、参考帧映射后的包围盒只占广角帧 `< 20%` 面积、**参考帧四角映射后任一维越出广角帧 > 16 px**（参考帧未完整落在广角帧内 = 共同视场不足；容忍轻微旋转/取整误差（最多 16 px），**不会**裁掉越界角按“部分重叠”继续主动对齐）。`crop_side="none"` 只在近同视场判据通过时出现，**不是失败兜底**；`min_inliers` 至少 4，`max_scale` 必须 > 1.0。构造 / `from_dict()` 还会校验字段（`reference_side`/`crop_side` 取值、`crop_side != reference_side`、`crop_rect` 为 4 个整数且非负/宽高为正、`target_size` 为正、`scale` 有限正数、`quality` 在 `[0, 1]`）；应用对齐时，`apply()` / `apply_side()` 把两路都缩放到 `target_size`；`apply_side()` 检查裁剪区是否越界，并**拒绝任何放大**（`target_size` 大于裁剪区，或参考帧小于 `target_size`，都抛 `ValueError`）。
 
-**接线**：`apps/calibrate_stereo.py` 启动时只估计一次（实时相机路径最多读 30 帧 / 5 秒），把 `fov.to_dict()` 写进 `StereoRig.meta["fov"]`（落盘后是标定 JSON 顶层的 `fov`），之后每帧 `fov.apply()` 后再检测角点（`--save-pairs` 另存的也是归一化画面）；`record_stereo.py` 在写盘 / 预览前按路 `apply_side()` 裁剪，且只有 `meta["fov"]` **缺失 / `None`** 才按旧标定原生画面录，`{}` / `[]` / 非 mapping 一律视为记录损坏退出 2；启用对齐时 `crop_rect` 越出采集帧也在打开 writer 前退出 2。`verify_stereo.py` 只对实时相机输入应用 `fov.apply()`；视频 / 图片不二次裁剪，但会在**首对帧**调用 `estimate_fov_alignment()` 证明输入确实已归一化 —— 仍需要主动对齐（原生画面）、尺度不在 `0.9–1.1` 或纹理不足估不出来都退出 2，显式加 `--fov-input-normalized` 才跳过校验（不静默假定）。旧标定没有 `fov` 键（`rig.meta.get("fov")` 为 `None`）→ 调用方拿到 `None`，按原生画面工作；`session.rig["fov"]` 只在对齐生效（`active=True`）时写入。
+**接线**：`apps/calibrate_stereo.py` 启动时只估计一次（实时相机路径最多读 30 帧 / 5 秒），把 `fov.to_dict()` 写进 `StereoRig.meta["fov"]`（落盘后是标定 JSON 顶层的 `fov`），之后每帧 `fov.apply()` 后再检测角点（`--save-pairs` 另存的也是归一化画面）；`record_stereo.py` 在写盘 / 预览前按路 `apply_side()` 归一化 —— 相机仍按 `--width/--height`（2560x1440）打开，但 writer、`session.json` 的 `left/right.width/height` 与 `calibration.image_size` 都用 `fov.target_size`（否则 `validate_session` 会报视频尺寸与 session 不一致）。只有 `meta["fov"]` **缺失 / `None`** 才按旧标定原生画面录，`{}` / `[]` / 非 mapping 一律视为记录损坏退出 2；启用对齐时 `crop_rect` 越出**采集帧**、`target_size` 与 `image_size` 不一致、`target_size` 大于裁剪区（旧版会放大的记录）或含奇数宽高，都在打开 writer 前退出 2。`verify_stereo.py` 只对实时相机输入应用 `fov.apply()`；视频 / 图片不二次裁剪，但会在**首对帧**调用 `estimate_fov_alignment()` 证明输入确实已归一化 —— 仍需要主动对齐（原生画面）、尺度不在 `0.9–1.1` 或纹理不足估不出来都退出 2，显式加 `--fov-input-normalized` 才跳过校验（不静默假定）。旧标定没有 `fov` 键（`rig.meta.get("fov")` 为 `None`）→ 调用方拿到 `None`，按原生画面工作；`session.rig["fov"]` 只在对齐生效（`active=True`）时写入。
 
-**当前真机样例（模块级，不是完整标定 E2E）**：2026-10-24 两路 2560×1440 MSMF 帧，左路（较窄）为参考、右路裁剪 `(409,126,1717,986)`（只保留 45.9% 画面）、`scale≈0.651`；对齐后重估残余尺度 `≈0.966`（目标 1.0）。换机 / 换镜头 / 换分辨率后以启动估计为准，不要写死。
+**当前真机样例（模块级，不是完整标定 E2E）**：2026-10-24 两路 2560×1440 MSMF 帧，左路（较窄）为参考、右路实测裁剪 `(409,126,1717,986)`（只保留 45.9% 画面；另一次启动估计裁剪区 1685×979）、`scale≈0.651`；共同输出 = 裁剪区**向下取偶** -> **1716×986 / 1684×978**，不是 2560×1440。换机 / 换镜头 / 换分辨率后以启动估计为准，不要写死；旧版（放大到 2560）上的残余尺度 0.966 不能当修复后的验证结论，需用真机帧对重验。
 
 ### 13.4 `stereo/sessions.py`
 ```python
