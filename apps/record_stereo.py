@@ -604,7 +604,14 @@ def main() -> int:
             else:
                 print("[FOV] 标定记录两路视场一致（crop_side=none），不裁剪")
         else:
-            print("[FOV] 旧标定没有 fov 记录：按原生画面录制（行为与以前一致）")
+            # `fov: null` 是**新标定明确记录**的"本次没有对齐"（parallel 下估计
+            # 失败后降级），与"旧标定根本没这个字段"要分开说：两者都按原始画面
+            # 写盘，但前者意味着两路像素尺度可能不一致。
+            if isinstance(rig.meta, dict) and "fov" in rig.meta and raw_fov is None:
+                print("[FOV] 本次无对齐（标定未产生 FOV）：两路各自原始画面")
+                LOG.info("标定 meta.fov=null：按两路原始画面录制")
+            else:
+                print("[FOV] 旧标定没有 fov 记录：按原生画面录制（行为与以前一致）")
 
         session.calibration = CalibrationInfo(
             path=str(calib_path.relative_to(session_dir)).replace("\\", "/"),

@@ -505,6 +505,32 @@ def main() -> int:
         print(f"  [{'通过' if good else '不达标'}] {label}")
         results.append((label, good))
 
+    # ---- 8c. 平行装置的「本次不做 FOV 对齐」出口（2026-10-24 加）----
+    # 契约：勾上只加 `--skip-fov`，**不许**偷偷把模式改成 angled（那是 90° 入口
+    # 的职责）；不勾则普通标定不带这个参数。文本里必须写明后果。
+    print("----- 8c. 「本次不做 FOV 对齐」勾选框 -----")
+    app.stereo_mode_var.set("auto")
+    app.calib_skip_fov.set(False)
+    plain_fov = " ".join(app._calibrate_args() or [])
+    app.calib_skip_fov.set(True)
+    skip_fov_s = " ".join(app._calibrate_args() or [])
+    app.calib_skip_fov.set(False)
+    checks_skip_fov = [
+        ("勾选后 argv 带 --skip-fov", "--skip-fov" in skip_fov_s),
+        ("勾选后**不加** --stereo-mode angled（不改模式）",
+         "--stereo-mode angled" not in skip_fov_s),
+        ("不勾时普通标定不带 --skip-fov", "--skip-fov" not in plain_fov),
+        ("界面文案写明后果（原始画面 / 纹理太少）",
+         "本次不做 FOV 对齐" in launcher_src
+         and "两路各自原始画面" in launcher_src
+         and "共同纹理太少" in launcher_src),
+        ("标定说明带上『本次不做 FOV 对齐』",
+         "本次不做 FOV 对齐" in mod_src),
+    ]
+    for label, good in checks_skip_fov:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
+
 
     off = app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo"))
     off_s = " ".join(off)

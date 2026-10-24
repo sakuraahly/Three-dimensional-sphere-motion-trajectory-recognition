@@ -990,12 +990,31 @@ class Launcher(tk.Tk):
         ttk.Button(box, text="画质诊断（两路同开，区分带宽 / 光学）",
                    command=self._run_camera_quality).grid(
             row=9, column=3, columnspan=4, sticky="w", pady=(6, 2))
+        # ---- 平行装置的「本次不做 FOV 对齐」出口（2026-10-24 加）----
+        # 为什么加：FOV 估计失败时脚本会**降级继续**（不裁剪、按原始画面标定），
+        # 但用户仍需要一个**主动**的选择 —— 尤其两路视场差异小、或共同纹理太少时，
+        # 与其让它在启动帧上白跑一次匹配，不如直接说明"这次不做对齐"。
+        # ⚠️ 它**只加 --skip-fov**，不加 `--stereo-mode angled`：模式与 FOV 是两件事，
+        # 平行装置不该被这个勾选偷偷改成大角度。
+        self.calib_skip_fov = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            box, variable=self.calib_skip_fov,
+            text="本次不做 FOV 对齐（标定按两路各自原始画面）").grid(
+            row=10, column=0, columnspan=5, sticky="w", pady=(4, 0))
+        self.calib_skip_fov_note = ttk.Label(
+            box, style="Hint.TLabel", wraplength=CARD_HINT_WRAP,
+            text="后果：两路各自原始画面；适合两路视场差异小、或有共同纹理太少的情况。"
+                 "两路像素尺度若不一致，视差/深度会有系统偏差 —— 勾了就在标定后复检极线误差。"
+                 "（大角度装置请用上面那个『90° 装置』入口，那是另一件事。）")
+        self.calib_skip_fov_note.grid(row=11, column=0, columnspan=9,
+                                      sticky="w", pady=(0, 2))
+        self._wrapped.append((self.calib_skip_fov_note, "card"))
         self.calib90_note = ttk.Label(
             box, style="Hint.TLabel", wraplength=CARD_HINT_WRAP,
             text="90° 装置：两路各用**原始画面**，不做 FOV 裁剪对齐；坐标系为 "
                  "left_camera。前提是两路**有共同可见区**（棋盘要同时出现在左右画面里），"
                  "且基线 B 应约为工作距离的 2 倍（B≈2·D）。不满足就别用这个大角度入口。")
-        self.calib90_note.grid(row=10, column=0, columnspan=9, sticky="w", pady=(0, 2))
+        self.calib90_note.grid(row=12, column=0, columnspan=9, sticky="w", pady=(0, 2))
         self._wrapped.append((self.calib90_note, "card"))
 
     # ---------- 第 2 步：参数 ----------
@@ -1842,13 +1861,15 @@ class Launcher(tk.Tk):
         # 90° 装置：模式由按钮强制为 angled，FOV 对齐那一步跳过 —— 那一步
         # 假设两路有足够重叠区可以裁剪，而 90° 装置的画面对应关系不是这样。
         mode = "angled" if angled_90 else self.stereo_mode_var.get()
+        # 「本次不做 FOV 对齐」只补 --skip-fov，**不改模式**（平行装置仍是 parallel）。
+        skip_fov = angled_90 or bool(self.calib_skip_fov.get())
         args = ["--left", _cam_arg(self.calib_left.get()),
                 "--right", _cam_arg(self.calib_right.get()),
                 "--stereo-mode", mode,
                 "--cols", str(cols), "--rows", str(rows), "--square", str(square),
                 "--target", str(target), "--min-pairs", str(minp),
                 "--width", width, "--height", height, "--fps", fps]
-        if angled_90:
+        if skip_fov:
             args += ["--skip-fov"]
         # ⚠️ 2026-10-14：这里原来**写死** `--backend msmf`（理由是"MSMF 与设备枚举
         # 顺序一致"）。但那样界面就完全没有选择权，而本机实测 **MSMF 打开两路
@@ -1912,6 +1933,8 @@ class Launcher(tk.Tk):
             note = f"收满 {target} 对后自动标定"
             if force_angled:
                 note = "90° 装置 / angled / 跳过 FOV；" + note
+            elif self.calib_skip_fov.get():
+                note = "本次不做 FOV 对齐（两路原始画面）；" + note
             if not base:
                 note += "；⚠ 未填预期基线，基线核对将是关着的"
             self._run(cmd, f"双目标定（左{left} / 右{right}，{note}）")

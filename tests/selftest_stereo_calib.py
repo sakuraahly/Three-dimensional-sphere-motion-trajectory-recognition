@@ -577,6 +577,53 @@ def test_epipolar_rejects_mismatch() -> bool:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)
 
+
+def test_fov_or_none() -> bool:
+    """FOV **估不出来** 与 **估出来不可信** 必须分开处理（2026-10-24）。
+
+    真实故障：parallel 标定在启动帧上 SIFT/ORB 都匹配不够（纯色墙/共同纹理太少），
+    旧代码直接 `return 1`，用户看到的就是"标定打不开"。但 `stereoCalibrate`
+    并不要求两路视场对齐 —— 估不出来应当**降级为不裁剪、按原始画面继续**，
+    同时把原始原因带出来打印，不能吞掉。
+    """
+    print("\n----- FOV 估计失败：默认降级 / --require-fov 仍失败 -----")
+    from unittest import mock
+
+    import apps.calibrate_stereo as cs
+
+    reason_text = "sift: SIFT 特征 2474/5000，ratio+交叉校验后匹配 14 < min_inliers=30"
+    boom = mock.Mock(side_effect=ValueError(reason_text))
+    checks = []
+
+    fov, reason = cs._fov_or_none(boom, mode="parallel", require_fov=False)
+    print(f"  parallel 默认：fov={fov!r}  reason={reason}")
+    checks.append(("parallel 默认降级为 fov=None（不抛异常）", fov is None))
+    checks.append(("降级时带回**原始原因**（ValueError + 细节）",
+                   isinstance(reason, str) and reason_text in reason
+                   and "ValueError" in reason))
+
+    for label, kw in (
+        ("--require-fov 时仍然失败（不降级）", dict(mode="parallel", require_fov=True)),
+        ("非 parallel（angled）不静默降级", dict(mode="angled", require_fov=False)),
+    ):
+        try:
+            cs._fov_or_none(boom, **kw)
+            checks.append((label, False))
+        except ValueError as exc:
+            checks.append((f"{label}（原因：{str(exc)[:40]}…）", reason_text in str(exc)))
+        except Exception as exc:                          # noqa: BLE001
+            checks.append((f"{label}（抛了非 ValueError：{type(exc).__name__}）", False))
+
+    sentinel = object()
+    got, why = cs._fov_or_none(lambda: sentinel, mode="parallel", require_fov=True)
+    checks.append(("估计成功时原样返回 (fov, None)",
+                   got is sentinel and why is None))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目标定自测（合成真值）")
     ap.add_argument("--views", type=int, default=25,
@@ -619,6 +666,7 @@ def main() -> int:
     all_ok = test_T_sign_convention() and all_ok
     all_ok = test_board_area_caps_grade() and all_ok
     all_ok = test_epipolar_rejects_mismatch() and all_ok
+    all_ok = test_fov_or_none() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1

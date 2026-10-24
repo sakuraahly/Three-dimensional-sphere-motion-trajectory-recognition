@@ -104,6 +104,26 @@ def _previous_calib_meta(out: str) -> dict | None:
     return raw if isinstance(raw, dict) else None
 
 
+def _fov_or_none(estimate_fn, *, mode: str, require_fov: bool):
+    """估计 FOV 对齐；**估不出来**与**估出来不可信**是两件事，这里只管前者。
+
+    - 返回 ``(fov, None)``：估计成功。
+    - 返回 ``(None, 原因)``：估计失败，调用方按**两路原始画面**继续
+      （仅 ``parallel`` 且没要求 ``--require-fov``）。几何上完全合法：
+      ``stereoCalibrate`` 不要求两路视场对齐。
+    - 抛异常：``require_fov=True`` 或 ``mode != "parallel"`` 时保留旧的
+      fail-closed 语义（要失败就明确失败，不静默降级）。
+
+    失败原因必须带回给调用方打印 —— 降级不等于吞掉证据。
+    """
+    try:
+        return estimate_fn(), None
+    except Exception as exc:                     # noqa: BLE001 - 原因要原样带回
+        if require_fov or mode != "parallel":
+            raise
+        return None, f"{type(exc).__name__}: {exc}"
+
+
 # --------------------------------------------------------------------------
 def build_report_figure(rig: StereoRig, pairs, spec: BoardSpec, out_path: Path) -> None:
     """画一张验证图：把左右两路的角点放到同一张画布上（左半 / 右半）。
@@ -178,6 +198,10 @@ def main() -> int:
     fov.add_argument("--fov", action="store_true",
                      help="即使 --stereo-mode angled 也强行做 FOV 对齐（单应/裁剪的前提"
                           "只对近平行成立；大角度下是否可用由你自己判断）")
+    ap.add_argument("--require-fov", action="store_true",
+                    help="视场对齐估计失败就退出（旧的 fail-closed 语义）。"
+                         "默认不要求：parallel 下估不出来时降级为不裁剪、"
+                         "按两路原始画面继续标定，并在 meta 里写 fov=null")
     ap.add_argument("--out", default="config/stereo_calibration", help="输出前缀")
     ap.add_argument("--save-pairs", default=None, help="把收下的图像对另存到这个目录（便于复查）")
     ap.add_argument("--report-png", default=None, help="输出验证图路径")
@@ -193,6 +217,9 @@ def main() -> int:
                     help="手持拍摄的宽松预设：停稳上限 10 px、清晰度下限 28、"
                          "允许更小的板。**换来过检风险**，精度不满意就退回默认值重标")
     args = ap.parse_args()
+    if args.skip_fov and args.require_fov:
+        ap.error("--skip-fov 与 --require-fov 矛盾：前者不做 FOV 对齐，后者要求"
+                 "「估不出来就失败」")
 
     # 日志要在**做任何事之前**起来：标定失败时最有价值的证据（拒绝了什么、
     # 各拒了多少帧）现在只在内存里，进程一退就没了。
@@ -253,6 +280,11 @@ def main() -> int:
     # H 没有物理意义，裁出来的画面会错位 —— 所以 angled 默认不做对齐，
     # 两路按各自原始画面标定（坐标系仍是 left_camera，见 数据标准.md §1.5）。
     # --fov 可以强行打开（是否真的近共视由用户判断）。
+    if args.require_fov and mode == "angled" and not args.fov:
+        # 静默失效是最坏的：用户要求"估不出来就失败"，但 angled 压根不做对齐，
+        # 这个要求会被悄悄忽略。宁可报错让他选清楚。
+        ap.error("--require-fov 在 angled 模式下无意义（该模式不做 FOV 对齐）。"
+                 "要强制对齐请加 --fov；要严格的失败语义请用 --stereo-mode parallel。")
     do_fov = not args.skip_fov and (mode != "angled" or args.fov)
     if mode == "angled" and not do_fov:
         print("[FOV] 跳过视场对齐（angled）：单应/裁剪的前提只对近平行成立；"
@@ -265,10 +297,14 @@ def main() -> int:
 
     # ---- 启动时一次性估计 FOV 对齐（之后逐帧复用，绝不重估） ----
     #
-    # 为什么必须在这里做、而且失败就退出（仅 parallel）：
-    #   左相机比右相机放大 ~1.5x，直接按原生分辨率标定，两路像素尺度不一致，
-    #   视差与深度会被系统性污染，而标定报告本身看不出来。
-    #   所以宁可在启动时明确失败，也不允许"没对齐就继续"（fail-closed）。
+    # 两种失败要分开对待：
+    #   · **估不出来**（特征太少 / 纯色墙）→ 默认在 parallel 下降级：不裁剪，
+    #     按两路原始画面继续标定。`stereoCalibrate` 不要求两路视场对齐，
+    #     这在几何上完全合法；只是两路像素尺度不一致时视差/深度会有系统偏差，
+    #     所以必须**明确打印**这次没有对齐，并写进 meta（fov=null）。
+    #     要恢复旧的 fail-closed，用 --require-fov。
+    #   · **估出来但不可信**（quality 低）→ 仍然由下面的 fov_gate_action()
+    #     拦住，那条是"不可信还硬用"，不在降级范围内。
     #
     # 相机刚打开的前几帧可能是黑帧/坏帧，这里最多读 30 帧或约 5 秒；
     # 一旦拿到成对帧就**只估计一次**，并把这帧对留给主循环（不丢弃）。
@@ -302,79 +338,90 @@ def main() -> int:
         return 1
 
     if do_fov:
+        print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
         try:
-            print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
-            fov = estimate_fov_alignment(first_pair[0], first_pair[1])
-        except ValueError as exc:
+            fov, fov_fail_reason = _fov_or_none(
+                lambda: estimate_fov_alignment(first_pair[0], first_pair[1]),
+                mode=mode, require_fov=args.require_fov)
+        except Exception as exc:                 # noqa: BLE001 - 原始异常原样呈现
             print("\n[错误] 无法自动估计两路 FOV 对齐，已停止（不会按原生分辨率继续）。")
-            print(f"       原因：{exc}")
+            print(f"       原因：{type(exc).__name__}: {exc}")
             print("       请把**有纹理的物体或标定板**同时放进两路画面、光照均匀、"
                   "对焦清晰，然后重试。")
             print("       空白墙/纯色桌面/严重欠曝都会让特征匹配失败。")
-            if mode == "parallel":
-                print("       **若是大角度装置（~90°），两路本就几乎没有共同纹理**："
-                      "请加 --skip-fov，或用 --stereo-mode angled 重跑。")
-            log.error("FOV 估计失败，退出（不静默继续）：%s", exc)
+            print("       本次是 --require-fov 或非 parallel 模式，所以不降级。")
+            log.error("FOV 估计失败，退出（--require-fov / 非 parallel）：%s", exc)
             src.release()
             return 1
 
-        # 这五个数不管哪种模式都并列打印出来：判据交给人，但数字必须是明面上的。
-        print(f"[FOV] scale={fov.scale:.4f}  inliers={fov.inliers}  "
-              f"quality={fov.quality:.3f}  crop_rect={list(fov.crop_rect)}  "
-              f"target_size={list(fov.target_size)}")
-        if mode == "parallel":
-            print("      平行基线参照（本机现役装置，实测夹角 1.4°）：scale=0.6649  "
-                  "inliers=296  quality=0.513  crop_rect=[404,195,1718,973]  "
-                  "target_size=[1718,972]")
-            # 只有"这次估计真的会被用来裁剪"才拦；不裁剪时低置信度不会污染
-            # 内参，中止它等于让一个与结果无关的条件决定能不能干活。
-            action = fov_gate_action(fov)
-            if action == "block":
-                print(f"\n[错误] FOV 对齐不可信（{fov_confidence_problem(fov)}）："
-                      "拒绝用这次估计裁剪标定图。")
-                print("       下一步：换有纹理的场景（标定板 / 纸箱 / 桌面杂物）重拍，"
-                      "别对着白墙或纯色桌面；")
-                print("       或者用 --skip-fov 让两路各用原始画面"
-                      "（大角度装置请加 --stereo-mode angled）。")
-                log.error("FOV 对齐不可信（%s），退出：%s",
-                          fov_confidence_problem(fov), fov.to_dict())
-                src.release()
-                return 1
-            if action == "warn":
-                print(f"[警告] FOV 估计置信度低（{fov_confidence_problem(fov)}），"
-                      "本次不裁剪，按原始画面标定；内参不受影响。")
-                log.warning("FOV 估计置信度低但不裁剪（%s）：%s",
-                            fov_confidence_problem(fov), fov.to_dict())
+        if fov is None:
+            print(f"\n[警告] 两路视场对齐估计失败（{fov_fail_reason}）："
+                  "本次不做裁剪，按两路原始画面继续标定。")
+            print("       注意：两路像素尺度可能不一致，视差/深度会有系统偏差；"
+                  "标定 meta 里 fov=null。")
+            print("       下一步：若这是大角度/90° 装置，下次请直接选『90° 装置』"
+                  "或加 --stereo-mode angled --skip-fov；若只是画面纹理太少，"
+                  "可换有纹理的场景重标。")
+            log.warning("FOV 估计失败，降级为不裁剪（fov=None）：%s", fov_fail_reason)
+            print()
         else:
-            print("      注：angled 不按下限判据 —— 大角度下的失败模式是"
-                  "「在近处某个平面上匹配得很好」，")
-            print("          inliers 变多不是好消息；请自行核对 scale 是否偏离物理预期。")
+            # 这五个数不管哪种模式都并列打印出来：判据交给人，但数字必须是明面上的。
+            print(f"[FOV] scale={fov.scale:.4f}  inliers={fov.inliers}  "
+                  f"quality={fov.quality:.3f}  crop_rect={list(fov.crop_rect)}  "
+                  f"target_size={list(fov.target_size)}")
+            if mode == "parallel":
+                print("      平行基线参照（本机现役装置，实测夹角 1.4°）：scale=0.6649  "
+                      "inliers=296  quality=0.513  crop_rect=[404,195,1718,973]  "
+                      "target_size=[1718,972]")
+                # 只有"这次估计真的会被用来裁剪"才拦；不裁剪时低置信度不会污染
+                # 内参，中止它等于让一个与结果无关的条件决定能不能干活。
+                action = fov_gate_action(fov)
+                if action == "block":
+                    print(f"\n[错误] FOV 对齐不可信（{fov_confidence_problem(fov)}）："
+                          "拒绝用这次估计裁剪标定图。")
+                    print("       下一步：换有纹理的场景（标定板 / 纸箱 / 桌面杂物）重拍，"
+                          "别对着白墙或纯色桌面；")
+                    print("       或者用 --skip-fov 让两路各用原始画面"
+                          "（大角度装置请加 --stereo-mode angled）。")
+                    log.error("FOV 对齐不可信（%s），退出：%s",
+                              fov_confidence_problem(fov), fov.to_dict())
+                    src.release()
+                    return 1
+                if action == "warn":
+                    print(f"[警告] FOV 估计置信度低（{fov_confidence_problem(fov)}），"
+                          "本次不裁剪，按原始画面标定；内参不受影响。")
+                    log.warning("FOV 估计置信度低但不裁剪（%s）：%s",
+                                fov_confidence_problem(fov), fov.to_dict())
+            else:
+                print("      注：angled 不按下限判据 —— 大角度下的失败模式是"
+                      "「在近处某个平面上匹配得很好」，")
+                print("          inliers 变多不是好消息；请自行核对 scale 是否偏离物理预期。")
 
-        mag = max(fov.scale, 1.0 / fov.scale)
-        print("[FOV] 自动视场对齐（启动时只估计一次，之后逐帧复用）")
-        print(f"      参考（较窄；必要时降采样，不裁剪）：{fov.reference_side}    "
-              f"裁剪：{fov.crop_side}")
-        print(f"      裁剪区 (x, y, w, h) = {fov.crop_rect}    "
-              f"归一化尺寸 {fov.target_size[0]}x{fov.target_size[1]}")
-        print(f"      较窄一侧相对较广一侧放大 ~{mag:.2f}x    "
-              f"尺度 left->right={fov.scale:.4f}    "
-              f"质量 {fov.quality:.2f}（{fov.method}，内点 {fov.inliers}）")
-        if fov.active:
-            wide_frame = first_pair[0] if fov.crop_side == "left" else first_pair[1]
-            wide_h, wide_w = wide_frame.shape[:2]
-            x, y, w, h = fov.crop_rect
-            keep = (w * h) / float(max(1, wide_w * wide_h))
-            print(f"      ⚠ 较广的一侧（{fov.crop_side}）会损失视场：只保留 {keep:.0%} "
-                  f"原画面（{w}x{h} / {wide_w}x{wide_h}），其余会被裁掉；")
-            print(f"        录制的两路视频会统一为 {fov.target_size[0]}x"
-                  f"{fov.target_size[1]} 并沿用这份对齐参数。")
-        else:
-            print("      两路视场基本一致：不裁剪、不缩放（crop_side=none）。")
-        log.info("FOV 对齐：参考 %s / 裁剪 %s / 裁剪区 %s / 放大 %.3fx / "
-                 "质量 %.3f（%s，内点 %d）",
-                 fov.reference_side, fov.crop_side, fov.crop_rect, mag,
-                 fov.quality, fov.method, fov.inliers)
-        print()
+            mag = max(fov.scale, 1.0 / fov.scale)
+            print("[FOV] 自动视场对齐（启动时只估计一次，之后逐帧复用）")
+            print(f"      参考（较窄；必要时降采样，不裁剪）：{fov.reference_side}    "
+                  f"裁剪：{fov.crop_side}")
+            print(f"      裁剪区 (x, y, w, h) = {fov.crop_rect}    "
+                  f"归一化尺寸 {fov.target_size[0]}x{fov.target_size[1]}")
+            print(f"      较窄一侧相对较广一侧放大 ~{mag:.2f}x    "
+                  f"尺度 left->right={fov.scale:.4f}    "
+                  f"质量 {fov.quality:.2f}（{fov.method}，内点 {fov.inliers}）")
+            if fov.active:
+                wide_frame = first_pair[0] if fov.crop_side == "left" else first_pair[1]
+                wide_h, wide_w = wide_frame.shape[:2]
+                x, y, w, h = fov.crop_rect
+                keep = (w * h) / float(max(1, wide_w * wide_h))
+                print(f"      ⚠ 较广的一侧（{fov.crop_side}）会损失视场：只保留 {keep:.0%} "
+                      f"原画面（{w}x{h} / {wide_w}x{wide_h}），其余会被裁掉；")
+                print(f"        录制的两路视频会统一为 {fov.target_size[0]}x"
+                      f"{fov.target_size[1]} 并沿用这份对齐参数。")
+            else:
+                print("      两路视场基本一致：不裁剪、不缩放（crop_side=none）。")
+            log.info("FOV 对齐：参考 %s / 裁剪 %s / 裁剪区 %s / 放大 %.3fx / "
+                     "质量 %.3f（%s，内点 %d）",
+                     fov.reference_side, fov.crop_side, fov.crop_rect, mag,
+                     fov.quality, fov.method, fov.inliers)
+            print()
 
     from calib import CaptureConfig
     cap_kw: dict = dict(
