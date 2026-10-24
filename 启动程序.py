@@ -442,16 +442,135 @@ class Launcher(tk.Tk):
         ttk.Combobox(mode_box, textvariable=self.stereo_mode_var, width=9,
                      state="readonly",
                      values=("auto", "parallel", "angled")).pack(side="left")
-        tk.Label(mode_box, text="auto=按会话/标定",
+        tk.Label(mode_box, text="auto=按标定/会话判定",
                  bg=ACCENT, fg="#bfdbfe",
                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
+        tk.Button(mode_box, text="模式说明", command=self._show_mode_help,
+                  bg="#1d4ed8", fg="white", relief="flat", padx=6,
+                  font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
         tk.Button(mode_box, text="基线夹角估算", command=self._show_geometry,
                   bg="#1d4ed8", fg="white", relief="flat", padx=6,
                   font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
+        tk.Button(actions, text="装置档案", command=self._open_profiles,
+                  bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
+                  font=("Microsoft YaHei UI", 10, "bold")).pack(
+            anchor="e", pady=(6, 0))
         tk.Button(actions, text="数据管理", command=self._open_data_manager,
                   bg="white", fg=ACCENT, relief="flat", padx=14, pady=4,
                   font=("Microsoft YaHei UI", 10, "bold")).pack(
             anchor="e", pady=(6, 0))
+
+        # ---- 常驻装置状态条（P0-1）----
+        # 为什么单开一行而不是塞进标题右侧：这一行会随档案变化（名称 / 模式 /
+        # 几何提示），塞进右上角那排按钮里会挤动布局，而且一长就被截断。
+        # 它是**常驻**的：模式下拉选了什么、当前哪套档案生效，不必再点开弹窗确认。
+        self._profile_bar = tk.Frame(self, bg="#1e40af")
+        self._profile_bar.pack(fill="x")
+        self._profile_line = tk.Label(
+            self._profile_bar, text="当前装置：读取中…", bg="#1e40af", fg="#dbeafe",
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left",
+            wraplength=CARD_HINT_WRAP)
+        self._profile_line.pack(side="left", padx=20, pady=4)
+        self._wrapped.append((self._profile_line, "card"))
+        self._refresh_profile_line()
+
+    def _show_mode_help(self) -> None:
+        """三种模式**行为差异**（P0-2）：下拉框只放英文值，含义写在这里。
+
+        为什么不让下拉项直接写中文：`--stereo-mode` 收的是
+        ``auto/parallel/angled``，把展示文案写进 `StringVar` 会把
+        "平行（FOV 裁剪）" 这样的字符串原样传给命令行。
+        """
+        messagebox.showinfo(
+            "双目模式：三者行为不同",
+            "parallel（平行）\n"
+            "  两光轴近乎平行；标定会做 FOV 裁剪对齐，取两路共同可见区。\n"
+            "  适合同一根横梁上的并排相机（B 远小于 D）。\n\n"
+            "angled（大角度 / 90°）\n"
+            "  两光轴夹角大（近似直角）；**各自用原始画面**，不做 FOV 裁剪；\n"
+            "  输出坐标系为 left_camera。适合 B ≈ 2·D 的 90° 装置。\n\n"
+            "auto（自动判定）\n"
+            "  按标定记录 / 会话记录推断上面哪一种；**仅作输入**，\n"
+            "  解析结果不写回档案、不落盘。没有依据时按平行处理。\n\n"
+            "提示：当前生效的档案与几何提示常驻在窗口顶部那条深蓝横条上。",
+            parent=self)
+
+    def _refresh_profile_line(self) -> None:
+        """按 `config/profiles.json` 的活动档案刷新顶部状态条（P0-1）。
+
+        读不到档案**不是**错误：全新机器上就是没有这份文件。
+        但显示必须说清"下一步点哪里"，不能只写"未设置"。
+        """
+        from stereo import profiles as rig_profiles
+        from stereo.stereo_mode import mode_label
+        try:
+            profile = rig_profiles.get_active()
+        except Exception as exc:                            # noqa: BLE001
+            text = (f"当前装置：读取档案失败（{exc}）"
+                    " · 下一步：点右上『装置档案』检查 config/profiles.json")
+            self._profile_line.configure(text=text)
+            return
+        if profile is None:
+            self._profile_line.configure(
+                text="当前装置：未设置 · 点右上『装置档案』新建，可保存平行 / 90° 两套参数"
+                     " · 未设置时按上方的『双目模式』执行")
+            return
+        hint = rig_profiles.geometry_hint(profile)
+        self._profile_line.configure(
+            text=f"当前装置：{profile.name} · {mode_label(profile.stereo_mode)} · {hint}")
+
+    def _open_profiles(self) -> None:
+        """『装置档案』：新建 / 覆盖一套装置参数并设为当前（P0-1 的入口）。
+
+        只做一件最小可用的事：名称 + 模式 + 预期基线 + 工作距离。
+        故意**不做**"批量管理"—— 多档案的增删已经在 `stereo/profiles.py`
+        里，界面先保证"能建、能切换、能看见"，而不是造一套平行实现。
+        """
+        from stereo import profiles as rig_profiles
+        dlg = tk.Toplevel(self)
+        dlg.title("装置档案")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        body = ttk.Frame(dlg, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="当前活动档案："
+                  + (rig_profiles.active_name() or "未设置")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        rows = (("名称", "rig1"), ("模式（parallel / angled）", "angled"),
+                ("预期基线 B（mm，可空）", "600"), ("工作距离 D（米，可空）", "0.30"))
+        vars_: list[tk.StringVar] = []
+        for i, (label, default) in enumerate(rows, start=1):
+            ttk.Label(body, text=label).grid(row=i, column=0, sticky="e", pady=3)
+            var = tk.StringVar(value=default)
+            ttk.Entry(body, textvariable=var, width=24).grid(
+                row=i, column=1, sticky="w", padx=(6, 0), pady=3)
+            vars_.append(var)
+        ttk.Label(body, text="保存会覆盖同名档案；不合格的值会被拒绝并说明原因。",
+                  style="Hint.TLabel", wraplength=360).grid(
+            row=len(rows) + 1, column=0, columnspan=2, sticky="w", pady=(8, 6))
+
+        def save() -> None:
+            name, mode, baseline, distance = (v.get().strip() for v in vars_)
+            try:
+                profile = rig_profiles.RigProfile(
+                    name=name, stereo_mode=mode,
+                    expected_baseline_mm=float(baseline) if baseline else None,
+                    working_distance_m=float(distance) if distance else None)
+                rig_profiles.upsert(profile, replace_existing=True)
+                rig_profiles.set_active(profile.name)
+            except Exception as exc:                        # noqa: BLE001
+                messagebox.showwarning("装置档案", f"没保存：{exc}", parent=dlg)
+                return
+            self._refresh_profile_line()
+            self._append(f"[装置] 已保存并设为当前：{profile.name}"
+                         f"（{mode}）；{rig_profiles.geometry_hint(profile)}")
+            dlg.destroy()
+
+        ttk.Button(body, text="保存并设为当前", command=save).grid(
+            row=len(rows) + 2, column=0, sticky="w")
+        ttk.Button(body, text="取消", command=dlg.destroy).grid(
+            row=len(rows) + 2, column=1, sticky="e")
+
 
     def _show_geometry(self) -> None:
         """用镜头中心距和工作距离估算两光轴夹角；不替用户假定 90°。"""
@@ -807,6 +926,25 @@ class Launcher(tk.Tk):
             row=8, column=0, columnspan=3, sticky="w", pady=(2, 2))
         ttk.Button(box, text="清空「无关」标记", command=self._run_cameras_unignore_all).grid(
             row=8, column=3, columnspan=2, sticky="w", pady=(2, 2))
+        # ---- 90° 装置专用标定入口（P0-3）----
+        # 为什么要有它：90° 装置与平行装置**走的是同一条标定命令**，差别只在
+        # `--stereo-mode angled --skip-fov`。下拉框里选 angled 也能做到，但
+        # "选错下拉"没有反馈、且 FOV 一步会白跑；这里把**前提条件**先讲清。
+        ttk.Button(box, text="标定（90° 装置，跳过 FOV）",
+                   command=self._run_calibration_90deg).grid(
+            row=9, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        # 画质诊断（P1-3）：以前这个工具**只有命令行能用**，界面上完全没有入口，
+        # 而"有一路画面明显更糊/更卡"恰恰是最常见的现场问题。
+        ttk.Button(box, text="画质诊断（两路同开，区分带宽 / 光学）",
+                   command=self._run_camera_quality).grid(
+            row=9, column=3, columnspan=4, sticky="w", pady=(6, 2))
+        self.calib90_note = ttk.Label(
+            box, style="Hint.TLabel", wraplength=CARD_HINT_WRAP,
+            text="90° 装置：两路各用**原始画面**，不做 FOV 裁剪对齐；坐标系为 "
+                 "left_camera。前提是两路**有共同可见区**（棋盘要同时出现在左右画面里），"
+                 "且基线 B 应约为工作距离的 2 倍（B≈2·D）。不满足就别用这个大角度入口。")
+        self.calib90_note.grid(row=10, column=0, columnspan=9, sticky="w", pady=(0, 2))
+        self._wrapped.append((self.calib90_note, "card"))
 
     # ---------- 第 2 步：参数 ----------
     def _build_step2(self) -> None:
@@ -898,10 +1036,13 @@ class Launcher(tk.Tk):
                    command=self._start_video).grid(row=1, column=1, padx=(0, 12), pady=4)
         ttk.Button(box, text="录制双目（无损）", command=self._start_record).grid(
             row=2, column=0, padx=(0, 12), pady=4)
-        ttk.Button(box, text="离线双目（会话）", command=self._start_offline_stereo).grid(
-            row=2, column=1, padx=(0, 12), pady=4)
-        ttk.Button(box, text="点选球（双目 seed）", command=self._pick_stereo_seed).grid(
-            row=2, column=2, padx=(0, 12), pady=4)
+        # 离线双目 / 点选球**只在「双目工作台」有一处入口**（P1-1）。
+        # 原来这两个按钮在工作台（②③）和第 3 步各有一份，两处行为一致但
+        # 一个带会话选择器、一个不带 —— 用户不知道点哪个才是"正确路径"。
+        # 现在这里只做**跳转**，不放第二份实现。
+        ttk.Button(box, text="离线双目 / 点选球 → 双目工作台（①–⑤）",
+                   command=lambda: self._scroll_to_card("双目工作台")).grid(
+            row=2, column=1, columnspan=2, padx=(0, 12), pady=4, sticky="w")
         ttk.Button(box, text="快测（十几秒）", command=self._run_tests_fast).grid(
             row=1, column=2, padx=(0, 6), pady=4)
         ttk.Button(box, text="全套回归（7 分钟）", command=self._run_tests_full).grid(
@@ -916,7 +1057,9 @@ class Launcher(tk.Tk):
         """把录制→校验→seed→三维→查看器串成一条可见的路径。"""
         box = self._card(
             "双目工作台",
-            "选一条会话，按 ①→⑥ 做。校验/离线/查看器都走「任务」管理器，可单独中断。")
+            "选一条会话，按 ①→⑤ 做（校验 → 点选 → 离线双目 → 3D+视频 → 导出）。"
+            "校验/离线/查看器都走「任务」管理器，可单独中断。"
+            "删除/清理在右上『数据管理』里做，本页不再有第二个入口。")
         ttk.Label(box, text="最近会话").grid(row=1, column=0, sticky="e", pady=4)
         self.wb_var = tk.StringVar()
         self.wb_combo = ttk.Combobox(box, textvariable=self.wb_var, width=32,
@@ -927,7 +1070,8 @@ class Launcher(tk.Tk):
             row=1, column=4, sticky="w", pady=4)
         ttk.Button(box, text="浏览会话…", command=self._wb_browse, width=11).grid(
             row=1, column=5, sticky="w", padx=(4, 0), pady=4)
-        ttk.Button(box, text="清理…", command=self._wb_clean, width=7).grid(
+        ttk.Button(box, text="清理（在数据管理里）", command=self._wb_clean,
+                   width=13).grid(
             row=1, column=6, sticky="w", padx=(4, 0), pady=4)
 
         self.wb_info = ttk.Label(box, text="还没有会话", style="Hint.TLabel",
@@ -991,14 +1135,17 @@ class Launcher(tk.Tk):
         self._append(f"[工作台] 已加入任意会话：{p}")
 
     def _wb_clean(self) -> None:
-        s = self._wb_selected()
-        if s is None:
-            messagebox.showinfo("清理", "先在工作台选一条会话。", parent=self)
-            return
-        from apps.cleanup_dialog import CleanupDialog
-        standard = (ROOT / "data" / "sessions").resolve()
-        root = standard if s.path.resolve().is_relative_to(standard) else s.path.parent
-        CleanupDialog(self, root, [s.path], on_done=self._wb_refresh)
+        """删除/清理**只有一个入口**：『数据管理』（P1-1）。
+
+        原来这里的『清理…』直接开 `CleanupDialog`，而顶部『数据管理』是另一个
+        窗口、也带清理 —— 同一件事两个窗口、两套勾选方式，用户不知道该信哪个。
+        现在统一到数据管理：它的『清理…』用的是同一个 `CleanupDialog`，
+        并且多了回收站 / 恢复。
+        """
+        if self._wb_selected() is not None:
+            self._append("[工作台] 删除/清理已统一到『数据管理』："
+                         "在里面勾选会话后点『清理…』（可恢复，见『回收站…』）。")
+        self._open_data_manager()
 
     def _wb_select_path(self, path: Path) -> None:
         target = Path(path).resolve()
@@ -1013,7 +1160,14 @@ class Launcher(tk.Tk):
         try:
             scanned = scan_sessions(ROOT / "data" / "sessions", limit=200)
         except Exception as exc:                            # noqa: BLE001
-            self.wb_info.configure(text=f"扫描会话失败：{exc}")
+            # 只说"失败：<异常>"等于让用户自己猜。现象 + 可能原因 + 下一步。
+            self.wb_info.configure(
+                text=f"扫描会话失败：{exc}\n"
+                     "可能原因：data/sessions 目录不存在、没有读取权限，"
+                     "或某个会话的 session.json 损坏。\n"
+                     "下一步：点「刷新」重试；仍失败就用右上『数据管理』打开该目录，"
+                     "看是哪条会话读不出来（日志里有完整异常）。")
+            self._append(f"[工作台] 扫描会话失败：{exc}")
             return
         scanned_paths = {s.path.resolve() for s in scanned}
         custom_paths = [p for p in self._wb_custom if p.exists()]
@@ -1064,7 +1218,12 @@ class Launcher(tk.Tk):
     def _after_record_task(self, task: Task) -> None:
         """录制结束 -> 只对新目录自动校验（P2）。"""
         if task.exit_code != 0:
-            self._append(f"[工作台] 录制失败（返回码 {task.exit_code}），不自动校验旧会话。")
+            self._append(
+                f"[工作台] 录制失败（返回码 {task.exit_code}）。"
+                "可能原因：相机被占用 / 标定分辨率与请求不一致 / 左或右相机没出图。"
+                "下一步：点『第 1 步』的『刷新并检测相机』确认识别，"
+                "或在『装置档案』里改用 90° 模式；详细报错见上方日志。"
+                "（不自动校验旧会话）")
             self._wb_refresh()
             return
         from apps._workbench import scan_sessions
@@ -1467,24 +1626,6 @@ class Launcher(tk.Tk):
             self._run(self._offline_stereo_args(str(session_dir)), "离线双目三维")
         return True
 
-    def _start_offline_stereo(self) -> None:
-        path = filedialog.askdirectory(
-            title="选择双目会话目录（含 session.json）",
-            initialdir=str(ROOT / "data" / "sessions"))
-        if not path:
-            return
-        if not (Path(path) / "session.json").exists():
-            messagebox.showwarning("不是会话目录", "这个目录里没有 session.json。")
-            return
-        if self.method.get() == "specular":
-            seed = Path(path) / "derived" / "seeds.json"
-            if not seed.exists():
-                messagebox.showinfo(
-                    "还需要 seed", "specular 需要先在左右画面点球心；现在打开点选窗口。")
-                if not self._pick_stereo_seed(path, offer_run=False):
-                    return
-        self._run(self._offline_stereo_args(path), "离线双目三维")
-
     def _confirm_stereo_cameras(self, left: str, right: str) -> bool:
         """标定/复检前的相机检查。**弹窗报错就返回 False（拦住这次操作）**。
 
@@ -1600,12 +1741,15 @@ class Launcher(tk.Tk):
             return None, False
         return val, True
 
-    def _calibrate_args(self) -> list[str] | None:
+    def _calibrate_args(self, *, angled_90: bool = False) -> list[str] | None:
         """把参数面板拼成 `calibrate_stereo.py` 的命令行。非法则返回 None。
 
         ⚠️ **这里曾经是硬编码的**（`--cols 8 --rows 5 --square 25`，且完全没有
         `--target`），于是从界面走**永远停在脚本默认的试标定档**，
         而用户以为在做正式标定。现在参数由面板给，面板的默认值就是正式档。
+
+        ``angled_90=True`` 是「标定（90° 装置）」按钮用的：它**复用同一份拼装**
+        （不复制第二套参数），只把模式强制成 ``angled`` 并补 ``--skip-fov``。
         """
         target = self._read_int(self.calib_target, "目标对数", 4, 200)
         if target is None:
@@ -1643,12 +1787,17 @@ class Launcher(tk.Tk):
 
         width, height = self.calib_res.get().split("x")
         fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
+        # 90° 装置：模式由按钮强制为 angled，FOV 对齐那一步跳过 —— 那一步
+        # 假设两路有足够重叠区可以裁剪，而 90° 装置的画面对应关系不是这样。
+        mode = "angled" if angled_90 else self.stereo_mode_var.get()
         args = ["--left", _cam_arg(self.calib_left.get()),
                 "--right", _cam_arg(self.calib_right.get()),
-                "--stereo-mode", self.stereo_mode_var.get(),
+                "--stereo-mode", mode,
                 "--cols", str(cols), "--rows", str(rows), "--square", str(square),
                 "--target", str(target), "--min-pairs", str(minp),
                 "--width", width, "--height", height, "--fps", fps]
+        if angled_90:
+            args += ["--skip-fov"]
         # ⚠️ 2026-10-14：这里原来**写死** `--backend msmf`（理由是"MSMF 与设备枚举
         # 顺序一致"）。但那样界面就完全没有选择权，而本机实测 **MSMF 打开两路
         # 要 34.6 s、DSHOW 只要 11.8 s**，且两个后端给的分辨率完全一致
@@ -1683,8 +1832,14 @@ class Launcher(tk.Tk):
         backend = self.calib_backend.get()
         return ["--backend", backend] if backend and backend != "auto" else []
 
-    def _run_calibration(self) -> None:
-        mode = self.calib_mode.get()
+    def _run_calibration(self, *, force_angled: bool = False) -> None:
+        """跑标定 / 复检。``force_angled=True`` = 「标定（90° 装置）」按钮。
+
+        两者**走同一条函数**：90° 只是把模式锁成 angled、跳过 FOV，其余
+        （相机检查、参数校验、任务管理）完全一样 —— 复制一份命令拼装
+        正是本项目反复出问题的地方。
+        """
+        mode = "calibrate" if force_angled else self.calib_mode.get()
         if mode == "skip":
             messagebox.showinfo("已跳过标定",
                                 "使用现有 / 默认参数直接检测。若三维距离不准，请先执行标定。")
@@ -1696,13 +1851,15 @@ class Launcher(tk.Tk):
         width, height = self.calib_res.get().split("x")
         fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
         if mode == "calibrate":
-            extra = self._calibrate_args()
+            extra = self._calibrate_args(angled_90=force_angled)
             if extra is None:
                 return                      # 校验失败，弹窗已经说清哪里不对
             cmd = [PY, str(ROOT / "apps" / "calibrate_stereo.py")] + extra
             target = self.calib_target.get().strip()
             base = self.calib_baseline.get().strip()
             note = f"收满 {target} 对后自动标定"
+            if force_angled:
+                note = "90° 装置 / angled / 跳过 FOV；" + note
             if not base:
                 note += "；⚠ 未填预期基线，基线核对将是关着的"
             self._run(cmd, f"双目标定（左{left} / 右{right}，{note}）")
@@ -1717,6 +1874,22 @@ class Launcher(tk.Tk):
                    "--width", width, "--height", height, "--fps", fps]
             cmd += self._backend_args()      # 同样是面板决定，不再写死 msmf
             self._run(cmd, "标定复检（判断装置是否被碰动）")
+
+    def _run_calibration_90deg(self) -> None:
+        """「标定（90° 装置）」：先把前提讲清，再走**同一条**标定链路（P0-3）。"""
+        if not messagebox.askokcancel(
+                "标定 90° 装置（大角度）",
+                "接下来会按【90° 装置】标定：\n"
+                "  · 模式强制为 angled（大角度 / 近似直角）\n"
+                "  · 跳过 FOV 对齐 —— 两路各用**原始画面**，不裁剪、不缩放\n"
+                "  · 输出三维坐标系为 left_camera\n\n"
+                "前提（不满足就别用这个入口）：\n"
+                "  1. 两路**有共同可见区** —— 棋盘要能同时出现在左右画面里；\n"
+                "  2. 基线 B 约为工作距离的 2 倍（B≈2·D，例如 D=0.30 m 时 B≈600 mm）。\n\n"
+                "不确定装置属于哪一类？先点『基线夹角估算』，或看顶部那条装置状态。",
+                parent=self):
+            return
+        self._run_calibration(force_angled=True)
 
     def _run_probe(self) -> None:
         """真的开一次相机，回答「现在有几台能出图」。
@@ -1754,7 +1927,11 @@ class Launcher(tk.Tk):
             devices = cr.list_devices()
             reg = cr.load_registry()
         except Exception as exc:                             # noqa: BLE001
-            self._append(f"[错误] 读取设备列表失败：{exc}")
+            self._append(
+                f"[错误] 读取设备列表失败：{exc}。"
+                "可能原因：config/cameras.json 内容损坏，或 WMI/PnP 枚举被系统策略挡住。"
+                "下一步：点『相机设备管理』重新识别一次；仍失败就手动选编号 "
+                "0/1/2 应急（此时角色 left/right 无法按身份绑定）。")
             return
 
         def label(d) -> str:
@@ -1795,6 +1972,30 @@ class Launcher(tk.Tk):
         else:
             self._append("没有枚举到设备（非 Windows 或系统枚举不可用），"
                          "只能按编号使用。")
+
+    def _run_camera_quality(self) -> None:
+        """画质诊断（P1-3）：调 `apps/tools/camera_quality.py --together`。
+
+        `--together` 是关键：单开一台测的是"这台相机的上限"，两路同开才暴露
+        共用一条 USB 总线时的争抢 —— 这决定了结论是"换线换口"还是"擦镜头"。
+        走 `_run`（与其它长任务同一套任务管理：可中断、有日志）。
+        """
+        left_raw, right_raw = self.calib_left.get(), self.calib_right.get()
+        if left_raw == "auto" or right_raw == "auto":
+            src: list[str] = ["--auto-cameras"]
+        else:
+            if not self._confirm_stereo_cameras(left_raw, right_raw):
+                return
+            src = ["--left", _cam_arg(left_raw), "--right", _cam_arg(right_raw)]
+        width, height = self.calib_res.get().split("x")
+        fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
+        cmd = [PY, str(ROOT / "apps" / "tools" / "camera_quality.py")] + src
+        cmd += ["--width", width, "--height", height, "--fps", fps,
+                "--together", "--seconds", "3"]
+        cmd += self._backend_args()
+        self._append("画质诊断：会先后各开一次 + 两路同开，约 10 秒；"
+                     "结论看「帧率/残帧」是否异常 —— 都不异常就不是带宽问题。")
+        self._run(cmd, "相机画质诊断（单开 vs 两路同开）")
 
     def _run_cameras_identify(self) -> None:
         self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"), "identify"],

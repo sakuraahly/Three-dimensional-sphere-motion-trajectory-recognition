@@ -469,6 +469,43 @@ def main() -> int:
     print(f"  [{'通过' if backend_ok else '不达标'}] 录制也读取相机后端（不再只影响标定）")
     results.append(("录制也读取相机后端（不再只影响标定）", backend_ok))
 
+    # ---- 8b. 90° 装置标定入口 / 模式标签 / 画质诊断（2026-10-24 加）----
+    #
+    # 守卫三件界面契约：
+    # 1. `mode_label("auto")` 不能再回"未知" —— 下拉的默认项就是 auto，
+    #    显示"未知"会让用户以为选项非法；
+    # 2. 「标定（90° 装置）」必须**复用** `_calibrate_args` 并带上
+    #    `--stereo-mode angled --skip-fov`（不是另写一份拼装）；
+    # 3. 画质诊断有 GUI 入口，且走 `--together`（单开测不出总线争抢）。
+    print("----- 8b. 90° 标定入口 / 模式标签 / 画质诊断 -----")
+    from stereo.stereo_mode import mode_label
+    app.stereo_mode_var.set("auto")
+    args90 = app._calibrate_args(angled_90=True) or []
+    s90 = " ".join(args90)
+    args_plain = " ".join(app._calibrate_args() or [])
+    checks_90 = [
+        ("mode_label(auto) 不再是「未知」", mode_label("auto") == "自动判定（按标定）"),
+        ("mode_label(无从识别) 仍是「未知」", mode_label("???") == "未知"),
+        ("90° 入口带 --stereo-mode angled", "--stereo-mode angled" in s90),
+        ("90° 入口带 --skip-fov（不白跑 FOV 对齐）", "--skip-fov" in s90),
+        ("普通标定不带 --skip-fov（两个入口行为不同）", "--skip-fov" not in args_plain),
+        ("90° 入口与普通标定共用同一套板参数",
+         "--cols 8 --rows 5 --square 25 --target 40 --min-pairs 20" in s90),
+        ("GUI 有画质诊断入口且走 --together",
+         hasattr(app, "_run_camera_quality")
+         and "camera_quality.py" in launcher_src and "--together" in launcher_src),
+        ("工作台编号与按钮一致（①→⑤，不再写 ⑥）",
+         "①→⑤" in launcher_src and "①→⑥" not in launcher_src),
+        ("删除/清理只剩数据管理一个入口（工作台改为打开同一窗口）",
+         "清理（在数据管理里）" in launcher_src
+         and "def _wb_clean" in launcher_src
+         and "from apps.cleanup_dialog import" not in launcher_src),
+    ]
+    for label, good in checks_90:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
+
+
     off = app._offline_stereo_args(str(ROOT / "data" / "sessions" / "demo"))
     off_s = " ".join(off)
     app.stereo_mode_var.set("angled")

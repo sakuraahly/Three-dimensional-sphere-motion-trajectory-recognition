@@ -59,6 +59,9 @@ _MODE_LABELS = {
     "parallel": "平行",
     "angled": "大角度（近似直角）",
 }
+# ``auto`` 不是模式，但**界面上会出现**（下拉框的默认项）。它必须有自己的
+# 标签：返回"未知"会让用户以为选错了，而"自动判定"正是它的真实含义。
+_AUTO_LABEL = "自动判定（按标定）"
 
 _MISSING = object()
 
@@ -192,8 +195,12 @@ def mode_label(mode: Any) -> str:
     """返回面向界面的中文标签；无法识别返回 ``"未知"``。
 
     canonical 名称和别名都会先归一化，因此 ``mode_label("90")`` 与
-    ``mode_label("angled")`` 相同。
+    ``mode_label("angled")`` 相同。``"auto"`` 单独给标签
+    （``"自动判定（按标定）"``）—— 它是界面下拉里真实存在的一项，
+    回 ``"未知"`` 会让人以为选项非法。
     """
+    if _is_auto(mode):
+        return _AUTO_LABEL
     canonical = _canonical_mode(mode)
     if canonical is None:
         return "未知"
