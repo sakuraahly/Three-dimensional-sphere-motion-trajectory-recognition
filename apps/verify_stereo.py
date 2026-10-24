@@ -130,9 +130,15 @@ def main() -> int:
         print("[FOV] 旧标定没有 fov 记录：按原生画面复检（行为与以前一致）")
 
     print(rig.describe())
+    # 两种模式的极线误差**不是同一把尺**（见 StereoRig.epipolar_metric_name）：
+    # parallel 是校正后 y 差，angled 是 F 矩阵点线距。报告里必须写明口径，
+    # 并且阈值不能混用 —— 否则 90° 装置会拿到一个好看但无意义的数字。
+    metric = rig.epipolar_metric_name(rig.stereo_mode)
+    print(f"复检口径：{metric}")
     ref = float(rig.quality.get("epipolar_rms", float("nan")))
     board_desc = rig.meta.get("board", "")
-    print(f"标定时记录的极线误差：{ref:.4f} px")
+    print(f"标定时记录的极线误差：{ref:.4f} px"
+          f"（口径：parallel 校正后 y 差 RMS，标定产物固定用该口径）")
     print()
 
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
@@ -177,7 +183,7 @@ def main() -> int:
                 continue
             if ol.sharpness < 40 or orr.sharpness < 40:
                 continue
-            errs.append(rig.epipolar_error(ol.corners, orr.corners))
+            errs.append(rig.epipolar_error_by_mode(rig.stereo_mode, ol.corners, orr.corners))
     finally:
         src.release()
 
@@ -187,13 +193,26 @@ def main() -> int:
 
     now = float(np.sqrt(np.mean(np.square(errs))))
     worst = float(np.max(errs))
-    print(f"本次复检：{len(errs)} 帧，极线误差 RMS {now:.4f} px（最大 {worst:.4f} px）")
+    print(f"本次复检：{len(errs)} 帧，{metric} RMS {now:.4f} px（最大 {worst:.4f} px）")
+
+    if rig.stereo_mode == "angled":
+        # 没有任何依据说明 angled 点线距 "多少 px 算装置被碰动"：
+        # 它随标定板到相机的距离、视场、畸变残差一起变，和 parallel 的 0.6 px
+        # 不是一回事，也**不能**与标定时记录的 y 差 RMS 相减比较。
+        # 所以只报数、不判通过/不通过（宁可不判，也不瞎判）。
+        print("标定当时的数字（parallel 口径）与本口径不可比，不计算变化量。")
+        print("[不判定] angled 模式：本工具只报告极线点线距，不做通过/不通过判定。")
+        print("         如需确认装置是否移动，请重新采集标定板并重标定后对比 rms。")
+        return 0
+
     print(f"标定当时：{ref:.4f} px")
     delta = now - ref
     print(f"变化量：{delta:+.4f} px")
     print()
 
     ok = True
+    print("[说明] 下面的 0.6 px 与 --tolerance 都是按 parallel 的 y 差口径定的阈值，"
+          "只在本口径下有效。")
     if now > 0.6:
         print(f"[不通过] 极线误差 {now:.3f} px 已经偏大，左右相机的相对位姿很可能变了。")
         ok = False

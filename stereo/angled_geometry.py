@@ -19,6 +19,15 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+# 共享公式下沉在 `sphere_tracker.geometry`：`calib/` 低于 `stereo/`（AGENTS.md §5），
+# `calib/params.py` 的 angled 复检也要用同一套点线距，不能再各写一份。
+# 这里 import 后 re-export，既有调用点（`from .angled_geometry import ...`）不变。
+from sphere_tracker.geometry import (  # noqa: F401  (re-export)
+    epipolar_line,
+    point_line_distance,
+    skew_symmetric,
+)
+
 _EPS = 1e-12
 # Relative threshold on sin^2(theta) between the two rays.  This only
 # rejects numerically parallel rays; useful-angle policy belongs upstream.
@@ -88,14 +97,6 @@ def _as_pixel(pixel: np.ndarray, name: str) -> np.ndarray:
 
 def _finite(*arrays: np.ndarray) -> bool:
     return all(bool(np.all(np.isfinite(arr))) for arr in arrays)
-
-
-def _skew(v: np.ndarray) -> np.ndarray:
-    x, y, z = (float(v[0]), float(v[1]), float(v[2]))
-    return np.array(
-        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
-        dtype=np.float64,
-    )
 
 
 def _project_pixel(
@@ -172,50 +173,11 @@ def fundamental_from_pose(
     # Explicit no-op reference: omitting D is intentional, not forgotten.
     _ = (D1, D2)
 
+    # 公式本体只有一份，在 sphere_tracker.geometry（calib 也要用）。
     K1_inv = np.linalg.inv(K1_arr)
     K2_inv_t = np.linalg.inv(K2_arr).T
-    F = K2_inv_t @ _skew(T_arr) @ R_arr @ K1_inv
+    F = K2_inv_t @ skew_symmetric(T_arr) @ R_arr @ K1_inv
     return np.asarray(F, dtype=np.float64)
-
-
-def epipolar_line(F: np.ndarray, pixel_left: np.ndarray) -> np.ndarray:
-    """Return ``(a, b, c)`` for the epipolar line in the right image.
-
-    The line is normalized so ``a**2 + b**2 == 1`` whenever the
-    homogeneous line has a finite nonzero normal.  If it does not (for
-    example a line at infinity), the unnormalized coefficients are
-    returned instead.
-    """
-    F_arr = np.asarray(F, dtype=np.float64)
-    if F_arr.shape != (3, 3):
-        raise ValueError(f"F must have shape (3, 3), got {F_arr.shape}")
-    p = _as_pixel(pixel_left, "pixel_left")
-    if not _finite(p):
-        raise ValueError("pixel_left values must be finite")
-
-    line = F_arr @ np.array([p[0], p[1], 1.0], dtype=np.float64)
-    normal_length = float(np.hypot(line[0], line[1]))
-    if np.isfinite(normal_length) and normal_length > 0.0:
-        normalized = line / normal_length
-        if _finite(normalized):
-            line = normalized
-    return np.asarray(line, dtype=np.float64).reshape(3)
-
-
-def point_line_distance(line: np.ndarray, pixel_right: np.ndarray) -> float:
-    """Return the perpendicular pixel distance from a point to a line."""
-    line_arr = np.asarray(line, dtype=np.float64).reshape(-1)
-    if line_arr.size != 3:
-        raise ValueError(f"line must contain 3 values, got shape {line_arr.shape}")
-    p = _as_pixel(pixel_right, "pixel_right")
-    if not _finite(line_arr, p):
-        raise ValueError("line and pixel_right values must be finite")
-
-    a, b, c = (float(line_arr[0]), float(line_arr[1]), float(line_arr[2]))
-    normal_length = float(np.hypot(a, b))
-    if normal_length <= 0.0:
-        raise ValueError("cannot measure distance to a degenerate line (a=b=0)")
-    return float(abs(a * p[0] + b * p[1] + c) / normal_length)
 
 
 def triangulate_pixels(

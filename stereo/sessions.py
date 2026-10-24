@@ -537,6 +537,20 @@ def validate_session(
                     warnings.append(
                         f"标定光轴夹角 {angle:.1f}° 很大，但会话按 parallel 记录；"
                         "如果这是大角度装置，请用 angled 模式重录/显式覆盖")
+                # 标定质量里的 epipolar_rms 永远是 parallel 口径（校正后 y 差）。
+                # 大角度装置下校正图像被极端拉伸，这个数不代表几何精度，
+                # 不能拿来判"标定可用"，也不能与会话复检的其他口径相减比较。
+                if rig.stereo_mode == "angled":
+                    try:
+                        q_epi = float(rig.quality.get("epipolar_rms"))
+                    except (TypeError, ValueError):
+                        q_epi = float("nan")
+                    if q_epi == q_epi:
+                        warnings.append(
+                            f"标定质量 epipolar_rms={q_epi:.3f} px 是 parallel 口径"
+                            "（校正后 y 差），angled 装置下不代表几何精度；"
+                            "复检请用 StereoRig.epipolar_error_by_mode('angled', ...) "
+                            "的口径另行判读")
 
     if abs(s.sync.offset) > 180:
         warnings.append(f"同步偏移 {s.sync.offset:+d} 超过默认搜索上限 ±180 帧")

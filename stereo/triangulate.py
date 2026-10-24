@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 
@@ -29,6 +30,14 @@ import numpy as np
 
 from calib import StereoRig
 from sphere_tracker.types import Detection
+
+_LOGGER = logging.getLogger(__name__)
+
+# 静默失效门限：帧数够多、却一个都没配上，几乎一定是"装置不是 parallel"。
+# 20 帧是"值得报警"的最小样本量；更少的帧数可能只是 1-2 个球没检出。
+SILENT_FAILURE_MIN_FRAMES = 20
+# 配对率低于这个值：不抛错（也许只是遮挡严重），但必须留下一条明确警告。
+LOW_MATCH_RATE = 0.05
 
 
 @dataclass
@@ -176,6 +185,10 @@ class StereoReconstructor:
     n_no_right: int = 0         # 右路没有候选
     n_rejected: int = 0         # 有候选但全被极线/视差条件拒掉
 
+    # 非致命诊断（配对率过低等）；由 update() 追加，供日志/报告读取
+    warnings: list[str] = field(default_factory=list)
+    _low_rate_warned: bool = field(default=False, repr=False)
+
     def __post_init__(self) -> None:
         # 视差符号按装置实际朝向自动定：右相机在右边 -> +1，装反了 -> -1。
         # 不这么做的话，装反时配对率是 0%，而报错只有"配不上"。
@@ -190,8 +203,22 @@ class StereoReconstructor:
         left: Detection | None,
         right_dets: list[Detection],
     ) -> StereoPoint | None:
-        """喂一帧的左右检测，返回三维点（配不上则返回 None）。"""
+        """喂一帧的左右检测，返回三维点（配不上则返回 None）。
+
+        帧数攒够后才会做一次"静默失效"检查（见 :meth:`_check_diagnostics`）：
+        parallel 模式下 0 配对会抛 ``RuntimeError``，而不是安静地输出空轨迹。
+        """
         self.n_frames += 1
+        pt = self._match_frame(t, left, right_dets)
+        self._check_diagnostics()
+        return pt
+
+    def _match_frame(
+        self,
+        t: float,
+        left: Detection | None,
+        right_dets: list[Detection],
+    ) -> StereoPoint | None:
         if left is None:
             self.n_no_left += 1
             return None
@@ -206,6 +233,58 @@ class StereoReconstructor:
         self.n_matched += 1
         self.trajectory.append(pt)
         return pt
+
+    # -- 静默失效门禁 ----------------------------------------------------
+    def _is_parallel(self) -> bool:
+        return self.rig is None or getattr(self.rig, "stereo_mode", "parallel") != "angled"
+
+    def _check_diagnostics(self) -> None:
+        """帧数够多后检查配对情况：0 配对 -> 抛错；配对率过低 -> 警告。
+
+        `angled` 模式不做这个门禁：它的配对慢但合法（见 stereo/angled.py），
+        而且 `StereoReconstructor` 也不是它的入口。
+        """
+        if not self._is_parallel():
+            return
+        if self.n_frames < SILENT_FAILURE_MIN_FRAMES:
+            return
+        if self.n_matched == 0:
+            raise RuntimeError(self._zero_match_message())
+        rate = self.match_rate
+        if rate < LOW_MATCH_RATE and not self._low_rate_warned:
+            self._low_rate_warned = True
+            msg = (f"截至第 {self.n_frames} 帧：parallel 模式配对率极低，"
+                   f"匹配 {self.n_matched} / 总数 {self.n_frames}"
+                   f"（{rate * 100:.1f}% < {LOW_MATCH_RATE * 100:.0f}%）。"
+                   f"本模式只比较 y 方向、max_epipolar={self.cfg.max_epipolar_px:g}px；"
+                   "若装置是大角度，请用 --stereo-mode angled 重跑；"
+                   "否则检查标定是否被碰动、左右是否接反。")
+            self.warnings.append(msg)
+            _LOGGER.warning(msg)
+
+    def _zero_match_message(self) -> str:
+        cfg = self.cfg
+        return (
+            f"parallel 模式下 0 个配对（共 {self.n_frames} 帧）："
+            f"装置夹角可能远大于 parallel 的假设（当前模式下只比较 y 方向、"
+            f"max_epipolar={cfg.max_epipolar_px:g}px）。"
+            f"分项：左路缺 {self.n_no_left} 帧 / 右路无候选 {self.n_no_right} 帧 / "
+            f"有候选但被极线或视差条件拒掉 {self.n_rejected} 帧。"
+            f"下一步：用 --stereo-mode angled 重跑，或重新标定。"
+        )
+
+    def diagnostics(self) -> dict:
+        """结构化诊断（计数 + 配对率 + 警告），给报告/日志用。"""
+        return {
+            "n_frames": self.n_frames,
+            "n_matched": self.n_matched,
+            "n_no_left": self.n_no_left,
+            "n_no_right": self.n_no_right,
+            "n_rejected": self.n_rejected,
+            "match_rate": self.match_rate,
+            "stereo_mode": "angled" if not self._is_parallel() else "parallel",
+            "warnings": list(self.warnings),
+        }
 
     @property
     def match_rate(self) -> float:

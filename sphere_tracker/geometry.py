@@ -254,6 +254,94 @@ def circle_edge_support(edges: np.ndarray, cx: float, cy: float, radius: float, 
 
 
 # --------------------------------------------------------------------------
+# 极线几何（parallel / angled 两种模式共用）
+# --------------------------------------------------------------------------
+#
+# 为什么这些公式放在这里而不是 `stereo/angled_geometry.py`：
+# `calib/` 在依赖方向上**低于** `stereo/`（见 AGENTS.md §5），
+# 所以 `calib/params.py` 不能反向 import `stereo.angled_geometry`。
+# angled 模式的极线判据（F 矩阵 + 点到极线距离）既是 stereo 的配对依据，
+# 也是 calib 复检 90° 装置时唯一有意义的指标，因此共享公式必须下沉到本模块，
+# `stereo/angled_geometry.py` 从这里导入并 re-export，两边不会各写一份。
+
+
+def skew_symmetric(v: np.ndarray) -> np.ndarray:
+    """向量 `v` 的反对称矩阵 `[v]_x`（满足 `[v]_x @ x == cross(v, x)`）。"""
+    x, y, z = (float(v[0]), float(v[1]), float(v[2]))
+    return np.array(
+        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
+        dtype=np.float64,
+    )
+
+
+def fundamental_matrix_from_pose(
+    K1: np.ndarray,
+    K2: np.ndarray,
+    R: np.ndarray,
+    T: np.ndarray,
+) -> np.ndarray:
+    """由位姿构造基础矩阵：`F = K2^-T @ [T]_x @ R @ K1^-1`。
+
+    约定 `X_right = R @ X_left + T`（OpenCV 的 `stereoCalibrate` 输出）。
+    输入像素必须是**去畸变后、仍在各自 K 像素系**的坐标
+    （`cv2.undistortPoints(..., P=K)`）；畸变是非线性的，无法塞进 3x3 的 F。
+    不做任何有效性判断（rank-2、T 是否为零）—— 由调用方决定如何处置。
+    """
+    K1_arr = np.asarray(K1, dtype=np.float64).reshape(3, 3)
+    K2_arr = np.asarray(K2, dtype=np.float64).reshape(3, 3)
+    R_arr = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    T_arr = np.asarray(T, dtype=np.float64).reshape(3)
+    F = np.linalg.inv(K2_arr).T @ skew_symmetric(T_arr) @ R_arr @ np.linalg.inv(K1_arr)
+    return np.asarray(F, dtype=np.float64)
+
+
+def epipolar_line(F: np.ndarray, pixel_left: np.ndarray) -> np.ndarray:
+    """左图点对应的右图极线 `(a, b, c)`，法向量已归一化（`a²+b²==1`）。
+
+    退化（法向量长度为 0，例如极线在无穷远）时返回未归一化的系数，
+    由 :func:`point_line_distance` 决定是否可用。
+    """
+    F_arr = np.asarray(F, dtype=np.float64)
+    if F_arr.shape != (3, 3):
+        raise ValueError(f"F must have shape (3, 3), got {F_arr.shape}")
+    p = np.asarray(pixel_left, dtype=np.float64).reshape(-1)
+    if p.size != 2:
+        raise ValueError(f"pixel_left must contain 2 values, got shape {p.shape}")
+    if not np.all(np.isfinite(p)):
+        raise ValueError("pixel_left values must be finite")
+
+    line = F_arr @ np.array([p[0], p[1], 1.0], dtype=np.float64)
+    normal_length = float(np.hypot(line[0], line[1]))
+    if np.isfinite(normal_length) and normal_length > 0.0:
+        normalized = line / normal_length
+        if np.all(np.isfinite(normalized)):
+            line = normalized
+    return np.asarray(line, dtype=np.float64).reshape(3)
+
+
+def point_line_distance(line: np.ndarray, point: np.ndarray) -> float:
+    """点到直线 `(a, b, c)` 的垂直距离（像素）：`|a x + b y + c| / hypot(a, b)`。
+
+    直线退化（`a == b == 0`）时抛 `ValueError`，不返回 0 ——
+    0 会被误读成"完美对齐"，而实际上这条极线根本没有定义。
+    """
+    line_arr = np.asarray(line, dtype=np.float64).reshape(-1)
+    if line_arr.size != 3:
+        raise ValueError(f"line must contain 3 values, got shape {line_arr.shape}")
+    p = np.asarray(point, dtype=np.float64).reshape(-1)
+    if p.size != 2:
+        raise ValueError(f"point must contain 2 values, got shape {p.shape}")
+    if not (np.all(np.isfinite(line_arr)) and np.all(np.isfinite(p))):
+        raise ValueError("line and point values must be finite")
+
+    a, b, c = (float(line_arr[0]), float(line_arr[1]), float(line_arr[2]))
+    normal_length = float(np.hypot(a, b))
+    if normal_length <= 0.0:
+        raise ValueError("cannot measure distance to a degenerate line (a=b=0)")
+    return float(abs(a * p[0] + b * p[1] + c) / normal_length)
+
+
+# --------------------------------------------------------------------------
 # 相机模型
 # --------------------------------------------------------------------------
 class CameraModel:

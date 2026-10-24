@@ -18,6 +18,11 @@ import cv2
 import numpy as np
 
 from .stereo_calib import StereoCalibrationResult
+from sphere_tracker.geometry import (
+    epipolar_line,
+    fundamental_matrix_from_pose,
+    point_line_distance,
+)
 
 _MAT_KEYS = ("K1", "D1", "K2", "D2", "R", "T", "E", "F", "R1", "R2", "P1", "P2", "Q")
 
@@ -149,6 +154,100 @@ class StereoRig:
             return float("nan")
         dy = p1[:n, 1] - p2[:n, 1]
         return float(np.sqrt(np.mean(dy * dy)))
+
+    # ------------------------------------------------------------------
+    # 按模式分流的入口（2026-10-24 加）
+    #
+    # 为什么另开方法、而不改上面 `epipolar_error()` 的语义：
+    # `quality["epipolar_rms"]` 是**落盘字段**，历史标定 JSON 里已经有这个数字，
+    # 测试也把它当字面值断言。改它的语义（哪怕只对 angled）会让新旧标定的数字
+    # 失去可比性，等于悄悄废掉"历史可对照"。所以旧方法一个字不动，
+    # 需要 angled 口径的调用方走下面的 `epipolar_error_by_mode`。
+    # ------------------------------------------------------------------
+    def epipolar_metric_name(self, mode: str | None = None) -> str:
+        """某一模式的极线误差口径（人读字符串，写进报告用）。
+
+        两种模式的数字**不可比**，报告里必须写清楚是哪一种，
+        否则 90° 装置会拿到一个"好看但无意义"的数字：
+
+        - ``parallel``：校正后同名点的 **y 差 RMS**（校正后极线是水平线，
+                  y 差就是点到极线的距离）；
+        - ``angled``  ：**F 矩阵的点线距 RMS**（原始像素去畸变后仍在 K 像素系，
+                  逐点算到对应极线的垂直距离）。大角度下校正图像被极端拉伸，
+                  y 差不再等于几何误差，所以不能用同一把尺。
+
+        `mode` 省略时取 `self.stereo_mode`（标定 meta 里记录的模式）。
+        """
+        if (mode or self.stereo_mode) == "angled":
+            return "angled：F 矩阵极线点线距 RMS（px，原始像素去畸变后）"
+        return "parallel：校正后 y 差 RMS（px）"
+
+    def epipolar_error_by_mode(
+        self,
+        mode: str,
+        pts_left: np.ndarray,
+        pts_right: np.ndarray,
+    ) -> float:
+        """按**显式传入**的 `mode` 计算极线误差（像素 RMS）。
+
+        调用方应传自己实际使用的模式（`rig.stereo_mode` 或会话记录的模式），
+        不要依赖隐式默认 —— 报告里写错模式比数字大 10 倍更危险。
+
+        - ``parallel``：直接转调 :meth:`epipolar_error`，**零行为变化**
+          （落盘的 `quality["epipolar_rms"]` 与它同口径，仍可对照）；
+        - ``angled``  ：F 矩阵点线距 RMS。校正图像在 90° 下被极端拉伸，
+          校正后的 y 差与真实几何误差脱钩，必须换口径。
+        """
+        if mode == "angled":
+            return self._epipolar_error_angled(pts_left, pts_right)
+        if mode == "parallel":
+            return self.epipolar_error(pts_left, pts_right)
+        raise ValueError(f"未知的 stereo_mode：{mode!r}（只支持 'parallel' / 'angled'）")
+
+    def _epipolar_error_angled(
+        self, pts_left: np.ndarray, pts_right: np.ndarray
+    ) -> float:
+        """angled 口径：右图点到左图对应极线的垂直距离（RMS，px）。
+
+        像素先 `undistortPoints(..., P=K)` 去畸变并留在 K 像素系 ——
+        畸变是非线性的，不先去掉的话 F 只近似成立。
+        `F` 优先用标定产物 `self.F`，没有就由 K/R/T 现场构造，
+        两者与上面的去畸变方式同一套约定。
+        """
+        a = np.asarray(pts_left, np.float64).reshape(-1, 2)
+        b = np.asarray(pts_right, np.float64).reshape(-1, 2)
+        n = min(len(a), len(b))
+        if n == 0:
+            return float("nan")
+        a, b = a[:n], b[:n]
+
+        F = None
+        if isinstance(self.F, np.ndarray) and self.F.shape == (3, 3):
+            if np.all(np.isfinite(self.F)):
+                F = self.F
+        if F is None:
+            F = fundamental_matrix_from_pose(self.K1, self.K2, self.R, self.T)
+
+        K1, D1 = self.K1, self.D1 if self.D1 is not None else np.zeros(5)
+        K2, D2 = self.K2, self.D2 if self.D2 is not None else np.zeros(5)
+        pa = cv2.undistortPoints(a.reshape(-1, 1, 2), K1, D1, P=K1).reshape(-1, 2)
+        pb = cv2.undistortPoints(b.reshape(-1, 1, 2), K2, D2, P=K2).reshape(-1, 2)
+
+        dists: list[float] = []
+        for p_left, p_right in zip(pa, pb):
+            try:
+                line = epipolar_line(F, p_left)
+                d = point_line_distance(line, p_right)
+            except ValueError:
+                # 退化的极线（点在极点上 / F 病态）：这一个点不参与 RMS，
+                # 不留 NaN 污染整体；全部退化时下面返回 nan。
+                continue
+            if np.isfinite(d):
+                dists.append(d)
+        if not dists:
+            return float("nan")
+        arr = np.asarray(dists, np.float64)
+        return float(np.sqrt(np.mean(arr * arr)))
 
     # ------------------------------------------------------------------
     def baseline_side(self) -> str:
