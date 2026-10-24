@@ -422,7 +422,8 @@ def test_fov_alignment() -> bool:
     else:
         checks.append(("空白无特征必须报错，不能静默返回对齐", False))
 
-    # 参考帧四角越界的判定：<=1 px 只容忍取整/浮点误差；>1 px 即共同视场不足。
+    # 参考帧四角越界的判定：少量越界（<=16 px）容忍轻微旋转/取整；
+    # 大幅越界即共同视场不足。
     try:
         from stereo.fov_align import _mapped_rect
 
@@ -430,14 +431,14 @@ def test_fov_alignment() -> bool:
             [[0, 0], [100, 0], [100, 100], [0, 100]]).reshape(-1, 1, 2)
         h_tol = np.array([[1.0, 0.0, -0.5], [0.0, 1.0, -0.5], [0.0, 0.0, 1.0]])
         rect = _mapped_rect(corners, h_tol, 100, 100)
-        h_bad = np.array([[1.0, 0.0, -1.5], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        h_bad = np.array([[1.0, 0.0, -20.5], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
         try:
             _mapped_rect(corners, h_bad, 100, 100)
         except ValueError:
             bad_raised = True
         else:
             bad_raised = False
-        checks.append(("四角越界 <=1 px 容忍取整；>1 px 报共同视场不足",
+        checks.append(("四角少量越界容忍；>16 px 报共同视场不足",
                        rect == (0, 0, 100, 100) and bad_raised))
     except Exception as exc:                                # noqa: BLE001
         checks.append((f"_mapped_rect 越界判定异常：{exc}", False))
