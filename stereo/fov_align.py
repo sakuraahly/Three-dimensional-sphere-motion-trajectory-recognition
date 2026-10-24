@@ -49,6 +49,7 @@ __all__ = [
     "MIN_FOV_INLIERS",
     "estimate_fov_alignment",
     "fov_confidence_problem",
+    "fov_gate_action",
 ]
 
 # FOV 对齐可信度的**下限**（默认值，调用方可覆盖）。
@@ -289,6 +290,21 @@ def fov_confidence_problem(
     if low_inliers:
         parts.append(f"inliers={fov.inliers} < {min_inliers}")
     return "，".join(parts)
+
+
+def fov_gate_action(fov: FovAlignment) -> str:
+    """下游该怎么处理这次估计：``"ok"`` / ``"warn"`` / ``"block"``。
+
+    分流依据是"这份估计**会不会真的被用来裁剪**"，不是质量本身：
+
+    - ``fov.active`` 为 False（两路视场基本一致，不裁剪）时，低置信度的
+      估计根本没被应用，不会污染内参 —— 只 ``warn``，不能因此中止；
+      否则一个与结果无关的条件就能把用户挡在门外。
+    - ``fov.active`` 为 True（真要裁剪/缩放标定图）且低于下限 → ``block``。
+    """
+    if not fov_confidence_problem(fov):
+        return "ok"
+    return "block" if fov.active else "warn"
 
 
 # --------------------------------------------------------------------------

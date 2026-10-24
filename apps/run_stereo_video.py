@@ -51,7 +51,7 @@ from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
 from stereo import MatchConfig, PairSource, StereoReconstructor, savgol_trajectory  # noqa: E402
 from stereo.stereo_mode import (  # noqa: E402
-    infer_mode, mode_label, normalize_mode, optical_axes_angle_deg,
+    mode_label, optical_axes_angle_deg, resolve_auto,
 )
 from stereo.visualization import (  # noqa: E402
     export_session_visualization,
@@ -252,23 +252,28 @@ def main() -> int:
         calib_path = session_dir / calib_path
     rig = StereoRig.load(calib_path)
     if args.stereo_mode == "auto":
-        # 只有 session.json 真的写了 stereo_mode/rig.stereo_mode 才让它优先；
-        # Session 对象的默认值 "parallel" 不能把标定里的 angled 盖掉。
+        # ---- 双目模式：入口层唯一解析点 ----
+        # auto 只在这里由 resolve_auto() 落定（显式 > 标定 meta > 会话 > parallel），
+        # 与 calibrate_stereo / record_stereo 同一套优先级与同一份实现；
+        # 核心层 normalize_mode() 收到 auto 会直接抛 ValueError。
+        # 只有 session.json 真的写了 stereo_mode / rig.stereo_mode 才作为候选传入：
+        # Session 对象的默认值 "parallel" 不是"会话里写了"，不能拿它冒充用户意图。
         try:
             raw_session = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
         except Exception:                                   # noqa: BLE001
             raw_session = {}
-        session_hint = {}
+        session_hint: dict = {}
         if isinstance(raw_session, dict):
             if "stereo_mode" in raw_session:
                 session_hint["stereo_mode"] = raw_session["stereo_mode"]
             rig_hint = raw_session.get("rig")
             if isinstance(rig_hint, dict) and "stereo_mode" in rig_hint:
                 session_hint["rig"] = {"stereo_mode": rig_hint["stereo_mode"]}
-        mode = infer_mode(session=session_hint,
-                          calibration={"meta": rig.meta})
+        mode = resolve_auto(args.stereo_mode, session=session_hint,
+                            calibration={"meta": rig.meta})
     else:
-        mode = normalize_mode(args.stereo_mode)
+        # 显式给了 parallel/angled；仍然走同一入口，避免这里再长出一套归一化。
+        mode = resolve_auto(args.stereo_mode)
     angle = optical_axes_angle_deg(rig.R)
     print(f"双目模式：{mode_label(mode)}（{mode}）；标定实测光轴夹角 {angle:.1f}°；"
           f"基线 {rig.baseline_mm:.1f} mm")
@@ -278,10 +283,14 @@ def main() -> int:
     elif mode == "parallel" and angle >= 40.0:
         print(f"[警告] 标定夹角 {angle:.1f}° 已经很大，但当前按 parallel 跑；"
               "如果这是大角度装置，请在会话/标定里标 angled，或显式 --stereo-mode angled。")
+    # 保留"矛盾即拒跑(2)"：这是**解析之后**的一致性复核，不是第二套推断 ——
+    # auto 沿用的模式（来自标定 meta 或会话）若与本次标定实测夹角明显打架，
+    # 说明数据自相矛盾（例如拿平行标定去跑 90° 装置），静默继续只会产出错的三维点。
+    # calibrate_stereo 对同一情形也是"标完就拒"，这里保持同一口径。
     if args.stereo_mode == "auto" and (
             (mode == "parallel" and angle >= 40.0)
             or (mode == "angled" and angle < 15.0)):
-        print("[错误] auto 推断出的模式与标定实测夹角矛盾，拒绝静默继续；"
+        print("[错误] auto 解析出的模式与标定实测夹角矛盾，拒绝静默继续；"
               "请显式 --stereo-mode parallel 或 angled。")
         return 2
     # 把本次实际使用的模式写回 session，避免之后 export_visualization 按旧字段

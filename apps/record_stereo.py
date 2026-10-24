@@ -597,6 +597,8 @@ def main() -> int:
                 print(f"[FOV] 沿用标定对齐：参考 {fov.reference_side} / "
                       f"裁剪 {fov.crop_side} / 裁剪区 {fov.crop_rect} -> "
                       f"{out_w}x{out_h}（采集 {cap_w}x{cap_h}，不放大）")
+                print(f"      scale={fov.scale:.4f}  inliers={fov.inliers}  "
+                      f"quality={fov.quality:.3f}  （平行基线参照：0.6649 / 296 / 0.513）")
                 LOG.info("沿用标定 FOV 对齐：%s；写盘 %sx%s（采集 %sx%s）",
                          fov.to_dict(), out_w, out_h, cap_w, cap_h)
             else:

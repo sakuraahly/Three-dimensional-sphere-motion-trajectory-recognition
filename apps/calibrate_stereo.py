@@ -58,10 +58,9 @@ from apps._common import (
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
 from stereo.fov_align import (
-    MIN_FOV_INLIERS,
-    MIN_FOV_QUALITY,
     estimate_fov_alignment,
     fov_confidence_problem,
+    fov_gate_action,
 )
 from stereo.stereo_mode import optical_axes_angle_deg, resolve_auto
 from sphere_tracker.sources import quiet_repeated_grab_warnings
@@ -327,10 +326,10 @@ def main() -> int:
             print("      平行基线参照（本机现役装置，实测夹角 1.4°）：scale=0.6649  "
                   "inliers=296  quality=0.513  crop_rect=[404,195,1718,973]  "
                   "target_size=[1718,972]")
-            # 门禁只属于 parallel：低于下限就不要猜，直接中止。
-            # 阈值在 stereo/fov_align.py（MIN_FOV_QUALITY / MIN_FOV_INLIERS），
-            # 0.30/60 是留余量的**下限** —— 现有可用标定的 0.513/296 是正常值。
-            if fov.quality < MIN_FOV_QUALITY or fov.inliers < MIN_FOV_INLIERS:
+            # 只有"这次估计真的会被用来裁剪"才拦；不裁剪时低置信度不会污染
+            # 内参，中止它等于让一个与结果无关的条件决定能不能干活。
+            action = fov_gate_action(fov)
+            if action == "block":
                 print(f"\n[错误] FOV 对齐不可信（{fov_confidence_problem(fov)}）："
                       "拒绝用这次估计裁剪标定图。")
                 print("       下一步：换有纹理的场景（标定板 / 纸箱 / 桌面杂物）重拍，"
@@ -341,6 +340,11 @@ def main() -> int:
                           fov_confidence_problem(fov), fov.to_dict())
                 src.release()
                 return 1
+            if action == "warn":
+                print(f"[警告] FOV 估计置信度低（{fov_confidence_problem(fov)}），"
+                      "本次不裁剪，按原始画面标定；内参不受影响。")
+                log.warning("FOV 估计置信度低但不裁剪（%s）：%s",
+                            fov_confidence_problem(fov), fov.to_dict())
         else:
             print("      注：angled 不按下限判据 —— 大角度下的失败模式是"
                   "「在近处某个平面上匹配得很好」，")
