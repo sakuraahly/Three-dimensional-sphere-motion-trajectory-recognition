@@ -460,11 +460,6 @@ def main() -> int:
         except Exception as exc:                            # noqa: BLE001
             print(f"[错误] 标定快照失败：{exc}")
             return 1
-        try:
-            validate_capture_size(rig, args.width, args.height)
-        except ValueError as exc:
-            print(f"[错误] {exc}")
-            return 2
 
         # 新标定在 meta 里带 FOV 对齐参数；**只有** 缺失 / None 才是旧标定 ->
         # fov=None，行为不变。{} / [] / 非 mapping 是损坏记录，必须像 verify
@@ -478,6 +473,14 @@ def main() -> int:
                   "请重新标定后再录。")
             LOG.error("标定 meta.fov 解析失败，拒绝录制：%s", exc)
             return 2
+        out_w, out_h = ((int(fov.target_size[0]), int(fov.target_size[1]))
+                        if fov is not None and fov.active
+                        else (int(args.width), int(args.height)))
+        try:
+            validate_capture_size(rig, out_w, out_h)
+        except ValueError as exc:
+            print(f"[错误] {exc}")
+            return 2
         if fov is not None:
             if fov.active and tuple(fov.target_size) != tuple(rig.image_size):
                 print(f"[错误] 标定 meta.fov.target_size {fov.target_size} 与 "
@@ -487,10 +490,10 @@ def main() -> int:
                           fov.target_size, rig.image_size)
                 return 2
             if fov.active:
-                # 预检：crop_rect 必须落在该路原生采集帧内。apply_side() 也会
-                # 在采集线程里报同样的错，但那时 writer 已打开、会话目录已建；
-                # 这里提前拒绝，不产出半截会话。
-                cap_w, cap_h = int(rig.image_size[0]), int(rig.image_size[1])
+                # crop_rect 在**广角路原生采集帧**的像素系里，不是 target_size。
+                # 预检：必须落在本次相机原生采集帧内；apply_side() 也会报，但那时
+                # writer 已打开、会话已建。这里提前拒绝，不产出半截会话。
+                cap_w, cap_h = int(args.width), int(args.height)
                 cx, cy, cw, ch = fov.crop_rect
                 if cx < 0 or cy < 0 or cx + cw > cap_w or cy + ch > cap_h:
                     print(f"[错误] 标定 meta.fov.crop_rect {fov.crop_rect} 超出"
@@ -543,8 +546,8 @@ def main() -> int:
         left_path = session_dir / "left.mkv"
         right_path = session_dir / "right.mkv"
         try:
-            left_writer = _make_writer(left_path, args.width, args.height, args.fps, tag)
-            right_writer = _make_writer(right_path, args.width, args.height, args.fps, tag)
+            left_writer = _make_writer(left_path, out_w, out_h, args.fps, tag)
+            right_writer = _make_writer(right_path, out_w, out_h, args.fps, tag)
         except Exception as exc:                            # noqa: BLE001
             print(f"[错误] {exc}")
             return 1

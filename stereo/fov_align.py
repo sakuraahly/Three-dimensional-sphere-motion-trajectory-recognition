@@ -20,7 +20,8 @@
 坐标约定
 --------
 - ``crop_rect = (x, y, w, h)``，坐标在被裁剪那一路的像素系里；
-- ``target_size = (width, height)``，等于参考帧尺寸（当前硬件为 2560x1440）；
+- ``target_size = (width, height)``，两路共同输出尺寸；取参考帧与裁剪区的较小尺寸，
+  **不把广角裁剪区上采样**（当前硬件约 1685x979）；
 - ``scale`` 是估计出的 left->right 像素尺度（右图像素 / 左图像素）：
   1.0 表示两路视场基本一致，当前硬件约为 1/1.5 ≈ 0.667。
 - **参考帧永远不缩放**；只裁剪较广的一路，再用 ``INTER_LINEAR`` 缩放到参考帧尺寸。
@@ -72,7 +73,7 @@ class FovAlignment:
     crop_side      : 被裁剪的一路（较广的一路），或 ``"none"`` 表示无需对齐。
     crop_rect      : ``(x, y, w, h)``，在 ``crop_side`` 那一路的像素系里；
                      ``crop_side == "none"`` 时记参考帧全幅 ``(0, 0, w, h)``，仅作占位。
-    target_size    : ``(width, height)``，参考帧尺寸；裁剪后缩放至此。
+    target_size    : ``(width, height)``，两路共同输出尺寸；不放大裁剪区，通常小于参考帧。
     scale          : 估计出的 left->right 像素尺度。
     method         : ``"sift"`` / ``"orb"``，实际使用的特征检测器。
     inliers        : 几何模型（homography / 仿射）的 RANSAC 内点数。
@@ -156,21 +157,35 @@ class FovAlignment:
         return self.crop_side != "none"
 
     def apply_side(self, frame: np.ndarray, side: str) -> np.ndarray:
-        """只归一化指定一路的帧；另一路（含 ``crop_side == "none"``）原样返回。
+        """归一化指定的单路帧。
 
-        录制线程按路处理帧，拿不到成对帧，所以提供这个方法：只有
-        ``side == crop_side`` 时裁剪 + 缩放，其余情况返回**同一个对象**，不做
-        任何复制或尺寸校验（参考帧尺寸由 :meth:`apply` 在成对时校验）。
+        - 裁剪路：按 crop_rect 裁剪，再缩放到 target_size；
+        - 参考路：不裁剪，但若 target_size 比参考原生尺寸小，必须**降采样**到
+          target_size（不放大裁剪区的代价就是参考路也要降采样）；
+        - crop_side == "none"：原样返回。
         """
         if side not in ("left", "right"):
             raise ValueError(f"side 必须是 'left' 或 'right'，收到 {side!r}")
-        if self.crop_side == "none" or side != self.crop_side:
+        if self.crop_side == "none":
             return frame
         if not isinstance(frame, np.ndarray):
             raise ValueError(f"apply_side 需要 {side} 帧是 numpy.ndarray，"
                              f"收到 {type(frame).__name__}")
 
         target_w, target_h = self.target_size
+        if side == self.reference_side:
+            if frame.shape[:2] == (target_h, target_w):
+                return frame
+            # 参考帧只降采样，不裁剪；若传入比 target 还小的帧则拒绝，不放大。
+            if frame.shape[0] < target_h or frame.shape[1] < target_w:
+                raise ValueError(
+                    f"参考帧尺寸 {(frame.shape[1], frame.shape[0])} 小于 "
+                    f"target_size {(target_w, target_h)}，拒绝放大参考帧")
+            return cv2.resize(frame, (target_w, target_h),
+                              interpolation=cv2.INTER_AREA)
+
+        if side != self.crop_side:
+            return frame
         x, y, w, h = self.crop_rect
         crop_h, crop_w = frame.shape[:2]
         if x < 0 or y < 0 or x + w > crop_w or y + h > crop_h:
@@ -179,8 +194,14 @@ class FovAlignment:
                 f"{(crop_w, crop_h)}")
 
         region = frame[y:y + h, x:x + w]
+        # 裁剪区可能略大于 target（AABB / 旋转）；缩到 target 是允许的，
+        # 但不会把更小的裁剪区放大。
+        if w < target_w or h < target_h:
+            raise ValueError(
+                f"crop_rect {(x, y, w, h)} 小于 target_size "
+                f"{(target_w, target_h)}，拒绝放大裁剪区")
         aligned = cv2.resize(region, (target_w, target_h),
-                             interpolation=cv2.INTER_LINEAR)
+                             interpolation=cv2.INTER_AREA)
         if aligned.shape[0] != target_h or aligned.shape[1] != target_w:
             raise ValueError(
                 f"缩放后尺寸 {aligned.shape[:2]} 不等于 target_size "
@@ -188,30 +209,12 @@ class FovAlignment:
         return aligned
 
     def apply(self, left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """按本次估计归一化帧对。
-
-        - 参考帧原样返回（不缩放、不修改）；
-        - 较广的一路按 ``crop_rect`` 裁剪，再用 ``INTER_LINEAR`` 缩放到
-          ``target_size``；
-        - ``crop_side == "none"`` 时两帧原样返回。
-
-        内部逐路调用 :meth:`apply_side`，与录制链路的单路语义保持一致。
-        """
+        """按本次估计归一化帧对，两路都输出 target_size。"""
         if self.crop_side == "none":
             return left, right
         if not isinstance(left, np.ndarray) or not isinstance(right, np.ndarray):
             raise ValueError("apply 需要 left/right 都是 numpy.ndarray")
-
-        target_w, target_h = self.target_size
-        reference = left if self.reference_side == "left" else right
-        if reference.shape[:2] != (target_h, target_w):
-            raise ValueError(
-                f"参考帧（{self.reference_side}）尺寸 {reference.shape[:2]} 与 "
-                f"target_size {(target_w, target_h)} 不一致")
-
-        if self.crop_side == "right":
-            return left, self.apply_side(right, "right")
-        return self.apply_side(left, "left"), right
+        return (self.apply_side(left, "left"), self.apply_side(right, "right"))
 
     def to_dict(self) -> dict[str, Any]:
         """JSON 友好（list 而不是 tuple）的字典。"""
@@ -546,7 +549,10 @@ def _estimate_with(method: str, gray_l: np.ndarray, gray_r: np.ndarray,
             f"(< {_MIN_CROP_AREA_RATIO:.0%})，重叠不足")
 
     quality = _quality(n_inliers, n_matches, min_inliers)
-    target_size = (ref_w, ref_h)
+    # 共同输出分辨率取“不放大”的交集：参考帧与裁剪区都不被 upscale。
+    # 只把较窄/参考帧 downscale 到广角裁剪区的原生像素规模；若参考更小则不放大宽帧。
+    # 这样既保持同一视场，又不把 1685x979 的裁剪硬拉到 2560x1440 导致模糊。
+    target_size = (min(ref_w, w), min(ref_h, h))
 
     # 尺度接近 1 且中心偏移小、参考帧几乎完整可见 -> 视场基本一致，不裁不缩。
     if abs(scale - 1.0) <= _NEAR_UNITY:

@@ -533,10 +533,10 @@ class AngledReconstructor:
 ```python
 @dataclass(frozen=True)
 class FovAlignment:
-    reference_side: str                    # "left"/"right"：较窄、更放大的一路；永不裁剪/缩放
+    reference_side: str                    # "left"/"right"：较窄、更放大的一路；不裁剪，必要时降采样
     crop_side: str                         # "left"/"right"/"none"：被裁剪的一路
     crop_rect: tuple[int, int, int, int]   # (x, y, w, h)，在 crop_side 的像素系里
-    target_size: tuple[int, int]           # (w, h) = 参考帧尺寸；裁剪后缩放到此
+    target_size: tuple[int, int]           # 两路共同输出尺寸；不放大裁剪区，通常小于参考帧
     scale: float                           # left -> right 像素尺度；1.0 = 视场基本一致
     method: str                            # "sift"/"orb"
     inliers: int;  quality: float          # quality ∈ [0, 1]
@@ -553,7 +553,7 @@ def estimate_fov_alignment(left: np.ndarray, right: np.ndarray, *,
 
 **输入 / 边界**：`left`/`right` 支持 BGR / BGRA / 灰度 `np.ndarray`（uint8 最稳）；模块是纯函数 / 纯数据，不读配置、不碰相机、不写文件。
 
-**做法**：SIFT 优先、ORB 兜底；Lowe ratio + 双向交叉校验；RANSAC homography（失败退仿射）。由内点拟合 `left->right` 尺度：`scale <= 1` 以左为参考裁右（视场接近时通常先判 `none`），`scale > 1` 以右为参考裁左。`|scale-1| <= 0.05`、中心偏移 `<= 10%` 短边、参考帧可见面积 `>= 90%` 时返回 `crop_side="none"`。参考帧永远原样返回；只对 `crop_side` 做 `crop_rect` 裁剪 + `INTER_LINEAR` 缩放到 `target_size`。
+**做法**：SIFT 优先、ORB 兜底；Lowe ratio + 双向交叉校验；RANSAC homography（失败退仿射）。由内点拟合 `left->right` 尺度：`scale <= 1` 以左为参考裁右（视场接近时通常先判 `none`），`scale > 1` 以右为参考裁左。`|scale-1| <= 0.05`、中心偏移 `<= 10%` 短边、参考帧可见面积 `>= 90%` 时返回 `crop_side="none"`。`target_size` 取参考帧与裁剪区的较小尺寸（不放大裁剪区）；`apply()` 对裁剪路做 `crop_rect` 裁剪 + 缩放，对参考路只降采样到 `target_size`，两路最终同尺寸。
 
 **失败语义（不会静默退化）**：参数非法或估计失败都抛 `ValueError`；估计失败时错误串带 SIFT/ORB 各自的失败原因 —— 帧非法 / 太小（短边 < 16）、没有足够特征或匹配、内点 `< min_inliers`、尺度超出 `[1/max_scale, max_scale]`、参考帧四角映射失败或退化（含非有限坐标、宽或高 < 2）、参考帧映射后的包围盒只占广角帧 `< 20%` 面积、**参考帧四角映射后任一维越出广角帧 > 16 px**（参考帧未完整落在广角帧内 = 共同视场不足；容忍轻微旋转/取整误差（最多 16 px），**不会**裁掉越界角按“部分重叠”继续主动对齐）。`crop_side="none"` 只在近同视场判据通过时出现，**不是失败兜底**；`min_inliers` 至少 4，`max_scale` 必须 > 1.0。构造 / `from_dict()` 还会校验字段（`reference_side`/`crop_side` 取值、`crop_side != reference_side`、`crop_rect` 为 4 个整数且非负/宽高为正、`target_size` 为正、`scale` 有限正数、`quality` 在 `[0, 1]`）；应用对齐时，`apply()` 检查参考帧尺寸是否等于 `target_size`，`apply_side()` 检查裁剪区是否越界。
 

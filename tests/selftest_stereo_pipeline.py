@@ -371,24 +371,23 @@ def test_fov_alignment() -> bool:
              f"质量 {align.quality:.2f}、方法 {align.method}）",
              align.method == "sift" and align.inliers >= 30
              and 0.0 <= align.quality <= 1.0
-             and align.target_size == (2560, 1440)
+             and align.target_size == (min(2560, w), min(1440, h))
              and 0 <= x and 0 <= y and x + w <= 2560 and y + h <= 1440
              and abs(x - 426) <= 25 and abs(y - 240) <= 25
              and abs(w - 1707) <= 25 and abs(h - 960) <= 25),
-            ("参考帧原样保留；广角帧裁剪后缩放到参考尺寸",
-             np.array_equal(aligned_left, left)
-             and aligned_right.shape == (1440, 2560, 3)
-             and not np.shares_memory(aligned_right, right)),
+            ("两路都缩到不放大裁剪区的共同尺寸；裁剪/参考尺寸一致",
+             aligned_left.shape == aligned_right.shape == (h, w, 3)
+             and aligned_left.shape[0] <= 1440 and aligned_left.shape[1] <= 2560),
         ])
         ref_only = align.apply_side(left, "left")
         crop_only = align.apply_side(right, "right")
         checks.append((
-            "apply_side：只归一化裁剪路，参考路原样、两路尺寸一致",
-            ref_only is left and ref_only.shape == left.shape
-            and crop_only.shape == aligned_right.shape
+            "apply_side：参考路降采样、裁剪路裁剪，两路尺寸一致",
+            ref_only.shape == crop_only.shape == aligned_left.shape
+            and not np.shares_memory(ref_only, left)
             and np.array_equal(crop_only, aligned_right),
         ))
-        post = estimate_fov_alignment(left, aligned_right)
+        post = estimate_fov_alignment(aligned_left, aligned_right)
         checks.append((f"对齐后残余尺度 {post.scale:.4f}（目标 1±0.1）",
                        abs(post.scale - 1.0) <= 0.10))
     except ValueError as exc:
