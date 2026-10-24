@@ -208,17 +208,18 @@ goto :direct
 
 :do_test
 rem 回归测试统一走 apps\run_tests.py（项目里**唯一**跑全套测试的地方）。
-rem   默认 fast：跳过两个慢测试（stereo_calib ~236s、synthetic ~90s），十几秒出结果。
+rem   默认 fast：跳过"已知慢的"测试，只跑其余（名单来自 timings.json 的实测中位数，不写死）。
+rem   当前跳过了哪些、各耗时多少：跑一次 apps\run_tests.py --list 看，别在这里写死数字。
 rem   要全套：启动程序.bat test full
 rem 分层依据是 outputs\test_results\timings.json 里的**实测中位数**，不写死名单。
 set "TIER=%~2"
 if "%TIER%"=="" set "TIER=fast"
 if /i "%TIER%"=="full" (
     set "DIRECT=apps\run_tests.py full"
-    set "DTITLE=回归测试 · full（15 个全跑，约 7 分钟）"
+    set "DTITLE=回归测试 · full（全部测试都跑，最慢的一档）"
 ) else (
     set "DIRECT=apps\run_tests.py fast"
-    set "DTITLE=回归测试 · fast（跳过已知慢的，十几秒）"
+    set "DTITLE=回归测试 · fast（跳过已知慢的）"
 )
 goto :direct
 
