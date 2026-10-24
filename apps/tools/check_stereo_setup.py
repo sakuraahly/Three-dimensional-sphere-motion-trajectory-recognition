@@ -48,9 +48,10 @@ PREVIEW_W = 620          # 单路预览宽度
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CALIBRATION_PATH = REPO_ROOT / "config" / "stereo_calibration.json"
 
-# 与 stereo/sessions.py 的基线交叉核对口径一致：>10% 提醒、>30% 报警。
-BASELINE_WARN_RATIO = 0.10
-BASELINE_ERROR_RATIO = 0.30
+# 档案里的"期望基线" vs 标定实测基线的偏差，**只用来写提示**：
+# 用户明确说过"我不能精确确定摄像头的位置"，所以档案里的 B/D 只能是**参考估算**，
+# 偏差再大也不能让 precheck 失败 —— 判定以标定结果为准（2026-10-24 改）。
+BASELINE_NOTE_RATIO = 0.10   # 超过这个比例才值得提一句（仅提示）
 
 
 # --------------------------------------------------------------------------
@@ -98,11 +99,10 @@ def _mean(points) -> tuple[float, float]:
 
 
 # --------------------------------------------------------------------------
-def _calibration_baseline(path: Path | None = None) -> float | None:
-    """读实际标定文件的算法基线（mm）；读不到返回 ``None``（不抛）。"""
-    target = Path(path) if path is not None else CALIBRATION_PATH
+def _json_baseline(path: Path) -> float | None:
+    """只读 ``.json`` 里的 ``baseline_mm``（``.npz`` 缺失时的退路）。"""
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
@@ -114,57 +114,97 @@ def _calibration_baseline(path: Path | None = None) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
+def _calibration_measured(path: Path | None = None) -> tuple[float | None, float | None]:
+    """读标定**实测**值 ``(基线 mm, 光轴夹角 °)``；读不到返回 ``(None, None)``（不抛）。
+
+    这是本工具唯一的**权威**几何来源：档案里的 B/D 只是参考估算，判定以这里为准。
+
+    为什么不另写解析：夹角必须由标定 ``R`` 算（``docs/数据标准.md``：
+    ``angle_deg`` 不是手填的 90.0），而 ``calib.params.StereoRig`` 已经同时提供
+    ``baseline_mm``（由 ``T`` 求模）与 ``angle_deg``（由 ``R`` 求），
+    直接复用它可以避免在这个检查工具里维护第二套矩阵/JSON 读法。
+    只有 ``.json`` 没有 ``.npz`` 的历史目录退回读 json 的基线（角度留空）。
+    """
+    target = Path(path) if path is not None else CALIBRATION_PATH.with_suffix("")
+    try:
+        from calib.params import StereoRig
+
+        rig = StereoRig.load(target)
+    except (OSError, ValueError, KeyError):
+        baseline = _json_baseline(Path(target).with_suffix(".json"))
+        return baseline, None
+    return float(rig.baseline_mm), float(rig.angle_deg)
+
+
 def _print_profile_section() -> tuple[list[str], list[str]]:
     """打印"当前装置档案"，返回 (warnings, errors)。
 
-    档案是可选项：没设置就一行提示，不改变 precheck 的判定；设置了才做
-    "期望基线 vs 实际标定基线"的交叉核对（>10% 警告、>30% 错误）。
+    ## 谁是权威（2026-10-24 按用户反馈改）
+
+    用户原话："我不能精确确定摄像头的位置，所以这个不该设置成强相关固定，
+    相反，应该以标定计算得到结果为主。"
+
+    所以这一段先把**标定实测**打在最前面（基线、光轴夹角，均来自标定 ``R``/``T``），
+    档案里填的 B/D 只作为**参考估算**跟在后面：偏差只写一行 ``参考：`` 提示，
+    **永不进 ``errors``/``warnings``，永不影响退出码**。
+    仅两种情况仍算真问题（与参考值无关）：档案文件坏了、档案指向的标定文件不见了。
     """
     print("-" * 62)
     print("当前装置档案")
+    notes: list[str] = []
     warnings: list[str] = []
     errors: list[str] = []
+
+    # --- 1) 标定实测（权威），永远排在最前面 ---
+    actual_baseline, actual_angle = _calibration_measured()
+    if actual_baseline is None:
+        print("  标定实测          : 读不到（config/stereo_calibration.json 缺失"
+              "或没有 baseline_mm）")
+    else:
+        angle_txt = f"、光轴夹角 {actual_angle:.1f}°" if actual_angle is not None else ""
+        print(f"  标定实测          : 基线 {actual_baseline:.1f} mm{angle_txt}"
+              "（来自 config/stereo_calibration.json，权威）")
+
+    # --- 2) 档案（参考） ---
     try:
         active = rig_profiles.get_active()
     except rig_profiles.ProfileError as exc:
-        print(f"  读不了档案        : {exc}")
+        print(f"  档案              : 读不了（{exc}）")
         errors.append(f"装置档案读不了：{exc}")
         return warnings, errors
 
     if active is None:
-        print("  未设置装置档案（可选）：配置后可让 precheck/录制带出正确几何预期")
+        print("  档案              : 未设置（可选，不影响判定）")
+        for w in warnings:
+            print(f"  ! {w}")
+        for e in errors:
+            print(f"  × {e}")
         return warnings, errors
 
     label = rig_profiles.mode_label(active.stereo_mode)
-    print(f"  名称              : {active.name}")
-    print(f"  双目模式          : {label}（{active.stereo_mode}）")
+    print(f"  档案              : {active.name} · {label}（{active.stereo_mode}）")
     if active.width and active.height:
         fps = f"@{active.fps}" if active.fps else ""
         print(f"  分辨率 / 帧率     : {active.width}x{active.height}{fps}")
 
-    if active.expected_baseline_mm is None:
-        print("  期望基线          : 未填（无法与实际标定交叉核对）")
-    else:
-        print(f"  期望基线          : {active.expected_baseline_mm:.2f} mm")
-        actual = _calibration_baseline()
-        if actual is None:
-            print("  实际标定基线      : 读不到"
-                  "（config/stereo_calibration.json 缺失或无 baseline_mm）")
-        else:
-            ratio = abs(active.expected_baseline_mm - actual) / actual
-            print(f"  实际标定基线      : {actual:.2f} mm（差 {100 * ratio:.1f}%）")
-            if ratio > BASELINE_ERROR_RATIO:
-                errors.append(
-                    f"装置档案期望基线 {active.expected_baseline_mm:.2f} mm 与标定 "
-                    f"{actual:.2f} mm 差 {100 * ratio:.0f}%（>30%：多半不是同一套装置，"
-                    "先核对左右相机与标定文件）")
-            elif ratio > BASELINE_WARN_RATIO:
-                warnings.append(
-                    f"装置档案期望基线 {active.expected_baseline_mm:.2f} mm 与标定 "
-                    f"{actual:.2f} mm 差 {100 * ratio:.0f}%（>10%）")
+    # --- 3) 档案的 B/D 一律"参考"语气；没填就安静跳过 ---
+    if active.expected_baseline_mm is not None or active.working_distance_m is not None:
+        bits = []
+        if active.expected_baseline_mm is not None:
+            bits.append(f"基线 {active.expected_baseline_mm:.1f} mm")
+        if active.working_distance_m is not None:
+            bits.append(f"工作距离 {active.working_distance_m:.2f} m")
+        print(f"  档案参考值        : {' / '.join(bits)}（估算，仅作参考，不参与判定）")
 
-    if active.working_distance_m is not None:
-        print(f"  工作距离          : {active.working_distance_m:.2f} m")
+    if (active.expected_baseline_mm is not None and actual_baseline is not None
+            and actual_baseline > 0):
+        ratio = abs(active.expected_baseline_mm - actual_baseline) / actual_baseline
+        if ratio > BASELINE_NOTE_RATIO:
+            notes.append(
+                f"参考：档案期望基线 {active.expected_baseline_mm:.1f} mm，"
+                f"标定实测 {actual_baseline:.1f} mm（差 {100 * ratio:.0f}%）。"
+                "标定结果为准 —— 若这不是同一套装置，请更新档案或换档案。")
+
     print(f"  几何提示          : {rig_profiles.geometry_hint(active)}")
 
     if active.calibration_path:
@@ -177,6 +217,8 @@ def _print_profile_section() -> tuple[list[str], list[str]]:
         print("  写盘/坐标系       : 按 docs/数据标准.md §1.5 为原始 left_camera，"
               "不做 FOV 裁剪")
 
+    for n in notes:
+        print(f"  · {n}")
     for w in warnings:
         print(f"  ! {w}")
     for e in errors:

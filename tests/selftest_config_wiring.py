@@ -494,10 +494,15 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         hint_good = rp.geometry_hint(good)
         print(f"  B=124 mm / D=0.30 m -> {hint_small}")
         print(f"  B=600 mm / D=0.30 m -> {hint_good}")
-        checks.append(("B=124/D=0.3（远小于 90°）-> 提示「不支持 90°」",
-                       "不支持 90°" in hint_small))
-        checks.append(("B=600/D=0.3（≈90°）-> 不提示「不支持」",
-                       "不支持" not in hint_good))
+        # 2026-10-24：文案从"不支持 90°"（命令式判定）改成"参考估算 / 以标定为准"。
+        # 断言改成**语气**而不是字面句子：必须同时出现"标定"与"参考"，
+        # 且**不许**再出现"不支持"这类判定语义（估算错的是数字，不是装置）。
+        checks.append(("B=124/D=0.3 的提示含「标定」+「参考」（不是命令式判定）",
+                       "标定" in hint_small and "参考" in hint_small))
+        checks.append(("B=600/D=0.3 的提示同样含「标定」+「参考」",
+                       "标定" in hint_good and "参考" in hint_good))
+        checks.append(("两种提示都不含「不支持」这类判定语义",
+                       "不支持" not in hint_small and "不支持" not in hint_good))
         checks.append(("两种提示都标注「非标定值」（不许把估算当标定）",
                        "非标定值" in hint_small and "非标定值" in hint_good))
 
@@ -522,6 +527,103 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_baseline_in_profile_is_reference_only() -> bool:
+    """档案里的期望基线只是**参考**：与标定差 384% 也不许让 precheck 失败。
+
+    ## 守的是什么（2026-10-24，用户原话）
+
+        "我不能精确确定摄像头的位置，所以这个不该设置成强相关固定，
+         相反，应该以标定计算得到结果为主。"
+
+    旧实现拿"我估的装置尺寸"去判死"标定算出的结果"：
+    `check_stereo_setup.py` 里 ``ratio > 0.30`` 就 ``errors.append(...)`` → 退出码 1。
+    一个填错 600 mm 的档案能让一台标定良好的装置过不了前置检查。
+
+    ## 判据
+
+    1. 造一个期望基线 600 mm 的临时档案（真标定实测 ≈124 mm，差 384%），
+       跑**真实 CLI** `check_stereo_setup.py --profiles-only`，**退出码必须是 0**；
+    2. 输出里"标定实测"必须排在"参考：档案期望基线"**之前**（权威值在前）；
+    3. 只填 ``name`` + ``stereo_mode`` 的档案能 upsert 成功（B/D 是可选的）。
+
+    ## 怎么测的（为什么是子进程 + 打补丁）
+
+    子进程能拿到**真正的进程退出码**（直接调函数只能看返回值，测不出 `sys.exit`）。
+    档案路径不能走真 `config/profiles.json`（那是用户的运行期产物，测试不许改它），
+    所以子进程里先把 ``stereo.profiles.DEFAULT_PATH`` 指到临时 store，
+    再调 ``main()`` —— 这是该模块唯一读路径的入口，不打补丁就得改产品代码加环境变量。
+    """
+    print("----- 档案基线只是参考：precheck 以标定为准 -----")
+    import json
+    import subprocess
+    import tempfile
+
+    from stereo import profiles as rp
+
+    checks: list[tuple[str, bool]] = []
+    tool = ROOT / "apps" / "tools" / "check_stereo_setup.py"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / "profiles.json"
+        store.write_text(json.dumps({
+            "schema": "sphere-rig-profiles", "version": 1, "active": "ref-600",
+            "profiles": {"ref-600": {
+                "name": "ref-600", "stereo_mode": "angled",
+                "expected_baseline_mm": 600.0, "working_distance_m": 0.30,
+                "notes": "", "created": "2026-10-24T00:00:00"}}},
+            ensure_ascii=False), encoding="utf-8")
+
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from pathlib import Path\n"
+            "from stereo import profiles as rp\n"
+            f"rp.DEFAULT_PATH = Path({str(store)!r})\n"
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('chk_setup', "
+            f"{str(tool)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "sys.argv = ['check_stereo_setup.py', '--profiles-only']\n"
+            "raise SystemExit(m.main())\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace")
+        out = proc.stdout or ""
+        print("  --- 子进程输出（节选）---")
+        for line in out.splitlines():
+            if "标定实测" in line or "档案" in line or "参考" in line or "几何提示" in line:
+                print(f"  {line}")
+        print(f"  退出码 = {proc.returncode}（旧实现在差 >30% 时会是 1）")
+
+        checks.append(("期望 600 mm vs 标定 124 mm（差 384%）precheck 仍返回 0",
+                       proc.returncode == 0))
+        pos_measured = out.find("标定实测")
+        pos_ref = out.find("参考：档案期望基线")
+        checks.append(("输出里「标定实测」排在「参考：档案期望基线」之前（权威在前）",
+                       pos_measured >= 0 and pos_ref >= 0 and pos_measured < pos_ref))
+
+    # 3) 只给 name + stereo_mode 也能建档（B/D 是可选的）
+    with tempfile.TemporaryDirectory() as tmp2:
+        p = Path(tmp2) / "profiles.json"
+        saved = rp.upsert(rp.RigProfile(name="minimal", stereo_mode="parallel"), path=p)
+        back = rp.get_profile("minimal", p)
+        print(f"  只给 name+stereo_mode -> upsert 返回 {saved.name!r}，"
+              f"B={saved.expected_baseline_mm}、D={saved.working_distance_m}")
+        print(f"  geometry_hint -> {rp.geometry_hint(saved)}")
+        checks.append(("只填 name+stereo_mode 的档案能 upsert 并读回（B/D 可空）",
+                       back is not None and back.name == "minimal"
+                       and back.expected_baseline_mm is None))
+        checks.append(("缺 B/D 时的几何提示仍含「标定」+「参考」（不装成缺项报错）",
+                       "标定" in rp.geometry_hint(saved)
+                       and "参考" in rp.geometry_hint(saved)))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -540,7 +642,9 @@ def main() -> int:
     print()
     g = test_rig_profiles_are_validated_and_persisted()
     print()
-    ok = a and b and c and d and e and f and g
+    h = test_baseline_in_profile_is_reference_only()
+    print()
+    ok = a and b and c and d and e and f and g and h
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 

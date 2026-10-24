@@ -81,6 +81,27 @@ RESOLUTIONS = _video_profile_options()
 DEFAULT_RESOLUTION = DEFAULT_VIDEO_PROFILE.label
 CALIB_FPS_DEFAULT = "24"
 
+# 标定结果：**几何的权威来源**（档案里的 B/D 只是参考估算，见 _refresh_profile_line）。
+CALIB_PATH = ROOT / "config" / "stereo_calibration"
+
+
+def calibration_measure() -> tuple[float, float] | None:
+    """读标定**实测**的 ``(基线 mm, 光轴夹角 °)``；没有可用标定时返回 ``None``。
+
+    为什么复用 ``calib.params.StereoRig`` 而不自己解析：基线与夹角分别由标定
+    ``T`` / ``R`` 算出（``angle_deg`` 不是手填的 90.0），``StereoRig`` 已经把这两件事
+    做对了，GUI 里再写第二份解析就会与 ``apps/tools/check_stereo_setup.py`` 的口径分叉。
+    读不到（没标定过 / 文件坏了）**不是错误**：顶部状态条写"尚无标定"即可。
+    """
+    try:
+        from calib.params import StereoRig
+
+        rig = StereoRig.load(CALIB_PATH)
+    except (OSError, ValueError, KeyError):
+        return None
+    return float(rig.baseline_mm), float(rig.angle_deg)
+
+
 # ---- 换行宽度：**跟着视口动态算，不写死** ----
 #
 # 为什么必须动态：
@@ -501,35 +522,57 @@ class Launcher(tk.Tk):
             parent=self)
 
     def _refresh_profile_line(self) -> None:
-        """按 `config/profiles.json` 的活动档案刷新顶部状态条（P0-1）。
+        """刷新顶部状态条：**以标定实测为主语**，档案的 B/D 只是后置参考。
 
-        读不到档案**不是**错误：全新机器上就是没有这份文件。
-        但显示必须说清"下一步点哪里"，不能只写"未设置"。
+        2026-10-24 按用户反馈改。原实现以"档案的期望值"为主语（还跟着一段
+        基于期望 B/D 的几何估算），等于让一个**估出来的装置尺寸**抢了权威位；
+        用户原话："我不能精确确定摄像头的位置，所以这个不该设置成强相关固定，
+        相反，应该以标定计算得到结果为主。"
+
+        现在的语序：``当前装置：<档案>·<模式> · 标定实测：基线/夹角 · 参考 B/D``。
+        读不到档案**不是**错误 —— 全新机器上就是没有这份文件，但要说清下一步点哪里。
         """
         from stereo import profiles as rig_profiles
         from stereo.stereo_mode import mode_label
+
+        measure = calibration_measure()
+        if measure is None:
+            actual = "标定实测：尚无标定"
+        else:
+            actual = f"标定实测：基线 {measure[0]:.1f} mm / 夹角 {measure[1]:.1f}°"
+
         try:
             profile = rig_profiles.get_active()
         except Exception as exc:                            # noqa: BLE001
             text = (f"当前装置：读取档案失败（{exc}）"
+                    f" · {actual}"
                     " · 下一步：点右上『装置档案』检查 config/profiles.json")
             self._profile_line.configure(text=text)
             return
         if profile is None:
             self._profile_line.configure(
-                text="当前装置：未设置 · 点右上『装置档案』新建，可保存平行 / 90° 两套参数"
-                     " · 未设置时按上方的『双目模式』执行")
+                text=f"当前装置：未设置 · {actual}"
+                     " · 点右上『装置档案』新建，可保存平行 / 90° 两套参数")
             return
-        hint = rig_profiles.geometry_hint(profile)
+
+        ref_bits = []
+        if profile.expected_baseline_mm is not None:
+            ref_bits.append(f"B={profile.expected_baseline_mm:.0f} mm")
+        if profile.working_distance_m is not None:
+            ref_bits.append(f"D={profile.working_distance_m:.2f} m")
+        ref = f" · 参考 {' / '.join(ref_bits)}（仅作参考）" if ref_bits else ""
         self._profile_line.configure(
-            text=f"当前装置：{profile.name} · {mode_label(profile.stereo_mode)} · {hint}")
+            text=f"当前装置：{profile.name} · {mode_label(profile.stereo_mode)} · {actual}{ref}")
 
     def _open_profiles(self) -> None:
         """『装置档案』：新建 / 覆盖一套装置参数并设为当前（P0-1 的入口）。
 
-        只做一件最小可用的事：名称 + 模式 + 预期基线 + 工作距离。
+        只做一件最小可用的事：名称 + 模式（**这两项就够**），B/D 可选。
         故意**不做**"批量管理"—— 多档案的增删已经在 `stereo/profiles.py`
         里，界面先保证"能建、能切换、能看见"，而不是造一套平行实现。
+
+        B/D 的默认值从 600 / 0.30 改成了**空**：预填具体数字等于暗示"这里必须填准"，
+        而用户明确说过"我不能精确确定摄像头的位置"—— 判定看标定，不看这两个框。
         """
         from stereo import profiles as rig_profiles
         dlg = tk.Toplevel(self)
@@ -542,7 +585,8 @@ class Launcher(tk.Tk):
                   + (rig_profiles.active_name() or "未设置")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         rows = (("名称", "rig1"), ("模式（parallel / angled）", "angled"),
-                ("预期基线 B（mm，可空）", "600"), ("工作距离 D（米，可空）", "0.30"))
+                ("期望基线 B（mm，可选，仅作参考）", ""),
+                ("工作距离 D（米，可选，仅作参考）", ""))
         vars_: list[tk.StringVar] = []
         for i, (label, default) in enumerate(rows, start=1):
             ttk.Label(body, text=label).grid(row=i, column=0, sticky="e", pady=3)
@@ -550,8 +594,11 @@ class Launcher(tk.Tk):
             ttk.Entry(body, textvariable=var, width=24).grid(
                 row=i, column=1, sticky="w", padx=(6, 0), pady=3)
             vars_.append(var)
-        ttk.Label(body, text="保存会覆盖同名档案；不合格的值会被拒绝并说明原因。",
-                  style="Hint.TLabel", wraplength=360).grid(
+        ttk.Label(body, text="只填名称 + 模式即可保存。B / D 可留空 —— 它们是装置的"
+                             "粗略估计，几何判定以 config/stereo_calibration 的"
+                             "实测基线 / 夹角为准；填了也只作参考。\n"
+                             "保存会覆盖同名档案；不合格的值会被拒绝并说明原因。",
+                  style="Hint.TLabel", wraplength=380).grid(
             row=len(rows) + 1, column=0, columnspan=2, sticky="w", pady=(8, 6))
 
         def save() -> None:

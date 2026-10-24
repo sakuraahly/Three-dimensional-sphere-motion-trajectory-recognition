@@ -287,42 +287,54 @@ def validate_profile(
 # 几何提示（纯函数，角度只是**估算**）
 # ---------------------------------------------------------------------------
 def geometry_hint(profile: RigProfile) -> str:
-    """按期望基线与工作距离给出人话提示（单行，可直接 print）。
+    """按期望基线与工作距离给出**参考**提示（单行，可直接 print）。
 
-    角度用对称交会近似 ``2*atan((B/2)/D)``（同 :func:`stereo.stereo_mode.geometry_advice`），
-    **只是提示，不是标定值** —— 真实夹角必须由标定 ``R`` 计算
-    （``docs/数据标准.md``: ``angle_deg`` 不是手填的 90.0）。
+    ## 语气：一律是"参考估算"，不是判定（2026-10-24 改）
+
+    用户原话："我不能精确确定摄像头的位置，所以这个不该设置成强相关固定，
+    相反，应该以标定计算得到结果为主。"
+
+    所以这里的话术必须让读者一眼看出两件事：
+
+    1. 括号里的角度是**由 B/D 粗估**的，不是标定值；
+    2. 真实夹角**以标定 ``R`` 计算为准**（``docs/数据标准.md``：``angle_deg``
+       不是手填的 90.0）。
+
+    因此本函数**不返回任何"错误/不支持"的判定语义** —— 它只是字符串。
+    估算偏离 90° 只说明"档案里填的 B/D 与 90° 装置对不上"，而不是"这个组合非法"：
+    用户的 B/D 本来就是估计值，错的是数字，不是装置。
     """
     baseline = profile.expected_baseline_mm
     distance = profile.working_distance_m
     if baseline is None or distance is None:
         missing = "、".join(
             name for name, value in (
-                ("期望基线 expected_baseline_mm", baseline),
-                ("工作距离 working_distance_m", distance),
+                ("expected_baseline_mm", baseline),
+                ("working_distance_m", distance),
             ) if value is None
         )
-        return f"无法估算夹角：档案缺少 {missing}（两者都给才能给出几何预期）"
+        return (f"参考估算：档案未填 {missing}（两项都是可选的，不影响判定）；"
+                "实际夹角以标定结果为准")
 
     angle = float(geometry_advice(baseline, distance)["angle_deg"])
     parts = [
-        f"估算夹角 {angle:.1f}°"
-        f"（由 B={baseline:.1f} mm / D={distance:.2f} m 估算，非标定值；"
-        "标定夹角请由标定 R 计算）"
+        f"参考估算：B={baseline:.0f} mm / D={distance:.2f} m ≈ {angle:.1f}°"
+        f"（由 B/D 粗估，非标定值；实际夹角以标定 R 计算为准）"
     ]
     if profile.stereo_mode == "angled":
         if abs(angle - 90.0) > 10.0:
             need = 2.0 * distance * 1000.0
             parts.append(
-                f"该基线/工作距离组合不支持 90°：需 B≈2·D ≈ {need:.0f} mm"
-                f"（当前 {baseline:.1f} mm）"
+                f"按此布置看不到 90° 所需的共同视场（对称 90° 需 B≈2·D≈{need:.0f} mm）"
+                f"—— 若装置是 90°，说明档案里的 B/D（当前 {baseline:.0f} mm）与实际不符，"
+                "请按标定结果更新"
             )
         else:
-            parts.append("与 90° 装置相符（±10° 内）")
+            parts.append("与本档案估算的 90° 相符（±10° 内，仅作参考）")
     elif angle >= 15.0:
-        parts.append("若实际装置是大角度/近似直角，请把 stereo_mode 设为 angled（估算仅作提示）")
+        parts.append("若实际装置是大角度/近似直角，请把 stereo_mode 设为 angled（估算仅作参考）")
     else:
-        parts.append("与平行/近平行装置相符")
+        parts.append("与平行/近平行装置的参考估算相符")
     return "；".join(parts)
 
 
