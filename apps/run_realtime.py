@@ -89,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
                    help=f"采集高度（默认档 {video_profiles.DEFAULT.label}）")
     p.add_argument("--fps", type=int, default=24,
-                   help="相机采集帧率（默认 24；默认档 2560x1440 主循环实测约 "
-                        "24.07fps，请求 30 会丢帧）")
+                   help="相机采集帧率（默认 24）。1440p 全尺寸写盘约 24fps；"
+                        "FOV 对齐后写盘 1718x972 时 30fps 实测稳定")
     p.add_argument(
         "--method",
         default=None,

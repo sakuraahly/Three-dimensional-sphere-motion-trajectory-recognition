@@ -125,8 +125,10 @@ def add_stereo_source_args(
     参数名/默认值集中在这里，三个双目 app 就永远同步，不会出现
     "这个脚本能用、那个不能"。
 
-    默认帧率 **24**（2026-10-24 真机实测）：默认档 2560x1440 下
-    ``record_stereo`` 主循环约 24.07fps，请求 30 会丢帧；24 是稳定目标。
+    默认帧率 **24**（2026-10-24 真机实测）：**1440p 全尺寸写盘**时
+    ``record_stereo`` 主循环约 24.07fps，请求 30 会丢帧；
+    但 **FOV 对齐后写盘 1718x972（1.67MP）时 30fps 稳定**（301 帧/10s 实测）。
+    两者不是一回事，别把 24 当成"这台机器只能 24"。
     """
     ap.add_argument("--left", default=None,
                     help="左相机：索引(0) / 角色名(left，查 config/cameras.json) / auto")
@@ -147,8 +149,8 @@ def add_stereo_source_args(
     ap.add_argument("--height", type=int, default=height,
                     help=f"相机采集高度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
     ap.add_argument("--fps", type=int, default=fps,
-                    help=f"相机采集帧率（默认 {fps}；1440p 主循环实测约 "
-                         f"24.07fps，请求 30 会丢帧）")
+                    help=f"相机采集帧率（默认 {fps}）。1440p 全尺寸写盘约 24fps；"
+                         "FOV 对齐后写盘 1718x972 时 30fps 实测稳定")
     return ap
 
 
