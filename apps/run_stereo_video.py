@@ -44,7 +44,8 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from calib import StereoRig                                  # noqa: E402
+from calib import StereoRig
+from calib.params import is_uncorrected                                  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig     # noqa: E402
 from sphere_tracker.geometry import CameraModel              # noqa: E402
 from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
@@ -81,6 +82,21 @@ def _make_pipeline(cfg: AppConfig, rig: StereoRig, side: str) -> SpherePipeline:
         ball_diameter_m=0.04,
     )
     return pipe
+
+
+def _mode_guard(mode: str, rectification: str) -> tuple[str, bool]:
+    """**兼容旧/错 meta**：记成 parallel 但标定其实是 none_raw（未校正）时改判 angled。
+
+    为什么需要：chain 产物（`R1=R2=I`、`P1=K1·[I|0]`、`P2=K2·[R|T]`）从没做过
+    极线校正，而 parallel 重建的 dy 门限与视差范围都建立在校正图上 —— 90° 装置
+    原始像素的 |dy| 可达几十~几百 px，结果是**全部候选被拒、配对率 0、不报错**。
+    历史标定文件已经这么写过，所以这里按标定产出的口径改判，而不是信 meta。
+
+    返回 ``(实际使用的模式, 是否发生了改判)``。纯函数，便于自测。
+    """
+    if mode == "parallel" and is_uncorrected(rectification):
+        return "angled", True
+    return mode, False
 
 
 def _project_left(rig, xyz, mode: str = "parallel") -> tuple[int, int] | None:
@@ -274,6 +290,13 @@ def main() -> int:
     else:
         # 显式给了 parallel/angled；仍然走同一入口，避免这里再长出一套归一化。
         mode = resolve_auto(args.stereo_mode)
+    # ---- 兼容旧数据：parallel + none_raw -> angled ----
+    # 必须在下面"实测夹角 vs 模式"复核之前：否则 90° 标定 + parallel 会直接
+    # 以退出码 2 结束，而不是按可用的 angled 路径重建。
+    mode, switched = _mode_guard(mode, rig.rectification)
+    if switched:
+        print("[模式] 标定是 none_raw（链式/未校正）但会话记为 parallel：已按 angled 重建。"
+              "可用 --stereo-mode angled 消掉这条提示。")
     angle = optical_axes_angle_deg(rig.R)
     print(f"双目模式：{mode_label(mode)}（{mode}）；标定实测光轴夹角 {angle:.1f}°；"
           f"基线 {rig.baseline_mm:.1f} mm")

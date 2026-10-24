@@ -151,6 +151,25 @@ def test_triangulate() -> bool:
         ("三维误差均值 <= 5 mm", mean_mm <= 5.0),
         ("三维误差最大 <= 10 mm", max_mm <= 10.0),
     ]
+    # ---- 使用点护栏：none_raw（链式/未校正）不能走 parallel 重建 ----
+    # 为什么要测：历史标定文件把 chain 记成 stereo_mode="parallel"，而
+    # dy ≤ 2.5 px / 视差范围都建立在校正图上 —— 90° 原始像素 |dy| 可达几百 px，
+    # 结果是全部候选被拒、配对率 0、**不报错**。护栏必须在构造点就拒绝。
+    bad_rig, _ = make_rig()
+    bad_rig.meta["rectification"] = "none_raw"
+    guard_text, guard_ok = "", False
+    try:
+        StereoReconstructor(bad_rig)
+    except ValueError as exc:
+        guard_text = str(exc)
+        guard_ok = "none_raw" in guard_text and "angled" in guard_text
+    print(f"  none_raw 护栏："
+          f"{guard_text.splitlines()[0][:62] if guard_text else '**没有报错**'}")
+    checks.append(("none_raw 标定构造 StereoReconstructor -> ValueError（拒绝 parallel 重建）",
+                   guard_ok))
+    # 护栏不能误伤正常标定：stereo_rectify 的 rig 仍可构造
+    checks.append(("stereo_rectify 标定不受护栏影响",
+                   StereoReconstructor(rig).n_frames == 0))
     ok = True
     for name, passed in checks:
         print(f"  [{'通过' if passed else '不达标'}] {name}")
@@ -257,6 +276,14 @@ def test_angled() -> bool:
     checks.append(("F 线距离/交会角质量评估",
                    q.line_rms_px < 1e-5 and "极线" in verdict
                    and q.n_pairs == len(pts)))
+    # run_stereo_video 的旧数据兼容：parallel + none_raw 必须改判 angled，
+    # 否则 90° 标定会走进 dy 门限为 0 配对的 parallel 路径。纯函数，可直接断言。
+    from apps.run_stereo_video import _mode_guard
+    checks.append(("run_video：parallel + none_raw -> 自动改判 angled",
+                   _mode_guard("parallel", "none_raw") == ("angled", True)))
+    checks.append(("run_video：已校正的 parallel / 显式 angled 不被改判",
+                   _mode_guard("parallel", "stereo_rectify") == ("parallel", False)
+                   and _mode_guard("angled", "none_raw") == ("angled", False)))
     ok = True
     for name, passed in checks:
         print(f"  [{'通过' if passed else '不达标'}] {name}")

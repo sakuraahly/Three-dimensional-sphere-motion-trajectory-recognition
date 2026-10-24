@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from calib import StereoRig
+from calib.params import is_uncorrected
 from sphere_tracker.types import Detection
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,17 +76,25 @@ class StereoPoint:
 
 
 def rectify_point_left(rig: StereoRig, x: float, y: float) -> tuple[float, float]:
-    """把一个左图像素点映射到"校正后的左相机"坐标系。"""
-    p = cv2.undistortPoints(np.array([[[x, y]]], np.float64), rig.K1, rig.D1,
-                            R=rig.R1, P=rig.P1)
-    return float(p[0, 0, 0]), float(p[0, 0, 1])
+    """把一个左图像素点映射到"校正后的左相机"坐标系。
+
+    坐标口径**只由** `StereoRig.undistort_points()` 决定，这里不再自己传
+    `rig.R1/P1`：`none_raw`（chain/90°）标定下 `P1` 的 3x3 是 `K1` 而不是
+    "新内参"，自己拼参数就会把口径写死成 parallel。
+    """
+    px, py = rig.undistort_points("left", [[x, y]])[0]
+    return float(px), float(py)
 
 
 def rectify_point_right(rig: StereoRig, x: float, y: float) -> tuple[float, float]:
-    """把一个右图像素点映射到"校正后的右相机"坐标系。"""
-    p = cv2.undistortPoints(np.array([[[x, y]]], np.float64), rig.K2, rig.D2,
-                            R=rig.R2, P=rig.P2)
-    return float(p[0, 0, 0]), float(p[0, 0, 1])
+    """把一个右图像素点映射到"校正后的右相机"坐标系（口径同上，统一入口）。
+
+    ⚠️ `none_raw` 下 `P2 = K2·[R|T]`，3x3 块是 **K2·R**、不是新内参；
+    直接把它当 `newCameraMatrix` 会**多转一次 R**（实测 828 px -> -9155 px），
+    交会残差随之失真。
+    """
+    px, py = rig.undistort_points("right", [[x, y]])[0]
+    return float(px), float(py)
 
 
 def match_epipolar(
@@ -190,6 +199,17 @@ class StereoReconstructor:
     _low_rate_warned: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
+        # ---- 使用点护栏：none_raw（链式/未校正）不能走 parallel 重建 ----
+        # 为什么必须在这里拦、而不是只靠入口写对 meta：
+        # 历史标定文件已经写错过（chain 落了 stereo_mode="parallel"），而
+        # max_epipolar_px=2.5 / 视差范围都建立在"极线已水平"的前提上。90° 装置
+        # 原始像素的 |dy| 可达几十~几百 px，于是**全部候选被拒、配对率 0、不报错**。
+        # 这种静默归零比崩溃难查得多，所以直接用异常拒绝。
+        rect = getattr(self.rig, "rectification", "") if self.rig is not None else ""
+        if is_uncorrected(rect):
+            raise ValueError(
+                "该标定未做极线校正（none_raw），不能用 parallel 重建"
+                "（dy 门限/视差范围都建立在校正图上）。请用 angled 重建。")
         # 视差符号按装置实际朝向自动定：右相机在右边 -> +1，装反了 -> -1。
         # 不这么做的话，装反时配对率是 0%，而报错只有"配不上"。
         if not self.cfg.disparity_sign:
