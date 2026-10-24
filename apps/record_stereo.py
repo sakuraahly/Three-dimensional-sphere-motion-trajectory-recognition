@@ -12,6 +12,10 @@ FOV 生效时（标定 meta 带 `fov`）写盘 / 预览用的是标定的 `fov.t
 `session.json` 的 `left/right.width/height`、`calibration.image_size` 都记
 写盘尺寸；无损 MKV 只接受偶数宽高，奇数 target 会在录制前退出 2。
 
+**angled 模式不做 FOV 对齐**：两路光轴近乎垂直、视场几乎不重叠，单应裁剪
+没有物理意义。此时写盘就是两路各自的原始画面（`--width/--height`），
+`fov` 记录即使存在也会被忽略（并在日志里说明）。
+
 录完做什么
 ----------
 - 写 `session.json`（分辨率 / 实测 fps / 帧数 / 标定快照 + sha256 / 同步偏移）；
@@ -49,9 +53,14 @@ if str(ROOT) not in sys.path:
 
 from apps._common import setup_logging                      # noqa: E402
 from calib.params import StereoRig                           # noqa: E402
-from stereo.fov_align import FovAlignment                    # noqa: E402
+from stereo.fov_align import (                              # noqa: E402
+    MIN_FOV_INLIERS,
+    MIN_FOV_QUALITY,
+    FovAlignment,
+    fov_confidence_problem,
+)
 from stereo.stereo_mode import (                             # noqa: E402
-    infer_mode, normalize_mode, optical_axes_angle_deg,
+    optical_axes_angle_deg, resolve_auto,
 )
 from sphere_tracker.camera_registry import (                 # noqa: E402
     load_registry,
@@ -482,6 +491,11 @@ def main() -> int:
             print(f"[错误] 标定快照失败：{exc}")
             return 1
 
+        # ---- 双目模式：入口层唯一解析点（核心层不接受 auto）----
+        # 标定 meta 是**平铺**的（StereoRig.save 直接写 meta），整份传进去。
+        mode = resolve_auto(args.stereo_mode, calibration=rig.meta)
+        LOG.info("双目模式：%s（--stereo-mode %s）", mode, args.stereo_mode)
+
         # 新标定在 meta 里带 FOV 对齐参数；**只有** 缺失 / None 才是旧标定 ->
         # fov=None，行为不变。{} / [] / 非 mapping 是损坏记录，必须像 verify
         # 一样退出 2：不能把“解析不出来”静默当成“没有 FOV”。
@@ -494,6 +508,14 @@ def main() -> int:
                   "请重新标定后再录。")
             LOG.error("标定 meta.fov 解析失败，拒绝录制：%s", exc)
             return 2
+        # angled：两路光轴近乎垂直、视场几乎不重叠，单应裁剪没有物理意义。
+        # 写盘就是两路各自的原始画面（坐标系仍是 left_camera），所以不用
+        # fov.target_size，也不再拿它去核对 image_size。
+        if mode == "angled":
+            if fov is not None and fov.active:
+                print("[FOV] 标定记录里带裁剪/缩放参数，但模式为 angled：忽略它。")
+                LOG.warning("angled 模式忽略标定 meta.fov=%s", fov.to_dict())
+            fov = None
         out_w, out_h = ((int(fov.target_size[0]), int(fov.target_size[1]))
                         if fov is not None and fov.active
                         else (int(args.width), int(args.height)))
@@ -512,8 +534,19 @@ def main() -> int:
             validate_capture_size(rig, out_w, out_h)
         except ValueError as exc:
             print(f"[错误] {exc}")
+            if mode == "angled" and raw_fov:
+                print("       这份 angled 标定带了 FOV 对齐记录（内参基于裁剪后尺寸），"
+                      "但 angled 录制按原始画面写盘；请重新标定（不强制 --fov），"
+                      "或改用与内参一致的写盘尺寸。")
             return 2
-        if fov is not None:
+        if mode == "angled":
+            lw, lh = int(left_src.info.width), int(left_src.info.height)
+            rw, rh = int(right_src.info.width), int(right_src.info.height)
+            print(f"[FOV] 未做 FOV 对齐（angled）：写盘为两路原始画面；"
+                  f"左 {lw}x{lh} / 右 {rw}x{rh}")
+            LOG.info("angled：跳过 FOV 对齐，写盘原始画面 左 %sx%s / 右 %sx%s",
+                     lw, lh, rw, rh)
+        elif fov is not None:
             if fov.active and tuple(fov.target_size) != tuple(rig.image_size):
                 print(f"[错误] 标定 meta.fov.target_size {fov.target_size} 与 "
                       f"image_size {rig.image_size} 不一致，拒绝录制。")
@@ -552,6 +585,15 @@ def main() -> int:
                     LOG.error("fov.target_size %s 含奇数宽高，拒绝录制",
                               fov.target_size)
                     return 2
+                # 沿用标定里的 FOV 时只警告、不中止：画面已经录下来还能救，
+                # 但必须让人知道这次写盘可能被错误裁剪。阈值与标定端同源
+                # （stereo/fov_align.py），不在这里另写一份。
+                if fov.quality < MIN_FOV_QUALITY or fov.inliers < MIN_FOV_INLIERS:
+                    print(f"[警告] 沿用的 FOV 对齐置信度低（{fov_confidence_problem(fov)}）："
+                          "写盘画面可能被错误裁剪；本次仍按该参数录制。")
+                    print("       建议换有纹理的场景重新标定，或改按原始画面录制。")
+                    LOG.warning("沿用低置信度 FOV：%s；%s",
+                                fov_confidence_problem(fov), fov.to_dict())
                 print(f"[FOV] 沿用标定对齐：参考 {fov.reference_side} / "
                       f"裁剪 {fov.crop_side} / 裁剪区 {fov.crop_rect} -> "
                       f"{out_w}x{out_h}（采集 {cap_w}x{cap_h}，不放大）")
@@ -571,10 +613,7 @@ def main() -> int:
             created=str(rig.meta.get("created") or ""),
             verdict=str((rig.quality or {}).get("verdict") or ""),
         )
-        if args.stereo_mode == "auto":
-            mode = infer_mode(calibration={"meta": rig.meta})
-        else:
-            mode = normalize_mode(args.stereo_mode)
+        # mode 已在加载标定后由 resolve_auto() 落定，这里不再分叉解析。
         session.stereo_mode = mode
         session.rig = {
             "stereo_mode": mode,

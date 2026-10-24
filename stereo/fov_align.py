@@ -43,7 +43,21 @@ from typing import Any
 import cv2
 import numpy as np
 
-__all__ = ["FovAlignment", "estimate_fov_alignment"]
+__all__ = [
+    "FovAlignment",
+    "MIN_FOV_QUALITY",
+    "MIN_FOV_INLIERS",
+    "estimate_fov_alignment",
+    "fov_confidence_problem",
+]
+
+# FOV 对齐可信度的**下限**（默认值，调用方可覆盖）。
+#
+# 现有可用标定实测 quality=0.513 / inliers=296 —— 那是**正常值**，不是判据；
+# 0.30 / 60 只是"明显不可信"的下限（给换机位/低纹理场景留余量），
+# 不是"必须 ≥0.5"。新数据足够多时再按实战分布调这两个数。
+MIN_FOV_QUALITY = 0.30
+MIN_FOV_INLIERS = 60
 
 # 匹配与估计参数集中在这里，换机器时只调一处。
 _SIFT_MAX_FEATURES = 5000
@@ -246,6 +260,35 @@ class FovAlignment:
         except KeyError as exc:
             raise ValueError(f"FovAlignment 字典缺少字段 {exc.args[0]!r}") from exc
         return cls(**payload)
+
+
+def fov_confidence_problem(
+    fov: FovAlignment,
+    *,
+    min_quality: float = MIN_FOV_QUALITY,
+    min_inliers: int = MIN_FOV_INLIERS,
+) -> str:
+    """低于可信下限时返回一句原因（如 ``"quality=0.18 < 0.30，inliers=37 < 60"``）。
+
+    可信时返回空串。**只对 parallel 有判别力**：
+
+    - parallel 的失败模式是"匹配不足"或"匹配到错的东西"，内点比例 / 数量
+      能反映出来，所以这里用下限拦住它；
+    - angled（大角度）的失败模式是"**在近处某个平面上匹配得很好**" ——
+      单应照样成立、inliers 甚至比平行基线（296）更高。也就是说 90° 下
+      inliers 变多**不是好消息**，这两个指标对它没有判别力，调用方不得对
+      angled 使用本函数做门禁（否则只会误伤"匹配很成功但几何无意义"的情况）。
+    """
+    low_quality = fov.quality < min_quality
+    low_inliers = fov.inliers < min_inliers
+    if not (low_quality or low_inliers):
+        return ""
+    parts = []
+    if low_quality:
+        parts.append(f"quality={fov.quality:.2f} < {min_quality:.2f}")
+    if low_inliers:
+        parts.append(f"inliers={fov.inliers} < {min_inliers}")
+    return "，".join(parts)
 
 
 # --------------------------------------------------------------------------

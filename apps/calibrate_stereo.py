@@ -57,8 +57,13 @@ from apps._common import (
     setup_logging,
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
-from stereo.fov_align import estimate_fov_alignment
-from stereo.stereo_mode import infer_mode, optical_axes_angle_deg
+from stereo.fov_align import (
+    MIN_FOV_INLIERS,
+    MIN_FOV_QUALITY,
+    estimate_fov_alignment,
+    fov_confidence_problem,
+)
+from stereo.stereo_mode import optical_axes_angle_deg, resolve_auto
 from sphere_tracker.sources import quiet_repeated_grab_warnings
 
 WINDOW = "stereo calibration"
@@ -85,6 +90,19 @@ def _screen_size() -> tuple[int, int]:
     except Exception:
         pass
     return 1920, 1080
+
+
+def _previous_calib_meta(out: str) -> dict | None:
+    """读上一份标定 JSON（``StereoRig.save`` 写的是**平铺**的 meta）。
+
+    读不到 / 不是对象就返回 ``None``：``--stereo-mode auto`` 在新装置上本来
+    就没有旧文件可继承，这不是错误。
+    """
+    try:
+        raw = json.loads(Path(out).with_suffix(".json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +172,13 @@ def main() -> int:
                     default="auto",
                     help="双目模式：auto=沿用旧输出模式（无旧文件则 parallel）；"
                          "angled=大角度（近似直角）。实际夹角由标定 R 计算，不写死 90°")
+    fov = ap.add_mutually_exclusive_group()
+    fov.add_argument("--skip-fov", action="store_true",
+                     help="跳过两路视场（FOV）对齐：不估单应、不裁剪不缩放，"
+                          "按两路各自原始画面标定。angled 默认就这样")
+    fov.add_argument("--fov", action="store_true",
+                     help="即使 --stereo-mode angled 也强行做 FOV 对齐（单应/裁剪的前提"
+                          "只对近平行成立；大角度下是否可用由你自己判断）")
     ap.add_argument("--out", default="config/stereo_calibration", help="输出前缀")
     ap.add_argument("--save-pairs", default=None, help="把收下的图像对另存到这个目录（便于复查）")
     ap.add_argument("--report-png", default=None, help="输出验证图路径")
@@ -209,15 +234,46 @@ def main() -> int:
     for w in getattr(src, "warnings", []) or []:
         log.warning("取帧源告警：%s", w)
 
+    # ---- 双目模式：入口层唯一解析点 ----
+    # auto 必须在这里落定；核心层 normalize_mode() 收到 auto 会直接报错。
+    # 旧输出 JSON 的 meta 是**平铺**的（StereoRig.save 不做嵌套），所以整份
+    # JSON 直接当 calibration 传进去，不要包成 {"meta": old}（那样永远查不到）。
+    prev_meta = _previous_calib_meta(args.out)
+    mode = resolve_auto(args.stereo_mode, calibration=prev_meta)
+    if args.stereo_mode == "auto":
+        note = (f"沿用旧输出 {Path(args.out).with_suffix('.json').name}"
+                if prev_meta else "无旧输出，默认 parallel")
+        print(f"[模式] {mode}（auto：{note}）")
+        log.info("auto -> %s（%s）", mode, note)
+    else:
+        print(f"[模式] {mode}（显式）")
+        log.info("模式：%s（显式）", mode)
+
+    # FOV 对齐的前提是两光轴**近平行**：两路看到同一片纹理，单应 H 才能把
+    # 较广一路裁到较窄一路的视场里。大角度（~90°）时两路视场几乎不重叠，
+    # H 没有物理意义，裁出来的画面会错位 —— 所以 angled 默认不做对齐，
+    # 两路按各自原始画面标定（坐标系仍是 left_camera，见 数据标准.md §1.5）。
+    # --fov 可以强行打开（是否真的近共视由用户判断）。
+    do_fov = not args.skip_fov and (mode != "angled" or args.fov)
+    if mode == "angled" and not do_fov:
+        print("[FOV] 跳过视场对齐（angled）：单应/裁剪的前提只对近平行成立；"
+              "两路按各自原始画面标定。")
+        print("      如需强行对齐（仅当你确认两路其实近共视）请加 --fov。")
+        log.info("angled 模式跳过 FOV 对齐（可用 --fov 强制）")
+    elif args.skip_fov:
+        print("[FOV] 已按 --skip-fov 跳过视场对齐，两路按原始画面标定。")
+        log.info("--skip-fov：跳过 FOV 对齐")
+
     # ---- 启动时一次性估计 FOV 对齐（之后逐帧复用，绝不重估） ----
     #
-    # 为什么必须在这里做、而且失败就退出：
+    # 为什么必须在这里做、而且失败就退出（仅 parallel）：
     #   左相机比右相机放大 ~1.5x，直接按原生分辨率标定，两路像素尺度不一致，
     #   视差与深度会被系统性污染，而标定报告本身看不出来。
     #   所以宁可在启动时明确失败，也不允许"没对齐就继续"（fail-closed）。
     #
     # 相机刚打开的前几帧可能是黑帧/坏帧，这里最多读 30 帧或约 5 秒；
     # 一旦拿到成对帧就**只估计一次**，并把这帧对留给主循环（不丢弃）。
+    # 跳过 FOV 时仍然要读这一帧 —— 主循环拿它当首帧，不浪费。
     fov = None
     first_pair = None
     read_attempts = 0
@@ -234,56 +290,87 @@ def main() -> int:
         break
 
     if first_pair is None:
-        print("\n[错误] 启动后读不到可用的成对画面，无法自动估计 FOV 对齐。")
+        print("\n[错误] 启动后读不到可用的成对画面，无法开始采集。")
         if src.is_live:
             print("       请先确认两路相机都能出图："
                   "python apps/tools/cameras.py doctor")
-            print("       然后重试；本次不会在未对齐的情况下继续标定。")
+            print("       然后重试；本次不会在没有画面的情况下继续标定。")
         else:
             print("       两路视频/图片序列没有同时有效的帧：检查左右文件是否成对、"
                   "长度是否一致。")
-        log.error("启动阶段取不到成对帧，无法估计 FOV，退出（%s）", src.kind)
+        log.error("启动阶段取不到成对帧，退出（%s）", src.kind)
         src.release()
         return 1
 
-    try:
-        print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
-        fov = estimate_fov_alignment(first_pair[0], first_pair[1])
-    except ValueError as exc:
-        print("\n[错误] 无法自动估计两路 FOV 对齐，已停止（不会按原生分辨率继续）。")
-        print(f"       原因：{exc}")
-        print("       请把**有纹理的物体或标定板**同时放进两路画面、光照均匀、"
-              "对焦清晰，然后重试。")
-        print("       空白墙/纯色桌面/严重欠曝都会让特征匹配失败。")
-        log.error("FOV 估计失败，退出（不静默继续）：%s", exc)
-        src.release()
-        return 1
+    if do_fov:
+        try:
+            print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
+            fov = estimate_fov_alignment(first_pair[0], first_pair[1])
+        except ValueError as exc:
+            print("\n[错误] 无法自动估计两路 FOV 对齐，已停止（不会按原生分辨率继续）。")
+            print(f"       原因：{exc}")
+            print("       请把**有纹理的物体或标定板**同时放进两路画面、光照均匀、"
+                  "对焦清晰，然后重试。")
+            print("       空白墙/纯色桌面/严重欠曝都会让特征匹配失败。")
+            if mode == "parallel":
+                print("       **若是大角度装置（~90°），两路本就几乎没有共同纹理**："
+                      "请加 --skip-fov，或用 --stereo-mode angled 重跑。")
+            log.error("FOV 估计失败，退出（不静默继续）：%s", exc)
+            src.release()
+            return 1
 
-    mag = max(fov.scale, 1.0 / fov.scale)
-    print("[FOV] 自动视场对齐（启动时只估计一次，之后逐帧复用）")
-    print(f"      参考（较窄；必要时降采样，不裁剪）：{fov.reference_side}    "
-          f"裁剪：{fov.crop_side}")
-    print(f"      裁剪区 (x, y, w, h) = {fov.crop_rect}    "
-          f"归一化尺寸 {fov.target_size[0]}x{fov.target_size[1]}")
-    print(f"      较窄一侧相对较广一侧放大 ~{mag:.2f}x    "
-          f"尺度 left->right={fov.scale:.4f}    "
-          f"质量 {fov.quality:.2f}（{fov.method}，内点 {fov.inliers}）")
-    if fov.active:
-        wide_frame = first_pair[0] if fov.crop_side == "left" else first_pair[1]
-        wide_h, wide_w = wide_frame.shape[:2]
-        x, y, w, h = fov.crop_rect
-        keep = (w * h) / float(max(1, wide_w * wide_h))
-        print(f"      ⚠ 较广的一侧（{fov.crop_side}）会损失视场：只保留 {keep:.0%} "
-              f"原画面（{w}x{h} / {wide_w}x{wide_h}），其余会被裁掉；")
-        print(f"        录制的两路视频会统一为 {fov.target_size[0]}x"
-              f"{fov.target_size[1]} 并沿用这份对齐参数。")
-    else:
-        print("      两路视场基本一致：不裁剪、不缩放（crop_side=none）。")
-    log.info("FOV 对齐：参考 %s / 裁剪 %s / 裁剪区 %s / 放大 %.3fx / "
-             "质量 %.3f（%s，内点 %d）",
-             fov.reference_side, fov.crop_side, fov.crop_rect, mag,
-             fov.quality, fov.method, fov.inliers)
-    print()
+        # 这五个数不管哪种模式都并列打印出来：判据交给人，但数字必须是明面上的。
+        print(f"[FOV] scale={fov.scale:.4f}  inliers={fov.inliers}  "
+              f"quality={fov.quality:.3f}  crop_rect={list(fov.crop_rect)}  "
+              f"target_size={list(fov.target_size)}")
+        if mode == "parallel":
+            print("      平行基线参照（本机现役装置，实测夹角 1.4°）：scale=0.6649  "
+                  "inliers=296  quality=0.513  crop_rect=[404,195,1718,973]  "
+                  "target_size=[1718,972]")
+            # 门禁只属于 parallel：低于下限就不要猜，直接中止。
+            # 阈值在 stereo/fov_align.py（MIN_FOV_QUALITY / MIN_FOV_INLIERS），
+            # 0.30/60 是留余量的**下限** —— 现有可用标定的 0.513/296 是正常值。
+            if fov.quality < MIN_FOV_QUALITY or fov.inliers < MIN_FOV_INLIERS:
+                print(f"\n[错误] FOV 对齐不可信（{fov_confidence_problem(fov)}）："
+                      "拒绝用这次估计裁剪标定图。")
+                print("       下一步：换有纹理的场景（标定板 / 纸箱 / 桌面杂物）重拍，"
+                      "别对着白墙或纯色桌面；")
+                print("       或者用 --skip-fov 让两路各用原始画面"
+                      "（大角度装置请加 --stereo-mode angled）。")
+                log.error("FOV 对齐不可信（%s），退出：%s",
+                          fov_confidence_problem(fov), fov.to_dict())
+                src.release()
+                return 1
+        else:
+            print("      注：angled 不按下限判据 —— 大角度下的失败模式是"
+                  "「在近处某个平面上匹配得很好」，")
+            print("          inliers 变多不是好消息；请自行核对 scale 是否偏离物理预期。")
+
+        mag = max(fov.scale, 1.0 / fov.scale)
+        print("[FOV] 自动视场对齐（启动时只估计一次，之后逐帧复用）")
+        print(f"      参考（较窄；必要时降采样，不裁剪）：{fov.reference_side}    "
+              f"裁剪：{fov.crop_side}")
+        print(f"      裁剪区 (x, y, w, h) = {fov.crop_rect}    "
+              f"归一化尺寸 {fov.target_size[0]}x{fov.target_size[1]}")
+        print(f"      较窄一侧相对较广一侧放大 ~{mag:.2f}x    "
+              f"尺度 left->right={fov.scale:.4f}    "
+              f"质量 {fov.quality:.2f}（{fov.method}，内点 {fov.inliers}）")
+        if fov.active:
+            wide_frame = first_pair[0] if fov.crop_side == "left" else first_pair[1]
+            wide_h, wide_w = wide_frame.shape[:2]
+            x, y, w, h = fov.crop_rect
+            keep = (w * h) / float(max(1, wide_w * wide_h))
+            print(f"      ⚠ 较广的一侧（{fov.crop_side}）会损失视场：只保留 {keep:.0%} "
+                  f"原画面（{w}x{h} / {wide_w}x{wide_h}），其余会被裁掉；")
+            print(f"        录制的两路视频会统一为 {fov.target_size[0]}x"
+                  f"{fov.target_size[1]} 并沿用这份对齐参数。")
+        else:
+            print("      两路视场基本一致：不裁剪、不缩放（crop_side=none）。")
+        log.info("FOV 对齐：参考 %s / 裁剪 %s / 裁剪区 %s / 放大 %.3fx / "
+                 "质量 %.3f（%s，内点 %d）",
+                 fov.reference_side, fov.crop_side, fov.crop_rect, mag,
+                 fov.quality, fov.method, fov.inliers)
+        print()
 
     from calib import CaptureConfig
     cap_kw: dict = dict(
@@ -376,7 +463,9 @@ def main() -> int:
 
             # 逐帧复用启动时得到的同一份 FOV 参数（不重估）；两路归一化后再
             # 送进 collector / 存图，所以 collector.image_size 就是归一化尺寸。
-            left, right = fov.apply(left, right)
+            # 跳过对齐（angled / --skip-fov）时两路保持原始画面。
+            if fov is not None:
+                left, right = fov.apply(left, right)
 
             t0 = time.perf_counter()
             gl = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
@@ -521,7 +610,7 @@ def main() -> int:
     img_size = collector.image_size
     # image_size 必须是 FOV 归一化后的尺寸（录制端会拿它核对分辨率）；
     # 不一致说明采集中途分辨率变了，继续标定只会得到错误内参。
-    if fov.active and tuple(img_size) != tuple(fov.target_size):
+    if fov is not None and fov.active and tuple(img_size) != tuple(fov.target_size):
         print(f"\n[错误] 采集帧尺寸 {img_size} 与 FOV 归一化尺寸 "
               f"{fov.target_size} 不一致，停止标定。")
         print("       通常是相机中途重连 / 分辨率被改变；请重新标定。")
@@ -546,16 +635,8 @@ def main() -> int:
         log.warning("标定未通过质量判定，未保存")
         return 1
 
-    mode = "parallel"
-    if args.stereo_mode == "angled":
-        mode = "angled"
-    elif args.stereo_mode == "auto":
-        # 重新标定同一装置时保留旧输出里的模式；新文件默认 parallel。
-        try:
-            old = json.loads(Path(args.out).with_suffix(".json").read_text(encoding="utf-8"))
-            mode = infer_mode(calibration={"meta": old})
-        except Exception:                                   # noqa: BLE001
-            mode = "parallel"
+    # 模式在启动前就由 resolve_auto() 落定了（入口层唯一解析点），这里只做
+    # "推断值与实测夹角是否自相矛盾"的复核；不再先 normalize 再分叉。
     measured_angle = float(optical_axes_angle_deg(res.R))
     if args.stereo_mode == "auto" and (
             (mode == "parallel" and measured_angle >= 40.0)
@@ -572,7 +653,7 @@ def main() -> int:
         "left": args.left if args.left is not None else (args.left_video or args.left_dir),
         "right": args.right if args.right is not None else (args.right_video or args.right_dir),
         "image_size": list(img_size),
-        "fov": fov.to_dict(),
+        "fov": fov.to_dict() if fov is not None else None,
         "stereo_mode": mode,
         "angle_deg": measured_angle,
     })
