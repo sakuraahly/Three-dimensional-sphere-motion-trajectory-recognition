@@ -64,7 +64,18 @@ class BoardObservation:
     found: bool = False
     corners: np.ndarray | None = None       # (N,1,2) float32
     homography: np.ndarray | None = None    # 板平面(0..1)->图像 的 3x3 单应
-    sharpness: float = 0.0                  # 棋盘区域的 Laplacian 方差
+    # 棋盘区域的 Laplacian 方差。**仅用于显示/日志**，不要拿它当门限：
+    # 同样的模糊程度下，板在画面里越大，这个值越小（实测 240px 宽 ~4373、
+    # 960px 宽 ~1017），阈值会随板大小漂移。判"糊不糊"请用 `focus`。
+    sharpness: float = 0.0
+    # 一个格子占多少像素（相邻内角点间距的中位数：横向取相邻列、纵向取相邻行，
+    # 再取两者的中位）。不用"整体宽/列数"是因为斜视时梯形会被平均掉、偏大。
+    square_px: float = 0.0
+    # **尺度无关的清晰度** = sharpness × square_px。Laplacian 方差随格子像素数
+    # 近似反比下降，乘回去就把"板大板小"消掉了 —— 同一模糊程度下几乎恒定
+    # （实测 σ=0/0.8/1.6/2.5/4.0 -> ~71k/8.5k/1.5k/480/150）。
+    # 所以门限（`CaptureConfig.min_sharpness`）只在 focus 上定义，不随板大小漂移。
+    focus: float = 0.0
     area_ratio: float = 0.0                 # 棋盘凸包面积 / 图像面积
     margin_px: float = 0.0                  # 角点到图像边界的最小距离
     brightness: float = 0.0
@@ -88,7 +99,13 @@ class BoardObservation:
 
 
 def _sharpness(gray: np.ndarray, corners: np.ndarray | None) -> float:
-    """棋盘区域的清晰度：Laplacian 方差。越小越模糊（运动模糊/失焦）。"""
+    """棋盘区域的清晰度：Laplacian 方差。越小越模糊（运动模糊/失焦）。
+
+    ⚠️ **这个值不是尺度无关的**：棋盘在画面里占的像素越少（板远/分辨率低），
+    方格边缘越密，同一模糊程度下方差反而更大（实测同一模糊 σ=0.8：板宽 240px
+    时 504、960px 时 125）。所以它只能当"显示用"的参考量，
+    **判据必须用 `BoardObservation.focus`（本值 × 格子像素数）**。
+    """
     if corners is None or len(corners) == 0:
         return 0.0
     x, y, w, h = cv2.boundingRect(corners.reshape(-1, 1, 2).astype(np.int32))
@@ -101,9 +118,31 @@ def _sharpness(gray: np.ndarray, corners: np.ndarray | None) -> float:
     return float(cv2.Laplacian(roi, cv2.CV_64F).var())
 
 
+def _square_px(corners: np.ndarray, spec: BoardSpec) -> float:
+    """一个方格占多少像素。用**相邻内角点间距的中位数**，不用整体宽/列数。
+
+    为什么不用"整体宽/列数"：板一斜，近端格子大、远端格子小，整体宽除以列数
+    拿到的是被梯形平均过的一个数，和棋盘区域里实际占主导的格子尺寸对不上；
+    Laplacian 方差的尺度因子正是"格子的像素尺寸"，所以要用**局部**间距。
+    """
+    if corners is None:
+        return 0.0
+    pts = np.asarray(corners, np.float32).reshape(-1, 2)
+    if pts.shape[0] != spec.n_points or spec.cols < 2 or spec.rows < 2:
+        return 0.0
+    grid = pts.reshape(spec.rows, spec.cols, 2)      # SB/经典都是行优先
+    hgaps = np.linalg.norm(grid[:, 1:, :] - grid[:, :-1, :], axis=2).ravel()
+    vgaps = np.linalg.norm(grid[1:, :, :] - grid[:-1, :, :], axis=2).ravel()
+    hmed = float(np.median(hgaps)) if hgaps.size else 0.0
+    vmed = float(np.median(vgaps)) if vgaps.size else 0.0
+    if hmed <= 0.0 or vmed <= 0.0:
+        return float(max(hmed, vmed))
+    return float(np.median([hmed, vmed]))
+
+
 def _finish(obs: BoardObservation, corners: np.ndarray, gray: np.ndarray,
             spec: BoardSpec, precise: bool, detector: str) -> BoardObservation:
-    """由角点补齐单应、面积、边距、清晰度、亮度等指标。
+    """由角点补齐单应、面积、边距、清晰度（sharpness/focus）、亮度等指标。
 
     `detector` 必须由调用方显式给出（`"sb"` / `"classic"`）——
     角点的**出身**不能丢，原因见 `detect_board()` 的文档串。
@@ -142,6 +181,9 @@ def _finish(obs: BoardObservation, corners: np.ndarray, gray: np.ndarray,
     obs.margin_px = float(min(pts[:, 0].min(), pts[:, 1].min(),
                               w - 1 - pts[:, 0].max(), h - 1 - pts[:, 1].max()))
     obs.sharpness = _sharpness(gray, obs.corners)
+    obs.square_px = _square_px(obs.corners, spec)
+    # 尺度无关清晰度：两者都算得出来才有意义（缺失时保持 0，交给调用方按"不知道"处理）
+    obs.focus = obs.sharpness * obs.square_px if (obs.sharpness and obs.square_px) else 0.0
     xs = np.clip(pts[:, 0].astype(np.int32), 0, w - 1)
     ys = np.clip(pts[:, 1].astype(np.int32), 0, h - 1)
     obs.brightness = float(gray[ys, xs].mean())

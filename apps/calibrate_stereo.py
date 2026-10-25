@@ -790,9 +790,12 @@ def main() -> int:
                          "手持板够不着就调大，但别超过 ~12：这条门限同时替代了左右同步，"
                          "放太松会让两路拍到不同位姿，解出的 R/T 会系统性偏")
     ap.add_argument("--min-sharpness", type=float, default=None,
-                    help="棋盘区域清晰度下限（Laplacian 方差，默认 55）。调低会收进更糊的帧")
+                    help="额外绝对下限（focus 单位）。默认 800——低于 "
+                         "findChessboardCornersSB 的可检出下限（约 3200），"
+                         "实际不会触发；真正生效的是「低于本组中位数 40%%」"
+                         "的相对清晰度判据。要更严请调大，但会成片拒收。")
     ap.add_argument("--relaxed", action="store_true",
-                    help="手持拍摄的宽松预设：停稳上限 10 px、清晰度下限 28、"
+                    help="手持拍摄的宽松预设：停稳上限 10 px、额外绝对下限 400、"
                          "允许更小的板。**换来过检风险**，精度不满意就退回默认值重标")
     args = ap.parse_args()
     if args.skip_fov and args.require_fov:
@@ -1035,7 +1038,7 @@ def main() -> int:
         # 手持预设。**每一条都是"用精度换成功率"**，所以逐条说清代价：
         cap_kw.update(
             stationary_max_px=10.0,   # 允许手更抖；代价=两路位姿差变大
-            min_sharpness=28.0,       # 允许更糊；代价=角点定位变差
+            min_sharpness=400.0,      # 额外的绝对下限（默认值高于 SB 检出下限时才会真拦）
             min_area_ratio=0.008,     # 允许板更远；代价=单像素误差占比变大
             min_margin_px=6.0,        # 允许更贴边；代价=边缘畸变没被约束住
             min_brightness=25.0,

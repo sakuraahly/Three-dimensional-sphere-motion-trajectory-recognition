@@ -1008,8 +1008,10 @@ class Launcher(tk.Tk):
             adv, "停稳上限 px", "3", "清空 = 用程序内置默认；这条**同时替代左右同步**，"
                                      "调大到 10 以上会让两路拍到不同位姿、R/T 系统性偏")
         self.calib_sharp = self._param_entry(
-            adv, "清晰度下限", "55", "清空 = 用程序内置默认（Laplacian 方差）。"
-                                     "调低会收进更糊的帧")
+            adv, "额外绝对下限（focus；默认 800 实际不触发，真正生效的是相对中位数 40%）", "800",
+            "清空 = 用程序内置默认。程序只拒「明显比本组中位数糊」的帧（<40%）；"
+            "这一格是额外的绝对下限，默认值低于相机能检出棋盘的下限，所以平时不起作用。"
+            "想让门更严就调大，但会成片拒收。")
         self.calib_relaxed = tk.BooleanVar(value=False)
         self._param_check(adv, "放宽模式（手持拍摄：一次放松 6 条门限）",
                           self.calib_relaxed,
@@ -2185,7 +2187,8 @@ class Launcher(tk.Tk):
             self.calib_stationary, "停稳上限 px", 0.5, 12.0)
         if not ok1:
             return None
-        sharp, ok2 = self._read_opt_float(self.calib_sharp, "清晰度下限", 5.0, 500.0)
+        sharp, ok2 = self._read_opt_float(
+            self.calib_sharp, "额外绝对下限（focus）", 50.0, 200000.0)
         if not ok2:
             return None
         baseline, ok3 = self._read_opt_float(

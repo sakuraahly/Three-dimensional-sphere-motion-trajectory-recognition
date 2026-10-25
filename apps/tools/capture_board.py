@@ -9,7 +9,11 @@
 判据沿用 ``calib.board`` 与 ``calib.capture`` 的口径，不另起一套：
   * 整块棋盘检出 —— ``calib.board.detect_board``（SB，绝不混用经典检测器）；
   * 静止 —— 相对上一帧角点的**最大**位移 ≤ ``--stationary-px``；
-  * 清晰度 —— 棋盘区域 Laplacian 方差 ≥ ``--min-sharpness``（同 record_stereo）。
+  * 清晰度 —— **尺度无关的 focus**，判据用 ``calib.capture.focus_gate``
+    （与 calibrate_stereo 同一条规则，不是照抄一份）：
+    ``focus = 棋盘 ROI 的 Laplacian 方差 × 格子像素数``；只拒**明显比本组中位数糊**
+    的帧（默认低于中位数 40%）与低于绝对地板的帧。旧口径（裸 Laplacian 方差）
+    会随棋盘占的像素数漂移，板一大就被误判成"糊"，已弃用。
 
 逐帧做的是**粗检**（降分辨率、不开 EXHAUSTIVE，约几十毫秒）；
 真正要落盘的那一帧再全分辨率精确复核 —— 和标定窗口的做法一致，
@@ -59,10 +63,15 @@ import numpy as np  # noqa: E402
 
 from _common import log_environment, setup_logging  # noqa: E402
 from calib.board import BoardObservation, BoardSpec, detect_board  # noqa: E402
+from calib.capture import CaptureConfig, focus_gate  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
 from sphere_tracker.sources import CameraSource, FileSource  # noqa: E402
 
 log = logging.getLogger("capture_board")
+
+# 清晰度判据的默认参数**取自 CaptureConfig**，不在这里另写一份数字 ——
+# 否则标定窗口与这个收图器会慢慢漂成两套阈值。
+_FOCUS_DEFAULTS = CaptureConfig()
 
 # 粗检用的宽度：960 宽在 1440p 上约 30~50 ms，够实时对准；精确复核仍用全分辨率。
 GATE_WORK_WIDTH = 960
@@ -71,13 +80,24 @@ GATE_WORK_WIDTH = 960
 BOTH_VIEW_HEIGHT = 720
 
 
-def judge_capture(found: bool, still_px: float, sharpness: float,
-                  stationary_px: float, min_sharpness: float) -> tuple[bool, str]:
+def judge_capture(found: bool, still_px: float, focus: float,
+                  stationary_px: float, min_sharpness: float | None,
+                  median_focus: float = float("nan"), n_samples: int = 0,
+                  min_ratio: float | None = None, floor: float | None = None,
+                  min_samples: int | None = None) -> tuple[bool, str]:
     """这一帧能不能存？返回 (可存, 不可存的原因)。
 
     纯函数：不碰相机、不建窗口、不读文件 —— GUI 与自测都直接调它。
     阈值必须由入参给（``--stationary-px`` / ``--min-sharpness``），这里不写死，
     否则命令行改了参数而判据没跟着变，是最难查的一类不一致。
+
+    清晰度**不是**这里自己判的：直接调 ``calib.capture.focus_gate``，
+    与标定窗口**同一条规则**（绝对地板 + 相对中位数）。两处各写一套，
+    早晚会分叉成"采集放行、标定拒收"。
+
+    ``focus`` 是**尺度无关**的清晰度（``BoardObservation.focus`` =
+    Laplacian 方差 × 格子像素数）。别塞 ``sharpness`` 进来 ——
+    那个量随棋盘在画面里的大小变化，板一大就会被误判成"糊"。
 
     顺序有意：**先报"没检出"再报"在动"再报"糊"**。
     板都没看见时说"太糊"会把人引去擦镜头，实际只是板不在画面里。
@@ -86,9 +106,14 @@ def judge_capture(found: bool, still_px: float, sharpness: float,
         return False, "没检出整块棋盘"
     if still_px > stationary_px:
         return False, f"还在动 {still_px:.1f} px"
-    if sharpness < min_sharpness:
-        return False, f"太糊 {sharpness:.1f}"
-    return True, ""
+    return focus_gate(
+        focus, median_focus=median_focus, n_samples=n_samples,
+        min_ratio=_FOCUS_DEFAULTS.min_focus_ratio if min_ratio is None else min_ratio,
+        floor=_FOCUS_DEFAULTS.focus_floor if floor is None else floor,
+        min_samples=(_FOCUS_DEFAULTS.focus_min_samples if min_samples is None
+                     else min_samples),
+        abs_min=min_sharpness,
+    )
 
 
 def should_autosave(stable_frames: int, auto_hold: int, since_last_s: float,
@@ -130,17 +155,24 @@ def corner_shift_px(prev: np.ndarray | None, cur: np.ndarray | None) -> float:
 
 
 def gate_frame(gray: np.ndarray, spec: BoardSpec, prev_corners: np.ndarray | None,
-               stationary_px: float, min_sharpness: float
+               stationary_px: float, min_sharpness: float | None,
+               focus_hist: list[float] | None = None
                ) -> tuple[BoardObservation, float, bool, str, np.ndarray | None]:
     """粗检一帧并给出判据：返回 (观测, 位移, 可存, 原因, 新基准帧)。
 
     只有检出时才更新基准帧：板短暂丢失（手挡了一下）不该把下一帧判成"还在动"，
     否则用户会莫名其妙地被卡住。
+
+    ``focus_hist`` 是**已存下**各帧的 focus（相对判据的基准）。只看已存下的帧：
+    被拒的帧不该把中位数拉低，否则"越来越糊"的一组会互相掩护着全进来。
     """
+    hist = focus_hist if focus_hist is not None else []
     obs = detect_board(gray, spec, work_width=GATE_WORK_WIDTH, exhaustive=False)
     still = corner_shift_px(prev_corners, obs.corners if obs.found else None)
-    can, reason = judge_capture(obs.found, still, obs.sharpness,
-                                stationary_px, min_sharpness)
+    can, reason = judge_capture(
+        obs.found, still, obs.focus, stationary_px, min_sharpness,
+        median_focus=float(np.median(hist)) if hist else float("nan"),
+        n_samples=len(hist))
     if obs.found:
         prev_corners = obs.corners.copy()
     return obs, still, can, reason, prev_corners
@@ -219,8 +251,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="存够这么多张就退出（--both 下按对数算，默认 15）")
     ap.add_argument("--stationary-px", type=float, default=3.0,
                     help="连续两帧角点最大位移上限（px，默认 3.0）")
-    ap.add_argument("--min-sharpness", type=float, default=40.0,
-                    help="棋盘区域 Laplacian 方差下限（默认 40.0）")
+    ap.add_argument("--min-sharpness", type=float, default=800.0,
+                    help="额外的**绝对**清晰度下限，比的是尺度无关的 focus"
+                         "（=Laplacian 方差 × 格子像素数，默认 800.0）。"
+                         "绝对阈值没有刻度，真正起作用的是相对判据：focus 低于"
+                         "已存帧中位数 40%% 才判糊（阈值取自 CaptureConfig）；越小越宽松")
     ap.add_argument("--auto", action="store_true",
                     help="停稳自动存（不用按空格）")
     ap.add_argument("--auto-hold", type=int, default=6,
@@ -299,6 +334,7 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
 
     saved: list[Path] = []
     prev_corners: np.ndarray | None = None
+    focus_hist: list[float] = []      # 已存帧的 focus（相对判据的基准）
     stable = 0
     last_save_ts: float | None = None
     last_cat = ""
@@ -317,7 +353,8 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             obs, still, can, reason, prev_corners = gate_frame(
-                gray, spec, prev_corners, args.stationary_px, args.min_sharpness)
+                gray, spec, prev_corners, args.stationary_px, args.min_sharpness,
+                focus_hist)
             stable = stable + 1 if can else 0
 
             since = float("inf") if last_save_ts is None else ts - last_save_ts
@@ -363,8 +400,10 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
             if not acc.found:
                 log.info("跳过：精确复核没检出整块棋盘")
                 continue
-            can_acc, reason_acc = judge_capture(True, still, acc.sharpness,
-                                                args.stationary_px, args.min_sharpness)
+            can_acc, reason_acc = judge_capture(
+                True, still, acc.focus, args.stationary_px, args.min_sharpness,
+                median_focus=float(np.median(focus_hist)) if focus_hist else float("nan"),
+                n_samples=len(focus_hist))
             if not can_acc:
                 log.info("跳过：精确复核 %s", reason_acc)
                 continue
@@ -375,10 +414,12 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                 print(f"[错误] 写不进文件：{path}")
                 return 1
             saved.append(path)
+            focus_hist.append(float(acc.focus))
             verb = "自动保存" if not manual else "已保存"
             print(f"{verb} {len(saved)}/{args.target}  {name}  "
-                  f"（清晰度 {acc.sharpness:.1f}，位移 {still:.1f} px）")
-            log.info("保存 %s（清晰度 %.1f，位移 %.1f px）", path, acc.sharpness, still)
+                  f"（focus {acc.focus:.0f}，原始清晰度 {acc.sharpness:.0f}，位移 {still:.1f} px）")
+            log.info("保存 %s（focus %.0f，原始清晰度 %.0f，格子 %.1fpx，位移 %.1f px）",
+                     path, acc.focus, acc.sharpness, acc.square_px, still)
             stable = 0
             last_save_ts = ts
             if len(saved) >= args.target:
@@ -422,6 +463,8 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
     saved = 0
     prev_l: np.ndarray | None = None
     prev_r: np.ndarray | None = None
+    focus_hist_l: list[float] = []      # 两路各记各的（两路画质可以差很多）
+    focus_hist_r: list[float] = []
     stable = 0
     last_save_ts: float | None = None
     last_cat = ""
@@ -442,9 +485,9 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
             gl = cv2.cvtColor(fl, cv2.COLOR_BGR2GRAY)
             gr = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
             obs_l, still_l, can_l, why_l, prev_l = gate_frame(
-                gl, spec, prev_l, args.stationary_px, args.min_sharpness)
+                gl, spec, prev_l, args.stationary_px, args.min_sharpness, focus_hist_l)
             obs_r, still_r, can_r, why_r, prev_r = gate_frame(
-                gr, spec, prev_r, args.stationary_px, args.min_sharpness)
+                gr, spec, prev_r, args.stationary_px, args.min_sharpness, focus_hist_r)
             both_ok = can_l and can_r
             stable = stable + 1 if both_ok else 0
             ts = max(ts_l, ts_r)
@@ -488,10 +531,14 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
             # 两路都精确复核：任一路不过就不存这一对（宁可少一对，不要错一对）
             acc_l = detect_board(gl, spec, exhaustive=True)
             acc_r = detect_board(gr, spec, exhaustive=True)
-            ok_l2, why_l2 = judge_capture(acc_l.found, still_l, acc_l.sharpness,
-                                          args.stationary_px, args.min_sharpness)
-            ok_r2, why_r2 = judge_capture(acc_r.found, still_r, acc_r.sharpness,
-                                          args.stationary_px, args.min_sharpness)
+            ok_l2, why_l2 = judge_capture(
+                acc_l.found, still_l, acc_l.focus, args.stationary_px, args.min_sharpness,
+                median_focus=float(np.median(focus_hist_l)) if focus_hist_l else float("nan"),
+                n_samples=len(focus_hist_l))
+            ok_r2, why_r2 = judge_capture(
+                acc_r.found, still_r, acc_r.focus, args.stationary_px, args.min_sharpness,
+                median_focus=float(np.median(focus_hist_r)) if focus_hist_r else float("nan"),
+                n_samples=len(focus_hist_r))
             if not (ok_l2 and ok_r2):
                 log.info("跳过：精确复核 左 %s｜右 %s", why_l2 or "OK", why_r2 or "OK")
                 continue
@@ -504,8 +551,11 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
                 print(f"[错误] 写不进文件：{pl} 或 {pr}")
                 return 1
             saved = n
+            focus_hist_l.append(float(acc_l.focus))
+            focus_hist_r.append(float(acc_r.focus))
             print(f"已存第 {n} 对（左 {n} / 右 {n}）  {name}  "
-                  f"（清晰度 左 {acc_l.sharpness:.1f} / 右 {acc_r.sharpness:.1f}）")
+                  f"（focus 左 {acc_l.focus:.0f} / 右 {acc_r.focus:.0f}；"
+                  f"原始清晰度 {acc_l.sharpness:.0f} / {acc_r.sharpness:.0f}）")
             log.info("保存一对 %s", name)
             stable = 0
             last_save_ts = ts

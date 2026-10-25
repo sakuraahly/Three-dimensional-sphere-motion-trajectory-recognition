@@ -208,6 +208,9 @@ def _offer_with_stub(want_detectors: tuple[str, ...]) -> tuple[bool, str, dict]:
         obs.corners = real_obs.corners
         obs.homography = real_obs.homography
         obs.sharpness, obs.area_ratio = 500.0, 0.30
+        # 清晰度门限比的是**尺度无关**的 focus（=sharpness × 格子像素数），
+        # 替身只造 sharpness 的话会被当成"focus=0 全糊"，把本节的场景挡在门外。
+        obs.square_px, obs.focus = 16.0, 8000.0
         obs.margin_px, obs.brightness = 100.0, 128.0
         return obs
 

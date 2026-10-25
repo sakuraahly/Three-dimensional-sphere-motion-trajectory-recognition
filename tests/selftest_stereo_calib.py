@@ -35,7 +35,7 @@ if str(ROOT) not in sys.path:
 import cv2
 import numpy as np
 
-from calib import AutoPairCollector, BoardSpec, CalibConfig, calibrate_stereo
+from calib import AutoPairCollector, BoardSpec, CalibConfig, CaptureConfig, calibrate_stereo
 from calib.params import StereoRig
 
 
@@ -1198,6 +1198,262 @@ def test_same_board_mode() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def _focus_board(board_w: int, sigma: float, hi: int = 255, lo: int = 0) -> np.ndarray:
+    """画一块 8x5 内角点的棋盘（板宽精确等于 ``board_w`` px），再按 σ 高斯模糊。
+
+    为什么板宽要"精确等于"：本节要证明 `focus` **不随板的大小漂移**，
+    所以三档必须只有尺寸不同，其余（方格比例、边界、对比度）完全一致。
+    """
+    spec = BoardSpec()
+    sq = board_w / float(spec.cols + 1)          # 内角点 8 -> 9 个方格
+    pad = int(round(sq * 1.5))
+    w = int(round((spec.cols + 1) * sq)) + 2 * pad
+    h = int(round((spec.rows + 1) * sq)) + 2 * pad
+    img = np.full((h, w), hi, np.uint8)
+    for i in range(spec.cols + 1):
+        for j in range(spec.rows + 1):
+            if (i + j) % 2 == 0:
+                x0 = int(round(pad + i * sq))
+                y0 = int(round(pad + j * sq))
+                img[y0:y0 + int(round(sq)), x0:x0 + int(round(sq))] = lo
+    if sigma > 0:
+        img = cv2.GaussianBlur(img, (0, 0), sigma)
+    # 白边：SB 需要棋盘外侧有一圈安静区，否则边缘那圈角点检不稳
+    return cv2.copyMakeBorder(img, 80, 80, 80, 80, cv2.BORDER_REPLICATE)
+
+
+def _focus_of(gray: np.ndarray):
+    from calib.board import detect_board as _db
+    return _db(gray, BoardSpec(), exhaustive=True)
+
+
+def test_focus_is_scale_invariant() -> bool:
+    """focus = Laplacian 方差 × 格子像素数 应当**不随棋盘大小变化**。
+
+    这是本次换指标的全部理由：旧指标 `sharpness` 随棋盘占的像素数强烈变化，
+    板一大就被判成"糊" —— 实测出现"格点已经稳稳检出、却判图模糊拒收"。
+    所以这里同时钉两件事：focus 三档相对偏差 ≤15%，而 sharpness 必须差 ≥2 倍
+    （后者证明"旧指标确实有尺度偏差"，不是我们凭空换的口径）。
+    """
+    print("----- focus 尺度不变性（同一模糊 σ=0.8，板宽 240/480/960 px） -----")
+    print(f"  {'板宽px':>7} {'格子px':>8} {'sharpness':>10} {'focus':>10}")
+    rows = []
+    for bw in (240, 480, 960):
+        obs = _focus_of(_focus_board(bw, 0.8))
+        rows.append((bw, obs.square_px, obs.sharpness, obs.focus))
+        print(f"  {bw:>7} {obs.square_px:>8.1f} {obs.sharpness:>10.0f} {obs.focus:>10.0f}")
+    bad = [r for r in rows if not r[3]]
+    if bad:
+        print(f"  [不达标] 这些档没算出 focus（没检出板？）：{[r[0] for r in bad]}")
+        return False
+    foc = [r[3] for r in rows]
+    shr = [r[2] for r in rows]
+    foc_spread = (max(foc) - min(foc)) / float(np.mean(foc))
+    shr_ratio = max(shr) / max(min(shr), 1e-9)
+    checks = [
+        (f"focus 三档相对偏差 {foc_spread * 100:.1f}% ≤ 15%", foc_spread <= 0.15),
+        (f"sharpness 三档最大/最小 = {shr_ratio:.2f} ≥ 2（证明旧指标有尺度偏差）",
+         shr_ratio >= 2.0),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def _gt_corners(board_w: int) -> np.ndarray:
+    """同一块合成棋盘的**真值内角点**（像素坐标，(N,1,2) float32）。
+
+    为什么要它：`findChessboardCornersSB` 在 σ≳2.0 时**直接检不出**板
+    （实测 240/480/960/1440/1920/2400 六档板宽都是同一个截止点，与板大小无关）。
+    而"单调性"要覆盖到 σ=2.5 —— 那一档只能用真值角点算 ROI 指标，
+    否则测的就不是"指标随模糊的变化"，而是"SB 的检出上限"。
+    """
+    spec = BoardSpec()
+    sq = board_w / float(spec.cols + 1)
+    pad = int(round(sq * 1.5))
+    xs = 80 + pad + np.arange(spec.cols, dtype=np.float32) * sq
+    ys = 80 + pad + np.arange(spec.rows, dtype=np.float32) * sq
+    gx, gy = np.meshgrid(xs, ys)
+    return np.stack([gx.ravel(), gy.ravel()], axis=1).reshape(-1, 1, 2).astype(np.float32)
+
+
+def test_focus_is_monotonic_in_blur() -> bool:
+    """越糊 focus 越小（σ=0 -> 0.8 -> 1.6 -> 2.5）。
+
+    只要求**单调下降**，不钉具体数值 —— 数值随棋盘图案/插值方式变，
+    钉死会让这条测试变成"改一行渲染就红"的脆弱测试。
+
+    σ=2.5 那一档 SB 已经检不出板，用真值角点算指标（见 ``_gt_corners``）。
+    """
+    print("----- focus 单调性（板宽 960 px，逐级加模糊） -----")
+    from calib.board import BoardObservation, _finish
+
+    sigmas = (0.0, 0.8, 1.6, 2.5)
+    vals = []
+    for s in sigmas:
+        gray = _focus_board(960, s)
+        obs = _focus_of(gray)
+        src = "检出的角点"
+        if not obs.found:
+            obs = _finish(BoardObservation(), _gt_corners(960), gray, BoardSpec(),
+                          precise=True, detector="gt")
+            src = "真值角点（SB 已检不出）"
+        vals.append(obs.focus)
+        print(f"  σ={s:.1f}  {src:<18} 格子 {obs.square_px:5.1f}px  "
+              f"sharpness {obs.sharpness:7.1f}  focus {obs.focus:>9.0f}")
+    checks = [("每一档都算出了 focus", all(v > 0 for v in vals))]
+    mono = all(vals[i] > vals[i + 1] for i in range(len(vals) - 1))
+    checks.append(("σ 递增时 focus 严格递减", mono))
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_focus_threshold() -> bool:
+    """绝对下限 800（focus）既不能误杀好帧，也要能拦下垃圾帧。
+
+    两个样本都走**真正的 AutoPairCollector**（不是直接比数字）——
+    换指标最容易出的事就是"指标换了、判据还连着旧字段"，只有走完整条链路才测得出来。
+
+    * 清晰帧（σ=2.0 以内）：必须收下 —— 这正是用户报的场景"格点已经检出来了却被判糊"；
+    * 糊到只剩低对比度的帧（focus≈200）：必须被拒，且原因里带 focus 与阈值。
+
+    ⚠️ 这条**不是**主要的清晰度闸门：任何被检出的帧 focus 都远高于 800，
+    所以它实际不触发。真正的闸门是相对判据（见 ``test_focus_relative_gate``）。
+    """
+    print("----- 绝对下限 800（额外下限，走完整 AutoPairCollector） -----")
+    cfg = CaptureConfig()
+    cfg.require_stationary = False
+    abs_min = float(cfg.min_sharpness)
+
+    def _offer(gray):
+        col = AutoPairCollector(BoardSpec(), cfg)
+        return col, col.offer(gray, gray)
+
+    sharp_img = _focus_board(960, 1.6)
+    o_sharp = _focus_of(sharp_img)
+    col1, (ok1, why1) = _offer(sharp_img)
+    print(f"  清晰帧 σ=1.6：focus={o_sharp.focus:.0f} 格子 {o_sharp.square_px:.1f}px"
+          f"  -> ok={ok1}  {why1}")
+
+    # 糊帧：把黑白压到 150/200（对比度 50）。SB 仍能检出，但棋盘区域几乎没有
+    # 高频能量 —— focus 掉到 ~200，正是"糊到不该用来标定"的水平。
+    blur_img = _focus_board(960, 1.6, hi=200, lo=150)
+    o_blur = _focus_of(blur_img)
+    col2, (ok2, why2) = _offer(blur_img)
+    print(f"  糊帧（对比度 50）：focus={o_blur.focus:.0f}"
+          f" 格子 {o_blur.square_px:.1f}px  -> ok={ok2}  {why2}")
+
+    checks = [
+        ("清晰帧 focus 高于绝对下限 800", o_sharp.focus >= abs_min),
+        ("清晰帧被收下（旧口径在这里会误杀）", ok1 is True and col1.count == 1),
+        ("糊帧 focus 低于绝对下限 800", 0 < o_blur.focus < abs_min),
+        ("糊帧被拒，且原因里点明「糊」", ok2 is False and "糊" in why2),
+        ("拒收原因带出两个数（focus 与阈值），能照着判断",
+         "focus" in why2 and f"{abs_min:.0f}" in why2),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def _focus_stub(focus: float):
+    """造一个"检出且清晰度已知"的观测（只给判据需要的字段）。"""
+    from calib.board import BoardObservation
+
+    grid = np.stack(np.meshgrid(np.linspace(100, 500, 8),
+                                np.linspace(100, 340, 5)), axis=-1)
+    corners = grid.reshape(-1, 1, 2).astype(np.float32)
+    obs = BoardObservation()
+    obs.found = True
+    obs.corners = corners
+    obs.homography = np.array([[400, 0, 100], [0, 240, 100], [0, 0, 1]], np.float64)
+    obs.focus = float(focus)
+    obs.sharpness = float(focus) / 20.0
+    obs.square_px = 20.0
+    obs.area_ratio = 0.30
+    obs.margin_px = 100.0
+    obs.brightness = 128.0
+    obs.detector = "sb"
+    return obs
+
+
+def test_focus_relative_gate() -> bool:
+    """相对判据：**闸门必须真的会触发**，同时不误杀整组偏软的帧。
+
+    为什么必须证伪：绝对阈值（旧值 800）在任何被检出的帧上都不触发 ——
+    表面有闸、实际全放行。下面第一条检查就是"明显糊的帧确实被拒"，
+    如果哪天判据退回绝对阈值，这条会立刻变红。
+    """
+    print("----- 相对清晰度判据（绝对阈值永不触发 -> 改判相对） -----")
+    from calib.capture import focus_gate
+
+    cfg = CaptureConfig()
+    kw = dict(min_ratio=cfg.min_focus_ratio, floor=cfg.focus_floor,
+              min_samples=cfg.focus_min_samples, abs_min=None)
+    hist = [5000.0, 5200.0, 4800.0, 5000.0, 5100.0]
+    med = float(np.median(hist))
+    n = len(hist)
+
+    ok_low, why_low = focus_gate(1200.0, label="左", median_focus=med,
+                                 n_samples=n, **kw)
+    print(f"  本组中位数 {med:.0f}；来一帧 focus 1200 -> ok={ok_low}  {why_low}")
+    ok_mid, why_mid = focus_gate(2600.0, label="左", median_focus=med,
+                                 n_samples=n, **kw)
+    print(f"  再来一帧 focus 2600（52%） -> ok={ok_mid}  {why_mid or '收下'}")
+    ok_floor, why_floor = focus_gate(180.0, label="左", median_focus=med,
+                                     n_samples=n, **kw)
+    print(f"  地板：focus 180 -> ok={ok_floor}  {why_floor}")
+    ok_cold, why_cold = focus_gate(900.0, label="左", median_focus=5000.0,
+                                   n_samples=3, **kw)
+    print(f"  冷启动（样本 3<{cfg.focus_min_samples}）：focus 900 -> ok={ok_cold}"
+          f"  {why_cold or '收下（没有基准，不做相对判断）'}")
+
+    # 整组都软：5 帧 focus 都是 3200 -> 全部收下，结束时提示一次
+    import contextlib
+    import io
+    import calib.capture as _cap
+    cfg_soft = CaptureConfig()
+    cfg_soft.require_stationary = False
+    cfg_soft.target_pairs = 5
+    cfg_soft.diversity_min = 0.0
+    col = AutoPairCollector(BoardSpec(), cfg_soft)
+    real_detect, real_roi = _cap.detect_board, _cap.detect_board_in_roi
+    _cap.detect_board = lambda *a, **k: _focus_stub(3200.0)
+    _cap.detect_board_in_roi = lambda *a, **k: _focus_stub(3200.0)
+    img = np.zeros((480, 640), np.uint8)
+    buf = io.StringIO()
+    accepted = []
+    try:
+        with contextlib.redirect_stdout(buf):
+            for _ in range(5):
+                accepted.append(col.offer(img, img)[0])
+    finally:
+        _cap.detect_board, _cap.detect_board_in_roi = real_detect, real_roi
+    out = buf.getvalue().strip()
+    print(f"  整组 focus 全 3200：收下 {col.count} 对（{accepted}）")
+    print(f"  组末提示：{out or '（没有提示）'}")
+
+    checks = [
+        ("明显偏糊（24% < 40%）的帧**被拒** —— 闸门真的会触发",
+         ok_low is False and "偏糊" in why_low),
+        ("拒收文案自证：带 focus / 中位数 / 阈值三个数",
+         f"{1200:.0f}" in why_low and f"{med:.0f}" in why_low and "40%" in why_low),
+        ("52% 的帧仍被收（不误杀正常帧）", ok_mid is True and why_mid == ""),
+        ("绝对地板拦得住垃圾帧，文案点明地板值",
+         ok_floor is False and "地板" in why_floor and "300" in why_floor),
+        ("样本不足（3<5）时不做相对拒绝（避免冷启动误杀）",
+         ok_cold is True and why_cold == ""),
+        ("整组偏软（focus 全 3200）全部收下 —— 估计值不否决测量",
+         all(accepted) and col.count == 5),
+        ("组末打印一次「整体偏软」提示，且不拒收",
+         "整体偏软" in out and "3200" in out and col.reject_total == 0),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def _raises_value_error(fn) -> bool:
     try:
         fn()
@@ -1255,6 +1511,10 @@ def main() -> int:
     all_ok = test_chain_triangulation_closure() and all_ok
     all_ok = test_chain_mode_guard() and all_ok
     all_ok = test_same_board_mode() and all_ok
+    all_ok = test_focus_is_scale_invariant() and all_ok
+    all_ok = test_focus_is_monotonic_in_blur() and all_ok
+    all_ok = test_focus_threshold() and all_ok
+    all_ok = test_focus_relative_gate() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1

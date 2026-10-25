@@ -295,13 +295,13 @@ def main() -> int:
             n_both += int(obs_l.found and obs_r.found)
             if obs_l.found:
                 area_l += obs_l.area_ratio
-                sharp_l += obs_l.sharpness
+                sharp_l += obs_l.focus
                 c = _center_norm(obs_l, *L_wh)
                 if c:
                     centers_l.append(c)
             if obs_r.found:
                 area_r += obs_r.area_ratio
-                sharp_r += obs_r.sharpness
+                sharp_r += obs_r.focus
                 c = _center_norm(obs_r, *R_wh)
                 if c:
                     centers_r.append(c)
@@ -362,9 +362,9 @@ def _report(args, total, n_l, n_r, n_both, area_l, area_r, sharp_l, sharp_r,
     print(f"两路同时看到      : {n_both}/{total}  ({100 * r_both:.0f}%)")
     print(f"左 / 右 分辨率    : {L_wh} / {R_wh}")
     if r_l > 0:
-        print(f"左路棋盘面积占比  : {100 * area_l / n_l:.1f}%   清晰度 {sharp_l / n_l:.0f}")
+        print(f"左路棋盘面积占比  : {100 * area_l / n_l:.1f}%   focus {sharp_l / n_l:.0f}")
     if r_r > 0:
-        print(f"右路棋盘面积占比  : {100 * area_r / n_r:.1f}%   清晰度 {sharp_r / n_r:.0f}")
+        print(f"右路棋盘面积占比  : {100 * area_r / n_r:.1f}%   focus {sharp_r / n_r:.0f}")
     if centers_l and centers_r:
         cl, cr = _mean(centers_l), _mean(centers_r)
         print(f"棋盘平均位置(0~1): 左 ({cl[0]:.2f}, {cl[1]:.2f})   右 ({cr[0]:.2f}, {cr[1]:.2f})")

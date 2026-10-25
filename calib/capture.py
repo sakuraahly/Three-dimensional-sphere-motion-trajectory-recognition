@@ -37,13 +37,74 @@ def reject_category(reason: str) -> str:
     return head.strip(" ：:，,。.")
 
 
+def focus_gate(
+    focus: float,
+    *,
+    label: str = "",
+    median_focus: float = float("nan"),
+    n_samples: int = 0,
+    min_ratio: float = 0.4,
+    floor: float = 300.0,
+    min_samples: int = 5,
+    abs_min: float | None = None,
+) -> tuple[bool, str]:
+    """清晰度判据：**收还是不收**。返回 ``(可收, 不可收的原因)``。
+
+    纯函数 —— 采集侧（``AutoPairCollector``）、命令行收图器
+    （``apps/tools/capture_board.py``）、复检（``apps/verify_stereo.py``）
+    都调这一个，不许各写一套：同一条规则写两遍，早晚会分叉成
+    "A 放行 B 拒收"，而同一份数据的两种结论是最难查的一类不一致。
+
+    为什么用**相对**判据：``focus`` 没有绝对刻度。同一机位只改对比度，
+    这个数就会成倍变化；因此任何"focus < 常数"的门限要么永远不触发
+    （常数只要低于检测器能检出的下限，就再也拦不住任何东西 —— 表面有闸、
+    实际全放行），要么误杀清晰帧。可靠的信息是**组内相对位置**：
+    同一组数据里，明显比中位数糊的那几帧才是真问题。
+
+    判据顺序（先绝对、后相对）：
+      1. ``abs_min`` 给了且不达标 -> 拒（老命令的 ``--min-sharpness``，兼容用）；
+      2. ``focus < floor`` -> 拒（只拦真正垃圾帧）；
+      3. ``n_samples >= min_samples`` 且 ``focus < min_ratio * median`` -> 拒；
+      4. 其余全收 —— **样本不足时不做相对判断**，否则前几帧没有基准，
+         正常的冷启动会被当成"异常糊"误杀。
+    """
+    prefix = f"{label}图" if label else "画面"
+    if abs_min is not None and focus < abs_min:
+        return False, f"{prefix}模糊（focus {focus:.0f} < 绝对下限 {abs_min:.0f}）"
+    if focus < floor:
+        return False, f"{prefix}糊（focus {focus:.0f} < 地板 {floor:.0f}）"
+    med = float(median_focus)
+    if (n_samples >= min_samples and np.isfinite(med) and med > 0
+            and focus < min_ratio * med):
+        return False, (f"{prefix}偏糊（focus {focus:.0f}，只有本组中位数 "
+                       f"{med:.0f} 的 {focus / med * 100:.0f}%，"
+                       f"阈值 {min_ratio * 100:.0f}%）")
+    return True, ""
+
+
 @dataclass
 class CaptureConfig:
     """自动挑帧的门槛。默认值偏严，宁可少收几帧也要收干净的。"""
 
     target_pairs: int = 25          # 收够多少对就停
     min_pairs: int = 10             # 少于这么多对不做标定
-    min_sharpness: float = 55.0     # 棋盘区域 Laplacian 方差下限（防运动模糊/失焦）
+    # ---- 清晰度判据（**相对**，见 focus_gate）----
+    #
+    # 为什么是相对判据：`BoardObservation.focus` 是个**没有绝对刻度**的量 ——
+    # 同一台相机、同一块板，仅改对比度/曝光，focus 就能差几倍。所以
+    # "focus < 某个常数就拒" 不是可用的判据：把常数设低（旧值 55、800）它在
+    # 任何被检出过的帧上都不会触发，等于没有闸门；设高就会误杀清晰帧。
+    # 这里改成只拒**明显比本组中位数糊**的帧，整组都软则只提示、不拒收。
+    min_focus_ratio: float = 0.4   # 低于本组中位数的这个比例才拒（相对闸门）
+    focus_floor: float = 300.0     # 绝对地板：只拦真正垃圾帧（远低于 SB 可检出下限）
+    focus_min_samples: int = 5     # 样本不足时不做相对判断（冷启动没有基准）
+    # 兼容用的**额外绝对下限**（语义是 focus）。非 None 时参与判定，
+    # 但它在任何被检出的帧上都远低于实际值（SB 检出下限远高于此），
+    # 所以不构成有效闸门 —— 真正生效的是上面的 min_focus_ratio。
+    min_sharpness: float | None = 800.0
+    # 整组收完后若 focus 中位数低于此值，打印**一次**提示（**不拒收**）：
+    # 能标定，但角点定位精度会略降。
+    soft_focus_hint: float = 4000.0
     min_area_ratio: float = 0.012   # 棋盘至少占画面面积的比例（别太远）
     max_area_ratio: float = 0.90    # 也别贴到脸上
     min_margin_px: float = 10.0     # 角点离画面边界至少多少像素（边缘畸变大）
@@ -164,6 +225,12 @@ class AutoPairCollector:
         # 全程都算得出来，却**没有任何出口** —— 这是"没有出口的字段"的又一個实例。
         self.area_seen: list[float] = []            # 每次算出的比例（各取左右较小者）
         self.frames_with_board = 0                  # 至少一路看到棋盘的帧数
+        # 已收下各帧的 focus（按左右分开）：相对判据的基准就是它们的中位数。
+        # 只用**已收下**的帧 —— 被拒的帧（比如真的糊了）不该把基准拉低，
+        # 否则一组"越来越糊"的帧会互相掩护着全进来。
+        self._focus_hist: dict[str, list[float]] = {"左": [], "右": []}
+        # "画面偏软"提示只打一次：站在相机前的人需要知道一次，不需要每帧刷屏。
+        self._soft_hinted = False
 
     # ------------------------------------------------------------------
     @property
@@ -218,8 +285,45 @@ class AutoPairCollector:
         self.rejected.clear()
         self.area_seen.clear()
         self.frames_with_board = 0
+        self._focus_hist = {"左": [], "右": []}
+        self._soft_hinted = False
         self.last_obs = (None, None)
         self.last_accepted = False
+
+    def _focus_verdict(self, name: str, focus: float) -> tuple[bool, str]:
+        """对某一路的一帧套用**同一条**清晰度判据（见 ``focus_gate``）。"""
+        hist = self._focus_hist[name]
+        med = float(np.median(hist)) if hist else float("nan")
+        return focus_gate(
+            focus, label=name, median_focus=med, n_samples=len(hist),
+            min_ratio=self.cfg.min_focus_ratio, floor=self.cfg.focus_floor,
+            min_samples=self.cfg.focus_min_samples, abs_min=self.cfg.min_sharpness,
+        )
+
+    def _hint_if_soft(self) -> None:
+        """整组收完后，若**某一路**偏软，按路提示（不拒收、不影响结果）。
+
+        为什么只在"整组收完"时说：单帧的绝对值没有刻度（见 ``focus_gate``），
+        逐帧提示会对着正常的帧反复报软；而一组收完后看中位数才有意义。
+
+        为什么**按路**看而不是两路合并：两路的 focus 没有共同刻度，合并后
+        一强一弱会被平均掉 —— 左 3000 / 右 8000 合并成 5500，左路的软
+        就再也提示不出来了。所以每路各看各的中位数，软哪路点名哪路。
+        """
+        if self._soft_hinted or not self.full:
+            return
+        self._soft_hinted = True
+        for name in ("左", "右"):
+            vals = self._focus_hist[name]
+            if not vals:
+                continue
+            med = float(np.median(vals))
+            if med >= self.cfg.soft_focus_hint:
+                continue
+            msg = (f"[提示] {name}图整体偏软（focus 中位数 {med:.0f}）——能标定，"
+                   f"但该路精度会略降；条件允许请对焦后重拍。")
+            print(msg)
+            logger.info("%s", msg)
 
     def _reject(self, reason: str) -> tuple[bool, str]:
         """记一次拒绝。
@@ -302,10 +406,11 @@ class AutoPairCollector:
                 why += "｜" + "；".join(notes)
             return self._reject(why)
         assert obs_l.corners is not None and obs_r.corners is not None
-        # 2) 清晰度
+        # 2) 清晰度（**尺度无关**的 focus + **相对**判据 —— 理由见 focus_gate）
         for name, obs in (("左", obs_l), ("右", obs_r)):
-            if obs.sharpness < cfg.min_sharpness:
-                return self._reject(f"{name}图模糊(清晰度 {obs.sharpness:.0f})")
+            can_focus, why_focus = self._focus_verdict(name, obs.focus)
+            if not can_focus:
+                return self._reject(why_focus)
 
         # 3) 大小与位置
         for name, obs in (("左", obs_l), ("右", obs_r)):
@@ -361,8 +466,9 @@ class AutoPairCollector:
 
         # 用精确角点复核关键指标，避免粗检的近似把不合格的帧放进来
         for name, acc in (("左", acc_l), ("右", acc_r)):
-            if acc.sharpness < cfg.min_sharpness:
-                return self._reject(f"{name}图模糊(精确复核)")
+            can_focus, why_focus = self._focus_verdict(name, acc.focus)
+            if not can_focus:
+                return self._reject(f"{why_focus}（精确复核）")
             if acc.margin_px < cfg.min_margin_px:
                 return self._reject(f"{name}图棋盘贴边(精确复核)")
             if acc.area_ratio < cfg.min_area_ratio:
@@ -377,7 +483,9 @@ class AutoPairCollector:
                 homography_right=acc_r.homography.copy(),
                 center_left=(cx, cy),
                 quality={
+                    "focus_l": acc_l.focus, "focus_r": acc_r.focus,
                     "sharpness_l": acc_l.sharpness, "sharpness_r": acc_r.sharpness,
+                    "square_px_l": acc_l.square_px, "square_px_r": acc_r.square_px,
                     "area_l": acc_l.area_ratio, "area_r": acc_r.area_ratio,
                 },
             )
@@ -385,9 +493,16 @@ class AutoPairCollector:
         self.last_obs = (acc_l, acc_r)
         self.last_accepted = True
         self.last_reason = f"已收 {self.count}/{cfg.target_pairs}"
-        logger.info("收下第 %d/%d 对（宫格 %d,%d；清晰度 左%.0f 右%.0f）",
+        # 收下的帧才进基准（见 _focus_hist 的说明）
+        self._focus_hist["左"].append(float(acc_l.focus))
+        self._focus_hist["右"].append(float(acc_r.focus))
+        self._hint_if_soft()
+        logger.info("收下第 %d/%d 对（宫格 %d,%d；focus 左%.0f 右%.0f；"
+                    "原始清晰度 左%.0f 右%.0f；格子 左%.1fpx 右%.1fpx）",
                     self.count, cfg.target_pairs, gx, gy,
-                    acc_l.sharpness, acc_r.sharpness)
+                    acc_l.focus, acc_r.focus,
+                    acc_l.sharpness, acc_r.sharpness,
+                    acc_l.square_px, acc_r.square_px)
         return True, self.last_reason
 
     # ------------------------------------------------------------------
@@ -530,10 +645,11 @@ class AutoPairCollector:
             (("都未检测到棋盘",),
              "两路都没看到板 —— 把板举到**两路视野重叠区**（先跑 启动程序.bat precheck 看重叠区在哪）"),
             (("未检测到棋盘",),
-             "有一路没看到板 —— 看条带里那一侧的「清晰度 / 面积」，"
+             "有一路没看到板 —— 看条带里那一侧的「focus / 面积」，"
              "多半是那一路画质或视野问题，跑 启动程序.bat diag 定位"),
-            (("模糊",),
-             "画面模糊 —— 擦镜头、撕保护膜、加光；或放宽 --min-sharpness"),
+            (("模糊", "偏糊", "糊"),
+             "画面比本组其他帧明显糊 —— 擦镜头、撕保护膜、加光，或重新对焦。"
+             "（判据是**相对**的：只拒明显低于本组中位数的帧；整组偏软只会提示、不拒收）"),
             (("棋盘太小",),
              "板太远 —— **把板拿近**，或换更大的板"),
             (("棋盘贴边",),
@@ -571,6 +687,7 @@ class AutoPairCollector:
             if not obs.found:
                 out.append(f"{name}: 未找到板")
                 continue
-            out.append(f"{name}: 清晰度{obs.sharpness:5.0f} 面积{obs.area_ratio * 100:4.1f}%"
+            out.append(f"{name}: focus{obs.focus:6.0f} 清晰度{obs.sharpness:5.0f}"
+                       f" 格子{obs.square_px:4.1f}px 面积{obs.area_ratio * 100:4.1f}%"
                        f" 曝光{obs.brightness:3.0f}")
         return out

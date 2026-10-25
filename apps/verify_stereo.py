@@ -32,6 +32,7 @@ import numpy as np
 from apps._common import add_stereo_source_args, open_pair_source
 from calib import BoardSpec, StereoRig
 from calib.board import detect_board
+from calib.capture import CaptureConfig, focus_gate
 from stereo.fov_align import FovAlignment, estimate_fov_alignment
 
 # 视频 / 图片输入是否已按标定 FOV 归一化：归一化后两路应接近同一视场，
@@ -93,6 +94,10 @@ def main() -> int:
     ap.add_argument("--max-frames", type=int, default=600)
     ap.add_argument("--tolerance", type=float, default=0.15,
                     help="允许的极线误差增量（像素）")
+    ap.add_argument("--min-sharpness", type=float, default=None,
+                    help="额外的**绝对**清晰度下限（口径同标定：尺度无关的 focus）。"
+                         "默认不启用 —— 绝对阈值没有刻度，真正起作用的判据在 "
+                         "calib.capture.focus_gate：只跳过明显低于本组中位数 40%% 的帧")
     ap.add_argument("--fov-input-normalized", action="store_true",
                     help="视频/图片输入已按标定 FOV 归一化：跳过首对帧校验。"
                          "默认会验证；低纹理等无法验证时若确认输入已归一化再加此开关")
@@ -152,6 +157,14 @@ def main() -> int:
     errs: list[float] = []
     frames = 0
     checked_fov_input = False
+    # 与标定收帧**同一套**清晰度判据（calib.capture.focus_gate）：
+    # 绝对阈值没有刻度（同一组数据里 focus 随对比度成倍变化），所以这里也
+    # 用"组内相对"——只跳过明显比本组中位数糊的帧。同一份数据不会出现
+    # "采集放行、复检拒收"。
+    cap_cfg = CaptureConfig()
+    focus_hist = {"左": [], "右": []}
+    focus_skips = 0
+    last_focus_reason = ""
     try:
         while len(errs) < args.samples and frames < args.max_frames:
             ok, left, right = src.read()
@@ -181,11 +194,35 @@ def main() -> int:
             orr = detect_board(gr, spec)
             if not (ol.found and orr.found):
                 continue
-            if ol.sharpness < 40 or orr.sharpness < 40:
+            # 尺度无关的清晰度（focus = 棋盘 ROI 的 Laplacian 方差 × 格子像素数），
+            # 与标定收帧同一口径；不要用 sharpness —— 板一大就会被误判成糊。
+            ok_focus = True
+            for name, obs in (("左", ol), ("右", orr)):
+                hist = focus_hist[name]
+                ok_one, why_one = focus_gate(
+                    obs.focus, label=name,
+                    median_focus=float(np.median(hist)) if hist else float("nan"),
+                    n_samples=len(hist),
+                    min_ratio=cap_cfg.min_focus_ratio,
+                    floor=cap_cfg.focus_floor,
+                    min_samples=cap_cfg.focus_min_samples,
+                    abs_min=args.min_sharpness,
+                )
+                if not ok_one:
+                    ok_focus = False
+                    last_focus_reason = why_one
+                    break
+            if not ok_focus:
+                focus_skips += 1
                 continue
+            focus_hist["左"].append(float(ol.focus))
+            focus_hist["右"].append(float(orr.focus))
             errs.append(rig.epipolar_error_by_mode(rig.stereo_mode, ol.corners, orr.corners))
     finally:
         src.release()
+
+    if focus_skips:
+        print(f"[提示] 因清晰度跳过 {focus_skips} 帧（例：{last_focus_reason}）")
 
     if not errs:
         print("[失败] 没有采到有效的标定板图像（两路都要能看到完整的板）")

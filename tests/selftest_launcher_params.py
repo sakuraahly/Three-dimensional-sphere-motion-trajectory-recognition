@@ -301,8 +301,9 @@ def main() -> int:
     expect("填 5.5 -> 传 --stationary-px 5.5", True,
            contains="--stationary-px 5.5")
     _set(app.calib_stationary, "")
-    _set(app.calib_sharp, "40")
-    expect("填 40 -> 传 --min-sharpness 40", True, contains="--min-sharpness 40")
+    _set(app.calib_sharp, "1200")
+    expect("填 1200 -> 传 --min-sharpness 1200（口径是尺度无关的 focus）", True,
+           contains="--min-sharpness 1200")
     _set(app.calib_sharp, "")
     app.calib_relaxed.set(True)
     expect("勾放宽 -> 传 --relaxed", True, contains="--relaxed")
