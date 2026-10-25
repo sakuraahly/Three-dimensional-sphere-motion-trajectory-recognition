@@ -112,17 +112,41 @@ def calibration_measure() -> tuple[float, float] | None:
 # 这里只放**纯函数**（不进 Tk、不读面板）：界面上点按钮和自测用的是同一份拼装，
 # 免得"界面一套、测试另一套"之后悄悄分叉。
 # --------------------------------------------------------------------------- #
+# 三段（不是四段）：参考段改成**一次双路同拍**。
+#
+# 为什么合并：以前 ref_left / ref_right 分两次按，中间只要板被碰一下，
+# 外参就会错而界面上完全看不出来。`--both` 让两路在同一时刻存同一块板，
+# 左右之间不会再有时间差，也就不存在"中间被动过"这个失败模式。
 CHAIN_STAGES = (
     ("left", "left", 15),
     ("right", "right", 15),
-    ("ref_left", "left", 3),
-    ("ref_right", "right", 3),
+    ("ref", "both", 3),
 )
+# 每个阶段落到哪些**计数目录**（参考段有两个，分别数）
+CHAIN_STAGE_DIRS = {
+    "left": ("left",),
+    "right": ("right",),
+    "ref": ("ref_left", "ref_right"),
+}
+# 就绪判定 / 缺图提示按"目录"走：四个目录各有各的目标张数
+CHAIN_DIR_TARGET = {"left": 15, "right": 15, "ref_left": 3, "ref_right": 3}
+CHAIN_REQUIRED_DIRS = ("left", "right", "ref_left", "ref_right")
+CHAIN_DIR_TEXT = {
+    "left": "拍左内参图",
+    "right": "拍右内参图",
+    "ref_left": "拍左参考图",
+    "ref_right": "拍右参考图",
+}
 CHAIN_STAGE_TEXT = {
-    "left": ("拍左内参图", "只用左相机，覆盖画面四角与不同倾角"),
-    "right": ("拍右内参图", "只用右相机，同样覆盖四角与不同倾角"),
-    "ref_left": ("拍左参考图", "把板固定在两路都能看全的位置，之后**不要再碰**"),
-    "ref_right": ("拍右参考图", "板**仍然不动**，只换成右相机拍"),
+    "left": ("拍左内参图",
+             "只用左相机，覆盖画面四角与不同倾角；"
+             "自动连拍：板停稳就会自动存，不用按键"),
+    "right": ("拍右内参图",
+              "只用右相机，同样覆盖四角与不同倾角；"
+              "自动连拍：板停稳就会自动存，不用按键"),
+    "ref": ("拍参考图（双路同时）",
+            "一块板同时给左右两路拍；**板固定后不要再碰**，"
+            "自动连拍会自己存够目标张数"),
 }
 
 
@@ -138,22 +162,22 @@ def _count_shots(directory) -> int:
 
 
 def _chain_ready(counts: dict[str, int]) -> bool:
-    """四段**各至少 1 张**才允许开始标定（参考段少于 3 张只提示，不拦）。
+    """四个目录**各至少 1 张**才允许开始标定（参考段少于 3 张只提示，不拦）。
 
     为什么门槛放在 1 张而不是 3 张：链式外参只要有参考图就能算，硬卡 3 张
     会让"只拍到 2 张但完全够用"的人点不动按钮；而**数量不足的风险必须说出来**，
     所以提示文字单独写在 `_chain_status_text` 里，不混进按钮可用性。
     """
-    return all(int(counts.get(key, 0) or 0) >= 1 for key, _side, _target in CHAIN_STAGES)
+    return all(int(counts.get(key, 0) or 0) >= 1 for key in CHAIN_REQUIRED_DIRS)
 
 
 def _chain_missing(counts: dict[str, int]) -> str:
     """缺什么、缺几张 —— 按钮是灰的，必须在这里说清原因，不能让人猜。"""
     bits = []
-    for key, _side, target in CHAIN_STAGES:
+    for key in CHAIN_REQUIRED_DIRS:
         got = int(counts.get(key, 0) or 0)
         if got < 1:
-            bits.append(f"{CHAIN_STAGE_TEXT[key][0]} 0/{target} 张")
+            bits.append(f"{CHAIN_DIR_TEXT[key]} 0/{CHAIN_DIR_TARGET[key]} 张")
     return "、".join(bits)
 
 
@@ -161,24 +185,35 @@ def _chain_status_text(counts: dict[str, int]) -> str:
     """按钮旁边那一行状态：缺图 / 参考段偏少 / 可以开始。"""
     if not _chain_ready(counts):
         return "还不能标定：缺 " + _chain_missing(counts)
-    weak = [f"{CHAIN_STAGE_TEXT[k][0]} {int(counts.get(k, 0) or 0)}/{t} 张"
-            for k, _s, t in CHAIN_STAGES
-            if k.startswith("ref") and int(counts.get(k, 0) or 0) < t]
+    weak = [f"{CHAIN_DIR_TEXT[k]} {int(counts.get(k, 0) or 0)}/{CHAIN_DIR_TARGET[k]} 张"
+            for k in CHAIN_REQUIRED_DIRS
+            if k.startswith("ref") and int(counts.get(k, 0) or 0) < CHAIN_DIR_TARGET[k]]
     if weak:
         return "可以开始（参考段偏少，建议补满：" + "、".join(weak) + "）"
-    return "四段都齐了，可以开始链式标定"
+    return "三段都齐了，可以开始链式标定"
 
 
-def chain_capture_cmd(root, stage: str, *, camera: str, width, height, fps,
+def chain_capture_cmd(root, stage: str, *, camera, width, height, fps,
                       backend: str, cols, rows, square) -> list[str]:
-    """一段采集的 argv（契约由 `apps/tools/capture_board.py` 定，别在这里改语义）。"""
+    """一段采集的 argv（契约由 `apps/tools/capture_board.py` 定，别在这里改语义）。
+
+    - 内参段：`--side left|right --out <root>/left|right --auto`
+    - 参考段：`--both --out-left <root>/ref_left --out-right <root>/ref_right --auto`
+      —— **不带 `--side`**：那是单路标记，带上去双路就没意义了。
+    """
     sub, side, target = next(s for s in CHAIN_STAGES if s[0] == stage)
-    cmd = [PY, str(ROOT / "apps" / "tools" / "capture_board.py"),
-           "--out", str(Path(root) / sub), "--side", side,
-           "--camera", str(camera),
-           "--width", str(width), "--height", str(height), "--fps", str(fps),
-           "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-           "--target", str(target)]
+    base = Path(root)
+    cmd = [PY, str(ROOT / "apps" / "tools" / "capture_board.py")]
+    if sub == "ref":
+        cmd += ["--both",
+                "--out-left", str(base / "ref_left"),
+                "--out-right", str(base / "ref_right")]
+    else:
+        cmd += ["--out", str(base / sub), "--side", side,
+                "--camera", str(camera)]
+    cmd += ["--width", str(width), "--height", str(height), "--fps", str(fps),
+            "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+            "--target", str(target), "--auto"]
     if backend and backend != "auto":
         cmd += ["--backend", str(backend)]
     return cmd
@@ -1123,7 +1158,7 @@ class Launcher(tk.Tk):
         self._build_chain_block()
 
     def _build_chain_block(self) -> None:
-        """单板链式标定：四段采集 + 一条标定命令的引导区（第三条路）。
+        """单板链式标定：三段采集（参考段双路同拍）+ 一条标定命令的引导区（第三条路）。
 
         为什么单独一张卡片而不是继续往第 1 步里塞：这一块是**另一套前提**
         （两路几乎无共视），和 joint / 90° 不是同一件事；混在一张卡片里，
@@ -1133,15 +1168,18 @@ class Launcher(tk.Tk):
             "单板链式标定（两路几乎无共视 / 90° 大角度）",
             "三条路怎么选：joint = 两路有充分共视；90° = 共视很少但能与同一块板同框；"
             "单板链式 = 两路几乎看不到同一区域，靠“板不动”的参考图定外参。\n"
-            "流程：按顺序拍完四段图（脚本会自己筛停稳 / 清晰度），再点最下面的"
+            "内参段板可以移动；参考段板必须固定在两路都能看全整块的位置，"
+            "一次双路同拍，左右之间不会再有时间差。\n"
+            "流程：按顺序拍完三段图（**停稳就自动存，不用按键**），再点最下面的"
             "『开始链式标定』。采集窗口里按 q 可提前结束，已拍的图会保留。")
         body = ttk.Frame(box)
         body.grid(row=1, column=0, columnspan=9, sticky="we", pady=(2, 4))
 
         self.chain_root = self._param_path(
             body, "工作目录",
-            "四段图分别存到 <工作目录>\\left / right / ref_left / ref_right；"
-            "某一段拍砸了可以直接重拍那一段（新图会追加进去）。", True)
+            "三段图分别存到 <工作目录>\\left / right / ref_left / ref_right"
+            "（参考段一次写两个目录）；某一段拍砸了可以直接重拍那一段"
+            "（新图会追加进去）。", True)
         self.chain_root.delete(0, "end")
         self.chain_root.insert(0, str(Path("outputs") / "chain"
                                       / time.strftime("%Y%m%d-%H%M%S")))
@@ -1154,7 +1192,7 @@ class Launcher(tk.Tk):
                             wraplength=PARAM_HINT_WRAP)
             lab.grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
             self._wrapped.append((lab, "param"))
-            ttk.Button(body, text=title, width=12,
+            ttk.Button(body, text=title, width=18,
                        command=lambda k=key: self._chain_capture(k)).grid(
                 row=row, column=3, sticky="w", padx=(8, 0), pady=(4, 0))
             cnt = ttk.Label(body, text="0 张", style="Hint.TLabel")
@@ -1165,7 +1203,7 @@ class Launcher(tk.Tk):
         ttk.Button(body, text="刷新张数", width=10,
                    command=self._chain_refresh).grid(
             row=row, column=0, sticky="w", pady=(10, 2))
-        # 只有四段都 ≥1 张才可点；不足时把**缺什么**写在下面的状态行里。
+        # 四个目录都 ≥1 张才可点；不足时把**缺什么**写在下面的状态行里。
         self.chain_run_btn = ttk.Button(
             body, text="开始链式标定", command=self._chain_run)
         self.chain_run_btn.grid(row=row, column=3, columnspan=2,
@@ -1185,13 +1223,20 @@ class Launcher(tk.Tk):
 
     def _chain_counts(self) -> dict[str, int]:
         root = self._chain_root_path()
-        return {key: _count_shots(root / key) for key, _s, _t in CHAIN_STAGES}
+        return {key: _count_shots(root / key) for key in CHAIN_REQUIRED_DIRS}
 
     def _chain_refresh(self) -> None:
-        """重数四段目录，刷新计数标签 / 按钮可用性 / 缺图提示。"""
+        """重数各样目录，刷新计数标签 / 按钮可用性 / 缺图提示。"""
         counts = self._chain_counts()
         for key, _side, _target in CHAIN_STAGES:
-            self.chain_count_labels[key].configure(text=f"{counts[key]} 张")
+            dirs = CHAIN_STAGE_DIRS[key]
+            if len(dirs) == 1:
+                text = f"{counts[dirs[0]]} 张"
+            else:
+                # 参考段两个目录分别数：`参考 左 3 / 右 3`
+                text = "参考 左 {} / 右 {}".format(
+                    counts["ref_left"], counts["ref_right"])
+            self.chain_count_labels[key].configure(text=text)
         ready = _chain_ready(counts)
         self.chain_run_btn.configure(state="normal" if ready else "disabled")
         self.chain_status.configure(text=_chain_status_text(counts))
@@ -1199,16 +1244,16 @@ class Launcher(tk.Tk):
     def _chain_capture(self, stage: str) -> None:
         """拍一段（走 `_run`：可中断、有日志，不裸调 subprocess）。"""
         root = self._chain_root_path()
-        target_dir = root / stage
-        try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            messagebox.showwarning("目录建不了",
-                                   f"没法创建 {target_dir}：{exc}\n"
-                                   "换个有写权限的工作目录再试。")
-            return
-        side = next(s for k, s, _t in CHAIN_STAGES if k == stage)
-        target = next(t for k, _s, t in CHAIN_STAGES if k == stage)
+        dirs = CHAIN_STAGE_DIRS[stage]
+        for name in dirs:
+            try:
+                (root / name).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showwarning("目录建不了",
+                                       f"没法创建 {root / name}：{exc}\n"
+                                       "换个有写权限的工作目录再试。")
+                return
+        _sub, side, target = next(s for s in CHAIN_STAGES if s[0] == stage)
         cols = self._read_int(self.calib_cols, "内角点·列", 3, 30)
         if cols is None:
             return
@@ -1218,22 +1263,28 @@ class Launcher(tk.Tk):
         square = self._read_int(self.calib_square, "方格边长 mm", 5, 500)
         if square is None:
             return
-        camera = _cam_arg(self.calib_left.get() if side == "left"
-                          else self.calib_right.get())
+        # 参考段是双路同拍，没有"这一路用哪个相机号"的问题，两个都传不进去。
+        camera = None
+        if stage != "ref":
+            camera = _cam_arg(self.calib_left.get() if side == "left"
+                              else self.calib_right.get())
         width, height = self.calib_res.get().split("x")
         fps = self.calib_fps.get().strip() or CALIB_FPS_DEFAULT
         cmd = chain_capture_cmd(
             root, stage, camera=camera, width=width, height=height, fps=fps,
             backend=self.calib_backend.get(), cols=cols, rows=rows, square=square)
+        where = " + ".join(str(root / d) for d in dirs)
         self._append(f"[链式标定] {CHAIN_STAGE_TEXT[stage][0]}：目标 {target} 张 → "
-                     f"{target_dir}")
-        self._run(cmd, f"链式标定 · {CHAIN_STAGE_TEXT[stage][0]}（{side}，目标 {target} 张）",
+                     f"{where}（自动连拍，停稳即存）")
+        self._run(cmd, f"链式标定 · {CHAIN_STAGE_TEXT[stage][0]}"
+                       f"（{side}，目标 {target} 张，自动连拍）",
                   on_done=lambda t, k=stage: self._after_chain_capture(t, k))
 
     def _after_chain_capture(self, task: Task, stage: str) -> None:
         """一段拍完：刷新张数；提前退出（3）也算正常，失败要说下一步。"""
         self._chain_refresh()
-        got = _count_shots(self._chain_root_path() / stage)
+        got = sum(_count_shots(self._chain_root_path() / d)
+                  for d in CHAIN_STAGE_DIRS[stage])
         name = CHAIN_STAGE_TEXT[stage][0]
         if task.exit_code == 0:
             self._append(f"[链式标定] {name}完成，目录里共 {got} 张。")
@@ -1250,12 +1301,12 @@ class Launcher(tk.Tk):
                 "或在『基本设置』里换一路相机；仍打不开就跑『相机探测』。")
 
     def _chain_run(self) -> None:
-        """四段齐了才拼链式标定命令；板参数/分辨率/后端全部沿用同一份面板值。"""
+        """四目录齐了才拼链式标定命令；板参数/分辨率/后端全部沿用同一份面板值。"""
         counts = self._chain_counts()
         if not _chain_ready(counts):
             messagebox.showwarning("还缺图",
                                    "还不能标定：缺 " + _chain_missing(counts)
-                                   + "。先把四段都拍上，再点这个按钮。")
+                                   + "。先把三段都拍上，再点这个按钮。")
             self._chain_refresh()
             return
         cols = self._read_int(self.calib_cols, "内角点·列", 3, 30)
