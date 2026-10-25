@@ -340,9 +340,20 @@ def pose_distance(h1, h2, image_diag: float) -> float           # 归一化到�
 ③ `object_points()` 单位是**米** —— 这是 `StereoRig.triangulate()` 输出米制坐标的前提。
 ④ `pose_distance` 任一位姿为 `None` 时返回 **`0.0`**（不是 `inf`），语义别搞反；3 通道输入会自动转灰度，`work_width` 生效时角点会**换算回全分辨率**。
 ### 12.2 `calib/capture.py`
+```text
+清晰度判据（唯一实现：focus_gate）：
+  1) focus < min_sharpness(800)   → 拒（绝对，低于 SB 可检出下限 ~3200，实际不触发）
+  2) focus < focus_floor(300)     → 拒（绝对地板）
+  3) 已收样本 ≥ focus_min_samples(5) 且 focus < 0.4 × 本路已收 focus 中位数 → 拒
+  4) 整路中位数 < soft_focus_hint(4000) → 组末提示一次（不拒收）
+为什么不用绝对阈值：focus 随棋盘占画面的像素数、对比度、镜头而变，一个常数只能在一台装置上调准。
+```
 ```python
 @dataclass CaptureConfig:
-    target_pairs=25; min_pairs=10; min_sharpness=55.0; min_area_ratio=0.012; max_area_ratio=0.90; min_margin_px=10.0
+    target_pairs=25; min_pairs=10; min_sharpness=800.0; min_area_ratio=0.012; max_area_ratio=0.90; min_margin_px=10.0
+    # ↑ min_sharpness 的语义在 2026-10-25 变过：现在是 focus（=Laplacian方差(ROI)×格子像素数），
+    #   不是老版的 ROI Laplacian 方差。历史日志里的数值不能直接对比。
+    min_focus_ratio=0.4; focus_floor=300.0; focus_min_samples=5; soft_focus_hint=4000.0
     min_brightness=35.0; max_brightness=230.0; require_stationary=True; stationary_max_px=3.0
     diversity_min=0.055; region_grid=3; max_per_region=5; gate_work_width=640
 @dataclass CapturedPair:
