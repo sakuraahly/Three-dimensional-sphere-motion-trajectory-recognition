@@ -1007,6 +1007,197 @@ def test_chain_mode_guard() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_same_board_mode() -> bool:
+    """**单板模式**：一块固定板，左右各拍一轮 ⇒ `T_AB = I`（2026-10-25）。
+
+    用户实际只有一块板：左相机拍一轮、右相机拍一轮，两轮看的是同一块板的
+    同一个世界系。数学上就是 `T_AB = I` 的特例：
+
+        T_{C_R←C_L} = T_{C_R←W} · I · T_{W←C_L}
+
+    这里守六件事：
+      1. 链式公式在 `T_AB=I` 下必须**精确**等于真值（<1e-9，不是"差不多"）；
+      2. 3 张同摆放的合成参考图 -> 离散度在门限内、链式外参 <1mm/0.5°；
+      2b. 参考图里板动了 -> 必须报离散度警告（不能静默出数）；
+      2c. 缺 `--right-dir`/`--ref-right` 时必须说清怎么补（不许猜 T_AB）；
+      3. `--same-board` 与双板专属参数同时给 -> argparse 退出码 2（不静默忽略）。
+    """
+    print("\n----- 单板模式（T_AB = I，参考图定外参） -----")
+    import subprocess
+    import tempfile
+    from types import SimpleNamespace
+
+    import apps.calibrate_stereo as app
+    import calib.relative_pose as rp
+
+    # ---- 1) T_AB = I 的链式外参 ----
+    T_camL_W = rp.rt_to_T(cv2.Rodrigues(np.radians([2.0, -3.0, 1.5]))[0],
+                          [0.02, -0.01, 0.45])
+    T_camR_W = rp.rt_to_T(cv2.Rodrigues(np.radians([88.0, -2.0, 90.5]))[0],
+                          [0.48, 0.03, 0.52])
+    T_true = rp.compose(T_camR_W, rp.invert(T_camL_W))
+    R_e, T_e, T_e_mat = rp.relative_extrinsics(T_camL_W, np.eye(4), T_camR_W)
+    d_mat = float(np.abs(T_e_mat - T_true).max())
+    d_rt = max(float(np.abs(R_e - T_true[:3, :3]).max()),
+               float(np.abs(np.asarray(T_e).reshape(3) - T_true[:3, 3]).max()))
+    print(f"  T_AB=I 链式：|T_camR_camL - 真值|max = {d_mat:.2e}  "
+          f"（R/T 分量 {d_rt:.2e}）  基线 {np.linalg.norm(T_true[:3, 3]) * 1000:.1f} mm")
+
+    # ---- 2) 3 张合成参考图：板同一位置 + 小噪声（90° 装置，板朝两路角平分线）----
+    # 为什么必须单独一组：内参那堆图里板在移动，左右各挑一张 = 两个不同摆放，
+    # 那时 T_AB 不是 I，链出来的外参就错了。这里把"参考图"当独立一份来验。
+    spec = BoardSpec(cols=8, rows=5, square_mm=25.0)
+    K = _K(900.0, 900.0, 640.0, 360.0)
+    D = np.zeros(5)
+    size = (1280, 720)
+
+    def _rotY(deg: float) -> np.ndarray:
+        a = math.radians(deg)
+        c, s = math.cos(a), math.sin(a)
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], float)
+
+    T_RL = np.eye(4)                      # 右相机 ← 左相机（90° 装置的真值）
+    T_RL[:3, :3] = _rotY(90.0)
+    T_RL[:3, 3] = [-0.5, 0.0, 0.6]
+    T_bW = np.eye(4)                      # 板在左相机系里的固定摆放
+    T_bW[:3, :3] = _rotY(140.0)           # 法向朝两光轴角平分线，两路都看正面
+    T_bW[:3, 3] = [0.05, 0.0, 0.45]
+
+    board_img, pad = make_board_image(spec, px_per_m=1200.0)
+    rng = np.random.default_rng(7)
+
+    def _write_refs(dirp: Path, T_cam_W: np.ndarray, jitter: float,
+                    prefix: str = "ref") -> None:
+        dirp.mkdir(parents=True, exist_ok=True)
+        for k in range(3):
+            Rj = cv2.Rodrigues(np.radians(rng.normal(0, jitter, 3)))[0]
+            rv, _ = cv2.Rodrigues(T_cam_W[:3, :3] @ Rj)
+            tv = T_cam_W[:3, 3] + rng.normal(0, jitter * 0.004, 3)
+            img = render_view(board_img, pad, spec, 1200.0, rv, tv, K, D, size,
+                              0.1, 0.3)
+            cv2.imwrite(str(dirp / f"{prefix}{k}.png"), img)
+
+    objp = spec.object_points()
+    with tempfile.TemporaryDirectory() as td:
+        dl, dr = Path(td) / "refL", Path(td) / "refR"
+        _write_refs(dl, T_bW, 0.03)                     # 0.03° 抖动 ≈ 手不抖
+        _write_refs(dr, rp.compose(T_RL, T_bW), 0.03)
+        T_l, info_l = app._ref_board_poses(sorted(dl.glob("*.png")), spec, objp,
+                                           K, D, "--ref-left")
+        T_r, info_r = app._ref_board_poses(sorted(dr.glob("*.png")), spec, objp,
+                                           K, D, "--ref-right")
+        est = rp.relative_extrinsics(T_l, np.eye(4), T_r)[2]
+        d_rot = rp.rotation_angle_deg(est[:3, :3], T_RL[:3, :3])
+        d_tr = float(np.linalg.norm(est[:3, 3] - T_RL[:3, 3])) * 1000.0
+        print(f"  3 张参考图：左 n={info_l['n']} 离散 {info_l['rot_deg']:.3f}°/"
+              f"{info_l['trans_mm']:.2f} mm；右 n={info_r['n']} 离散 "
+              f"{info_r['rot_deg']:.3f}°/{info_r['trans_mm']:.2f} mm")
+        print(f"  链式外参 vs 真值：{d_rot:.3f}° / {d_tr:.3f} mm（门限 0.5° / 1 mm）")
+        quiet = not info_l["warn"] and not info_r["warn"]
+        accurate = d_rot < 0.5 and d_tr < 1.0
+
+        # ---- 2b) 重复性样本 = 逐张参考图各算一次 T_AB（真值恒为 I）----
+        smp = app._same_board_samples(info_l, info_r)
+        cs = rp.consistency(smp)
+        rep_ok = (len(smp) == 3 and cs["n"] == 3
+                  and cs["rot_max_deg"] < 0.5 and cs["trans_max_mm"] < 2.0)
+        # 只有 1 张参考图时必须如实退回 n=1，不许伪造样本
+        one = app._same_board_samples({"n": 1, "poses": [np.eye(4)]},
+                                      {"n": 1, "poses": [np.eye(4)]})
+        rep_one = len(one) == 1 and np.allclose(one[0], np.eye(4))
+        # 只有 1 张参考图时不能印 0.000°/0.00 mm（会被读成"测过且很稳"）
+        n1_txt = app._ref_stability_text(
+            {"n": 1, "rot_deg": 0.0, "trans_mm": 0.0})
+        n3_txt = app._ref_stability_text(
+            {"n": 3, "rot_deg": 0.106, "trans_mm": 0.29})
+        n1_ok = "未评估" in n1_txt and "0.000" not in n1_txt
+        n3_ok = "0.106" in n3_txt and "0.29" in n3_txt
+        # ---- 2c) 报告行格式（用假 report 文本验过滤/改写）----
+        fake = "\n".join([
+            "双目标定结果（chain：独立单目 + 刚性双板公共参考）",
+            "右目重投影 RMS: 0.10 px",
+            "T_AB 重复性   : n=3  旋转最大偏离 0.106°  平移最大偏离 0.29 mm",
+            "两板间距      : 0.00 mm（||T_AB||，用卷尺核对）",
+            "  ! T_AB 只测了 1 次：**无法评估重复性**",
+            "  → --pair-frame 给一个含 3~5 张同框图的目录",
+        ])
+        rep = app._chain_report(SimpleNamespace(report=lambda: fake), True,
+                                "参考图 左 3 / 右 3")
+        fmt_ok = "T_AB          : I（单板；参考图 左 3 / 右 3）" in rep \
+            and "由参考图逐张求 T_AB" in rep \
+            and "两板间距" not in rep and "--pair-frame" not in rep
+
+        # ---- 3) 参考图里板动了（8° / 40 mm）-> 必须警告或拒绝，不能静默 ----
+        dm = Path(td) / "moved"
+        _write_refs(dm, T_bW, 0.03)
+        moved = T_bW.copy()
+        moved[:3, :3] = _rotY(148.0)                    # 板转了 8°
+        moved[:3, 3] = [0.07, 0.0, 0.485]               # 且挪了 40 mm
+        _write_refs(dm, moved, 0.03, prefix="mv")       # 追加 3 张"动了"的
+        try:
+            _Tm, info_m = app._ref_board_poses(sorted(dm.glob("*.png")), spec,
+                                               objp, K, D, "--ref-left")
+            moved_flagged = bool(info_m["warn"])
+            how = (f"警告（离散 {info_m['rot_deg']:.2f}°/"
+                   f"{info_m['trans_mm']:.1f} mm）")
+        except ValueError as exc:
+            moved_flagged, how = True, f"拒绝：{str(exc).splitlines()[0][:40]}"
+        print(f"  参考图混入板动了的 3 张 -> {how}")
+
+    # ---- 4) 缺 --right-dir / --ref-right 的说明 ----
+    msg2 = app._chain_input_error(SimpleNamespace(
+        same_board=True, left_dir=str(ROOT), right_dir=str(ROOT),
+        ref_left=str(ROOT), ref_right=None))
+    has_ref = bool(msg2) and "--ref-right" in msg2 \
+        and "不能拿标内参那堆移动中的图" in msg2
+    print(f"  缺 --ref-right：{(msg2 or '').splitlines()[-3][:56]}")
+
+    msg = app._chain_input_error(SimpleNamespace(
+        same_board=True, left_dir=str(ROOT), right_dir=None,
+        ref_left=str(ROOT), ref_right=str(ROOT)))
+    print(f"  缺 --right-dir：{(msg or '').splitlines()[0][:56]}")
+    has_right = bool(msg) and "--right-dir" in msg and "缺少" in msg
+
+    # ---- 3) 与双板参数互斥 -> exit 2 ----
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "apps" / "calibrate_stereo.py"),
+         "--same-board", "--pair-frame", "x"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+    err = (proc.stderr or "") + (proc.stdout or "")
+    mutual = "互斥" in err and "T_AB" in err
+    line = next((ln.strip() for ln in err.splitlines() if "互斥" in ln), err.strip()[:70])
+    print(f"  --same-board + --pair-frame -> 退出码 {proc.returncode}；{line[:96]}")
+
+    # ---- 4) 帮助里必须有这个开关（否则用户找不到这条路） ----
+    help_proc = subprocess.run(
+        [sys.executable, str(ROOT / "apps" / "calibrate_stereo.py"), "--help"],
+        cwd=str(ROOT), capture_output=True, text=True, timeout=120)
+    help_txt = (help_proc.stdout or "") + (help_proc.stderr or "")
+    has_help = help_proc.returncode == 0 and "--same-board" in help_txt \
+        and "--ref-left" in help_txt and "同一块固定板" in help_txt
+    print(f"  --help 含 --same-board/--ref-left：{has_help}（退出码 {help_proc.returncode}）")
+
+    checks = [
+        ("T_AB=I 时链式外参 = 真值（< 1e-9）", d_mat < 1e-9),
+        ("返回的 R/T 与 4x4 自洽（< 1e-9）", d_rt < 1e-9),
+        ("3 张同摆放参考图：离散度在门限内（不误报）", quiet),
+        ("3 张参考图链式外参 < 0.5° / 1 mm", accurate),
+        ("重复性样本 n=3、离散在门限内", rep_ok),
+        ("参考图仅 1 张 -> 如实 n=1（不伪造样本）", rep_one),
+        ("n=1 印「未评估」而非 0.000°/0.00 mm", n1_ok),
+        ("n≥2 印真实离散度", n3_ok),
+        ("报告写 T_AB=I（单板；参考图 左 3 / 右 3），无两板专属行", fmt_ok),
+        ("参考图里板动了 -> 警告或拒绝（不静默出数）", moved_flagged),
+        ("缺 --right-dir 时说明该怎么给", has_right),
+        ("缺 --ref-right 时说明「不能用移动中的图」", has_ref),
+        ("--same-board + --pair-frame -> 退出码 2 且报「互斥」", proc.returncode == 2 and mutual),
+        ("--help 列出 --same-board / --ref-* 及其说明", has_help),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def _raises_value_error(fn) -> bool:
     try:
         fn()
@@ -1063,6 +1254,7 @@ def main() -> int:
     all_ok = test_chain_extrinsics_90deg() and all_ok
     all_ok = test_chain_triangulation_closure() and all_ok
     all_ok = test_chain_mode_guard() and all_ok
+    all_ok = test_same_board_mode() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1

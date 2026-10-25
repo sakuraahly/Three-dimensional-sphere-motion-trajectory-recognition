@@ -58,7 +58,7 @@ from apps._common import (
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
 from calib import detect_board
-from calib.relative_pose import rotation_angle_deg
+from calib.relative_pose import compose, invert, rotation_angle_deg
 from calib.stereo_calib import board_pose_from_points, calibrate_mono_points
 from stereo.fov_align import (
     estimate_fov_alignment,
@@ -201,13 +201,51 @@ def _assign_ab(pose1: np.ndarray, pose2: np.ndarray,
 
 
 def _chain_input_error(args) -> str | None:
-    """检查 chain 的输入是否齐全；返回**可执行**的错误说明（None 表示齐全）。"""
-    if args.left is not None or args.right is not None \
-            or args.left_video or args.right_video:
+    """检查 chain 的输入是否齐全；返回**可执行**的错误说明（None 表示齐全）。
+
+    `--same-board`（单板模式）只需两路目录：两轮拍的是**同一块板**，
+    公共参考系就是它自己的世界系，`T_AB` 按定义等于 `I` —— 没有"两块板"
+    可测，所以同框图/`--pair-camera`/`--board-b-dir` 在这里既不需要也不接受。
+    """
+    same_board = bool(getattr(args, "same_board", False))
+    if getattr(args, "left", None) is not None or getattr(args, "right", None) is not None \
+            or getattr(args, "left_video", None) or getattr(args, "right_video", None):
+        if same_board:
+            return ("--method chain --same-board 本轮只支持**离线目录**：\n"
+                    "  请改用：--left-dir <板目录> --right-dir <板目录>\n"
+                    "  实时采集 chain 的 GUI 流程属于下一阶段（见计划书阶段 B）。")
         return ("--method chain 本轮只支持**离线目录**（链上用单目位姿，不做实时采集）。\n"
                 "  请改用：--left-dir <A 板目录> --right-dir <B 板目录> "
                 "--pair-frame <同框图目录> --pair-camera left|right\n"
                 "  实时采集 chain 的 GUI 流程属于下一阶段（见计划书阶段 B）。")
+    if same_board:
+        missing = []
+        if not getattr(args, "left_dir", None):
+            missing.append("--left-dir <左相机标内参用的图像目录，板可移动>")
+        if not getattr(args, "right_dir", None):
+            missing.append("--right-dir <右相机标内参用的图像目录，板可移动>")
+        if not getattr(args, "ref_left", None):
+            missing.append("--ref-left <左相机看这块板、板**不动**的参考图目录>")
+        if not getattr(args, "ref_right", None):
+            missing.append("--ref-right <右相机看**同一块**板、同一个位置的参考图目录>")
+        if not missing:
+            return None
+        why = ""
+        if not getattr(args, "ref_left", None) or not getattr(args, "ref_right", None):
+            why = ("  单板模式需要一组'板不动'的参考图，不能拿标内参那堆移动中的图来当外参参考：\n"
+                   "  那堆图里板在移动（否则凑不出 15 个姿态），左右各挑一张就是两个不同摆放，\n"
+                   "  它们的 T_AB 并不是 I，链出来的外参是错的。\n")
+        return ("--same-board（单板模式）需要**两段**输入：\n"
+                "  内参段：--left-dir + --right-dir（板可移动，各 ≥15 姿态）\n"
+                "  外参段：--ref-left + --ref-right（板固定在同一个位置，各 1~5 张，"
+                "两路都要完整看到整块板）\n"
+                + why +
+                "  缺少：" + "；".join(missing) + "\n"
+                "  完整用法：python apps/calibrate_stereo.py --method chain --same-board "
+                "--left-dir imgs/left --right-dir imgs/right "
+                "--ref-left imgs/ref_left --ref-right imgs/ref_right\n"
+                "  （单板模式不需要 --pair-frame / --pair-camera / --board-b-dir："
+                "只有一块板，T_AB 按定义取 I）")
     missing = []
     if not args.left_dir:
         missing.append("--left-dir <左相机拍 A 板的图像目录>")
@@ -246,6 +284,10 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
         "board": spec.describe(),
         "source": "dir",
         "method": "chain",
+        # 单板模式：内参段（板可移动）+ 外参段（板不动的参考图各一组），T_AB = I。
+        "same_board": bool(getattr(args, "same_board", False)),
+        "ref_left": str(getattr(args, "ref_left", "") or "") or None,
+        "ref_right": str(getattr(args, "ref_right", "") or "") or None,
         "rectification": res.rectification,
         "left": args.left_dir,
         "right": args.board_b_dir or args.right_dir,
@@ -258,8 +300,123 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
     }
 
 
+# 单板模式：一组"板不动"的参考图之间允许的位姿离散度。超过就不是"没动"了。
+REF_ROT_WARN_DEG = 0.5
+REF_TRANS_WARN_MM = 2.0
+
+
+def _ref_board_poses(paths, spec, objp, K, D, label):
+    """用一组"板不动"的参考图求 `T_cam←W`（单板模式唯一的外参锚点）。
+
+    为什么必须单独一组图：内参那堆图里板是**移动**的，随便挑一张当公共参考，
+    左右挑中的是**两个不同摆放**，此时 `T_AB ≠ I`，链出来的外参直接错。
+
+    任何一张没**完整**检出整块棋盘就抛 `ValueError` —— OpenCV 会把局部角点当成
+    整块板，位姿错得离谱却照样返回结果，这里不能让它静默通过。
+
+    返回 `(T, info)`；`info["warn"]` 为真表示参考图之间位姿不一致（板动了/对焦变了）。
+    """
+    poses, rows, bad = [], [], []
+    for p in paths:
+        gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            bad.append(f"{p.name}（读不出来）")
+            continue
+        obs = detect_board(gray, spec, exhaustive=True)
+        if not obs.found or obs.corners is None:
+            bad.append(f"{p.name}（未完整检出整块 {spec.cols}x{spec.rows} 棋盘）")
+            continue
+        T, err = _pnp_reproj_rms(objp, obs.corners, K, D)
+        poses.append(T)
+        rows.append((p.name, err))
+    if bad:
+        raise ValueError(
+            f"{label} 有图没检出**整块**棋盘：{'、'.join(bad)}\n"
+            "  单板模式要求参考图里板要**整体入画**（四边都留白、不贴边、不过曝）。\n"
+            "  只看到一角的角点会被 OpenCV 当成整块板，位姿错得很离谱却不报错。")
+    k = int(np.argmin([e for _n, e in rows]))
+    best = poses[k]
+    rot = max(rotation_angle_deg(best[:3, :3], T[:3, :3]) for T in poses)
+    tr = max(float(np.linalg.norm(T[:3, 3] - best[:3, 3])) * 1000.0 for T in poses)
+    return best, {
+        "n": len(poses), "best": rows[k][0], "err": rows[k][1],
+        "rot_deg": float(rot), "trans_mm": float(tr), "rows": rows,
+        "poses": poses,
+        "warn": bool(rot > REF_ROT_WARN_DEG or tr > REF_TRANS_WARN_MM),
+    }
+
+
+def _same_board_samples(info_l, info_r) -> list[np.ndarray]:
+    """单板的 `T_AB` 重复性样本：**逐张**参考图各算一次 `T_{B←A}`（≈I）。
+
+    为什么可以这么算：所有参考图都是"同一块板、同一个摆放"，
+    所以第 i 张左右参考图组成的 `T_camR_W_i · inv(T_camL_W_i)` 就是一次独立的
+    `T_AB` 测量，其真值恒为 `I`；它的散布正是"板有没有动 / 对焦有没有变"的证据。
+    核心层的 `consistency()` 拿到 ≥2 个样本才会评估重复性 —— 这样单板模式
+    也能拿到真实的 n，而不是被当成"只测了 1 次"。
+
+    注意配对方式：按**文件顺序** zip（第 i 张左 ↔ 第 i 张右），两侧张数不等时
+    取 `min(n_l, n_r)`。这里**不要求**左右是同一时刻拍的对子 —— 板不动，任一张
+    左参考图和任一张右参考图都描述同一个物理摆放，所以任意配对都成立；
+    配对只影响"样本之间是否独立"，不影响正确性。
+    """
+    m = min(info_l["n"], info_r["n"])
+    if m < 2:
+        return [np.eye(4)]
+    return [compose(Tr, invert(Tl))
+            for Tl, Tr in zip(info_l["poses"][:m], info_r["poses"][:m])]
+
+
+def _ref_stability_text(info: dict) -> str:
+    """参考图的"离散度"一句话；n<2 时必须说**未评估**。
+
+    n=1 时 info 里的 0.000°/0.00 mm 是"没算过"的默认值，印出来会被读成
+    "测过而且很稳" —— 这两种含义在报告里绝不能混。
+    """
+    if info["n"] < 2:
+        return "离散度 未评估（n<2，只有 1 张参考图，无法评估重复性）"
+    return (f"离散度 旋转 {info['rot_deg']:.3f}° / "
+            f"平移 {info['trans_mm']:.2f} mm")
+
+
+def _chain_report(res, same_board: bool, ref_note: str = "") -> str:
+    """chain 的报告文本。
+
+    单板模式下 `T_AB` 按定义是 `I`，报告里"两板间距 / T_AB 重复性"这两行
+    既没有测量对象也没有意义（会印出 `0.00 mm`，读起来像"两板贴在一起"），
+    所以在这里如实换成 `T_AB = I（单板）`。同理"T_AB 只测了 1 次 → 建议拍
+    3~5 张同框图"也一并抹掉：单板模式压根不许给 --pair-frame，照着做会撞互斥。
+    核心层报告不改 —— 双板模式的那两行是它唯一的自查证据。
+    """
+    text = res.report()
+    if not same_board:
+        return text
+    out = []
+    for line in text.splitlines():
+        if "两板间距" in line or "--pair-frame" in line:
+            continue
+        if "T_AB 只测了 1 次" in line:
+            # 单板没有同框图可补，改写成本模式能照做的建议
+            line = ("  ! T_AB 重复性：参考图只有 1 张（n=1），**未评估重复性**；"
+                    "建议 --ref-left/--ref-right 各再拍 1~4 张（板一动不动）")
+        if line.strip().startswith("T_AB 重复性") and "参考图只有 1 张" not in line:
+            # 核心层的 n/离散度就是逐张参考图算的 T_AB，语义对，只补一句来源
+            line = line + "（由参考图逐张求 T_AB 得到）"
+        if "刚性双板公共参考" in line:
+            line = "双目标定结果（chain：独立单目 + 单块固定板）"
+        out.append(line)
+        if line.startswith("右目重投影 RMS"):
+            out.append("T_AB          : I（单板；" + (ref_note or "—") + "）")
+    return "\n".join(out)
+
+
 def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
-    """chain 的离线流程：三份图 → 单目内参/位姿 → T_AB → 链式外参。"""
+    """chain 的离线流程：三份图 → 单目内参/位姿 → T_AB → 链式外参。
+
+    `--same-board` 时只读两份目录，`T_AB = I`：板没动，A/B 是同一块板的
+    同一个世界系，链式外参退化成 `T_{C_R←W} · T_{W←C_L}`。
+    """
+    same_board = bool(getattr(args, "same_board", False))
     problem = _chain_input_error(args)
     if problem:
         print(f"\n[错误] {problem}")
@@ -270,9 +427,18 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
 
     left_paths = _list_images(Path(args.left_dir))
     right_paths = _list_images(Path(args.board_b_dir or args.right_dir))
-    pair_paths = _list_images(Path(args.pair_frame))
-    for label, paths in (("--left-dir", left_paths), ("B 板目录", right_paths),
-                         ("--pair-frame", pair_paths)):
+    right_label = "--right-dir" if same_board else "B 板目录"
+    pair_paths = [] if same_board else _list_images(Path(args.pair_frame))
+    ref_left_paths = _list_images(Path(args.ref_left)) if same_board else []
+    ref_right_paths = _list_images(Path(args.ref_right)) if same_board else []
+    required = [("--left-dir", left_paths), (right_label, right_paths)]
+    if same_board:
+        # 外参段：两路各一组"板不动"的参考图
+        required += [("--ref-left", ref_left_paths),
+                     ("--ref-right", ref_right_paths)]
+    else:
+        required.append(("--pair-frame", pair_paths))
+    for label, paths in required:
         if not paths:
             print(f"\n[错误] {label} 里没有图像（支持 "
                   f"{'/'.join(sorted(_IMAGE_SUFFIXES))}）。")
@@ -301,12 +467,23 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         return corners, size, failed
 
     c_left, size_left, fail_l = _read_corners(left_paths, "--left-dir")
-    c_right, size_right, fail_r = _read_corners(right_paths, "B 板目录")
+    c_right, size_right, fail_r = _read_corners(right_paths, right_label)
     if c_left is None or c_right is None:
         return 1
     print(f"[chain] 检出：左 {len(c_left)}/{len(left_paths)}（{fail_l} 张未检出），"
           f"右 {len(c_right)}/{len(right_paths)}（{fail_r} 张未检出）；"
           f"尺寸 左 {size_left[0]}x{size_left[1]} / 右 {size_right[0]}x{size_right[1]}")
+    if same_board:
+        # 前提必须打在**结果之前**：这份外参的正确性完全押在"板没动"上，
+        # 事后才发现这块板被动过，全部数字都得重来。
+        print("[chain] 单板模式：T_AB = I（同一块固定板）")
+        print("        内参段：--left-dir / --right-dir（板可移动，各 ≥15 姿态）")
+        print(f"        外参段：--ref-left {len(ref_left_paths)} 张 / "
+              f"--ref-right {len(ref_right_paths)} 张（板固定不动）")
+        print("        前提：两段之间、以及左右参考图之间**板必须一动不动**。"
+              "板动 1 mm，外参就错 1 mm。")
+        print("        每路都要**完整**检出整块棋盘（OpenCV 不认局部角点）。")
+        log.warning("chain 单板模式：T_AB=I，前提是参考图期间板未移动")
     if len(c_left) < 3 or len(c_right) < 3:
         print("\n[错误] chain 每路至少需要 3 个姿态才能标内参；"
               "建议各 ≥15 个并覆盖画面四角。")
@@ -324,59 +501,98 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         return 1
     print(f"[chain] 单目 RMS：左 {mono_l['rms']:.3f} px / 右 {mono_r['rms']:.3f} px")
 
-    # 同框图的参考姿态簇：由 --pair-camera 那一路的目录决定
-    ref_mono = mono_l if args.pair_camera == "left" else mono_r
-    ref_rots = [cv2.Rodrigues(r)[0] for r in ref_mono["rvecs"]]
-    K_pair, D_pair = ref_mono["K"], ref_mono["D"]
-    pair_cam_size = size_left if args.pair_camera == "left" else size_right
-
-    samples, pair_rows = [], []
-    for p in pair_paths:
-        gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-        if gray is None:
-            continue
-        if (gray.shape[1], gray.shape[0]) != pair_cam_size:
-            print(f"\n[错误] 同框图 {p.name} 尺寸 {gray.shape[1]}x{gray.shape[0]} "
-                  f"与 --pair-camera {args.pair_camera} 的标定尺寸 {pair_cam_size} 不一致。")
-            log.error("chain：同框图尺寸不一致 %s", p)
-            return 1
-        found = _detect_two_boards(gray, spec)
-        if found is None:
-            print(f"  [跳过] {p.name}：没有同时检出两块板")
-            continue
+    if same_board:
+        # 单板：A 与 B 是同一块板的同一个世界系，T_AB 按定义就是单位阵 ——
+        # 它不是"估"出来的，也不该被当成可优化的量。
+        samples, pair_rows = [np.eye(4)], []
+        ref_note = ""
         try:
-            T1, e1 = _pnp_reproj_rms(objp, found[0].corners, K_pair, D_pair)
-            T2, e2 = _pnp_reproj_rms(objp, found[1].corners, K_pair, D_pair)
-            T_A, T_B, d_a, d_b = _assign_ab(T1, T2, ref_rots, args.pair_camera)
+            T_ref_l, info_l = _ref_board_poses(ref_left_paths, spec, objp,
+                                               mono_l["K"], mono_l["D"], "--ref-left")
+            T_ref_r, info_r = _ref_board_poses(ref_right_paths, spec, objp,
+                                               mono_r["K"], mono_r["D"], "--ref-right")
         except ValueError as exc:
-            print(f"\n[错误] 同框图 {p.name} 无法分配 A/B 板：{exc}")
-            log.error("chain：A/B 分配失败 %s", exc)
+            print(f"\n[错误] {exc}")
+            log.error("chain 单板参考图不可用：%s", exc)
             return 1
-        T_ab = relative_pose.board_to_board_from_single_camera(T_A, T_B)
-        samples.append(T_ab)
-        pair_rows.append((p.name, e1, e2, d_a, d_b))
+        for lbl, info in (("--ref-left", info_l), ("--ref-right", info_r)):
+            print(f"[chain] {lbl} 参考位姿：n={info['n']}（取 {info['best']}，"
+                  f"重投影 {info['err']:.2f} px）  {_ref_stability_text(info)}")
+            if info["warn"]:
+                print(f"[警告] 参考图之间位姿不一致 → 板在拍参考图时动了或对焦变了"
+                      f"（{lbl}：旋转 {info['rot_deg']:.2f}° / 平移 {info['trans_mm']:.2f} mm，"
+                      f"门限 {REF_ROT_WARN_DEG}° / {REF_TRANS_WARN_MM} mm）。外参按这张算，"
+                      "但请重拍参考图后再定稿。")
+                log.warning("chain 单板：%s 参考图位姿离散 旋转 %.2f° 平移 %.2f mm",
+                            lbl, info["rot_deg"], info["trans_mm"])
+        T_camL_A, T_camR_B = T_ref_l, T_ref_r
+        ref_note = f"参考图 左 {info_l['n']} / 右 {info_r['n']}"
+        # 重复性样本：逐张参考图各算一次 T_AB（真值恒为 I）。
+        # 参考图 ≥2 张时核心层就能拿到真实 n，单板模式也能到「可用」以上；
+        # 只有 1 张时如实退回 [I]（n=1，未评估重复性），绝不伪造样本。
+        samples = _same_board_samples(info_l, info_r)
+        print(f"[chain] T_AB：I（单板；{ref_note}）  "
+              f"重复性 n={len(samples)}"
+              + ("（n=1，未评估重复性）" if len(samples) < 2 else ""))
+    else:
+        # 同框图的参考姿态簇：由 --pair-camera 那一路的目录决定
+        ref_mono = mono_l if args.pair_camera == "left" else mono_r
+        ref_rots = [cv2.Rodrigues(r)[0] for r in ref_mono["rvecs"]]
+        K_pair, D_pair = ref_mono["K"], ref_mono["D"]
+        pair_cam_size = size_left if args.pair_camera == "left" else size_right
 
-    if not samples:
-        print("\n[错误] --pair-frame 里没有一张图能**同时**检出 A、B 两块板。\n"
-              "  下一步：把双板靶标放到 --pair-camera 那一路的画面中央、光照均匀、"
-              "两块板都完整入画，重拍 3~5 张。")
-        log.error("chain：没有可用的同框图")
-        return 1
-    for name, e1, e2, d_a, d_b in pair_rows:
-        print(f"  同框图 {name}: 重投影 {e1:.2f}/{e2:.2f} px，"
-              f"到参考姿态簇 {d_a:.1f}°/{d_b:.1f}°")
-    cons = relative_pose.consistency(samples)
-    print(f"[chain] T_AB：n={cons['n']}  旋转最大偏离 {cons['rot_max_deg']:.3f}°  "
-          f"平移最大偏离 {cons['trans_max_mm']:.3f} mm  两板间距 "
-          f"{cons['baseline_mm']:.1f} mm")
+        samples, pair_rows = [], []
+        for p in pair_paths:
+            gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                continue
+            if (gray.shape[1], gray.shape[0]) != pair_cam_size:
+                print(f"\n[错误] 同框图 {p.name} 尺寸 {gray.shape[1]}x{gray.shape[0]} "
+                      f"与 --pair-camera {args.pair_camera} 的标定尺寸 {pair_cam_size} 不一致。")
+                log.error("chain：同框图尺寸不一致 %s", p)
+                return 1
+            found = _detect_two_boards(gray, spec)
+            if found is None:
+                print(f"  [跳过] {p.name}：没有同时检出两块板")
+                continue
+            try:
+                T1, e1 = _pnp_reproj_rms(objp, found[0].corners, K_pair, D_pair)
+                T2, e2 = _pnp_reproj_rms(objp, found[1].corners, K_pair, D_pair)
+                T_A, T_B, d_a, d_b = _assign_ab(T1, T2, ref_rots, args.pair_camera)
+            except ValueError as exc:
+                print(f"\n[错误] 同框图 {p.name} 无法分配 A/B 板：{exc}")
+                log.error("chain：A/B 分配失败 %s", exc)
+                return 1
+            T_ab = relative_pose.board_to_board_from_single_camera(T_A, T_B)
+            samples.append(T_ab)
+            pair_rows.append((p.name, e1, e2, d_a, d_b))
 
-    # 链上用的两路板位姿：挑各自重投影最小的那一帧
-    i = int(np.argmin(mono_l["per_view"]))
-    j = int(np.argmin(mono_r["per_view"]))
-    T_camL_A = relative_pose.rt_to_T(cv2.Rodrigues(mono_l["rvecs"][i])[0],
-                                     mono_l["tvecs"][i])
-    T_camR_B = relative_pose.rt_to_T(cv2.Rodrigues(mono_r["rvecs"][j])[0],
-                                     mono_r["tvecs"][j])
+        if not samples:
+            print("\n[错误] --pair-frame 里没有一张图能**同时**检出 A、B 两块板。\n"
+                  "  下一步：把双板靶标放到 --pair-camera 那一路的画面中央、光照均匀、"
+                  "两块板都完整入画，重拍 3~5 张。")
+            log.error("chain：没有可用的同框图")
+            return 1
+        for name, e1, e2, d_a, d_b in pair_rows:
+            print(f"  同框图 {name}: 重投影 {e1:.2f}/{e2:.2f} px，"
+                  f"到参考姿态簇 {d_a:.1f}°/{d_b:.1f}°")
+        cons = relative_pose.consistency(samples)
+        print(f"[chain] T_AB：n={cons['n']}  旋转最大偏离 {cons['rot_max_deg']:.3f}°  "
+              f"平移最大偏离 {cons['trans_max_mm']:.3f} mm  两板间距 "
+              f"{cons['baseline_mm']:.1f} mm")
+
+    # 链上用的两路板位姿。
+    # 双板：A/B 是**两块不同的板**，板框随板走，所以挑各自重投影最小的那一帧
+    # 都还是"该板在某一位姿下"的位姿，链式外参不受影响。
+    # 单板：两路必须用**同一个物理摆放**（--ref-*），绝不能各挑一张移动中的图，
+    # 否则 T_AB ≠ I，链出来的外参是错的 —— 上面已单独算好，这里不能再覆盖。
+    if not same_board:
+        i = int(np.argmin(mono_l["per_view"]))
+        j = int(np.argmin(mono_r["per_view"]))
+        T_camL_A = relative_pose.rt_to_T(cv2.Rodrigues(mono_l["rvecs"][i])[0],
+                                         mono_l["tvecs"][i])
+        T_camR_B = relative_pose.rt_to_T(cv2.Rodrigues(mono_r["rvecs"][j])[0],
+                                         mono_r["tvecs"][j])
 
     # chain 的产物是 none_raw（未做极线校正）的链式外参，只可能用 angled 重建。
     # 以前这里跟 auto 走：新装置没有旧 JSON 时 auto 落到 parallel，于是把
@@ -389,15 +605,20 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     try:
         res = calibrate_stereo(
             objp, c_left, c_right, size_left, cfg, spec, stereo_mode=mode,
-            T_camL_A=T_camL_A, T_AB=samples[0], T_camR_B=T_camR_B,
-            T_AB_samples=samples)
+            T_camL_A=T_camL_A, T_AB=np.eye(4) if same_board else samples[0],
+            T_camR_B=T_camR_B, T_AB_samples=samples)
     except ValueError as exc:
         print(f"\n[错误] {exc}")
         log.error("chain 标定被拒绝：%s", exc)
         return 1
 
-    print(res.report())
-    log.info("chain 结果：\n%s", res.report())
+    report = _chain_report(res, same_board, ref_note if same_board else "")
+    print(report)
+    log.info("chain 结果：\n%s", report)
+    if same_board and rig_angle(res.R) > 60.0:
+        print("[警告] 注意：单板模式在 >60° 的装置上要求两路各自都能看到**整块**板；"
+              "请确认每路检出的是完整棋盘，而不是只看到一角。")
+        log.warning("单板模式 + 夹角 %.1f° > 60°：需确认每路检出完整棋盘", rig_angle(res.R))
     if not res.ok:
         print("标定未通过质量判定，未保存结果。")
         log.warning("chain 标定未通过质量判定，未保存")
@@ -407,7 +628,30 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     rig.quality["method"] = "chain"
     rig.quality["rectification"] = res.rectification
     rig.quality["consistency"] = res.consistency
-    rig.quality["t_ab_mm"] = res.consistency.get("baseline_mm", float("nan"))
+    if not same_board:
+        rig.quality["t_ab_mm"] = res.consistency.get("baseline_mm", float("nan"))
+    else:
+        # 参考图的稳定性必须**落盘**。只打印警告的话，过几天回看，
+        # 这份标定和"参考图确实没动"的那份长得一模一样——而外参的可信度不同。
+        def _ref_stab(info: dict) -> dict:
+            if info["n"] < 2:
+                return {"n": info["n"], "rot_deg": None, "trans_mm": None,
+                        "note": "n<2：未评估重复性"}
+            return {"n": info["n"], "rot_deg": float(info["rot_deg"]),
+                    "trans_mm": float(info["trans_mm"])}
+
+        rig.quality["same_board_ref"] = {
+            "left": _ref_stab(info_l),
+            "right": _ref_stab(info_r),
+            "warn": bool(info_l["warn"] or info_r["warn"]),
+            "warn_threshold": {"rot_deg": REF_ROT_WARN_DEG,
+                               "trans_mm": REF_TRANS_WARN_MM},
+            "best": [str(info_l["best"]), str(info_r["best"])],
+        }
+        if rig.quality["same_board_ref"]["warn"]:
+            rig.quality["same_board_ref"]["note"] = (
+                "参考图之间位姿不一致：板在拍参考图时动了或对焦变了；"
+                "外参按其中一张算，建议重拍参考图后再定稿")
     # 90° 下 F 极线指标需要"同名点"，而 chain 的左右角点**不是对应点**
     # （各自看各自的板），所以这里不做 angled 质量评估，并写清原因。
     rig.quality["angled_grade"] = "未评估"
@@ -515,6 +759,16 @@ def main() -> int:
                          "用来求两板刚性相对位姿 T_AB")
     ap.add_argument("--pair-camera", choices=("left", "right"), default=None,
                     help="chain：--pair-frame 是哪一路相机拍的（left/right）")
+    ap.add_argument("--same-board", action="store_true",
+                    help="同一块固定板：板在两次拍摄之间不得移动；"
+                         "左/右各拍一轮（--left-dir/--right-dir），"
+                         "无需双板靶标与同框图。此时 T_AB 按定义取 I")
+    ap.add_argument("--ref-left", default=None,
+                    help="单板模式的外参锚点：左相机看这块板、**板不动**的参考图"
+                         "（文件或目录，1~5 张）。板要整体入画")
+    ap.add_argument("--ref-right", default=None,
+                    help="单板模式的外参锚点：右相机看**同一块板同一个位置**的参考图"
+                         "（文件或目录，1~5 张）。内参仍取 --right-dir 的结果")
     fov = ap.add_mutually_exclusive_group()
     fov.add_argument("--skip-fov", action="store_true",
                      help="跳过两路视场（FOV）对齐：不估单应、不裁剪不缩放，"
@@ -550,6 +804,14 @@ def main() -> int:
     if args.method == "chain" and args.stereo_mode == "parallel":
         ap.error("chain 产出的是未校正标定（none_raw），不能标成 parallel："
                  "parallel 重建依赖校正后的极线与视差，90° 下不成立。")
+    # 单板模式没有"两块板"：同框图/同框相机/B 板目录都失去测量对象。
+    # 静默忽略它们最坏 —— 用户会以为自己给的同框图被用上了（T_AB 其实仍是 I）。
+    if args.same_board and (args.pair_frame or args.pair_camera or args.board_b_dir):
+        ap.error("--same-board 与 --pair-frame/--pair-camera/--board-b-dir 互斥："
+                 "单板模式没有\"两块板\"可测，T_AB 直接取 I。")
+    if args.same_board and args.method != "chain":
+        ap.error("--same-board 只对 --method chain 有意义（joint 需要两路共视）；"
+                 "请加 --method chain。")
 
     # 日志要在**做任何事之前**起来：标定失败时最有价值的证据（拒绝了什么、
     # 各拒了多少帧）现在只在内存里，进程一退就没了。
@@ -579,8 +841,11 @@ def main() -> int:
     log.info("标定板：%s", spec.describe())
     # ---- chain：离线目录流程（不打开相机/视频，也不做 FOV 对齐）----
     if args.method == "chain":
-        print("方法：chain（独立单目 + 刚性双板公共参考，不需要两路共视）")
-        log.info("method=chain")
+        if args.same_board:
+            print("方法：chain + 单板（独立单目 + 同一块固定板公共参考，T_AB=I）")
+        else:
+            print("方法：chain（独立单目 + 刚性双板公共参考，不需要两路共视）")
+        log.info("method=chain same_board=%s", args.same_board)
         return _run_chain(args, spec, log)
 
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")
