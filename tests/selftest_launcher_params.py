@@ -1328,6 +1328,81 @@ def main() -> int:
         print(f"    备注清空后 notes={json.loads(mjf.read_text(encoding='utf-8'))['notes']!r}")
         print(f"    备份文件：{[p.name for p in sorted(md.glob('session.json.bak-*'))]}")
 
+    # ---- 18. 单板链式标定（第三条路）-----------------------------------
+    #
+    # 为什么要有这一段：GUI 里新增了「四段采集 + 一条 chain 标定」的引导区，
+    # 而这三条路（joint / 90° / 链式）**前提不同、命令也必须不同**。
+    # 拼错了不会有任何界面反馈，只会白拍半小时板。
+    # 断言只碰模块级纯函数，不依赖真实 Tk 状态。
+    print("----- 18. 单板链式标定：四段采集 argv / 标定 argv / 就绪判定 -----")
+    chain_root = ROOT / "outputs" / "chain" / "20260101-000000"
+    panel = dict(width="2560", height="1440", fps="24", backend="auto",
+                 cols=8, rows=5, square=25)
+    checks_chain: list[tuple[str, bool]] = []
+    for stage, side, target in (("left", "left", "15"), ("right", "right", "15"),
+                                ("ref_left", "left", "3"), ("ref_right", "right", "3")):
+        argv = mod.chain_capture_cmd(chain_root, stage, camera=side, **panel)
+        out_dir = argv[argv.index("--out") + 1].replace("\\", "/")
+        checks_chain.append((
+            f"采 {stage}：--side {side} --target {target} --out …/{stage}",
+            argv[argv.index("--side") + 1] == side
+            and argv[argv.index("--target") + 1] == target
+            and argv[argv.index("--camera") + 1] == side
+            and out_dir.endswith("/" + stage)
+            and any(a.endswith("capture_board.py") for a in argv)))
+
+    calib_argv = mod.chain_calibrate_cmd(
+        chain_root, cols=8, rows=5, square=25, width="2560", height="1440",
+        fps="24", backend="auto", target=40, min_pairs=20)
+    calib_joined = " ".join(calib_argv)
+    calib_posix = calib_joined.replace("\\", "/")
+    root_posix = chain_root.as_posix()
+    checks_chain += [
+        ("标定命令走 --method chain + --same-board",
+         "--method chain" in calib_joined and "--same-board" in calib_argv),
+        ("四个目录全传：left / right / ref_left / ref_right",
+         all(f"{root_posix}/{d}" in calib_posix
+             for d in ("left", "right", "ref_left", "ref_right"))),
+        ("不走 90° 那条路（不得含 --stereo-mode）",
+         "--stereo-mode" not in calib_argv and "angled" not in calib_argv),
+        ("板参数 / 分辨率沿用同一份面板值",
+         "--cols 8 --rows 5 --square 25" in calib_joined
+         and "--width 2560 --height 1440 --fps 24" in calib_joined),
+        ("后端 auto 时不传 --backend（落到脚本默认）",
+         "--backend" not in calib_argv),
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="chain_cnt_") as tmp:
+        cdir = Path(tmp)
+        zero = mod._count_shots(cdir)
+        (cdir / "f000.png").write_bytes(b"x")
+        one = mod._count_shots(cdir)
+        (cdir / "notes.txt").write_text("x", encoding="utf-8")
+        for i in range(1, 15):
+            (cdir / f"f{i:03d}.png").write_bytes(b"x")
+        fifteen = mod._count_shots(cdir)
+        missing = mod._count_shots(cdir / "no_such_dir")
+    checks_chain += [
+        ("_count_shots：0 / 1 / 15 张，txt 不计", (zero, one, fifteen) == (0, 1, 15)),
+        ("_count_shots：目录不存在按 0 张", missing == 0),
+    ]
+
+    full = {"left": 15, "right": 15, "ref_left": 3, "ref_right": 3}
+    checks_chain += [
+        ("_chain_ready：四段齐 → 可点", mod._chain_ready(full) is True),
+        ("_chain_ready：任一段 0 张 → 不可点（按钮 disabled）",
+         all(mod._chain_ready({**full, k: 0}) is False for k in full)),
+        ("_chain_ready：每段各 1 张也放行（参考段偏少只提示）",
+         mod._chain_ready({k: 1 for k in full}) is True),
+        ("缺图时状态文字点名缺哪一段",
+         "拍左参考图" in mod._chain_status_text({**full, "ref_left": 0})),
+    ]
+    for name, passed in checks_chain:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        results.append((name, passed))
+    print(f"    采集 argv（ref_left）：{' '.join(mod.chain_capture_cmd(chain_root, 'ref_left', camera='left', **panel))}")
+    print(f"    标定 argv：{calib_joined}")
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
