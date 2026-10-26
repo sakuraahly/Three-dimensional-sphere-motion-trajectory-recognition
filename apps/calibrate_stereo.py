@@ -744,6 +744,20 @@ def _cross_validate_joint(objp, ip1, ip2, size, cfg: CalibConfig, spec: BoardSpe
             camera="left")
         train_both = reprojection_rms_px(
             objp, [ip1[i] for i in train_idx], [ip2[i] for i in train_idx], *params)
+
+        # ---- 数值自洽守卫（不依赖任何自报字段）----
+        # 两目角点数相同、等权 pooling，恒有 rms_both² = (rms_R² + rms_L²)/2。
+        # 这条恒等式能同时抓住两类真实 bug：残差被广播/拼错、只算了一目却标成两目。
+        # 自报字段（used_train_idx / rms_estimator）可以说谎，算术说不谎。
+        for tag, both, right, left in (("训练折", train_both, train_right, train_left),
+                                       ("测试折", test, test_right, test_left)):
+            expect = (right ** 2 + left ** 2) / 2.0
+            if both > 0 and abs(both ** 2 - expect) / both ** 2 > 0.05:
+                raise RuntimeError(
+                    f"交叉验证打分自相矛盾（{tag}）：两目 {both:.4f}² 与 "
+                    f"√((右 {right:.4f}² + 左 {left:.4f}²)/2)={expect ** 0.5:.4f}² 不符"
+                    f"（>5%）。角点数应相等，出现偏差说明残差拼装或口径有 bug。"
+                )
         return {"train_rms": float(train_right), "test_rms": float(test_right),
                 # 声明估计量：两者必须相同，否则比值无意义（见 calib/validation.py 的守卫）
                 "train_rms_estimator": "reprojection_right_px",
