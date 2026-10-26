@@ -43,6 +43,7 @@ from typing import Any
 import cv2
 
 from calib.params import StereoRig
+from sphere_tracker.quality import frames_quality
 from .stereo_mode import optical_axes_angle_deg
 
 SCHEMA = "sphere-stereo-session"
@@ -328,12 +329,13 @@ def _sharpness(
 ) -> tuple[float, float] | None:
     """算 `(Laplacian 方差中位数, 平均亮度)`；读不到返回 None。
 
-    口径**完全对齐** `apps/tools/camera_quality.py::measure()`：同一个
+    口径**完全对齐** `apps/tools/camera_quality.py::measure()`：共用库层的同一个
     `frames_quality()`、同一 25–75% 中心裁切、同一"跳过预热再连取若干帧"的采样
     （那里是预热 30 帧、留最多 8 张；这里照抄这两个数）。差别只有输入：
     本函数吃录像，那个吃实时相机 —— 所以**数值只能在同分辨率/同场景下互相比较**，
     换个分辨率（Live 2560x1440 vs 录像 1718x972）这个绝对值没有可比性。
-    导入失败（比如没装相机后端）只是不打这条提示，绝不影响判定。
+    只有"读不到帧"才返回 None；画质计算本身不再有兜底 —— 依赖是库内正常 import，
+    出问题就该响亮地失败，不该静默降级。
     """
     cap = cv2.VideoCapture(str(video_path))
     try:
@@ -355,10 +357,6 @@ def _sharpness(
             return None
     finally:
         cap.release()
-    try:
-        from apps.tools.camera_quality import frames_quality
-    except Exception:                            # noqa: BLE001 —— 提示功能，不许影响判定
-        return None
     m = frames_quality(grays)
     return float(m.sharp), float(m.bright)
 

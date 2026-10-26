@@ -53,6 +53,9 @@ import numpy as np  # noqa: E402
 
 from _common import add_stereo_source_args  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
+# 纯计算部分在库层：`stereo/sessions.py` 也要用同一套口径，库不能反向 import 本文件。
+# 这里**重新导出**这两个名字，老用法 `from apps.tools.camera_quality import frames_quality` 照旧可用。
+from sphere_tracker.quality import FrameMetrics, frames_quality  # noqa: E402,F401
 from sphere_tracker.sources import BLACK_FRAME_STD, CameraSource  # noqa: E402
 
 
@@ -78,49 +81,6 @@ class Quality:
     @property
     def ok(self) -> bool:
         return not self.error
-
-
-@dataclass
-class FrameMetrics:
-    """一组成片的画质指标（中位数）。
-
-    抽成独立纯函数是为了让**只有一套清晰度算法**：校验器（``stereo/sessions.py``）
-    也要给"清晰度"提示，若各写一份，两个工具迟早给出两个数。
-    """
-    sharp: float = 0.0
-    bright: float = 0.0
-    contrast: float = 0.0
-    over: float = 0.0
-    under: float = 0.0
-
-
-def frames_quality(grays: list[np.ndarray]) -> FrameMetrics:
-    """中景（避开边缘暗角）的清晰度 / 亮度 / 反差 / 过曝 / 死黑，各取中位数。
-
-    纯计算：只吃灰度帧，不碰相机、不读文件。空输入返回全 0。
-    """
-    if not grays:
-        return FrameMetrics()
-    h, w = grays[0].shape[:2]
-    cy0, cy1 = int(h * 0.25), int(h * 0.75)
-    cx0, cx1 = int(w * 0.25), int(w * 0.75)
-    sharps, brights, contrasts, overs, unders = [], [], [], [], []
-    for g in grays:
-        crop = g[cy0:cy1, cx0:cx1]
-        if crop.size < 100:
-            crop = g
-        sharps.append(float(cv2.Laplacian(crop, cv2.CV_64F).var()))
-        brights.append(float(crop.mean()))
-        contrasts.append(float(crop.std()))
-        overs.append(float((crop > 245).mean()))
-        unders.append(float((crop < 12).mean()))
-    return FrameMetrics(
-        sharp=float(np.median(sharps)),
-        bright=float(np.median(brights)),
-        contrast=float(np.median(contrasts)),
-        over=float(np.median(overs)),
-        under=float(np.median(unders)),
-    )
 
 
 def _is_partial(gray: np.ndarray) -> bool:
