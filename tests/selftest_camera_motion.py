@@ -44,6 +44,7 @@ import cv2
 import numpy as np
 
 from sphere_tracker.camera_motion import GlobalMotionEstimator, MotionEstimate
+from sphere_tracker.multi_target import MultiTracker, TrackConfig
 
 
 def est(dx: float = 0.0, dy: float = 0.0, method: str = "features") -> MotionEstimate:
@@ -207,6 +208,108 @@ def test_estimate() -> bool:
     return all(p for _n, p in checks)
 
 
+def _end_of(track) -> tuple[float, float]:
+    """轨迹最后一次**真实观测**的位置（跳过 None 空洞）。"""
+    for p in reversed(track.positions):
+        if p is not None:
+            return float(p[1]), float(p[2])
+    raise AssertionError("轨迹没有任何观测")
+
+
+def test_multi_target() -> bool:
+    """多球关联：交叉不换身份 / 遮挡沿用 tid / 超时建新轨 / 噪声不建轨。
+
+    这四条守的是 `multi_target.py` 的**边界**，不是"代码能跑"：
+    纯位置关联在什么情况下成立、在什么情况下必须承认失败（`swap_events`），
+    都把结果钉在数值上，避免"看起来像在跟踪"。
+    """
+    print("----- 二维多目标关联（gate 40 px / max_missing 15 / min_hits 3）-----")
+    checks: list[tuple[str, bool]] = []
+
+    def report(label: str, ok: bool, detail: str) -> None:
+        print(f"  {label:<30} {detail}  {'通过' if ok else '不达标'}")
+        checks.append((label, ok))
+
+    # --- 1. 两球匀速交叉：两条轨迹、身份不互换、终点贴真值 ---------------
+    # A 水平向右，B 竖直向下，在 t≈46 时两心最近只差 24 px（小于 gate），
+    # 这是纯位置关联最容易认错的地方；匀速外推必须把身份分开。
+    A0, VA = (100.0, 200.0), (4.0, 0.0)
+    B0, VB = (300.0, 80.0), (0.0, 3.0)
+    trk = MultiTracker(TrackConfig())
+    for t in range(100):
+        ax, ay = A0[0] + VA[0] * t, A0[1] + VA[1] * t
+        bx, by = B0[0] + VB[0] * t, B0[1] + VB[1] * t
+        trk.update(float(t), [(ax, ay), (bx, by)])
+    st = trk.stats()
+    ok_n = (len(trk.tracks) == 2 and st["n_tracks"] == 2)
+    report("交叉后轨迹数", ok_n, f"{len(trk.tracks)} 条（应为 2）")
+    # 按**起点**判定身份：起点贴 A 的那条，终点必须贴 A 的终点
+    err = []
+    for tr in trk.tracks:
+        t0, x0, y0 = tr.positions[0]
+        is_a = abs(x0 - A0[0]) < 1.0 and abs(y0 - A0[1]) < 1.0
+        tx, ty = _end_of(tr)
+        ex = A0[0] + VA[0] * 99 if is_a else B0[0] + VB[0] * 99
+        ey = A0[1] + VA[1] * 99 if is_a else B0[1] + VB[1] * 99
+        err.append(((ex - tx) ** 2 + (ey - ty) ** 2) ** 0.5)
+    ok_id = all(e < 2.0 for e in err) and len(err) == 2
+    report("身份未互换（终点误差）", ok_id,
+           f"{', '.join(f'{e:.2f}' for e in err)} px（应 < 2）")
+    ok_no_swap = st["n_swap"] == 0
+    report("未发生身份交换", ok_no_swap, f"swap_events={st['n_swap']}（应为 0）")
+    print(f"    stats: {st}")
+
+    # --- 2. 遮挡 10 帧后原位置重现：必须沿用原 tid -----------------------
+    cfg = TrackConfig()
+    trk = MultiTracker(cfg)
+    for t in range(10):
+        trk.update(float(t), [(320.0, 240.0)])
+    tid0 = trk.tracks[0].tid
+    for t in range(10, 20):
+        trk.update(float(t), [])
+    missing_now = trk.tracks[0].missing
+    trk.update(20.0, [(320.0, 240.0)])
+    st = trk.stats()
+    ok_reid = (len(trk.tracks) == 1 and trk.tracks[0].tid == tid0
+               and st["n_reid"] == 1 and trk.tracks[0].reid_events == 1)
+    report("遮挡 10 帧沿用原 tid", ok_reid,
+           f"缺失 {missing_now} 帧后 tid {tid0}->{trk.tracks[0].tid}，n_reid={st['n_reid']}")
+
+    # --- 3. 遮挡 30 帧（> max_missing）后在远处重现：必须新建 tid ---------
+    trk = MultiTracker(TrackConfig())
+    for t in range(10):
+        trk.update(float(t), [(320.0, 240.0)])
+    tid0 = trk.tracks[0].tid
+    for t in range(10, 40):
+        trk.update(float(t), [])
+    alive_after = len(trk.tracks)          # 超时后应当被删干净
+    for t in range(40, 43):                # 远处重现，还要连续 3 帧才建轨
+        trk.update(float(t), [(500.0, 400.0)])
+    st = trk.stats()
+    ok_new = (alive_after == 0 and st["n_tracks"] == 2 and len(trk.tracks) == 1
+              and trk.tracks[0].tid != tid0)
+    report("超时后远处重现建新 tid", ok_new,
+           f"超时存活 {alive_after} 条，n_tracks={st['n_tracks']}，"
+           f"tid {tid0}->{trk.tracks[0].tid}")
+
+    # --- 4. 纯噪声：随机点不许建轨（min_hits 必须真的生效）----------------
+    # 场景：640x480 画面里每帧 2 个孤立随机点，连续 100 帧。
+    # 注意这是**概率性**判据，不是定理：随机点偶尔也能连续 3 帧落进
+    # 40 px / 20 px 的门限里（实测 100 个 seed 有 6 个会漏建 1 条短假轨）。
+    # 固定 seed 是为了让这条断言可复现；它证明的是"常规噪声密度下不建轨"，
+    # 不证明"任何噪声都不建轨"。
+    trk = MultiTracker(TrackConfig())
+    rng = np.random.default_rng(42)
+    for t in range(100):
+        pts = [(float(rng.uniform(0, 640)), float(rng.uniform(0, 480))) for _ in range(2)]
+        trk.update(float(t), pts)
+    st = trk.stats()
+    ok_noise = st["n_tracks"] == 0 and len(trk.tracks) == 0
+    report("纯噪声不建轨（2 点/帧）", ok_noise, f"n_tracks={st['n_tracks']}（应为 0）")
+
+    return all(p for _n, p in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("相机自运动估计自测")
@@ -215,7 +318,9 @@ def main() -> int:
     print()
     b = test_estimate()
     print()
-    ok = a and b
+    c = test_multi_target()
+    print()
+    ok = a and b and c
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 
