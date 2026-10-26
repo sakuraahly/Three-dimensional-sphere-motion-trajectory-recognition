@@ -169,12 +169,29 @@ RUNTIME_REPRO_MARK = "config"
 
 
 def doc_files() -> list[Path]:
+    """要检查的 Markdown 清单。
+
+    ⚠️ **不要按名字排除临时探针**（2026-10-26 的教训）：
+    `selftest_doc_facts` 做"反向自证"时，会在 `docs/` 下造一个 `_zz_tmp_*_probe.md`
+    再跑本检查、期望被抓到。按名字过滤会把**它的探针也一起屏蔽**，
+    自证于是变成"永远通过" —— 我为了让并发不误报而加的那行过滤，恰好干掉了这件事。
+
+    正确处理是：**容忍扫描期间文件消失**（见 `_read_text`），而不是不去看它。
+    """
     return [ROOT / "AGENTS.md", ROOT / "README.md",
-            # 跳过测试临时探针：`selftest_doc_facts` 会在 docs/ 下建 `_zz_tmp_*_probe.md`
-            # 又立刻删掉。它与本检查并发跑时，枚举到一半文件就消失了（FileNotFoundError），
-            # 看起来像"规范漂移"，其实只是两条进程撞在一起。
-            *sorted(q for q in (ROOT / "docs").rglob("*.md")
-                    if not q.name.startswith("_zz_tmp_"))]
+            *sorted((ROOT / "docs").rglob("*.md"))]
+
+
+def _read_text(path: Path) -> str | None:
+    """读文件；扫描期间被别的进程删掉就返回 None（不是错误）。
+
+    并发场景：`selftest_doc_facts` 建/删探针与 `check_standards` 枚举同时发生，
+    glob 拿到名字、读取时文件已经没了。这不是"规范漂移"，是竞态。
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
 
 
 def _src_literals() -> set[str]:
@@ -214,9 +231,12 @@ def _outside_path(cand: str) -> Path | None:
 def _iter_refs():
     """逐条产出文档里的路径引用：(文档相对路径, 引用原文, 行号, 该行, 候选路径, 分段)。"""
     for doc in doc_files():
+        text = _read_text(doc)
+        if text is None:            # 扫描期间被删（并发跑测试的探针）—— 跳过，不算问题
+            continue
         rel = doc.relative_to(ROOT).as_posix()
         for lineno, line in enumerate(
-                doc.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                (text or "").splitlines(), 1):
             for m in PATH_RE.finditer(line):
                 raw = m.group(1)
                 cand = raw.replace("\\", "/").lstrip("./")
