@@ -16,9 +16,10 @@
 from __future__ import annotations
 
 from ..config import DetectorConfig
+from ..plugins import resolve
 from .base import BaseDetector, resolve_weights
 from .color import ColorBlobDetector
-from .factory import build_single_detector
+from .factory import build_single_detector, canonical_name
 from .fusion import FusionDetector
 from .hough import HoughDetector
 from .motion import MotionDetector
@@ -45,19 +46,10 @@ __all__ = [
 # 工厂
 # --------------------------------------------------------------------------
 def build_detector(cfg: DetectorConfig) -> BaseDetector:
-    """根据配置创建检测器。"""
-    name = cfg.method.strip().lower()
-    if name in ("color", "hough", "motion", "specular"):
-        det = build_single_detector(name, cfg)
-        assert det is not None
-        return det
-    if name == "fusion":
-        return FusionDetector(cfg)
-    if name == "yolo":
-        return YoloDetector(cfg)
-    if name in ("yolo_sam", "sam", "sam2"):
-        return YoloSamDetector(cfg)
-    raise ValueError(
-        f"未知检测方法 {cfg.method!r}，可选：color / hough / motion / specular / "
-        "fusion / yolo / yolo_sam"
-    )
+    """根据配置创建检测器。
+
+    名字 → 实现走注册表（`registry.py`），这里**不再有 if 链**：
+    以前这份分派和 `factory.build_single_detector` 各写一遍，加一个检测器要改两处。
+    未知名字抛 `UnknownPlugin`，消息里带可用名字与注册模块（R3，不 fallback）。
+    """
+    return resolve("detector", canonical_name(cfg.method))(cfg)

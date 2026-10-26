@@ -114,7 +114,10 @@ class DetectorConfig:
     """
 
     method: str = "color"
-    # 融合时启用的子检测器
+    # 融合时启用的子检测器。这是 fusion 的**语义**配置（投票成员），不是"有哪些
+    # 检测器"的清单来源 —— 清单在 `detectors/registry.py`（规则 R7）。
+    # 这 3 个名字**必须**在 detector 注册表里存在：`selftest_plugins` 会断言，
+    # 拼错时 fusion 会静默少一路投票（只剩 2 票，"多方一致"的门槛就松了）。
     fusion_members: list[str] = field(default_factory=lambda: ["color", "hough", "motion"])
 
     # ---- 尺寸/形状约束（像素）。是抑制误检最有效的一招 ----

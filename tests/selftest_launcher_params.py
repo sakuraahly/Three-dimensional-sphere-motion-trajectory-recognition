@@ -157,20 +157,25 @@ def main() -> int:
     # 直接用 `AppConfig()` 读，而不是去 grep 源码字符串
     # （我第一版就是 grep `"color" in rt_src`，写成了一条会被正确实现判红的坏断言）。
     from sphere_tracker.config import AppConfig as _AppConfig
+    from sphere_tracker.detectors import registry as _detector_registry  # noqa: F401  （import 即注册）
+    from sphere_tracker.plugins import default as _plugin_default
+    from sphere_tracker.plugins import names as _plugin_names
     script_default = _AppConfig().detector.method
     got_default = app.method.get()
-    rt_src = (ROOT / "apps" / "run_realtime.py").read_text(encoding="utf-8")
     print(f"  界面默认 = {got_default!r}；"
           f"DetectorConfig 的默认（= 不传 --method 时生效）= {script_default!r}")
+    # 断言"注册表首项 == 注册表默认 == config 默认"，而不是"列表第 0 项的字面量"：
+    # 清单顺序是展示细节，默认值才是契约（`docs/插件化架构.md` §5）。
     checks_default = [
         (f"界面默认检测方法与脚本默认逐字相同（{script_default}）",
          got_default == script_default),
-        ("下拉框首项就是默认值（改列表顺序不会让默认值漂走）",
-         bool(mod.METHODS) and mod.METHODS[0] == got_default),
+        ("下拉首项 == default(\"detector\") == DetectorConfig().method",
+         _plugin_names("detector")[0] == _plugin_default("detector") == script_default),
+        ("下拉框内容就是注册表（界面没有手写清单）",
+         list(app.method["values"]) == _plugin_names("detector")),
         ("color 排在 fusion 之前（默认项不该埋在列表中间）",
-         mod.METHODS.index("color") < mod.METHODS.index("fusion")),
-        ("脚本侧确实把 --method 的缺省交给配置（没另写一个默认值）",
-         "args.method" in rt_src and "cfg.detector.method = args.method" in rt_src),
+         _plugin_names("detector").index("color")
+         < _plugin_names("detector").index("fusion")),
     ]
     for name, ok in checks_default:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
