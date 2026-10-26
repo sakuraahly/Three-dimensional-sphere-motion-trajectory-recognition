@@ -317,6 +317,27 @@ class SpherePipeline:
 **坑**：① `reset()` 清 tracker/`history3d`/detector/motion_estimator/`_prev_gray`/`_frame_index`/`_prev_t`，**但不清 `_fps_ema`、`_t0`、`_detector_error`**（换源后 FPS 会带旧值平滑，报错也不会再打印）。
 ② `history3d` 只在三维成立时追加，`state.z/vz` 也在那里回填。
 ③ 检测器的 `RuntimeError`（AI 后端未装）只打印**一次**，之后静默按"没检测到"跑。
+## 11b. `sphere_tracker/multi_target.py` —— 二维多目标关联（未接主流程）
+```python
+@dataclass TrackConfig:  gate_px=40.0; max_missing=15; predict_kind="const_velocity"
+                         reid_radius_px=120.0; reid_after_missing=10; min_hits=3
+@dataclass Track:  tid; positions: list[(t,x,y)|None]; state; hits; missing;
+                   velocity(px/s); predicted; reid_events; swap_events
+                   .last_observation -> (t,x,y)|None;  .length -> 真实观测点数
+class MultiTracker:
+    def __init__(self, cfg: TrackConfig | None = None)
+    def update(self, t, detections: Sequence[tuple[float,float]]) -> list[Track]
+    def stats(self) -> dict[str, float]      # n_tracks / n_active / n_reid / n_swap / mean_track_len
+    def reset(self) -> None
+```
+- 返回**当前存活**轨迹（按创建顺序）；`update` 内部顺序：先对全部轨迹按匀速外推 → 贪心一对一关联（按距离升序，全局门限 `gate_px`）→ 身份互换仲裁 → 未命中记 `miss` → 删 `dead` → 未匹配检测进 `pending`（连续 `min_hits` 次才建轨）。
+- `positions` 是**逐帧表**：丢失帧写 `None`；`predicted` 是外推值，**不是观测**，不要当下游真值。
+- **坑**：① `predict_kind` 只支持 `"const_velocity"`，别的值在 `__init__` 就 `ValueError`（没有加速度/重力模型是刻意的 —— 二维里重力会飘）。
+  ② 半径法 reid 只看位置：两球靠近到同一个 `reid_radius_px` 圈内**可能互相认错**，球从别处再入且距离超半径就**认不回**；要根治必须有外观特征（当前检测器只给圆心+半径）。
+  ③ **`swap_events` / `stats()["n_swap"]` 是记账，不是修复**：两球重合附近二维位置本质退化，最优匹配胜出后显式记一次交换，而不是假装没发生。看到 `n_swap > 0` 说明这段轨迹的身份**已经不可信**。
+  ④ `mean_track_len` 只统计**当前存活**轨迹（被删的短轨迹不参与，否则均值被拉低看不出身份保持好坏）。
+  ⑤ 时间 `t` 必须单调；速度是"最后两个观测"差分（单帧噪声直接进速度，外推 10 帧可偏 10–20 px，正是 `reid_radius_px` 要兜的那部分）。
+
 ## 12. `calib/` —— 双目标定（离线、一次）
 ### 12.1 `calib/board.py`
 ```python
@@ -436,6 +457,27 @@ def toml_dumps(data: dict) -> str        # 最小 TOML 序列化器（stdlib 只
 **产物**：`left_camera.<ext>` / `right_camera.<ext>` / `stereo_rig.<ext>` + `summary.txt`。
 **格式**：JSON（stdlib）、YAML（PyYAML，可选）、TOML（自带 writer）。
 请求 YAML 但缺 PyYAML 时**一个文件都不写**（避免留下半套）；未知格式抛 `ValueError`。
+### 12.6 `calib/world_frame.py` —— 世界系（棋盘 PnP）
+```python
+MAX_BOARD_RMSE_PX = 2.0                      # 超过就不许当世界系
+@dataclass WorldFrame:
+    T_world_cam: np.ndarray                  # 4x4，p_world = T @ p_left_camera
+    source: str; units="m"; note=""; board_rmse_px: float|None; created_at: str
+    def apply(self, points: (N,3) | None) -> (N,3) | None      # None 原样返回
+    def describe(self) -> str
+    def save(self, path) -> Path                               # JSON，矩阵一行一个 4x4 行
+    @classmethod load(cls, path) -> WorldFrame                 # 任何校验不过就 ValueError
+    @classmethod from_camera_board(cls, T_cam_board, *, source="manual", units="m",
+                                   note="", board_rmse_px=None, ground_axis="z") -> WorldFrame
+def from_board(image_path, board_spec: BoardSpec, rig: StereoRig, *, ground_axis="z") -> WorldFrame
+```
+- `from_board`：`detect_board` → `solvePnP`（用左路 `K1/D1`）→ `T_cam_board` → 取逆。CLI 在 `apps/tools/set_world_frame.py`（`--image --board-cols/--board-rows/--board-square --rig --out --note --ground-axis {z,-z} --dry-run`）。
+- **校验规则**（`__post_init__`，全部抛 `ValueError` 并说明是哪一条）：4x4 / 全 `finite` / 最后一行必须是 `[0,0,0,1]` / 旋转块 `RᵀR−I` 最大偏差 ≤ 1e-6 / `det(R) > 0`（<0 是镜像不是旋转）。`load()` **绝不回退成单位矩阵**，文件缺失抛 `FileNotFoundError`。
+- **坑**：① 原点取画面**最"左下"的内角点**（按 `x−y` 最小），消掉 SB 与经典检测器之间 180° 的起点差；相机装歪 90° 时"左下"仍可算但已不等于物理左下角。
+  ② **`Z` 是棋盘法向，不是"重力反方向"**：板平放地面、图案朝上拍时默认 +Z 指向地面以下，要 Z 朝上必须传 `ground_axis="-z"`（Y 同时反向以保右手系）。符号只能靠人确认，程序不替你猜。
+  ③ `board_rmse_px` **只反映 PnP 拟合好坏**，看不出来"板是不是真的平放在地上"——板没放平、相机与板不同侧，世界系都会歪而 rmse 依然漂亮。
+  ④ 内部计算一律 `left_camera`，只在**导出那一刻**转世界；没这个文件时导出必须写 `coordinate_system="left_camera"`，不许静默当世界系。
+
 ## 13. `stereo/` —— 双目逐帧
 ### 13.1 `stereo/sync.py`
 ```python
@@ -634,6 +676,24 @@ def export_session_visualization(session_dir, *, csv_name="traj3d.csv") -> dict[
   用 `csv.DictReader` 会把 `track` 错当 `residual_px`（本轮踩过）；
 - 坐标/单位/版本规则见 `docs/数据标准.md`；`run_stereo_video` 全片跑完会自动导出，
   部分帧试跑（`_firstN`）不覆盖正式 JSON。
+### 13.7 `stereo/predict3d.py` —— 三维弹道外推 + 反弹检测（未接主流程）
+```python
+@dataclass(frozen=True) PredictConfig:
+    g=(0.0,-9.81,0.0); horizons=(0.1,0.2,0.3,0.5); min_samples=5
+    max_gap_s=0.25; residual_gate_m=0.05
+@dataclass(frozen=True) BallisticState:
+    p0; v0; g; rms_m; n; t_ref; dropped=0        # p0 是 t_ref（最后一个有效样本）时刻的位置
+def fit_ballistic(times, points, cfg=None, reason=None) -> BallisticState | None
+def predict(state: BallisticState | None, horizons) -> dict[float, np.ndarray]   # None -> {}
+def detect_bounce(times, points, cfg=None, reason=None) -> int | None
+```
+- 模型 `p(t)=p0+v0·τ+0.5·g·τ²`，只解每轴 `(p0,v0)` 共 6 个未知数（线性最小二乘，**无迭代优化器**）；`g` 是**已知常向量** —— 三维里它不依赖焦距和深度，这正是三维比二维稳的原因。
+- **`fit_ballistic` 什么时候返回 `None`**（原因写进 `reason`，从不硬给一个解）：`n < min_samples` / 时间跨度 < 1 ms / 设计矩阵条件数 > 1e8 / 残差 `rms_m > residual_gate_m`（窗口里多半混进了反弹）。
+- **`detect_bounce` 的判据（两步缺一不可）**：先看整段残差，没超门限 → `None`（纯噪声仍是同一条抛物线，不许报反弹）；超标才逐切分点分段拟合，要求**两段各自合格**且明显优于整段（`worst ≤ 0.5·rms_all`），`v_y` 由负转正只作挑点的加分项。返回的是 `_prepare` 之后的数组下标（已排序、去重时与原始下标不同）。
+- **坑**：① **`g` 的方向由世界系定义**。默认 `(0,-9.81,0)` 只是"y 轴向上"的**约定，不是测量**；相机俯拍/侧装时必须用 `PredictConfig(g=...)` 换成世界系给出的重力方向，否则 0.3 s 外推能偏几十厘米。
+  ② `predict` 的 horizon 相对 `t_ref`（最新观测），不是第一个样本 —— "现在"永远是最新观测。
+  ③ 重复/乱序时间戳在 `_prepare` 里排序去重，丢弃数记在 `dropped`；`residual_gate_m=0.05` 是"毫米级残差"的门限，混进反弹就会被拒，**别为了让它出结果而调大**。
+
 ## 14. 依赖方向
 
 > **图与规则在根目录 `AGENTS.md` §5（唯一权威），这里不复制。**
@@ -649,7 +709,8 @@ def export_session_visualization(session_dir, *, csv_name="traj3d.csv") -> dict[
 ## 15. 核对记录与本文边界
 **已用 `inspect.signature` 复核的 38 个签名**：`geometry` 的 `refine_circle_subpixel`/`fit_circle_robust`/`circle_radial_gradient_stats`/`CameraModel.__init__`/`estimate_focal_from_known_ball`；`camera_motion` 的 `GlobalMotionEstimator.__init__`/`.estimate`/`warp_to_current`；`detectors.base._score_candidate`；`track` 的 `KalmanFilter.__init__`/`Track.__init__`；`predict` 的 `predict_quadratic`/`TrajectoryPredictor.predict`；`sources` 的 `CameraSource.__init__`/`open_source`/`LatestFrameCamera.latest`；`viz` 的 `draw_prediction`/`draw_3d_panel`/`hud_lines`；`pipeline` 的 `SpherePipeline.process`/`.render`；`calib` 的 `detect_board`/`detect_board_in_roi`/`pose_distance`/`AutoPairCollector.offer`/`calibrate_stereo`/`StereoRig.rectify_maps`/`StereoRig.triangulate`；`stereo` 的 `find_offset`/`brightness_series`/`match_epipolar`/`triangulate_one`/`StereoReconstructor.update`/`PairSource.__init__`/`from_args`/`resolve_backend`；以及 §13.3c 的 `estimate_fov_alignment`/`FovAlignment.from_dict`（2 个，2026-10-24 补）。
 
-**边界（诚实标注）**：① 本文**不覆盖** `apps/`、`tests/`、启动器与 PPT 工具链的内部实现（只在 §13.2 提了一句 `apps/_common.py` 的参数约定）。
+**边界（诚实标注）**：⓪ 2026-10-26 新增的 §11b `multi_target` / §12.6 `world_frame` / §13.7 `predict3d`
+签名是**按源码抄写**的，**没有**跑 `inspect.signature` 复核（不在上面那 38 个之列）。① 本文**不覆盖** `apps/`、`tests/`、启动器与 PPT 工具链的内部实现（只在 §13.2 提了一句 `apps/_common.py` 的参数约定）。
 ② 文中所有"实测数字"（300/93/12/40 ms、~0.1 s vs ~10 s、圆度 0.61~0.63…）**引自源码注释**，我**没有**重跑那 6 个 `tests/selftest_*.py`。
 ③ ~~§10 的 `viz.scale != 1` 绘制不一致~~ —— **已修，不再是边界**（2026-10-14 的 `feat(ui)` 那轮把 scale 接进每个 `draw_*`，见 §10 坑④）。
 ④ **未确认**：`MotionDetector._bg_stale` 在长时间手持下的实际重学效果、`optimize_mode()` 在非本机摄像头上的耗时 —— 只有代码注释作依据。

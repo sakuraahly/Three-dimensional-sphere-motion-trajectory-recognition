@@ -114,15 +114,12 @@ KNOWN_MENTIONS: dict[str, str] = {
         "§2.1 在陈述**这个脚本不存在**（这是那条发现的结论本身）",
     "docs/交接文档.md:STC/scripts/Check-Standards.ps1":
         "§历史小记在讲「`AGENTS.md` 原先写着…并称它负责落差检测」，是在归档旧说法",
-    # ---- 2026-10-19 计划：世界系变换文件**尚未实现** ----
-    "docs/planbooks/2026-10-19_相机接入与数据采集.md:world_frame.json":
-        "P6 计划中的世界系变换文件，尚未实现",
-    "docs/planbooks/2026-10-19_金属球检测与三维后处理.md:world_frame.json":
-        "P4 计划中的世界系变换文件，尚未实现",
-    "docs/数据标准.md:world_frame.json":
-        "世界系变换文件，尚未实现（数据标准里明确标注）",
-    "docs/交接文档.md:world_frame.json":
-        "世界系变换文件，尚未实现（交接文档 §8 明确标注）",
+    # ---- 世界系变换文件：2026-10-25 起**已实现**，豁免条目随之作废 ----
+    # `calib/world_frame.py` + `apps/tools/set_world_frame.py` 落地后，
+    # `world_frame.json` 出现在 .py 的字面量里（stereo/visualization.py 的默认路径等），
+    # `_src_literals()` 会把"源码里写过的路径"视为合法运行时路径 ——
+    # 于是这 4 条豁免永远不再命中，留着只会让检查器报"死白名单"。
+    # 记一笔原因，免得以后有人以为是漏配。
     "README.md:video_edge_detect.py": "在「历史遗留脚本」说明表格里",
     "README.md:test.py": "同上",
     "docs/开题报告_研究思路四页文稿.md:calib/calibrate_stereo.py":

@@ -103,7 +103,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
-| **相机 / 标定**（9） | `cameras.py` `list_cameras.py` `camera_quality.py` `capture_board.py` `check_stereo_setup.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` | 课题主线（含"按空格存棋盘图"的采集工具，供链式/单板标定用） |
+| **相机 / 标定**（10） | `cameras.py` `list_cameras.py` `camera_quality.py` `capture_board.py` `check_stereo_setup.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` `set_world_frame.py` | 课题主线（含"按空格存棋盘图"的采集工具，供链式/单板标定用；以及"拍一张地面棋盘图定世界系"） |
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
 | **文档与事实**（5） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` `build_sbom.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落）、生成 / 更新 SBOM |
 | **数据 / 会话**（1） | `check_dataset.py` | 校验录制会话（视频 / 标定 / 同步） |
@@ -114,6 +114,21 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **为什么不拆成 `apps/tools/ppt/`**：这 8 个文件的路径在 7 份文档里被引用
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
+
+### `apps/` 顶层：13 个可执行脚本 + 7 个私有模块
+
+| 组 | 文件 | 用途 |
+| -- | ---- | ---- |
+| 主线（4） | `run_stereo_video.py` `run_all.py` `run_realtime.py` `run_video.py` | 离线双目三维重建 / 一条命令编排 3→6 / 实时单目 / 离线单目 |
+| 标定与录制（3） | `record_stereo.py` `calibrate_stereo.py` `verify_stereo.py` | 双路录制（含 session.json）/ 自动标定 / 标定复检 |
+| 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
+| 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
+| 私有模块（7） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` | 不是入口，被上面那些 import（日志与取帧 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算） |
+
+> ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
+> 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
+> 这里照着加粗，那 13 个 `apps/` 脚本会被当成"工具分组"，然后因为磁盘上
+> `apps/tools/` 里没有它们而报"列了但不存在"。要改格式，先改那个解析器。
 
 ---
 
@@ -220,7 +235,7 @@ apps / tests                        （只调用，不被调用）
 | 测试 | 守什么 |
 | ---- | ------ |
 | `selftest_synthetic.py` | 单目全链路（三场景） |
-| `selftest_camera_motion.py` | 相机自运动：迟滞状态机 + 位移换算方向 |
+| `selftest_camera_motion.py` | 相机自运动：迟滞状态机 + 位移换算方向；多目标关联（遮挡外推 / 半径法重识别 / 身份互换记账） |
 | `selftest_camera_registry.py` | 摄像头设备管理（角色 / 「无关」清单） |
 | `selftest_camera_quality.py` | 相机画质会诊（蒙雾 / 过曝 / 残帧） |
 | `selftest_pair_source.py` | 成对取帧 + 同步偏移语义 |
