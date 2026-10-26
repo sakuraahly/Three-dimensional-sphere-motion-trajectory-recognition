@@ -268,8 +268,9 @@ def _recover_stale_mutation() -> None:
     源码里就留着 `# ← 注入` 的变异体 —— 而**下一个测试会在坏代码上跑**，
     结果看起来正常。这套测试是"信任的根"，必须在根上先对账。
     """
+    import pathlib as _pathlib                 # 本模块没在顶层 import pathlib
     import sys as _sys
-    tests_dir = pathlib.Path(__file__).resolve().parent.parent / "tests"
+    tests_dir = _pathlib.Path(__file__).resolve().parent.parent / "tests"
     if str(tests_dir) not in _sys.path:
         _sys.path.insert(0, str(tests_dir))
     try:
