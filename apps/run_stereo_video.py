@@ -22,6 +22,8 @@
 
     derived/traj3d.csv        逐帧：matched, t, X/Y/Z, 左右像素, 极线/交会残差
     derived/annotated.mp4     左右并排 + 检测圈（--no-video 可关）
+    derived/traj3d_world.csv  同上列名，坐标换成世界系（有 world_frame.json 时）
+    derived/predictions.csv   t_ref,horizon_s,x,y,z（弹道外推；--no-predict 可关）
 
 ⚠️ 默认检测器是 `color`，适合**哑光纯色球**。金属/高光球（例如摆锤）用
 `color` 会锁到背景高光；可试 `--method hough --min-radius 6 --max-radius 15`，
@@ -44,13 +46,16 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from calib import StereoRig
+from calib import StereoRig, WorldFrame
 from calib.params import is_uncorrected                                  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig     # noqa: E402
 from sphere_tracker.geometry import CameraModel              # noqa: E402
 from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
-from stereo import MatchConfig, PairSource, StereoReconstructor, savgol_trajectory  # noqa: E402
+from stereo import (  # noqa: E402
+    MatchConfig, PairSource, PredictConfig, StereoReconstructor,
+    fit_ballistic, predict, savgol_trajectory,
+)
 from stereo.stereo_mode import (  # noqa: E402
     mode_label, optical_axes_angle_deg, resolve_auto,
 )
@@ -97,6 +102,82 @@ def _mode_guard(mode: str, rectification: str) -> tuple[str, bool]:
     if mode == "parallel" and is_uncorrected(rectification):
         return "angled", True
     return mode, False
+
+
+def _world_block(world: WorldFrame | None, arr, base_frame: str) -> tuple[np.ndarray | None, dict]:
+    """左相机系 -> 世界系。**纯函数**：不读文件、不猜模式，坐标系由调用处给出。
+
+    `base_frame` 是"没有世界系时这次的点到底在哪个系"：
+    ``parallel`` -> ``"rectified_left_camera"``（校正后左相机系），
+    ``angled`` -> ``"left_camera"``（原始左相机系）。写错比不写更危险 ——
+    下游会按 `left_camera` 的 K/D 去解释校正系的点。
+
+    返回 ``(坐标已换成世界系的数组或 None, 写进 traj3d.json 的坐标系块)``：
+
+    - ``world is None``：数组返回 ``None``，块里如实写 ``base_frame``，
+      **不冒充世界系**；
+    - ``world`` 给了：``traj3d.csv`` 那份坐标不动，这里只产出
+      用于 ``derived/traj3d_world.csv`` 的副本，坐标系记 ``"world"``。
+
+    输入 ``arr`` 是 ``(N,4)`` 的 ``[t, X, Y, Z]``（``rec.as_array()`` 的布局）或
+    ``(N,3)`` 的纯点；时间列原样保留。
+    """
+    if world is None:
+        return None, {"coordinate_system": base_frame, "world_frame": None}
+    block = {
+        "coordinate_system": "world",
+        "world_frame": {"source": world.source, "note": world.note,
+                        "created_at": world.created_at},
+    }
+    if arr is None:
+        return None, block
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim != 2 or a.shape[1] not in (3, 4):
+        raise ValueError(f"_world_block 需要 (N,3)/(N,4) 的点，实际 shape={a.shape}")
+    out = a.copy()
+    if a.shape[0]:
+        if a.shape[1] == 4:
+            out[:, 1:4] = world.apply(a[:, 1:4])
+        else:
+            out[:, 0:3] = world.apply(a)
+    return out, block
+
+
+def _predict_block(arr, cfg: PredictConfig) -> tuple[list[dict], dict]:
+    """对一条三维轨迹做弹道拟合 + 解析外推。**纯函数**：不读文件。
+
+    返回 ``(rows, block)``：``rows`` 每个 horizon 一条
+    ``{t_ref, horizon_s, x, y, z}``，直接写 ``derived/predictions.csv``；
+    ``block`` 是 ``traj3d.json`` 里的 ``predictions`` 内容。
+
+    拟合不合格（样本不足 / 残差超门限）时 ``rows`` 为空、``block`` 只带
+    ``skipped`` 原因 —— **绝不返回硬凑的预测值**。
+    """
+    a = (np.zeros((0, 4), dtype=np.float64) if arr is None
+         else np.asarray(arr, dtype=np.float64))
+    if a.ndim != 2 or a.shape[1] != 4:
+        raise ValueError(f"_predict_block 需要 (N,4) 的 [t,X,Y,Z]，实际 shape={a.shape}")
+    if a.shape[0] == 0:
+        return [], {"skipped": "没有可用的三维点"}
+    why: list[str] = []
+    state = fit_ballistic(a[:, 0], a[:, 1:4], cfg, why)
+    if state is None:
+        return [], {"skipped": why[0] if why else "弹道拟合失败"}
+    pred = predict(state, cfg.horizons)
+    rows: list[dict] = []
+    for h in cfg.horizons:
+        p = pred[float(h)]
+        rows.append({"t_ref": float(state.t_ref), "horizon_s": float(h),
+                     "x": float(p[0]), "y": float(p[1]), "z": float(p[2])})
+    block = {
+        "t_ref": float(state.t_ref),
+        "state": {"p0": [float(v) for v in state.p0],
+                  "v0": [float(v) for v in state.v0],
+                  "rms_m": float(state.rms_m), "n": int(state.n)},
+        "points": [{"horizon_s": r["horizon_s"], "x": r["x"],
+                    "y": r["y"], "z": r["z"]} for r in rows],
+    }
+    return rows, block
 
 
 def _project_left(rig, xyz, mode: str = "parallel") -> tuple[int, int] | None:
@@ -239,6 +320,14 @@ def main() -> int:
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
     ap.add_argument("--smooth", action="store_true", help="另存 Savitzky-Golay 平滑后的三维 CSV")
+    ap.add_argument("--world-frame", default=str(ROOT / "config" / "world_frame.json"),
+                    help="世界系文件（默认 config/world_frame.json）；存在且合法时额外写 "
+                         "derived/traj3d_world.csv，traj3d.csv 仍是左相机系")
+    ap.add_argument("--no-world", action="store_true",
+                    help="强制不做世界系变换（即使配置文件存在）；traj3d.json 记为 left_camera")
+    ap.add_argument("--predict-horizons", default="0.1,0.2,0.3,0.5",
+                    help="三维预测的外推时刻（秒，逗号分隔；默认 0.1,0.2,0.3,0.5）")
+    ap.add_argument("--no-predict", action="store_true", help="不做三维弹道预测")
     ap.add_argument("--no-plot", action="store_true", help="不生成 traj3d.png")
     ap.add_argument("--no-video", action="store_true")
     args = ap.parse_args()
@@ -251,6 +340,30 @@ def main() -> int:
     except ValueError:
         print(f"[错误] --origin 要写成 x,y,z 三个数，现在是 {args.origin!r}")
         return 2
+    try:
+        horizons = tuple(float(v) for v in args.predict_horizons.split(",") if v.strip())
+        if not horizons or any(h <= 0.0 for h in horizons):
+            raise ValueError
+    except ValueError:
+        print(f"[错误] --predict-horizons 要写成正数秒（逗号分隔），"
+              f"现在是 {args.predict_horizons!r}")
+        return 2
+    # ---- 世界系：先读先校验，坏文件在这里就退（不要跑完视频才发现）----
+    world_path = Path(args.world_frame)
+    world: WorldFrame | None = None
+    if args.no_world:
+        print("[坐标] --no-world：不做世界系变换，坐标为左相机系")
+    elif not world_path.exists():
+        print(f"[坐标] 未设置世界系（{world_path} 不存在）：只输出相机系坐标，"
+              "具体是哪个相机系由下面的双目模式决定")
+    else:
+        try:
+            world = WorldFrame.load(world_path)
+        except (ValueError, OSError) as exc:
+            # 明确失败：绝不回退成单位矩阵、绝不静默忽略
+            print(f"[错误] 世界系文件不可用，已停止：{exc}")
+            return 1
+        print(f"[坐标] {world.describe()}（{world_path}）")
     errors, warnings = validate_session(session_dir)
     print(f"会话：{session_dir}")
     for w in warnings:
@@ -316,6 +429,18 @@ def main() -> int:
         print("[错误] auto 解析出的模式与标定实测夹角矛盾，拒绝静默继续；"
               "请显式 --stereo-mode parallel 或 angled。")
         return 2
+    # ---- 本次实际使用的坐标系：由**已解析的** mode 决定，不在别处再猜 ----
+    # parallel 的三角化点在校正后的左相机系；angled 走原始射线，才是原始左相机系。
+    # 两者都叫"左相机系"是错的：世界系/查看器要按对应的 K/D 去解释这些点。
+    base_frame = "rectified_left_camera" if mode == "parallel" else "left_camera"
+    if world is not None and mode == "parallel":
+        # 为什么拒绝：T_world_cam 按**原始**左相机系定义（K1/D1、原始图 PnP），
+        # 而 parallel 的点在**校正后**系里，两者之间还差 R1（p_rect = R1·p_cam）。
+        # 直接拿 T_world_cam 乘校正系的点，等于把一个坐标系当成另一个用 ——
+        # 数字看着正常、实际整体歪掉，且从结果里看不出错。宁可不跑。
+        print("[错误] 世界系变换暂不支持 parallel 模式：校正系与原始系之间还需额外变换，"
+              "请用 angled 标定后重跑。")
+        return 1
     # 把本次实际使用的模式写回 session，避免之后 export_visualization 按旧字段
     # 把 angled 的 traj3d.json 又改回 rectified_left_camera
     if getattr(s, "stereo_mode", "parallel") != mode:
@@ -545,8 +670,8 @@ def main() -> int:
         print("  3) 当前会话若继续 0 匹配，建议重录并在第 0 帧重新点选，"
               "不要靠放大 --max-epipolar 硬吃错配")
     smoothed = None
+    arr = rec.as_array() if rec.trajectory else np.zeros((0, 4), dtype=np.float64)
     if rec.trajectory:
-        arr = rec.as_array()
         print(f"三维范围：X {arr[:,1].min():.3f}~{arr[:,1].max():.3f} m  "
               f"Y {arr[:,2].min():.3f}~{arr[:,2].max():.3f} m  "
               f"Z {arr[:,3].min():.3f}~{arr[:,3].max():.3f} m")
@@ -565,15 +690,78 @@ def main() -> int:
             plot_path = out_dir / f"traj3d{partial}.png"
             _plot_trajectory(arr, plot_path, smoothed)
             print(f"三维图：{plot_path}")
+    # ---- 世界系：另写一份坐标，traj3d.csv 的左相机系语义不动 ----
+    world_arr, world_block = _world_block(world, arr, base_frame)
+    if world_arr is not None:
+        # arr 与 rows 里的 matched 行同序（rec.as_array 逐点顺序 = 追加顺序）
+        wrows = [list(r) for r in rows]
+        j = 0
+        for r in wrows:
+            if int(r[2]) == 1 and j < len(world_arr):
+                r[3] = f"{world_arr[j, 1]:.6f}"
+                r[4] = f"{world_arr[j, 2]:.6f}"
+                r[5] = f"{world_arr[j, 3]:.6f}"
+                j += 1
+        world_csv = out_dir / f"traj3d_world{partial}.csv"
+        with open(world_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(wrows)
+        print(f"世界系 CSV：{world_csv}")
+    # ---- 三维预测：世界系存在时先把重力换到相机系，输出仍与 traj3d.csv 同系 ----
+    # 默认假设相机系 Y 朝下（与 StereoRig/K 的像素轴一致），所以重力沿 +Y；
+    # 拟合在哪个系里做，g 就必须写成那个系的向量（predict3d 的文档要求）。
+    g_cam = (0.0, 9.81, 0.0)
+    if world is not None:
+        R_wc = np.asarray(world.T_world_cam, dtype=np.float64)[:3, :3]
+        # p_cam = R^T·(p_world - t)，所以世界系重力换到相机系是 R^T·g_world
+        g_cam = tuple(float(v) for v in (R_wc.T @ np.array([0.0, -9.81, 0.0])))
+    fit_arr = np.column_stack([arr[:, 0], smoothed]) if smoothed is not None else arr
+    if args.no_predict:
+        pred_rows: list[dict] = []
+        pred_block: dict = {"skipped": "已用 --no-predict 关闭"}
+    else:
+        pred_rows, pred_block = _predict_block(
+            fit_arr, PredictConfig(g=g_cam, horizons=horizons))
+    if pred_rows:
+        pred_path = out_dir / f"predictions{partial}.csv"
+        with open(pred_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["t_ref", "horizon_s", "x", "y", "z"])
+            for r in pred_rows:
+                w.writerow([f"{r['t_ref']:.6f}", f"{r['horizon_s']:.3f}",
+                            f"{r['x']:.6f}", f"{r['y']:.6f}", f"{r['z']:.6f}"])
+        pick = min(pred_rows, key=lambda r: abs(r["horizon_s"] - 0.3))
+        print(f"预测：t_ref={pick['t_ref']:.3f} s，{pick['horizon_s']:.1f} s 后 "
+              f"({pick['x']:.3f}, {pick['y']:.3f}, {pick['z']:.3f}) m；{pred_path}")
+    else:
+        print(f"预测跳过：{pred_block.get('skipped', '原因未知')}")
     print(f"CSV：{csv_path}")
     if writer is not None:
         print(f"标注视频：{video_path}")
     if not partial:
+        # --no-world 时把 export 的世界系入口指到一个不存在的路径（它按"无配置"处理）
+        vis_world_path = (world_path if world is not None
+                          else world_path.with_name(world_path.name + ".disabled"))
         try:
             paths = export_session_visualization(
-                session_dir, csv_name=csv_path.name, stereo_mode=mode)
+                session_dir, csv_name=csv_path.name, stereo_mode=mode,
+                world_frame_path=vis_world_path)
             print(f"标准轨迹 JSON：{paths['trajectory']}")
             print(f"可视化 JSON：{paths['visualization']}")
+            # 坐标系与预测块写进 traj3d.json：export 刚重建过它，必须在之后补
+            traj_path = paths["trajectory"]
+            payload = json.loads(traj_path.read_text(encoding="utf-8"))
+            payload["coordinate_system"] = world_block["coordinate_system"]
+            payload["world_frame"] = world_block["world_frame"]
+            if pred_rows:
+                payload["predictions"] = {k: pred_block[k]
+                                          for k in ("t_ref", "state", "points")}
+            else:
+                payload["predictions"] = None
+                payload["predictions_skipped"] = pred_block.get("skipped", "原因未知")
+            traj_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
         except Exception as exc:                            # noqa: BLE001
             print(f"[警告] 标准 JSON 导出失败：{exc}")
     return 0 if rec.n_matched else 2

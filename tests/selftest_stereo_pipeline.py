@@ -28,12 +28,16 @@ from calib import StereoRig
 from stereo import (
     Kalman3D,
     MatchConfig,
+    PredictConfig,
     StereoReconstructor,
     SyncConfig,
+    detect_bounce,
     find_offset,
+    fit_ballistic,
     fuse_depth,
     match_epipolar,
     mono_depth,
+    predict,
     savgol_trajectory,
     stereo_depth,
     timestamp_offset,
@@ -212,6 +216,92 @@ def test_trajectory_fusion() -> bool:
         (f"逆方差融合 Z={z_f:.3f}，σ={sig_f*1000:.1f} mm",
          abs(z_f - 1.0) < 0.02 and sig_f < 0.01),
         ("单目无效时退化为双目", abs(z_bad - 1.2) < 1e-9 and abs(sig_bad - 0.05) < 1e-9),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
+def test_predict3d() -> bool:
+    """第 7 节：三维弹道预测（重力是已知常向量）+ 反弹重初始化。"""
+    print("----- 三维弹道预测（匀速 + 已知重力） -----")
+    cfg = PredictConfig()
+    g = np.asarray(cfg.g, dtype=np.float64)
+    p_origin = np.array([0.0, 1.0, 0.0])
+    v_origin = np.array([2.0, 3.0, 0.0])
+    t = np.arange(0.0, 0.5 + 1e-9, 1.0 / 30.0)
+    pts = p_origin + v_origin * t[:, None] + 0.5 * g * (t ** 2)[:, None]
+
+    # ---- 1. 解析解：无噪点必须被精确恢复 ----
+    # 注意 state 的时基是 t_ref = 最后一个样本（"现在"），所以 v0 对应 v(t_ref)，
+    # 不是 t=0 的初速度 —— 这正是预测该用的量。
+    st = fit_ballistic(t, pts, cfg)
+    t_ref = float(t[-1])
+    p_ref = p_origin + v_origin * t_ref + 0.5 * g * t_ref ** 2
+    v_ref = v_origin + g * t_ref
+    err_p = float(np.max(np.abs(st.p0 - p_ref))) if st is not None else 1e9
+    err_v = float(np.max(np.abs(st.v0 - v_ref))) if st is not None else 1e9
+    pred = predict(st, cfg.horizons) if st is not None else {}
+    truth_03 = p_origin + v_origin * (t_ref + 0.3) + 0.5 * g * (t_ref + 0.3) ** 2
+    err_03 = float(np.linalg.norm(pred[0.3] - truth_03)) if 0.3 in pred else 1e9
+
+    # 重复时间戳：去重 + 记账，不能把 p0/v0 拉偏
+    st_dup = fit_ballistic(np.concatenate([t, t[-1:]]),
+                           np.concatenate([pts, pts[-1:]]), cfg)
+
+    # ---- 2. 噪声鲁棒：1 mm 高斯噪声 ----
+    rng = np.random.default_rng(5)
+    noisy = pts + rng.normal(0.0, 1e-3, pts.shape)
+    st_n = fit_ballistic(t, noisy, cfg)
+    err_03_n = (float(np.linalg.norm(predict(st_n, [0.3])[0.3] - truth_03))
+                if st_n is not None else 1e9)
+
+    # ---- 3. 样本不足：n=3 必须拒绝并说明原因 ----
+    why_short: list[str] = []
+    st_short = fit_ballistic(t[:3], pts[:3], cfg, why_short)
+
+    # ---- 4. 机动检测：0.4 s 落地反弹（v_y 由负转正）----
+    tb = 0.4
+    tt = np.arange(0.0, 0.8 + 1e-9, 1.0 / 30.0)
+    y_b = 1.0 - 2.0 * tb + 0.5 * g[1] * tb ** 2
+    y = np.where(tt <= tb, 1.0 - 2.0 * tt + 0.5 * g[1] * tt ** 2,
+                 y_b + 1.5 * (tt - tb) + 0.5 * g[1] * (tt - tb) ** 2)
+    bounce_pts = np.column_stack([0.5 * tt, y, 1.0 + 0.1 * tt])
+    truth_idx = int(np.argmax(tt > tb))
+    why_b: list[str] = []
+    idx = detect_bounce(tt, bounce_pts, cfg, why_b)
+    idx_err = abs(idx - truth_idx) if idx is not None else 10 ** 6
+
+    # 关键证伪：纯噪声（同一条弹道 + 2 mm 噪声，无反弹）必须返回 None
+    tn = np.arange(0.0, 0.5 + 1e-9, 1.0 / 30.0)
+    pn = (p_origin + v_origin * tn[:, None] + 0.5 * g * (tn ** 2)[:, None]
+          + rng.normal(0.0, 2e-3, (tn.size, 3)))
+    why_n: list[str] = []
+    idx_noise = detect_bounce(tn, pn, cfg, why_n)
+
+    checks = [
+        (f"解析解：n={getattr(st, 'n', 0)}，v0 误差 {err_v:.1e} m/s，"
+         f"p(t_ref) 误差 {err_p:.1e} m，rms={getattr(st, 'rms_m', float('nan')):.1e}",
+         st is not None and err_v < 1e-9 and err_p < 1e-9 and st.rms_m < 1e-9),
+        (f"predict 四档 {0.1}/{0.2}/{0.3}/{0.5} s 键齐全，0.3 s 误差 {err_03:.1e} m",
+         set(pred) == {0.1, 0.2, 0.3, 0.5} and err_03 < 1e-9
+         and predict(None, cfg.horizons) == {}),
+        (f"重复时间戳去重：dropped={getattr(st_dup, 'dropped', -1)}，n={getattr(st_dup, 'n', 0)}",
+         st_dup is not None and st_dup.dropped == 1 and st_dup.n == t.size
+         and float(np.max(np.abs(st_dup.v0 - v_ref))) < 1e-9),
+        (f"1 mm 噪声：rms={st_n.rms_m * 1e3 if st_n else float('nan'):.2f} mm"
+         f"（最小二乘吸收约 0.8x，故略低于 1 mm），0.3 s 误差 {err_03_n * 1e3:.2f} mm",
+         st_n is not None and 0.5e-3 <= st_n.rms_m <= 3e-3 and err_03_n < 0.010),
+        (f"n=3 -> None，原因「{why_short[0] if why_short else '无'}」",
+         st_short is None and bool(why_short) and "样本" in why_short[0]),
+        (f"0.4 s 反弹：检出索引 {idx}（真值 {truth_idx}，{len(tt)} 点，"
+         f"±2 帧内）；{why_b[0][:46] if why_b else '无'}",
+         idx is not None and idx_err <= 2),
+        (f"纯噪声（无反弹）-> {idx_noise}（必须为 None）；"
+         f"{why_n[0][:34] if why_n else '无'}",
+         idx_noise is None),
     ]
     ok = True
     for name, passed in checks:
@@ -593,6 +683,73 @@ def test_fov_alignment() -> bool:
     return ok
 
 
+def test_pipeline_blocks() -> bool:
+    """主流程（run_stereo_video）的两段纯函数：世界系块 / 预测块。
+
+    不启动相机、不读真实会话 —— 只喂数组，验证"该给的给、该拒的拒"。
+    """
+    print("----- 主流程纯函数（世界系 / 预测块） -----")
+    from calib.world_frame import WorldFrame
+    from apps.run_stereo_video import _predict_block, _world_block
+
+    # ---- 1. 没有世界系：坐标系由调用处给定，必须如实写，不改写 ----
+    arr = np.array([[0.0, 0.1, 0.2, 0.3],
+                    [0.1, 0.2, 0.3, 0.4]], np.float64)
+    w_par, j_par = _world_block(None, arr, "rectified_left_camera")
+    w_ang, j_ang = _world_block(None, arr, "left_camera")
+    # ---- 2. 已知世界系（平移 +10 mm）：点整体平移，时间列不受影响 ----
+    T = np.eye(4)
+    T[:3, 3] = [0.010, 0.010, 0.010]
+    wf = WorldFrame(T_world_cam=T, source="selftest", note="平移 10 mm")
+    w_out, j_out = _world_block(wf, arr, "left_camera")
+    w_out_p, j_out_p = _world_block(wf, arr, "rectified_left_camera")
+    shift_err = (float(np.max(np.abs(w_out[:, 1:4] - arr[:, 1:4] - 0.010)))
+                 if w_out is not None else float("inf"))
+    # ---- 3. 解析抛物线（无噪）：0.3 s 预测必须精确复现 ----
+    cfg = PredictConfig()
+    g = np.asarray(cfg.g, np.float64)
+    p0 = np.array([0.05, 1.20, 0.80])
+    v0 = np.array([1.5, 0.8, -0.4])
+    t = np.arange(0.0, 0.5 + 1e-9, 1.0 / 30.0)
+    pts = p0 + v0 * t[:, None] + 0.5 * g * (t ** 2)[:, None]
+    rows, block = _predict_block(np.column_stack([t, pts]), cfg)
+    t_ref = float(t[-1])
+    truth_03 = p0 + v0 * (t_ref + 0.3) + 0.5 * g * (t_ref + 0.3) ** 2
+    row_03 = next((r for r in rows if abs(r["horizon_s"] - 0.3) < 1e-12), None)
+    err_03 = (float(np.max(np.abs(np.array([row_03["x"], row_03["y"], row_03["z"]])
+                                 - truth_03)))
+              if row_03 is not None else 1e9)
+    # ---- 4. 样本不足（3 点）：必须拒绝并给出"样本"原因 ----
+    rows_short, block_short = _predict_block(np.column_stack([t[:3], pts[:3]]), cfg)
+
+    checks = [
+        ("parallel 无世界系 -> rectified_left_camera / world_frame=None",
+         w_par is None and j_par["coordinate_system"] == "rectified_left_camera"
+         and j_par["world_frame"] is None),
+        ("angled 无世界系 -> left_camera / world_frame=None",
+         w_ang is None and j_ang["coordinate_system"] == "left_camera"
+         and j_ang["world_frame"] is None),
+        (f"世界系平移 10 mm -> 最大偏差 {shift_err:.1e} m",
+         w_out is not None and j_out["coordinate_system"] == "world"
+         and shift_err < 1e-12
+         and float(np.max(np.abs(w_out[:, 0] - arr[:, 0]))) == 0.0),
+        ("有世界系：两种基础系都记 world（不再暴露 base_frame）",
+         j_out_p["coordinate_system"] == "world"
+         and w_out_p is not None
+         and float(np.max(np.abs(w_out_p - w_out))) == 0.0),
+        (f"抛物线 0.3 s 预测误差 {err_03:.1e} m（{len(rows)} 档）",
+         len(rows) == len(cfg.horizons) and err_03 < 1e-9
+         and block["state"]["n"] == t.size),
+        (f"3 点 -> rows 空，原因「{block_short.get('skipped', '无')}」",
+         rows_short == [] and "样本" in str(block_short.get("skipped", ""))),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     print("=" * 62)
     print("双目链路自测（合成真值）")
@@ -609,8 +766,13 @@ def main() -> int:
     print()
     f = test_fov_alignment()
     print()
-    print("判定结果：" + ("全部通过" if (a and b and c and d and e and f) else "有不达标项"))
-    return 0 if (a and b and c and d and e and f) else 1
+    p3 = test_predict3d()
+    print()
+    g = test_pipeline_blocks()
+    print()
+    allok = a and b and c and d and e and f and p3 and g
+    print("判定结果：" + ("全部通过" if allok else "有不达标项"))
+    return 0 if allok else 1
 
 
 if __name__ == "__main__":

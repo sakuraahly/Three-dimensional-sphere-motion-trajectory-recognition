@@ -49,6 +49,13 @@ from .timestamp_pair import (
     sidecar_for_video,
 )
 from .trajectory import Kalman3D, savgol_trajectory
+from .predict3d import (
+    BallisticState,
+    PredictConfig,
+    detect_bounce,
+    fit_ballistic,
+    predict,
+)
 from .depth_fusion import fuse_depth, mono_depth, stereo_depth
 from .triangulate import (
     MatchConfig,
@@ -94,6 +101,11 @@ __all__ = [
     "apply_offset",
     "Kalman3D",
     "savgol_trajectory",
+    "PredictConfig",
+    "BallisticState",
+    "fit_ballistic",
+    "predict",
+    "detect_bounce",
     "fuse_depth",
     "mono_depth",
     "stereo_depth",
