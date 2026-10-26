@@ -80,7 +80,7 @@ sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）
 calib/            双目标定（离线一次）
 stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角测量）
 apps/             可执行程序；tools/ 放一次性设置与诊断
-tests/            回归测试（23 个，改动后必跑）
+tests/            回归测试（24 个，改动后必跑）
 docs/             文档
 assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / 运行期产物
 ```
@@ -89,7 +89,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
-2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 23 个回归测试必须能一键复跑。
+2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 24 个回归测试必须能一键复跑。
 3. **能重新生成的东西不进版本库**（`outputs/`、`config/`、权重、视频素材）。
 4. **交付物不放 `outputs/`**。`outputs/` 的语义是"删了也能重新生成"，
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
@@ -183,6 +183,7 @@ apps / tests                        （只调用，不被调用）
 | `docs/项目总纲.md` | 项目是什么、文档怎么配合、术语 | 建立全局印象 |
 | `docs/交接文档.md` | 现状、代码地图、**踩坑（最值钱）**、命令速查 | 动代码之前 |
 | `docs/开发指南.md` | 环境、怎么加东西、方法论 | 要改代码 |
+| `docs/插件化架构.md` | 检测器 / 预测器 / 标定方法的注册表、扩展点与注入点（设计已定、分阶段落地中） | 要新增一种实现 / 改出厂默认 |
 | `docs/文件结构.md` | 目录逐项说明 | 不确定东西放哪 |
 | `docs/数据标准.md` | seed / traj3d / visualization 的 JSON schema、坐标系、版本规则 | 接数据、写可视化、换格式 |
 | `docs/3D查看器.md` | 读 visualization.json 的查看器用法/控件/限制 | 要看三维轨迹 |
@@ -221,11 +222,11 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 7. 质量底线：23 个回归测试
+## 7. 质量底线：24 个回归测试
 
 ```powershell
 启动程序.bat test              # fast 档：跳过三个慢测试（mutation_guards / stereo_calib / synthetic）
-启动程序.bat test full         # 全套 23 个（改代码后必跑，约 6 分钟）
+启动程序.bat test full         # 全套 24 个（改代码后必跑，约 6 分钟）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
 
@@ -234,6 +235,7 @@ apps / tests                        （只调用，不被调用）
 
 | 测试 | 守什么 |
 | ---- | ------ |
+| `selftest_plugins.py` | 插件注册表自测：清单唯一（R7）、未知名字报错（R3）、默认唯一（R4）、边界（R5） |
 | `selftest_synthetic.py` | 单目全链路（三场景） |
 | `selftest_camera_motion.py` | 相机自运动：迟滞状态机 + 位移换算方向；多目标关联（遮挡外推 / 半径法重识别 / 身份互换记账） |
 | `selftest_camera_registry.py` | 摄像头设备管理（角色 / 「无关」清单） |

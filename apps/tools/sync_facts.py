@@ -12,15 +12,18 @@
 本模块把这两类**派生事实**变成"由磁盘算、可校验"：
 
     python apps/tools/sync_facts.py --check     # 校验，不一致就非零退出
+    python apps/tools/sync_facts.py --fix       # 按同一份期望表改对，改完自动再校验
 
 设计约束（都是踩过的）
 
 1. **只认"描述现状"的说法，不碰"历史记录"。**
    "原状态：6 个回归测试一个都没跑""六 → 八""新增第 10 个回归测试"是**当时的实况**，
    改了就是篡改历史。所以检查目标是**逐条写死**的期望串，不做全库正则替换。
-2. **不做自动改写正文。** 第一版想做，权衡后放弃：正文改写风险（误伤历史记录、
-   破坏排版）高于收益，而"指出哪份文档哪一行不符"已经能让人一分钟改完。
-   本工具的价值在**发现**，不在**代笔**。
+2. **改写范围严格限定在"期望串"里。** 第一版想过全库正则替换，被否掉了：
+   正文改写会误伤历史记录、破坏排版。现在 `--fix` 只做一件事 ——
+   拿**期望串本身**当模板，把其中紧邻「个」的那个数字换成新值。
+   同一行里的「约 6 分钟」「20 对」不在模板内，因此不会被碰到。
+   仍用不了模板的行（说明文档的**说法形态**变了）不静默跳过，而是列出来并返回非零。
 3. **分组以 `AGENTS.md` §3 的清单为准，不按文件名猜。**
    第一版按 `opening|preview|ppt` 猜，结果新建的 `sync_facts.py` 被猜进
    "相机/标定"组、把计数从 7 变成 8 —— **靠命名约定推断归属，本身就是漂移源**。
@@ -126,6 +129,7 @@ def expected_test_count_strings(n: int) -> list[tuple[tuple[str, ...], str]]:
         ((f"**{cn}个回归测试都必须输出", f"**{n} 个回归测试都必须输出"),
          "docs/项目总纲.md"),
         ((f"| {cn}个回归测试 ", f"| {n} 个回归测试 "), "docs/项目总纲.md"),
+        ((f"（{n} 个 selftest，清单见",), "docs/项目总纲.md"),
         ((f"回归测试（{cn}个，改动后必跑）", f"回归测试（{n} 个，改动后必跑）"),
          "docs/项目总纲.md"),
         # ---- AGENTS.md ----
@@ -144,6 +148,12 @@ def expected_test_count_strings(n: int) -> list[tuple[tuple[str, ...], str]]:
         # ---- 用户手册（2026-10-14 补：这一份此前只被间接覆盖，
         #      所以 §2.3 的 9 个说法与 13 行的表并存了很久都没人报）----
         ((f"完整的一套是 {n} 个", f"完整的一套是 {n}个"), "docs/用户手册.md"),
+        # 2026-10-26 补：扫全库时发现这三处同义说法一直没进表（都是"描述现状"，
+        # 不是历史记录）—— 表覆盖不到的地方，就是漂移能长期躺着的地方。
+        ((f"加 full 跑全套 {n} 个",), "docs/用户手册.md"),
+        ((f"启动程序.bat test full         # 全套 {n} 个（改代码后必跑）",), "docs/用户手册.md"),
+        ((f"{n} 个测试的 `main()`",), "docs/开发指南.md"),
+        ((f"——{n} 个测试都不需要真相机",), "docs/交接文档.md"),
         # ---- 文件结构 ----
         ((f"回归测试（{cn}个，改动后必跑）", f"回归测试（{n} 个，改动后必跑）"),
          "docs/文件结构.md"),
@@ -151,6 +161,9 @@ def expected_test_count_strings(n: int) -> list[tuple[tuple[str, ...], str]]:
         ((f"回归测试（改动代码后必跑，共 {n} 个）",), "README.md"),
         # ---- 开题报告文稿 ----
         ((f"合成真值自测（{n} 个回归测试）",), "docs/开题报告_研究思路四页文稿.md"),
+        # 架构图里省了量词，只写「回归测试 ×22」——2026-10-26 补：
+        # 它一直在图上，却因为形态不同（没有「个」）躲过了所有检查。
+        ((f"回归测试 ×{n}",), "docs/开题报告_研究思路四页文稿.md"),
         ((f"{cn}个测试覆盖", f"{n} 个测试覆盖"), "docs/开题报告_研究思路四页文稿.md"),
     ]
 
@@ -163,15 +176,211 @@ def _relevant_lines(path: Path, keywords: tuple[str, ...]) -> str:
     return " ； ".join(out[:3])
 
 
+# --------------------------------------------------------------------------
+# --fix：按期望串改写文档
+#
+# 关键取舍：**不猜"哪个数字是测试数"，而是用期望串里数字的上下文当锚点**。
+# 期望串本身就是模板（"全套 {n} 个，约 6 分钟"），把其中的数字挖成捕获组，
+# 得到 "全套 (?P<num>…) (?P<gap>\s*)个，约 6 分钟"——
+# 「6 分钟」在模板里是字面量，改不到它。这比"整行找数字再判断"可靠得多，
+# 也不会因为文档里多了一个数字就误伤。
+# --------------------------------------------------------------------------
+_NUM_TOKEN = rf"(?:[0-9]+|[{CN_DIGITS}]+)"
+
+# 数量 token 的**两种锚点**（都是"描述测试数量"的既有写法）：
+#   1. `24 个` / `二十四个` —— 正文；
+#   2. `回归测试 ×22` —— 架构图里省掉量词，只留乘号（`×22` 读作"22 个"）。
+# 锚点必须是**形状**（数字紧邻某个固定字），不能是"这行里第一个数字"：
+# 架构图那行还有「实时程序」「离线批处理」，按"第一个数字"会改错东西。
+_ANCHORS = (
+    re.compile(rf"(?P<num>{_NUM_TOKEN})(?P<gap>\s*)个"),
+    re.compile(rf"×\s*(?P<num>{_NUM_TOKEN})"),
+)
+
+
+def _count_pattern(target: str) -> re.Pattern[str] | None:
+    """把期望串转成"可改写"的正则；认不出数量 token 则返回 None。
+
+    只认上面两种锚点之内的数字，据此锁定 token，其它数字一律留在模板外
+    （模板里「约 6 分钟」「20 对」是字面量，`sub` 碰不到）。
+    模板里数字两侧的空白放宽成 `\\s*`：同一句话在正文里可能多一个或少一个空格
+    （模板写 `**二十四个**`、文档写 `**23 个**`，就是这一处差异）。
+    """
+    m = None
+    for anchor in _ANCHORS:
+        m = anchor.search(target)
+        if m:
+            break
+    if m is None:
+        return None
+
+    pre, post = target[:m.start("num")], target[m.end("num"):]
+    pre_rx = re.escape(pre.rstrip()) + r"\s*"
+    post_rx = r"\s*" + re.escape(post.lstrip())
+    return re.compile(pre_rx + rf"(?P<num>{_NUM_TOKEN})" + post_rx)
+
+
+
+
+def _rewrite(pat: re.Pattern[str], text: str, n: int) -> tuple[str, int]:
+    """按文档**原有写法**选数字样式：原来写中文就写中文，写阿拉伯就写阿拉伯。
+
+    强行统一文体是一次无意义的大改（见上面"两种写法并存"的说明）。
+
+    ⚠️ 替换的是**整个匹配**，所以要把数字之外的部分原样拼回去 ——
+    第一版直接 `return new + gap + "个"`，把模板前缀（"启动程序.bat test full # 全套"）
+    一起吞掉了，4 行命令只剩"24 个，约 6 分钟"。**改写必须是等长替换思维**：
+    只动 token，其余字节逐字保留。
+    """
+    def repl(mo: re.Match[str]) -> str:
+        old = mo.group("num")
+        new = cn_number(n) if old[0] in CN_DIGITS else str(n)
+        start = mo.start("num") - mo.start(0)
+        whole = mo.group(0)
+        return whole[:start] + new + whole[start + len(old):]
+    return pat.subn(repl, text)
+
+
+def _test_description(path: Path) -> str:
+    """从测试模块的文档串首行取一句说明，供 §7 表使用。
+
+    不手写描述：手写的说明在这张表里已经过期过（加了测试却忘了补一行），
+    而从被测文件自己身上取，永远不会对不上。
+    """
+    src = path.read_text(encoding="utf-8")
+    m = re.match(r'\s*[rbuf]*("""|\'\'\')(.*?)\1', src, re.S)
+    if not m:
+        return "（自动登记：模块无文档串）"
+    first = next((ln.strip() for ln in m.group(2).splitlines() if ln.strip()), "")
+    first = first.rstrip("。.;；")
+    if len(first) > 60:
+        first = first[:60] + "…"
+    return first or "（自动登记：模块无文档串）"
+
+
+def fix_counts(n: int) -> tuple[list[str], list[str], int]:
+    """按期望表改文档。返回 (已改清单, 改不了清单, 总处数)。"""
+    cache: dict[str, str] = {}
+    hits: dict[str, int] = {}
+    unfixable: list[str] = []
+
+    for wants, rel in expected_test_count_strings(n):
+        p = ROOT / rel
+        if not p.exists():
+            unfixable.append(f"{rel}：文件不存在")
+            continue
+        text = cache.get(rel) or p.read_text(encoding="utf-8")
+        if any(w in text for w in wants):
+            continue                      # 这条已经是对的，跳过
+        total = 0
+        for w in wants:
+            pat = _count_pattern(w)
+            if pat is None:
+                continue
+            text, k = _rewrite(pat, text, n)
+            total += k
+        if total:
+            cache[rel] = text
+            hits[rel] = hits.get(rel, 0) + total
+        else:
+            # 不静默：说明"说法形态变了"（换了措辞/换了句式），模板套不上。
+            unfixable.append(f"{rel}：找不到可改的旧说法（期望「{wants[0]}」）")
+
+    for rel, text in cache.items():
+        (ROOT / rel).write_text(text, encoding="utf-8")
+    return [f"{rel}：{c} 处" for rel, c in hits.items()], unfixable, sum(hits.values())
+
+
+def fix_agents_registry() -> tuple[list[str], list[str]]:
+    """把磁盘上多出来、`AGENTS.md` §7 却没登记的测试补进表里。
+
+    插入位置取**字母序**（`run_tests.py --list` 的枚举顺序也是字母序，两者一致）。
+    理由：§7 表原是按"加入时间"排的，那个顺序不在任何地方留档，"上次加到哪了"
+    只能靠记忆——记错就是下一次漂移；字母序有唯一解。
+    副作用要知道：表本身不是字母序，所以新行可能落在表中部甚至表头
+    （`selftest_plugins.py` 就排在 `selftest_synthetic.py` 之前）。
+    这里选"位置可复现"而不是"位置好看"。
+    """
+    path = ROOT / "AGENTS.md"
+    text = path.read_text(encoding="utf-8")
+    actual = {p.name for p in test_files()}
+    missing = sorted(actual - set(re.findall(r"`(selftest_[a-z0-9_]+\.py)`", text)))
+    if not missing:
+        return [], []
+
+    lines = text.splitlines()
+    try:
+        hdr = next(i for i, ln in enumerate(lines) if ln.strip() == "| 测试 | 守什么 |")
+    except StopIteration:
+        return [], ["AGENTS.md：找不到 §7 的「| 测试 | 守什么 |」表头，请手工登记"]
+
+    # 表体 = 表头后的分隔行 + 连续的 `|` 行
+    end = hdr + 2
+    while end < len(lines) and lines[end].startswith("|"):
+        end += 1
+    rows = lines[hdr + 2:end]
+
+    added: list[str] = []
+    for name in missing:
+        row = f"| `{name}` | {_test_description(ROOT / 'tests' / name)} |"
+        # 第一个"文件名比它大"的行之前插入；没有则追加到表尾
+        pos = len(rows)
+        for i, ln in enumerate(rows):
+            m = re.search(r"`(selftest_[a-z0-9_]+\.py)`", ln)
+            if m and m.group(1) > name:
+                pos = i
+                break
+        rows.insert(pos, row)
+        added.append(name)
+
+    new_text = "\n".join(lines[:hdr + 2] + rows + lines[end:]) + "\n"
+    path.write_text(new_text, encoding="utf-8")
+    return added, []
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="派生事实校验器（计数 / 清单）")
-    ap.add_argument("--check", action="store_true",
-                    help="只校验（默认行为也是校验；保留该参数为了与文档里的写法一致）")
-    ap.parse_args(argv)
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true",
+                      help="只校验（默认行为也是校验；保留该参数为了与文档里的写法一致）")
+    mode.add_argument("--fix", action="store_true",
+                      help="按同一份期望表把文档改对；改完再校验一次")
+    args = ap.parse_args(argv)
 
     n = len(test_files())
     cn = cn_number(n)
+
+    if args.fix:
+        print("=" * 76)
+        print(f"派生事实同步：按期望表改文档（测试数应为 {n}）")
+        print("=" * 76)
+        fixed, unfixable, total = fix_counts(n)
+        added, reg_problems = fix_agents_registry()
+        unfixable.extend(reg_problems)
+        if fixed:
+            print(f"已改 {len(fixed)} 份文档、{total} 处：")
+            for x in fixed:
+                print(f"  · {x}")
+        else:
+            print("文档无需修改（测试数量说法已是最新）")
+        if added:
+            print(f"AGENTS.md §7 补登记：{', '.join(added)}")
+        else:
+            print("AGENTS.md §7 无需补登记")
+        if unfixable:
+            print()
+            print(f"**{len(unfixable)} 处改不了**（说法形态变了，模板套不上，请手工核对）：")
+            for x in unfixable:
+                print(f"  · {x}")
+            print()
+            print("判定结果：部分未改，请手工处理后重跑")
+            return 1
+        print()
+        print("现在再校验一次：")
+        print()
+
     groups = agents_groups()
+
     disk = tools_on_disk()
 
     print("=" * 76)
@@ -237,6 +446,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {i}) {msg}")
         print()
         print("判定结果：有不达标项")
+        if args.fix:
+            print("（--fix 之后仍有不一致：多半是 §3 分组/缺文件这类结构性事实，"
+                  "本工具只改计数与 §7 登记，其余请手工处理）")
         return 1
 
     print(f"✅ 分组清单：{len(disk)} 个工具全部被 AGENTS.md §3 归类，计数一致")
@@ -244,6 +456,8 @@ def main(argv: list[str] | None = None) -> int:
           f"（「{cn}」或「{n}」），AGENTS.md §7 登记完整")
     print()
     print("判定结果：全部通过")
+    if args.fix:
+        print("✅ 现在一致了（文档已按磁盘事实对齐，再跑 --fix 不会有改动）")
     return 0
 
 

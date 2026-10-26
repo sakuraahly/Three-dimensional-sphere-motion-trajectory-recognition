@@ -76,8 +76,14 @@ SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 # 分工：**"漏登记"由第 2 节自动抓**（集合差），
 # 这里只负责"数量变了要有人点头"。往 `tests/` 加文件后，
 # 改这个数字就是那次点头 —— 忘了改它会红，那是**设计如此**。
-# 历次：21 → 22（加 `selftest_window_mode.py`）→ 23（加 `selftest_mutation_guards.py`）。
-REAL_TEST_COUNT = 23
+# 它守的是另一件事：**有人悄悄删掉一个测试**时，数量对不上就会有人注意到。
+# 但请注意：**这道门不是唯一的门** —— 第 2 节还要求"磁盘上每个
+# `selftest_*.py` 都在 `AGENTS.md` §7 登记"，两条一起才成立
+# （只靠这里，删掉一个测试再改这个数字就无声无息；只靠第 2 节，
+#  删干净后登记表也一起删，同样无声无息）。
+# 历次：21 → 22（加 `selftest_window_mode.py`）→ 23（加 `selftest_mutation_guards.py`）
+#       → 24（2026-10-26 加 `selftest_plugins.py`：插件注册表不变量 + R5/R7 边界）。
+REAL_TEST_COUNT = 24
 # 测试命名规范（AGENTS.md §4）
 TEST_NAME_RE = re.compile(r"^selftest_[a-z0-9_]+\.py$")
 # 临时探针用的假路径（造一处新漂移用；用完即删）
