@@ -183,12 +183,6 @@ def cross_validate(
         try:
             out = fit_fn(train_idx, test_idx)
             train, test = _fold_rms(out)
-            # ---- 泄漏守卫（2026-10-26 加）----
-            # 这个工具最容易的误用是：fit_fn 忽略传入的 train_idx、每折都拿全量训练，
-            # 于是 test_rms==train_rms、比值恒 1.0，一路绿灯。**外部看不出来**。
-            # 所以要求 fit_fn 把真正用于拟合的索引报出来 `used_train_idx`：
-            #   - 报了但对不上 → 该折判失败（不是警告，是数据错）；
-            #   - 没报 → 整份结果降级为"未验证"，宁可说不知道，也不发假合格证。
             # ---- 估计量守卫（2026-10-26 加）----
             # 训练用 `stereoCalibrate` 的 rms、测试用"位姿焊死的重投影"，两把尺子
             # 长度不同，比值天生偏乐观（实测偏高约 0.2）。要求 fit_fn 声明两个估计量，
@@ -203,6 +197,12 @@ def cross_validate(
                     )
                 if not (est_t and est_s):
                     estimator_unclear = True
+            # ---- 泄漏守卫（2026-10-26 加）----
+            # 这个工具最容易的误用是：fit_fn 忽略传入的 train_idx、每折都拿全量训练，
+            # 于是 test_rms==train_rms、比值恒 1.0，一路绿灯。**外部看不出来**。
+            # 所以要求 fit_fn 把真正用于拟合的索引报出来 `used_train_idx`：
+            #   - 报了但对不上 → 该折判失败（不是警告，是数据错）；
+            #   - 没报 → 整份结果降级为"未验证"，宁可说不知道，也不发假合格证。
             if isinstance(out, dict):
                 used = out.get("used_train_idx")
                 if used is None:
