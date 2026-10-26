@@ -261,6 +261,27 @@ def run(names: list[str], timeout: float, timings: dict[str, list[float]],
     return results
 
 
+def _recover_stale_mutation() -> None:
+    """跑任何测试之前，先收拾上次变异测试留下的残局。
+
+    `selftest_mutation_guards` 会临时改坏源码再还原。进程被硬杀时还原不会执行，
+    源码里就留着 `# ← 注入` 的变异体 —— 而**下一个测试会在坏代码上跑**，
+    结果看起来正常。这套测试是"信任的根"，必须在根上先对账。
+    """
+    import sys as _sys
+    tests_dir = pathlib.Path(__file__).resolve().parent.parent / "tests"
+    if str(tests_dir) not in _sys.path:
+        _sys.path.insert(0, str(tests_dir))
+    try:
+        from _journal import recover
+    except Exception:
+        return
+    recovered = recover()
+    if recovered is not None:
+        print(f"[警告] 上次变异测试未走完，已还原 {recovered.name}；本轮结果才可信")
+        print()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="回归测试运行器（项目里唯一跑全套测试的地方）")
@@ -274,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="只跑这些（可给简写，如 calib_facts）")
     ap.add_argument("--list", action="store_true", help="只列清单与分层，不跑")
     args = ap.parse_args(argv)
+
+    if not args.list:
+        _recover_stale_mutation()
 
     all_names = discover()
     if not all_names:
