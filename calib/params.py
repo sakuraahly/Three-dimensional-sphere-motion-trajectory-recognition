@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -401,6 +402,7 @@ class StereoRig:
     def save(self, path: str | Path) -> tuple[Path, Path]:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        self._backup_existing(p)
         arrays = {k: getattr(self, k) for k in _MAT_KEYS if getattr(self, k, None) is not None}
         arrays["image_size"] = np.asarray(self.image_size, dtype=np.int32)
         np.savez(p.with_suffix(".npz"), **arrays)
@@ -414,6 +416,34 @@ class StereoRig:
             json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         return p.with_suffix(".npz"), p.with_suffix(".json")
+
+    @staticmethod
+    def _backup_existing(p: Path) -> Path | None:
+        """把即将被覆盖的标定复制到 `config/backup/`，返回备份路径（无旧文件则 None）。
+
+        ## 为什么必须有（2026-10-26 真实事故）
+
+        一次"只是想看看指标"的实跑就会**默认写盘**，把当时那台装置调好的标定直接冲掉。
+        作者本人踩过一次：124.0 mm 的可用标定被一次试验覆盖成 69.2 mm，
+        只能从手工备份还原。标定文件是不可再生的（要重新拍 30+ 张图），
+        所以**覆盖前必须留一份**，哪怕是"用户明确想覆盖"也一样 ——
+        失败的标定常常当场看不出来，等发现时已经没有旧文件可比。
+
+        备份放 `config/backup/`（`config/` 本身被 gitignore，属于可再生产物区；
+        但备份的目的是"同机还原"，不是进版本库）。
+        """
+        js, npz = p.with_suffix(".json"), p.with_suffix(".npz")
+        if not js.exists() and not npz.exists():
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        bdir = p.parent / "backup"
+        bdir.mkdir(parents=True, exist_ok=True)
+        dest_json = bdir / f"{p.stem}_{stamp}.json"
+        if js.exists():
+            shutil.copy2(js, dest_json)
+        if npz.exists():
+            shutil.copy2(npz, bdir / f"{p.stem}_{stamp}.npz")
+        return dest_json
 
     @classmethod
     def load(cls, path: str | Path) -> "StereoRig":
