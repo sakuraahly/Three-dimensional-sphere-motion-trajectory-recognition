@@ -170,7 +170,11 @@ RUNTIME_REPRO_MARK = "config"
 
 def doc_files() -> list[Path]:
     return [ROOT / "AGENTS.md", ROOT / "README.md",
-            *sorted((ROOT / "docs").rglob("*.md"))]
+            # 跳过测试临时探针：`selftest_doc_facts` 会在 docs/ 下建 `_zz_tmp_*_probe.md`
+            # 又立刻删掉。它与本检查并发跑时，枚举到一半文件就消失了（FileNotFoundError），
+            # 看起来像"规范漂移"，其实只是两条进程撞在一起。
+            *sorted(q for q in (ROOT / "docs").rglob("*.md")
+                    if not q.name.startswith("_zz_tmp_"))]
 
 
 def _src_literals() -> set[str]:
