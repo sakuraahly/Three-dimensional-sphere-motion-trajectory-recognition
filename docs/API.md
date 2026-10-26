@@ -478,6 +478,86 @@ def from_board(image_path, board_spec: BoardSpec, rig: StereoRig, *, ground_axis
   ③ `board_rmse_px` **只反映 PnP 拟合好坏**，看不出来"板是不是真的平放在地上"——板没放平、相机与板不同侧，世界系都会歪而 rmse 依然漂亮。
   ④ 内部计算一律 `left_camera`，只在**导出那一刻**转世界；没这个文件时导出必须写 `coordinate_system="left_camera"`，不许静默当世界系。
 
+### 12.7 `calib/metric_check.py` —— 尺度自检（三种入口，只有一种是真的）
+```python
+_GOOD_TRANS_MM=2.0; _OK_TRANS_MM=5.0; _GOOD_ROT_DEG=0.5; _OK_ROT_DEG=1.5   # 模块级默认
+def stereo_scale_consistency(T_CR_CL, poses_left, poses_right, *,
+        good_trans_mm=2.0, ok_trans_mm=5.0,
+        good_rot_deg=0.5, ok_rot_deg=1.5) -> dict
+def square_size_check(T_CR_CL, objp, corners_left, corners_right, spec,
+        K_L, D_L, K_R, D_R, *, good_pct=1.0, ok_pct=3.0) -> dict
+def board_scale_error(T_world_cam, objp, corners_list, spec, K, D) -> dict
+```
+- `stereo_scale_consistency` 返回：`n / translation_mm(均值) / median_mm / p95_mm / max_mm / per_pair_mm / worst_index / rotation_deg / rotation_median_deg / rotation_p95_deg / max_rotation_deg / per_pair_deg / insufficient / verdict / rotation_verdict`。输入 `T` 与位姿**平移单位是米**，输出 mm。
+- `square_size_check` 返回：`n / square_mm / square_mm_expected / error_mm / error_pct / scale_ratio / per_point_mm / verdict`。先 `undistortPoints(..., P=K)` 再三角化（针孔口径，与 `none_raw` 的 `P1/P2` 一致），相邻间距取"每点到最近邻的中位数"（不依赖角点顺序）。
+- `board_scale_error` 返回：`n_views / reproj_rms_px / per_view_rms_px / tautological(恒 True) / verdict / note`。
+- `verdict` 只有四种字符串：`优秀 / 可用 / 不可用 / 数据不足`，**不抛异常**（参数形状非法才 `ValueError`）。
+
+**调用顺序 / 前置条件**：`stereo_scale_consistency` 与 `square_size_check` 都要**先有 `T_{C_R←C_L}`**（来自 `calibrate_stereo` 或链式合成）与**两路对同一批摆放的板位姿**；`poses_left[i]` 与 `poses_right[i]` 必须逐项对应同一物理摆放。跨路一致性**只对单板模式（`T_AB ≈ I`）成立** —— 双板模式下左看 A、右看 B，两组板位姿不在同一个板坐标系里。
+
+**坑**：① **`n<2` 不发合格证**：一对时"残差 = 0"是恒等式（外参可能正是由这一对反向构造的），不构成证据；此时返回 `insufficient=True`、`verdict` 与 `rotation_verdict` 都是「数据不足（n=…）」并说明至少要 2 张同摆放参考图，**不要**把 `median_mm=0.0` 当合格。
+② **`board_scale_error` 是自检无效的入口，不是证据**：单目 `solvePnP` 的平移与 `objp` 同尺度（`objp` 由 `spec.square_mm` 生成），缩放 `objp` 会同步缩放 `t`，重投影完全不变 ⇒ 量出的方格边长必然自洽。它只反映"角点与板模型一致"，`tautological=True` 已如实标注。要验尺度请用前两个函数。
+③ **残差只随 `‖T‖` 放大，不随板距**：外参尺度错 k 倍时残差 ≈ `|k−1|·‖T‖`（实测 k=1.1、`‖T‖=781 mm` → **78.10 mm** = 0.1×基线；同一实验里板放到 0.4/0.8/1.2 m 残差都是 **10.00 mm**，即改变板距不改变它）。原因：这个差是"两个板原点在同一坐标系里的偏移"，与板本身多远无关 —— 它抓的是**外参尺度**，不是"远处更不准"。
+> ⚠️ 模块**顶部** docstring 里"随基线（板到左相机的距离）线性放大"一句与上面实测不符（把 `‖T‖` 说成了板距），以本节与 `calib/stereo_calib.py` 里 `cross_check` 的注释为准。
+④ 重投影 RMS 对这一类错**完全免疫**（齐次坐标乘常数不变）：所以"RMS 0.2 px + 外参整体偏 10%"可以同时成立，只有这两个函数能看出来。
+
+### 12.8 `calib/validation.py` —— 交叉验证与**泄漏守卫**
+```python
+GOOD_RATIO_MAX = 1.5; WARN_RATIO_MAX = 2.5
+FitFn = Callable[[Sequence[int], Sequence[int]], dict[str, Any]]
+def cross_validate(fit_fn, n_items, *, k=4, seed=0) -> dict
+```
+返回：`k / n_items / seed / degenerate / train_rms_median / test_rms_median / ratio / ratio_per_fold_median / verdict / leak_check("ok"|"unverified") / n_folds_ok / per_fold / failed_folds / note`。
+
+**`fit_fn` 的契约（2026-10-26 收紧，别漏）**：`fit_fn(train_idx, test_idx) -> dict`，至少含 `"train_rms"`、`"test_rms"`（都是 float，非有限即该折失败），且**必须报 `"used_train_idx"` = 真正拿去拟合的索引**。
+
+**为什么要这个契约**：这个工具最容易的误用是 `fit_fn` 忽略传入的 `train_idx`、每折都拿全量数据训练 —— 于是 `test_rms == train_rms`、`ratio` 恒 1.0、一路绿灯，**从外面完全看不出来**。守卫只有两条：
+| 情况 | 结果 |
+| ---- | ---- |
+| 报了 `used_train_idx` 且与 `train_idx` 集合相等 | `leak_check="ok"`，正常判定 |
+| 报了但对不上（训练集与测试集重叠） | 该折抛 `ValueError` → 进 `failed_folds`，`verdict` 带「部分折失败」 |
+| **没报** | `leak_check="unverified"`，`verdict` 整条降级为「未验证（…无法排除训练/测试泄漏）：按比值看是「…」，但不可采信」 |
+
+**其它坑**：① `k=1` 退化（训练集自评，`test_rms` 恒等于 `train_rms`），`degenerate=True` 且 verdict 明写"不能作为泛化证据"；`n_items < k` 抛 `ValueError`（不硬算一个 ratio）。
+② 失败折**不记 0**：`_median` 空列表返回 `nan`（0 会被后续比值当成真值）；"忘了返回 `test_rms`"会得到 `ratio=0` 的"完美泛化"，所以缺项一律算失败折。
+③ 门限三档：`≤1.5` 泛化良好 / `≤2.5` 轻度过拟合 / `>2.5` 过拟合。**`ratio` 只回答"换一批图还能不能复现"，不回答"绝对精度够不够"**（后者看 RMS 本身与板占画面比例）。
+④ `seed` 必须固定：同一 seed 必须给同一划分，否则"上次 1.4 这次 2.8"没法比较。
+
+### 12.9 `calib/uncertainty.py` —— 外参不确定度（数值雅可比 + delta 法）
+```python
+STEP_ROT = 1e-6; STEP_TRANS = 1e-6      # 中心差分步长（rad / m）
+COND_MAX = 1e12                          # 列归一化后的条件数门限
+def extrinsic_sigma(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T,
+                    image_size, *, noise_px=None) -> dict
+```
+返回：`sigma_baseline_mm / sigma_angle_deg / sigma_t_mm(3,) / sigma_r_deg(3,) / cov_t_mm2 / cov_r_rad2 / noise_px / noise_px_from_residual / ssr_px2 / dof / n_residuals / n_views / cond / baseline_mm / focal_px / depth_sigma_mm_at(callable) / note`。
+
+**算法**：把 `(R,T)` 当非线性最小二乘的 6 个参数，残差取**右目**重投影（`r_i = project(R·R_i, R·t_i + T) − p2_i`，各视图板位姿 `(R_i,t_i)` 由左目 `solvePnP` 给出并**固定**），在解处取数值雅可比：
+
+```
+Σ_θ = σ²·(JᵀJ)⁻¹,   σ² = SSR/(m−6),   m = 2·角点数·视图数
+σ_B = √(uᵀ Σ_t u), u = T/‖T‖            # 用完整协方差，不只取对角
+σ_angle = √(tr Σ_r)                     # 弧度 -> 度
+σ_Z(Z) = Z·√((σ_d/d)² + (σ_B/B)²),  d = f·B/Z,  σ_d = √2·noise_px
+```
+
+**最后一条是"这是量级估计、不是置信区间"的实测依据**（2026-10-26，30 次噪声实现）：
+
+| 场景 | σ_B 预测 / 实测散布 |
+| ---- | ---- |
+| 0.5 px 噪声、12 视图、54 点 | **0.74** |
+| 基线 60 / 200 mm、1 px、3 视图 | **0.54–0.62** |
+| 2 m 远场（板距 1.2–2.0 m） | **0.41** |
+
+即**系统性偏低**，远场更糟：远处的板位姿与 `T` 强相关，而条件协方差（各视图位姿、内参固定）吃不到这部分。标定距离附近可信，拿去做验收会偏乐观。
+
+**坑**：① **只统计右目**：左目投影完全不含 `(R,T)`，雅可比列恒 0，塞进 SSR 只会把 `σ²` 抬高却不给 `JᵀJ` 任何贡献（有偏）。
+② 失败**返回 `{"error": ...}`**（缺 `dof`、基线为 0、雅可比奇异、`JᵀJ` 不可逆），**不返回 inf/nan** —— 否则下游会当成"很大的数"继续算；调用方必须判 `"error" in u`。
+③ 奇异判据先**按列归一化再算条件数**（旋转列 px/rad 与平移列 px/m 天然差 1e5 量级，不归一化门限无从设起）；`dead_params` 指出"哪个自由度对残差完全没影响"。
+④ `noise_px` 缺省由 `√(SSR/(m−6))` 从**同一批残差**估 —— 既拟合又估噪声，`σ²` 会略偏小（与条件协方差的偏大方向相反，净结果是上面的 0.74）。想显式给就传 `noise_px`。
+⑤ **不含 `σ_f`**（要 `calibrateCameraExtended` 的 `stdDeviationsIntrinsics`，见 `StereoCalibrationResult.fx_sigma()`）；两项都要时把平方相加。`T` 必须是**米**，`depth_sigma_mm_at(z)` 的 `z` 也是米、越界返回 `nan`。
+⑥ `image_size` 参数**在函数体里没用**（`projectPoints` 不需要），保留只为与 `calibrate_stereo` 调用口径一致。
+
 ## 13. `stereo/` —— 双目逐帧
 ### 13.1 `stereo/sync.py`
 ```python
@@ -710,7 +790,8 @@ def detect_bounce(times, points, cfg=None, reason=None) -> int | None
 **已用 `inspect.signature` 复核的 38 个签名**：`geometry` 的 `refine_circle_subpixel`/`fit_circle_robust`/`circle_radial_gradient_stats`/`CameraModel.__init__`/`estimate_focal_from_known_ball`；`camera_motion` 的 `GlobalMotionEstimator.__init__`/`.estimate`/`warp_to_current`；`detectors.base._score_candidate`；`track` 的 `KalmanFilter.__init__`/`Track.__init__`；`predict` 的 `predict_quadratic`/`TrajectoryPredictor.predict`；`sources` 的 `CameraSource.__init__`/`open_source`/`LatestFrameCamera.latest`；`viz` 的 `draw_prediction`/`draw_3d_panel`/`hud_lines`；`pipeline` 的 `SpherePipeline.process`/`.render`；`calib` 的 `detect_board`/`detect_board_in_roi`/`pose_distance`/`AutoPairCollector.offer`/`calibrate_stereo`/`StereoRig.rectify_maps`/`StereoRig.triangulate`；`stereo` 的 `find_offset`/`brightness_series`/`match_epipolar`/`triangulate_one`/`StereoReconstructor.update`/`PairSource.__init__`/`from_args`/`resolve_backend`；以及 §13.3c 的 `estimate_fov_alignment`/`FovAlignment.from_dict`（2 个，2026-10-24 补）。
 
 **边界（诚实标注）**：⓪ 2026-10-26 新增的 §11b `multi_target` / §12.6 `world_frame` / §13.7 `predict3d`
-签名是**按源码抄写**的，**没有**跑 `inspect.signature` 复核（不在上面那 38 个之列）。① 本文**不覆盖** `apps/`、`tests/`、启动器与 PPT 工具链的内部实现（只在 §13.2 提了一句 `apps/_common.py` 的参数约定）。
+签名是**按源码抄写**的，**没有**跑 `inspect.signature` 复核（不在上面那 38 个之列）；
+同日新增的 §12.7 `metric_check` / §12.8 `validation` / §12.9 `uncertainty` 三节同理。① 本文**不覆盖** `apps/`、`tests/`、启动器与 PPT 工具链的内部实现（只在 §13.2 提了一句 `apps/_common.py` 的参数约定）。
 ② 文中所有"实测数字"（300/93/12/40 ms、~0.1 s vs ~10 s、圆度 0.61~0.63…）**引自源码注释**，我**没有**重跑那 6 个 `tests/selftest_*.py`。
 ③ ~~§10 的 `viz.scale != 1` 绘制不一致~~ —— **已修，不再是边界**（2026-10-14 的 `feat(ui)` 那轮把 scale 接进每个 `draw_*`，见 §10 坑④）。
 ④ **未确认**：`MotionDetector._bg_stale` 在长时间手持下的实际重学效果、`optimize_mode()` 在非本机摄像头上的耗时 —— 只有代码注释作依据。
