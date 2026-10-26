@@ -941,7 +941,8 @@ def _cv_fit(train_rms: float, test_rms: float, boom_at: int | None = None):
             raise RuntimeError(f"模拟第 {state['fold']} 折 stereoCalibrate 发散")
         # 新契约（2026-10-26）：必须上报真正参与拟合的索引，否则结果降级为"未验证"
         return {"train_rms": train_rms, "test_rms": test_rms,
-                "used_train_idx": train_idx}
+                "used_train_idx": train_idx,
+                "train_rms_estimator": "same", "test_rms_estimator": "same"}
 
     return fit
 

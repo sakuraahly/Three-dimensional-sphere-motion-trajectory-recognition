@@ -727,11 +727,49 @@ def _cross_validate_joint(objp, ip1, ip2, size, cfg: CalibConfig, spec: BoardSpe
         test = reprojection_rms_px(objp, [ip1[i] for i in test_idx],
                                    [ip2[i] for i in test_idx], tr.K1, tr.D1,
                                    tr.K2, tr.D2, tr.R, tr.T)
-        return {"train_rms": float(tr.rms), "test_rms": float(test),
+        # 判外参泛化**只看右目**：左目残差与 (R,T) 无关，合并会把它当常数底、
+        # 把比值压向 1（真机 25 对上实测 1.45 vs 只算右目 1.56，差一个判定档）。
+        params = (tr.K1, tr.D1, tr.K2, tr.D2, tr.R, tr.T)
+        test_right = reprojection_rms_px(
+            objp, [ip1[i] for i in test_idx], [ip2[i] for i in test_idx], *params,
+            camera="right")
+        test_left = reprojection_rms_px(
+            objp, [ip1[i] for i in test_idx], [ip2[i] for i in test_idx], *params,
+            camera="left")
+        train_right = reprojection_rms_px(
+            objp, [ip1[i] for i in train_idx], [ip2[i] for i in train_idx], *params,
+            camera="right")
+        train_left = reprojection_rms_px(
+            objp, [ip1[i] for i in train_idx], [ip2[i] for i in train_idx], *params,
+            camera="left")
+        train_both = reprojection_rms_px(
+            objp, [ip1[i] for i in train_idx], [ip2[i] for i in train_idx], *params)
+        return {"train_rms": float(train_right), "test_rms": float(test_right),
+                # 声明估计量：两者必须相同，否则比值无意义（见 calib/validation.py 的守卫）
+                "train_rms_estimator": "reprojection_right_px",
+                "test_rms_estimator": "reprojection_right_px",
+                "test_rms_both": float(test), "test_rms_left": float(test_left),
+                # 左目的 train/test 必须与右目同口径：左目与 (R,T) 无关，
+                # 两者本该几乎相等（差得多说明打分口径混了，别拿去当结论）
+                "train_rms_left": float(train_left), "train_rms_both": float(train_both),
                 # 供 cross_validate 的泄漏守卫核对：真正参与拟合的帧
                 "used_train_idx": list(train_idx)}
 
-    return cross_validate(fit, n_items=len(ip1), k=k, seed=0)
+    rep = cross_validate(fit, n_items=len(ip1), k=k, seed=0)
+    # 两目合并的比值只作参考：从每折里取中位数，不参与判定
+    import statistics as _st
+    ok_folds = [f for f in rep.get("per_fold", []) if f.get("error") is None]
+
+    def _med(key):
+        vals = [f[key] for f in ok_folds if isinstance(f.get(key), float)]
+        return float(_st.median(vals)) if vals else None
+
+    rep["test_rms_both_median"] = _med("test_rms_both")
+    rep["train_rms_both_median"] = _med("train_rms_both")
+    # 左目自检：与 (R,T) 无关，train/test 应当接近 1（差太多 = 口径混了）
+    rep["test_rms_left_median"] = _med("test_rms_left")
+    rep["train_rms_left_median"] = _med("train_rms_left")
+    return rep
 
 
 def rig_angle(R) -> float:

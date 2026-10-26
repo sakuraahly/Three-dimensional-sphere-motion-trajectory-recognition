@@ -359,9 +359,18 @@ class StereoCalibrationResult:
             return f"交叉验证      : 跳过（{cv['skipped']}）"
         if "error" in cv:
             return f"交叉验证      : 失败（{cv['error']}）"
-        return (f"交叉验证      : {cv['k']} 折  训练 RMS 中位 {cv['train_rms_median']:.3f} px / "
+        line = (f"交叉验证      : {cv['k']} 折（有效对 {cv.get('n_items', '?')}）"
+                f"  外参（右目）训练 {cv['train_rms_median']:.3f} px / "
                 f"测试 {cv['test_rms_median']:.3f} px → 比值 {cv['ratio']:.2f}"
                 f"（{cv['verdict']}）")
+        # 必须把三种口径都印出来：否则读者无法判断这个比值被稀释了多少
+        if isinstance(cv.get("test_rms_both_median"), float):
+            line += (f"；两目合并 {cv['train_rms_both_median']:.3f}"
+                     f"/{cv['test_rms_both_median']:.3f}（仅参考）")
+        if isinstance(cv.get("test_rms_left_median"), float):
+            line += (f"；左目 {cv['train_rms_left_median']:.3f}"
+                     f"/{cv['test_rms_left_median']:.3f}（应≈相等，否则口径混了）")
+        return line
 
     def _report_chain(self) -> str:
         """chain 的报告：**不写校正后极线 RMS**（90° 下这个数没有几何意义）。
@@ -555,7 +564,8 @@ def _epipolar_errors(ip1, ip2, K1, D1, K2, D2, R1, R2, P1, P2) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
-def reprojection_rms_px(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T) -> float:
+def reprojection_rms_px(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T,
+                        *, camera: str = "both") -> float:
     """**固定**内外参，在给定的图像对上算两路重投影 RMS（px）。
 
     用途：交叉验证的**测试集打分**。`cv2.stereoCalibrate` 回来的 `rms` 是训练集
@@ -565,6 +575,12 @@ def reprojection_rms_px(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T) -> f
 
     注意：右路用 `x_R = R·x_L + T`（**不重新求解**板位姿），所以测试 RMS 里
     真正被检验的是 `(R, T)`；左路那一半只反映内参。
+
+    ⚠️ **正因为左路只反映内参，合并两路会把外参信号稀释**（2026-10-26 修正）：
+    左路残差近似是一个与 `(R,T)` 无关的常数底，把 test/train 的比值**压向 1**。
+    在真机 25 对上实测：合并两路 ratio=1.45（判「泛化良好」），**只算右路 ratio=1.56**
+    （判「轻度过拟合」）—— 差一个档，方向正是"报喜不报忧"。
+    所以：判外参泛化用 `camera="right"`；`camera="left"` 用来看内参；`"both"` 只作参考。
     """
     obj_list = _as_objpoints(objp, len(imgpoints1))
     p1s = _as_imgpoints(list(imgpoints1))
@@ -583,8 +599,12 @@ def reprojection_rms_px(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T) -> f
         tb = np.asarray(tvec, np.float64).reshape(3, 1)
         uv2, _ = cv2.projectPoints(obj, cv2.Rodrigues(R @ Rb)[0], R @ tb + T.reshape(3, 1),
                                    np.asarray(K2, np.float64), np.asarray(D2, np.float64))
-        errs.append((uv1.reshape(-1, 2) - q1.reshape(-1, 2)).ravel())
-        errs.append((uv2.reshape(-1, 2) - q2.reshape(-1, 2)).ravel())
+        if camera in ("both", "left"):
+            errs.append((uv1.reshape(-1, 2) - q1.reshape(-1, 2)).ravel())
+        if camera in ("both", "right"):
+            errs.append((uv2.reshape(-1, 2) - q2.reshape(-1, 2)).ravel())
+    if camera not in ("both", "left", "right"):
+        raise ValueError(f'camera 只能是 both/left/right，收到 {camera!r}')
     if not errs:
         return float("nan")
     e = np.concatenate(errs)

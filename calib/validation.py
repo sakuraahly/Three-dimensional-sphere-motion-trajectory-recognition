@@ -166,6 +166,7 @@ def cross_validate(
     trains: list[float] = []
     tests: list[float] = []
     unverified = False
+    estimator_unclear = False
 
     for i, (train_idx, test_idx) in enumerate(folds):
         entry: dict[str, Any] = {
@@ -188,6 +189,20 @@ def cross_validate(
             # 所以要求 fit_fn 把真正用于拟合的索引报出来 `used_train_idx`：
             #   - 报了但对不上 → 该折判失败（不是警告，是数据错）；
             #   - 没报 → 整份结果降级为"未验证"，宁可说不知道，也不发假合格证。
+            # ---- 估计量守卫（2026-10-26 加）----
+            # 训练用 `stereoCalibrate` 的 rms、测试用"位姿焊死的重投影"，两把尺子
+            # 长度不同，比值天生偏乐观（实测偏高约 0.2）。要求 fit_fn 声明两个估计量，
+            # 不一致直接判该折失败；未声明则结论降级，别让 reader 以为那是干净的 1.45。
+            if isinstance(out, dict):
+                est_t = out.get("train_rms_estimator")
+                est_s = out.get("test_rms_estimator")
+                if est_t and est_s and est_t != est_s:
+                    raise ValueError(
+                        f"训练/测试不是同一个估计量（{est_t} vs {est_s}）——"
+                        f"这种比值只能说明两把尺子不一样长"
+                    )
+                if not (est_t and est_s):
+                    estimator_unclear = True
             if isinstance(out, dict):
                 used = out.get("used_train_idx")
                 if used is None:
@@ -220,6 +235,8 @@ def cross_validate(
         ratio = float("inf") if np.isfinite(test_med) else float("nan")
 
     base = _ratio_verdict(ratio)
+    if estimator_unclear and not unverified:
+        base += "（⚠️ 训练/测试未见估计量声明，比值可能混了尺子，仅供参考）"
     if unverified:
         # 把降级信息放进 base，这样"部分折失败"那条分支也不会把结论说满
         base = (f"未验证（fit_fn 未报告 used_train_idx，无法排除训练/测试泄漏）："
@@ -251,6 +268,7 @@ def cross_validate(
                                           if f["error"] is None]),
         "verdict": verdict,
         "leak_check": "unverified" if unverified else "ok",
+        "estimator_declared": not estimator_unclear,
         "n_folds_ok": n_ok,
         "per_fold": per_fold,
         "failed_folds": failed,
