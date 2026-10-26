@@ -51,6 +51,7 @@ __all__ = [
     "board_to_board_from_single_camera",
     "relative_extrinsics",
     "consistency",
+    "average_T",
     "rt_to_T",
     "T_to_rt",
     "rotation_angle_deg",
@@ -220,4 +221,258 @@ def consistency(T_AB_list) -> dict:
         "trans_max_mm": float(trans_arr.max()) if trans_arr.size else 0.0,
         "trans_mean_mm": float(trans_arr.mean()) if trans_arr.size else 0.0,
         "baseline_mm": float(np.mean([np.linalg.norm(T[:3, 3]) for T in Ts])) * 1000.0,
+    }
+
+
+# --------------------------------------------------------------------------
+# 多帧鲁棒聚合（2026-10-26 加）
+# --------------------------------------------------------------------------
+#
+# ## 为什么不能"取第一帧"、也不能"旋转矩阵算术平均再正交化"
+#
+# `T_AB` 是 chain 链上的**乘法因子**，它的误差会原样进入外参（不衰减）。
+# 多帧同框图给出的是一簇观测，**用一帧 = 丢掉其余帧的全部信息**；
+# 而算术平均旋转矩阵再正交化在旋转差小于 1° 时几乎等于真解、差大于 10° 时
+# 会系统性偏向"矩阵平均"而非"几何平均"（对旋转群不是内蕴运算，结果依赖参数化）。
+# 正确做法是在**李群/四元数**上取平均：旋转在单位四元数球面上做加权平均
+# （先对齐半球符号，否则 q 与 -q 会互相抵消），平移取**几何中位数**（对离群
+# 不敏感，而算术平均会被单个 20 mm 的坏帧拉走）。
+#
+# 权重用 Huber：偏离超过 `huber_k · σ`（σ 由 MAD 稳健估计，且设下限，
+# 避免"样本极一致 → σ→0 → 把所有样本都判成离群"的退化）的样本被降权。
+
+_QUAT_FLOOR = 1e-12
+
+
+def _quat_from_R(R) -> np.ndarray:
+    """旋转矩阵 -> 单位四元数 `(w, x, y, z)`（Shepperd 分支法，数值稳定）。"""
+    m = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    tr = float(m[0, 0] + m[1, 1] + m[2, 2])
+    if tr > 0.0:
+        s = np.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([w, x, y, z], dtype=np.float64)
+    nrm = float(np.linalg.norm(q))
+    if nrm < _QUAT_FLOOR:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    return q / nrm
+
+
+def _R_from_quat(q) -> np.ndarray:
+    """单位四元数 `(w, x, y, z)` -> 旋转矩阵（输出天然正交、det=+1）。"""
+    v = np.asarray(q, dtype=np.float64).ravel()
+    w, x, y, z = v / float(np.linalg.norm(v))
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+def _huber_weights(dist: np.ndarray, c: float) -> np.ndarray:
+    """Huber 权：`d <= c` 取 1，否则 `c/d`（对离群只降权、不硬剔）。"""
+    d = np.asarray(dist, dtype=np.float64)
+    w = np.ones_like(d)
+    if c > 0:
+        big = d > c
+        w[big] = c / d[big]
+    return w
+
+
+_CHI3_MEDIAN = 1.5382      # 三维各向同性正态距离的中位数 / σ（χ₃ 中位数）
+
+
+def _robust_sigma(dist: np.ndarray, floor: float) -> float:
+    """由"样本到中心的**距离**"估**逐轴** σ，带下限。
+
+    ⚠️ 这里**不能**对距离做 MAD：距离恒为正、分布偏斜（半正态/χ₃），MAD 会
+    系统性低估 σ，于是正常噪声也会越过门限被当成离群。实测（合成数据）：
+    σ=3 mm 的干净 8 帧，用 MAD 会剔掉 6 帧，反而把均值算坏。
+    正确做法是用 χ₃ 的中位数反推：`median(d) = 1.5382 σ`。
+    """
+    v = np.asarray(dist, dtype=np.float64)
+    if v.size == 0:
+        return float(floor)
+    return max(float(np.median(v)) / _CHI3_MEDIAN, float(floor))
+
+
+def average_T(
+    samples,
+    *,
+    max_iter: int = 8,
+    huber_k: float = 2.5,
+    rot_scale_floor_deg: float = 0.5,
+    trans_scale_floor_mm: float = 1.0,
+    min_rot_deg: float = 1.0,
+    min_trans_mm: float = 5.0,
+):
+    """多帧 `T` 的 **SE(3) 鲁棒平均**：平移取几何中位数、旋转取四元数加权平均。
+
+    参数
+    ----
+    samples : 序列，每项 4x4 刚体变换（同一物理量 `T_{B←A}` 的多次观测）。
+    max_iter : 加权迭代上限。
+    huber_k : Huber 门限（单位：σ）。2.5 对应"约 99% 的高斯样本不降权"。
+    rot_scale_floor_deg / trans_scale_floor_mm : σ 的下限，**必须有**，
+        否则样本高度一致时 σ→0，所有样本都会被判成离群。
+    min_rot_deg / min_trans_mm : 判离群的**绝对下限**（与 `stereo_calib` 里
+        `outlier_min_px` 同一个思路）：偏离小于它的一律不算离群，避免在
+        "全都很一致"时凭空造出离群点。取 1° / 5 mm —— 与
+        `stereo_calib.CHAIN_ROT_OK_DEG / CHAIN_TRANS_OK_MM`（重复性"可用"门限）
+        同量级：比这更小的偏离本来就在可用范围内，剔掉它反而增加方差。
+        判据：`max(k·χ₃中位数·σ, 下限)`。
+
+    返回
+    ----
+    `(T_mean, stats)`，`stats` 含：
+        n / used / n_outliers / outlier_index
+        rot_spread_deg / trans_spread_mm（样本到均值的**最大**偏离，
+            与 `consistency()` 的 `*_max_*` 同口径；含被剔除的样本）
+        rot_rms_deg / trans_rms_mm（到均值的 RMS）
+        dist_rot_deg / dist_trans_mm（**每个**样本到均值的距离，逐项对应入参）
+        sigma_rot_deg / sigma_trans_mm / threshold_rot_deg / threshold_trans_mm
+        iterations / converged / huber_k / max_iter
+
+    边界
+    ----
+    0 个样本 -> `ValueError`；1 个样本 -> 原样返回（散布记 0，不做任何拟合）。
+    """
+    Ts = [_as_T(T, f"samples[{i}]") for i, T in enumerate(samples)]
+    n = len(Ts)
+    if n == 0:
+        raise ValueError("average_T() 需要至少 1 个样本；0 个样本无法给出任何位姿")
+    if n == 1:
+        return Ts[0].copy(), {
+            "n": 1, "used": 1, "n_outliers": 0, "outlier_index": [],
+            "rot_spread_deg": 0.0, "trans_spread_mm": 0.0,
+            "rot_rms_deg": 0.0, "trans_rms_mm": 0.0,
+            "dist_rot_deg": [0.0], "dist_trans_mm": [0.0],
+            "sigma_rot_deg": 0.0, "sigma_trans_mm": 0.0,
+            "threshold_rot_deg": float(min_rot_deg),
+            "threshold_trans_mm": float(min_trans_mm),
+            "iterations": 0, "converged": True,
+            "huber_k": float(huber_k), "max_iter": int(max_iter),
+        }
+
+    R_list = [T[:3, :3] for T in Ts]
+    t_arr = np.array([T[:3, 3] for T in Ts], dtype=np.float64)      # (n,3)，米
+    q_arr = np.array([_quat_from_R(R) for R in R_list], dtype=np.float64)
+
+    # ---- 稳健起点：旋转取"到其它样本旋转距离之和最小"的那一帧（medoid），
+    #      平移取逐坐标中位数。**不取第一帧** —— 第一帧本身可能就是坏帧。 ----
+    n = len(Ts)
+    pair = np.zeros((n, n), dtype=np.float64)
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair[i, j] = pair[j, i] = rotation_angle_deg(R_list[i], R_list[j])
+    start = int(np.argmin(pair.sum(axis=1)))
+    R_cur = R_list[start].copy()
+    t_cur = np.median(t_arr, axis=0)
+
+    def _refine(active, R0, t0):
+        """在 `active` 子集上跑 Huber-IRLS；返回 (R, t, sigma_rot, sigma_trans, 迭代数, 是否收敛)。"""
+        Rc, tc = R0.copy(), t0.copy()
+        s_r = s_t = 0.0
+        converged = False
+        it = 0
+        for it in range(1, int(max_iter) + 1):
+            rot_d = np.array([rotation_angle_deg(R_list[i], Rc) for i in active])
+            tr_mm = np.array([np.linalg.norm(t_arr[i] - tc) for i in active]) * 1000.0
+            s_r = _robust_sigma(rot_d, rot_scale_floor_deg)
+            s_t = _robust_sigma(tr_mm, trans_scale_floor_mm)
+            w = _huber_weights(rot_d, huber_k * s_r) * _huber_weights(tr_mm, huber_k * s_t)
+
+            # 旋转：四元数球面加权平均（先对齐半球符号，否则 q 与 -q 互相抵消）
+            qs = q_arr[active]
+            dots = qs @ _quat_from_R(Rc)
+            qs = qs * np.where(dots < 0.0, -1.0, 1.0)[:, None]
+            q_mean = (w[:, None] * qs).sum(axis=0)
+            R_new = _R_from_quat(q_mean) if np.linalg.norm(q_mean) > _QUAT_FLOOR else Rc.copy()
+
+            # 平移：Weiszfeld 迭代（几何中位数）+ Huber 权
+            d = np.linalg.norm(t_arr[active] - tc, axis=1)
+            if float(d.max()) < 1e-12:
+                t_new = tc.copy()
+            else:
+                ww = w / np.maximum(d, 1e-12)
+                t_new = (ww[:, None] * t_arr[active]).sum(axis=0) / ww.sum()
+
+            d_rot = rotation_angle_deg(R_new, Rc)
+            d_t = float(np.linalg.norm(t_new - tc)) * 1000.0
+            Rc, tc = R_new, t_new
+            if d_rot < 1e-4 and d_t < 1e-3:
+                converged = True
+                break
+        return Rc, tc, s_r, s_t, it, converged
+
+    active = list(range(n))
+    R_c, t_c, s_r, s_t, iters, conv = _refine(active, R_cur, t_cur)
+
+    def _distances(Rc, tc):
+        rot = [rotation_angle_deg(R_list[i], Rc) for i in range(n)]
+        tr = [float(np.linalg.norm(t_arr[i] - tc)) * 1000.0 for i in range(n)]
+        return rot, tr
+
+    rot_all, tr_all = _distances(R_c, t_c)
+    # 门限 = max(k·χ₃中位数·σ, 绝对下限)：前者按"本批数据的真实噪声"自适应，
+    # 后者防止"样本极一致"时把与中心差 0.1 mm 的样本也当离群。
+    thr_r = max(huber_k * _CHI3_MEDIAN * s_r, float(min_rot_deg))
+    thr_t = max(huber_k * _CHI3_MEDIAN * s_t, float(min_trans_mm))
+    out_idx = [i for i in range(n) if rot_all[i] > thr_r or tr_all[i] > thr_t]
+
+    # ---- 剔除离群后**重算一次**：Huber 只是降权，20 mm 的坏帧仍会把均值拉偏
+    #      一点；既然有 `min_*` 绝对门限兜底，就干脆把它们排除后重算。
+    #      离群名单**只判一次**（用第一轮的 σ），否则剔除会让 σ 变小、
+    #      再把更多样本判成离群，越剔越多。 ----
+    if 0 < len(out_idx) < n:
+        active = [i for i in range(n) if i not in out_idx]
+        R_c, t_c, s_r, s_t, iters2, conv2 = _refine(active, R_c, t_c)
+        iters, conv = iters + iters2, conv2
+        rot_all, tr_all = _distances(R_c, t_c)
+        thr_r = max(huber_k * _CHI3_MEDIAN * s_r, float(min_rot_deg))
+        thr_t = max(huber_k * _CHI3_MEDIAN * s_t, float(min_trans_mm))
+
+    T_mean = rt_to_T(R_c, t_c)
+    rot_arr = np.asarray(rot_all, dtype=np.float64)
+    tr_arr = np.asarray(tr_all, dtype=np.float64)
+    return T_mean, {
+        "n": n,
+        "used": int(len(active)),
+        "n_outliers": int(len(out_idx)),
+        "outlier_index": [int(i) for i in out_idx],
+        "rot_spread_deg": float(rot_arr.max()),
+        "trans_spread_mm": float(tr_arr.max()),
+        "rot_rms_deg": float(np.sqrt(np.mean(rot_arr ** 2))),
+        "trans_rms_mm": float(np.sqrt(np.mean(tr_arr ** 2))),
+        "dist_rot_deg": [float(v) for v in rot_arr],
+        "dist_trans_mm": [float(v) for v in tr_arr],
+        "sigma_rot_deg": float(s_r),
+        "sigma_trans_mm": float(s_t),
+        "threshold_rot_deg": float(thr_r),
+        "threshold_trans_mm": float(thr_t),
+        "iterations": int(iters),
+        "converged": bool(conv),
+        "huber_k": float(huber_k),
+        "max_iter": int(max_iter),
     }

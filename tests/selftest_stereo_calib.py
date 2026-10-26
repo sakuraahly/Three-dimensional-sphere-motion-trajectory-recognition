@@ -1198,6 +1198,174 @@ def test_same_board_mode() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_average_T() -> bool:
+    """`average_T`：SE(3) 鲁棒平均（2026-10-26）。
+
+    ## 守的是什么
+
+    `T_AB` 是 chain 上的**乘法因子**，它的误差原样进入外参（不衰减）。以前多帧
+    同框图只拿来算离散度、**真正进链的是调用方给的那一帧** —— n 帧的信息被丢成
+    1 帧。这里守四件事：
+
+      1. 10 帧（其中 2 帧故意偏 5°/20 mm）聚合后 < 0.5°/2 mm，且离群正好 2 个；
+      2. 单帧 -> 原样返回且散布为 0；0 帧 -> `ValueError`；
+      3. **对照实验**：同一份数据下"取第一帧"误差 > 2°（证明聚合不是摆设）——
+         所以故意让第一帧就是坏帧之一；
+      4. 干净数据（0.3°/1 mm 抖动）**不许误杀** —— 否则"聚合"会变成"随机丢帧"。
+         这一条卡的是 σ 估计：对"距离"做 MAD 会系统性低估（距离恒正、分布偏斜），
+         实测能把 σ=3 mm 的干净 8 帧剔掉 6 帧。
+    """
+    print("\n----- T_AB 多帧鲁棒聚合（average_T） -----")
+    import calib.relative_pose as rp
+
+    T_true = rp.rt_to_T(cv2.Rodrigues(np.radians([12.0, -30.0, 5.0]))[0],
+                        [0.21, -0.05, 0.13])
+
+    def _perturb(T, dr_deg: float, dt_mm: float, r) -> np.ndarray:
+        out = T.copy()
+        out[:3, :3] = cv2.Rodrigues(np.radians(r.normal(0.0, dr_deg, 3)))[0] @ T[:3, :3]
+        out[:3, 3] = T[:3, 3] + r.normal(0.0, dt_mm / 1000.0, 3)
+        return out
+
+    rng = np.random.default_rng(2026)
+    samples = []
+    for i in range(10):
+        s = _perturb(T_true, 0.1, 0.5, rng)
+        if i < 2:                              # 前两帧坏：偏 5° / 20 mm
+            s[:3, :3] = cv2.Rodrigues(np.radians([0.0, 5.0, 0.0]))[0] @ s[:3, :3]
+            s[:3, 3] = s[:3, 3] + np.array([0.0, 0.0, 0.020])
+        samples.append(s)
+
+    T_mean, st = rp.average_T(samples)
+    agg_rot = rp.rotation_angle_deg(T_mean[:3, :3], T_true[:3, :3])
+    agg_tr = float(np.linalg.norm(T_mean[:3, 3] - T_true[:3, 3])) * 1000.0
+    first_rot = rp.rotation_angle_deg(samples[0][:3, :3], T_true[:3, :3])
+    first_tr = float(np.linalg.norm(samples[0][:3, 3] - T_true[:3, 3])) * 1000.0
+    print(f"  聚合：误差 {agg_rot:.4f}° / {agg_tr:.3f} mm "
+          f"（n={st['n']}，使用 {st['used']}，剔除 {st['n_outliers']}："
+          f"{st['outlier_index']}）")
+    print(f"  对照「取第一帧」：误差 {first_rot:.4f}° / {first_tr:.3f} mm")
+    print(f"  散布：旋转 {st['rot_spread_deg']:.3f}° / 平移 {st['trans_spread_mm']:.2f} mm"
+          f"（含坏帧）  门限 {st['threshold_rot_deg']:.3f}° / "
+          f"{st['threshold_trans_mm']:.2f} mm  σ {st['sigma_rot_deg']:.3f}° / "
+          f"{st['sigma_trans_mm']:.2f} mm")
+
+    # ---- 边界：单帧原样返回 / 0 帧必须报错 ----
+    T_one, st_one = rp.average_T([T_true])
+    one_ok = (np.array_equal(T_one, T_true) and st_one["rot_spread_deg"] == 0.0
+              and st_one["trans_spread_mm"] == 0.0 and st_one["n_outliers"] == 0)
+    zero_raises = _raises_value_error(lambda: rp.average_T([]))
+
+    # ---- 干净数据不许误杀 ----
+    clean = [_perturb(T_true, 0.3, 1.0, rng) for _ in range(6)]
+    T_clean, st_clean = rp.average_T(clean)
+    clean_err = rp.rotation_angle_deg(T_clean[:3, :3], T_true[:3, :3])
+    clean_tr = float(np.linalg.norm(T_clean[:3, 3] - T_true[:3, 3])) * 1000.0
+    print(f"  干净 6 帧（0.3°/1 mm 抖动）：误差 {clean_err:.4f}° / {clean_tr:.3f} mm，"
+          f"误判离群 {st_clean['n_outliers']} 个")
+
+    checks = [
+        ("10 帧（2 坏）聚合误差 < 0.5°", agg_rot < 0.5),
+        ("10 帧（2 坏）聚合误差 < 2 mm", agg_tr < 2.0),
+        ("离群正好 2 个且就是那两帧", st["n_outliers"] == 2
+         and sorted(st["outlier_index"]) == [0, 1] and st["used"] == 8),
+        ("对照：取第一帧误差 > 2°（聚合确实有用）", first_rot > 2.0),
+        ("单帧 -> 原样返回、散布 0、无离群", one_ok),
+        ("0 帧 -> ValueError", zero_raises),
+        ("干净 6 帧不误杀离群（σ 估计不偏小）", st_clean["n_outliers"] == 0),
+        ("干净 6 帧聚合误差 < 0.5° / 2 mm", clean_err < 0.5 and clean_tr < 2.0),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_scale_self_check() -> bool:
+    """外参**尺度**自检（2026-10-26）：重投影 RMS 抓不到的那一类错。
+
+    ## 为什么必须单独验
+
+    `stereoCalibrate`/链式外参的重投影 RMS 只约束"射线方向一致"，**不约束尺度**：
+    把基线整体放大 1.1 倍，重投影残差一模一样。所以这里构造真值已知的合成装置，
+    再把 `T_{C_R←C_L}` 的平移乘 1.1，看检查能不能抓到。
+
+    守五件事：
+      1. 无噪 -> `median_mm < 0.5`；
+      2. 尺度 ×1.1 -> `median_mm` 显著变大，且 ≈ `0.1·‖T‖`（随基线放大）；
+      3. 同一组 ×1.1 数据下**旋转残差仍为 0** —— 证明只查旋转抓不到尺度；
+      4. `square_size_check` 在无噪下量出 25 mm、×1.1 时量出 27.5 mm；
+      5. 单目入口如实地把自己标成 `tautological=True`（循环论证，不能当验收）。
+    """
+    print("\n----- 外参尺度自检（stereo_scale_consistency / square_size_check） -----")
+    import calib.relative_pose as rp
+    from calib import metric_check
+
+    R_true = cv2.Rodrigues(np.radians([0.0, 90.0, 0.0]))[0]
+    T_true = rp.rt_to_T(R_true, [-0.5, 0.0, 0.6])        # T_{C_R←C_L}，基线 781 mm
+    rng = np.random.default_rng(5)
+    poses_l = [rp.rt_to_T(cv2.Rodrigues(np.radians(rng.uniform(-15, 15, 3)))[0],
+                          [0.03, -0.02, 0.45 + 0.02 * i]) for i in range(8)]
+    poses_r = [rp.compose(T_true, TL) for TL in poses_l]
+
+    good = metric_check.stereo_scale_consistency(T_true, poses_l, poses_r)
+    bad_T = T_true.copy()
+    bad_T[:3, 3] *= 1.1
+    bad = metric_check.stereo_scale_consistency(bad_T, poses_l, poses_r)
+    expect_mm = 0.1 * float(np.linalg.norm(T_true[:3, 3])) * 1000.0
+    print(f"  真值外参：median {good['median_mm']:.6f} mm  旋转 {good['rotation_deg']:.6f}°"
+          f"  -> {good['verdict']}")
+    print(f"  平移 ×1.1：median {bad['median_mm']:.3f} mm（理论 0.1·||T|| = "
+          f"{expect_mm:.1f} mm）  旋转 {bad['rotation_deg']:.6f}°  -> {bad['verdict']}")
+
+    # ---- 方格边长回代（三角化后量绝对尺寸）----
+    spec = BoardSpec(cols=8, rows=5, square_mm=25.0)
+    objp = spec.object_points()
+    K = _K(900.0, 900.0, 640.0, 360.0)
+    D = np.zeros(5)
+    ang = math.radians(140.0)
+    R_b = np.array([[math.cos(ang), 0, math.sin(ang)], [0, 1, 0],
+                    [-math.sin(ang), 0, math.cos(ang)]])
+    T_CL_B = rp.rt_to_T(R_b, [0.05, 0.0, 0.45])
+
+    def _proj(T) -> np.ndarray:
+        rvec, _ = cv2.Rodrigues(T[:3, :3])
+        pts, _ = cv2.projectPoints(objp, rvec, T[:3, 3].reshape(3, 1), K, D)
+        return pts.reshape(-1, 2)
+
+    sq_good = metric_check.square_size_check(
+        T_true, objp, _proj(T_CL_B), _proj(rp.compose(T_true, T_CL_B)),
+        spec, K, D, K, D)
+    sq_bad = metric_check.square_size_check(
+        bad_T, objp, _proj(T_CL_B), _proj(rp.compose(T_true, T_CL_B)),
+        spec, K, D, K, D)
+    print(f"  方格边长：真值外参 {sq_good['square_mm']:.4f} mm"
+          f"（{sq_good['error_pct']:+.4f}%） / ×1.1 {sq_bad['square_mm']:.4f} mm"
+          f"（{sq_bad['error_pct']:+.2f}%）")
+
+    mono = metric_check.board_scale_error(np.eye(4), objp, [_proj(T_CL_B)], spec, K, D)
+    print(f"  单目入口：reproj {mono['reproj_rms_px']:.4f} px  "
+          f"tautological={mono['tautological']}  verdict={mono['verdict'][:22]}…")
+
+    checks = [
+        ("真值外参：median < 0.5 mm", good["median_mm"] < 0.5),
+        ("真值外参：旋转残差 < 0.05°", good["rotation_deg"] < 0.05),
+        ("尺度 ×1.1：median > 5 mm", bad["median_mm"] > 5.0),
+        ("尺度 ×1.1：median ≈ 0.1·||T||（±1 mm，随基线放大）",
+         abs(bad["median_mm"] - expect_mm) < 1.0),
+        ("尺度 ×1.1：旋转残差仍 ≈ 0（只查旋转抓不到尺度）",
+         bad["rotation_deg"] < 0.05),
+        ("square_size_check：无噪量出 25 mm（< 0.5%）",
+         abs(sq_good["error_pct"]) < 0.5),
+        ("square_size_check：×1.1 量出 27.5 mm（±1%）",
+         abs(sq_bad["square_mm"] - 27.5) < 0.275),
+        ("单目入口标成 tautological（不冒充尺度证据）",
+         mono["tautological"] is True and "无效" in mono["verdict"]),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def _focus_board(board_w: int, sigma: float, hi: int = 255, lo: int = 0) -> np.ndarray:
     """画一块 8x5 内角点的棋盘（板宽精确等于 ``board_w`` px），再按 σ 高斯模糊。
 
@@ -1454,6 +1622,94 @@ def test_focus_relative_gate() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_pending_metrics_honesty() -> bool:
+    """**没算出来/不适用**的指标必须写明原因，不许印 0，也不许省略（2026-10-26）。
+
+    守三条具体的历史谎言：
+
+    1. `depth_sigma_mm` 用 `Z=f·B/d`，而 90°/未校正下"视差"不存在 ——
+       以前照旧代公式，**给出一个对不上任何物理量的数**。现在必须 `nan`，
+       且报告写"不适用"而不是空着。
+    2. `extrinsic_sigma` 失败时返回 `{"error": ...}`，报告必须**原样**打印；
+       印 0 或略过都等于说"外参是准的"。
+    3. 交叉验证跳过时必须写**为什么**跳过（"--no-cv" / 样本不足 / chain 不适用）。
+
+    这些都是"输出口径"的断言，构造 `StereoCalibrationResult` 直接验，不必跑标定。
+    """
+    print("\n----- 未算出的指标：必须写原因（不允许 0 / 省略） -----")
+    from calib.stereo_calib import StereoCalibrationResult
+
+    K = _K(900.0, 900.0, 640.0, 360.0)
+    T = np.array([-0.065, 0.0, 0.0])
+    R = np.eye(3)
+
+    ang = StereoCalibrationResult(
+        K1=K, K2=K, D1=np.zeros(5), D2=np.zeros(5), R=R, T=T,
+        std1=np.array([1.0, 1.0, 1.0, 1.0, 0, 0, 0, 0, 0]),
+        rms=0.4, method="chain", stereo_mode="angled", rectification="none_raw")
+    ang_text = ang.report()
+    dz_ang = ang.depth_sigma_mm(0.6)
+    ang_ok = (not np.isfinite(dz_ang)) and "深度不确定度  : 不适用" in ang_text \
+        and "Z=fB/d" in ang_text
+    print(f"  angled：σ_Z(0.6m)={dz_ang}  报告行="
+          f"{next((l for l in ang_text.splitlines() if '深度不确定度' in l), '（缺）')[:60]}")
+
+    # 同一份参数标成 parallel + 已校正 -> 公式仍要能算（不是把这一档废掉）
+    par = StereoCalibrationResult(
+        K1=K, K2=K, D1=np.zeros(5), D2=np.zeros(5), R=R, T=T,
+        std1=np.array([1.0, 1.0, 1.0, 1.0, 0, 0, 0, 0, 0]),
+        rms=0.4, method="joint", stereo_mode="parallel",
+        rectification="stereo_rectify")
+    dz_par = par.depth_sigma_mm(0.6)
+    par_ok = np.isfinite(dz_par) and dz_par > 0
+    print(f"  parallel：σ_Z(0.6m)={dz_par:.2f} mm（同一份 K/T，公式仍可用）")
+
+    # 外参不确定度：失败 -> 原文打印；成功 -> 两行（含基线项）+ 新旧对照
+    err_text = "雅可比奇异：数据不足以确定 6 个自由度"
+    ang.extrinsic_sigma = {"error": err_text}
+    err_ok = err_text in ang.report()
+    print(f"  extrinsic_sigma 失败 -> 报告含原文：{err_ok}")
+
+    sig = {"sigma_baseline_mm": 0.3, "sigma_angle_deg": 0.02,
+           "baseline_mm": 65.0, "depth_sigma_mm_at": lambda z: 12.0}
+    par.extrinsic_sigma = sig
+    t2 = par.report()
+    sig_ok = ("σ_B = 0.300 mm" in t2 and "1 m 处 σ_Z ≈ 12.0 mm" in t2
+              and "σ_Z(1 m) 对照" in t2 and "无基线项" in t2)
+    print(f"  外参不确定度行 + 新旧对照行：{sig_ok}")
+
+    # 交叉验证：跳过必须带原因；成功必须带 k/中位/比值
+    par.cv = {"skipped": "--no-cv"}
+    skip_ok = "交叉验证      : 跳过（--no-cv）" in par.report()
+    par.cv = {"k": 4, "train_rms_median": 0.5, "test_rms_median": 0.7,
+              "ratio": 1.4, "verdict": "泛化良好"}
+    run_ok = "4 折" in par.report() and "1.40" in par.report()
+
+    # 跨路一致性：n=1 的 0.00 是构造出来的，必须标成"无法评估"而不是证据
+    ang.cross_check = {"insufficient": "n=1：外参正是由这一对位姿构造的，残差恒为 0"}
+    insuff_ok = "跨路一致性    : 无法评估" in ang.report()
+    ang.cross_check = None
+    none_ok = "跨路一致性    : 无法计算（缺少两路同板位姿）" in ang.report()
+    ang.cross_check = {"median_mm": 0.8, "p95_mm": 1.2, "rot_deg": 0.1, "n": 4}
+    num_ok = "中位 0.80 mm / P95 1.20 mm / 0.100 °（n=4）" in ang.report()
+    print(f"  跨路一致性：n=1 标未评估={insuff_ok}  缺失写原因={none_ok}  有数印数={num_ok}")
+
+    checks = [
+        ("angled/none_raw：σ_Z 为 nan 且报告写「不适用」", ang_ok),
+        ("parallel/已校正：同一公式仍能算（没把这一档废掉）", par_ok),
+        ("extrinsic_sigma 的错误原文被原样打印", err_ok),
+        ("有 σ_B 时印 σ_B/σ_θ/σ_Z(1 m) 且并列新旧口径", sig_ok),
+        ("交叉验证跳过时印「跳过（原因）」", skip_ok),
+        ("交叉验证成功时印折数/中位/比值", run_ok),
+        ("跨路一致性 n=1 -> 标「无法评估」（残差恒 0 不是证据）", insuff_ok),
+        ("跨路一致性缺位姿 -> 印「无法计算 + 原因」", none_ok),
+        ("跨路一致性有数 -> 印中位/P95/旋转/n", num_ok),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def _raises_value_error(fn) -> bool:
     try:
         fn()
@@ -1511,6 +1767,9 @@ def main() -> int:
     all_ok = test_chain_triangulation_closure() and all_ok
     all_ok = test_chain_mode_guard() and all_ok
     all_ok = test_same_board_mode() and all_ok
+    all_ok = test_average_T() and all_ok
+    all_ok = test_scale_self_check() and all_ok
+    all_ok = test_pending_metrics_honesty() and all_ok
     all_ok = test_focus_is_scale_invariant() and all_ok
     all_ok = test_focus_is_monotonic_in_blur() and all_ok
     all_ok = test_focus_threshold() and all_ok

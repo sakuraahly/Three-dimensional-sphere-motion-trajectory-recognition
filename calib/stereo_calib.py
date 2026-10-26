@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from . import relative_pose
+from . import metric_check, relative_pose
 from .board import BoardSpec
 
 # 联合求解（`stereoCalibrate`）在 angled 下**至少**需要这么多对共视数据。
@@ -39,6 +39,13 @@ CHAIN_ROT_GOOD_DEG = 0.5      # 优秀
 CHAIN_ROT_OK_DEG = 1.5        # 可用
 CHAIN_TRANS_GOOD_MM = 2.0
 CHAIN_TRANS_OK_MM = 5.0
+
+# 跨路一致性的告警门限：**两个数取同一档**（"可用"下限），与
+# `metric_check.stereo_scale_consistency` 的门限同源。
+# 混档（5 mm + 0.5°）会把正常装置天天判成坏：实测 α 正确、1 px 角点噪声时
+# 旋转中位数已达 0.585°，而 0.5° 在 metric_check 里是"优秀"的门限。
+_CROSS_TRANS_WARN_MM = 5.0
+_CROSS_ROT_WARN_DEG = 1.5
 
 
 @dataclass
@@ -179,6 +186,23 @@ class StereoCalibrationResult:
     std1: np.ndarray | None = None
     std2: np.ndarray | None = None
 
+    # ---- 2026-10-26 新增（只加输出，不改任何数值路径）----
+    #
+    # 跨路一致性：用解出的 `T_{C_R←C_L}` 把两路看**同一块板同一位置**的板位姿
+    # 搬到同一坐标系，看残差有多大。这是 chain 唯一能自查外参的指标 ——
+    # 单目 RMS 只说明"各路的板拟合得好"，完全不涉及两路之间的相对关系。
+    # 形状：`{"median_mm","p95_mm","rot_deg","n"}`；拿不到位姿时为 None；
+    # 计算抛异常时为 `{"error": "..."}`（**不填 0**）。
+    cross_check: dict | None = None
+    # 外参不确定度（`calib.uncertainty.extrinsic_sigma` 的原样输出，含 `error` 键）。
+    # **只对 joint 有意义**：它需要"同一批板同时被两路看到"的同名角点。
+    extrinsic_sigma: dict | None = None
+    # 交叉验证结果（`calib.validation.cross_validate` 的输出），或 `{"skipped": 原因}`。
+    cv: dict | None = None
+    # "parallel" / "angled"：深度公式 `Z=f·B/d` 只在平行装置成立，
+    # 报告必须知道这件事才能决定要不要印 σ_Z（见 `depth_sigma_mm`）。
+    stereo_mode: str = "parallel"
+
     @property
     def board_area(self) -> float:
         """两路里**较小**的那个比例（双目要两路都够大才有意义）。"""
@@ -192,8 +216,28 @@ class StereoCalibrationResult:
             return float("nan")
         return float(np.ravel(self.std1)[0])
 
+    def depth_applicable(self) -> bool:
+        """`Z = f·B/d` 在本份标定上是否成立（决定 σ_Z 能不能算）。
+
+        ## 为什么必须有这道闸（2026-10-26）
+
+        这个公式假设**两光轴平行、极线水平、视差沿 x 方向**：`d` 是
+        "同一物点在左右图的 x 差"，只有满足平行假设时才有 `Z = f·B/d`。
+        90° 装置（`rectification="none_raw"`）两光轴近似垂直：没有公共的极线方向，
+        "视差"这个量根本不存在 —— 此时若照旧代公式，**算出来的是一个数字，
+        但它对应不到任何物理量**（基线方向与深度方向已经不同轴）。
+        错数比缺数危险，所以这里直接判"不适用"，让报告去写"请看外参不确定度"。
+
+        只有 `stereo_mode == "parallel"`（近平行）且 `rectification` 是
+        `stereo_rectify`（真的做过极线校正）时，公式才成立。
+        """
+        return self.stereo_mode == "parallel" and self.rectification == "stereo_rectify"
+
     def depth_sigma_mm(self, z_m: float = 0.6) -> float:
         """在距离 `z_m`（米）处的**深度标准差估计**，单位 mm。
+
+        ⚠️ **只在平行装置上成立**：`angled`/`none_raw` 返回 `nan`（理由见
+        `depth_applicable()`）。报告会据此改印"不适用"，而不是印一个错数。
 
         ## 公式与它的边界
 
@@ -213,6 +257,10 @@ class StereoCalibrationResult:
         离散度不一定吻合（实测里还混有"收敛到更差局部解"的成分）。
         **用途：让"该信到什么程度"有个可比较的数字，而不是当验收门限。**
         """
+        # ⚠️ 90°/未校正 -> 直接 nan（见 `depth_applicable()` 的推导）：
+        #    这时"视差"不是可测量，公式给不出物理量。
+        if not self.depth_applicable():
+            return float("nan")
         f = float(self.K1[0, 0]) if self.K1 is not None else float("nan")
         b = float(np.linalg.norm(np.ravel(self.T))) if self.T is not None else float("nan")
         if not (np.isfinite(f) and np.isfinite(b) and b > 0 and z_m > 0):
@@ -230,6 +278,90 @@ class StereoCalibrationResult:
         if rel <= 0:
             return float("nan")
         return float(np.sqrt(rel) * z_m * 1000.0)
+
+    @staticmethod
+    def _aggregate_line(c: dict) -> str:
+        """`T_AB 聚合` 那一行。
+
+        为什么必须印：`T_AB 重复性` 只说"这几帧散得多开"，**不说外参用了哪一帧**。
+        聚合之后链上的 `T_AB` 是多帧的鲁棒均值，与"取一帧"是两份不同的结果；
+        不写清 n 和剔除数，事后无法判断这份外参到底吃了几帧的信息。
+        """
+        agg = c.get("aggregate") or {}
+        if c.get("used_aggregate"):
+            return (f"T_AB 聚合     : n={agg.get('n', 0)}  "
+                    f"旋转散布 {agg.get('rot_spread_deg', float('nan')):.3f}°  "
+                    f"平移散布 {agg.get('trans_spread_mm', float('nan')):.3f} mm"
+                    f"（剔除 {agg.get('n_outliers', 0)} 个离群，"
+                    f"实际使用 {agg.get('used', 0)} 帧）")
+        if c.get("n", 0) >= 2:
+            return ("T_AB 聚合     : 未启用（T_AB = I 的单板模式：I 是定义不是测量值，"
+                    "样本只作重复性证据）")
+        return "T_AB 聚合     : 未启用（n<2，单帧原样使用）"
+
+    def _cross_check_line(self) -> str:
+        """`跨路一致性` 那一行（chain）。拿不到就说**为什么**拿不到，不印 0。"""
+        c = self.cross_check
+        if c is None:
+            return "跨路一致性    : 无法计算（缺少两路同板位姿）"
+        if "error" in c:
+            return f"跨路一致性    : 无法计算（{c['error']}）"
+        if "insufficient" in c:
+            # ⚠️ 单帧时这个残差**恒为 0**：外参 T = T_camR_B·T_AB·inv(T_camL_A)
+            # 正是用这一对位姿构造的，代回去当然重合。印 0.00 会被读成"验过且完美"，
+            # 而真相是"没有第二份独立观测，什么也没验"。
+            return f"跨路一致性    : 无法评估（{c['insufficient']}）"
+        return (f"跨路一致性    : 中位 {c['median_mm']:.2f} mm / "
+                f"P95 {c['p95_mm']:.2f} mm / {c['rot_deg']:.3f} °（n={c['n']}）")
+
+    def _sigma_lines(self) -> list[str]:
+        """外参不确定度 + "旧口径 vs 新口径"的 σ_Z 对照。
+
+        为什么要**并列**印两个数：旧口径（`depth_sigma_mm`，只有 σ_f + σ_d）
+        一直少一项 `(Z/B)·σ_B`，而短基线近距装置上这一项是主导项
+        （65 mm 基线、1 m 处 `Z/B ≈ 15`）。只印新数，读者无从知道
+        "以前那份报告低估了多少倍"；只印旧数就是继续骗自己。
+        """
+        s = self.extrinsic_sigma
+        if s is None:
+            if self.method == "chain":
+                return ["外参不确定度  : 无法计算（chain 两路角点不是同名点，"
+                        "σ_B 需要两路共视）"]
+            return ["外参不确定度  : 无法计算（未传入共视角点）"]
+        if "error" in s:
+            # **原样打印**：错误文本本身带"下一步怎么做"，改写就等于扔证据。
+            return [f"外参不确定度  : {s['error']}"]
+        sb = float(s["sigma_baseline_mm"])
+        bm = float(s["baseline_mm"])
+        pct = (sb / bm * 100.0) if bm > 0 else float("nan")
+        sa = float(s["sigma_angle_deg"])
+        dz_new = float(s["depth_sigma_mm_at"](1.0))
+        out = [f"外参不确定度  : σ_B = {sb:.3f} mm（基线 {bm:.2f} mm，{pct:.3f}%）、"
+               f"σ_θ = {sa:.3f}°、1 m 处 σ_Z ≈ {dz_new:.1f} mm"]
+        old = self.depth_sigma_mm(1.0)
+        if np.isfinite(old) and np.isfinite(dz_new):
+            # 不给"低估 N 倍"这种带方向的结论：旧口径缺 σ_B 是真的，但它同时含
+            # σ_f（小板上这一项可以很大），所以新旧谁大要看数据。如实印比值。
+            ratio = (old / dz_new) if dz_new > 0 else float("inf")
+            out.append(f"  ↳ σ_Z(1 m) 对照：旧口径 {old:.2f} mm（只含 σ_f+σ_d，"
+                       f"**无基线项**）→ 新口径 {dz_new:.2f} mm（含 σ_B）；"
+                       f"旧/新 = {ratio:.2f}×（>1 = 旧口径偏大，<1 = 旧口径漏掉主导项）")
+        else:
+            out.append("  ↳ σ_Z(1 m) 对照：无法给出（旧公式在本模式下不适用或 σ 非有限）")
+        return out
+
+    def _cv_line(self) -> str:
+        """`交叉验证` 那一行。"""
+        cv = self.cv
+        if cv is None:
+            return "交叉验证      : 未运行"
+        if "skipped" in cv:
+            return f"交叉验证      : 跳过（{cv['skipped']}）"
+        if "error" in cv:
+            return f"交叉验证      : 失败（{cv['error']}）"
+        return (f"交叉验证      : {cv['k']} 折  训练 RMS 中位 {cv['train_rms_median']:.3f} px / "
+                f"测试 {cv['test_rms_median']:.3f} px → 比值 {cv['ratio']:.2f}"
+                f"（{cv['verdict']}）")
 
     def _report_chain(self) -> str:
         """chain 的报告：**不写校正后极线 RMS**（90° 下这个数没有几何意义）。
@@ -252,8 +384,17 @@ class StereoCalibrationResult:
             f"T_AB 重复性   : n={c.get('n', 0)}  "
             f"旋转最大偏离 {c.get('rot_max_deg', float('nan')):.3f}°  "
             f"平移最大偏离 {c.get('trans_max_mm', float('nan')):.3f} mm",
+            self._aggregate_line(c),
             f"两板间距      : {c.get('baseline_mm', float('nan')):.2f} mm"
             f"（||T_AB||，用卷尺核对）",
+            # 深度公式 `Z=f·B/d` 在 none_raw 下不成立（没有公共极线方向 -> 无视差），
+            # 这一行必须**明说"不适用"**，而不是省掉：省掉会让读者以为"这份标定
+            # 没算深度不确定度"，而真相是"这个口径在这里没有物理意义"。
+            "深度不确定度  : 不适用（angled 不能用 Z=fB/d；请看下面的外参不确定度）",
+            # 跨路一致性 = chain 唯一涉及"两路之间"的证据（单目 RMS 只管各自拟合）
+            self._cross_check_line(),
+            *self._sigma_lines(),
+            self._cv_line(),
             "立体校正      : none_raw —— 未做极线校正；坐标即原始 left_camera 系；"
             "任何依赖极线水平对齐/视差的方法都不适用",
             "投影矩阵      : P1 = K1·[I|0]  P2 = K2·[R|T]（T 与三维点同单位，"
@@ -306,6 +447,13 @@ class StereoCalibrationResult:
         if np.isfinite(dz):
             lines.append(f"深度不确定度  : 在 0.60 m 处约 **±{dz:.1f} mm**"
                          f"（含焦距项 + 视差项，**不含基线项**；数量级估计）")
+        elif not self.depth_applicable():
+            # 这里**不能**静默省略：省略等于"没这个指标"，而真相是"这个公式不适用"。
+            lines.append("深度不确定度  : 不适用（angled 不能用 Z=fB/d；"
+                         "请看下面的外参不确定度）")
+        for ln in self._sigma_lines():
+            lines.append(ln)
+        lines.append(self._cv_line())
         lines.append("-" * 62)
         lines.append(f"判定          : {self.verdict}")
         for w in self.warnings:
@@ -407,6 +555,42 @@ def _epipolar_errors(ip1, ip2, K1, D1, K2, D2, R1, R2, P1, P2) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+def reprojection_rms_px(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T) -> float:
+    """**固定**内外参，在给定的图像对上算两路重投影 RMS（px）。
+
+    用途：交叉验证的**测试集打分**。`cv2.stereoCalibrate` 回来的 `rms` 是训练集
+    自评（同一批角点既拟合又打分），不能拿来当"换一批图还行不行"的证据。
+    这里把参数焊死，逐个视图 `solvePnP` 求板位姿（这是测试集里唯一允许的自由度 ——
+    板的摆放），再投影回左右两路比对观测角点。
+
+    注意：右路用 `x_R = R·x_L + T`（**不重新求解**板位姿），所以测试 RMS 里
+    真正被检验的是 `(R, T)`；左路那一半只反映内参。
+    """
+    obj_list = _as_objpoints(objp, len(imgpoints1))
+    p1s = _as_imgpoints(list(imgpoints1))
+    p2s = _as_imgpoints(list(imgpoints2))
+    R = np.asarray(R, np.float64).reshape(3, 3)
+    T = np.asarray(T, np.float64).reshape(3)
+    errs = []
+    for obj, q1, q2 in zip(obj_list, p1s, p2s):
+        ok, rvec, tvec = cv2.solvePnP(obj, q1, np.asarray(K1, np.float64),
+                                      np.asarray(D1, np.float64))
+        if not ok:
+            raise ValueError("交叉验证打分：测试集某视图 solvePnP 失败（角点/板模型不匹配）")
+        uv1, _ = cv2.projectPoints(obj, rvec, tvec, np.asarray(K1, np.float64),
+                                   np.asarray(D1, np.float64))
+        Rb = cv2.Rodrigues(rvec)[0]
+        tb = np.asarray(tvec, np.float64).reshape(3, 1)
+        uv2, _ = cv2.projectPoints(obj, cv2.Rodrigues(R @ Rb)[0], R @ tb + T.reshape(3, 1),
+                                   np.asarray(K2, np.float64), np.asarray(D2, np.float64))
+        errs.append((uv1.reshape(-1, 2) - q1.reshape(-1, 2)).ravel())
+        errs.append((uv2.reshape(-1, 2) - q2.reshape(-1, 2)).ravel())
+    if not errs:
+        return float("nan")
+    e = np.concatenate(errs)
+    return float(np.sqrt(np.mean(e * e)))
+
+
 def _as_objpoints(objp, n: int) -> list[np.ndarray]:
     """把物体点规整成"每视图一个 (N,3) float32 数组"。
 
@@ -493,6 +677,7 @@ def _calibrate_chain(
     T_AB: np.ndarray | None,
     T_camR_B: np.ndarray | None,
     T_AB_samples: Sequence[np.ndarray] | None,
+    cross_poses: Sequence[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> StereoCalibrationResult:
     """chain 分支：独立单目 + 刚性双板公共参考。
 
@@ -513,6 +698,25 @@ def _calibrate_chain(
             "  注意：不能回退到 joint —— 90° 装置两路几乎不共视，联合求解不成立。"
         )
     T_AB = relative_pose._as_T(T_AB, "T_AB")
+
+    # ---- 多帧 T_AB 聚合（2026-10-26）----
+    #
+    # 以前这里只把 `T_AB_samples` 拿去算重复性、发个警告，**真正进链的仍是调用方
+    # 给的那一帧**。而 90° 装置的外参误差主要就来自 `T_AB`，多帧样本被白白丢掉。
+    # 现在 n>=2 时用 `average_T`（平移几何中位数 + 四元数加权平均）聚合后再合成。
+    #
+    # ⚠️ 例外：`T_AB = I` 的单板模式**不聚合**。那里的 I 不是"测量值"而是
+    #    "A、B 是同一块板的同一世界系"这一**定义**；样本是逐张参考图算出的
+    #    漂移量（真值恒为 I），把它们平均等于把参考图的漂移当成真实的两板
+    #    相对位姿，反而引入系统误差。单板模式的证据看 `same_board_ref`。
+    provided = [relative_pose._as_T(T, f"T_AB_samples[{i}]")
+                for i, T in enumerate(T_AB_samples or [])]
+    same_board_TAB = np.allclose(T_AB, np.eye(4), atol=1e-9, rtol=0.0)
+    used_aggregate = False
+    agg: dict = {}
+    if len(provided) >= 2 and not same_board_TAB:
+        T_AB, agg = relative_pose.average_T(provided)
+        used_aggregate = True
 
     res.method = "chain"
     res.n_views_left = len(imgpoints1)
@@ -572,12 +776,76 @@ def _calibrate_chain(
     res.rms = float("nan")
     res.baseline_mm = float(np.linalg.norm(T)) * 1000.0
 
-    samples = list(T_AB_samples) if T_AB_samples else [T_AB]
+    samples = list(provided) if provided else [T_AB]
     res.consistency = relative_pose.consistency(samples)
+    # 聚合的产物必须一起落盘：否则过几天回看，"用了 4 帧聚合"和"只用 1 帧"
+    # 这两份结果长得一模一样，而它们的可信度不同。
+    res.consistency["used_aggregate"] = used_aggregate
+    res.consistency["n_outliers"] = int(agg.get("n_outliers", 0))
+    if used_aggregate:
+        res.consistency["aggregate"] = {
+            "n": int(agg["n"]),
+            "used": int(agg["used"]),
+            "n_outliers": int(agg["n_outliers"]),
+            "outlier_index": list(agg["outlier_index"]),
+            "rot_spread_deg": float(agg["rot_spread_deg"]),
+            "trans_spread_mm": float(agg["trans_spread_mm"]),
+            "iterations": int(agg["iterations"]),
+            "converged": bool(agg["converged"]),
+        }
 
     # ---- 判定 ----
     warns: list[str] = []
     sugg: list[str] = []
+    # ---- 跨路一致性（2026-10-26）----
+    #
+    # chain 以前把 `res.rms` 置 NaN，报告却凭"两路单目 RMS 各自很小"判通过 ——
+    # 那两个数**只描述各自的板拟合**，对"两路之间的相对位姿对不对"零信息。
+    # 这里补上唯一涉及两路的证据：把两路看同一块板同一位置的板位姿用解出的
+    # `T_{C_R←C_L}` 搬到同一坐标系，残差应接近 0；若外参尺度偏 k 倍，
+    # 残差 ≈ |k-1|·‖T‖（随**基线**线性放大，与板到相机的距离无关；见 metric_check
+    # 的推导，实测 k=1.1 / ‖T‖=781 mm -> 78.10 mm，板放 0.4/0.8/1.2 m 都是 10.00 mm）。
+    #
+    # ⚠️ 只对 `T_AB ≈ I` 的单板模式成立：双板模式下左看 A、右看 B，
+    #    两组板位姿根本不在同一个板坐标系里，拿来做这个检查会得到无意义的差。
+    if same_board_TAB:
+        pairs_src = list(cross_poses or [])
+        if not pairs_src and T_camL_A is not None and T_camR_B is not None:
+            pairs_src = [(T_camL_A, T_camR_B)]
+        if pairs_src and len(pairs_src) < 2:
+            # 单帧 = 没有第二份独立观测：残差恒为 0（外参就是这一对构造的）。
+            res.cross_check = {"insufficient":
+                               f"n={len(pairs_src)}：外参正是由这一对位姿构造的，"
+                               f"残差恒为 0，不构成证据；要 ≥2 张同摆放参考图"}
+        elif pairs_src:
+            try:
+                chk = metric_check.stereo_scale_consistency(
+                    T_camR_camL, [p[0] for p in pairs_src], [p[1] for p in pairs_src])
+                res.cross_check = {
+                    "median_mm": float(chk["median_mm"]),
+                    "p95_mm": float(chk["p95_mm"]),
+                    "rot_deg": float(chk["rotation_deg"]),
+                    "n": int(chk["n"]),
+                    "verdict": chk["verdict"],
+                }
+            except Exception as exc:                      # noqa: BLE001 - 原因要原样带回
+                res.cross_check = {"error": f"{type(exc).__name__}: {exc}"}
+    if res.cross_check and "error" not in res.cross_check \
+            and "insufficient" not in res.cross_check:
+        cc = res.cross_check
+        # 门限必须取**同一档**：5 mm 是 metric_check 的"不可用"边界，与它并列的
+        # 旋转门限就该是 `ok_rot_deg=1.5°`。若配 0.5°（那里是"优秀"边界），
+        # 两档混用会把正常装置判成坏的 —— 实测 α 正确、1 px 角点噪声时旋转中位数
+        # 已达 0.585°，必然天天告警，告警一旦天天响就没人看了。
+        if cc["median_mm"] > _CROSS_TRANS_WARN_MM or cc["rot_deg"] > _CROSS_ROT_WARN_DEG:
+            warns.append(
+                f"跨路一致性差：中位 {cc['median_mm']:.2f} mm / 旋转 {cc['rot_deg']:.3f}° "
+                f"（门限 {_CROSS_TRANS_WARN_MM:.0f} mm / {_CROSS_ROT_WARN_DEG:.1f}°，"
+                f"即 metric_check 的「可用」下限）—— 外参可疑，或拍参考图时板动了"
+                f"（两路的'同一个位置'其实不是同一个位置）")
+    # chain 的交叉验证没有意义：两路内参已各自冻结，子集重跑只是重标一次内参，
+    # 检验不到"外参能不能泛化"。如实写出来，而不是悄悄不印。
+    res.cv = {"skipped": "chain 的单目内参已冻结，子集重跑无意义"}
     if cfg.expected_baseline_mm:
         rel = abs(res.baseline_mm - cfg.expected_baseline_mm) / cfg.expected_baseline_mm
         if rel > cfg.baseline_tolerance:
@@ -650,6 +918,7 @@ def calibrate_stereo(
     T_AB: np.ndarray | None = None,
     T_camR_B: np.ndarray | None = None,
     T_AB_samples: Sequence[np.ndarray] | None = None,
+    cross_poses: Sequence[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> StereoCalibrationResult:
     """从已配对的角点做完整双目标定（含离群剔除与质量判定）。
 
@@ -683,12 +952,13 @@ def calibrate_stereo(
             f"或补足 ≥{MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED} 对两路同时可见的板。")
 
     res = StereoCalibrationResult(image_size=image_size, board_desc=spec.describe(),
-                                  n_pairs_in=len(imgpoints1), method=cfg.method)
+                                  n_pairs_in=len(imgpoints1), method=cfg.method,
+                                  stereo_mode=stereo_mode)
     if cfg.method == "chain":
         return _calibrate_chain(
             objp, list(imgpoints1), list(imgpoints2), image_size, cfg, spec, res,
             stereo_mode=stereo_mode, T_camL_A=T_camL_A, T_AB=T_AB,
-            T_camR_B=T_camR_B, T_AB_samples=T_AB_samples,
+            T_camR_B=T_camR_B, T_AB_samples=T_AB_samples, cross_poses=cross_poses,
         )
 
     if len(imgpoints1) < 4 or len(imgpoints1) != len(imgpoints2):
@@ -744,6 +1014,26 @@ def calibrate_stereo(
     res.used_index = list(b["idx"])
     res.rejected_index = [i for i in range(res.n_pairs_in) if i not in set(b["idx"])]
     res.std1, res.std2 = b.get("std1"), b.get("std2")
+
+    # ---- 外参不确定度（2026-10-26）----
+    #
+    # `cv2.stereoCalibrate` **不返回** `T` 的协方差，于是报告里的 σ_Z 一直缺
+    # 基线项 —— 而短基线近距装置上 `(Z/B)·σ_B` 恰恰是主导项。这里用数值雅可比
+    # 在解处估 `(R,T)` 的条件协方差（推导见 calib/uncertainty.py），只加输出、
+    # 不动任何数值路径。
+    #
+    # 失败**不吞**：`extrinsic_sigma` 用 `{"error": ...}` 明确失败，报告原样打印。
+    try:
+        from .uncertainty import extrinsic_sigma as _extrinsic_sigma
+
+        used = list(b["idx"])
+        res.extrinsic_sigma = _extrinsic_sigma(
+            [obj_all[i] for i in used],
+            [imgpoints1[i] for i in used],
+            [imgpoints2[i] for i in used],
+            res.K1, res.D1, res.K2, res.D2, res.R, res.T, image_size)
+    except Exception as exc:                              # noqa: BLE001 - 原文要保留
+        res.extrinsic_sigma = {"error": f"{type(exc).__name__}: {exc}"}
 
     # ---- 板占画面比例：从**实际用上**的那些对的角点算 ----
     #
