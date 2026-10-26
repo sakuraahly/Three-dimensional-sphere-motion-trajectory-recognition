@@ -490,7 +490,8 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         log.error("chain：姿态太少 左%d 右%d", len(c_left), len(c_right))
         return 1
 
-    cfg_mono = CalibConfig()
+    cfg_mono = CalibConfig(rational_model=bool(getattr(args, "rational_model", False)),
+                           fix_principal_point=bool(getattr(args, "fix_principal_point", False)))
     objp = spec.object_points()
     try:
         mono_l = calibrate_mono_points(objp, c_left, size_left, cfg_mono)
@@ -501,6 +502,10 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         return 1
     print(f"[chain] 单目 RMS：左 {mono_l['rms']:.3f} px / 右 {mono_r['rms']:.3f} px")
 
+    # 跨路一致性的输入：单板模式下两路看的是**同一块板的同一位置**，逐张参考图
+    # 配成 (T_camL_B, T_camR_B) 交给核心层做"搬坐标系看是否重合"的检查。
+    # 双板模式没有这个前提（左看 A、右看 B），保持 None —— 核心层会如实写"无法计算"。
+    cross_poses = None
     if same_board:
         # 单板：A 与 B 是同一块板的同一个世界系，T_AB 按定义就是单位阵 ——
         # 它不是"估"出来的，也不该被当成可优化的量。
@@ -531,6 +536,11 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         # 参考图 ≥2 张时核心层就能拿到真实 n，单板模式也能到「可用」以上；
         # 只有 1 张时如实退回 [I]（n=1，未评估重复性），绝不伪造样本。
         samples = _same_board_samples(info_l, info_r)
+        # 跨路一致性：逐张参考图配对（同一物理摆放 -> 可逐对比较）。
+        # 张数不等时取 min（与 `_same_board_samples` 同一配对口径）。
+        m = min(int(info_l["n"]), int(info_r["n"]))
+        if m >= 1:
+            cross_poses = list(zip(info_l["poses"][:m], info_r["poses"][:m]))
         print(f"[chain] T_AB：I（单板；{ref_note}）  "
               f"重复性 n={len(samples)}"
               + ("（n=1，未评估重复性）" if len(samples) < 2 else ""))
@@ -601,12 +611,14 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     mode = "angled"
     print("[模式] chain → stereo_mode=angled（由方法决定，不跟 auto）")
     log.info("chain -> stereo_mode=angled（由方法决定，不跟 auto）")
-    cfg = CalibConfig(method="chain", expected_baseline_mm=args.baseline_mm)
+    cfg = CalibConfig(method="chain", expected_baseline_mm=args.baseline_mm,
+                      rational_model=bool(getattr(args, "rational_model", False)),
+                      fix_principal_point=bool(getattr(args, "fix_principal_point", False)))
     try:
         res = calibrate_stereo(
             objp, c_left, c_right, size_left, cfg, spec, stereo_mode=mode,
             T_camL_A=T_camL_A, T_AB=np.eye(4) if same_board else samples[0],
-            T_camR_B=T_camR_B, T_AB_samples=samples)
+            T_camR_B=T_camR_B, T_AB_samples=samples, cross_poses=cross_poses)
     except ValueError as exc:
         print(f"\n[错误] {exc}")
         log.error("chain 标定被拒绝：%s", exc)
@@ -669,6 +681,57 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     print("注意：chain 的 R1/R2=I、P1/P2 是「只去畸变」的投影矩阵（未做极线校正），"
           "三角测量可直接用；但校正图像/视差接口不适用。")
     return 0
+
+
+# 交叉验证的最少输入对数：4 折每折至少 3 对训练/1 对测试才有意义；
+# 12 对是"每折 9 训 3 测"的下限，再少就只是在测噪声。
+CV_MIN_PAIRS = 12
+
+
+def _cross_validate_joint(objp, ip1, ip2, size, cfg: CalibConfig, spec: BoardSpec,
+                          mode: str, k: int = 4) -> dict:
+    """joint 的 k 折交叉验证：每折用 k-1 折重标，剩下 1 折**只打分**。
+
+    ## 为什么只能对 joint 做（chain 不行）
+
+    chain 的单目内参是在**全量**数据上标好后冻结的；在子集上"重跑"只会得到另一份
+    内参，检验不到外参能不能泛化 —— 那不是交叉验证，那是重标一次。joint 的
+    `stereoCalibrate` 每折真的重新解 `(R,T)`，所以测试折的 RMS 是**没参与拟合**
+    的数据给出的，才有信息量。
+
+    ## 打分口径
+
+    测试折用 `reprojection_rms_px`（参数焊死、只放开板的摆放），不用
+    `stereoCalibrate` 的返回值 —— 后者对测试折来说根本没被计算过。
+
+    折内**关掉离群剔除**（`reject_outliers=False`）：否则每折剔掉的集合不同，
+    训练/测试比值就混进了"剔了多少对"这个变量，无法比较。
+    """
+    from calib.validation import cross_validate
+    from calib.stereo_calib import reprojection_rms_px
+
+    cfg_cv = CalibConfig(
+        expected_baseline_mm=cfg.expected_baseline_mm,
+        rational_model=cfg.rational_model,
+        fix_principal_point=cfg.fix_principal_point,
+        reject_outliers=False,
+        alpha=cfg.alpha,
+    )
+
+    def fit(train_idx, test_idx):
+        tr = calibrate_stereo(objp, [ip1[i] for i in train_idx],
+                              [ip2[i] for i in train_idx], size, cfg_cv, spec,
+                              stereo_mode=mode)
+        if not tr.ok:
+            raise RuntimeError(f"训练折本身判定为「{tr.grade}」：{tr.verdict}")
+        test = reprojection_rms_px(objp, [ip1[i] for i in test_idx],
+                                   [ip2[i] for i in test_idx], tr.K1, tr.D1,
+                                   tr.K2, tr.D2, tr.R, tr.T)
+        return {"train_rms": float(tr.rms), "test_rms": float(test),
+                # 供 cross_validate 的泄漏守卫核对：真正参与拟合的帧
+                "used_train_idx": list(train_idx)}
+
+    return cross_validate(fit, n_items=len(ip1), k=k, seed=0)
 
 
 def rig_angle(R) -> float:
@@ -743,6 +806,27 @@ def main() -> int:
     ap.add_argument("--min-pairs", type=int, default=20,
                     help="最少收多少对才尝试标定（默认 20）")
     ap.add_argument("--baseline-mm", type=float, default=None, help="预期基线（毫米），用于核对")
+    # ---- 内参解法的两个开关（2026-10-26 接上 CLI）----
+    #
+    # 这两个参数在 `CalibConfig` 里一直存在、`stereo_calib` 也一直在读，但**全仓
+    # 没有任何入口**：用户永远只能拿到 5 参数、放开主点的解。参数在代码里而入口
+    # 不存在，等于告诉使用者"这条路可以走"却把门锁上。
+    ap.add_argument("--rational-model", action="store_true",
+                    help="畸变用 8 参数有理模型（k1..k6）而不是 5 参数。"
+                         "**什么时候该开**：视场很广/畸变很大（广角短焦、鱼眼、画面边缘直线"
+                         "明显弯成弧）。**开了会怎样**：待解参数从 5 个涨到 8 个，需要更多、"
+                         "更铺满画面边角的姿态；姿态不足时它会过拟合（重投影变小、"
+                         "而外参与深度反而更差）。默认关 = 与本项目历史结果同口径")
+    ap.add_argument("--fix-principal-point", action="store_true",
+                    help="把主点 (cx,cy) 固定在图像中心、不参与优化。"
+                         "**什么时候该开**：姿态很少（<约 10 个）或板始终只在画面中央 —— "
+                         "这时主点与焦距/畸变会互相抵消而漂掉。**开了会怎样**：主点若真有"
+                         "装配偏差，这个偏差会被强制带进所有结果，且报告不会报警。默认关")
+    ap.add_argument("--no-cv", action="store_true",
+                    help="跳过 4 折交叉验证（joint 且 n_pairs≥12 时默认会跑）。"
+                         "**它做什么**：把图像分 4 折，每次用 3 折重标、剩 1 折只打分，"
+                         "看训练/测试 RMS 的比值 —— 这是唯一能发现「过拟合」的指标。"
+                         "**代价**：多花几秒。只想先看一眼结果时可以关")
     ap.add_argument("--stereo-mode", choices=("auto", "parallel", "angled"),
                     default="auto",
                     help="双目模式：auto=沿用旧输出模式（无旧文件则 parallel）；"
@@ -1273,7 +1357,9 @@ def main() -> int:
                   fov.target_size)
         return 1
 
-    cfg = CalibConfig(expected_baseline_mm=args.baseline_mm)
+    cfg = CalibConfig(expected_baseline_mm=args.baseline_mm,
+                      rational_model=args.rational_model,
+                      fix_principal_point=args.fix_principal_point)
     try:
         res = calibrate_stereo(objp, ip1, ip2, img_size, cfg, spec, stereo_mode=mode)
     except ValueError as exc:
@@ -1282,6 +1368,34 @@ def main() -> int:
         print(f"\n[错误] {exc}")
         log.error("标定被拒绝：%s", exc)
         return 1
+
+    # ---- 交叉验证（2026-10-26）----
+    #
+    # 必须在 `res.report()` **之前**算：报告里的那行要印它的结论。
+    # 默认只在 joint 且有效对 ≥12 时跑（4 折、每折一次完整重标，几秒量级）。
+    #
+    # ⚠️ 只用**已通过离群剔除**的那批图：标定流程本身已经认定那 8 对是坏数据，
+    #    再把它们塞进测试折，测出来的就是"坏数据有多坏"，而不是"外参能不能泛化"。
+    cv_idx = list(res.used_index) if res.used_index else list(range(len(ip1)))
+    cv_ip1 = [ip1[i] for i in cv_idx]
+    cv_ip2 = [ip2[i] for i in cv_idx]
+    if args.no_cv:
+        res.cv = {"skipped": "--no-cv"}
+    elif len(cv_idx) < CV_MIN_PAIRS:
+        res.cv = {"skipped": f"有效对 n={len(cv_idx)} < {CV_MIN_PAIRS}，4 折拆不开"
+                              f"（每折至少留 1 对只打分）"}
+    else:
+        t_cv = time.perf_counter()
+        try:
+            res.cv = _cross_validate_joint(objp, cv_ip1, cv_ip2, img_size, cfg, spec, mode)
+            print(f"[CV] 4 折交叉验证完成（{time.perf_counter() - t_cv:.1f} s）")
+        except Exception as exc:                          # noqa: BLE001 - 原文要保留
+            res.cv = {"error": f"{type(exc).__name__}: {exc}"}
+            log.warning("交叉验证失败：%s", exc)
+        # 失败的折**逐条印原因**：只写"3/4 折失败"等于把唯一能修的线索藏起来。
+        for fold in (res.cv.get("failed_folds") or []):
+            print(f"  [CV] 折 {fold['fold']} 失败（训 {fold['n_train']} / "
+                  f"测 {fold['n_test']}）：{fold['error']}")
     print(res.report())
     log.info("标定结果：\n%s", res.report())
 
