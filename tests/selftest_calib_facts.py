@@ -84,6 +84,8 @@ import numpy as np
 from calib.export import build_export, write_export
 from calib.params import StereoRig
 from calib.stereo_calib import CalibConfig, StereoCalibrationResult, calibrate_stereo
+from calib.uncertainty import extrinsic_sigma
+from calib.validation import cross_validate
 from calib.world_frame import WorldFrame, from_board
 from stereo.visualization import build_visualization_payload
 
@@ -257,6 +259,24 @@ def test_log_summary_is_self_consistent() -> bool:
     print(f"  基线 {REAL_BASELINE_MM} mm vs 尺子 {TAPE_BASELINE_MM:.0f} mm = {ratio:.2f} 倍")
     checks.append(("占比最高的原因就是「棋盘还在移动」",
                    top[0] == "棋盘还在移动，请停稳再收"))
+    # ---- 泄漏守卫（2026-10-26 加）：这个工具**最容易被误用**成"永远通过" ----
+    # 若 fit 忽略传入的 train_idx、每折都拿全量训练，比值恒 1.0 且外部看不出来。
+    def _leaky(train_idx, test_idx):
+        return {"train_rms": 0.2, "test_rms": 0.2}          # 故意不报 used_train_idx
+
+    rep = cross_validate(_leaky, CV_N, k=4, seed=0)
+    print(f"    忽略折号 -> leak_check={rep['leak_check']}  verdict「{rep['verdict'][:28]}…」")
+    checks.append(("fit 不报 used_train_idx -> 降级为「未验证」而不是发合格证",
+                   rep["leak_check"] == "unverified" and "未验证" in rep["verdict"]))
+
+    def _lying(train_idx, test_idx):
+        return {"train_rms": 0.2, "test_rms": 0.2, "used_train_idx": list(range(CV_N))}
+
+    rep = cross_validate(_lying, CV_N, k=4, seed=0)
+    checks.append(("谎报 used_train_idx -> 该折判失败（训练/测试重叠）",
+                   len(rep["failed_folds"]) == 4
+                   and "不一致" in (rep["failed_folds"][0]["error"] or "")))
+
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)
@@ -294,6 +314,36 @@ def test_mono_ok_but_stereo_explodes() -> bool:
          REAL_RMS / REAL_ERR_LEFT > 20.0 and REAL_RMS / REAL_ERR_RIGHT > 20.0),
         ("真机的单目 RMS 同样**也超了 ok_rms 门槛**（所以「正常」≠「达标」）",
          REAL_ERR_LEFT > cfg.ok_rms and REAL_ERR_RIGHT > cfg.ok_rms),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_save_backs_up_previous() -> bool:
+    """第 3b 节：覆盖保存前必须留一份旧标定（2026-10-26 真实事故后加的）。
+
+    事故：一次"只想看指标"的实跑默认写盘，把调好的 124.0 mm 标定覆盖成 69.2 mm。
+    标定不可再生（要重拍 30+ 张图），所以 `StereoRig.save()` 覆盖前必须先备份。
+    """
+    import pathlib as _pl
+    import tempfile
+    print("----- 3b. 覆盖保存前自动备份 -----")
+    d = _pl.Path(tempfile.mkdtemp())
+    rig = StereoRig.load("config/stereo_calibration")
+    target = d / "stereo_calibration"
+
+    rig.save(target)
+    first = (d / "backup").exists()
+    rig.save(target)
+    backups = sorted((d / "backup").glob("*.json"))
+
+    print(f"  首次保存 -> 备份目录被创建：{first}（不该：没有旧文件可备）")
+    print(f"  二次保存 -> 备份数 {len(backups)}：{[b.name for b in backups]}")
+    checks = [
+        ("首次保存不产生备份（无旧文件）", first is False),
+        ("二次保存留下 1 份旧标定", len(backups) == 1),
+        ("备份与主文件同 stem", bool(backups) and backups[0].stem.startswith(target.stem)),
     ]
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
@@ -860,21 +910,315 @@ def test_visualization_world_frame() -> bool:
     return all(ok for _n, ok in checks)
 
 
+# ==========================================================================
+# 第 10-11 节：交叉验证 + 外参不确定度（2026-10-26 加）
+#
+# 为什么要在这里钉：上面 1-9 节钉的都是"标定结果怎么判"，而**没有任何一节**
+# 回答 "这个 RMS 换一批图还复现吗"（`calib/validation.py`）与
+# "基线 T 的不确定度是多少"（`calib/uncertainty.py`）。
+# 缺了这两个，报告里的 "RMS 0.2 px" 就是**训练集自评**，
+# 而 `depth_sigma_mm()` 的 docstring 自己承认"不含 σ_B"。
+# ==========================================================================
+
+# 交叉验证用的"假拟合器"口径：数值本身不重要，重要的是判定能不能把它认出来
+CV_GOOD = (0.20, 0.25)      # ratio 1.25 -> 泛化良好
+CV_OVERFIT = (0.20, 0.60)   # ratio 3.00 -> 过拟合
+CV_LIGHT = (0.20, 0.40)     # ratio 2.00 -> 轻度过拟合
+CV_N = 20                   # 20 对图像（本项目"建议 20 对以上"那条线）
+
+
+def _cv_fit(train_rms: float, test_rms: float, boom_at: int | None = None):
+    """造一个 `fit_fn`：恒定输出给定 RMS；`boom_at` 指定的那一折抛异常。
+
+    用恒定值而不是真跑标定，是为了**只测判定逻辑本身** —— 若判定写错，
+    真标定那点噪声会把错误掩盖成"看起来也差不多"。
+    """
+    state = {"fold": -1}
+
+    def fit(train_idx, test_idx):
+        state["fold"] += 1
+        if boom_at is not None and state["fold"] == boom_at:
+            raise RuntimeError(f"模拟第 {state['fold']} 折 stereoCalibrate 发散")
+        # 新契约（2026-10-26）：必须上报真正参与拟合的索引，否则结果降级为"未验证"
+        return {"train_rms": train_rms, "test_rms": test_rms,
+                "used_train_idx": train_idx}
+
+    return fit
+
+
+def test_cross_validate_verdicts() -> bool:
+    """第 10 节：交叉验证的四种判定（比值 1.25 / 2.0 / 3.0、边界、某折炸掉）。"""
+    print("----- 10. 交叉验证：训练/测试比值 -> 判定 -----")
+    checks: list[tuple[str, bool]] = []
+
+    rep = cross_validate(_cv_fit(*CV_GOOD), CV_N, k=4, seed=0)
+    print(f"    train 0.20 / test 0.25 -> ratio {rep['ratio']:.2f}  "
+          f"verdict「{rep['verdict']}」")
+    checks.append(("0.20/0.25（ratio 1.25）-> 泛化良好",
+                   rep["verdict"] == "泛化良好" and not rep["failed_folds"]))
+    checks.append((f"4 折都成功、每折 {CV_N // 4} 个测试样本",
+                   rep["n_folds_ok"] == 4
+                   and all(len(f["test_idx"]) == CV_N // 4 for f in rep["per_fold"])))
+
+    rep = cross_validate(_cv_fit(*CV_LIGHT), CV_N, k=4, seed=0)
+    print(f"    train 0.20 / test 0.40 -> ratio {rep['ratio']:.2f}  "
+          f"verdict「{rep['verdict']}」")
+    checks.append(("0.20/0.40（ratio 2.00）-> 轻度过拟合",
+                   rep["verdict"] == "轻度过拟合：样本偏少或位姿单一"))
+
+    rep = cross_validate(_cv_fit(*CV_OVERFIT), CV_N, k=4, seed=0)
+    print(f"    train 0.20 / test 0.60 -> ratio {rep['ratio']:.2f}  "
+          f"verdict「{rep['verdict']}」")
+    # 用户看到 "RMS 0.2 px" 就以为可靠 —— 3 倍差距必须被明确否掉，而不是"轻度过拟合"
+    checks.append(("0.20/0.60（ratio 3.00）-> 过拟合：结果不可用于测量",
+                   rep["verdict"] == "过拟合：结果不可用于测量"))
+
+    # 边界：3 个样本拆不出 4 折 —— 必须抛错并说明需要多少帧
+    message = ""
+    try:
+        cross_validate(_cv_fit(*CV_GOOD), 3, k=4, seed=0)
+    except ValueError as exc:
+        message = str(exc)
+    print(f"    n_items=3, k=4 -> ValueError: {message.splitlines()[0]}")
+    checks.append(("n_items=3 < k=4 -> ValueError（且写明至少需要 4 帧）",
+                   "至少 4 帧" in message and "3 帧" in message))
+
+    # 某折抛异常：**不许静默跳过**。4 折里炸 1 折，结论就不能是"泛化良好"
+    rep = cross_validate(_cv_fit(*CV_GOOD, boom_at=2), CV_N, k=4, seed=0)
+    print(f"    第 2 折抛异常 -> failed_folds={len(rep['failed_folds'])}  "
+          f"n_folds_ok={rep['n_folds_ok']}  verdict「{rep['verdict']}」")
+    checks.append(("某折抛异常 -> failed_folds 非空（不是静默跳过）",
+                   len(rep["failed_folds"]) == 1
+                   and rep["failed_folds"][0]["error"] is not None))
+    checks.append(("某折抛异常 -> verdict 不是「泛化良好」",
+                   rep["verdict"] != "泛化良好" and "部分折失败" in rep["verdict"]))
+
+    # k=1：退化。test_rms 恒等于 train_rms，ratio 恒为 1 —— 不能冒充泛化证据
+    rep = cross_validate(_cv_fit(*CV_OVERFIT), CV_N, k=1, seed=0)
+    print(f"    k=1 -> degenerate={rep['degenerate']}  verdict「{rep['verdict']}」")
+    checks.append(("k=1 -> degenerate=True 且 verdict 写明「退化」",
+                   rep["degenerate"] is True and "退化" in rep["verdict"]))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+# --------------------------------------------------------------------------
+# 合成双目装置（**已知真值**，用来把"预测的 σ_B"和"实测的基线散布"对上）
+# --------------------------------------------------------------------------
+RIG_IMG = (1280, 720)
+RIG_FX = 1150.0
+RIG_D = np.array([-0.08, 0.02, 0.0, 0.0, 0.0])
+RIG_BASELINE_MM = 65.0        # 卷尺口径（`selftest_board_corner_order.TAPE_BASELINE_MM`）
+RIG_NOISE_PX = 0.3            # 亚像素噪声（与 stereo_calib 注释里的合成实验同量级）
+RIG_VIEWS = 20
+RIG_TRIALS = 30               # 30 次不同噪声实现
+RIG_REL_ROT = np.array([0.0, 0.10, 0.0])
+RIG_REL_T = np.array([[-RIG_BASELINE_MM / 1000.0], [0.004], [0.01]])
+
+
+def _rig_K() -> np.ndarray:
+    return np.array([[RIG_FX, 0.0, RIG_IMG[0] / 2.0],
+                     [0.0, RIG_FX, RIG_IMG[1] / 2.0],
+                     [0.0, 0.0, 1.0]])
+
+
+def _synth_rig(seed: int):
+    """造一台"已知 R、T"的双目：返回 (objp, K, ip1, ip2, R_true, T_true)。"""
+    K = _rig_K()
+    objp = SPEC.object_points().reshape(-1, 1, 3).astype(np.float32)
+    R_rel = cv2.Rodrigues(RIG_REL_ROT)[0]
+    rng = np.random.default_rng(seed)
+    cv2.setRNGSeed(seed)          # 让 stereoCalibrate 内部也逐次可复现
+    ip1, ip2 = [], []
+    for _ in range(RIG_VIEWS):
+        rvec = rng.uniform(-0.5, 0.5, 3)
+        tvec = np.array([rng.uniform(-0.07, 0.07),
+                         rng.uniform(-0.05, 0.05),
+                         rng.uniform(0.45, 0.80)])
+        Rv = cv2.Rodrigues(rvec)[0]
+        p1, _ = cv2.projectPoints(objp, rvec, tvec, K, RIG_D)
+        rvec_r = cv2.Rodrigues(R_rel @ Rv)[0]
+        p2, _ = cv2.projectPoints(objp, rvec_r, R_rel @ tvec + RIG_REL_T.ravel(),
+                                  K, RIG_D)
+        ip1.append((p1.reshape(-1, 2) + rng.normal(0.0, RIG_NOISE_PX, (SPEC.n_points, 2)))
+                   .astype(np.float32).reshape(-1, 1, 2))
+        ip2.append((p2.reshape(-1, 2) + rng.normal(0.0, RIG_NOISE_PX, (SPEC.n_points, 2)))
+                   .astype(np.float32).reshape(-1, 1, 2))
+    return objp, K, ip1, ip2, R_rel, RIG_REL_T
+
+
+def _fit_extrinsic_only(ip1, ip2, K):
+    """固定内参做一次双目标定，返回 (R, T) —— 与 `_synth_rig` 的真值可比。"""
+    obj = SPEC.object_points().reshape(-1, 1, 3).astype(np.float32)
+    out = cv2.stereoCalibrate([obj] * len(ip1), ip1, ip2,
+                              K.copy(), RIG_D.copy(), K.copy(), RIG_D.copy(),
+                              RIG_IMG, flags=cv2.CALIB_FIX_INTRINSIC)
+    return out[5], out[6]
+
+
+def test_extrinsic_sigma_vs_empirical() -> bool:
+    """第 11a 节：预测的 σ_B vs 30 次实测基线散布（比值必须落在 0.5~2.0）。
+
+    这是**唯一能证明 σ_B 不是瞎编**的实验：合成装置知道真值，
+    换 30 次噪声实现就能量出"基线到底抖多少"，预测值必须在同一量级。
+    """
+    print("----- 11a. σ_B：预测值 vs 30 次实测基线散布 -----")
+    checks: list[tuple[str, bool]] = []
+    baselines: list[float] = []
+    predicted: list[float] = []
+    angles: list[float] = []
+    for s in range(RIG_TRIALS):
+        objp, K, ip1, ip2, _Rt, _Tt = _synth_rig(s)
+        R, T = _fit_extrinsic_only(ip1, ip2, K)
+        u = extrinsic_sigma(objp, ip1, ip2, K, RIG_D, K, RIG_D, R, T, RIG_IMG)
+        if "error" in u:
+            print(f"    第 {s} 次 -> 意外奇异：{u['error']}")
+            checks.append((f"第 {s} 次不该奇异", False))
+            continue
+        baselines.append(float(np.linalg.norm(T)) * 1000.0)
+        predicted.append(u["sigma_baseline_mm"])
+        angles.append(u["sigma_angle_deg"])
+
+    emp = float(np.std(np.asarray(baselines), ddof=1))
+    pred = float(np.median(np.asarray(predicted)))
+    ratio = pred / emp if emp > 0 else float("inf")
+    print(f"    实测基线 {np.mean(baselines):.2f} ± {emp:.4f} mm（n={len(baselines)}，"
+          f"真值 {RIG_BASELINE_MM:.1f} mm）")
+    print(f"    预测 σ_B 中位数 {pred:.4f} mm  ->  预测/实测 = {ratio:.2f}")
+    print(f"    预测 σ_angle 中位数 {np.median(angles):.4f}°")
+    # 门限 0.5~2.0：数量级正确即可。预测偏低是因为 σ² 由同一批残差估、
+    # 且各视图位姿被 solvePnP 吸收了一部分噪声（条件协方差 vs 联合估计）。
+    checks.append((f"预测/实测 = {ratio:.2f}，落在 [0.5, 2.0]", 0.5 <= ratio <= 2.0))
+    checks.append((f"σ_B 远小于基线（{pred:.3f} mm << {RIG_BASELINE_MM:.0f} mm），"
+                   f"不是把整条基线当误差", pred < 0.1 * RIG_BASELINE_MM))
+    checks.append((f"σ_angle = {np.median(angles):.4f}° < 1°（外参旋转可信）",
+                   float(np.median(angles)) < 1.0))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_depth_sigma_includes_baseline() -> bool:
+    """第 11b 节：深度公式**含** σ_B（正是 `depth_sigma_mm()` 缺的那项）+ 奇异不混过去。"""
+    print("----- 11b. 深度不确定度含 σ_B + 奇异案例 -----")
+    checks: list[tuple[str, bool]] = []
+    objp, K, ip1, ip2, _Rt, _Tt = _synth_rig(0)
+    R, T = _fit_extrinsic_only(ip1, ip2, K)
+    u = extrinsic_sigma(objp, ip1, ip2, K, RIG_D, K, RIG_D, R, T, RIG_IMG)
+    checks.append(("正常装置不返回 error", "error" not in u))
+    if "error" in u:
+        print(f"    意外奇异：{u['error']}")
+        for name, ok in checks:
+            print(f"  [{'通过' if ok else '不达标'}] {name}")
+        return False
+
+    z = 1.0
+    dz_full = u["depth_sigma_mm_at"](z)
+    # "只用 σ_f"：`stereo_calib.depth_sigma_mm()` 那套口径（σ_d + σ_f，**无** σ_B）。
+    # σ_f 取 `calibrateCameraExtended` 在这类合成数据上的典型量级 0.5 px。
+    sigma_f_px = 0.5
+    dz_f_only = z * sigma_f_px / RIG_FX * 1000.0
+    print(f"    σ_B = {u['sigma_baseline_mm']:.4f} mm，基线 {u['baseline_mm']:.2f} mm")
+    print(f"    1.0 m 处：含 σ_B 的 σ_Z = {dz_full:.2f} mm；"
+          f"只用 σ_f = {dz_f_only:.2f} mm（比值 {dz_full / dz_f_only:.1f}x）")
+    checks.append((f"depth_sigma_mm_at(1.0) = {dz_full:.2f} mm > 只用 σ_f 的 "
+                   f"{dz_f_only:.2f} mm（σ_B 项真的算进去了）", dz_full > dz_f_only))
+
+    # 光"大于"还不够：1 m 处视差项本来就占 95%，少算 σ_B 只差 5%。
+    # 所以这里把公式**逐项复算**一遍 —— 少一项就会对不上。
+    b_m = u["baseline_mm"] / 1000.0
+    d_px = u["focal_px"] * b_m / z
+    sd_px = np.sqrt(2.0) * u["noise_px"]
+    term_d = z * sd_px / d_px * 1000.0
+    term_b = z * (u["sigma_baseline_mm"] / 1000.0) / b_m * 1000.0
+    recomputed = float(np.hypot(term_d, term_b))
+    print(f"    逐项复算：视差项 {term_d:.3f} mm + 基线项 {term_b:.3f} mm"
+          f"（各占 {(term_d / dz_full) ** 2 * 100:.1f}% / "
+          f"{(term_b / dz_full) ** 2 * 100:.1f}% 的方差）-> {recomputed:.3f} mm")
+    checks.append((f"σ_Z 逐项复算一致（{recomputed:.3f} vs {dz_full:.3f} mm）："
+                   f"σ_Z = Z·√((σ_d/d)² + (σ_B/B)²)，基线项确实在式子里",
+                   abs(recomputed - dz_full) <= 1e-9 * max(dz_full, 1.0)))
+    b_term_06 = 0.6 * (u["sigma_baseline_mm"] / 1000.0) / b_m * 1000.0
+    share_06 = b_term_06 / u["depth_sigma_mm_at"](0.6)
+    print(f"    0.6 m 处基线项 {b_term_06:.2f} mm，占 σ_Z 的 {share_06 * 100:.1f}%"
+          f"（越近占比越大：它是 Z/B 倍的放大）")
+    checks.append((f"0.6 m 处基线项占 σ_Z 的 {share_06 * 100:.1f}% > 5%"
+                   f"（不是可忽略的常数）", share_06 > 0.05))
+    checks.append((f"σ_Z 随距离增长：1.0 m -> {dz_full:.2f} mm，2.0 m -> "
+                   f"{u['depth_sigma_mm_at'](2.0):.2f} mm",
+                   u["depth_sigma_mm_at"](2.0) > dz_full))
+    checks.append(("σ_t 与 σ_r 都是 3 维且有限",
+                   np.all(np.isfinite(u["sigma_t_mm"]))
+                   and np.all(np.isfinite(u["sigma_r_deg"]))
+                   and u["sigma_t_mm"].shape == (3,)))
+
+    # ---- 奇异：板面与右目光心共面（完全侧视）-> 右目深度维退化 ----
+    # 物理含义：板上的点与第二台相机的光心共线，于是"绕这条线的旋转"与
+    # "沿板面的平移"在残差上完全等价 —— 6 个自由度里至少有一个不可观测。
+    obj_line = np.stack([np.linspace(-0.09, 0.09, SPEC.n_points),
+                         np.zeros(SPEC.n_points), np.full(SPEC.n_points, 0.6)], 1).astype(np.float32)
+    p1, _ = cv2.projectPoints(obj_line, np.zeros(3), np.zeros(3), K, RIG_D)
+    T_side = np.array([[0.07], [0.0], [-0.6]])
+    p2, _ = cv2.projectPoints(obj_line, np.zeros(3), T_side, K, RIG_D)
+    bad = extrinsic_sigma(obj_line, [p1.astype(np.float32)],
+                          [p2.astype(np.float32)], K, RIG_D, K, RIG_D,
+                          np.eye(3), T_side, RIG_IMG)
+    msg = bad.get("error", "")
+    print(f"    侧视退化 -> {msg or bad}")
+    checks.append(("退化几何 -> 返回 error，且是「雅可比奇异」那条",
+                   "error" in bad and "奇异" in msg))
+    checks.append(("退化几何 -> **没有** inf/nan 混过去（error 里无 sigma_* 数值）",
+                   not any(k.startswith("sigma_") for k in bad)))
+
+    # ---- 残差维数不足：3 个点 1 个视图 -> m=6，减 6 个自由度后 ≤0 ----
+    # 这时**根本没有噪声估计的自由度**，必须明确拒绝而不是给出一个"很小的 σ"。
+    few = extrinsic_sigma(obj_line[:3], [p1[:3].astype(np.float32)],
+                          [p2[:3].astype(np.float32)], K, RIG_D, K, RIG_D,
+                          np.eye(3), T_side, RIG_IMG)
+    print(f"    1 视图 x 3 点 -> {few.get('error', few)}")
+    checks.append(("残差维数不足 -> error（m−6 ≤ 0 时不假装能估噪声）",
+                   "error" in few and "残差维数" in few.get("error", "")))
+
+    # ---- 左右点数不一致：对应关系已不可信，直接抛错 ----
+    message = ""
+    try:
+        extrinsic_sigma(obj_line, [p1.astype(np.float32)],
+                        [p2[:4].astype(np.float32)], K, RIG_D, K, RIG_D,
+                        np.eye(3), T_side, RIG_IMG)
+    except ValueError as exc:
+        message = str(exc)
+    print(f"    左右点数 40/4 -> ValueError: {message.splitlines()[0][:70]}")
+    checks.append(("左右点数不一致 -> ValueError（不是截断后继续算）",
+                   "期望" in message and "40" in message))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
-    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定 + 世界系）")
+    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定 + 世界系"
+          " + 交叉验证 + 外参不确定度）")
     print("=" * 70)
     results = []
     for fn in (test_log_summary_is_self_consistent,
                test_mono_ok_but_stereo_explodes,
                test_unusable_result_is_never_saved,
+               test_save_backs_up_previous,
                test_baseline_anchor_is_optional_and_therefore_silent,
                test_board_area_and_tiered_verdict,
                test_export_formats,
                test_world_frame_roundtrip,
                test_world_frame_apply,
                test_world_frame_from_board_photo,
-               test_visualization_world_frame):
+               test_visualization_world_frame,
+               test_cross_validate_verdicts,
+               test_extrinsic_sigma_vs_empirical,
+               test_depth_sigma_includes_baseline):
         results.append(fn())
         print()
     ok = all(results)
