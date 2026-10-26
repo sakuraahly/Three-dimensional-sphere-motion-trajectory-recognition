@@ -420,7 +420,7 @@ def main() -> int:
                          "1440p 全尺寸未复测")
     ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
                     help=f"录制高度（默认 {RECORD_DEFAULT.label}；说明见 --width）")
-    ap.add_argument("--fps", type=int, default=24,
+    ap.add_argument("--fps", type=int, default=DEFAULT_FPS,
                     help="请求相机的帧率（提示值），**不是**容器标称帧率；容器帧率"
                          "取相机协商值（取不到才退回本值）。默认 24")
     ap.add_argument("--codec", choices=tuple(CODECS), default="hfyuv",

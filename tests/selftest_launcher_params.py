@@ -762,9 +762,19 @@ def main() -> int:
     print("----- 8. calibrate_stereo.py / _common.py 的默认值（命令行入口）-----")
     import re as _re
     src = (ROOT / "apps" / "calibrate_stereo.py").read_text(encoding="utf-8")
-    common_src = (ROOT / "apps" / "_common.py").read_text(encoding="utf-8")
-    fps_m = _re.search(r"fps:\s*int\s*=\s*(\d+)", common_src)
-    common_fps = fps_m.group(1) if fps_m else "(找不到 fps 默认值)"
+    # fps 默认值改为**读函数签名**，不再用正则抠源码（2026-10-26）：
+    # 默认值已收成 `video_profiles.DEFAULT_FPS` 一处来源，`_common.py` 里写的是常量名，
+    # 旧正则 `fps:\s*int\s*=\s*(\d+)` 会直接失配 —— 那是判据写错了，不是代码错。
+    import inspect as _inspect
+    from apps import _common as _common_mod
+    common_fps = "(找不到 fps 默认值)"
+    for _fn in vars(_common_mod).values():
+        if not _inspect.isfunction(_fn):
+            continue
+        _p = _inspect.signature(_fn).parameters.get("fps")
+        if _p is not None and isinstance(_p.default, int):
+            common_fps = str(_p.default)
+            break
 
     def default_of(flag: str) -> str:
         """从 `add_argument("<flag>" ...)` 那一段里抠出 default 值。"""

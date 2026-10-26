@@ -21,6 +21,8 @@
 
 from __future__ import annotations
 
+from sphere_tracker.video_profiles import DEFAULT_FPS
+
 import argparse
 import logging
 import sys
@@ -118,7 +120,7 @@ def add_stereo_source_args(
     *,
     width: int = video_profiles.DEFAULT.width,
     height: int = video_profiles.DEFAULT.height,
-    fps: int = 24,
+    fps: int = DEFAULT_FPS,
 ) -> argparse.ArgumentParser:
     """补上双目取帧参数 —— 字段名与 ``stereo.from_args()`` 读的一一对应。
 

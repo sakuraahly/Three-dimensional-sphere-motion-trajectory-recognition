@@ -101,6 +101,12 @@ PROFILES: tuple[VideoProfile, ...] = (
 # 默认档直接引用 PROFILES 里的同一个对象，避免出现"两个 2560x1440"。
 DEFAULT: VideoProfile = PROFILES[1]
 
+# 默认帧率。**全项目只此一处**（2026-10-26）：此前 GUI 的 CALIB_FPS_DEFAULT、
+# `apps/_common.py` 的 `fps: int = 24`、`apps/record_stereo.py` 的 `--fps default=24`、
+# 命令行入口的 `"60"` 各写一遍 —— 四个数字里已经有一个是错的（60），
+# 而用户看到的是"同一个程序，两个入口默认帧率不同"。
+DEFAULT_FPS = 24
+
 # 录制默认档：**独立于 DEFAULT**。当前两者都指向 1440，但名字保留独立，
 # 免得以后改 DEFAULT 时录制静默跟过去（录制还受吞吐/存储约束）。
 # 两个名字都指向 PROFILES 里的同一对象，不存在第二份字面量。

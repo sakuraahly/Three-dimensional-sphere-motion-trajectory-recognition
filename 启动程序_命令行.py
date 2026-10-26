@@ -23,6 +23,17 @@ while not (ROOT / "apps").is_dir() and ROOT.parent != ROOT:
     ROOT = ROOT.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# 参数默认值**全部**从这里来（2026-10-26）：第二入口曾把检测方法写成 "fusion"、
+# 分辨率写成 1920x1080 / 60fps，与真实默认（color / 2560x1440 / 24）长期不一致 ——
+# 用户在不同入口看到的行为不同，却没有任何提示。插件化之后没有理由再抄一份。
+from sphere_tracker import detectors as _detectors        # noqa: E402,F401  import 即注册
+from sphere_tracker.plugins import default as _plugin_default  # noqa: E402
+from sphere_tracker.video_profiles import (              # noqa: E402
+    DEFAULT as _DEFAULT_PROFILE,
+    DEFAULT_FPS as _DEFAULT_FPS,
+    options as _profile_options,
+)
 PY = sys.executable
 
 
@@ -66,14 +77,14 @@ def clear() -> None:
 CFG: dict[str, str] = {
     "camera": "auto",            # auto = 启动时自动挑最优（优先外接、避开内置/红外、非全黑）
     "diameter": "0.04",
-    "method": "fusion",
+    "method": _plugin_default("detector"),
     "preset": "不使用",
     "horizon": "0.6",
     "focal": "",
     "calib_left": "left",        # 角色名：按设备身份绑定，换 USB 口也不漂
     "calib_right": "right",      # 也可填具体编号（如 0 / 2），但换接口可能指向别的相机
-    "resolution": "1920x1080",
-    "fps": "60",
+    "resolution": f"{_DEFAULT_PROFILE.width}x{_DEFAULT_PROFILE.height}",
+    "fps": str(_DEFAULT_FPS),
 }
 
 
@@ -181,7 +192,7 @@ def edit_config() -> None:
           f"（需先跑『相机设备管理』固定）{C.RESET}")
     CFG["calib_left"] = ask("标定用左相机 (left/编号)", CFG["calib_left"])
     CFG["calib_right"] = ask("标定用右相机 (right/编号)", CFG["calib_right"])
-    print(f"{C.DIM}分辨率可选：1920x1080 / 1280x720 / 960x540 / 640x480{C.RESET}")
+    print(f"{C.DIM}分辨率可选：{' / '.join(_profile_options())}{C.RESET}")
     CFG["resolution"] = ask("两路统一分辨率", CFG["resolution"])
     CFG["fps"] = ask("帧率", CFG["fps"])
     print(f"\n{C.GREEN}参数已更新{C.RESET}")

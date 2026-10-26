@@ -79,6 +79,7 @@ MONO_CAMERAS = ["auto", "0", "1", "2"]
 # 这里再写一遍就是下一次"标定 1080p、录制 1440p"静默混用的种子。
 from sphere_tracker.video_profiles import (  # noqa: E402  （要等 ROOT 进 sys.path）
     DEFAULT as DEFAULT_VIDEO_PROFILE,
+    DEFAULT_FPS as DEFAULT_VIDEO_FPS,
     detection_width,
     options as _video_profile_options,
     parse as parse_video_profile,
@@ -88,7 +89,7 @@ RESOLUTIONS = _video_profile_options()
 # 不在 GUI 另写一个 1080p。默认 2560x1440@24：真机实测两台外接相机无视
 # 1920/1280 请求、恒给 2560x1440，且 1440p@30 主循环只有 24.07fps（会丢帧）。
 DEFAULT_RESOLUTION = DEFAULT_VIDEO_PROFILE.label
-CALIB_FPS_DEFAULT = "24"
+CALIB_FPS_DEFAULT = str(DEFAULT_VIDEO_FPS)   # 唯一来源：video_profiles.DEFAULT_FPS
 # 标定面板的两个对数默认值。写成常量而不是散在控件里的字符串字面量 ——
 # 否则"测试只能靠 grep 字符串"来确认它们，改一下控件类型（StringVar→IntVar）就误报。
 CALIB_TARGET_PAIRS = 40
