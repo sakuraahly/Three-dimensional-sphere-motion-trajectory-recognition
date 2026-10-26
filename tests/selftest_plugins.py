@@ -49,12 +49,21 @@ if str(ROOT) not in sys.path:
 
 from sphere_tracker.config import DetectorConfig                      # noqa: E402
 from sphere_tracker.detectors import build_detector, build_single_detector  # noqa: E402
+
+# 「import 即注册」：这些模块的顶层（或尾部）执行注册装饰器。
+# 漏掉任何一个，对应 kind 的表就是空的，`default()` 会抛错 —— 所以放在这里显式 import，
+# 而不是指望别处顺手带上（那正是"看不见的依赖"）。
+import calib.export                     # noqa: E402,F401  注册 exporter
+import calib.methods                    # noqa: E402,F401  注册 calib_method
+import sphere_tracker.predict           # noqa: E402,F401  注册 predictor
+import sphere_tracker.sources           # noqa: E402,F401  注册 source
 from sphere_tracker.plugins import (                                   # noqa: E402
     UnknownPlugin, clear, default, describe, names, register, resolve,
 )
 
-# 本轮的 kind。P2 会加 predictor / source / calib_method / exporter / tracker。
-KINDS = ("detector",)
+# 已迁移到注册表的**全部**六个扩展点（P0/P1 detector、P2 其余四类、P3 tracker）。
+# 少写一个等于少守一块：表里没有的 kind，"名字唯一/恰一默认/summary 非空"就没人在盯。
+KINDS = ("detector", "predictor", "source", "calib_method", "exporter", "tracker")
 # R7 要扫描的入口：任何"用户能选检测器"的地方。
 ENTRY_FILES = sorted((ROOT / "apps").glob("*.py")) + [ROOT / "启动程序.py"]
 # R5 没有白名单。2026-10-26 解掉 `stereo/sessions.py` 那处反向依赖后，违例数为 0 ——

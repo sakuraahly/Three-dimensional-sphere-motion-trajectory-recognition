@@ -398,8 +398,6 @@ def test_handover_section_13_claims() -> bool:
         ("标定默认 40 / 20", "apps/calibrate_stereo.py",
          ["default=40", "default=20"]),
         ("GUI 把 --display-width 传下去", "启动程序.py", ["--display-width"]),
-        ("GUI 标定面板默认 40 / 20 / 24（1440p 主循环实测）", "启动程序.py",
-         ['"40"', '"20"', '"24"']),
         ("GUI 用 resolve_roles（两个角色不撞车）", "启动程序.py", ["resolve_roles"]),
         ("GUI 有任务管理器且杀进程树", "启动程序.py", ["def stop_task", "taskkill"]),
         ("同名相机歧义会被拦下", "sphere_tracker/camera_registry.py",
@@ -433,6 +431,18 @@ def test_handover_section_13_claims() -> bool:
         if not ok:
             print(f"    {rel} 缺：{missing}")
         checks.append((label, ok))
+
+    # GUI 标定面板的默认值：断言**值**，不断言"源码里有这几个字符串"（2026-10-26）。
+    # 旧写法要求 启动程序.py 里出现 '"40"'/'"20"'/'"24"' —— 一旦控件换成 IntVar/Spinbox，
+    # 行为完全正确也会红。现在默认值提成模块常量，直接读常量值。
+    try:
+        import 启动程序 as _gui
+        got = (_gui.CALIB_TARGET_PAIRS, _gui.CALIB_MIN_PAIRS, _gui.CALIB_FPS_DEFAULT)
+    except Exception as exc:                      # noqa: BLE001 - 导入失败本身就是问题
+        got, err = None, f"{type(exc).__name__}: {exc}"
+        print(f"    导入 启动程序 失败：{err}")
+    checks.append(("GUI 标定面板默认 40 / 20 / 24（按常量值断言，不靠源码字面量）",
+                   got == (40, 20, "24")))
 
     # 默认检测方法必须是 color（§13.5 的核心结论之一）
     cfg = (ROOT / "sphere_tracker" / "config.py").read_text(encoding="utf-8")

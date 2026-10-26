@@ -42,6 +42,7 @@ import numpy as np
 from sphere_tracker.config import AppConfig, ColorConfig
 from sphere_tracker.geometry import CameraModel
 from sphere_tracker.pipeline import SpherePipeline
+from sphere_tracker.plugins import names as method_names  # 预测器清单的唯一来源（R7）
 
 GRAVITY = 9.80665
 
@@ -543,7 +544,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description="合成数据自测")
     p.add_argument("--method", default=None, help="只测某一种方法")
     p.add_argument("--preset", default="white_ball")
-    p.add_argument("--predict", default="quadratic", choices=["kalman", "quadratic"])
+    p.add_argument("--predict", default="quadratic", choices=method_names("predictor"))
     p.add_argument("--gravity-fit", action="store_true", help="三维预测时用已知重力约束")
     p.add_argument("--write-video", action="store_true")
     p.add_argument("--check-ai", action="store_true")

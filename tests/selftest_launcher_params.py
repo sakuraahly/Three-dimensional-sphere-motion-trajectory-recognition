@@ -631,13 +631,14 @@ def main() -> int:
     # 根因是"手算行号"这种做法；现在改成每个 parent 一个游标、辅助函数自己分配。
     # 所以这里钉的是**没有同格重复、没有同列竖向重叠**。
     sections = list(getattr(app, "_calib_sections", ()))
-    defaults_ok = (len(sections) == 2
-                   and sections[0].expanded and not sections[1].expanded)
     section_names = [s.header_button.cget("text") for s in sections]
-    checks_layout.append(("参数区是「基本设置 / 高级设置」两个可折叠区",
-                          len(sections) == 2
-                          and "基本设置" in section_names[0]
-                          and "高级设置" in section_names[1]))
+    # 用 >= 2 而不是 == 2（2026-10-26）：加功能常常要在标定面板再加一个区，
+    # 那是**正常演进**，不该让这条布局测试变红。真正要钉的是"前两个区是基本/高级，且默认状态正确"。
+    two_ok = (len(sections) >= 2
+              and "基本设置" in section_names[0]
+              and "高级设置" in section_names[1])
+    defaults_ok = (two_ok and sections[0].expanded and not sections[1].expanded)
+    checks_layout.append((f"参数区前两个是「基本设置 / 高级设置」（共 {len(sections)} 区）", two_ok))
     checks_layout.append(("默认基本展开、高级收起", defaults_ok))
     checks_layout.append(("展开后的设置区有可见边框", all(
         int(s.content.cget("borderwidth") or 0) >= 1
