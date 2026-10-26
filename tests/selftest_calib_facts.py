@@ -84,6 +84,8 @@ import numpy as np
 from calib.export import build_export, write_export
 from calib.params import StereoRig
 from calib.stereo_calib import CalibConfig, StereoCalibrationResult, calibrate_stereo
+from calib.world_frame import WorldFrame, from_board
+from stereo.visualization import build_visualization_payload
 
 # 复用角点顺序测试里的合成装置（保证两处口径一致）
 from selftest_board_corner_order import (  # noqa: E402
@@ -606,9 +608,261 @@ def test_export_formats() -> bool:
     return all(ok for _n, ok in checks)
 
 
+# --------------------------------------------------------------------------
+# 世界系（config/world_frame.json）
+#
+# 这一节守的是**"世界系不能说谎"**：
+# 1. 落盘/读回逐元素一致，坏矩阵（最后一行 / 非正交 / 3x3）必须被拒并指出原因；
+# 2. `apply()` 与手算一致（变换写错方向时这一条会红）；
+# 3. 真图片走一遍 `from_board()`（不是只测 `from_camera_board()`）；
+# 4. 没有 `world_frame.json` 时 `visualization.json` **必须**保持左相机系 ——
+#    静默当世界系是这一节唯一真正危险的行为。
+# --------------------------------------------------------------------------
+#: 绕 Z 转 90° 再平移 (1,2,3)：手算期望值就写在这张矩阵旁边。
+WORLD_T = np.array([[0.0, -1.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0, 2.0],
+                    [0.0, 0.0, 1.0, 3.0],
+                    [0.0, 0.0, 0.0, 1.0]])
+
+
+def _write_world_json(path: Path, T) -> None:
+    path.write_text(json.dumps({"version": 1, "source": "manual", "units": "m",
+                                "note": "", "board_rmse_px": None,
+                                "created_at": "2026-01-01 00:00:00",
+                                "T_world_cam": np.asarray(T).tolist()},
+                               ensure_ascii=False), encoding="utf-8")
+
+
+def test_world_frame_roundtrip() -> bool:
+    """落盘 -> 读回逐元素一致；三类坏矩阵都必须 ValueError 且指出原因。"""
+    print("----- 6. 世界系：往返 + 坏文件必须被拒 -----")
+    checks: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "world_frame.json"
+        WorldFrame(WORLD_T, "manual", note="合成").save(p)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        checks.append(("JSON 含 version/T_world_cam/source/units/note/created_at",
+                       all(k in data for k in ("version", "T_world_cam", "source",
+                                               "units", "note", "board_rmse_px",
+                                               "created_at"))))
+        back = WorldFrame.load(p)
+        checks.append(("往返后矩阵逐元素一致（< 1e-12）",
+                       float(np.max(np.abs(back.T_world_cam - WORLD_T))) < 1e-12))
+        checks.append(("source/note 一并带回",
+                       back.source == "manual" and back.note == "合成"))
+
+        bad_cases = [
+            ("最后一行不是 [0,0,0,1]",
+             np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 2.0]]),
+             "最后一行"),
+            ("旋转块非正交",
+             np.array([[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0.2, 0, 1.0, 0], [0, 0, 0, 1.0]]),
+             "正交"),
+            ("3x3 不是 4x4", np.eye(3), "4x4"),
+        ]
+        for name, T, keyword in bad_cases:
+            bp = Path(td) / "bad.json"
+            _write_world_json(bp, T)
+            message = ""
+            try:
+                WorldFrame.load(bp)
+            except ValueError as exc:
+                message = str(exc)
+            checks.append((f"坏文件被拒：{name}",
+                           keyword in message and str(bp) in message))
+            print(f"    {name} -> {message or '（**没有报错**）'}")
+
+        bp = Path(td) / "broken.json"
+        bp.write_text("{ this is not json", encoding="utf-8")
+        message = ""
+        try:
+            WorldFrame.load(bp)
+        except ValueError as exc:
+            message = str(exc)
+        checks.append(("坏 JSON 被拒且指出文件", "JSON" in message and str(bp) in message))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_world_frame_apply() -> bool:
+    """apply()：3 个点的手算期望值（变换方向写反/转置写错都会红）。"""
+    print("----- 7. 世界系：apply() 数值 -----")
+    wf = WorldFrame(WORLD_T, "manual")
+    got = wf.apply(np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 1.0]]))
+    expect = np.array([[1.0, 3.0, 3.0], [-1.0, 2.0, 3.0], [1.0, 2.0, 4.0]])
+    err = float(np.max(np.abs(got - expect)))
+    checks = [
+        (f"3 个点与手算一致（max|差| = {err:.2e} < 1e-12）", err < 1e-12),
+        ("None -> None（空数据直通）", wf.apply(None) is None),
+    ]
+    try:
+        wf.apply(np.zeros((2, 2)))
+    except ValueError:
+        checks.append(("形状不是 (N,3) 时报错", True))
+    else:
+        checks.append(("形状不是 (N,3) 时报错", False))
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def _write_board_photo(path: Path, spec: BoardSpec, K: np.ndarray) -> None:
+    """画一张**真的能被 `detect_board` 检出**的棋盘照片（透视投影 + 白边）。"""
+    sq, pad = 60, 2
+    flat = np.full(((spec.rows + 1 + 2 * pad) * sq, (spec.cols + 1 + 2 * pad) * sq),
+                   255, np.uint8)
+    for j in range(spec.rows + 1):
+        for i in range(spec.cols + 1):
+            if (i + j) % 2 == 0:
+                y0, x0 = (pad + j) * sq, (pad + i) * sq
+                flat[y0:y0 + sq, x0:x0 + sq] = 0
+    s = spec.square_mm / 1000.0
+    outer = np.array([[-s, -s, 0], [spec.cols * s, -s, 0],
+                      [spec.cols * s, spec.rows * s, 0], [-s, spec.rows * s, 0]], float)
+    rvec = cv2.Rodrigues(np.array([np.deg2rad(25.0), 0.12, -0.05]))[0]
+    tvec = np.array([-0.06, -0.04, 0.50])
+    dst = cv2.projectPoints(outer, rvec, tvec, K, np.zeros(5))[0].reshape(-1, 2)
+    src = np.array([[pad * sq, pad * sq],
+                    [(pad + spec.cols + 1) * sq, pad * sq],
+                    [(pad + spec.cols + 1) * sq, (pad + spec.rows + 1) * sq],
+                    [pad * sq, (pad + spec.rows + 1) * sq]], np.float32)
+    H = cv2.getPerspectiveTransform(src, dst.astype(np.float32))
+    photo = cv2.warpPerspective(flat, H, (1920, 1080), borderValue=128)
+    cv2.imwrite(str(path), photo)
+
+
+def test_world_frame_from_board_photo() -> bool:
+    """真图片路径：`from_board()` 能检出、rmse 过门槛、尺度与 Z 方向说得清。"""
+    print("----- 8. 世界系：真图片 from_board() -----")
+    checks: list[tuple[str, bool]] = []
+    K = np.array([[1400.0, 0.0, 960.0], [0.0, 1400.0, 540.0], [0.0, 0.0, 1.0]])
+    rig = StereoRig(
+        K1=K, D1=np.zeros((1, 5)), K2=K.copy(), D2=np.zeros((1, 5)),
+        R=np.eye(3), T=np.array([[-0.065], [0.0], [0.0]]),
+        image_size=(1920, 1080),
+        meta={"stereo_mode": "angled", "rectification": "none_raw"},
+    )
+    with tempfile.TemporaryDirectory() as td:
+        photo = Path(td) / "board.png"
+        _write_board_photo(photo, SPEC, K)
+        checks.append(("照片真的写出来了", photo.is_file()))
+
+        wf = from_board(photo, SPEC, rig)
+        checks.append((f"rmse = {wf.board_rmse_px:.2f} px < 1.0",
+                       wf.board_rmse_px is not None and wf.board_rmse_px < 1.0))
+        checks.append(("source = board_pnp", wf.source == "board_pnp"))
+        checks.append(("describe() 含来源与 rmse",
+                       "board_pnp" in wf.describe() and "rmse=" in wf.describe()))
+
+        # 相机到世界原点的距离应等于合成时的板距（~0.5 m）——尺度对了才叫世界系。
+        cam = wf.apply(np.zeros((1, 3)))[0]        # 左相机光心在世界系里的位置
+        dist = float(np.linalg.norm(cam))
+        checks.append((f"相机光心距世界原点 {dist:.3f} m（合成板距 0.5 m）",
+                       0.4 < dist < 0.6))
+        # 默认 +Z = 棋盘法向 = 背离相机的那一侧 -> 相机在负 Z。
+        checks.append((f"默认 ground_axis=z 时相机在 Z<0 一侧（z={cam[2]:.3f}）",
+                       cam[2] < 0.0))
+        wf_up = from_board(photo, SPEC, rig, ground_axis="-z")
+        cam_up = wf_up.apply(np.zeros((1, 3)))[0]
+        checks.append((f"ground_axis='-z' 时相机翻到 Z>0（z={cam_up[2]:.3f}）",
+                       cam_up[2] > 0.0))
+        checks.append(("两种 ground_axis 的 rmse 相同（只翻轴、不动拟合）",
+                       abs(wf.board_rmse_px - wf_up.board_rmse_px) < 1e-12))
+
+        blank = Path(td) / "blank.png"
+        cv2.imwrite(str(blank), np.full((720, 1280), 255, np.uint8))
+        message = ""
+        try:
+            from_board(blank, SPEC, rig)
+        except ValueError as exc:
+            message = str(exc)
+        checks.append(("空图（检不到板）抛 ValueError 并说明怎么重拍",
+                       "没检测到" in message and "重拍" in message))
+        print(f"    空图 -> {message}")
+
+        missing = Path(td) / "nope.png"
+        try:
+            from_board(missing, SPEC, rig)
+        except ValueError as exc:
+            checks.append(("图打不开 -> ValueError 指出路径", str(missing) in str(exc)))
+        else:
+            checks.append(("图打不开 -> ValueError 指出路径", False))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_visualization_world_frame() -> bool:
+    """没配置 -> 左相机系且写明；有配置 -> world + 点被换；配置坏了 -> 抛错。"""
+    print("----- 9. visualization.json：世界系不许静默 -----")
+    checks: list[tuple[str, bool]] = []
+    trajectory = {
+        "session": "synthetic", "unit": "m", "stereo_mode": "angled",
+        "coordinate_system": "left_camera",
+        "bounds": {"min": [0.1, 0.2, 0.3], "max": [0.1, 0.2, 0.3]},
+        "samples": [
+            {"frame": 0, "t": 0.0, "matched": True, "xyz": [0.1, 0.2, 0.3],
+             "confident": True},
+            {"frame": 1, "t": 0.03, "matched": False, "xyz": None, "confident": False},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "world_frame.json"
+
+        vis0 = build_visualization_payload(trajectory, world_frame_path=p)
+        checks.append(("无 world_frame.json：coordinate_system 仍是 left_camera",
+                       vis0["coordinate_system"] == "left_camera"))
+        checks.append(("无 world_frame.json：notes 明说当前是左相机系",
+                       any("左相机系" in n for n in vis0.get("notes", []))))
+        checks.append(("无 world_frame.json：点坐标未被改动",
+                       vis0["trajectory"][0]["xyz"] == [0.1, 0.2, 0.3]))
+        checks.append(("无 world_frame.json：不写 world_frame 字段",
+                       "world_frame" not in vis0))
+
+        WorldFrame(WORLD_T, "manual", note="合成").save(p)
+        vis1 = build_visualization_payload(trajectory, world_frame_path=p)
+        checks.append(("有 world_frame.json：coordinate_system = world",
+                       vis1["coordinate_system"] == "world"))
+        checks.append(("有 world_frame.json：点被换成世界系（手算 0.8/2.1/3.3）",
+                       np.allclose(vis1["trajectory"][0]["xyz"], [0.8, 2.1, 3.3], atol=1e-12)))
+        checks.append(("bounds 跟着重算",
+                       np.allclose(vis1["bounds"]["min"], [0.8, 2.1, 3.3], atol=1e-12)))
+        checks.append(("world_frame 带 source/note/created_at",
+                       set(vis1["world_frame"]) == {"source", "note", "created_at"}))
+        checks.append(("未匹配的点仍为 None（不凭空造坐标）",
+                       vis1["samples"][1]["xyz"] is None))
+
+        p.write_text("{ broken json", encoding="utf-8")
+        message = ""
+        try:
+            build_visualization_payload(trajectory, world_frame_path=p)
+        except ValueError as exc:
+            message = str(exc)
+        checks.append(("坏 JSON -> 抛错并指出文件与原因",
+                       "JSON" in message and str(p) in message))
+        print(f"    坏 JSON -> {message}")
+
+        _write_world_json(p, np.eye(3))
+        message = ""
+        try:
+            build_visualization_payload(trajectory, world_frame_path=p)
+        except ValueError as exc:
+            message = str(exc)
+        checks.append(("3x3 矩阵 -> 抛错（**不许**回退成单位矩阵）",
+                       "4x4" in message and str(p) in message))
+        print(f"    3x3 -> {message}")
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
-    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定）")
+    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定 + 世界系）")
     print("=" * 70)
     results = []
     for fn in (test_log_summary_is_self_consistent,
@@ -616,7 +870,11 @@ def main() -> int:
                test_unusable_result_is_never_saved,
                test_baseline_anchor_is_optional_and_therefore_silent,
                test_board_area_and_tiered_verdict,
-               test_export_formats):
+               test_export_formats,
+               test_world_frame_roundtrip,
+               test_world_frame_apply,
+               test_world_frame_from_board_photo,
+               test_visualization_world_frame):
         results.append(fn())
         print()
     ok = all(results)

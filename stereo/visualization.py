@@ -14,6 +14,11 @@
 
 坐标系：parallel 用 `rectified_left_camera`；angled 用 `left_camera`，
 单位米；XYZ 轴定义见 `docs/数据标准.md`。
+
+世界系：若 `config/world_frame.json` 存在且合法，`visualization.json` 的
+点坐标会被换成**世界系**（`coordinate_system="world"`，并附 `world_frame`
+来源信息）；不存在时保持左相机系，并在 `notes` 里明说 ——
+**绝不静默把相机系当世界系**。真值应用在 `build_visualization_payload()` 里。
 """
 
 from __future__ import annotations
@@ -28,6 +33,12 @@ SEEDS_SCHEMA = "sphere-stereo-seeds"
 TRAJECTORY_SCHEMA = "sphere-stereo-trajectory"
 VISUALIZATION_SCHEMA = "sphere-stereo-visualization"
 VERSION = 1
+
+#: 世界系配置的默认位置（与 `apps/tools/set_world_frame.py --out` 的默认值一致）。
+DEFAULT_WORLD_FRAME_PATH = Path(__file__).resolve().parents[1] / "config" / "world_frame.json"
+
+#: 可以称为"左相机系"的取值：parallel 的是**校正后**左相机系。
+LEFT_CAMERA_SYSTEMS = ("left_camera", "rectified_left_camera")
 
 
 def _now() -> str:
@@ -193,8 +204,16 @@ def build_trajectory_payload(
     }
 
 
-def build_visualization_payload(trajectory: dict) -> dict:
-    """从标准轨迹生成可视化专用数据（不重复逐帧 diagnostics）。"""
+def build_visualization_payload(
+    trajectory: dict,
+    *,
+    world_frame_path: str | Path | None = None,
+) -> dict:
+    """从标准轨迹生成可视化专用数据（不重复逐帧 diagnostics）。
+
+    `world_frame_path` 省略时查 `config/world_frame.json`；
+    存在就换成世界系，不存在就保持左相机系（并在 `notes` 里说明）。
+    """
     samples = trajectory.get("samples") or []
     points = []
     for s in samples:
@@ -203,7 +222,7 @@ def build_visualization_payload(trajectory: dict) -> dict:
                 "frame": s["frame"], "t": s["t"], "xyz": s["xyz"],
                 "confident": bool(s.get("confident")),
             })
-    return {
+    payload = {
         "schema": VISUALIZATION_SCHEMA,
         "version": VERSION,
         "session": trajectory.get("session"),
@@ -227,6 +246,74 @@ def build_visualization_payload(trajectory: dict) -> dict:
             for s in samples
         ],
     }
+    return _apply_world_frame(payload, world_frame_path)
+
+
+def _apply_world_frame(vis: dict, world_frame_path: str | Path | None) -> dict:
+    """把可视化数据换成世界系；没有配置就**明说**坐标仍是相机系。
+
+    三条规矩：
+    - 有配置：改点、重算 bounds、`coordinate_system="world"`、写 `world_frame`；
+    - 没配置：`coordinate_system` 保持左相机系、`notes` 写明，**不冒充世界系**；
+    - 配置坏了：抛 `ValueError` 指出文件与原因，**绝不回退成单位矩阵**。
+    """
+    path = DEFAULT_WORLD_FRAME_PATH if world_frame_path is None else Path(world_frame_path)
+    if not path.exists():
+        current = str(vis.get("coordinate_system") or "")
+        vis["coordinate_system"] = current if current in LEFT_CAMERA_SYSTEMS else "left_camera"
+        # 提示语必须跟着**真实**坐标系走：parallel 的点在校正系，说成"左相机系"会误导。
+        label = "校正后的左相机系" if vis["coordinate_system"] == "rectified_left_camera" else "左相机系"
+        vis["notes"] = [f"未设置 world_frame.json：当前坐标为{label}"]
+        return vis
+
+    # 只在真要换坐标时才 import：纯左相机系导出不该多背 calib 的依赖。
+    from calib.world_frame import WorldFrame
+
+    # ⚠️ 校正系（parallel 产物）**不能**直接乘 `T_world_cam`。
+    # `T_world_cam` 按**原始左相机系**定义，而 parallel 的点满足 `p_rect = R1 · p_cam`；
+    # 直接相乘等于把两个不同的系当成一个，误差是整幅校正旋转（本装置 1.4°，大角度下几度）。
+    # 正确做法是先 `p_cam = R1⁻¹ · p_rect` 再变换——但那需要 R1 与基线尺度，
+    # 属于另一件事；在那之前**拒绝**，别给一个看起来成功的错数。
+    frame = str(vis.get("coordinate_system") or "")
+    if frame == "rectified_left_camera":
+        raise ValueError(
+            "世界系变换暂不支持 parallel 模式：本数据的坐标在校正后的左相机系"
+            "（rectified_left_camera），而世界系变换按原始左相机系定义；"
+            "两者相差 R1 旋转，直接相乘会得到错误坐标。"
+            "请用 angled 标定后重跑，或先关闭世界系（--no-world）。"
+        )
+
+    try:
+        wf = WorldFrame.load(path)
+    except ValueError as exc:
+        message = str(exc)
+        raise ValueError(message if str(path) in message
+                         else f"{path}：{message}") from exc
+
+    for item in vis.get("trajectory") or []:
+        item["xyz"] = wf.apply([item["xyz"]])[0].tolist()
+    for s in vis.get("samples") or []:
+        if s.get("xyz"):
+            s["xyz"] = wf.apply([s["xyz"]])[0].tolist()
+
+    xs = [it["xyz"] for it in vis.get("trajectory") or []]
+    vis["bounds"] = None if not xs else {
+        "min": [min(p[i] for p in xs) for i in range(3)],
+        "max": [max(p[i] for p in xs) for i in range(3)],
+    }
+    vis["unit"] = wf.units
+    vis["coordinate_system"] = "world"
+    vis["world_frame"] = {
+        "source": wf.source,
+        "note": wf.note,
+        "created_at": wf.created_at,
+    }
+    vis["notes"] = [f"已应用世界系：{path}"]
+    # 轴标签描述的是**数据**，换到世界系后必须跟着换；否则标签会说谎。
+    vis["style"]["axes"] = {"x": "World X (board columns)",
+                            "y": "World Y (board rows)",
+                            "z": "World Z (ground normal)"}
+    return vis
 
 
 def export_session_visualization(
@@ -234,12 +321,13 @@ def export_session_visualization(
     *,
     csv_name: str = "traj3d.csv",
     stereo_mode: str | None = None,
+    world_frame_path: str | Path | None = None,
 ) -> dict[str, Path]:
     """写 `traj3d.json` + `visualization.json`，返回路径。"""
     session_dir = Path(session_dir)
     trajectory = build_trajectory_payload(
         session_dir, csv_name=csv_name, stereo_mode=stereo_mode)
-    vis = build_visualization_payload(trajectory)
+    vis = build_visualization_payload(trajectory, world_frame_path=world_frame_path)
     derived = session_dir / "derived"
     derived.mkdir(parents=True, exist_ok=True)
     traj_path = derived / "traj3d.json"
