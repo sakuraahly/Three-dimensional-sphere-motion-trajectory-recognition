@@ -44,6 +44,8 @@ from sphere_tracker import camera_registry as cr
 from sphere_tracker import video_profiles
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detectors import build_detector
+from sphere_tracker.plugins import default as default_method
+from sphere_tracker.plugins import describe, names as method_names
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import (
     INDEX_BACKEND,
@@ -76,7 +78,9 @@ def _describe(info) -> str:
     return "，".join(bits)
 
 WINDOW = "sphere tracker (real-time)"
-METHOD_CYCLE = ["fusion", "color", "hough", "motion", "yolo", "yolo_sam"]
+# 按 'c' 轮换检测方法：**顺序与可选项都取自注册表**（R7）。
+# 这里原来是手写 6 项（漏了 specular），于是"能按 c 切到的"与"--method 能写的"不一致。
+METHOD_CYCLE = method_names("detector")
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,7 +98,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--method",
         default=None,
-        help="检测方法：fusion / color / hough / motion / yolo / yolo_sam",
+        choices=method_names("detector"),
+        help="检测方法（不传则取配置，默认 %s）。可选：%s" % (
+            default_method("detector"),
+            "；".join(f"{d['name']}={d['summary']}" for d in describe("detector"))),
     )
     p.add_argument(
         "--preset",

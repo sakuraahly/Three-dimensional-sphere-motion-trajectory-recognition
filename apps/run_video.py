@@ -23,7 +23,10 @@ import cv2
 import numpy as np
 
 from sphere_tracker.config import AppConfig, ColorConfig, load_config
+from sphere_tracker.detectors import registry  # noqa: F401  （import 即注册：R1）
 from sphere_tracker.pipeline import SpherePipeline
+from sphere_tracker.plugins import default as default_method
+from sphere_tracker.plugins import describe, names as method_names
 from sphere_tracker.sources import open_source
 from apps._window import WindowManager
 
@@ -37,7 +40,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--csv", default=None, help="导出轨迹 CSV")
     p.add_argument("--frames-dir", action="store_true", help="输入是图片文件夹时，输出逐帧 PNG")
     p.add_argument("--config", default=None)
-    p.add_argument("--method", default=None)
+    p.add_argument("--method", default=None, choices=method_names("detector"),
+                   help="检测方法（不传则取配置，默认 %s）。可选：%s" % (
+                       default_method("detector"),
+                       "；".join(f"{d['name']}={d['summary']}"
+                                 for d in describe("detector"))))
     p.add_argument("--preset", default=None)
     p.add_argument("--ball-diameter", type=float, default=None)
     p.add_argument("--focal", type=float, default=None)

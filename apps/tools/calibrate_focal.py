@@ -37,6 +37,19 @@ from sphere_tracker.geometry import estimate_focal_from_known_ball
 from sphere_tracker.sources import open_source
 
 
+
+def detector_names() -> list[str]:
+    """可选检测器名（唯一来源：插件注册表）。"""
+    from sphere_tracker.plugins import names
+    return names("detector")
+
+
+def default_detector() -> str:
+    """默认检测器（唯一来源：插件注册表，与 GUI/CLI 同一处）。"""
+    from sphere_tracker.plugins import default
+    return default("detector")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="单点焦距标定")
     p.add_argument("--camera", type=int, default=None)
@@ -44,7 +57,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--video", default=None)
     p.add_argument("--distance", type=float, required=True, help="球心到相机的实际距离（米）")
     p.add_argument("--ball-diameter", type=float, default=0.04, help="球直径（米）")
-    p.add_argument("--method", default="fusion")
+    # 默认值与可选清单都来自插件注册表（2026-10-26）：此前这里硬写 "fusion"，
+    # 而真默认是 "color" —— 同一台机器上两个入口的默认行为不同，很难被发现。
+    p.add_argument("--method", default=default_detector(), choices=detector_names())
     p.add_argument("--preset", default="white_ball")
     p.add_argument("--config", default=None)
     p.add_argument("--save", default="config/sphere_config.json")

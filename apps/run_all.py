@@ -44,7 +44,14 @@ from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:       # 只为读检测器注册表（R7）；执行链仍是子进程，方式不变
+    sys.path.insert(0, str(ROOT))
 PY = sys.executable
+
+# import 注册模块即完成注册（R1 要求显式，不扫描目录）
+from sphere_tracker.detectors import registry as _detector_registry   # noqa: E402,F401
+from sphere_tracker.plugins import default as default_method          # noqa: E402
+from sphere_tracker.plugins import describe, names as method_names    # noqa: E402
 
 STEPS = ("check", "tri", "export")
 CALIB_LABEL = "config/stereo_calibration.json"
@@ -258,8 +265,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="auto（默认，按前置条件自动挑）或逗号分隔：check,tri,export")
     ap.add_argument("--stereo-mode", choices=("auto", "angled", "parallel"), default="auto",
                     help="双目模式，透传给 tri / export")
-    ap.add_argument("--detector", choices=("color", "hough", "fusion", "specular"), default=None,
-                    help="检测器，透传给 tri；默认取会话配置，没有则 color")
+    ap.add_argument("--detector", choices=method_names("detector"), default=None,
+                    help="检测器，透传给 tri；默认取会话配置，没有则 %s。可选：%s" % (
+                        default_method("detector"),
+                        "；".join(f"{d['name']}={d['summary']}"
+                                  for d in describe("detector"))))
     ap.add_argument("--skip-check", action="store_true",
                     help="跳过 check（会记为 skipped 并说明，绝不静默）")
     ap.add_argument("--dry-run", action="store_true",

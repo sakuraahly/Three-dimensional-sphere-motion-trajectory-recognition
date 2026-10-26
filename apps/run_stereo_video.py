@@ -49,8 +49,11 @@ if str(ROOT) not in sys.path:
 from calib import StereoRig, WorldFrame
 from calib.params import is_uncorrected                                  # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig     # noqa: E402
+from sphere_tracker.detectors import registry                # noqa: E402,F401  （import 即注册）
 from sphere_tracker.geometry import CameraModel              # noqa: E402
 from sphere_tracker.pipeline import SpherePipeline           # noqa: E402
+from sphere_tracker.plugins import default as default_method, names as method_names  # noqa: E402
+from sphere_tracker.plugins import describe                  # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
 from stereo import (  # noqa: E402
     MatchConfig, PairSource, PredictConfig, StereoReconstructor,
@@ -285,8 +288,12 @@ def _plot_trajectory(arr: np.ndarray, path: Path, smoothed: np.ndarray | None = 
 def main() -> int:
     ap = argparse.ArgumentParser(description="离线双目三维轨迹（读会话）")
     ap.add_argument("session", help="data/sessions/<id> 目录或 session.json")
-    ap.add_argument("--method", default="color",
-                    choices=("color", "hough", "fusion", "motion", "specular"))
+    ap.add_argument("--method", default=default_method("detector"),
+                    choices=method_names("detector"),
+                    help="检测方法（默认 %s）。可选：%s" % (
+                        default_method("detector"),
+                        "；".join(f"{d['name']}={d['summary']}"
+                                  for d in describe("detector"))))
     ap.add_argument("--preset", default="", help="color 预设，如 white_ball；空=默认")
     ap.add_argument("--origin", default="0,0,0",
                     help="视频里标出的参照原点（parallel=校正左相机系，"

@@ -46,16 +46,17 @@ INK = "#1f2937"
 MUTED = "#6b7280"
 BG = "#eef2f8"
 
-# 检测方法下拉框。**顺序有意义**：第一项是默认值（见下面 `self.method.set(METHODS[0])`）。
-# `color` 排第一，与 `run_realtime.py:--method` 的默认值、以及
-# `docs/用户手册.md` §3.1「`color`（默认，最快）」一致。
-#
-# ⚠️ 2026-10-14 修：这里原来是 `["fusion", ...]` 且 `set("fusion")`，于是
-# **界面默认 fusion、命令行默认 color** —— 用户从界面走就必然吃上
-# fusion 在真实纹理下 265 ms/帧（实测 loop 3.7 fps、丢帧 91%），
-# 而文档三处都写着"默认 color"。界面与命令行的默认值必须一致，
-# 否则"界面所见"与"文档所承诺"就是两份东西（同一个毛病在 `--target` 上犯过一次）。
-METHODS = ["color", "specular", "fusion", "hough", "motion", "yolo", "yolo_sam"]
+# 检测方法下拉框：**唯一来源是检测器注册表**（`sphere_tracker/detectors/registry.py`，规则 R7）。
+# 以前这里是手写清单，于是四个入口已经漂移（GUI 7 项 / run_stereo_video 5 项 / run_all 4 项）；
+# 现在加一个检测器只改注册表一处，界面与命令行不可能再对不上。
+# 顺序 = 注册顺序；默认值 = 注册表声明的默认（= `DetectorConfig.method`），
+# 不再靠"列表首项"这种隐式约定 —— 展示顺序与默认值是两件独立的事。
+from sphere_tracker.detectors import registry as _detector_registry  # noqa: E402,F401  （import 即注册）
+from sphere_tracker.plugins import default as _plugin_default  # noqa: E402
+from sphere_tracker.plugins import names as _plugin_names  # noqa: E402
+
+METHODS = _plugin_names("detector")
+DEFAULT_METHOD = _plugin_default("detector")
 PRESETS = ["不使用", "white_ball", "orange_ball", "green_ball",
            "blue_ball", "red_ball", "yellow_ball"]
 # 左右下拉的默认项：直接给**角色名**（left/right），绑定的设备身份不随 USB 口漂移。
@@ -1364,7 +1365,7 @@ class Launcher(tk.Tk):
             "球直径/预测视野/焦距只用于单目；双目深度来自标定，不读这些值。")
         ttk.Label(box, text="检测方法").grid(row=1, column=0, sticky="e", pady=4)
         self.method = ttk.Combobox(box, values=METHODS, width=10, state="readonly")
-        self.method.set(METHODS[0])          # 取列表首项 = 与命令行/文档同一个默认值
+        self.method.set(DEFAULT_METHOD)      # 注册表声明的默认值（= 命令行/文档同一个）
         self.method.grid(row=1, column=1, sticky="w", padx=(4, 20), pady=4)
 
         ttk.Label(box, text="颜色预设").grid(row=1, column=2, sticky="e", pady=4)
