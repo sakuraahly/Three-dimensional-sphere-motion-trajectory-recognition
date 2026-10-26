@@ -48,7 +48,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preset", default=None)
     p.add_argument("--ball-diameter", type=float, default=None)
     p.add_argument("--focal", type=float, default=None)
-    p.add_argument("--predict", default=None, choices=["kalman", "quadratic"])
+    p.add_argument("--predict", default=None, choices=method_names("predictor"),
+                   help="预测方法（不传则取配置，默认 %s）。可选：%s" % (
+                       default_method("predictor"),
+                       "；".join(f"{d['name']}={d['summary']}"
+                                 for d in describe("predictor"))))
     p.add_argument("--horizon", type=float, default=None)
     p.add_argument("--gravity-fit", action="store_true")
     p.add_argument("--max-frames", type=int, default=0, help=">0 时只处理前 N 帧")

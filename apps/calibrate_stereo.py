@@ -58,6 +58,8 @@ from apps._common import (
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
 from calib import detect_board
+from calib.methods import plan as method_plan
+from calib.methods import single_board as single_board_method
 from calib.relative_pose import compose, invert, rotation_angle_deg
 from calib.stereo_calib import board_pose_from_points, calibrate_mono_points
 from stereo.fov_align import (
@@ -66,6 +68,7 @@ from stereo.fov_align import (
     fov_gate_action,
 )
 from stereo.stereo_mode import optical_axes_angle_deg, resolve_auto
+from sphere_tracker.plugins import default, describe, names
 from sphere_tracker.sources import quiet_repeated_grab_warnings
 
 WINDOW = "stereo calibration"
@@ -283,7 +286,8 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
     return {
         "board": spec.describe(),
         "source": "dir",
-        "method": "chain",
+        # 这条链式流程的方法名从注册表取（唯一声明 same_board 的那个），不写死。
+        "method": single_board_method(),
         # 单板模式：内参段（板可移动）+ 外参段（板不动的参考图各一组），T_AB = I。
         "same_board": bool(getattr(args, "same_board", False)),
         "ref_left": str(getattr(args, "ref_left", "") or "") or None,
@@ -611,7 +615,7 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     mode = "angled"
     print("[模式] chain → stereo_mode=angled（由方法决定，不跟 auto）")
     log.info("chain -> stereo_mode=angled（由方法决定，不跟 auto）")
-    cfg = CalibConfig(method="chain", expected_baseline_mm=args.baseline_mm,
+    cfg = CalibConfig(method=args.method, expected_baseline_mm=args.baseline_mm,
                       rational_model=bool(getattr(args, "rational_model", False)),
                       fix_principal_point=bool(getattr(args, "fix_principal_point", False)))
     try:
@@ -637,7 +641,7 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         return 1
 
     rig = StereoRig.from_result(res, meta=_chain_meta(args, spec, res, size_left))
-    rig.quality["method"] = "chain"
+    rig.quality["method"] = res.method
     rig.quality["rectification"] = res.rectification
     rig.quality["consistency"] = res.consistency
     if not same_board:
@@ -883,10 +887,12 @@ def main() -> int:
                     default="auto",
                     help="双目模式：auto=沿用旧输出模式（无旧文件则 parallel）；"
                          "angled=大角度（近似直角）。实际夹角由标定 R 计算，不写死 90°")
-    ap.add_argument("--method", choices=("joint", "chain"), default="joint",
-                    help="外参求解方法：joint=两路联合求解（需充分共视，平行装置用）；"
-                         "chain=独立单目 + 刚性双板公共参考（90° 用，不需要共视）。"
-                         "angled + joint 且共视<8 对会被拒绝出数")
+    # 选项与默认值都来自标定方法注册表（`calib/methods.py`，R7）——
+    # 这里不再写第二份方法名清单，说明文字直接用注册表里的用户视角 summary。
+    ap.add_argument("--method", choices=names("calib_method"),
+                    default=default("calib_method"),
+                    help="外参求解方法（默认 %(default)s）：" + "；".join(
+                        f"{d['name']}={d['summary']}" for d in describe("calib_method")))
     # ---- chain 的三样输入（本轮只支持离线目录）----
     ap.add_argument("--board-b-dir", default=None,
                     help="chain：右路那块 B 板的图像目录（省略则用 --right-dir）")
@@ -940,7 +946,9 @@ def main() -> int:
     # chain 产出的是 none_raw（未做极线校正）的链式外参；parallel 重建依赖
     # 校正后的极线与视差（`stereo/triangulate.py` 的 dy 门限/视差范围），90° 下
     # 两者都不成立。允许标成 parallel = 让下游静默 0 配对，所以入口就拒绝。
-    if args.method == "chain" and args.stereo_mode == "parallel":
+    # （下面三处校验是**业务规则**，不是分派逻辑；方法的属性从注册表取，不比较名字。）
+    method = method_plan(args.method)
+    if method.rectification == "none_raw" and args.stereo_mode == "parallel":
         ap.error("chain 产出的是未校正标定（none_raw），不能标成 parallel："
                  "parallel 重建依赖校正后的极线与视差，90° 下不成立。")
     # 单板模式没有"两块板"：同框图/同框相机/B 板目录都失去测量对象。
@@ -948,9 +956,9 @@ def main() -> int:
     if args.same_board and (args.pair_frame or args.pair_camera or args.board_b_dir):
         ap.error("--same-board 与 --pair-frame/--pair-camera/--board-b-dir 互斥："
                  "单板模式没有\"两块板\"可测，T_AB 直接取 I。")
-    if args.same_board and args.method != "chain":
-        ap.error("--same-board 只对 --method chain 有意义（joint 需要两路共视）；"
-                 "请加 --method chain。")
+    if args.same_board and not method.same_board:
+        ap.error(f"--same-board 只对需要它的方法有意义（{args.method} 要求两路共视）；"
+                 f"请改用 --method {' / '.join(n for n in names('calib_method') if method_plan(n).same_board)}。")
 
     # 日志要在**做任何事之前**起来：标定失败时最有价值的证据（拒绝了什么、
     # 各拒了多少帧）现在只在内存里，进程一退就没了。
@@ -979,12 +987,13 @@ def main() -> int:
         log.warning("试标定档：target=%d（正式档 40）", args.target)
     log.info("标定板：%s", spec.describe())
     # ---- chain：离线目录流程（不打开相机/视频，也不做 FOV 对齐）----
-    if args.method == "chain":
+    # 分派按注册表声明（`offline_only`），不比较方法名。
+    if method.offline_only:
         if args.same_board:
-            print("方法：chain + 单板（独立单目 + 同一块固定板公共参考，T_AB=I）")
+            print(f"方法：{args.method} + 单板（独立单目 + 同一块固定板公共参考，T_AB=I）")
         else:
-            print("方法：chain（独立单目 + 刚性双板公共参考，不需要两路共视）")
-        log.info("method=chain same_board=%s", args.same_board)
+            print(f"方法：{args.method}（独立单目 + 刚性双板公共参考，不需要两路共视）")
+        log.info("method=%s same_board=%s", args.method, args.same_board)
         return _run_chain(args, spec, log)
 
     print("提示：把板举到**两路都能看到**的位置，慢慢移动，每个姿势停一下（程序只收停稳的帧）")

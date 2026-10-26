@@ -65,7 +65,7 @@ from _common import log_environment, setup_logging  # noqa: E402
 from calib.board import BoardObservation, BoardSpec, detect_board  # noqa: E402
 from calib.capture import CaptureConfig, focus_gate  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
-from sphere_tracker.sources import CameraSource, FileSource  # noqa: E402
+from sphere_tracker.sources import open_source  # noqa: E402
 
 log = logging.getLogger("capture_board")
 
@@ -189,20 +189,28 @@ def _open_source(source: str | None, camera: str | None, args,
                  side: str | None = None):
     """按 ``video:``/``--source*`` / ``--camera*`` / 角色打开一路输入。
 
+    类型判定与装配**全部委托** `sphere_tracker.sources.open_source`：
+    收图器以前自己抄了一份"video: 前缀 = 视频、否则 = 相机"，于是它只认 2 种源，
+    而 `run_video` 认 3 种（图片文件夹在这里会当成相机去开）。现在两边同一份实现。
+
+    ``video:`` 前缀保留原意（**强制**按视频文件打开）；不带前缀时让 `open_source`
+    按路径推断 —— 也就是说图片目录/单张图片现在也能直接喂进来。
+
     失败抛 RuntimeError/FileNotFoundError，由调用方统一转成退出码 1。
     """
     if source:
         raw = str(source)
-        path = raw[len("video:"):] if raw.lower().startswith("video:") else raw
-        return FileSource(path)
+        forced_video = raw.lower().startswith("video:")
+        path = raw[len("video:"):] if forced_video else raw
+        return open_source(path, kind="file" if forced_video else None)
 
     want = camera or side
     index = cr.resolve_camera_arg(want, interactive=False)
     if index is None:
         raise RuntimeError(f"没能把 {want!r} 解析成相机索引；"
                            f"先跑 python apps/tools/cameras.py list --probe")
-    return CameraSource(index=index, width=args.width, height=args.height,
-                        fps=args.fps, backend=_backend_const(args.backend))
+    return open_source(camera=index, width=args.width, height=args.height,
+                       fps=args.fps, backend=_backend_const(args.backend))
 
 
 def _draw_overlay(frame: np.ndarray, spec: BoardSpec, obs: BoardObservation,
@@ -269,7 +277,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--camera-left", default=None, help="--both：左路相机（默认取 left 角色）")
     ap.add_argument("--camera-right", default=None, help="--both：右路相机（默认取 right 角色）")
     ap.add_argument("--source", default=None,
-                    help="视频源：video:<路径> 或直接给路径；只读视频（--both 时用 --source-left/--source-right）")
+                    help="输入源：路径（视频文件/图片文件夹/单张图片，按后缀与目录自动判）；"
+                         "video:<路径> 强制当视频；只读文件（--both 时用 --source-left/--source-right）")
     ap.add_argument("--source-left", default=None, help="--both 自测：左路视频源")
     ap.add_argument("--source-right", default=None, help="--both 自测：右路视频源")
     ap.add_argument("--timeout", type=float, default=0.0,

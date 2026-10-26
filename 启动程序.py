@@ -53,10 +53,18 @@ BG = "#eef2f8"
 # 不再靠"列表首项"这种隐式约定 —— 展示顺序与默认值是两件独立的事。
 from sphere_tracker.detectors import registry as _detector_registry  # noqa: E402,F401  （import 即注册）
 from sphere_tracker.plugins import default as _plugin_default  # noqa: E402
+from sphere_tracker.plugins import describe as _plugin_describe  # noqa: E402
 from sphere_tracker.plugins import names as _plugin_names  # noqa: E402
+
+# 标定方法同理：唯一来源是 `calib/methods.py` 的注册表（规则 R7）。
+from calib.methods import plan as _calib_method_plan  # noqa: E402
+from calib.methods import single_board as _single_board_method  # noqa: E402
 
 METHODS = _plugin_names("detector")
 DEFAULT_METHOD = _plugin_default("detector")
+# 双目标定的「外参方法」下拉：选项与默认值都来自注册表，界面里不再写方法名。
+CALIB_METHODS = _plugin_names("calib_method")
+DEFAULT_CALIB_METHOD = _plugin_default("calib_method")
 PRESETS = ["不使用", "white_ball", "orange_ball", "green_ball",
            "blue_ball", "red_ball", "yellow_ball"]
 # 左右下拉的默认项：直接给**角色名**（left/right），绑定的设备身份不随 USB 口漂移。
@@ -81,6 +89,10 @@ RESOLUTIONS = _video_profile_options()
 # 1920/1280 请求、恒给 2560x1440，且 1440p@30 主循环只有 24.07fps（会丢帧）。
 DEFAULT_RESOLUTION = DEFAULT_VIDEO_PROFILE.label
 CALIB_FPS_DEFAULT = "24"
+# 标定面板的两个对数默认值。写成常量而不是散在控件里的字符串字面量 ——
+# 否则"测试只能靠 grep 字符串"来确认它们，改一下控件类型（StringVar→IntVar）就误报。
+CALIB_TARGET_PAIRS = 40
+CALIB_MIN_PAIRS = 20
 
 # 标定结果：**几何的权威来源**（档案里的 B/D 只是参考估算，见 _refresh_profile_line）。
 CALIB_PATH = ROOT / "config" / "stereo_calibration"
@@ -221,22 +233,31 @@ def chain_capture_cmd(root, stage: str, *, camera, width, height, fps,
 
 
 def chain_calibrate_cmd(root, *, cols, rows, square, width, height, fps,
-                        backend: str, target, min_pairs) -> list[str]:
+                        backend: str, target, min_pairs,
+                        method: str | None = None) -> list[str]:
     """链式标定的 argv。
+
+    ``method`` 决定 `--method` 与要不要补 `--same-board`：默认取注册表里
+    「需要单块固定板」的那个方法（`calib/methods.py` 的 `single_board()`），
+    界面里没有再写一遍方法名。`--same-board` 只在该方法声明需要时追加 ——
+    它是**前置条件**，不是链式流程的装饰。
 
     ⚠️ **不带 `--stereo-mode angled`**：那是「90° 装置」那条路的标记，
     两条路的前提不同，混在一起会让标定脚本按错误假设取画面。
     """
     base = Path(root)
+    plan = _calib_method_plan(method or _single_board_method())
     cmd = [PY, str(ROOT / "apps" / "calibrate_stereo.py"),
-           "--method", "chain", "--same-board",
-           "--left-dir", str(base / "left"),
-           "--right-dir", str(base / "right"),
-           "--ref-left", str(base / "ref_left"),
-           "--ref-right", str(base / "ref_right"),
-           "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-           "--target", str(target), "--min-pairs", str(min_pairs),
-           "--width", str(width), "--height", str(height), "--fps", str(fps)]
+           "--method", plan.name]
+    if plan.same_board:
+        cmd += ["--same-board"]
+    cmd += ["--left-dir", str(base / "left"),
+            "--right-dir", str(base / "right"),
+            "--ref-left", str(base / "ref_left"),
+            "--ref-right", str(base / "ref_right"),
+            "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+            "--target", str(target), "--min-pairs", str(min_pairs),
+            "--width", str(width), "--height", str(height), "--fps", str(fps)]
     if backend and backend != "auto":
         cmd += ["--backend", str(backend)]
     return cmd
@@ -959,9 +980,11 @@ class Launcher(tk.Tk):
         # 分组标题也走 `_hint()`：**行号统一由游标分配**，一处手算都没有。
         self._hint(basic, "① 收多少对（越多越准，40 对约需举板几分钟）")
         self.calib_target = self._param_entry(
-            basic, "目标对数", "40", "收够就自动开始标定（默认 40 = 正式档）")
+            basic, "目标对数", str(CALIB_TARGET_PAIRS),
+            f"收够就自动开始标定（默认 {CALIB_TARGET_PAIRS} = 正式档）")
         self.calib_minpairs = self._param_entry(
-            basic, "最少对数", "20", "少于这么多不做标定；剔除离群后不足会直接拒绝")
+            basic, "最少对数", str(CALIB_MIN_PAIRS),
+            f"少于 {CALIB_MIN_PAIRS} 对不做标定；剔除离群后不足会直接拒绝")
 
         self._hint(basic, "② 标定板（必须和手上那张纸完全一致）")
         self.calib_cols = self._param_entry(
@@ -1158,6 +1181,24 @@ class Launcher(tk.Tk):
                  "且基线 B 应约为工作距离的 2 倍（B≈2·D）。不满足就别用这个大角度入口。")
         self.calib90_note.grid(row=12, column=0, columnspan=9, sticky="w", pady=(0, 2))
         self._wrapped.append((self.calib90_note, "card"))
+        # ---- 外参方法（2026-10-26 加）----
+        # 为什么要有：以前界面根本不传 `--method`，也就是**只有 joint 一条路**，
+        # 而 90° 装置要的 chain 藏在下面的「单板链式标定」卡片里 —— 用户看不到
+        # "这次到底用了哪种解法"，两个入口的说法也各写一份。现在选择点只有这里一个，
+        # 选项与默认值都来自注册表（`calib/methods.py`）。
+        ttk.Label(box, text="外参方法").grid(row=13, column=0, sticky="e", pady=(8, 0))
+        self.calib_method = ttk.Combobox(
+            box, values=CALIB_METHODS, width=10, state="readonly")
+        self.calib_method.set(DEFAULT_CALIB_METHOD)
+        self.calib_method.grid(row=13, column=1, sticky="w",
+                               padx=(4, 12), pady=(8, 0))
+        self.calib_method_note = ttk.Label(
+            box, style="Hint.TLabel", wraplength=CARD_HINT_WRAP,
+            text="；".join(f"{d['name']}={d['summary']}" for d in _plugin_describe("calib_method"))
+                 + "。（chain 要走下面的『单板链式标定』：需要三段离线图，实时采集不支持）")
+        self.calib_method_note.grid(row=14, column=0, columnspan=9,
+                                    sticky="w", pady=(0, 2))
+        self._wrapped.append((self.calib_method_note, "card"))
         self._build_chain_block()
 
     def _build_chain_block(self) -> None:
@@ -2210,6 +2251,12 @@ class Launcher(tk.Tk):
                 "--cols", str(cols), "--rows", str(rows), "--square", str(square),
                 "--target", str(target), "--min-pairs", str(minp),
                 "--width", width, "--height", height, "--fps", fps]
+        # 外参方法：名字与"要不要 --same-board"都由注册表声明决定（不比较方法名）。
+        # 默认（joint）不带 --same-board —— 那是 chain 的前置条件，多带会被脚本拒绝。
+        plan = _calib_method_plan(self.calib_method.get() or DEFAULT_CALIB_METHOD)
+        args += ["--method", plan.name]
+        if plan.same_board:
+            args += ["--same-board"]
         if skip_fov:
             args += ["--skip-fov"]
         # ⚠️ 2026-10-14：这里原来**写死** `--backend msmf`（理由是"MSMF 与设备枚举

@@ -1,5 +1,9 @@
 """视频源：摄像头 / 视频文件 / 单张图片。
 
+三种源登记为 `source` 插件（`camera` / `file` / `images`，默认 `camera`），
+`open_source()` 是**唯一**装配口；`stereo/pair_source.py` 与
+`apps/tools/capture_board.py` 都委托它，不各写一份类型判定。
+
 Windows 上打开摄像头的坑都在这里处理掉了：
   - 后端优先级 DSHOW -> MSMF -> 默认；
   - 设置 MJPG 才能拿到高分辨率高帧率（很多摄像头默认 YUY2 只能 5-10 fps）；
@@ -18,6 +22,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from .plugins import register, resolve
 
 WINDOWS_BACKENDS = [
     ("DSHOW", cv2.CAP_DSHOW),
@@ -915,15 +921,94 @@ class ImageSource(VideoSource):
         return True, frame, t
 
 
-def open_source(path: str | None = None, camera: int | None = None, **kwargs) -> VideoSource:
-    """按路径或摄像头编号打开帧源。"""
-    if path:
-        p = Path(path)
-        if p.is_dir():
-            exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-            files = sorted(f for f in p.iterdir() if f.suffix.lower() in exts)
-            return ImageSource(files, **kwargs)
-        if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}:
-            return ImageSource([p], **kwargs)
-        return FileSource(p)
+# ---------------------------------------------------------------------------
+# 「什么算图片」—— 全项目唯一的答案在这里
+# ---------------------------------------------------------------------------
+#
+# 这份后缀清单原来写了三遍（`open_source` 里两遍 + `stereo/pair_source.py`
+# 的 `IMG_EXT`）。漏改一处的后果不是报错，而是**同一个文件夹在一个入口能读、
+# 在另一个入口读成空**（或者单张图被当成视频打不开）—— 静默的不一致。
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"})
+
+
+def image_files(path: str | Path) -> list[Path]:
+    """`path` 是图片目录 -> 目录里的图片（按名排序）；是单张图片 -> `[它]`；否则 `[]`。"""
+    p = Path(path)
+    if p.is_dir():
+        return sorted(f for f in p.iterdir() if f.suffix.lower() in IMAGE_EXTENSIONS)
+    return [p] if p.suffix.lower() in IMAGE_EXTENSIONS else []
+
+
+def infer_source_kind(path: str | Path) -> str:
+    """**没给 `kind=` 时**靠路径猜类型 —— 全项目唯一一份推断（即重构前的行为）。
+
+    空目录也判 `images`：由 `ImageSource` 报出「没有可用的图片」，
+    比当视频去 `cv2.VideoCapture(目录)` 报「无法打开视频」更能指到问题。
+    """
+    p = Path(path)
+    if p.is_dir() or p.suffix.lower() in IMAGE_EXTENSIONS:
+        return "images"
+    return "file"
+
+
+# ---------------------------------------------------------------------------
+# 三种源注册为 `source` 插件（`docs/插件化架构.md` §3）
+# ---------------------------------------------------------------------------
+# 三个工厂吃同一套参数 `(path=None, camera=None, **kwargs)`：`open_source` 是
+# **唯一**装配口，`stereo/pair_source.py` 与 `apps/tools/capture_board.py` 都委托它。
+# 以前这条装配路径有三份，第三份（`capture_board`）只支持 camera/video。
+
+
+def _build_camera(*, path: str | Path | None = None,
+                  camera: int | None = None, **kwargs) -> VideoSource:
+    """实时相机。`path` 忽略（相机没有路径）；`camera=None` 就是 0 号。"""
     return CameraSource(index=0 if camera is None else camera, **kwargs)
+
+
+def _build_file(*, path: str | Path | None = None,
+                camera: int | None = None, **kwargs) -> VideoSource:
+    """视频文件。**kwargs 不转发 —— 与重构前 `FileSource(p)` 逐字一致。"""
+    if not path:
+        raise ValueError("file 源必须给 path（视频文件路径）")
+    return FileSource(path)
+
+
+def _build_images(*, path: str | Path | None = None,
+                  camera: int | None = None, **kwargs) -> VideoSource:
+    """图片目录（或单张图片）当序列。`fps` 等 kwargs 转给 `ImageSource`。"""
+    if not path:
+        raise ValueError("images 源必须给 path（图片文件夹或单张图片）")
+    files = image_files(path)
+    if not files:
+        raise ValueError(f"没有可用的图片：{path}")
+    return ImageSource(files, **kwargs)
+
+
+# 顺序 = 展示顺序（GUI 下拉/CLI help），首项就是默认项，两者不再是两件事。
+# 默认 `camera`：重构前 `open_source()` 不传任何参数走的就是 CameraSource。
+register("source", "camera", _build_camera,
+         summary="实时相机（默认；接上相机直接跑，可边看边调）", default=True)
+register("source", "file", _build_file,
+         summary="视频文件（录好的片子，离线复算/对拍结果）")
+register("source", "images", _build_images,
+         summary="图片文件夹或单张图片（按文件名排序当序列，逐帧核对/标定）")
+
+
+def open_source(path: str | None = None, camera: int | None = None,
+                kind: str | None = None, **kwargs) -> VideoSource:
+    """按 `kind=`（camera / file / images）或路径/摄像头编号打开帧源。
+
+    三条路，优先级就是用户的意思：
+
+    1. 给了 `kind=` -> 直接查注册表；名字拼错抛 `UnknownPlugin` 并列候选（R3，不猜）；
+    2. 没给 `kind` 但给了 `path` -> 按**旧行为**推断（目录/图片后缀 = images，其余 = file）；
+    3. 都没给 -> 默认项 `camera`（`camera=None` 即 0 号）。
+
+    兼容性：`open_source(p)` / `open_source(camera=0)` 与重构前逐字同行为 ——
+    推断只是"没给 kind 时的兼容路径"，不是主导航。
+    """
+    if kind is not None:
+        return resolve("source", kind)(path=path, camera=camera, **kwargs)
+    if path:
+        return resolve("source", infer_source_kind(path))(path=path, **kwargs)
+    return resolve("source", "camera")(camera=camera, **kwargs)

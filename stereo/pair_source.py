@@ -77,7 +77,12 @@ from sphere_tracker.camera_registry import (
     resolve_camera_arg,
     select_cameras,
 )
-from sphere_tracker.sources import CameraSource, LatestFrameCamera
+from sphere_tracker.sources import (
+    IMAGE_EXTENSIONS,
+    CameraSource,
+    LatestFrameCamera,
+    infer_source_kind,
+)
 
 from .timestamp_pair import (
     canary_safe,
@@ -86,7 +91,6 @@ from .timestamp_pair import (
     sidecar_for_video,
 )
 
-IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 CAMERA_WAIT_TIMEOUT = 5.0        # 等相机出新帧的上限（秒），超时就用已有帧继续
 CAMERA_POLL_INTERVAL = 0.005     # 轮询间隔，比 30 fps 的帧间隔（33 ms）小得多
 # 实时两路各自的采集线程是独立跑的，严格说没有共同帧号。
@@ -220,9 +224,9 @@ class ImageDirFrameReader(FrameReader):
         if not d.is_dir():
             raise NotADirectoryError(f"不是文件夹：{d}")
         self.dir = d
-        self.files = sorted(p for p in d.iterdir() if p.suffix.lower() in IMG_EXT)
+        self.files = sorted(p for p in d.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
         if not self.files:
-            raise RuntimeError(f"文件夹里没有图片（支持 {sorted(IMG_EXT)}）：{d}")
+            raise RuntimeError(f"文件夹里没有图片（支持 {sorted(IMAGE_EXTENSIONS)}）：{d}")
         first = cv2.imread(str(self.files[0]), cv2.IMREAD_COLOR)
         if first is None:
             raise RuntimeError(f"无法读取图片：{self.files[0]}")
@@ -441,14 +445,21 @@ class CameraPairReader(FrameReader):
 
 
 def _make_reader(value, what: str) -> FrameReader:
-    """造一路帧源：文件夹 = 图片序列，其余当视频文件。"""
-    p = Path(value)
-    if p.is_dir():
-        return ImageDirFrameReader(p)
-    if p.suffix.lower() in IMG_EXT:
-        raise RuntimeError(f"{what} 给的是单张图片（{p}），做不了双目；"
-                           f"请给文件夹（directory=）或视频（video=）")
-    return VideoFrameReader(p)
+    """造一路帧源：类型判定**委托** `sources.infer_source_kind`（全项目唯一一份）。
+
+    这里只负责"上位类型 -> 哪个 FrameReader"：`PairSource` 要 `seek()` /
+    `frame_count()`，所以不能用 `sources` 的 `FileSource` / `ImageSource`
+    —— 那是"顺序读"的形状。判定本身照样只有一处，改后缀清单只改 `sources`。
+    """
+    kind = infer_source_kind(value)
+    if kind != "images":
+        return VideoFrameReader(value)
+    try:
+        return ImageDirFrameReader(value)
+    except NotADirectoryError:
+        # 单张图片做不了双目（一帧没有视差）—— 这条提示比 "不是文件夹" 有用
+        raise RuntimeError(f"{what} 给的是单张图片（{value}），做不了双目；"
+                           f"请给文件夹（directory=）或视频（video=）") from None
 
 
 # --------------------------------------------------------------------------

@@ -25,6 +25,7 @@ from __future__ import annotations
 import numpy as np
 
 from .config import PredictConfig
+from .plugins import plugin, resolve
 from .types import TrailPoint, TrackState
 
 
@@ -268,7 +269,11 @@ def predict_kalman(
 
 
 class TrajectoryPredictor:
-    """对外统一入口。"""
+    """对外统一入口。
+
+    `method` 由插件注册表分派（见文件末尾）；未知名字抛 `UnknownPlugin`，
+    **不再静默退回 quadratic** —— 拼错方法名时给个默认值比报错危险得多。
+    """
 
     def __init__(self, cfg: PredictConfig) -> None:
         self.cfg = cfg
@@ -285,9 +290,56 @@ class TrajectoryPredictor:
     ) -> np.ndarray | None:
         if not self.cfg.enable:
             return None
-        if self.cfg.method == "kalman":
-            return predict_kalman(state, self.cfg, dims)
-        return predict_quadratic(
-            trail, self.cfg, dims, residual_tol=residual_tol,
+        return resolve("predictor", self.cfg.method)(
+            trail, state, self.cfg, dims, residual_tol=residual_tol,
             t_now=t_now, gravity_value=gravity_value, t_break=t_break,
         )
+
+
+# ---------------------------------------------------------------------------
+# 注册表（R1：显式注册）
+#
+# 为什么注册在**本模块末尾**、而不是单开 `predictors/registry.py`：
+# 两个实现函数就定义在这里，独立的注册表模块必须 `import predict`，而
+# `predict` 又要 import 注册表才能分派 —— 直接成环。`detectors` 用延迟
+# import 绕开了同类环，但那边有 7 个实现、分文件才划算；这里 2 个实现
+# 一一对应，同模块注册少一层间接，也少一个"忘记 import 注册表"的失败模式。
+#
+# 统一调用签名 `(trail, state, cfg, dims, **kwargs)`：`predict()` 只认这一种，
+# 各实现按需取参数，分派处不再有方法名分支。
+# ---------------------------------------------------------------------------
+@plugin("predictor", "kalman",
+        summary="卡尔曼状态直接外推（最快；匀速/缓变够用，碰撞瞬间略滞后）")
+def _predict_kalman_entry(
+    trail: list[TrailPoint],
+    state: TrackState | None,
+    cfg: PredictConfig,
+    dims: int = 2,
+    **_: object,
+) -> np.ndarray | None:
+    """kalman 项的统一签名：不用历史窗口/重力参数，忽略即可。"""
+    return predict_kalman(state, cfg, dims)
+
+
+@plugin("predictor", "quadratic",
+        summary="加权二次拟合 + 自适应窗口（默认；抛体与反弹都更稳）",
+        default=True)
+def _predict_quadratic_entry(
+    trail: list[TrailPoint],
+    state: TrackState | None,
+    cfg: PredictConfig,
+    dims: int = 2,
+    residual_tol: float | None = None,
+    t_now: float | None = None,
+    gravity_value: float | None = None,
+    t_break: float | None = None,
+) -> np.ndarray | None:
+    """quadratic 项的统一签名：原样转发自适应窗口与重力约束参数。"""
+    return predict_quadratic(
+        trail, cfg, dims, residual_tol=residual_tol,
+        t_now=t_now, gravity_value=gravity_value, t_break=t_break,
+    )
+
+
+# 默认项 = `PredictConfig.method` 的现值（"quadratic"），见 config.py。
+# 注册顺序 kalman / quadratic 与迁移前 `choices=["kalman", "quadratic"]` 一致。

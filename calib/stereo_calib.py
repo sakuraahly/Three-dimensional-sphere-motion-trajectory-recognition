@@ -22,8 +22,15 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from sphere_tracker.plugins import default as _plugin_default
+from sphere_tracker.plugins import names as _plugin_names
+
 from . import metric_check, relative_pose
 from .board import BoardSpec
+from .methods import plan as _method_plan
+
+# 方法名的唯一来源是注册表（`calib/methods.py`，规则 R7）。
+_DEFAULT_METHOD = _plugin_default("calib_method")
 
 # 联合求解（`stereoCalibrate`）在 angled 下**至少**需要这么多对共视数据。
 #
@@ -52,13 +59,11 @@ _CROSS_ROT_WARN_DEG = 1.5
 class CalibConfig:
     """标定配置。默认值按"20-30 对图像、普通 USB 相机"调好的。"""
 
-    # ---- 外参求解方法（2026-10-24 加）----
+    # ---- 外参求解方法（2026-10-24 加；2026-10-26 起由注册表决定默认）----
     #
-    # joint：`cv2.stereoCalibrate` 联合求解。前提是**同一块板同时出现在两路**，
-    #        只对平行/有充分共视的装置成立。
-    # chain：独立单目 + 刚性双板公共参考（T_{C_R←C_L} = T_{C_R←B}·T_{B←A}·T_{A←C_L}）。
-    #        不需要双目共视，90° 装置用它。
-    method: str = "joint"
+    # 可用名字与默认值都来自 `calib/methods.py` 的注册表（`joint` / `chain`），
+    # 这里不再写第二份清单；`--help` 与 `apps/` 的 choices 也从那里取。
+    method: str = _DEFAULT_METHOD
 
     refine_intrinsics: bool = True     # 第 3 步：放开内参整体精化
     rational_model: bool = False       # 用 8 参数畸变模型（视角很广、畸变很大时再开）
@@ -98,12 +103,13 @@ class CalibConfig:
     baseline_tolerance: float = 0.20            # 允许的相对偏差
 
     def __post_init__(self) -> None:
-        # 非法方法名必须**立刻**报错：否则拼错成 "chna" 会悄悄走 joint 分支，
+        # 非法方法名必须**立刻**报错：否则拼错成 "chna" 会悄悄走默认分支，
         # 在 90° 装置上跑出一个看起来正常、其实无意义的解。
-        if self.method not in ("joint", "chain"):
+        known = _plugin_names("calib_method")
+        if self.method not in known:
             raise ValueError(
-                f"CalibConfig.method={self.method!r} 非法：只支持 'joint' / 'chain'"
-                f"（joint=双目联合求解，需两路共视；chain=独立单目+刚性双板公共参考）"
+                f"CalibConfig.method={self.method!r} 非法：只支持 {' / '.join(known)}"
+                f"（用 --help 看每种方法的说明与前置条件）"
             )
 
 
@@ -144,7 +150,7 @@ class StereoCalibrationResult:
     warnings: list[str] = field(default_factory=list)
     board_desc: str = ""
     # ---- 外参求解方法（2026-10-24 加）----
-    method: str = "joint"
+    method: str = _DEFAULT_METHOD
     # "stereo_rectify"：R1/R2/P1/P2 由 cv2.stereoRectify 产出；
     # "none_raw"：chain 产物 —— **未做极线校正**，R1=R2=I、P1/P2 只是
     #             "去畸变 + 原坐标系"的投影矩阵，`Q` 为 None。
@@ -324,7 +330,7 @@ class StereoCalibrationResult:
         """
         s = self.extrinsic_sigma
         if s is None:
-            if self.method == "chain":
+            if self.rectification == "none_raw":
                 return ["外参不确定度  : 无法计算（chain 两路角点不是同名点，"
                         "σ_B 需要两路共视）"]
             return ["外参不确定度  : 无法计算（未传入共视角点）"]
@@ -419,7 +425,8 @@ class StereoCalibrationResult:
         return "\n".join(lines)
 
     def report(self) -> str:
-        if self.method == "chain":
+        # 按**产物口径**分支（而不是方法名）：这份报告的形状只取决于有没有做极线校正。
+        if self.rectification == "none_raw":
             return self._report_chain()
         lines = []
         lines.append("=" * 62)
@@ -738,7 +745,7 @@ def _calibrate_chain(
         T_AB, agg = relative_pose.average_T(provided)
         used_aggregate = True
 
-    res.method = "chain"
+    res.method = cfg.method
     res.n_views_left = len(imgpoints1)
     res.n_views_right = len(imgpoints2)
     res.n_pairs_in = len(imgpoints1) + len(imgpoints2)
@@ -960,22 +967,28 @@ def calibrate_stereo(
     cfg = cfg or CalibConfig()
     spec = spec or BoardSpec()
 
-    # ---- 护栏：angular + joint + 共视不足 -> 拒绝出数 ----
+    # ---- 唯一分派点：方法的行为全部来自注册表（`calib/methods.py`，R7）----
+    method = _method_plan(cfg.method)
+
+    # ---- 护栏：angular + 需要共视的方法 + 共视不足 -> 拒绝出数 ----
     # 必须在"数据不足就 return 空结果"**之前**：否则 3 对数据会得到一个
     # 静默的 ok=False，用户看不出这是"方法不成立"还是"手滑少收了两对"。
     n_covis = min(len(imgpoints1), len(imgpoints2))
-    if (cfg.method == "joint" and stereo_mode == "angled"
+    if (method.needs_covisibility and stereo_mode == "angled"
             and n_covis < MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED):
+        alt = " / ".join(n for n in _plugin_names("calib_method")
+                         if not _method_plan(n).needs_covisibility)
         raise ValueError(
             f"angled 且只有 {n_covis} 对共视数据：宽基线从零优化会被噪声主导，拒绝出数。"
-            f"下一步：用 --method chain（需刚性双板靶标），"
+            f"下一步：用 --method {alt}（需刚性双板靶标），"
             f"或补足 ≥{MIN_COVISIBLE_PAIRS_FOR_JOINT_ANGLED} 对两路同时可见的板。")
 
     res = StereoCalibrationResult(image_size=image_size, board_desc=spec.describe(),
                                   n_pairs_in=len(imgpoints1), method=cfg.method,
                                   stereo_mode=stereo_mode)
-    if cfg.method == "chain":
-        return _calibrate_chain(
+    # `run` 为 None = 主路径（joint）就地继续往下算；有 `run` = 插件提供的分支。
+    if method.run is not None:
+        return method.run(
             objp, list(imgpoints1), list(imgpoints2), image_size, cfg, spec, res,
             stereo_mode=stereo_mode, T_camL_A=T_camL_A, T_AB=T_AB,
             T_camR_B=T_camR_B, T_AB_samples=T_AB_samples, cross_poses=cross_poses,

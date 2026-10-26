@@ -29,12 +29,14 @@ from typing import Any
 
 import numpy as np
 
+from sphere_tracker.plugins import names, plugin, resolve
+
 from .params import StereoRig
 
 SCHEMA_CAMERA = "sphere-camera"
 SCHEMA_RIG = "sphere-stereo-rig"
 VERSION = 1
-FORMATS = ("json", "yaml", "toml")
+# `FORMATS` 在文件后段由注册表生成（见"导出器注册表"一节），这里不写第二份清单。
 
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -187,6 +189,42 @@ def toml_dumps(data: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# 导出器注册表（`exporter`，R1/R7）
+#
+# 三个序列化器都定义在本模块里，所以注册也放在这里：单开
+# `exporters/registry.py` 会变成「注册表 import export，export import 注册表」，
+# 只能再引入延迟 import —— 为一个 3 项的查表多一个失败模式，不划算。
+#
+# 统一签名 `(data) -> str`：`write_export()` 只管"选哪个"，不再关心"怎么序列化"。
+# 默认项 = 迁移前 `else` 分支的行为（toml）。
+# --------------------------------------------------------------------------
+@plugin("exporter", "json", summary="标准 JSON（stdlib 写出，任何语言都能读）")
+def _dump_json(data: dict) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+
+
+@plugin("exporter", "yaml",
+        summary="YAML（人读最舒服；需 PyYAML，缺包时导出前直接报错）",
+        needs=("pyyaml",))
+def _dump_yaml(data: dict) -> str:
+    import yaml  # 依赖由 `write_export()` 预先检查，缺包时一个文件都不写
+
+    return yaml.safe_dump(
+        data, allow_unicode=True, sort_keys=False, default_flow_style=False,
+    )
+
+
+@plugin("exporter", "toml",
+        summary="TOML（默认；内置最小序列化器，无需额外依赖）", default=True)
+def _dump_toml(data: dict) -> str:
+    return toml_dumps(data)
+
+
+# 唯一清单：外部（`export_calibration.py`、help）都从这里取，不再手写。
+FORMATS = tuple(names("exporter"))
+
+
+# --------------------------------------------------------------------------
 # 写文件
 # --------------------------------------------------------------------------
 def _summary(rig: StereoRig, files: list[str]) -> str:
@@ -213,6 +251,10 @@ def write_export(
 
     先校验依赖再动手：请求了 YAML 但没装 PyYAML 时，**一个文件都不写**，
     免得留下半套导出物让人误以为完整。
+
+    格式由 `exporter` 注册表分派（默认 toml）。**2026-10-26 起未知格式报错，
+    不再静默降级为 toml** —— 把拼错的格式悄悄写成 TOML，正是本项目反复吃亏的
+    "看起来成功了"。
     """
     fmts = [str(f).strip().lower() for f in formats if str(f).strip()]
     unknown = [f for f in fmts if f not in FORMATS]
@@ -233,20 +275,11 @@ def write_export(
     out.mkdir(parents=True, exist_ok=True)
 
     written: list[Path] = []
-    names = {"left": "left_camera", "right": "right_camera", "rig": "stereo_rig"}
+    stems = {"left": "left_camera", "right": "right_camera", "rig": "stereo_rig"}
     for fmt in fmts:
         for key in ("left", "right", "rig"):
-            path = out / f"{names[key]}.{fmt}"
-            if fmt == "json":
-                text = json.dumps(data[key], indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-            elif fmt == "yaml":
-                import yaml
-                text = yaml.safe_dump(
-                    data[key], allow_unicode=True, sort_keys=False,
-                    default_flow_style=False,
-                )
-            else:
-                text = toml_dumps(data[key])
+            path = out / f"{stems[key]}.{fmt}"
+            text = resolve("exporter", fmt)(data[key])
             path.write_text(text, encoding="utf-8")
             written.append(path)
 

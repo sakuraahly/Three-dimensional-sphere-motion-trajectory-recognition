@@ -123,7 +123,10 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--horizon", type=float, default=None, help="预测未来多少秒")
     p.add_argument(
-        "--predict", default=None, choices=["kalman", "quadratic"], help="预测方法"
+        "--predict", default=None, choices=method_names("predictor"),
+        help="预测方法（不传则取配置，默认 %s）。可选：%s" % (
+            default_method("predictor"),
+            "；".join(f"{d['name']}={d['summary']}" for d in describe("predictor"))),
     )
     p.add_argument(
         "--gravity-fit", action="store_true", help="三维预测时使用已知重力约束"

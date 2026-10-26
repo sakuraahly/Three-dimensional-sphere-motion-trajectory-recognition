@@ -28,7 +28,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from calib import StereoRig                      # noqa: E402
-from calib.export import FORMATS, write_export    # noqa: E402
+from calib.export import write_export             # noqa: E402
+from sphere_tracker.plugins import names          # noqa: E402
+
+# 默认值与 help 都从注册表取（R7）：这里再写一遍 "json,yaml,toml" 就会漂移。
+_EXPORTERS = names("exporter")
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,8 +41,8 @@ def parse_args() -> argparse.Namespace:
                     help="标定文件前缀（不带扩展名）")
     ap.add_argument("--out", default="outputs/calib_export",
                     help="输出目录（不存在会创建）")
-    ap.add_argument("--formats", default="json,yaml,toml",
-                    help=f"逗号分隔，可选：{','.join(FORMATS)}")
+    ap.add_argument("--formats", default=",".join(_EXPORTERS),
+                    help=f"逗号分隔，可选：{','.join(_EXPORTERS)}")
     return ap.parse_args()
 
 

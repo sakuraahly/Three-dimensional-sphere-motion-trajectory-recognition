@@ -22,12 +22,13 @@ from collections import deque
 import cv2
 import numpy as np
 
+from . import track as _track_plugins  # noqa: F401  import 只为触发 tracker 注册（R1）
 from .camera_motion import GlobalMotionEstimator
 from .config import AppConfig
 from .detectors import build_detector
 from .geometry import CameraModel
+from .plugins import default, resolve
 from .predict import TrajectoryPredictor
-from .track import BallTracker
 from .types import FrameContext, FrameResult, TrailPoint
 from .viz import (
     draw_3d_panel,
@@ -41,13 +42,44 @@ from .viz import (
 
 
 class SpherePipeline:
-    """把各个模块串起来的编排器。"""
+    """把各个模块串起来的编排器。
 
-    def __init__(self, cfg: AppConfig | None = None) -> None:
+    三个实现（检测/跟踪/预测）都是**注入点**（`docs/插件化架构.md` §4）：
+
+    - 不传 = 按配置从注册表取，与重构前**逐字同行为**；
+    - 传了 = 就用传进来的对象，pipeline 不检查类型（只要求满足既有调用面：
+      `detect/reset`、`update/reset`、`predict`）—— 鸭子类型，不为了"类型正确"
+      逼着测试去继承一堆基类。
+
+    为什么要有注入点：单测能塞假实现，不必开相机、不必真跑推理就能验证
+    "编排顺序 / 三维重建 / 画图" 这些 pipeline 自己的职责；反过来，
+    "换一个跟踪器"也不必再改这个文件 —— 改成一行配置（`tracker` 目前只有
+    一种实现，按 R4 取注册表里唯一的默认项，`TrackerConfig` 还没有 method 字段）。
+
+    `predictor` 保留 `TrajectoryPredictor` 这个**门面**（不是某个具体实现）：
+    真正的"按 `cfg.predict.method` 选实现"发生在 `predict.py` 的注册表分派处；
+    pipeline 只认 `.predict(...)`，这样 `enable` 开关与参数映射仍然只有一处实现。
+    """
+
+    def __init__(
+        self,
+        cfg: AppConfig | None = None,
+        *,
+        detector: object | None = None,
+        tracker: object | None = None,
+        predictor: object | None = None,
+    ) -> None:
         self.cfg = cfg or AppConfig()
-        self.detector = build_detector(self.cfg.detector)
-        self.tracker = BallTracker(self.cfg.tracker)
-        self.predictor = TrajectoryPredictor(self.cfg.predict)
+        # 检测器仍走 build_detector：它在 detectors 那层还要做名字别名归一化，
+        # 直接 resolve("detector", …) 会绕过那一层（R7 的清单只有一份）。
+        self.detector = detector if detector is not None else build_detector(self.cfg.detector)
+        self.tracker = (
+            tracker if tracker is not None
+            else resolve("tracker", default("tracker"))(self.cfg.tracker)
+        )
+        self.predictor = (
+            predictor if predictor is not None else TrajectoryPredictor(self.cfg.predict)
+        )
         self.camera: CameraModel | None = None
         self.history3d: deque[TrailPoint] = deque(maxlen=self.cfg.tracker.trail_length)
         self._frame_index = 0

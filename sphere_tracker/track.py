@@ -13,6 +13,7 @@ from collections import deque
 import numpy as np
 
 from .config import TrackerConfig
+from .plugins import plugin
 from .types import Detection, TrailPoint, TrackState
 
 
@@ -426,3 +427,19 @@ class BallTracker:
             if tr.id == self.primary_id:
                 return tr
         return self.tracks[0] if self.tracks else None
+
+
+# ---------------------------------------------------------------------------
+# 注册表（R1：显式注册，import 本模块时执行）
+#
+# 为什么注册在**本模块末尾**、而不是单开 `trackers/registry.py`：
+# 现在只有一种实现，独立注册表模块的唯一作用是"多一次 import 才能分派"，
+# 而漏掉那次 import 的失败模式很难看出来（R1 的注解就是为它写的）。
+# 真出现第二种跟踪器时再拆目录，那时分文件才有收益（与 detectors 同理）。
+# ---------------------------------------------------------------------------
+@plugin("tracker", "ball",
+        summary="卡尔曼 + 最近邻关联（默认；支持多球、短暂遮挡后延续同一轨迹）",
+        default=True)
+def _build_ball_tracker(cfg: TrackerConfig) -> BallTracker:
+    """`tracker/ball` 的工厂：签名统一为 `factory(cfg) -> 实现对象`。"""
+    return BallTracker(cfg)
