@@ -1,0 +1,65 @@
+# 云端的自动门：与本地 `.githooks/pre-push` 跑同一条判据链。
+#
+# ⚠️ **这份文件在写下的那一刻还没有在 runner 上跑过**（2026-10-27）。
+#   本地能验的都验了：
+#     · 干净 checkout 里 `run_tests fast -j 4` → 23/23（104.7s，见交接文档 §27）
+#     · `check_standards` 在干净 checkout 里四类全绿（同上）
+#     · YAML 能被 parser 解析
+#   本地**验不了**的：runner 上有没有 tkinter、opencv 的 wheel 装不装得上、要跑多久。
+#   所以在它第一次真的跑绿之前，**别把"有 CI"当成"代码是好的"** ——
+#   这正是本项目反复踩的"写着的闸门不拦人"。
+#
+# 为什么是 windows-latest 而不是 ubuntu
+# -------------------------------------
+# 3 个测试 import tkinter（entrypoints / launcher_params / task_manager），
+# 项目路径与编码也按 Windows 写的。ubuntu 上这几个必红，而那种红**不是缺陷**，
+# 只会训练人忽略 CI。要么在 Windows 上跑真的，要么不跑。
+#
+# 为什么跑 fast 而不是 full
+# -------------------------
+# `fast` 在**没有 timings.json 的机器上会跑全部 23 个**（除 NEVER_FAST 的
+# `selftest_mutation_guards`）—— 也就是说 CI 上它已经是"除了那个改源码的变异测试，
+# 其余全跑"。变异测试要临时改工作区源码，在 CI 里跑没有额外价值，还慢 100 秒。
+
+name: gate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时取消旧的那次 —— 门要的是"最新一次绿"，不是"每次都跑完"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 本地是 3.14.7；这里稳一档用 3.13 —— opencv 的 cp313 wheel 早就齐了，
+          # 3.14 的还在陆续补齐，CI 不该拿"能不能装上依赖"当不确定性来源。
+          python-version: "3.13"
+          cache: pip
+
+      - name: 装依赖（只装 requirements.txt，不装 AI 后端）
+        run: python -m pip install --upgrade pip -r requirements.txt
+
+      - name: 规范落差自查（引用 / 来源 / 计数 / 待办）
+        run: python apps/tools/check_standards.py
+
+      - name: 回归测试（fast，并行；名单来自 timings.json，缺失时跑全部）
+        run: python apps/run_tests.py fast -j auto
+
+      - name: 存下结果 JSON（失败也存，否则看不出哪一步红的）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: outputs/test_results/
+          if-no-files-found: ignore
