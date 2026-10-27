@@ -337,6 +337,60 @@ def test_run_all_orchestrator() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_every_cli_parses() -> bool:
+    """每个带 argparse 的 app，`--help` 必须能正常退出。
+
+    ## 这条守的是什么（真实事故，2026-10-26）
+
+    改 `apps/record_stereo.py` 时把 `--fps` 的默认值换成常量 `DEFAULT_FPS`，
+    却漏了它本来用 `from sphere_tracker.video_profiles import RECORD_DEFAULT`
+    这一行导入（我的插入判断"看到 video_profiles 就跳过"，正好跳过）。
+    结果是**模块能 import、24 个测试全绿、但 `--help` 一跑就 NameError** ——
+    因为没有任何测试执行过它的 `main()`。
+
+    "能 import" ≠ "能跑"。这条用最便宜的方式补上：真跑一次 `--help`。
+    只挑**含 argparse 的**脚本（纯 GUI 的没有 `--help`，跳过）。
+    """
+    import re as _re
+    import subprocess
+
+    ap = list(Path(ROOT / "apps").glob("*.py"))
+    targets = []
+    for p in ap:
+        if p.name.startswith("_"):
+            continue
+        src = p.read_text(encoding="utf-8", errors="replace")
+        if "argparse.ArgumentParser" in src:
+            targets.append(p)
+
+    bad: list[str] = []
+    skipped: list[str] = []
+    for p in sorted(targets):
+        try:
+            r = subprocess.run([sys.executable, str(p), "--help"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=90, cwd=str(ROOT))
+        except subprocess.TimeoutExpired:
+            bad.append(f"{p.name}: --help 超时（90s）")
+            continue
+        if r.returncode != 0:
+            tail = (r.stderr or r.stdout or "").strip().splitlines()
+            bad.append(f"{p.name}: exit={r.returncode} | {tail[-1] if tail else '无输出'}")
+        elif "usage:" not in (r.stdout or ""):
+            bad.append(f"{p.name}: exit=0 但输出里没有 usage（可能没真解析）")
+
+    for p in ap:
+        if p not in targets:
+            skipped.append(p.name)
+
+    print(f"  带 argparse 的入口 {len(targets)} 个；跳过（无 argparse）{len(skipped)} 个")
+    for line in bad:
+        print(f"    [不达标] {line}")
+    if skipped:
+        print(f"  跳过的：{', '.join(sorted(x for x in skipped if not x.startswith('_')))}")
+    return not bad
+
+
 def main() -> int:
     print("=" * 70)
     print("入口一致性自测（三个入口 -> 同一个测试运行器 / 规范检查器）")
@@ -347,6 +401,7 @@ def main() -> int:
                test_gui_uses_runner,
                test_cli_uses_runner,
                test_agreement_across_entrypoints,
+               test_every_cli_parses,
                test_run_all_orchestrator):
         results.append(fn())
         print()

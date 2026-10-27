@@ -70,7 +70,7 @@ from sphere_tracker.sources import (                         # noqa: E402
     INDEX_BACKEND,
     CameraSource,
 )
-from sphere_tracker.video_profiles import RECORD_DEFAULT      # noqa: E402
+from sphere_tracker.video_profiles import DEFAULT_FPS, RECORD_DEFAULT      # noqa: E402
 from stereo.sessions import (                                # noqa: E402
     CalibrationInfo,
     CameraInfo,
