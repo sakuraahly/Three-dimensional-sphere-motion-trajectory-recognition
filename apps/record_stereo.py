@@ -6,6 +6,23 @@
 但**录制要每一帧都留下**。所以这里自己开两路 `CameraSource`，各跑一个采集线程、
 各写一个 writer，主线程只负责计时 / 预览 / 停止。
 
+为什么不用 `apps._common.add_stereo_source_args`（**别"统一"它们**）
+-------------------------------------------------------------------
+两处都定义了 `--left/--right/--backend/--width/--height/--fps`，看起来像重复，
+但**不是重复，是有意分开**：
+
+- 那个共用函数服务于"**读**现有素材"（`stereo.from_args` 消费）：多给
+  `--auto-cameras`/`--backup-camera`/`--left-video`/`--left-dir` 等 8 个选项；
+- 录制器只**开相机**，一个都读不到（`grep args.` 可验证），其中 `--left-video`
+  出现在**录制**命令里更是纯误导；
+- 两侧默认值语义也不同：共用侧 `--left=None`（= 交给 `auto` 推断），
+  录制侧 `--left="left"`（= 缺省就按角色名开工，双击 bat 直接能录）。
+
+数值层面**已经没有第二个来源**：宽高来自 `video_profiles.RECORD_DEFAULT`、
+帧率来自 `video_profiles.DEFAULT_FPS`（两者都注明"全项目只此一处"）。
+真正的单一是**数值单一**，不是硬把两份 argparse 揉成一份 —— 揉完就得往共用函数里
+塞"录制专用"的帮助文案，耦合方向反而错了。
+
 FOV 生效时（标定 meta 带 `fov`）写盘 / 预览用的是标定的 `fov.target_size`
 （两路共同、**不放大**，当前一对约 1684x978），**不是** `--width/--height`：
 相机仍按 `--width/--height`（2560x1440）打开，再在采集线程里逐帧归一化。
