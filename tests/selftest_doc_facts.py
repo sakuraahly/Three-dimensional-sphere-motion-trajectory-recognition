@@ -284,10 +284,13 @@ def test_whitelist_vanish_and_outside_repo() -> bool:
         print("  [不达标] check_standards.py 不存在")
         return False
     cs = _load_checker()
-    stale, outside_present, runtime_repro = cs.collect_refs()
+    stale, outside_present, outside_absent, runtime_repro = cs.collect_refs()
 
     # ---- ① 白名单无死条目 ----
-    dead = sorted(k for k in cs.KNOWN_MENTIONS if k not in stale)
+    # 走检查器的**唯一实现**（`dead_whitelist_entries`），不在这里再算一遍：
+    # 第一版测试自己写了 `[k for k in KNOWN_MENTIONS if k not in stale]`，
+    # 于是"本机没有 STC 树"那个例外只修进了 check_refs，干净副本里测试照样红。
+    dead = cs.dead_whitelist_entries(stale)
     print(f"  KNOWN_MENTIONS {len(cs.KNOWN_MENTIONS)} 条，命中 {len(cs.KNOWN_MENTIONS) - len(dead)} 条，"
           f"死条目 {len(dead)} 条")
     for k in dead[:10]:
@@ -307,6 +310,10 @@ def test_whitelist_vanish_and_outside_repo() -> bool:
 
     # ---- ③ `STC/` 引用按 `ROOT.parent` 解析 ----
     stc_present = {k: v for k, v in outside_present.items() if v.startswith("STC/")}
+    # 本机没有整棵 `../STC/` 时，那些引用会被**如实归入** outside_absent（不计失效）。
+    stc_absent = {k: v for k, v in outside_absent.items()
+                  if v.replace("\\", "/").startswith("STC/")}
+    probe_runnable = (ROOT.parent / "STC").is_dir()
     leaked = sorted(k for k in stc_present if k in stale)          # 存在却被判失效 = 假阳性
     ghost = sorted(k for k in stale                                # 不存在却没人管 = 漏报
                    if k.split(":")[1].replace("\\", "/").startswith("STC/"))
@@ -338,7 +345,7 @@ def test_whitelist_vanish_and_outside_repo() -> bool:
     try:
         code_cfg, out_cfg = _run(CHECKER, "--quiet")
         # 必须**出现在分类里**（不是被静默吞掉 —— 那和"白名单永久豁免"同样坏）
-        _s, _o, repro_cfg = cs.collect_refs()
+        _s, _o, _oa, repro_cfg = cs.collect_refs()
         cfg_key = f"docs/{CFG_PROBE_DOC.name}:{CFG_PROBE_REF}"
         cfg_classified = cfg_key in repro_cfg
         cfg_in_stale = cfg_key in _s
@@ -352,13 +359,21 @@ def test_whitelist_vanish_and_outside_repo() -> bool:
     checks = [
         ("KNOWN_MENTIONS 没有死条目（白名单不会变成永久豁免）", not dead),
         ("死条目会被 check_refs 报出来（不是只算不用）", caught_vanished),
-        ("仓库外 `STC/` 引用确实按父目录解析到了（不是空集，断言没空跑）",
-         len(stc_present) > 0),
+        # ⚠️ 2026-10-27 改成"两个桶加起来不空"（B-27）。原来是 `len(stc_present) > 0`，
+        # 钉的是"这台机器上恰好有 ../STC" —— 干净 checkout / CI runner 上必然假红。
+        # 判据要守的是"这些引用**有着落**"（要么解析到、要么如实归入『本机没有』），
+        # 而不是"本机恰好装了 STC"。
+        ("仓库外 `STC/` 引用都有下落（解析到 or 归入「本机没有」），断言没空跑",
+         (len(stc_present) + len(stc_absent)) > 0),
         ("`STC/` 里存在的引用**不被**判为失效（P2 假阳性已修）", not leaked),
         ("不存在的 `STC/` 引用没有漏网（要么进 problems，要么在白名单里）",
          all(k in cs.KNOWN_MENTIONS or k in cs.KNOWN_DRIFT for k in ghost)),
-        ("新造一处不存在的 `STC/` 引用会让检查器报红", code != 0),
-        ("并且指出了那个路径（不只是「有错」）", caught_stc),
+        # 反过来：**树不在**时这条自证本来就不该跑（判据被环境关掉了），
+        # 明确标成"跳过"而不是假装通过 —— 与相机测试的口径一致。
+        ("新造一处不存在的 `STC/` 引用会让检查器报红"
+         + ("" if probe_runnable else "［跳过：本机没有 STC 树］"),
+         code != 0 if probe_runnable else True),
+        ("并且指出了那个路径（不只是「有错」）", caught_stc if probe_runnable else True),
         ("删掉探针后恢复通过（不是靠永久豁免过的）", code2 == 0),
         ("`config/` 是不存在的路径时**也不阻断**（可再生产物不升级成硬承诺）",
          code_cfg == 0),

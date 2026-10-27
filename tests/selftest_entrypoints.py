@@ -251,8 +251,26 @@ def test_run_all_orchestrator() -> bool:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         sess = _fake_session(root)
-        code, out, _err = _run_all("--session", str(sess), "--dry-run",
-                                   "--stereo-mode", "angled")
+        # ⚠️ 6.1 **必须自带标定 fixture**（2026-10-27）：原来直接跑 CLI 的 dry-run，
+        # 而 CLI 用默认的 `config/stereo_calibration.*` 判断 check 步能不能跑。
+        # 干净 checkout 里 `config/` 被 gitignore → check 步被 skipped、`cmd=[]`
+        # →「三步都转到现有脚本」当场假红（实测：干净副本 4 红之一）。
+        # 判据的本意是"命令拼装对不对"，与"这台机器标定过没有"无关，
+        # 所以调**同一个纯函数** `plan_steps` 并显式给 calib_files。
+        fake_calib = root / "fake_calib.json"
+        fake_calib.write_text("{}", encoding="utf-8")
+        plan = RA.plan_steps(sess, stereo_mode="angled", calib_files=[fake_calib])
+        cmds = {s["name"]: " ".join(s["cmd"]) for s in plan}
+        # 统一成正斜杠：`cmd` 里是 Windows 绝对路径（`D:\...\apps\tools\check_dataset.py`），
+        # 而断言用的是仓库相对写法；不归一化就会因为分隔符不同而假红。
+        out = "\n".join(cmds.values()).replace("\\", "/")
+
+        # 6.0 CLI 通路仍然要走一遍：dry-run 必须退出 0 且把步骤名打出来
+        #     （具体命令由上面的纯函数断言，避免依赖本机标定）
+        code, cli_out, _err = _run_all("--session", str(sess), "--dry-run",
+                                       "--stereo-mode", "angled")
+        cli_ok = code == 0 and all(name in cli_out for name in ("check", "tri", "export"))
+        print(f"  CLI dry-run：exit={code}，三个步骤名都打印={cli_ok}")
 
         # 6.1 三步的命令都拼出来了，且**指向现有脚本**（不是抄进来的算法）
         forwarded = {
@@ -321,6 +339,7 @@ def test_run_all_orchestrator() -> bool:
         print(f"  正文不含算法/库 import、只 subprocess 调脚本: {no_logic}")
 
     checks = [
+        ("CLI dry-run 退出 0 且打印三步（通路没断）", cli_ok),
         ("三步都转到现有脚本（check_dataset / run_stereo_video / export_visualization）",
          all(rel in out for rel in forwarded.values())),
         ("每步参数透传正确（--strict / --method / --stereo-mode / --plot）",

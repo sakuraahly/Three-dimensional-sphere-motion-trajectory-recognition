@@ -320,6 +320,24 @@ def test_mono_ok_but_stereo_explodes() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def _synthetic_rig() -> StereoRig:
+    """造一套**能存盘**的假标定 —— 只用于测 `save()` 的备份行为。
+
+    为什么不读本机真标定（2026-10-27）：这一节要测的是"覆盖前有没有留旧文件"，
+    与这台机器标定到多少毫米**毫无关系**。原来 `StereoRig.load("config/stereo_calibration")`
+    直接读真文件，于是在干净 checkout（`config/` 被 gitignore）里**整个测试崩在
+    FileNotFoundError**，连带 `run_tests fast` 报红 —— 实测这是"干净副本 4 红"之一。
+    """
+    import numpy as _np
+    K = _np.array([[800.0, 0.0, 640.0], [0.0, 800.0, 360.0], [0.0, 0.0, 1.0]])
+    D = _np.zeros(5)
+    return StereoRig(
+        K1=K.copy(), D1=D.copy(), K2=K.copy(), D2=D.copy(),
+        R=_np.eye(3), T=_np.array([[-0.07], [0.0], [0.0]]),   # 基线 70 mm
+        image_size=(1280, 720),
+    )
+
+
 def test_save_backs_up_previous() -> bool:
     """第 3b 节：覆盖保存前必须留一份旧标定（2026-10-26 真实事故后加的）。
 
@@ -330,7 +348,7 @@ def test_save_backs_up_previous() -> bool:
     import tempfile
     print("----- 3b. 覆盖保存前自动备份 -----")
     d = _pl.Path(tempfile.mkdtemp())
-    rig = StereoRig.load("config/stereo_calibration")
+    rig = _synthetic_rig()          # 不再读本机真标定：见 _synthetic_rig 的说明
     target = d / "stereo_calibration"
 
     rig.save(target)

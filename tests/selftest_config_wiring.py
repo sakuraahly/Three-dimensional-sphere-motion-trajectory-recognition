@@ -573,6 +573,14 @@ def test_baseline_in_profile_is_reference_only() -> bool:
                 "notes": "", "created": "2026-10-24T00:00:00"}}},
             ensure_ascii=False), encoding="utf-8")
 
+        # ⚠️ 也要自带一份"标定实测"（2026-10-27）：这一节的判据是
+        # 「标定实测排在参考之前」，没有标定就没有那一行，定位比较会拿 -1 去比 → 假红。
+        # 干净 checkout 里 `config/` 是空的（gitignore），实测就是 4 红之一。
+        # 造一份只带 `baseline_mm` 的 json：`_calibration_measured` 在缺 .npz 时
+        # 会退回读这个字段（角度留空），足够触发"权威在前"的排序。
+        fake_calib = Path(tmp) / "stereo_calibration.json"
+        fake_calib.write_text(json.dumps({"baseline_mm": 124.0}), encoding="utf-8")
+
         code = (
             "import sys\n"
             f"sys.path.insert(0, {str(ROOT)!r})\n"
@@ -584,6 +592,7 @@ def test_baseline_in_profile_is_reference_only() -> bool:
             f"{str(tool)!r})\n"
             "m = importlib.util.module_from_spec(spec)\n"
             "spec.loader.exec_module(m)\n"
+            f"m.CALIBRATION_PATH = Path({str(fake_calib)!r})\n"
             "sys.argv = ['check_stereo_setup.py', '--profiles-only']\n"
             "raise SystemExit(m.main())\n"
         )

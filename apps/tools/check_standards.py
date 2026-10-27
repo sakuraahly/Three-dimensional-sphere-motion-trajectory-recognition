@@ -165,8 +165,14 @@ OUTSIDE_REPO_MARK = "STC"
 # 实测 `mv config/camera_modes.json` 后本工具报"实际失效 3 处"、exit 1。
 # 换台机器、清一次缓存、重标一次，就会误红。豁免挂在单条 mention 上时，
 # 它的寿命取决于"此刻磁盘上有没有那个文件"，这本身就是漂移。
+#
+# 2026-10-27 扩到 `outputs/`：理由完全一样 —— 它同样**整目录不入库**
+# （`AGENTS.md` §3 规则 3），所以任何机器上都没有义务存在。文档里引它是在说
+# "去哪儿找证据"，不是承诺"这个文件必须在"。实测：干净 checkout 里
+# `docs/团队角色与派发记录.md` 等引了 24 处 `outputs/...`，全部被判失效 →
+# `check_standards` 红 → `selftest_doc_facts` 跟着红。
 # --------------------------------------------------------------------------
-RUNTIME_REPRO_MARK = "config"
+RUNTIME_REPRO_MARK = ("config", "outputs")
 
 
 def doc_files() -> list[Path]:
@@ -248,8 +254,8 @@ def _iter_refs():
 
 
 def _is_runtime_reproducible(parts: list[str]) -> bool:
-    """候选路径首段是 `config/` → 属**运行期可再生产物**，不参与"承诺/失效"判定。"""
-    return parts[0] == RUNTIME_REPRO_MARK
+    """候选路径首段是 `config/` / `outputs/` → **运行期可再生产物**，不参与"承诺/失效"判定。"""
+    return parts[0] in RUNTIME_REPRO_MARK
 
 
 @functools.lru_cache(maxsize=1)
@@ -279,30 +285,39 @@ def _repo_basenames() -> frozenset[str]:
     return frozenset(names)
 
 
-def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
-    """扫一遍文档，返回 (失效引用, 仓库外但确实存在的引用, 运行期可再生产物)。
+def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]:
+    """扫一遍文档，返回 (失效引用, 仓库外但确实存在的引用, **本机没有的外部资产**, 运行期可再生产物)。
 
-    三者的差别就是 P1 那条自相矛盾的修法：
-    **存在的不算失效**，只有"不存在"的才进第一个返回值 —— 于是
-    "扫到的失效数"与"进入 problems 的条数"天然同口径。
+    四者的差别就是几次"检查器自己不可移植"的修法：
 
-    第三类（`config/`）**先于存在性判定**分流，所以它**永远**不进第一个返回值：
-    文件在不在都不影响结论。这正是 2026-10-24 那个回归的修法 ——
-    豁免挂在"路径类别"上，而不是挂在"此刻文件是否存在"上。
+    - **存在的不算失效**，只有"不存在"的才进第一个返回值 —— 于是
+      "扫到的失效数"与"进入 problems 的条数"天然同口径。
+    - `config/`（第三变第四类）**先于存在性判定**分流，所以它**永远**不进第一个返回值：
+      文件在不在都不影响结论（2026-10-24 的回归就是这么修的）。
+    - **"整棵外部资产不在本机" ≠ "引用失效"**（2026-10-27，B-27）：
+      `STC/` 在仓库外，别人的机器 / CI runner / 全新 checkout 上**整棵树都不在**。
+      第一版把这 4 处当作失效 → 干净副本里 `check_standards` 直接红 →
+      `selftest_doc_facts` 跟着红（实测"干净副本 4 红"之一）。
+      判据应当是"**树在、文件没了**"才算漂移；树根本不在，属于环境事实，如实归类即可。
     """
     literals = _src_literals()
     found: dict[str, str] = {}
     outside_present: dict[str, str] = {}
+    outside_absent: dict[str, str] = {}
     runtime_repro: dict[str, str] = {}
+    outside_tree = ROOT.parent / OUTSIDE_REPO_MARK
     for rel, raw, lineno, line, cand, parts in _iter_refs():
         key = f"{rel}:{raw}"
         detail = f"L{lineno}: {line.strip()[:100]}"
         outside = _outside_path(cand)
         if outside is not None:
             # 仓库外：按父目录解析。存在 → 归类"仓库外（存在）"，**不计入失效**；
-            # 不存在 → 计入失效（白名单之外的会进 problems）。
+            # 整棵树不在 → 归类"本机没有该外部资产"，**也不计入失效**；
+            # 只有"树在、文件没了"才计入失效（白名单之外的会进 problems）。
             if outside.exists():
                 outside_present[key] = outside.relative_to(ROOT.parent).as_posix()
+            elif not outside_tree.is_dir():
+                outside_absent[key] = cand
             else:
                 found[key] = detail
             continue
@@ -315,7 +330,7 @@ def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
         if len(parts) == 1 and parts[0] in _repo_basenames():
             continue
         found[key] = detail
-    return found, outside_present, runtime_repro
+    return found, outside_present, outside_absent, runtime_repro
 
 
 def collect_stale_refs() -> dict[str, str]:
@@ -330,6 +345,29 @@ def outer_mentions(stale: dict[str, str]) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------
+def dead_whitelist_entries(stale: dict[str, str]) -> list[str]:
+    """`KNOWN_MENTIONS` 里"已不再命中任何失效引用"的条目。
+
+    **唯一实现**：`check_refs()` 与 `tests/selftest_doc_facts.py` 都调这里 ——
+    这条规则第一次是各写一份的（测试自己又算了一遍），于是"树不在本机"那个例外
+    只修进了一边，干净副本里测试照样红。规则有两份 = 迟早对不上。
+
+    例外：白名单里指向**仓库外资产**（`STC/`）的条目，在"整棵树不在本机"时
+    本来就无从命中（它被归进 `outside_absent`，不是 `stale`）。
+    把它们判成"死条目"等于要求"这台机器必须装 STC" —— 又一条环境断言。
+    """
+    dead = sorted(k for k in KNOWN_MENTIONS if k not in stale)
+    if not dead or (ROOT.parent / OUTSIDE_REPO_MARK).is_dir():
+        return dead
+    outside_keys = [
+        k for k in dead
+        if OUTSIDE_REPO_MARK in k.split(":")[1].replace("\\", "/").split("/")[0]]
+    if outside_keys:
+        print(f"  （本机没有 {OUTSIDE_REPO_MARK}/ 树，白名单里 {len(outside_keys)} 条"
+              f"指向它的条目无从命中，不算「死条目」）")
+    return [k for k in dead if k not in outside_keys]
+
+
 def check_refs(verbose: bool) -> list[str]:
     """A 类：引用 vs 谈及。
 
@@ -338,7 +376,7 @@ def check_refs(verbose: bool) -> list[str]:
     "报告 23 处失效 / 同时判定全部通过"这种自相矛盾的输出 —— 守漂移的工具自己漂了。
     """
     print("----- A. 文档里的仓库路径引用 -----")
-    stale, outside_present, runtime_repro = collect_refs()
+    stale, outside_present, outside_absent, runtime_repro = collect_refs()
     outside_missing = outer_mentions(stale)
     inside = {k: v for k, v in stale.items() if k not in outside_missing}
     known = set(KNOWN_MENTIONS) | set(KNOWN_DRIFT)
@@ -347,6 +385,10 @@ def check_refs(verbose: bool) -> list[str]:
 
     print(f"  STC/ 引用（仓库外，按 {ROOT.parent.name}/ 解析）："
           f"存在 {len(outside_present)} 处（不计失效）、不存在 {len(outside_missing)} 处（计入失效）")
+    if outside_absent:
+        print(f"  本机没有整棵 {OUTSIDE_REPO_MARK}/（{ROOT.parent.as_posix()}）—— "
+              f"{len(outside_absent)} 处引用**如实归类但不计失效**"
+              f"（别人的机器/CI 上本来就没有这棵树，不是漂移）")
     if verbose:
         for k in sorted(outside_present):
             print(f"    [仓库外（存在）] {k} -> {outside_present[k]}")
@@ -380,7 +422,7 @@ def check_refs(verbose: bool) -> list[str]:
                         "请从 check_standards.py 的 KNOWN_DRIFT 里删掉，"
                         "否则它会变成永久豁免：\n"
                         + "\n".join(f"    · {k}" for k in vanished))
-    dead_mentions = sorted(k for k in KNOWN_MENTIONS if k not in stale)
+    dead_mentions = dead_whitelist_entries(stale)
     if dead_mentions:
         # 与 KNOWN_DRIFT 同理：白名单只增不减就会变成永久豁免。
         # 条目为什么"死"通常是好理由（文档删了那句、或那个文件真的补上了），
@@ -402,13 +444,28 @@ def check_refs(verbose: bool) -> list[str]:
 
 
 def check_sources(verbose: bool) -> list[str]:
-    """C 类：`AGENTS.md` 引用的规范文件是否真的存在。"""
+    """C 类：`AGENTS.md` 引用的规范文件是否真的存在。
+
+    ⚠️ **外部资产的两种"没有"必须分开**（2026-10-27）：
+    `STC/` 在仓库**外面**（`..\\STC\\`，属用户的其他资产）。全新 checkout 或别人的机器上
+    **整棵树都不在**，这不叫漂移；而"树在、某个文件没了"才是真的漂移。
+    第一版把两者都判红，后果是：`git archive` 出来的干净副本里 `check_standards` 直接红，
+    连带 `selftest_doc_facts` 也红 —— **CI 上线第一天就挂，而且挂得莫名其妙**。
+    实测过（B-27）：干净副本 23 个测试里 4 红，这条是其中之一。
+    """
     print("----- C. 规范来源是否存在 -----")
     text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     stc_refs = sorted(set(re.findall(r"`(STC[/\\][^`]+)`", text)))
     problems: list[str] = []
     # `STC/` 在仓库外（`..\STC\`），所以按**父目录**去找
     outside_root = ROOT.parent
+    stc_tree = outside_root / "STC"
+    if stc_refs and not stc_tree.is_dir():
+        print(f"  （本机没有仓库外的 {stc_tree.as_posix()} —— STC 属用户其他资产，"
+              f"C 类跳过，不算漂移）")
+        print(f"    引用 {len(stc_refs)} 处：{', '.join(stc_refs[:3])}"
+              f"{' …' if len(stc_refs) > 3 else ''}")
+        return []
     for ref in stc_refs:
         cand = outside_root / ref.replace("\\", "/")
         ok = cand.exists()
