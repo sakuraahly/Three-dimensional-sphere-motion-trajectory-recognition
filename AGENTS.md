@@ -236,7 +236,7 @@ apps / tests                        （只调用，不被调用）
 
 ```powershell
 启动程序.bat test              # fast 档：跳过三个慢测试（mutation_guards / stereo_calib / synthetic）
-启动程序.bat test full         # 全套 24 个（改代码后必跑，约 6 分钟）
+启动程序.bat test full         # 全套 24 个（改代码后必跑；串行约 8.5 分钟）
 启动程序.bat test full -j 6    # 同上但并行 6 路，约 3.3 分钟（结果与串行一致）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
