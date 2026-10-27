@@ -309,6 +309,10 @@ def main() -> int:
                     help="specular 的 seeds.json（默认自动用 <session>/derived/seeds.json）")
     ap.add_argument("--seed-frame", type=int, default=0,
                     help="specular 在第几帧初始化（默认 0；种子坐标要对应这一帧）")
+    ap.add_argument("--out", default=None, metavar="DIR",
+                    help="把产物写到这个目录（traj3d.csv / annotated.mp4 / 预测 / 世界系）。"
+                         "不给就写回 <session>/derived —— 做对照实验时用它，"
+                         "免得每次覆盖上一次的结果")
     ap.add_argument("--detect-width", type=int, default=0,
                     help="检测缩到多宽（0=原图；真实纹理下 hough 建议 960）")
     ap.add_argument("--min-radius", type=float, default=8.0)
@@ -569,8 +573,16 @@ def main() -> int:
     else:
         epi = 2.5 if args.max_epipolar is None else args.max_epipolar
         rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=epi))
-    out_dir = session_dir / "derived"
+    # `--out` 让产物**不落在会话目录里**（2026-10-27 补）。
+    #
+    # 为什么需要：做对照实验时（换方法 / 换 seed / 换门限）会连着跑好几次，
+    # 每次都覆盖 `<session>/derived/`，上一次的结果就没了 —— 要么手工 `cp` 到别处
+    # （实测就是这么干的，完事还得记着删），要么反复跑同一份数据。
+    # 现在的约定：**不给 `--out` 就还是老行为**（写回会话目录），给了就全写进去。
+    out_dir = Path(args.out) if args.out else (session_dir / "derived")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.out:
+        print(f"[输出] 产物写到 {out_dir}（会话目录保持干净）")
     # 部分帧试跑不要把正式的 traj3d.csv / annotated.mp4 覆盖成 0.17 s
     partial = f"_first{args.max_frames}" if args.max_frames else ""
     csv_path = out_dir / f"traj3d{partial}.csv"
