@@ -154,7 +154,9 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 ## 5. 依赖方向（单向，禁止反向）
 
 ```
-config / types / geometry          （最底层，不依赖任何本项目模块）
+plugins                             （最底层：只认 kind → name → 工厂，不 import 本项目任何模块）
+    ↑
+config / types / geometry          （不依赖任何本项目模块）
     ↑
 detectors/  camera_motion/
     ↑
@@ -167,11 +169,19 @@ calib → stereo                      （双目，依赖库但不被库依赖）
 apps / tests                        （只调用，不被调用）
 ```
 
+- **`plugins` 在链条最底**：它只维护"有哪些实现"，不认识任何具体实现，也不 import 上游。
+  各模块**自己**在 import 时往它登记（`detectors/registry.py`、`predict.py` 尾部、
+  `calib/methods.py` 等），因此依赖方向不变 —— 是"同名登记"而不是"上层反向依赖"。
+- **新增一种实现 = 新建一个文件 + 一行 `@plugin(...)`**。**禁止**在任何入口、`choices=`、
+  帮助文本、`config.py` 注释里再手写名字清单：那份清单只准有注册表一份
+  （`tests/selftest_plugins.py` 用 AST 扫，出现即判红）。
 - `camera_registry` 与 `sources` 同层：只**惰性** import 一次 `sources`
   （`camera_registry.py:397`），其余只用标准库；反过来 `sources` 不 import 它，不成环。
 - **反向依赖**（如 `geometry.py` 去 import `pipeline`）会立刻把项目变成一团乱麻。
+  库层（`sphere_tracker/` `calib/` `stereo/`）**不许** import `apps/` —— 由同一条 AST 测试守着。
 - **模块划分已经审计过：分层清晰、无循环依赖 → 不做大改。**
   不要为了"整洁"重排目录；`sources.py` 是下一个拆分候选，但**别为了拆而拆**。
+
 
 ---
 
@@ -183,7 +193,7 @@ apps / tests                        （只调用，不被调用）
 | `docs/项目总纲.md` | 项目是什么、文档怎么配合、术语 | 建立全局印象 |
 | `docs/交接文档.md` | 现状、代码地图、**踩坑（最值钱）**、命令速查 | 动代码之前 |
 | `docs/开发指南.md` | 环境、怎么加东西、方法论 | 要改代码 |
-| `docs/插件化架构.md` | 检测器 / 预测器 / 标定方法的注册表、扩展点与注入点（设计已定、分阶段落地中） | 要新增一种实现 / 改出厂默认 |
+| `docs/插件化架构.md` | **六个扩展点的注册表**（检测器 / 预测器 / 视频源 / 标定方法 / 导出 / 跟踪器）、七条规则、注入点（**已落地**） | 要新增一种实现 / 改出厂默认 |
 | `docs/文件结构.md` | 目录逐项说明 | 不确定东西放哪 |
 | `docs/数据标准.md` | seed / traj3d / visualization 的 JSON schema、坐标系、版本规则 | 接数据、写可视化、换格式 |
 | `docs/3D查看器.md` | 读 visualization.json 的查看器用法/控件/限制 | 要看三维轨迹 |

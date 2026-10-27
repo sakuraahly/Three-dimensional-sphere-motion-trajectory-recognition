@@ -15,6 +15,54 @@
 
 **范围与前提**：本文只覆盖三个库包（`apps/`、`tests/`、启动器、PPT 工具链不在范围内）；文中"实测数字"引自源码注释或既有文档，我**没有**重跑那 6 个 selftest。
 **真机标定跑过，但还没有一次可用的结果**（2026-10-14 更正，原写"从未跑过"）：10-10 那轮 8 对判**不可用且未保存**（双目 RMS 46.40 px、基线 199.67 mm vs 实测 65 mm）；10-13 那轮 25 对里 22 对可用、基线 67.28 mm 只差实测 3.5%，但**两路分辨率错配**（1280x720 vs 1920x1080）所以那份 R/T 不能用。详见 `交接文档.md` §11.3、§12.2、§13.2。
+## 0b. `sphere_tracker/plugins.py` —— 实现注册表（**新增一种实现前先读这节**）
+
+一张全局表：`kind → name → 工厂`。检测器 / 预测器 / 视频源 / 标定方法 / 导出格式 / 跟踪器
+**全部**从这张表里选，不再有 if 链、也不许在别处手写名字清单。
+
+| 函数 | 签名 | 行为 |
+| ---- | ---- | ---- |
+| `plugin` | `plugin(kind, name, *, summary, default=False, needs=(), replace=False)` | 装饰器，登记工厂并**返回原对象** |
+| `register` | 同上（把 `factory` 作为位置参数传入） | 非装饰器写法 |
+| `resolve` | `resolve(kind, name)` | 返回工厂。**找不到抛 `UnknownPlugin`**（`LookupError` 子类），消息里带 kind、请求的名字、全部候选、以及候选的来源模块；**绝不 fallback 到默认** |
+| `names` | `names(kind) -> list[str]` | 注册顺序即展示顺序；GUI 下拉、`argparse choices`、`--help` 都用它 |
+| `default` | `default(kind) -> str` | 该 kind 的默认名。零个或多于一个 `default=True` 都抛错（**不许靠 import 顺序决定默认**） |
+| `describe` | `describe(kind) -> list[dict]` | `[{name, summary, needs, is_default}]`，给 GUI tooltip / CLI help 用 |
+| `clear` | `clear()` | **仅测试用**，清空全表 |
+
+**调用方必须遵守的三条**（违反任一条都会被 `tests/selftest_plugins.py` 抓到）：
+
+1. **别猜名字**：选项一律 `names(kind)`，默认一律 `default(kind)`。手写 `choices=("color","hough",…)`
+   会让不同入口悄悄不一致（历史上四份检测器清单就是 7/5/4/6 四个数）。
+2. **别吞 `UnknownPlugin`**：用户拼错名字时要报错并给候选，不要退化成"那就用默认吧"。
+3. **别在 `sphere_tracker/`、`calib/`、`stereo/` 里 import `apps/`**（AST 测试守着）。
+
+**当前六类的实际内容**（2026-10-26；以 `python -c "from sphere_tracker.plugins import *; print(names('detector'))"` 为准）：
+
+| kind | 成员 | 默认 |
+| ---- | ---- | ---- |
+| `detector` | color / specular / hough / motion / fusion / yolo / yolo_sam | `color` |
+| `predictor` | kalman / quadratic | `quadratic` |
+| `source` | camera / file / images | `camera` |
+| `calib_method` | joint / chain | `joint` |
+| `exporter` | json / yaml / toml | `toml` |
+| `tracker` | ball | `ball` |
+
+**新增一种实现的三步**（这就是插件化要买到的东西）：
+
+```python
+# 1. 新建文件，写实现
+# 2. 在实现所在模块登记（import 即生效；不要在 plugins.py 里集中登记，否则它会反向依赖具体实现）
+@plugin("detector", "my_detector", summary="一句话说明什么场景用它")
+def _build(cfg): return MyDetector(cfg)
+# 3. 跑 python tests/selftest_plugins.py
+```
+
+> ⚠️ **`summary` 是必填的**（空串视为缺失会报错）：它直接当 CLI 帮助与 GUI 提示用，
+> 缺了就是"用户看到一个没有说明的选项"。
+> ⚠️ **`needs=(...)`** 用来声明可选依赖（如 `ultralytics`）。它的语义是"没装也能出现在列表里，
+> 但构造/运行时要给明确提示" —— 不要在 import 阶段就炸，那会让 GUI 列不出这一项。
+
 ## 1. `sphere_tracker/config.py` —— 全部可调参数
 ```python
 class ColorConfig:  @staticmethod preset(name: str) -> "ColorConfig"
