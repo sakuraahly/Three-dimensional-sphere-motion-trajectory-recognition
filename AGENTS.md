@@ -123,7 +123,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | 标定与录制（3） | `record_stereo.py` `calibrate_stereo.py` `verify_stereo.py` | 双路录制（含 session.json）/ 自动标定 / 标定复检 |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（7） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` | 不是入口，被上面那些 import（日志与取帧 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算） |
+| 私有模块（7） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
