@@ -44,8 +44,7 @@ from sphere_tracker import camera_registry as cr
 from sphere_tracker import video_profiles
 from sphere_tracker.config import AppConfig, ColorConfig, load_config, save_config
 from sphere_tracker.detectors import build_detector
-from sphere_tracker.plugins import default as default_method
-from sphere_tracker.plugins import describe, names as method_names
+from sphere_tracker.plugins import names as method_names   # 按键轮换检测方法要用
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import (
     INDEX_BACKEND,
@@ -54,7 +53,7 @@ from sphere_tracker.sources import (
     quiet_repeated_grab_warnings,
 )
 from sphere_tracker.stats import FramePump, Health
-from apps._common import log_environment, setup_logging
+from apps._common import add_mono_pipeline_args, log_environment, setup_logging
 from apps._window import WindowManager
 
 _log = logging.getLogger("realtime")
@@ -92,44 +91,17 @@ def parse_args() -> argparse.Namespace:
                    help=f"采集宽度（默认档 {video_profiles.DEFAULT.label}）")
     p.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
                    help=f"采集高度（默认档 {video_profiles.DEFAULT.label}）")
-    p.add_argument("--fps", type=int, default=24,
-                   help="相机采集帧率（默认 24）。1440p 全尺寸写盘约 24fps；"
+    p.add_argument("--fps", type=int, default=video_profiles.DEFAULT_FPS,
+                   help=f"相机采集帧率（默认 {video_profiles.DEFAULT_FPS}）。"
+                        "1440p 全尺寸写盘约 24fps；"
                         "FOV 对齐后写盘 1718x972 时 30fps 实测稳定")
-    p.add_argument(
-        "--method",
-        default=None,
-        choices=method_names("detector"),
-        help="检测方法（不传则取配置，默认 %s）。可选：%s" % (
-            default_method("detector"),
-            "；".join(f"{d['name']}={d['summary']}" for d in describe("detector"))),
-    )
-    p.add_argument(
-        "--preset",
-        default=None,
-        help="颜色预设：white_ball / orange_ball / green_ball / blue_ball / red_ball / yellow_ball",
-    )
-    p.add_argument("--config", default=None, help="读取 JSON 配置（标定结果）")
+    # 八个流水线参数与 `run_video.py` **同源**（`apps/_common.py`）：
+    # --config / --method / --preset / --ball-diameter / --focal /
+    # --predict / --horizon / --gravity-fit。原来这边是"全的"、离线那边是"残的"，
+    # 两边说明对不上；见该函数的 docstring。
+    add_mono_pipeline_args(p)
     p.add_argument(
         "--save-config", default="config/sphere_config.json", help="配置保存路径"
-    )
-    p.add_argument(
-        "--ball-diameter",
-        type=float,
-        default=None,
-        help="球直径，单位米（用于三维测距）",
-    )
-    p.add_argument(
-        "--focal", type=float, default=None, help="相机像素焦距 fx（标定过就填）"
-    )
-    p.add_argument("--horizon", type=float, default=None, help="预测未来多少秒")
-    p.add_argument(
-        "--predict", default=None, choices=method_names("predictor"),
-        help="预测方法（不传则取配置，默认 %s）。可选：%s" % (
-            default_method("predictor"),
-            "；".join(f"{d['name']}={d['summary']}" for d in describe("predictor"))),
-    )
-    p.add_argument(
-        "--gravity-fit", action="store_true", help="三维预测时使用已知重力约束"
     )
     p.add_argument("--no-3d", action="store_true", help="关闭三维估计")
     p.add_argument("--record", default=None, help="把标注后的画面录制成 mp4")

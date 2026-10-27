@@ -25,9 +25,8 @@ import numpy as np
 from sphere_tracker.config import AppConfig, ColorConfig, load_config
 from sphere_tracker.detectors import registry  # noqa: F401  （import 即注册：R1）
 from sphere_tracker.pipeline import SpherePipeline
-from sphere_tracker.plugins import default as default_method
-from sphere_tracker.plugins import describe, names as method_names
 from sphere_tracker.sources import open_source
+from apps._common import add_mono_pipeline_args
 from apps._window import WindowManager
 
 WINDOW = "run_video"
@@ -39,22 +38,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default=None, help="输出标注视频（.mp4）")
     p.add_argument("--csv", default=None, help="导出轨迹 CSV")
     p.add_argument("--frames-dir", action="store_true", help="输入是图片文件夹时，输出逐帧 PNG")
-    p.add_argument("--config", default=None)
-    p.add_argument("--method", default=None, choices=method_names("detector"),
-                   help="检测方法（不传则取配置，默认 %s）。可选：%s" % (
-                       default_method("detector"),
-                       "；".join(f"{d['name']}={d['summary']}"
-                                 for d in describe("detector"))))
-    p.add_argument("--preset", default=None)
-    p.add_argument("--ball-diameter", type=float, default=None)
-    p.add_argument("--focal", type=float, default=None)
-    p.add_argument("--predict", default=None, choices=method_names("predictor"),
-                   help="预测方法（不传则取配置，默认 %s）。可选：%s" % (
-                       default_method("predictor"),
-                       "；".join(f"{d['name']}={d['summary']}"
-                                 for d in describe("predictor"))))
-    p.add_argument("--horizon", type=float, default=None)
-    p.add_argument("--gravity-fit", action="store_true")
+    # 八个流水线参数与 `run_realtime.py` **同源**（`apps/_common.py`）。
+    # 这里原来手抄了一份，实测已经和实时那边漂了：--config 没说明、
+    # --ball-diameter/--focal/--horizon/--gravity-fit 全都没有说明、
+    # 而 --preset 的说明里抄了一份预设名单。详见该函数的 docstring。
+    add_mono_pipeline_args(p)
     p.add_argument("--max-frames", type=int, default=0, help=">0 时只处理前 N 帧")
     p.add_argument("--no-show", action="store_true", help="不弹窗（批处理用）")
     return p.parse_args()

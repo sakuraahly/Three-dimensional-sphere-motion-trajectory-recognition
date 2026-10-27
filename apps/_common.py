@@ -156,6 +156,85 @@ def add_stereo_source_args(
     return ap
 
 
+def add_mono_pipeline_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """补上**单目**链路的八个公共参数。
+
+    ============  ==========================================================
+    `--config`    读取 JSON 配置（标定结果）
+    `--method`    检测方法 —— 选项/默认/说明全部来自 detector 注册表
+    `--preset`    颜色预设 —— 选项来自 `ColorConfig.preset_names()`
+    `--ball-diameter` / `--focal`   单目测距所需的两个物理先验
+    `--predict` / `--horizon`       预测方法与其视野
+    `--gravity-fit`                 三维预测时用已知重力约束
+    ============  ==========================================================
+
+    ## 为什么要有它（2026-10-27）
+
+    单目有两个入口：``run_realtime.py``（相机）与 ``run_video.py``（离线文件 /
+    图片序列）。它们跑的是**同一条流水线**（检测 → 跟踪 → 预测），这八个参数
+    必须同名、同默认、同说明。原来是两份手抄，实测已经漂了：
+
+    - ``--config`` 实时那边写了"读取 JSON 配置（标定结果）"，离线那边一个字没有；
+    - ``--ball-diameter`` / ``--focal`` / ``--horizon`` / ``--gravity-fit``
+      的说明同样只在实时那边有；
+    - ``--preset`` 的说明里**手抄了一份预设名单** —— 那是预设表的第三份副本
+      （另外两份在 `calibrate_color.py` 和 GUI 下拉里），加一种球色要改四处。
+
+    漂移的后果不是崩溃，而是"同一个参数在两个入口里解释不一样"，用户只能靠猜。
+
+    ## 说明文字一律派生，不手写清单（R7）
+
+    检测方法来自 `plugins.describe("detector")`、预测方法来自 predictor 注册表、
+    颜色预设来自 `ColorConfig.preset_names()`。**加一种实现/一种球色，两个入口的
+    帮助同时变**，这个函数不用动。
+
+    ## 前置条件：注册表得已经填好
+
+    本函数在**调用时**读注册表，所以调用方必须先 import 注册模块
+    （各入口第二段就做：``from sphere_tracker.detectors import registry``，
+    import 即注册，R1）。忘了会在下面直接抛出一条指明修法的错误，
+    而不是给出一份空的可选值。
+    """
+    from sphere_tracker.config import ColorConfig
+    from sphere_tracker.plugins import default as default_name
+    from sphere_tracker.plugins import describe, names
+
+    if not names("detector"):
+        raise RuntimeError(
+            "add_mono_pipeline_args() 被调用时 detector 注册表还是空的 —— "
+            "请在同一模块的顶部先 `from sphere_tracker.detectors import registry`"
+            "（import 即注册，R1），再构造 ArgumentParser。"
+            "否则 --method 的可选值会是空的，而且报错位置离原因很远。"
+        )
+
+    ap.add_argument("--config", default=None, help="读取 JSON 配置（标定结果）")
+    ap.add_argument(
+        "--method", default=None, choices=names("detector"),
+        help="检测方法（不传则取配置，默认 %s）。可选：%s" % (
+            default_name("detector"),
+            "；".join(f"{d['name']}={d['summary']}" for d in describe("detector"))),
+    )
+    ap.add_argument(
+        "--preset", default=None, choices=ColorConfig.preset_names(),
+        help="颜色预设（球色），不传则用配置里的颜色。可选：%s" % (
+            " / ".join(ColorConfig.preset_names())),
+    )
+    ap.add_argument("--ball-diameter", type=float, default=None,
+                    help="球直径，单位米（用于三维测距）")
+    ap.add_argument("--focal", type=float, default=None,
+                    help="相机像素焦距 fx（标定过就填）")
+    ap.add_argument(
+        "--predict", default=None, choices=names("predictor"),
+        help="预测方法（不传则取配置，默认 %s）。可选：%s" % (
+            default_name("predictor"),
+            "；".join(f"{d['name']}={d['summary']}" for d in describe("predictor"))),
+    )
+    ap.add_argument("--horizon", type=float, default=None, help="预测未来多少秒")
+    ap.add_argument("--gravity-fit", action="store_true",
+                    help="三维预测时使用已知重力约束")
+    return ap
+
+
 def open_pair_source(args, *, exit_code: int = 1):
     """按参数装配 ``stereo.PairSource``；失败时打印原因并返回 ``None``。
 
@@ -175,6 +254,7 @@ def open_pair_source(args, *, exit_code: int = 1):
 __all__ = [
     "ROOT",
     "LOG_DIR",
+    "add_mono_pipeline_args",
     "add_stereo_source_args",
     "open_pair_source",
     "setup_logging",
