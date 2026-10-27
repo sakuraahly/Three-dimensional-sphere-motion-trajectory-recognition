@@ -234,7 +234,8 @@ class VideoSource:  info: SourceInfo
     def release(self) -> None;  @property is_live -> bool        # 基类 False；CameraSource 覆写 True
 class LatestFrameCamera:               # 后台线程采集，永远取"最新帧"
     def __init__(self, source: CameraSource) -> None
-    def latest(self, last_seq: int = -1) -> tuple[int, np.ndarray | None]
+    def latest(self, last_seq: int = -1) -> tuple[int, np.ndarray | None, float]
+    #                                          ^seq  ^frame              ^t_capture
     def wait_first(self, timeout: float = 10.0) -> np.ndarray | None
     def stop(self) -> None             # join(1.5) 并释放底层 source；属性 info / dropped
 class CameraSource(VideoSource):
@@ -249,7 +250,8 @@ CANDIDATE_MODES: tuple[tuple[int, int], ...]     # 自动探测用的候选分�
 ```
 **调用顺序 / 前置条件**：app 里的标准用法是 `src = open_source(...)` → 循环 `ok, frame, t = src.read()` → `pipe.process(frame, t)` → 结束 `src.release()`；**`pipeline` 不 import `sources`**（取帧与编排分层）。`open_source` 分派：`path` 是目录 → `ImageSource`（按扩展名过滤 + 文件名排序）；`path` 是图片扩展名 → `ImageSource([单张])`；否则 → `FileSource`；都不给 → `CameraSource(index=camera or 0)`。要"永远处理最新画面"就用 `LatestFrameCamera(CameraSource(...))`（双目分支就是这么用的），循环里用 `latest()`。
 
-**坑**：① **`latest(last_seq=-1)` 的 `last_seq` 没被使用**：直接返回当前 `(seq, frame)`，"有没有新帧"要自己比 `seq`。
+**坑**：① **`latest(last_seq=-1)` 的 `last_seq` 没被使用**：直接返回当前 `(seq, frame, t_capture)`，"有没有新帧"要自己比 `seq`。
+①b **第三个值是"这一帧被采到的时刻"，不是"你来取的时刻"**（2026-10-27 修）：它在采集线程里 `read()` 返回时就记下，同一帧取两次返回**同一个**值。用"处理时刻"当时间轴会让轴随负载漂移 —— 项目自己量过：滞后 1 帧（17 ms）→ 三维误差 440 mm。`FramePump` 因此要求源**必须**回三个值，只回两个会抛 `TypeError`（不许静默退化成年龄 0）。
 ② `CameraSource.__init__` **很重**：依次试后端（DSHOW→MSMF→ANY）与分辨率（用户值→1280x720→640x480→默认），每个组合连读至多 12 帧做"全黑常量流"检查（判据 `frame.std() > 1.0`）；`optimize=True` 还会跑一次 `optimize_mode()`（最坏 10–40 秒，只跑一次，缓存到 `config/camera_modes.json`）。全失败抛 `RuntimeError`（消息里带"占用/红外/遮挡/USB 带宽"四个可能原因）。
 ③ `info.fps` **尽量是实测值**：`CAP_PROP_FPS` 常返回"你请求的值"而不是真实帧率（实测请求 60、实际 29.8）；`fps_measured` 告诉你这个值是不是实测 —— 写录像帧率要用它；`resolution_fallback=True` = 请求的分辨率不支持、已降级（USB 摄像头常表现为"打开成功但每帧全黑"）。
 ④ 时间戳语义不同：`CameraSource` 用 `perf_counter()`，`FileSource`/`ImageSource` 用 `帧号/fps`，跨源不可比。
