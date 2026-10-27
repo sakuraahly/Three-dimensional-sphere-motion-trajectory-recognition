@@ -76,7 +76,8 @@ if __package__:
         triangulate_pixels,
     )
 else:  # `python stereo/angled.py`: no package context, run the self-test.
-    _ROOT = Path(__file__).resolve().parents[1]
+    _ROOT = next(p for p in Path(__file__).resolve().parents
+                 if (p / "sphere_tracker").is_dir())
     if str(_ROOT) not in sys.path:
         sys.path.insert(0, str(_ROOT))
     from angled_geometry import (  # noqa: E402  (path bootstrapped just above)

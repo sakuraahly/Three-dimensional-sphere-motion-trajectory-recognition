@@ -56,7 +56,8 @@ import numpy as np
 if __package__ in (None, ""):
     # Allow ``python calib/angled_quality.py``: the script directory, not
     # the project root, is sys.path[0] in that mode.
-    _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    _PROJECT_ROOT = next(p for p in Path(__file__).resolve().parents
+                         if (p / "sphere_tracker").is_dir())
     if str(_PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(_PROJECT_ROOT))
 

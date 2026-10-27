@@ -43,7 +43,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker").is_dir())
 if str(ROOT) not in sys.path:       # 只为读检测器注册表（R7）；执行链仍是子进程，方式不变
     sys.path.insert(0, str(ROOT))
 PY = sys.executable

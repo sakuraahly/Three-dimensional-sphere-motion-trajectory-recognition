@@ -391,6 +391,208 @@ def test_every_cli_parses() -> bool:
     return not bad
 
 
+# 单目两个入口共用的八个参数。名字与 `apps/_common.add_mono_pipeline_args()`
+# 里登记的一致 —— 这里也**不手写第二份语义**：它只是"哪些参数算公共"的清单，
+# 而这个清单本身就是被测对象（公共块少了一个参数，这里也会红）。
+MONO_COMMON_FLAGS = ("--config", "--method", "--preset", "--ball-diameter",
+                     "--focal", "--predict", "--horizon", "--gravity-fit")
+MONO_ENTRIES = ("run_realtime.py", "run_video.py")
+
+
+def _flag_literals(path: Path, candidates: set[str],
+                   minimum: int = 3) -> list[tuple[int, list[str]]]:
+    """源码里出现的"手抄清单"：一个列表/元组/集合字面量装了 ≥`minimum` 个候选名。
+
+    和 `selftest_plugins._literal_name_lists` 同一个思路（R7），只是换了一批名字。
+    用 AST 而不是正则：正则会把注释、docstring 里的举例也算进去，
+    于是"文档里写了三个预设名"就会假红 —— 那是判据写错了，不是代码错。
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        return []
+    hits: list[tuple[int, list[str]]] = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, (_ast.List, _ast.Tuple, _ast.Set)):
+            continue
+        elems = [e.value for e in node.elts
+                 if isinstance(e, _ast.Constant) and isinstance(e.value, str)]
+        matched = [v for v in elems if v in candidates]
+        if len(matched) >= minimum:
+            hits.append((getattr(node, "lineno", 0), matched))
+    return hits
+
+
+def test_shared_arg_blocks() -> bool:
+    """单目两个入口的公共参数必须**出自同一个函数**，预设名单不许再手抄。
+
+    ## 这条守的是什么（真实漂移，2026-10-27 实测）
+
+    `run_realtime.py`（相机）与 `run_video.py`（离线文件）跑同一条流水线，
+    八个参数却各写一份。手抄的两份**已经漂了**：
+
+    - `--config`：实时那边写"读取 JSON 配置（标定结果）"，离线那边一个字没有；
+    - `--ball-diameter` / `--focal` / `--horizon` / `--gravity-fit`：说明同样只在实时那边；
+    - `--preset`：说明里手抄了一份预设名单，而那是预设表的**第三份**副本
+      （另外两份在 `calibrate_color.py` 的按键表和 GUI 下拉里）。
+
+    漂移的后果**不是崩溃**，而是"同一个参数在两个入口里解释不一样"，用户只能靠猜 ——
+    这类问题没有报错、没有测试会红，只能靠人偶然发现。
+
+    收进 `apps/_common.add_mono_pipeline_args()` 之后，本测试保证它不会再被抄开：
+    调用必须在、手抄必须没有、生效必须可验。四条缺一不可 ——
+    只查结构会漏"调了但没生效"，只查行为会漏"生效了但旁边又抄了一份"。
+    """
+    checks: list[tuple[str, bool]] = []
+
+    # ---- 1. 调用在 / 2. 手抄没有 ----
+    for name in MONO_ENTRIES:
+        path = ROOT / "apps" / name
+        if not path.is_file():
+            checks.append((f"{name} 存在", False))
+            continue
+        src = path.read_text(encoding="utf-8", errors="replace")
+        calls = src.count("add_mono_pipeline_args(")
+        checks.append((f"{name} 调用 add_mono_pipeline_args（实际 {calls} 处，应恰好 1）",
+                       calls == 1))
+        dup = [flag for flag in MONO_COMMON_FLAGS
+               if f'add_argument("{flag}"' in src]
+        checks.append((f"{name} 不再自己定义公共参数（发现 {dup or '无'}）", not dup))
+
+    # ---- 3. 生效可验：--help 里八个参数都在 ----
+    missing: list[str] = []
+    for name in MONO_ENTRIES:
+        path = ROOT / "apps" / name
+        if not path.is_file():
+            continue
+        try:
+            r = subprocess.run([sys.executable, str(path), "--help"],
+                               capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=90, cwd=str(ROOT))
+        except subprocess.TimeoutExpired:
+            missing.append(f"{name}: --help 超时")
+            continue
+        text = r.stdout or ""
+        gone = [flag for flag in MONO_COMMON_FLAGS if flag not in text]
+        if r.returncode != 0 or gone:
+            missing.append(f"{name}: exit={r.returncode} 缺 {gone or '（无）'}")
+    checks.append((f"两个入口的 --help 都含全部 {len(MONO_COMMON_FLAGS)} 个公共参数"
+                   f"{'（' + '；'.join(missing) + '）' if missing else ''}", not missing))
+
+    # ---- 4. 预设名单不许手抄（≥3 个预设名的字面量 = 又抄了一份） ----
+    from sphere_tracker.config import ColorConfig
+
+    presets = set(ColorConfig.preset_names())
+    scanned = sorted((ROOT / "apps").glob("*.py")) \
+        + sorted((ROOT / "apps" / "tools").glob("*.py")) \
+        + [GUI, ROOT / "启动程序_命令行.py"]
+    offenders: list[str] = []
+    for path in scanned:
+        if not path.is_file():
+            continue
+        for lineno, names in _flag_literals(path, presets):
+            offenders.append(f"{path.name}:{lineno} {names}")
+    checks.append((f"预设名单只此一处（{len(scanned)} 个文件扫描，手抄 {len(offenders)} 处）"
+                   f"{'：' + '；'.join(offenders) if offenders else ''}", not offenders))
+
+    for label, good in checks:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+    return all(good for _label, good in checks)
+
+
+PROJECT_PKGS = ("sphere_tracker", "calib", "stereo", "apps")
+
+
+def test_path_bootstrap_is_marker_based() -> bool:
+    """为了 import 本项目包而改 `sys.path` 的文件，必须**按标记上溯**到仓库根。
+
+    ## 为什么（2026-10-27，交接文档 §10.4(a) 挂着的那条）
+
+    全项目 57 个文件各自写了同样 4 行引导（算仓库根 + `sys.path.insert`）。
+    写法实测有四种，其中三种是**按位置数**：
+
+    ```python
+    ROOT = Path(__file__).resolve().parent        # apps/ 下能用，但插的是 apps/
+    ROOT = Path(__file__).resolve().parents[1]    # 换个目录深度就错
+    ROOT = Path(__file__).resolve().parents[2]    # apps/tools/ 下才对
+    ```
+
+    按位置数的写法**只在文件不动的时候正确**，而且错了**不会当场报错** ——
+    它指向一个存在的目录（只是不是仓库根），于是后面的 `import sphere_tracker`
+    报 `ModuleNotFoundError`，离真正原因（数错了几层）很远。
+    按标记上溯（找含 `sphere_tracker/` 的祖先）与深度无关，也没有这个坑。
+
+    ## 判据为什么定在"语义"而不是"逐字相同"
+
+    两种上溯写法 —— `while not (ROOT / "sphere_tracker").is_dir(): ROOT = ROOT.parent`
+    与 `next(p for p in parents if (p / "sphere_tracker").is_dir())` —— **都合规**，
+    它们做的是同一件事。要求逐字相同只会制造 57 个文件的无意义 diff，
+    而真实风险来自"按位置数"，不是来自"两种等价写法并存"。
+
+    ## 为什么不误伤"插自己目录"的脚本
+
+    `apps/tools/preview_pptx.py` 插的是**自己所在目录**，为的是 import 兄弟模块
+    `_preview_lib` —— 那是另一件事，与"找仓库根"无关。所以判据先问
+    "这个文件是否在模块层 import 了本项目包"，不 import 的直接不适用。
+    """
+    import ast as _ast
+
+    targets: list[Path] = []
+    for pattern in ("*.py", "apps/*.py", "apps/tools/*.py", "tests/*.py",
+                    "stereo/*.py", "calib/*.py"):
+        targets += sorted(ROOT.glob(pattern))
+
+    violations: list[str] = []
+    applicable = 0
+    for path in targets:
+        try:
+            src = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "sys.path.insert" not in src:
+            continue
+        try:
+            tree = _ast.parse(src)
+        except SyntaxError as exc:
+            violations.append(f"{path.relative_to(ROOT).as_posix()}: 语法错误 {exc}")
+            continue
+
+        imports_project = False
+        insert_line: int | None = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                if any(a.name.split(".")[0] in PROJECT_PKGS for a in node.names):
+                    imports_project = True
+            elif isinstance(node, _ast.ImportFrom):
+                if (node.module or "").split(".")[0] in PROJECT_PKGS:
+                    imports_project = True
+            elif isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute):
+                inner = node.func.value
+                if (isinstance(inner, _ast.Attribute) and inner.attr == "path"
+                        and getattr(inner.value, "id", "") == "sys"
+                        and node.func.attr == "insert" and insert_line is None):
+                    insert_line = node.lineno
+        if not imports_project or insert_line is None:
+            continue
+
+        applicable += 1
+        head = "\n".join(
+            line for line in src.splitlines()[:insert_line]
+            if not line.lstrip().startswith("#"))       # 注释里的示例不算
+        if "is_dir()" not in head and "is_file()" not in head:
+            violations.append(
+                f"{path.relative_to(ROOT).as_posix()}:{insert_line} "
+                f"改 sys.path 前没有按标记上溯（疑似 parent / parents[N]）")
+
+    print(f"  需要引导的项目包使用者 {applicable} 个；按位置数（不合规）{len(violations)} 个")
+    for line in violations:
+        print(f"    [不达标] {line}")
+    print(f"  [{'通过' if not violations else '不达标'}] 全部按标记上溯到含 sphere_tracker/ 的祖先")
+    return not violations
+
+
 def main() -> int:
     print("=" * 70)
     print("入口一致性自测（三个入口 -> 同一个测试运行器 / 规范检查器）")
@@ -402,6 +604,8 @@ def main() -> int:
                test_cli_uses_runner,
                test_agreement_across_entrypoints,
                test_every_cli_parses,
+               test_path_bootstrap_is_marker_based,
+               test_shared_arg_blocks,
                test_run_all_orchestrator):
         results.append(fn())
         print()

@@ -48,7 +48,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker").is_dir())
 for _p in (ROOT,):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
