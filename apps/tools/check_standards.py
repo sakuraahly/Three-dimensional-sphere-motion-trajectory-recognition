@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import subprocess
 import sys
@@ -251,6 +252,33 @@ def _is_runtime_reproducible(parts: list[str]) -> bool:
     return parts[0] == RUNTIME_REPRO_MARK
 
 
+@functools.lru_cache(maxsize=1)
+def _repo_basenames() -> frozenset[str]:
+    """仓库内所有**文件名**的集合（一次遍历，供"裸文件名引用"查表）。
+
+    ## 为什么要有它（2026-10-27 实测）
+
+    原实现是"每遇到一条单段引用就 `ROOT.rglob(name)` 走一遍全仓"。
+    文档里这类引用有几百条，于是**一次检查要递归 695 遍、调 16 万次 `scandir`**，
+    光 `nt.scandir` 就 9.6s，整个 `check_standards` 跑一次 **15.9s** ——
+    而它只是在回答"仓库里有没有叫这个名字的文件"。
+
+    更贵的是它被 `selftest_doc_facts` **调了 10 次**（每次都重启进程，缓存不跨进程），
+    于是那一个测试占了全套 125s（全套 600s 的 1/5）。
+
+    改法：**建一次索引，之后都是集合查找**。判定语义完全不变
+    （原代码也只是看 `hits` 是否非空），成本从 O(引用数 × 仓库)**降到 O(仓库)**。
+    """
+    names: set[str] = set()
+    for p in ROOT.rglob("*"):
+        parts = p.parts
+        if ".git" in parts or "__pycache__" in parts:
+            continue
+        if p.is_file():
+            names.add(p.name)
+    return frozenset(names)
+
+
 def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     """扫一遍文档，返回 (失效引用, 仓库外但确实存在的引用, 运行期可再生产物)。
 
@@ -284,12 +312,8 @@ def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
             continue
         if (ROOT / cand).exists() or cand in literals:
             continue
-        if len(parts) == 1:
-            hits = [p for p in ROOT.rglob(parts[0])
-                    if p.is_file() and ".git" not in p.parts
-                    and "__pycache__" not in p.parts]
-            if hits:
-                continue
+        if len(parts) == 1 and parts[0] in _repo_basenames():
+            continue
         found[key] = detail
     return found, outside_present, runtime_repro
 
