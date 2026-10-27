@@ -425,15 +425,16 @@ class CameraPairReader(FrameReader):
             # 左路必须出新帧（否则主循环会拿到同一帧空转）；
             # 右路要连续走 CAMERA_ALIGN_STEPS 帧，才说明它的时间也确实往前了 ——
             # 两路采集线程独立跑，右路只动一下不代表它追上了左路。
+            # （`latest()` 现在返回 `(seq, frame, t_capture)`，这里只用 seq。）
             left_fresh = self.cams[0].latest()[0] > snap[0][0]
-            right_fresh = all(c.latest()[0] > seq + CAMERA_ALIGN_STEPS - 1
-                              for c, (seq, _f) in zip(self.cams[1:], snap[1:]))
+            right_fresh = all(c.latest()[0] > s[0] + CAMERA_ALIGN_STEPS - 1
+                              for c, s in zip(self.cams[1:], snap[1:]))
             if (left_fresh and right_fresh) or time.perf_counter() >= deadline:
                 break
             time.sleep(CAMERA_POLL_INTERVAL)
 
-        _s1, a = self.cams[0].latest()
-        _s2, b = self.cams[1].latest()
+        _s1, a, _t1 = self.cams[0].latest()
+        _s2, b, _t2 = self.cams[1].latest()
         return (a is not None and b is not None), a, b
 
     def seek(self, index: int) -> tuple[bool, np.ndarray | None]:

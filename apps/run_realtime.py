@@ -294,7 +294,13 @@ def main() -> int:
                     continue
                 frame = got.frame
                 t0 = time.perf_counter()
-                result = pipe.process(frame, time.perf_counter() - t_start)
+                # 时间轴用**这一帧被采到的时刻**，不是"我开始处理它的时刻"（2026-10-27）。
+                # 两者差 = 处理延迟：用它当 t 会让整条轴随负载后移且抖动，
+                # 而预测器吃的就是这条轴（交接文档 §P0-1：滞后 1 帧 → 三维误差 440 mm）。
+                # `got.frame_t` 由采集线程在 `read()` 返回时就记下；源没给（=0）才退回旧口径。
+                t_frame = (got.frame_t - t_start) if got.frame_t > 0 \
+                    else (time.perf_counter() - t_start)
+                result = pipe.process(frame, t_frame)
                 result.stalled = got.stalled
                 # ---- 逐帧 DEBUG 记录（**只有文件收**，终端不受影响）----
                 #

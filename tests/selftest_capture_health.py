@@ -89,6 +89,11 @@ class ScriptedSource:
     ⚠️ **每次 read 都要睡一下**（`delay`）：第一版没睡，采集线程在毫秒内跑了
     **5 万帧**，既白烧 CPU，又让"距最后一次成功多久"这类时间判据在负载下变得脆弱。
     假源也要有接近真实的节奏（真相机 ~30 fps）。
+
+    ⚠️ **时间戳必须用 `perf_counter`**（与 `CameraSource.read()` 同钟）。
+    这里原来写的是 `time.monotonic()` —— 两个时钟在 Windows 上起点不同，
+    而 `FramePump` 用 `perf_counter` 算帧年龄，混起来会得到"负的年龄"或荒唐的大数。
+    测试替身和生产代码用不同的钟，是**测试自己造出来的 bug**，见第 6 节。
     """
 
     def __init__(self, script: list[str], delay: float = 0.004) -> None:
@@ -106,7 +111,7 @@ class ScriptedSource:
             raise RuntimeError("模拟驱动崩掉")
         if kind == "empty":
             return False, None, 0.0
-        return True, FRAME.copy(), time.monotonic()
+        return True, FRAME.copy(), time.perf_counter()
 
 
 def wait_for(pred, timeout: float = 2.0) -> bool:
@@ -138,7 +143,7 @@ def test_healthy_capture_has_no_errors() -> bool:
     try:
         wait_for(lambda: cam.latest()[0] >= 3)
         t_first = cam.last_ok_t
-        seq, frame = cam.latest()
+        seq, frame, _t_cap = cam.latest()
         # 再等几帧，last_ok_t 必须往前走
         wait_for(lambda: cam.latest()[0] >= seq + 5)
         t_later = cam.last_ok_t
@@ -249,6 +254,60 @@ def test_stalled_reports_true_after_timeout() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_frame_time_travels_with_frame() -> bool:
+    """第 6 节：**采集时刻必须跟着帧一起交到消费方手里**（交接文档 §P0-1 判据①②）。
+
+    ## 这条守的是什么（2026-10-27）
+
+    `LatestFrameCamera._run` 原来把 `read()` 的第三个值直接扔了：
+
+    ```python
+    ok, frame, _t = self.source.read()      # ← 时间在这儿被丢掉
+    ...
+    def latest(self, last_seq=-1): return self._seq, self._frame   # 只回两个
+    ```
+
+    后果链：消费方拿不到帧时间 → 只能用"我开始处理它的时刻"顶替 →
+    处理慢一点，整条时间轴就往后移，而且**随负载抖动** → 预测器吃的是这条轴。
+    项目自己量化过：滞后 1 帧（17 ms）→ 三维误差 **440 mm**（34 倍）。
+
+    所以判据是三条，缺一不可：
+
+    1. **单调**：seq 前进时 `t_capture` 不许倒退；
+    2. **同一帧两次取出同一个时间**（若每次刷新 = 还是"取的时刻"，不是采集时刻）；
+    3. **同钟**：`t_capture` 与消费方 `perf_counter()` 之差必须是个**小正数**
+       —— 这一条专门抓"假源用 monotonic、生产用 perf_counter"这种测试自己造的 bug。
+    """
+    print("----- 6. 采集时刻随帧走（单调 / 同一帧不刷新 / 与消费方同钟）-----")
+    cam, _src = make(["ok"])
+    try:
+        wait_for(lambda: cam.latest()[0] >= 5)
+        s1, _f1, t1 = cam.latest()
+        # 同一帧连取两次：时间不许变（这是"采集时刻"与"取的时刻"的分水岭）
+        s2, _f2, t2 = cam.latest()
+        same_frame_same_t = (s1 == s2) and (t1 == t2)
+        # 再等几帧，时间必须往前走
+        wait_for(lambda: cam.latest()[0] >= s1 + 5)
+        s3, _f3, t3 = cam.latest()
+        # 同钟验证：拿 perf_counter 去减，差值必须落在"刚采到"的范围内
+        age_ms = (time.perf_counter() - t3) * 1000.0
+        print(f"  seq {s1}->{s3}：t {t1:.4f} -> {t3:.4f}"
+              f"（递增={t3 > t1}）；同一帧两次取 t 相同={same_frame_same_t}")
+        print(f"  消费方用 perf_counter 算出的帧年龄 = {age_ms:.1f}ms"
+              f"（同一条时钟链，应落在 0~200ms）")
+        checks = [
+            ("seq 前进时 t_capture 递增（单调）", t3 > t1),
+            ("同一帧被取两次时 t_capture 不刷新", same_frame_same_t),
+            ("t_capture 与消费方同钟（年龄是合理的小正数，不是垃圾值）",
+             0.0 <= age_ms <= 200.0),
+        ]
+    finally:
+        stop(cam)
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("采集健康度自测（相机没了 ≠ 球没动）")
@@ -258,7 +317,8 @@ def main() -> int:
                test_exceptions_are_counted,
                test_empty_frames_are_counted_too,
                test_success_resets_the_counter,
-               test_stalled_reports_true_after_timeout):
+               test_stalled_reports_true_after_timeout,
+               test_frame_time_travels_with_frame):
         results.append(fn())
         print()
     ok = all(results)

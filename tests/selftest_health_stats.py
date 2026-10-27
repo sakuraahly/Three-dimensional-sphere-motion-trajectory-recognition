@@ -248,18 +248,27 @@ def test_frame_pump_bookkeeping() -> bool:
     print("----- 5. FramePump：取帧簿记 -----")
 
     class FakeCam:
-        """假的"最新帧"源，按剧本给出 (seq, frame)，并可切换 stalled。"""
+        """假的"最新帧"源，按剧本给出 `(seq, frame[, t_capture])`，并可切换 stalled。
 
-        def __init__(self, steps):
+        `with_time=False` 用来模拟"源忘了回采集时刻"——那必须当场炸（见下面第 8 条）。
+        """
+
+        def __init__(self, steps, *, with_time=True):
             self.steps = list(steps)
             self.i = -1
+            self.with_time = with_time
             self.last_ok_t = time.monotonic()
             self._stalled = False
 
         def latest(self, last_seq=-1):
             if self.i + 1 < len(self.steps):
                 self.i += 1
-            return self.steps[self.i]
+            step = self.steps[self.i]
+            seq, frame = step[0], step[1]
+            if not self.with_time:
+                return seq, frame
+            t_cap = step[2] if len(step) > 2 else time.perf_counter()
+            return seq, frame, t_cap
 
         def stalled(self, timeout=1.0):
             return self._stalled
@@ -324,11 +333,40 @@ def test_frame_pump_bookkeeping() -> bool:
         last_ok_t = time.monotonic()
 
         def latest(self, last_seq=-1):
-            return 0, f
+            return 0, f, time.perf_counter()
 
     got = FramePump(NoStall(), Health()).next()
     print(f"  源没有 stalled()：报 {got.stalled}（必须 False —— 不谎报停住）")
     checks += [("源不支持 stalled 时报 False（不谎报）", got.stalled is False)]
+
+    # 7) 帧年龄必须按**这一帧自带的采集时刻**算（交接文档 §P0-1 判据②）
+    #
+    # 改之前：`age = now - source.last_ok_t`。`last_ok_t` 是"最后一次成功取帧"的时刻，
+    # 对**当前这一帧**来说它是错的（拿到旧帧时会算成 0）—— 也就是"看起来永远新鲜"。
+    t_cap = time.perf_counter() - 0.12
+    got = FramePump(FakeCam([(0, f, t_cap)]), Health()).next()
+    print(f"  注入 120ms 前采集的帧：frame_age_ms={got.frame_age_ms:.1f}（应 ≈120）"
+          f" frame_t 透传={abs(got.frame_t - t_cap) < 1e-9}")
+    checks += [
+        ("帧年龄按帧自带的 t_capture 算（≈120ms，不是 0）",
+         100.0 <= got.frame_age_ms <= 160.0),
+        ("PumpResult.frame_t 原样透传（调用方要用它当时间轴）",
+         abs(got.frame_t - t_cap) < 1e-9),
+    ]
+
+    # 8) 源不回第三个值 -> **当场炸**，不许静默退化成"年龄 0"
+    class NoTime:
+        def latest(self, last_seq=-1):
+            return 0, f
+
+    try:
+        FramePump(NoTime(), Health()).next()
+        checks.append(("latest() 缺 t_capture 必须抛 TypeError", False))
+        print("  源只回两个值：没抛异常（不达标）")
+    except TypeError as exc:
+        ok_msg = "t_capture" in str(exc)
+        print(f"  源只回两个值：抛 TypeError，消息提到 t_capture={ok_msg}")
+        checks.append(("latest() 缺 t_capture 抛 TypeError 且点名原因", ok_msg))
 
     checks += [("stats 仍是纯数据 + 取帧簿记（不 import 本项目其他模块）",
                 not _imports_project_modules())]

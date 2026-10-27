@@ -207,6 +207,7 @@ class PumpResult:
     skipped: int = 0              # 中间被覆盖掉的帧数
     capture_ms: float = 0.0       # 两次"取到新帧"之间的间隔
     frame_age_ms: float = 0.0     # 从采集线程抓到它，到我们取走它
+    frame_t: float = 0.0          # **这一帧的采集时刻**（源时钟：perf_counter）
     stalled: bool = False         # 采集是否已停住
 
 
@@ -226,6 +227,11 @@ class FramePump:
 
     ⚠️ **它不做节流 sleep** —— "没有新帧时要不要等"是调用方的策略，
     塞进来会让本类带上时序行为，又变回难测。
+
+    ⚠️ **时钟**：帧年龄必须用**源给的 `t_capture`** 算，所以这里的 `now` 用
+    `perf_counter`（与 `CameraSource.read()` / `LatestFrameCamera.latest()`
+    同一时钟）。原先用 `monotonic` —— 两个时钟在 Windows 上起点不同，
+    混用算出来的年龄是垃圾值。
     """
 
     def __init__(self, source: Any, health: Health, stalled_after_s: float = 1.0) -> None:
@@ -233,18 +239,31 @@ class FramePump:
         self.health = health
         self.stalled_after_s = float(stalled_after_s)
         self._last_seq = -1
-        self._t_last_new = time.monotonic()
+        self._t_last_new = time.perf_counter()
 
     def next(self) -> PumpResult:
         """取一次。不会阻塞，也不会 sleep。"""
-        seq, frame = self.source.latest(self._last_seq)
-        now = time.monotonic()
+        got = self.source.latest(self._last_seq)
+        # 严格要求三个值：少了 `t_capture` 就答不出"这帧多老"，
+        # 而那正是本类存在的理由。宁可当场炸，也不要静默退化成 0。
+        try:
+            seq, frame, t_cap = got
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"{type(self.source).__name__}.latest() 必须返回 "
+                f"(seq, frame, t_capture) 三个值，实际是 {got!r}。"
+                "缺了帧时间就只能用「处理时刻」顶替，时间轴会随负载漂移"
+                "（交接文档 §P0-1）。"
+            ) from None
+        now = time.perf_counter()
         stalled = self._stalled()
         if frame is None:
-            return PumpResult(frame=None, seq=seq, stalled=stalled)
+            return PumpResult(frame=None, seq=seq, frame_t=float(t_cap or 0.0),
+                              stalled=stalled)
 
         is_new = seq != self._last_seq
-        res = PumpResult(frame=frame, seq=seq, is_new=is_new, stalled=stalled)
+        res = PumpResult(frame=frame, seq=seq, is_new=is_new, stalled=stalled,
+                         frame_t=float(t_cap or 0.0))
         if not is_new:
             # 还是同一帧：**不改任何计数**（否则 capture_fps 会虚高）
             return res
@@ -254,7 +273,9 @@ class FramePump:
             if res.skipped:
                 self.health.note_dropped(res.skipped)
             res.capture_ms = (now - self._t_last_new) * 1000.0
-        res.frame_age_ms = (now - getattr(self.source, "last_ok_t", now)) * 1000.0
+        # 帧年龄 = 现在 - **这一帧被采到的时刻**。源没给时间（= 0）才退回旧口径。
+        ref = res.frame_t if res.frame_t > 0 else getattr(self.source, "last_ok_t", now)
+        res.frame_age_ms = (now - ref) * 1000.0
         self._last_seq = seq
         self._t_last_new = now
         self.health.note_capture(capture_ms=res.capture_ms, frame_age_ms=res.frame_age_ms)

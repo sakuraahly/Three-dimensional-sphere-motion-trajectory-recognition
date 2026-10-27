@@ -197,6 +197,14 @@ class LatestFrameCamera:
         self._lock = threading.Lock()
         self._frame = None
         self._seq = 0
+        # **这一帧是什么时候采的**（`perf_counter`，与 `CameraSource.read()` 同一时钟）。
+        #
+        # 为什么必须存在这里（2026-10-27）：`_run` 原来拿到 `read()` 的第三个值后
+        # 直接扔了（`ok, frame, _t = ...`），`latest()` 只回 `(seq, frame)`。
+        # 于是**消费方永远拿不到帧时间**，只能用"我开始处理它的时刻"顶替 ——
+        # 处理一慢，整条时间轴往后移，而且随负载抖动；预测器吃的就是这条轴
+        # （交接文档 §P0-1：滞后 1 帧 → 三维误差 440 mm）。
+        self._t_cap = 0.0
         self._stop = False
         self.dropped = 0
         # ── 采集健康度：为什么必须有这两个计数器 ──────────────────────────
@@ -221,7 +229,7 @@ class LatestFrameCamera:
     def _run(self) -> None:
         while not self._stop:
             try:
-                ok, frame, _t = self.source.read()
+                ok, frame, t_cap = self.source.read()
             except Exception:
                 self.read_errors += 1
                 time.sleep(0.05)
@@ -235,13 +243,22 @@ class LatestFrameCamera:
             with self._lock:
                 self._frame = frame
                 self._seq += 1
+                self._t_cap = t_cap          # 采集时刻**跟着帧走**，不再丢
                 self.read_errors = 0
                 self.last_ok_t = time.monotonic()
 
     def latest(self, last_seq: int = -1):
-        """返回 (seq, frame)。frame 可能和上次相同（采集还没出新帧）。"""
+        """返回 `(seq, frame, t_capture)`。
+
+        `t_capture` 是 `cap.read()` 返回那一刻的时刻（`perf_counter`），
+        **不是**"主循环来取的时刻"。同一帧被取两次返回**同一个** `t_capture`
+        —— 否则"帧年龄"会被反复刷新成 0，看起来永远新鲜（那正是改之前的病）。
+
+        三个值必须一起回：只回 `(seq, frame)` 时，消费方没有任何办法知道
+        "这帧多老"，只能拿自己的时钟顶替，于是时间轴随处理负载漂移。
+        """
         with self._lock:
-            return self._seq, self._frame
+            return self._seq, self._frame, self._t_cap
 
     def stalled(self, timeout: float = 1.0) -> bool:
         """采集是否已经"停住"：连续读失败、或超过 `timeout` 秒没有新帧。
@@ -257,7 +274,7 @@ class LatestFrameCamera:
     def wait_first(self, timeout: float = 10.0):
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < timeout:
-            seq, frame = self.latest()
+            _seq, frame, _t = self.latest()
             if frame is not None:
                 return frame
             time.sleep(0.02)
