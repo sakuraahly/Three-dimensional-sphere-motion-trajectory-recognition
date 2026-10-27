@@ -46,12 +46,38 @@ def _K(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
     return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
 
+# 畸变映射缓存（2026-10-27）。
+#
+# 这个映射**只依赖 (K, D, size, iters)，与图像内容无关**，而本测试会用同一台"相机"
+# 渲染几十帧。原先每帧重算一遍 1280x720x12 次迭代 —— profile 显示
+# `_forward_distort_map` 被调 242 次、**独占 172.6s**（占整个测试 211s 的 81%），
+# 而真正做标定的 `calibrate_stereo` 连前 14 名都没进。
+#
+# 记忆化后结果**按位相同**（同一份映射表复用，不是近似），因此所有数值断言不受影响。
+# 容量上限是为了防止"参数组合很多"时无界占内存（一张表约 7MB）。
+_DISTORT_CACHE: dict[tuple, tuple] = {}
+_DISTORT_CACHE_MAX = 12
+
+
 def _forward_distort_map(K, D, size, iters: int = 12):
     """构造"把无畸变图变成畸变图"的 remap 映射（OpenCV 只提供反方向）。
 
     做法：对每个目标像素 q 迭代求解 p，使 forward(p) = q。
     径向畸变单调时几步就收敛。
+
+    结果按 `(K, D, size, iters)` 缓存 —— 调用方**不得原地修改**返回的数组
+    （它们是共享的；`cv2.remap` 只读，没问题）。
     """
+    key = (
+        np.asarray(K, dtype=np.float64).tobytes(),
+        np.asarray(D, dtype=np.float64).ravel().tobytes(),
+        tuple(size),
+        int(iters),
+    )
+    cached = _DISTORT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     w, h = size
     u, v = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
     qx, qy = (u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1]
@@ -66,9 +92,12 @@ def _forward_distort_map(K, D, size, iters: int = 12):
         fy_ = py * radial + p1 * (r2 + 2 * py * py) + 2 * p2 * px * py
         px += qx - fx_
         py += qy - fy_
-    return (px * K[0, 0] + K[0, 2]).astype(np.float32), (py * K[1, 1] + K[1, 2]).astype(
-        np.float32
-    )
+    out = ((px * K[0, 0] + K[0, 2]).astype(np.float32),
+           (py * K[1, 1] + K[1, 2]).astype(np.float32))
+    if len(_DISTORT_CACHE) >= _DISTORT_CACHE_MAX:      # 简单 FIFO 淘汰
+        _DISTORT_CACHE.pop(next(iter(_DISTORT_CACHE)))
+    _DISTORT_CACHE[key] = out
+    return out
 
 
 def make_board_image(
