@@ -509,6 +509,25 @@ def _heading_index(path: Path) -> dict[str, str]:
     return out
 
 
+def _hook_installed() -> bool | None:
+    """`core.hooksPath` 是否指向了 `.githooks`；问不到 git 就返回 None。
+
+    **只做提示，不算失败**：新 clone 下来本来就还没装（安装是每台机器一次的手工步骤），
+    把它做成失败会让所有人在第一次跑 standards 时撞红。
+    但也不能完全不说 —— "写着的闸门不拦人"正是本项目最烦的一类问题，
+    所以让它每次跑 standards 都自己喊一声。
+    """
+    try:
+        proc = subprocess.run(["git", "config", "--get", "core.hooksPath"],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", cwd=str(ROOT), timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return False
+    return (proc.stdout or "").strip().replace("\\", "/").strip("/") == ".githooks"
+
+
 def check_backlog(verbose: bool) -> list[str]:
     """D 类：待办清单自洽 + `done` 能对上 git + 文档待办章节全覆盖。"""
     print("----- D. 待办清单（唯一来源 / 状态 / commit 对账） -----")
@@ -593,6 +612,12 @@ def check_backlog(verbose: bool) -> list[str]:
 
     summary = "；".join(f"{k} {v}" for k, v in counted.items() if v)
     print(f"    {len(rows)} 条（{summary}）")
+    hooked = _hook_installed()
+    if hooked is False:
+        print("    [提示] 提交前自动门没装：`git config core.hooksPath .githooks`"
+              "（每台机器一次；不装则 pre-push 不会跑本检查）")
+    elif hooked is None:
+        print("    （问不到 git，自动门装没装未知）")
     if verbose or problems:
         for cells in rows[:3]:
             print(f"    · {cells[0]:<5} {cells[1]:<8} {cells[2][:40]}")
