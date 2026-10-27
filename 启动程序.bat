@@ -139,6 +139,7 @@ if /i "%MODE%"=="run"       goto :do_run
 if /i "%MODE%"=="diag"      goto :do_diag
 if /i "%MODE%"=="test"      goto :do_test
 if /i "%MODE%"=="standards" goto :do_standards
+if /i "%MODE%"=="gate"      goto :do_gate
 echo       不认识的参数「%MODE%」，改用图形界面。
 goto :ui_gui
 
@@ -224,10 +225,33 @@ if /i "%TIER%"=="full" (
 goto :direct
 
 :do_standards
-rem 规范落差自查：文档引用 / 规范来源 / 派生事实计数 是否与磁盘一致。
+rem 规范落差自查：文档引用 / 规范来源 / 派生事实计数 / 待办清单 是否与磁盘一致。
 set "DIRECT=apps\tools\check_standards.py"
-set "DTITLE=规范落差自查（引用 / 来源 / 计数）"
+set "DTITLE=规范落差自查（引用 / 来源 / 计数 / 待办）"
 goto :direct
+
+:do_gate
+rem 提交前的自动门（`.githooks/pre-push` 调它）：规范自查 + 回归 fast（并行）。
+rem
+rem ⚠️ **这里绝不能 pause**：它是被 git 钩子**非交互**调用的，
+rem    等输入就等于把 push 卡死，而且看起来像"卡住了"而不是"在等回车"。
+rem 形状与 `:direct` 不同（连跑两条、不要标题横幅），所以单独写而不是 goto :direct。
+echo [gate 1/2] 规范落差自查（引用 / 来源 / 计数 / 待办）...
+"%PY%" apps\tools\check_standards.py --quiet
+if errorlevel 1 goto :gate_fail
+echo.
+echo [gate 2/2] 回归测试 fast（-j auto 并行；名单来自实测中位数，不写死）...
+"%PY%" apps\run_tests.py fast -j auto
+if errorlevel 1 goto :gate_fail
+echo.
+echo [gate] 通过。
+exit /b 0
+
+:gate_fail
+echo.
+echo [gate] 不通过 —— 已拦下。修完再推；确有急事用 `git push --no-verify`，
+echo        并在提交信息里说明为什么跳过（别默认它就是"能用"）。
+exit /b 1
 
 :direct
 echo [3/3] %DTITLE%

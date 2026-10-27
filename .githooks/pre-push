@@ -1,0 +1,39 @@
+#!/bin/sh
+# 提交前的自动门（本地 git 钩子）。
+#
+# 为什么有它
+# ----------
+# 24 个回归测试、规范自查、计数对账**都有**，但在此之前**没有任何东西保证它们跑过** ——
+# 全靠人记得。`apps/run_tests.py` 开头自己写过："只改一行文档也要等全套，
+# 于是大家就不跑了 —— 质量门形同虚设。" 一个只写在文档里的门，等于没有门。
+#
+# 装法（一次，每台机器各自一次）
+# ------------------------------
+#     git config core.hooksPath .githooks
+#
+# 看装没装：`git config --get core.hooksPath` → 应输出 `.githooks`
+# 跳过（不推荐，会被 review 问）：`git push --no-verify`
+#
+# 为什么走 `启动程序.bat gate` 而不是直接调 python
+# ----------------------------------------------
+# "裸 `python` 会解析到 msys64 那个没装 opencv 的解释器"这个坑，已经在 .bat 里
+# 用"真跑一次 `import cv2`"绕开了。这里再抄一遍判断就是第二份真相 ——
+# 而本项目刚因为"同一条事实两份副本"改过一轮。
+#
+# 为什么是 pre-push 而不是 pre-commit
+# -----------------------------------
+# 提交要快（改一行、存一次），推送是**有意的、少见的**动作，适合当门。
+# 快档约 2.7 分钟，并行后更短；嫌久可以 `--no-verify`，但别改默认值。
+
+set -e
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# cmd 只在 Windows 上有；别的平台上直接调用会被跳过并给出提示（本项目只支持 Windows，
+# 但钩子不该在别的平台上"静默不做事" —— 那样会被误认为通过）。
+if command -v cmd.exe >/dev/null 2>&1; then
+    exec cmd.exe //c "启动程序.bat" gate
+fi
+
+echo "[gate] 非 Windows 环境：找不到 cmd.exe，自动门跳过（本项目只在 Windows 上验证过）。" >&2
+exit 0

@@ -450,6 +450,158 @@ def check_facts(verbose: bool) -> list[str]:
             + ("：\n" + "\n".join(f"    {x}" for x in fails) if fails else "")]
 
 
+# ------------------------------------------------------------------ #
+# D 类：待办清单
+# ------------------------------------------------------------------ #
+# 为什么这一类存在（2026-10-27）：待办原来散在 3000 行 `交接文档.md` 的 6 张表
+# 加一个 planbook 的 13 个 P 项里，**没有 ID、没有状态、互相滞后**。于是
+# "还有哪些活"这个问题每次都要靠人翻 —— 包括 AI。翻出来的答案还会互相矛盾
+# （§12.7 说时间层待办，§P0-1 的判据已满足一半）。
+#
+# 所以：状态**只认** `docs/待办清单.md` 一份，本类负责三件事：
+#   1. 表自己自洽（ID 唯一、状态在词汇表里、blocked/wontfix 必须写原因）；
+#   2. `done` 必须能对上 git —— "改完必验"里最容易被跳过的就是"真的提交了吗"；
+#   3. **反向**：文档里每个"待办 / 还没做"章节，必须至少被表里一条引用。
+#      少了这一条，新写的待办就会绕过本表，"唯一来源"当场失效。
+BACKLOG = ROOT / "docs" / "待办清单.md"
+BACKLOG_STATES = {"open", "doing", "blocked", "done", "wontfix"}
+BACKLOG_ID_RE = re.compile(r"^B-(\d+)$")
+# 章节标题形如 "### 11.6 待办" / "### 硬件待办"；只有带这些词的才算"待办章节"
+TODO_HEADING_RE = re.compile(r"^#{2,4}\s+(?:(\d+(?:\.\d+)?)[.、]?\s*)?(.+)$")
+TODO_WORDS = ("待办", "还没做", "尚未处理")
+COMMIT_RE = re.compile(r"commit=([0-9a-f]{6,40})")
+
+
+def _split_row(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _git_commits() -> set[str] | None:
+    """`git log` 里所有短 hash；没有 git 就返回 None（不静默当成通过）。"""
+    try:
+        proc = subprocess.run(["git", "log", "--format=%h", "-2000"],
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", cwd=str(ROOT), timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()}
+
+
+@functools.lru_cache(maxsize=16)
+def _heading_index(path: Path) -> dict[str, str]:
+    """`交接文档.md` 里所有 "编号 -> 标题" 的索引（用来核对 `§NN.N` 是否真的存在）。
+
+    带 `lru_cache`：30 行待办 × 每行 1~2 份文档，不缓存就是 60 次全量读那个 3000 行文件。
+    """
+    out: dict[str, str] = {}
+    text = _read_text(path)
+    if text is None:
+        return out
+    for line in text.splitlines():
+        m = TODO_HEADING_RE.match(line)
+        if not m:
+            continue
+        num, title = m.group(1), m.group(2)
+        if num:
+            out[num] = title
+    return out
+
+
+def check_backlog(verbose: bool) -> list[str]:
+    """D 类：待办清单自洽 + `done` 能对上 git + 文档待办章节全覆盖。"""
+    print("----- D. 待办清单（唯一来源 / 状态 / commit 对账） -----")
+    rel = BACKLOG.relative_to(ROOT).as_posix()
+    text = _read_text(BACKLOG)
+    if text is None:
+        return [f"找不到 {rel} —— 待办的唯一来源不在了；"
+                f"别把状态再写回各章节（那正是这次要收掉的问题）"]
+
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = _split_row(line)
+        if cells and BACKLOG_ID_RE.match(cells[0]):
+            rows.append(cells)
+    if not rows:
+        return [f"{rel} 里没有解析出任何 `B-NN` 行 —— 表格式改了？检查器会因此变成空转"]
+
+    problems: list[str] = []
+    commits = _git_commits()
+    if commits is None:
+        print("    （没有可用的 git，`done` 的 commit 对账跳过 —— 其余照查）")
+
+    seen: dict[str, int] = {}
+    counted = {s: 0 for s in sorted(BACKLOG_STATES)}
+    for cells in rows:
+        if len(cells) < 5:
+            problems.append(f"{cells[0]}：列数不足 5（应是 ID/状态/一句话/卡在什么/详情）")
+            continue
+        bid, state, _what, why, detail = cells[0], cells[1], cells[2], cells[3], cells[4]
+        seen[bid] = seen.get(bid, 0) + 1
+        if state not in BACKLOG_STATES:
+            problems.append(f"{bid}：状态 {state!r} 不在词汇表 {sorted(BACKLOG_STATES)}")
+            continue
+        counted[state] += 1
+        # blocked / wontfix 必须写清原因：只写"待定""—"等于没有
+        if state in ("blocked", "wontfix") and why.strip() in ("", "—", "-", "/"):
+            problems.append(f"{bid}：{state} 必须写清「卡在什么 / 为什么不做」")
+        # done 必须能对上 git
+        if state == "done":
+            m = COMMIT_RE.search("|".join(cells))
+            if not m:
+                problems.append(f"{bid}：done 必须带 `commit=<短 hash>`（改完必验要能查）")
+            elif commits is not None and not any(c.startswith(m.group(1))
+                                                  for c in commits):
+                problems.append(f"{bid}：commit={m.group(1)} 在 `git log` 里查不到")
+        # 详情指路必须真的存在。
+        # `§NN` 按**同一格里点名的那份 .md** 解析（没点名才默认 `交接文档.md`）——
+        # 第一版只认交接文档，于是 `§2.4`（开发指南的章节）被误报成不存在。
+        # 判据写错比代码错更容易骗人，所以这里宁可多一层解析。
+        for sec in re.findall(r"§(\d+(?:\.\d+)*)", detail):
+            docs = re.findall(r"`([^`]+\.md)`", detail) or ["docs/交接文档.md"]
+            if not any(sec in _heading_index(ROOT / d) for d in docs
+                       if (ROOT / d).exists()):
+                problems.append(
+                    f"{bid}：详情指向 §{sec}，但 {' / '.join(docs)} 里没有这个编号章节")
+        for ref in re.findall(r"`([^`]+\.(?:md|py|bat|json))`", detail):
+            if not (ROOT / ref).exists():
+                problems.append(f"{bid}：详情指向 `{ref}`，但磁盘上没有")
+
+    for bid, n in seen.items():
+        if n > 1:
+            problems.append(f"{bid}：ID 重复出现 {n} 次")
+
+    # ---- 反向：文档里每个"待办章节"都必须被本表引用 ----
+    doc = ROOT / "docs" / "交接文档.md"
+    uncited: list[str] = []
+    doc_text = _read_text(doc) or ""
+    for line in doc_text.splitlines():
+        m = TODO_HEADING_RE.match(line)
+        if not m or not any(w in line for w in TODO_WORDS):
+            continue
+        num, title = m.group(1), m.group(2)
+        key = f"§{num}" if num else re.sub(r"[^\w\u4e00-\u9fff]", "", title)
+        if key not in text:
+            uncited.append(f"{key}（{title.strip()}）")
+    if uncited:
+        problems.append(
+            "这些待办章节没有被 `docs/待办清单.md` 引用，等于「有个待办没人管」："
+            + "、".join(uncited))
+
+    summary = "；".join(f"{k} {v}" for k, v in counted.items() if v)
+    print(f"    {len(rows)} 条（{summary}）")
+    if verbose or problems:
+        for cells in rows[:3]:
+            print(f"    · {cells[0]:<5} {cells[1]:<8} {cells[2][:40]}")
+    if problems:
+        for p in problems:
+            print(f"    [不达标] {p}")
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="规范落差自查（只读）")
     ap.add_argument("--quiet", action="store_true", help="少打细节")
@@ -469,6 +621,8 @@ def main(argv: list[str] | None = None) -> int:
     print()
     problems += check_facts(verbose)
     print()
+    problems += check_backlog(verbose)
+    print()
 
     print("=" * 78)
     if problems:
@@ -478,7 +632,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print("判定结果：有不达标项")
         return 1
-    print("三类检查全部通过：引用、来源、计数都与磁盘一致。")
+    print("四类检查全部通过：引用、来源、计数、待办都与磁盘一致。")
     print("判定结果：全部通过")
     return 0
 
