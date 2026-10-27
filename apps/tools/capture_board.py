@@ -62,6 +62,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 from _common import log_environment, setup_logging  # noqa: E402
+from apps._window import DEFAULT_WINDOW_SIZE, WindowManager  # noqa: E402
 from calib.board import BoardObservation, BoardSpec, detect_board  # noqa: E402
 from calib.capture import CaptureConfig, focus_gate  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
@@ -76,8 +77,10 @@ _FOCUS_DEFAULTS = CaptureConfig()
 # 粗检用的宽度：960 宽在 1440p 上约 30~50 ms，够实时对准；精确复核仍用全分辨率。
 GATE_WORK_WIDTH = 960
 
-# 双路并排窗口里每一路的高度（两路缩放后 hstack，窗口别撑爆屏幕）。
-BOTH_VIEW_HEIGHT = 720
+# 版式常量见下方 `GUIDE_MARGIN` / `GUIDE_AREA_RANGE` / `CANVAS_MIN`。
+# 原来这里有个 `BOTH_VIEW_HEIGHT = 720`：它把两路各缩到 720 高再 hstack →
+# 一张固定的 2560x720 拼图，配 AUTOSIZE 窗口 —— 拖不动、全屏无效、字缩没了。
+# 2026-10-27 起改成"画布跟着窗口尺寸走"，这个常量随之删掉。
 
 
 def judge_capture(found: bool, still_px: float, focus: float,
@@ -213,30 +216,152 @@ def _open_source(source: str | None, camera: str | None, args,
                        fps=args.fps, backend=_backend_const(args.backend))
 
 
-def _draw_overlay(frame: np.ndarray, spec: BoardSpec, obs: BoardObservation,
-                  count: int, target: int, reason: str, ok: bool,
-                  hint: str = "空格 保存   q/ESC 退出") -> np.ndarray:
-    """把角点、进度、当前原因画在画面上（窗口模式用；不改原帧）。"""
-    view = frame.copy()
-    if obs.found and obs.corners is not None:
-        cv2.drawChessboardCorners(view, spec.pattern_size, obs.corners, True)
+CANVAS_MIN = (640, 360)            # 兜底下限：窗口被拖到极小时也不至于除零
+GUIDE_MARGIN = 0.06                # 引导框距边 6%：整块板要落在框内
+GUIDE_AREA_RANGE = (8.0, 35.0)     # 板占画面面积的建议区间（%）
+TARGET_BOX = 0.52                  # 内框占画面宽高的比例（面积≈27%，落在上面区间里）
+VIEW_SINGLE = "capture_board"
+VIEW_BOTH = "capture_board (both)"
+
+
+def _canvas_size(name: str) -> tuple[int, int]:
+    """按**当前窗口**尺寸给画布尺寸；窗口还没建好就用 1280x720 起步。
+
+    这是"同时适配全屏和窗口模式"的关键：全屏时 `getWindowImageRect` 给的是
+    屏幕图像区，于是画布 = 屏幕，imshow 是 1:1（字不糊）；窗口模式下给的是
+    窗口客户区，画布 = 窗口，也是 1:1。两种模式共用同一条路径，不需要两套版式。
+
+    首帧的回退值刻意取 `DEFAULT_WINDOW_SIZE`（1280x720）而不是"屏幕的 86%"：
+    `WindowManager.ensure()` 会把初始窗口设成"图片的 1.5 倍、屏幕上限定 90%"，
+    首帧给一张接近屏幕的画布 → 窗口直接开到 90% 屏，很吓人。给 720p 就刚好。
+    """
+    try:
+        rect = cv2.getWindowImageRect(name)
+        if rect and rect[2] > 0 and rect[3] > 0:
+            return int(rect[2]), int(rect[3])
+    except Exception:                                    # noqa: BLE001
+        pass
+    return DEFAULT_WINDOW_SIZE
+
+
+def _fit_into(img: np.ndarray, w: int, h: int):
+    """等比缩放到 (w, h) 以内，返回 (图, 左上角偏移 x, y, 缩放比)。"""
+    ih, iw = img.shape[:2]
+    scale = min(w / max(iw, 1), h / max(ih, 1))
+    nw, nh = max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return (cv2.resize(img, (nw, nh), interpolation=interp),
+            (w - nw) // 2, (h - nh) // 2, scale)
+
+
+def _board_metrics(obs: BoardObservation, shape) -> tuple[float, float]:
+    """(板占画面面积 %, 最靠近边缘的角点距边 px)；没检出就 (nan, nan)。"""
+    if not obs.found or obs.corners is None or not len(obs.corners):
+        return float("nan"), float("nan")
+    h, w = shape[:2]
+    pts = obs.corners.reshape(-1, 2).astype(np.float32)
+    area = float(cv2.contourArea(cv2.convexHull(pts))) / max(1.0, float(w * h)) * 100.0
+    edge = float(min(pts[:, 0].min(), pts[:, 1].min(),
+                     w - pts[:, 0].max(), h - pts[:, 1].max()))
+    return area, edge
+
+
+def _paint_lane(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
+                frame: np.ndarray, spec: BoardSpec, obs: BoardObservation,
+                *, ok: bool, reason: str, title: str) -> None:
+    """一路画面 + 引导框 + 角点 + 指标，画进画布的 (x0, y0, w, h) 格子里。
+
+    **角点与文字都画在画布坐标系里**（先算缩放比再映射）。反过来做（在原图上画、
+    再整体缩放）会让提示文字跟着分辨率一起缩 —— 2560 宽的拼图缩到窗口里，
+    0.55 号字只剩几个像素，那正是"看起来没有提示"的原因。
+    """
+    img, ox, oy, scale = _fit_into(frame, w, h)
+    canvas[y0 + oy:y0 + oy + img.shape[0], x0 + ox:x0 + ox + img.shape[1]] = img
+
+    # 1) 双层引导框：
+    #    外框（距边 6%）= **不许出界**（贴边会被"图棋盘贴边"门限拒）；
+    #    内框（居中 52%×52%，面积≈27%）= **建议至少填满**，落在 GUIDE_AREA_RANGE 里。
+    #    只画外框等于"框住整个画面"，用户看不出该把板放多大 —— 这是第一版的实际问题。
+    gx, gy = int(w * GUIDE_MARGIN), int(h * GUIDE_MARGIN)
+    cv2.rectangle(canvas, (x0 + gx, y0 + gy), (x0 + w - gx, y0 + h - gy),
+                  (96, 96, 96), 1, cv2.LINE_AA)
+    tw, th = int(w * TARGET_BOX), int(h * TARGET_BOX)
+    tx0, ty0 = x0 + (w - tw) // 2, y0 + (h - th) // 2
+    guide = (70, 210, 90) if ok else (120, 170, 210)
+    cv2.rectangle(canvas, (tx0, ty0), (tx0 + tw, ty0 + th), guide, 1, cv2.LINE_AA)
+    fs = max(0.5, h / 780.0)
+    cv2.putText(canvas, "目标区", (tx0 + int(8 * fs), ty0 + int(20 * fs)),
+                cv2.FONT_HERSHEY_SIMPLEX, fs * 0.6, guide, 1, cv2.LINE_AA)
+
+    # 2) 角点：映射到画布坐标再画
+    if obs.found and obs.corners is not None and len(obs.corners):
+        pts = obs.corners.reshape(-1, 2).astype(np.float32) * scale
+        pts[:, 0] += x0 + ox
+        pts[:, 1] += y0 + oy
+        cv2.drawChessboardCorners(canvas, spec.pattern_size,
+                                  pts.reshape(-1, 1, 2), True)
+
+    # 3) 文字：字号随格子高度走，全屏下也不会小；**垫一条深色底**，
+    #    否则压在画面亮部就看不见（第一版直接写在图上，遇到白背景等于消失）。
+    fs = max(0.5, h / 780.0)
+    thick = max(1, int(round(fs * 2)))
     color = (80, 220, 120) if ok else (60, 180, 255)
-    cv2.putText(view, f"{count}/{target}", (12, 34), cv2.FONT_HERSHEY_SIMPLEX,
-                1.0, color, 2, cv2.LINE_AA)
-    cv2.putText(view, (reason or "可以保存"), (12, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-    cv2.putText(view, hint, (12, view.shape[0] - 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
-    return view
+    head = f"{title}  " + ("OK" if ok else (reason or "—"))
+    # 原因可能很长（"棋盘还在移动（12px）"之类），超出格宽就截断 —— 宁可少几个字，
+    # 也不要让文字横穿到隔壁那一路去（看起来像标错了路）。
+    while len(head) > 4 and cv2.getTextSize(
+            head, cv2.FONT_HERSHEY_SIMPLEX, fs, thick)[0][0] > w - int(24 * fs):
+        head = head[:-2] + "…"
+    (hw, hh), _ = cv2.getTextSize(head, cv2.FONT_HERSHEY_SIMPLEX, fs, thick)
+    cv2.rectangle(canvas, (x0, y0), (x0 + hw + int(22 * fs), y0 + hh + int(18 * fs)),
+                  (26, 26, 26), -1)
+    cv2.putText(canvas, head, (x0 + int(10 * fs), y0 + int(30 * fs)),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, color, thick, cv2.LINE_AA)
+
+    area, edge = _board_metrics(obs, frame.shape)
+    if np.isfinite(area):
+        lo, hi = GUIDE_AREA_RANGE
+        warn = "  ← 偏小" if area < lo else ("  ← 偏大" if area > hi else "")
+        detail = (f"板 {area:.1f}%{warn}  清晰度 {obs.focus:.0f}  "
+                  f"距边 {edge:.0f}px")
+    else:
+        detail = "未检出：整块入框、别贴边、别斜到看不见格"
+    dy = y0 + h - int(12 * fs)
+    (dw, dh), _ = cv2.getTextSize(detail, cv2.FONT_HERSHEY_SIMPLEX, fs * 0.78, 1)
+    cv2.rectangle(canvas, (x0, dy - dh - int(8 * fs)), (x0 + dw + int(22 * fs), y0 + h),
+                  (26, 26, 26), -1)
+    cv2.putText(canvas, detail, (x0 + int(10 * fs), dy),
+                cv2.FONT_HERSHEY_SIMPLEX, fs * 0.78, (232, 232, 232), 1, cv2.LINE_AA)
 
 
-def _side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-    """两路画面缩到同一高度后左右拼接（窗口里一眼看出是哪一路不满足）。"""
-    def fit(img: np.ndarray) -> np.ndarray:
-        h = img.shape[0]
-        scale = BOTH_VIEW_HEIGHT / float(h) if h else 1.0
-        return cv2.resize(img, (int(round(img.shape[1] * scale)), BOTH_VIEW_HEIGHT))
-    return np.hstack([fit(left), fit(right)])
+def _compose(lanes: list[dict], size: tuple[int, int], footer: str,
+             ok_all: bool) -> np.ndarray:
+    """把 N 路 lane 拼成一张画布。`lanes` 里每项：
+    `{title, frame, obs, ok, reason, spec}`。
+    """
+    W, H = int(size[0]), int(size[1])
+    n = max(1, len(lanes))
+    fh = int(np.clip(H // 10, 56, 104))              # 底部状态栏高度
+    body = max(1, H - fh)
+    cw = max(1, W // n)
+    # 底色用深灰而不是纯黑：letterbox 的黑边看起来像"画面坏了"，深灰是有意的底色
+    canvas = np.full((H, W, 3), 45, np.uint8)
+    for i, lane in enumerate(lanes):
+        x0 = i * cw
+        w = cw if i < n - 1 else (W - x0)            # 最后一格吃掉余数，右边缘不留黑缝
+        _paint_lane(canvas, x0, 0, w, body, lane["frame"], lane["spec"],
+                    lane["obs"], ok=lane["ok"], reason=lane["reason"],
+                    title=lane["title"])
+        if i:                                        # 格间分隔线：高对比画面下否则会糊成一片
+            cv2.line(canvas, (x0, 0), (x0, body), (90, 90, 90), 1, cv2.LINE_AA)
+    # 底部状态栏：进度 + 两路是否"同时"满足 + 按键
+    cv2.rectangle(canvas, (0, body), (W, H), (26, 26, 26), -1)
+    fs = max(0.6, H / 900.0)
+    cv2.putText(canvas, footer, (int(14 * fs), body + int(fh * 0.66)),
+                cv2.FONT_HERSHEY_SIMPLEX, fs,
+                (80, 220, 120) if ok_all else (60, 180, 255), 2, cv2.LINE_AA)
+    return canvas
+
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -330,6 +455,9 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     show = not (args.no_show or args.source)
     auto = bool(args.auto) or not show
     hold, gap = _auto_settings(args)
+    # 窗口助手必须在**第一次调用它之前**建好（静态看没毛病，跑起来才炸
+    # UnboundLocalError —— `run_realtime` 踩过这个，见 `selftest_window_mode` §3）。
+    wins = WindowManager()
 
     try:
         src = _open_source(args.source, args.camera, args, side=args.side)
@@ -372,13 +500,23 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
 
             pressed = -1
             if show:
-                hint = (f"自动：连稳 {hold} 帧 / 间隔 {gap:.1f} s   空格 立即存   q/ESC 退出"
-                        if auto else "空格 保存   q/ESC 退出")
-                view = _draw_overlay(frame, spec, obs, len(saved), args.target,
-                                     "" if can else reason, can, hint=hint)
-                cv2.imshow("capture_board", view)
+                hint = (f"自动：连稳 {hold} 帧 / 间隔 {gap:.1f} s   空格 立即存   "
+                        f"q 退出   {wins.fullscreen_hint()}"
+                        if auto else
+                        f"空格 保存   q 退出   {wins.fullscreen_hint()}")
+                footer = (f"{len(saved)}/{args.target} 张   "
+                          f"{'可保存' if can else (reason or '—')}   "
+                          f"{src.info.width}x{src.info.height}   {hint}")
+                canvas = _compose(
+                    [{"title": f"{args.side or '相机'}", "frame": frame,
+                      "obs": obs, "ok": can, "reason": reason, "spec": spec}],
+                    _canvas_size(VIEW_SINGLE), footer, can)
+                wins.show(VIEW_SINGLE, canvas)
                 pressed = cv2.waitKey(1) & 0xFF
-                if pressed in (ord("q"), 27):
+                # 全屏键先处理：Esc 在全屏时只退全屏，不该把收图退掉
+                if wins.handle_key(VIEW_SINGLE, pressed, canvas):
+                    continue
+                if pressed == ord("q") or (pressed == 27):
                     log.info("用户退出（q/ESC）")
                     break
 
@@ -452,6 +590,8 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
     """
     show = not args.no_show
     hold, gap = _auto_settings(args)
+    # 同上：先建后用一个字都不能省（`selftest_window_mode` §3 会扫顺序）。
+    wins = WindowManager()
     src_l = src_r = None
     try:
         src_l = _open_source(args.source_left, args.camera_left, args, side="left")
@@ -506,15 +646,30 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
 
             pressed = -1
             if show:
-                vl = _draw_overlay(fl, spec, obs_l, saved, args.target,
-                                   "左 OK" if can_l else f"左：{why_l}", can_l,
-                                   hint="空格 立即存一对   q/ESC 退出")
-                vr = _draw_overlay(fr, spec, obs_r, saved, args.target,
-                                   "右 OK" if can_r else f"右：{why_r}", can_r,
-                                   hint="空格 立即存一对   q/ESC 退出")
-                cv2.imshow("capture_board (both)", _side_by_side(vl, vr))
+                # 两路各自的原因 + **共同可见**状态：单板参考图的核心就是
+                # "同一块板同一位置，两路同时看到" —— 所以这一条必须一眼可见，
+                # 不能只显示"左 OK / 右：还在动"就完事。
+                if both_ok:
+                    seen = "两路同时可见 ✓ 可以存"
+                elif can_l:
+                    seen = f"右路未满足：{why_r}"
+                elif can_r:
+                    seen = f"左路未满足：{why_l}"
+                else:
+                    seen = f"两路都未满足｜左 {why_l or 'OK'}｜右 {why_r or 'OK'}"
+                footer = (f"{saved}/{args.target} 对   {seen}   "
+                          f"空格 立即存   q 退出   {wins.fullscreen_hint()}")
+                canvas = _compose(
+                    [{"title": "左", "frame": fl, "obs": obs_l, "ok": can_l,
+                      "reason": why_l, "spec": spec},
+                     {"title": "右", "frame": fr, "obs": obs_r, "ok": can_r,
+                      "reason": why_r, "spec": spec}],
+                    _canvas_size(VIEW_BOTH), footer, both_ok)
+                wins.show(VIEW_BOTH, canvas)
                 pressed = cv2.waitKey(1) & 0xFF
-                if pressed in (ord("q"), 27):
+                if wins.handle_key(VIEW_BOTH, pressed, canvas):
+                    continue
+                if pressed == ord("q") or pressed == 27:
                     log.info("用户退出（q/ESC）")
                     break
 

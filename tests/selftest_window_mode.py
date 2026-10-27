@@ -67,6 +67,10 @@ APPS = (
     "apps/tools/cameras.py",
     "apps/tools/calibrate_color.py",
     "apps/tools/calibrate_focal.py",
+    # 2026-10-27 补：单板链式标定的收图窗口（双路成对 + 单路）一直没接，
+    # 于是它既不能全屏、窗口也拖不动（AUTOSIZE + 固定 2560x720 拼图）。
+    # 用户的原话是"所有程序的视频显示窗口都要有全屏模式"—— 这就是漏掉的那个。
+    "apps/tools/capture_board.py",
 )
 # 这些程序里 `f` 已经被别的功能占用，全屏只能留给 F11。
 # **抢掉别人已用的键比没有全屏更糟** —— 那是把一个既有功能弄坏。
@@ -133,7 +137,13 @@ def main() -> int:
         built = "wins = WindowManager()" in src
         uses_show = "wins.show(" in src
         uses_key = "wins.handle_key(" in src
-        imports = "from apps._window import WindowManager" in src
+        # ⚠️ 2026-10-27：这里原来是逐字 `"from apps._window import WindowManager" in src`，
+        # 于是只要多导一个名字（`from apps._window import DEFAULT_WINDOW_SIZE, WindowManager`）
+        # 就会被判成"没导入" —— 断言耦合了**导入写法**，不是"有没有导入"。
+        # 改成认"从 apps._window 导入了 WindowManager"，其余三条（建/show/键）照旧严格。
+        import re as _re
+        imports = bool(_re.search(
+            r"from\s+apps\._window\s+import[^\n]*\bWindowManager\b", src))
         # `wins` 必须在**第一次使用之前**建好。
         # 第一版 `run_realtime` 把提示语写在建管理器之前，跑起来才炸
         # `UnboundLocalError` —— 静态看语法完全正常。
@@ -166,6 +176,55 @@ def main() -> int:
                 stragglers.append(f"{rel}:{i + 1}")
     print(f"  直接 cv2.imshow(...) 的位置：{stragglers or '无'}")
     ck("没有绕开助手的 cv2.imshow（否则那个窗口没全屏）", not stragglers)
+
+    # ---- 6. 版式：画布尺寸必须跟着窗口走（窗口 / 全屏两种尺寸都验）----
+    #
+    # 为什么要钉这条（2026-10-27）：收图标定板的窗口原来把两路各缩到 720 高再
+    # `hstack` → 一张**固定的 2560x720** 拼图。窗口是 AUTOSIZE（拖不动），
+    # 全屏也无效；提示文字画在原始分辨率上再整体缩放，缩完只剩几个像素。
+    # 现在的契约很硬：**请求多大，画布就多大**，于是全屏=屏幕、窗口=客户区，
+    # 两种模式共用一条路径（`_canvas_size` 每帧从 `getWindowImageRect` 取）。
+    print("----- 6. 版式：画布尺寸 = 请求尺寸（全屏与窗口同一路径）-----")
+    from apps.tools import capture_board as cb
+    import numpy as np
+
+    spec = cb.BoardSpec(cols=8, rows=5, square_mm=25.0)
+    frame = np.zeros((1080, 1920, 3), np.uint8)
+    xs = np.linspace(300, 1500, 8)
+    ys = np.linspace(300, 800, 5)
+    corners = np.array([[x, y] for y in ys for x in xs], np.float32).reshape(-1, 1, 2)
+    obs = cb.BoardObservation(found=True, corners=corners, focus=1200.0)
+    obs_none = cb.BoardObservation(found=False)
+
+    for label, size in (("窗口 1280x720", (1280, 720)),
+                        ("全屏 1920x1080", (1920, 1080))):
+        one = cb._compose(
+            [{"title": "左", "frame": frame, "obs": obs, "ok": True,
+              "reason": "", "spec": spec}], size, "footer", True)
+        two = cb._compose(
+            [{"title": "左", "frame": frame, "obs": obs, "ok": True,
+              "reason": "", "spec": spec},
+             {"title": "右", "frame": frame, "obs": obs_none, "ok": False,
+              "reason": "未检出棋盘", "spec": spec}], size, "footer", False)
+        ck(f"{label}：单路画布尺寸 = 请求尺寸",
+           one.shape[:2] == (size[1], size[0]))
+        ck(f"{label}：双路画布尺寸 = 请求尺寸（不会被撑成固定 2560 宽）",
+           two.shape[:2] == (size[1], size[0]))
+
+    # 角点必须真的画在**画布坐标系**里：有板与无板的两张图不能一样。
+    # 若哪天又把文字/角点画回原图再整体缩放，这条会先红。
+    with_pts = cb._compose(
+        [{"title": "左", "frame": frame, "obs": obs, "ok": True,
+          "reason": "", "spec": spec}], (1280, 720), "footer", True)
+    without = cb._compose(
+        [{"title": "左", "frame": frame, "obs": obs_none, "ok": True,
+          "reason": "", "spec": spec}], (1280, 720), "footer", True)
+    ck("角点/引导框真的画到了画布上（有板与无板不同）",
+       bool((with_pts != without).any()))
+
+    # 窗口还没建好时 `_canvas_size` 不许抛，也不许返回 0
+    w0, h0 = cb._canvas_size("__no_such_window__")
+    ck(f"窗口未建时画布尺寸有回退值（{w0}x{h0}，>0）", w0 > 0 and h0 > 0)
 
     print()
     ok = all(v for _n, v in results)
