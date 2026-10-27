@@ -237,8 +237,14 @@ apps / tests                        （只调用，不被调用）
 ```powershell
 启动程序.bat test              # fast 档：跳过三个慢测试（mutation_guards / stereo_calib / synthetic）
 启动程序.bat test full         # 全套 24 个（改代码后必跑，约 6 分钟）
+启动程序.bat test full -j 6    # 同上但并行 6 路，约 3.3 分钟（结果与串行一致）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
+
+> **`-j N` 的三条约束**（`apps/run_tests.py` 的 `EXCLUSIVE` / `CONFLICT_GROUPS` 里写着原因）：
+> ① `mutation_guards` **独占且最后**跑（它会临时改源码，和别人并行 = 别人在坏代码上跑）；
+> ② `doc_facts` 与 `entrypoints` **互斥**（前者在 `docs/` 造坏引用探针，后者会跑 `check_standards`）；
+> ③ 并行**不写** `timings.json`（抢 CPU 会污染快/慢分层）。
 
 分层依据是**实测耗时**（`outputs/test_results/timings.json` 的中位数），不是写死的名单；
 细节见 `apps/run_tests.py` 的文档串。

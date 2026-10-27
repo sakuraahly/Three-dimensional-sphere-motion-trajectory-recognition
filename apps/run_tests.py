@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -73,6 +74,30 @@ DEFAULT_SLOW_THRESHOLD = 60.0
 # 自动分层的依据是机器计时，而计时会被负载影响；把"跑不跑某个测试"完全交给
 # 一个会漂的数字，就意味着某天它会**悄悄不被跑**。这几个测试守的是
 # "不跑就发现不了、且后果是静默错误"的东西，所以显式钉住。
+# ---- 并行执行的三条约束（2026-10-27）------------------------------------
+# `--jobs N` 不是"把循环换成线程池"就完事，下面两组是**真实会互相破坏**的：
+#
+# 1) 独占：`selftest_mutation_guards` 会**临时改写源码**再还原。
+#    它和任何测试并行 = 别的测试在这份被改坏的代码上跑，且结果看起来正常。
+EXCLUSIVE = frozenset({"selftest_mutation_guards.py"})
+#
+# 2) 互斥组：`selftest_doc_facts` 会在 `docs/` 下造"坏引用"探针并跑 `check_standards`；
+#    `selftest_entrypoints` 也会跑 `check_standards`。两者并行时，后者会看到前者留下的
+#    探针，于是"规范检查报红"——这是并行引入的假失败，和代码无关。
+#    （2026-10-27 实测：并发手跑这两个确实会撞出 FileNotFoundError 与红节。）
+CONFLICT_GROUPS = (
+    frozenset({"selftest_doc_facts.py", "selftest_entrypoints.py"}),
+)
+# 子进程里把数学库线程压成 1：16 核上开 6 个进程、每个再开满 BLAS 线程会互相抢，
+# 反而比串行慢。测试本身没有能吃到多线程的负载。
+_PARALLEL_ENV = {
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1",
+}
+
+
 MUST_RUN = (
     "selftest_pair_source.py",       # 偏移符号搞反 = 程序照跑、三维系统性偏
     "selftest_config_wiring.py",     # 配置项写了没人读 = 改了不生效
@@ -195,16 +220,18 @@ def classify(names: list[str], timings: dict[str, list[float]],
     return fast, slow, unknown
 
 
-def run_one(name: str, timeout: float) -> TestResult:
-    """跑一个测试，独立子进程。"""
+def run_one(name: str, timeout: float, *,
+            extra_env: dict[str, str] | None = None) -> TestResult:
+    """跑一个测试，独立子进程。`extra_env` 用于并行时压住数学库线程数。"""
     path = TESTS_DIR / name
     res = TestResult(name=name)
+    env = None if not extra_env else {**os.environ, **extra_env}
     t0 = time.perf_counter()
     try:
         proc = subprocess.run(
             [sys.executable, str(path)],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout, cwd=str(ROOT),
+            errors="replace", timeout=timeout, cwd=str(ROOT), env=env,
         )
         out = (proc.stdout or "") + (proc.stderr or "")
         res.exit_code = proc.returncode
@@ -238,27 +265,100 @@ def _tail(text: str, n: int = 6) -> list[str]:
     return lines[-n:]
 
 
+def _print_result(idx: int, total: int, r: TestResult) -> None:
+    mark = {"pass": "通过", "fail": "不达标", "timeout": "超时",
+            "error": "无法运行"}[r.status]
+    extra = "（跳过）" if r.skipped else ""
+    print(f"\r[{idx}/{total}] {r.name:<38} {r.seconds:7.1f}s  "
+          f"{'PASS' if r.status == 'pass' else 'FAIL'}  {mark}{extra}")
+    if r.tail:
+        for ln in r.tail:
+            print(f"          | {ln}")
+
+
 def run(names: list[str], timeout: float, timings: dict[str, list[float]],
-        threshold: float) -> list[TestResult]:
+        threshold: float, jobs: int = 1) -> list[TestResult]:
+    if jobs > 1 and len(names) > 1:
+        return _run_parallel(names, timeout, timings, threshold, jobs)
+    return _run_serial(names, timeout, timings, threshold)
+
+
+def _run_serial(names: list[str], timeout: float,
+                timings: dict[str, list[float]], threshold: float
+                ) -> list[TestResult]:
     results: list[TestResult] = []
     for i, name in enumerate(names, 1):
         print(f"[{i}/{len(names)}] {name} …", end="", flush=True)
         r = run_one(name, timeout)
         r.slow = median(timings.get(name) or []) > threshold
-        mark = {"pass": "通过", "fail": "不达标", "timeout": "超时",
-                "error": "无法运行"}[r.status]
-        extra = "（跳过）" if r.skipped else ""
-        print(f"\r[{i}/{len(names)}] {name:<38} {r.seconds:7.1f}s  "
-              f"{'PASS' if r.status == 'pass' else 'FAIL'}  {mark}{extra}")
-        if r.tail:
-            for ln in r.tail:
-                print(f"          | {ln}")
+        _print_result(i, len(names), r)
         results.append(r)
         # 每跑完一个就更新耗时 —— 中途 Ctrl-C 也不丢已测数据
         if r.status in ("pass", "fail") and r.seconds > 0:
             note_timing(timings, name, r.seconds)
             save_timings(timings)
     return results
+
+
+def _run_parallel(names: list[str], timeout: float,
+                  timings: dict[str, list[float]], threshold: float,
+                  jobs: int) -> list[TestResult]:
+    """并行跑（`--jobs N`）。
+
+    ## 三条必须遵守的约束
+
+    1. **独占的放最后串行**（`EXCLUSIVE`）：`mutation_guards` 会临时改源码。
+       放最后还有个额外好处 —— 万一它中途死掉留下变异体，**后面没有测试会在坏代码上跑**
+       （`tests/_journal.py` 会在下次启动时还原）。
+    2. **互斥组内不许重叠**（`CONFLICT_GROUPS`）：会通过 `docs/` 探针互相污染。
+    3. **并行时不写耗时基线**：多个进程抢 CPU，记下来的数会比真实值大得多，
+       而 `timings.json` 正是"快/慢分层"的依据 —— 污染它会让 `fast` 档悄悄跑错测试。
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import nullcontext
+
+    group_of: dict[str, int] = {}
+    for gi, grp in enumerate(CONFLICT_GROUPS):
+        for n in grp:
+            group_of[n] = gi
+    locks = [threading.Lock() for _ in CONFLICT_GROUPS]
+    print_lock = threading.Lock()
+    counter = [0]
+
+    rest = [n for n in names if n not in EXCLUSIVE]
+    exclusive = [n for n in names if n in EXCLUSIVE]
+
+    print(f"并行 {jobs} 路：{len(rest)} 个（每个子进程 BLAS 线程=1，避免互相抢）")
+    if exclusive:
+        print(f"独占串行（会临时改源码，且放在最后）：{', '.join(exclusive)}")
+    print("说明：并行不更新 outputs/test_results/timings.json —— 抢 CPU 的耗时会污染"
+          "快/慢分层")
+    print()
+
+    def task(name: str) -> TestResult:
+        gi = group_of.get(name)
+        with (locks[gi] if gi is not None else nullcontext()):
+            r = run_one(name, timeout, extra_env=_PARALLEL_ENV)
+        r.slow = median(timings.get(name) or []) > threshold
+        with print_lock:
+            counter[0] += 1
+            _print_result(counter[0], len(names), r)
+        return r
+
+    results: list[TestResult] = []
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        results.extend(pool.map(task, rest))
+
+    for name in exclusive:
+        counter[0] += 1
+        r = run_one(name, timeout)
+        r.slow = median(timings.get(name) or []) > threshold
+        _print_result(counter[0], len(names), r)
+        results.append(r)
+
+    by_name = {r.name: r for r in results}
+    return [by_name[n] for n in names if n in by_name]
 
 
 def _recover_stale_mutation() -> None:
@@ -283,6 +383,18 @@ def _recover_stale_mutation() -> None:
         print()
 
 
+def _resolve_jobs(raw: str) -> int:
+    """把 `--jobs` 解析成正整数；`auto` = CPU 核数（上限 8，再多是抢内存不是提效）。"""
+    text = str(raw).strip().lower()
+    if text in ("auto", "0"):
+        return max(1, min(8, os.cpu_count() or 4))
+    try:
+        n = int(text)
+    except ValueError:
+        raise SystemExit(f"--jobs 只接受整数或 auto，收到 {raw!r}")
+    return max(1, n)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="回归测试运行器（项目里唯一跑全套测试的地方）")
@@ -295,6 +407,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--only", nargs="+", metavar="NAME",
                     help="只跑这些（可给简写，如 calib_facts）")
     ap.add_argument("--list", action="store_true", help="只列清单与分层，不跑")
+    ap.add_argument("--jobs", "-j", default="1", metavar="N",
+                    help="并行路数：整数，或 auto（=CPU 核数，上限 8）。默认 1 = 串行。"
+                         "会改源码的测试自动独占串行，见 EXCLUSIVE")
     args = ap.parse_args(argv)
 
     if not args.list:
@@ -359,8 +474,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{tag}] {n:<38} {detail}")
         return 0
 
+    jobs = _resolve_jobs(args.jobs)
+    if jobs > 1:
+        print(f"并行：{jobs} 路（-j {args.jobs}）")
+        print()
+
     t0 = time.perf_counter()
-    results = run(selected, args.timeout, timings, args.slow_threshold)
+    results = run(selected, args.timeout, timings, args.slow_threshold, jobs)
     total = time.perf_counter() - t0
 
     n_pass = sum(1 for r in results if r.status == "pass")
