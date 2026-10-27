@@ -235,9 +235,9 @@ apps / tests                        （只调用，不被调用）
 ## 7. 质量底线：24 个回归测试
 
 ```powershell
-启动程序.bat test              # fast 档：跳过三个慢测试（mutation_guards / stereo_calib / synthetic）
-启动程序.bat test full         # 全套 24 个（改代码后必跑；串行约 8.5 分钟）
-启动程序.bat test full -j 6    # 同上但并行 6 路，约 3.3 分钟（结果与串行一致）
+启动程序.bat test              # fast 档：自动跳过中位耗时 > 60s 的慢测试（当前名单见 --list）
+启动程序.bat test full         # 全套 24 个（改代码后必跑；串行约 5.8 分钟）
+启动程序.bat test full -j 6    # 同上但并行 6 路，约 3.4 分钟（结果与串行一致）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
 
