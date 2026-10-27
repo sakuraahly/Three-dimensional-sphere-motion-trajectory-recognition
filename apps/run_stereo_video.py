@@ -294,7 +294,10 @@ def main() -> int:
                         default_method("detector"),
                         "；".join(f"{d['name']}={d['summary']}"
                                   for d in describe("detector"))))
-    ap.add_argument("--preset", default="", help="color 预设，如 white_ball；空=默认")
+    ap.add_argument("--preset", default=None,
+                    choices=ColorConfig.preset_names(),
+                    help="color 预设（球色）；不传=用配置里的颜色。可选：%s"
+                         % (" / ".join(ColorConfig.preset_names())))
     ap.add_argument("--origin", default="0,0,0",
                     help="视频里标出的参照原点（parallel=校正左相机系，"
                          "angled=原始左相机系；x,y,z 米；默认相机光心投影）")

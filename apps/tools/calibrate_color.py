@@ -36,7 +36,12 @@ from sphere_tracker.detectors import ColorBlobDetector
 from sphere_tracker.sources import open_source
 
 WINDOW = "calibrate color"
-PRESETS = ["white_ball", "orange_ball", "green_ball", "blue_ball", "red_ball", "yellow_ball"]
+# 数字键 1..N 套用的预设，**顺序和名字都来自 `COLOR_PRESETS`**（`config.py` 唯一来源）。
+# 这里原来手抄了一份六项清单 —— 与 `run_realtime` 的帮助文本、GUI 下拉互为副本，
+# 加一种球色要改四处。数字键与顺序的绑定是**界面契约**（用户手册写着 1-6 白/橙/绿/蓝/红/黄），
+# 所以顺序不能随意调整：新增预设请追加，不要插队。
+PRESETS = ColorConfig.preset_names()
+MAX_PRESET_KEYS = 9        # 只有 "1".."9" 是能按的键；超出部分按键不可达（不静默错位）
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,7 +153,7 @@ def main() -> int:
         if key == ord("s"):
             p = save_config(cfg, args.save)
             print(f"已保存配置：{p}")
-        if ord("1") <= key <= ord("6"):
+        if ord("1") <= key < ord("1") + min(len(PRESETS), MAX_PRESET_KEYS):
             name = PRESETS[key - ord("1")]
             c = ColorConfig.preset(name)
             cfg.detector.color = c

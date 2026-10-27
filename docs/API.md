@@ -65,7 +65,9 @@ def _build(cfg): return MyDetector(cfg)
 
 ## 1. `sphere_tracker/config.py` —— 全部可调参数
 ```python
+COLOR_PRESETS: dict[str, dict]      # 预设名 -> HSV 参数；**全项目只此一处**
 class ColorConfig:  @staticmethod preset(name: str) -> "ColorConfig"
+                    @staticmethod preset_names() -> list[str]   # 定义顺序
     # white_ball / orange_ball / green_ball / blue_ball / red_ball / yellow_ball
 class AppConfig:  detector / tracker / camera / predict / viz
     def to_dict(self) -> dict;  def save(self, path: str | Path) -> Path      # mkdir -p 后写 JSON
@@ -74,7 +76,7 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 ```
 | 组               | 关键默认值                                                                                                                                                                                                                                                                                                        |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DetectorConfig` | `method="fusion"`、`fusion_members=["color","hough","motion"]`、`min_radius=8.0`、`max_radius=200.0`、`min_circularity=0.55`、`min_fill_ratio=0.72`、`min_radial_consistency=0.90`、`subpixel_refine=True`、`subpixel_rays=72`、`motion_compensation="auto"`、`camera_motion_threshold_px=0.8`、`motion_work_width=320`、`agree_px=6.0`、`agree_ratio=0.45`、`yolo_weights="models/yolo11n.pt"`、`sam_model="models/sam2.1_t.pt"`、`yolo_classes=[32]` |
+| `DetectorConfig` | `method="color"`、`fusion_members=["color","hough","motion"]`、`min_radius=8.0`、`max_radius=200.0`、`min_circularity=0.55`、`min_fill_ratio=0.72`、`min_radial_consistency=0.90`、`subpixel_refine=True`、`subpixel_rays=72`、`motion_compensation="auto"`、`camera_motion_threshold_px=0.8`、`motion_work_width=320`、`agree_px=6.0`、`agree_ratio=0.45`、`yolo_weights="models/yolo11n.pt"`、`sam_model="models/sam2.1_t.pt"`、`yolo_classes=[32]` |
 | `TrackerConfig`  | `order=2`、`process_noise=1.5e2`、`measurement_noise=2.0`、`gate_chi2=9.21`、`maneuver_min_px_s=250.0`、`maneuver_ratio=1.6`、`max_coast_frames=12`、`init_hits=2`、`trail_length=240`、`trail_source="measurement"`                                                                                                                                                                                                  |
 | `CameraConfig`   | `fx=fy=0.0`（未标定）、`cx=cy=-1.0`（用图像中心）、`hfov_deg=60.0`、`ball_diameter_m=0.04`、`enable_3d=True`                                                                                                                                                                                                       |
 | `PredictConfig`  | `method="quadratic"`、`horizon_s=0.6`、`steps=30`、`min_points=6`、`use_gravity=False`、`use_pixel_gravity=True`、`window_s=0.45`、`min_window_s=0.12`、`residual_tol=2.5`、`smooth_window=1`                                                                                                                          |
@@ -83,6 +85,7 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 **坑**：① 默认颜色预设是**白色/高亮球**（`[0,0,175]`–`[179,80,255]`），**不是橙球** —— 拍橙球必须 `preset("orange_ball")` 或跑 `apps/tools/calibrate_color.py`，否则"检测不到"会被误判成算法问题。
 ② `DetectorConfig.min_score`（默认 `0.55`）与 `TrackerConfig.max_q_scale`（默认 `64.0`）**现在是活的** —— 接线位置：`detectors/fusion.py:75` 的孤证门限读 `cfg.min_score`、`KalmanFilter.__init__(..., max_q_scale=cfg.max_q_scale)`（`track.py:40` 用它算 `q_max`）。
 **但 `_merge_dataclass` 仍然忽略未知字段**，所以**键名拼错会静默失效**（不报错）—— 配置接线由 `tests/selftest_config_wiring.py` 扫全部字段守着。
+③ 预设的**名字清单只有 `COLOR_PRESETS` 一份**（2026-10-27）：「有哪些球色」曾被手抄在 CLI 帮助、HSV 工具的数字键表、GUI 下拉三处，加一种球色要改四处。现在 `preset_names()` 是唯一出口，各入口的 `--preset` 还带 `choices=`（拼错当场报 usage，而不是运行时 `KeyError`）。`tests/selftest_entrypoints.py` 扫 `apps/` 与两个启动脚本，出现"≥3 个预设名的字面量"即判红。
 （2026-10-10 之前确实是两个死配置项，行为等价修复后默认值对齐了历史硬编码值 `0.55` / `64.0`，见 `交接文档.md` §10.7-1。）
 ③ `red_ball` 预设自带 `use_second_range=True`（红色跨 0 度），别只抄 `hsv_lower/upper`。
 ## 2. `sphere_tracker/types.py` —— 数据容器（字段要记准）

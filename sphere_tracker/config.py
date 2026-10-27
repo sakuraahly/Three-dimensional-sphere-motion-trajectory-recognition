@@ -8,6 +8,38 @@ from pathlib import Path
 from typing import Any
 
 
+# 颜色预设表：**(名字 -> HSV 参数)**，全项目只此一处。
+#
+# 为什么提到模块级（2026-10-27）：这张表原来藏在 `ColorConfig.preset()` 的
+# 函数体里，于是"有哪些预设"这个事实**没有任何可查询的出口**，只能靠人抄 ——
+# 实测被抄在了三处：
+#   `apps/run_realtime.py` 的 `--preset` 帮助文本、
+#   `apps/tools/calibrate_color.py` 的 `PRESETS` 列表、
+#   `preset()` 自己的 `if name not in presets`。
+# 抄出来的第二、三处没有任何机制保证跟上，加一个预设要改三个文件、还漏得掉。
+# 现在 `preset_names()` 从这张表派生，CLI 的 `choices=` 与帮助文本都读它，
+# 于是"加一种球色 = 往这里加一行"。
+COLOR_PRESETS: dict[str, dict[str, Any]] = {
+    # 白色 / 浅色球体（与 `ColorConfig()` 的默认值**逐值相同**，
+    # 所以"不传 --preset"等效于 white_ball —— 这句话是事实，不是约定）
+    "white_ball": dict(hsv_lower=[0, 0, 175], hsv_upper=[179, 80, 255]),
+    # 橙色球（篮球、橙球）
+    "orange_ball": dict(hsv_lower=[5, 110, 110], hsv_upper=[22, 255, 255]),
+    # 绿色球
+    "green_ball": dict(hsv_lower=[40, 70, 60], hsv_upper=[85, 255, 255]),
+    # 蓝色球
+    "blue_ball": dict(hsv_lower=[95, 90, 60], hsv_upper=[130, 255, 255]),
+    # 红色球（跨 0 度，用双区间）
+    "red_ball": dict(
+        hsv_lower=[0, 110, 70], hsv_upper=[10, 255, 255],
+        use_second_range=True,
+        hsv_lower2=[170, 110, 70], hsv_upper2=[179, 255, 255],
+    ),
+    # 黄色球
+    "yellow_ball": dict(hsv_lower=[20, 100, 100], hsv_upper=[35, 255, 255]),
+}
+
+
 @dataclass
 class ColorConfig:
     """HSV 颜色分割参数。OpenCV 的色相 H 范围是 0-179，S/V 是 0-255。
@@ -28,29 +60,21 @@ class ColorConfig:
     hsv_upper2: list[int] = field(default_factory=lambda: [179, 255, 255])
 
     @staticmethod
+    def preset_names() -> list[str]:
+        """全部预设名，按 :data:`COLOR_PRESETS` 的**定义顺序**（= 界面展示顺序）。
+
+        这是"有哪些预设"的唯一出口：CLI 的 `choices=`、`--help` 文本、
+        HSV 标定工具的数字键都从这里取。**不要在别处再抄一份名单** ——
+        `tests/selftest_entrypoints.py` 会扫出来。
+        """
+        return list(COLOR_PRESETS)
+
+    @staticmethod
     def preset(name: str) -> "ColorConfig":
-        """常用预设。"""
-        presets: dict[str, dict[str, Any]] = {
-            # 白色 / 浅色球体
-            "white_ball": dict(hsv_lower=[0, 0, 175], hsv_upper=[179, 80, 255]),
-            # 橙色球（篮球、橙球）
-            "orange_ball": dict(hsv_lower=[5, 110, 110], hsv_upper=[22, 255, 255]),
-            # 绿色球
-            "green_ball": dict(hsv_lower=[40, 70, 60], hsv_upper=[85, 255, 255]),
-            # 蓝色球
-            "blue_ball": dict(hsv_lower=[95, 90, 60], hsv_upper=[130, 255, 255]),
-            # 红色球（跨 0 度，用双区间）
-            "red_ball": dict(
-                hsv_lower=[0, 110, 70], hsv_upper=[10, 255, 255],
-                use_second_range=True,
-                hsv_lower2=[170, 110, 70], hsv_upper2=[179, 255, 255],
-            ),
-            # 黄色球
-            "yellow_ball": dict(hsv_lower=[20, 100, 100], hsv_upper=[35, 255, 255]),
-        }
-        if name not in presets:
-            raise KeyError(f"未知预设 {name!r}，可选：{sorted(presets)}")
-        return ColorConfig(**presets[name])
+        """按名字取预设。未知名字抛 `KeyError` 并列出可选值。"""
+        if name not in COLOR_PRESETS:
+            raise KeyError(f"未知预设 {name!r}，可选：{sorted(COLOR_PRESETS)}")
+        return ColorConfig(**COLOR_PRESETS[name])
 
 
 @dataclass

@@ -51,6 +51,7 @@ BG = "#eef2f8"
 # 现在加一个检测器只改注册表一处，界面与命令行不可能再对不上。
 # 顺序 = 注册顺序；默认值 = 注册表声明的默认（= `DetectorConfig.method`），
 # 不再靠"列表首项"这种隐式约定 —— 展示顺序与默认值是两件独立的事。
+from sphere_tracker.config import ColorConfig as _ColorConfig  # noqa: E402
 from sphere_tracker.detectors import registry as _detector_registry  # noqa: E402,F401  （import 即注册）
 from sphere_tracker.plugins import default as _plugin_default  # noqa: E402
 from sphere_tracker.plugins import describe as _plugin_describe  # noqa: E402
@@ -65,8 +66,11 @@ DEFAULT_METHOD = _plugin_default("detector")
 # 双目标定的「外参方法」下拉：选项与默认值都来自注册表，界面里不再写方法名。
 CALIB_METHODS = _plugin_names("calib_method")
 DEFAULT_CALIB_METHOD = _plugin_default("calib_method")
-PRESETS = ["不使用", "white_ball", "orange_ball", "green_ball",
-           "blue_ball", "red_ball", "yellow_ball"]
+# 颜色预设下拉：**唯一来源是 `sphere_tracker/config.py` 的 `COLOR_PRESETS`**（R7 同理）。
+# 以前这里是手写的七项清单，同样抄了一份在 `run_realtime` 的帮助文本和
+# `calibrate_color` 的按键表里 —— 加一种球色要改四处、还漏得掉。
+# 「不使用」是界面自己的哨兵值（= 不传 `--preset`，用配置里的颜色），不是预设。
+PRESETS = ["不使用", *_ColorConfig.preset_names()]
 # 左右下拉的默认项：直接给**角色名**（left/right），绑定的设备身份不随 USB 口漂移。
 # 数字编号仍可手选，但换一次接口就可能指向别的相机。
 CAMERAS = ["left", "right", "auto", "0", "1", "2"]

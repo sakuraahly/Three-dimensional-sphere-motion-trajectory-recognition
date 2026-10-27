@@ -60,7 +60,10 @@ def parse_args() -> argparse.Namespace:
     # 默认值与可选清单都来自插件注册表（2026-10-26）：此前这里硬写 "fusion"，
     # 而真默认是 "color" —— 同一台机器上两个入口的默认行为不同，很难被发现。
     p.add_argument("--method", default=default_detector(), choices=detector_names())
-    p.add_argument("--preset", default="white_ball")
+    p.add_argument("--preset", default="white_ball",
+                   choices=ColorConfig.preset_names(),
+                   help="颜色预设（球色），可选：%s"
+                        % (" / ".join(ColorConfig.preset_names())))
     p.add_argument("--config", default=None)
     p.add_argument("--save", default="config/sphere_config.json")
     return p.parse_args()
