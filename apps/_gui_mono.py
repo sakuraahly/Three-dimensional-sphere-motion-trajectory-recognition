@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -82,6 +83,8 @@ class MonoWindow(tk.Toplevel):
             value=prefs.get_str("mono.diameter_mm", "40"))
         self.var_focal = tk.StringVar(
             value=prefs.get_str("mono.focal_override", ""))   # 空 = 用标定值
+        self.var_record_secs = tk.StringVar(
+            value=prefs.get_str("mono.record_seconds", "10"))
 
         # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
@@ -173,12 +176,37 @@ class MonoWindow(tk.Toplevel):
     # ------------------------------------------------------------------ #
     def _build_step3(self, parent) -> None:
         box = self.surface.card(
-            parent, "③ 开始识别",
-            "实时窗口会用上面填的球直径和焦距。没有内参时它会按 60° 视场估算焦距，"
-            "状态条会写明这一点 —— 那种结果只能看趋势，不能当测量。")
+            parent, "③ 录制与识别",
+            "先录一段：**只写相机原图，不叠任何标注**，所以录完可以换参数反复检测。"
+            "录好的文件在 data/mono_takes 下，用「离线视频」选它就能跑。"
+            "「开始实时」是跳过录制、边看边测。没有内参时焦距按 60° 视场估算，"
+            "状态条会写明 —— 那种结果只能看趋势，不能当测量。".replace("**", ""))
+        line = ttk.Frame(box)
+        line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
+                  sticky="w", pady=(4, 0))
+        ttk.Label(line, text="录制时长 秒").pack(side="left")
+        ttk.Entry(line, textvariable=self.var_record_secs, width=6).pack(
+            side="left", padx=(8, 12))
+        ttk.Label(line, text="（0 = 按 q 停止）", style="Hint.TLabel").pack(side="left")
         actions = self.surface.action_row(box)
-        self.surface.primary(actions, "开始实时", self._start_realtime)
+        self.surface.primary(actions, "录制视频", self._start_record)
+        self.surface.secondary(actions, "开始实时", self._start_realtime)
         self.surface.secondary(actions, "离线视频", self._start_video)
+
+    def _start_record(self) -> None:
+        """录制单目视频（只写原图）。录完可直接用「离线视频」检测。"""
+        out_dir = ROOT / "data" / "mono_takes"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{time.strftime('%Y%m%d_%H%M%S')}.mkv"
+        secs = self.var_record_secs.get().strip() or "10"
+        cmd = [sys.executable, str(ROOT / "apps" / "record_mono.py"),
+               "--camera", self.var_camera.get().strip() or "main",
+               "--duration", secs,
+               "--out", str(out)]
+        self.app.tasks.start(cmd, f"单目录制 {secs}s")
+        self.status.set_status(
+            f"已开始录制 {secs} 秒 → {out.name}（有倒计时，看到 REC 才开始动）。"
+            f"录完点「离线视频」选这个文件", "info")
 
     # ------------------------------------------------------------------ #
     # 状态
@@ -348,6 +376,7 @@ class MonoWindow(tk.Toplevel):
         p.set("mono.target", self.var_target.get().strip())
         p.set("mono.diameter_mm", self.var_diameter.get().strip())
         p.set("mono.focal_override", self.var_focal.get().strip())
+        p.set("mono.record_seconds", self.var_record_secs.get().strip())
         p.save()
 
     def _stop_my_tasks(self) -> None:
