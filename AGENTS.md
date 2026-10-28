@@ -81,7 +81,7 @@ sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）
 calib/            双目标定（离线一次）
 stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角测量）
 apps/             可执行程序；tools/ 放一次性设置与诊断
-tests/            回归测试（24 个，改动后必跑）
+tests/            回归测试（25 个，改动后必跑）
 docs/             文档
 assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / 运行期产物
 ```
@@ -90,7 +90,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
-2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 24 个回归测试必须能一键复跑。
+2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 25 个回归测试必须能一键复跑。
 3. **能重新生成的东西不进版本库**（`outputs/`、`config/`、权重、视频素材）。
 4. **交付物不放 `outputs/`**。`outputs/` 的语义是"删了也能重新生成"，
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
@@ -116,7 +116,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：13 个可执行脚本 + 7 个私有模块
+### `apps/` 顶层：13 个可执行脚本 + 13 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -124,7 +124,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | 标定与录制（3） | `record_stereo.py` `calibrate_stereo.py` `verify_stereo.py` | 双路录制（含 session.json）/ 自动标定 / 标定复检 |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（7） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算） |
+| 私有模块（13） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
@@ -251,11 +251,11 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 7. 质量底线：24 个回归测试
+## 7. 质量底线：25 个回归测试
 
 ```powershell
 启动程序.bat test              # fast 档：自动跳过中位耗时 > 60s 的慢测试（当前名单见 --list）
-启动程序.bat test full         # 全套 24 个（改代码后必跑；串行约 5.8 分钟）
+启动程序.bat test full         # 全套 25 个（改代码后必跑；串行约 5.8 分钟）
 启动程序.bat test full -j 6    # 同上但并行 6 路，约 3.4 分钟（结果与串行一致）
 启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
@@ -270,6 +270,7 @@ apps / tests                        （只调用，不被调用）
 
 | 测试 | 守什么 |
 | ---- | ------ |
+| `selftest_gui_budget.py` | GUI 预算自测：防止分窗重做之后又长回"一个窗口装全部" |
 | `selftest_plugins.py` | 插件注册表自测：清单唯一（R7）、未知名字报错（R3）、默认唯一（R4）、边界（R5） |
 | `selftest_synthetic.py` | 单目全链路（三场景） |
 | `selftest_camera_motion.py` | 相机自运动：迟滞状态机 + 位移换算方向；多目标关联（遮挡外推 / 半径法重识别 / 身份互换记账） |
@@ -322,6 +323,13 @@ apps / tests                        （只调用，不被调用）
 ## 9. 明确不做 / 已知边界（避免重复讨论）
 
 - **不改模块划分**：分层已审计通过，只做清理不做重排。
+- **`apps/` 私有模块已 13 个，暂仍不建包**（2026-10-28）：原定"超过 12 个再议"，
+  现在到了这个点，**议的结论是先不动**。判据：建 `apps/gui/` 要同步改
+  `from apps._gui_xxx import ...` 的调用点、以及 `selftest_entrypoints` 里
+  "扫 `apps/_gui_*.py` 全体"的 glob 假设 —— 换来的是目录齐整，代价是一次
+  必然的引用漂移。真正的边界是**每个文件只做一件事**（现在满足：控件层 / 任务层 /
+  外壳 / 控制台 / 单目窗 / 双目窗各自独立），不是"文件放在哪个目录"。
+  何时再议：新增第 15 个私有模块时。
 - **不把 `docs/` 再分目录**：会打断几十处交叉引用，收益只是"好看"。
 - **不做大范围样板统一**（ROOT 引导 25 处、`make_scratch_dir` 3 份）：
   纯样式，动 20+ 文件换整洁，风险大于收益。**记录在案，不假装不存在。**

@@ -82,8 +82,10 @@ SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 # （只靠这里，删掉一个测试再改这个数字就无声无息；只靠第 2 节，
 #  删干净后登记表也一起删，同样无声无息）。
 # 历次：21 → 22（加 `selftest_window_mode.py`）→ 23（加 `selftest_mutation_guards.py`）
-#       → 24（2026-10-26 加 `selftest_plugins.py`：插件注册表不变量 + R5/R7 边界）。
-REAL_TEST_COUNT = 24
+#       → 24（2026-10-26 加 `selftest_plugins.py`：插件注册表不变量 + R5/R7 边界）
+#       → 25（2026-10-28 加 `selftest_gui_budget.py`：分窗后的每步预算。
+#             **用户签字在案**：计划书 §9 第 3 条"测试 24→25/26"，见 §9 末段裁决）。
+REAL_TEST_COUNT = 25
 # 测试命名规范（AGENTS.md §4）
 TEST_NAME_RE = re.compile(r"^selftest_[a-z0-9_]+\.py$")
 # 临时探针用的假路径（造一处新漂移用；用完即删）
