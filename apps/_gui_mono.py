@@ -68,13 +68,26 @@ class MonoWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.configure(bg=BG)
-        self.geometry("880x700")
+        # 三步加起来约 712 px 高（实测 ① 10–338、② 348–512、③ 522–712），
+        # 700 的窗口会把第③步的下半截切掉——用户看到的是"方框被遮挡"。
+        # 给到 820 一次看全三步；屏幕逻辑高 1000，放得下。
+        self.geometry("880x820")
         self.minsize(780, 560)
         self.surface = Surface(self)
 
         # 记住上次填的值（GuiPrefs 只存输入；派生值在那里会被拒绝）
         prefs = app.prefs
-        self.var_camera = tk.StringVar(value=prefs.get_str("mono.camera", "main"))
+        # 默认取配置里的第一个角色。**不能默认空**：`capture_board` 的
+        # `resolve_camera_arg(None)` 返回 None、不自动挑，会报"没能把 None
+        # 解析成相机索引"；也不能默认 "main"（配置里没有这个角色）。
+        # 2026-10-28 两个坑都踩着过。
+        _roles = list(app.state.camera_roles().keys())
+        _saved = prefs.get_str("mono.camera", "")
+        # 存过的值可能已失效（角色被改名/删了，或早期版本存过 "main"）——
+        # 失效就回落第一个角色，别把一个不存在的角色名带进命令行。
+        if _saved not in _roles:
+            _saved = _roles[0] if _roles else "0"
+        self.var_camera = tk.StringVar(value=_saved)
         self.var_cols = tk.StringVar(value=prefs.get_str("board.cols", "8"))
         self.var_rows = tk.StringVar(value=prefs.get_str("board.rows", "5"))
         self.var_square = tk.StringVar(value=prefs.get_str("board.square_mm", "25"))
@@ -115,6 +128,14 @@ class MonoWindow(tk.Toplevel):
         self.lbl_calib = self.surface.hint(box, "检查中…")
         # 相机身份放 L1（同双目窗的道理）：没有它就没法确认用的是哪台
         self.lbl_cams = self.surface.hint(box, "读取相机…")
+        # 选哪台相机：值取自 config/cameras.json 的角色，**不给手打**
+        pick = ttk.Frame(box)
+        pick.grid(row=self.surface._next_row(box), column=0, columnspan=9,
+                  sticky="w", pady=(0, 4))
+        ttk.Label(pick, text="用这台相机").pack(side="left")
+        _roles = list(self.app.state.camera_roles().keys()) or ["0", "1", "2"]
+        ttk.Combobox(pick, values=_roles, width=14, state="readonly",
+                     textvariable=self.var_camera).pack(side="left", padx=(8, 0))
 
         # L1：只有板参数（三个必需值）合在一行 —— 它们是一件事（这块板长什么样），
         # 拆成三行会让首屏输入控件数超标，也让"8×5、25 mm"读起来不像一句话。
@@ -223,8 +244,10 @@ class MonoWindow(tk.Toplevel):
     def _refresh_state(self) -> None:
         st = self.app.state
         try:
+            cam = self.var_camera.get().strip()
             self.lbl_cams.configure(
-                text="相机：" + st.camera_role_text("main"))
+                text="相机：" + ("自动挑（优先外接）" if not cam
+                                 else st.camera_role_text(cam)))
         except Exception:                                   # noqa: BLE001
             self.lbl_cams.configure(text="相机：读取失败（config/cameras.json）")
         ready, text = st.mono_status()
@@ -283,8 +306,12 @@ class MonoWindow(tk.Toplevel):
     # 动作
     # ------------------------------------------------------------------ #
     def _common_camera_args(self) -> list[str]:
+        """空或 auto 一律**不传** ``--camera``，让 capture_board / record_mono
+        自己按"优先外接"挑一台。"""
         cam = self.var_camera.get().strip()
-        return ["--camera", cam] if cam else []
+        if not cam or cam.lower() in ("auto", "none", "自动"):
+            return ["--camera", "0"]      # 兜底：0 号相机（工具不接受空）
+        return ["--camera", cam]
 
     def _start_capture(self) -> None:
         CALIB_FRAME_DIR.mkdir(parents=True, exist_ok=True)

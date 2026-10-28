@@ -485,8 +485,11 @@ def _check_args(ap: argparse.ArgumentParser, args) -> None:
         ap.error("--source-left/--source-right 只用于 --both 自测")
     if not args.out:
         ap.error("缺 --out（单路）；双路请用 --both --out-left … --out-right …")
-    if not args.side:
-        ap.error("缺 --side（left/right）")
+    # `--side` 在单路里**不是必需的**：它只用来给窗口标题和会话记一个"这是哪一路"，
+    # 真正的相机由 `--camera`（角色名/索引）决定，都不给就自动挑。
+    # 原来这里强制要求 side，导致单目标定（只有一路）根本调不起来
+    # （2026-10-28 用户报 "capture_board.py: error: 缺 --side"）。
+    # 双路的 `--both` 分支仍然要求 left/right，那是另一段校验。
 
 
 def _auto_settings(args) -> tuple[int, float]:
