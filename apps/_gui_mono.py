@@ -176,8 +176,12 @@ class MonoWindow(tk.Toplevel):
             "球直径是单目测深的第二个已知量：同一颗球在画面里占多少像素，"
             "就能反推它多远。直径量错 0.5%，深度就错 0.5%。"
             "下面的误差预算是按解析公式算的，用来判断这套方案够不够你的实验。")
+        # ⚠ 走游标：写死 row=1 时游标也停在 1（card() 的说明占了 row=0），
+        # 后面那句 hint 就拿到同一个 row=1 —— 说明文字直接压在参数行上，
+        # 两个输入框看起来"被遮挡"（2026-10-28 用户截图）。
         row = ttk.Frame(box)
-        row.grid(row=1, column=0, columnspan=9, sticky="w", pady=(4, 0))
+        row.grid(row=self.surface._next_row(box), column=0, columnspan=9,
+                 sticky="w", pady=(4, 0))
         ttk.Label(row, text="球直径 mm").pack(side="left")
         ent = ttk.Entry(row, textvariable=self.var_diameter, width=8)
         ent.pack(side="left", padx=(8, 16))

@@ -213,7 +213,9 @@ class StereoWindow(tk.Toplevel):
         self.app = app
         self.mode = mode
         self.configure(bg=BG)
-        self.geometry("920x720")
+        # 四步加起来超过 720 px：④ 的说明会被底部状态条压住（实测 120x6 px）。
+        # 给到 800 让四步展开后仍留出状态条的位置；屏幕逻辑高 1000，放得下。
+        self.geometry("920x800")
         self.minsize(800, 580)
         self.surface = Surface(self)
 

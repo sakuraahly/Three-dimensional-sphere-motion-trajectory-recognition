@@ -92,11 +92,12 @@ class ConsoleWindow(tk.Toplevel):
                                    fill="both", expand=True)
         self.text = tk.Text(logbox, height=14, wrap="none", state="disabled",
                             font=("Consolas", 9), bg="#f8fafc")
-        self.text.grid(row=0, column=0, columnspan=9, sticky="nsew")
-        logbox.rowconfigure(0, weight=1)
+        row_log = self.surface._next_row(logbox)   # Text 与滚动条共用这一行
+        self.text.grid(row=row_log, column=0, columnspan=9, sticky="nsew")
+        logbox.rowconfigure(row_log, weight=1)
         logbox.columnconfigure(0, weight=1)     # 列也要权重，否则只长高不长宽
         bar2 = ttk.Scrollbar(logbox, orient="vertical", command=self.text.yview)
-        bar2.grid(row=0, column=9, sticky="ns")
+        bar2.grid(row=row_log, column=9, sticky="ns")
         self.text.configure(yscrollcommand=bar2.set)
         for line in app.recent_log():
             self._append(line)
