@@ -23,11 +23,27 @@ class BoardSpec:
 
     注意 findChessboardCorners 的参数顺序是 (列, 行)，
     即 pattern_size = (cols, rows)。
+
+    构造时校验范围：3≤cols≤30、3≤rows≤30、5≤square_mm≤500，
+    越界抛 ValueError —— 范围的唯一来源在这里，GUI/CLI 不再各抄一份。
     """
 
     cols: int = 8                 # 内角点列数
     rows: int = 5                 # 内角点行数
     square_mm: float = 25.0       # 方格实际边长（毫米）
+
+    # 范围校验的**唯一来源**（2026-10-27 计划书 §3.1 ①）：此前 GUI 把同一套
+    # 范围抄了 3 份、CLI 四处零校验，`--cols 31` 能直接构造出"检测永远
+    # 返回 0 张"的板，且没有任何解释。钉在这里之后，所有构造点同时被守住。
+    _RANGES = (("cols", 3, 30), ("rows", 3, 30), ("square_mm", 5.0, 500.0))
+
+    def __post_init__(self) -> None:
+        for name, lo, hi in self._RANGES:
+            value = getattr(self, name)
+            if not (lo <= value <= hi):
+                raise ValueError(
+                    f"BoardSpec.{name}={value} 超出允许范围 [{lo}, {hi}]"
+                    f"（cols/rows 是内角点数，至少 3 才成格；square_mm 单位毫米）")
 
     @property
     def n_points(self) -> int:

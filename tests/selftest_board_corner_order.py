@@ -44,6 +44,10 @@
 （"把守卫换成 RMS 最小"这条不需要额外注入 —— 第 2 节本身就是它的反例：
 四个候选的 RMS 极差只有 `2e-6` px，门限无从设起。）
 
+第 5 节（2026-10-28 追加）：`BoardSpec` 范围校验 —— 越界构造抛 ValueError
+且消息含范围与实际值，合法边界值可正常构造。把 `__post_init__` 的校验
+删掉或放宽任一边界，该节即红。
+
 用法::
 
     python tests/selftest_board_corner_order.py
@@ -345,6 +349,45 @@ def test_real_rig_baseline_is_inflated() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_boardspec_range_guard() -> bool:
+    """第 5 节：BoardSpec 范围校验（2026-10-27 计划书 §3.1 ①）。
+
+    此前 GUI 把同一套范围抄了 3 份、CLI 四处零校验：``--cols 31`` 能直接
+    构造出"检测永远返回 0 张"的板且不解释。钉在 ``__post_init__ 之后，
+    越界构造必须当场炸、消息必须写清范围与实际值。
+    """
+    print("----- 5. BoardSpec 范围校验（3≤cols/rows≤30，5≤square_mm≤500） -----")
+    ranges = {"cols": (3, 30), "rows": (3, 30), "square_mm": (5.0, 500.0)}
+    bad = [
+        ("cols=2（下界外）", dict(cols=2, rows=5, square_mm=25.0), "cols", 2),
+        ("cols=31（上界外）", dict(cols=31, rows=5, square_mm=25.0), "cols", 31),
+        ("rows=2（下界外）", dict(cols=8, rows=2, square_mm=25.0), "rows", 2),
+        ("rows=31（上界外）", dict(cols=8, rows=31, square_mm=25.0), "rows", 31),
+        ("square_mm=4（下界外）", dict(cols=8, rows=5, square_mm=4.0), "square_mm", 4.0),
+        ("square_mm=501（上界外）", dict(cols=8, rows=5, square_mm=501.0), "square_mm", 501.0),
+    ]
+    checks = []
+    for label, kw, field, value in bad:
+        lo, hi = ranges[field]
+        try:
+            BoardSpec(**kw)
+            checks.append((f"越界 {label} 必须抛 ValueError", False))
+        except ValueError as exc:
+            msg = str(exc)
+            got = (field in msg and f"[{lo}, {hi}]" in msg and str(value) in msg)
+            print(f"    {label} -> {msg}")
+            checks.append((f"越界 {label} 抛 ValueError 且消息含范围与实际值", got))
+    for label, kw in (
+            ("下界本身 cols=3,rows=3,square=5", dict(cols=3, rows=3, square_mm=5.0)),
+            ("上界本身 cols=30,rows=30,square=500", dict(cols=30, rows=30, square_mm=500.0)),
+            ("默认 8x5x25", dict())):
+        BoardSpec(**kw)
+        checks.append((f"合法 {label} 可正常构造", True))
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("标定板角点顺序自测（SB vs 经典 + 守卫该盯什么量）")
@@ -353,7 +396,8 @@ def main() -> int:
     for fn in (test_permutation_is_rot180,
                test_rms_is_blind_to_permutation,
                test_physical_quantities_discriminate,
-               test_real_rig_baseline_is_inflated):
+               test_real_rig_baseline_is_inflated,
+               test_boardspec_range_guard):
         results.append(fn())
         print()
     ok = all(results)
