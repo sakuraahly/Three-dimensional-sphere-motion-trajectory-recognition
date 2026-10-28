@@ -140,6 +140,7 @@ if /i "%MODE%"=="diag"      goto :do_diag
 if /i "%MODE%"=="test"      goto :do_test
 if /i "%MODE%"=="standards" goto :do_standards
 if /i "%MODE%"=="gate"      goto :do_gate
+if /i "%MODE%"=="legacy"    goto :ui_legacy
 echo       不认识的参数「%MODE%」，改用图形界面。
 goto :ui_gui
 
@@ -152,6 +153,20 @@ if errorlevel 1 (
 )
 rem 自动定位界面脚本（根目录里 import tkinter 的那个），不写死中文文件名
 "%PY%" -c "import glob,runpy; f=[p for p in glob.glob('*.py') if 'tkinter' in open(p,encoding='utf-8').read()][0]; runpy.run_path(f,run_name='__main__')"
+set "RC=%ERRORLEVEL%"
+if not "%RC%"=="0" (
+    echo.
+    echo       启动器异常退出（返回码 %RC%）。请看上面的报错。
+    pause
+)
+exit /b %RC%
+
+:ui_legacy
+rem 经典单窗口界面（过渡期保留）：新界面是默认，这里显式退回旧界面。
+rem 与 :ui_gui 同样"不写死中文文件名"——靠 tkinter 特征定位脚本，
+rem 再用 sys.argv 把 --legacy 传给它。
+echo [3/3] 启动经典界面（过渡）...
+"%PY%" -c "import glob,runpy,sys; f=[p for p in glob.glob('*.py') if 'tkinter' in open(p,encoding='utf-8').read()][0]; sys.argv=[f,'--legacy']; runpy.run_path(f,run_name='__main__')"
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.

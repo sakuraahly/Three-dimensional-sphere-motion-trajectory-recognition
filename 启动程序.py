@@ -3085,7 +3085,25 @@ class Launcher(tk.Tk):
         self.destroy()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """入口：默认新界面（门厅 + 三个模式窗）；``--legacy`` 走经典单窗口。
+
+    为什么两个入口并存（2026-10-28）：分窗在逐窗落地（单目窗、双目窗已建，
+    收集图/工作台的若干动作仍指向经典界面的等价入口）。**旧代码一行没删** ——
+    删它要同步改 ``selftest_launcher_params`` / ``selftest_entrypoints`` 的判据，
+    而按全局 §15.2，改测试判据必须由**非实现者** Critic 签 PASS；
+    限流期间没有可用 Critic，所以这一步留给 B-102，由独立 Critic 验收。
+
+    过渡期两条硬约束（写在这里，免得后来者以为是遗漏）：
+
+    1. 经典界面只能从门厅的「经典界面（过渡）」或 ``--legacy`` 进入，
+       不提供"两个都是主入口"的错觉；
+    2. 新界面是**默认** —— 否则用户看不到变化，重做就没有意义。
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--legacy" not in args:
+        from apps._gui_app import run as _run_new_gui
+        return _run_new_gui()
     Launcher().mainloop()
     return 0
 
