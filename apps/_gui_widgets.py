@@ -114,11 +114,18 @@ class Surface:
 
     # ---------- 卡片 ----------
     def card(self, parent: tk.Misc, title: str, hint: str = "", *,
-             pady: tuple[int, int] = (10, 0)) -> ttk.Frame:
-        """一张卡片。返回的 Frame 是内部 grid 的父容器。"""
+             pady: tuple[int, int] = (10, 0), fill: str = "x",
+             expand: bool = False) -> ttk.Frame:
+        """一张卡片。返回的 Frame 是内部 grid 的父容器。
+
+        ``fill``/``expand`` 默认 ``"x"``/``False`` —— 参数卡按内容定高，这没问题。
+        但**日志那种要吃掉剩余高度的卡片必须传 ``fill="both", expand=True``**，
+        否则窗口放大之后内容还缩在左上角（2026-10-28 截图里控制台就是这样：
+        窗口 900×560，内容只占 530×330，右边下面全空）。
+        """
         box = ttk.LabelFrame(parent, text=title, style="Card.TLabelframe",
                              padding=(14, 8))
-        box.pack(fill="x", padx=16, pady=pady)
+        box.pack(fill=fill, expand=expand, padx=16, pady=pady)
         if hint:
             lab = ttk.Label(box, text=hint, style="Hint.TLabel",
                             wraplength=CARD_HINT_WRAP)
@@ -298,7 +305,9 @@ class StatusBar(ttk.Frame):
             ttk.Button(self, text="中断", command=on_stop).pack(side="right",
                                                                 padx=(0, 12))
         if on_log is not None:
-            ttk.Button(self, text="查看日志", command=on_log).pack(
+            # 文案用完整名字：用户明确要求「查看日志」改成这个。
+            # 它在每个窗底部常驻，是进入任务表与日志的唯一入口。
+            ttk.Button(self, text="任务管理器和运行日志", command=on_log).pack(
                 side="right", padx=(0, 6))
 
     def set_status(self, text: str, level: str = "info") -> None:

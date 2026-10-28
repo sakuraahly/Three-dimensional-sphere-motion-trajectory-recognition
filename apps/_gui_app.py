@@ -319,7 +319,7 @@ class App(tk.Tk):
 
     def open_console(self):
         from apps._gui_console import ConsoleWindow
-        return self.open_window("console", "日志与任务", ConsoleWindow)
+        return self.open_window("console", "任务管理器和运行日志", ConsoleWindow)
 
     # ---------- 三张卡的入口（工厂集中在 App，窗口自己不知道别人） ----------
     def open_mono(self):
@@ -435,7 +435,7 @@ class HubWindow(tk.Toplevel):
         row = self.surface.action_row(box)
         # 相机设备放第一个：没有相机身份，标定/录制都没有起点，它比"数据管理"更靠前
         self.surface.secondary(row, "相机设备", self._open_cameras)
-        self.surface.secondary(row, "日志与任务", self.app.open_console)
+        self.surface.secondary(row, "任务管理器和运行日志", self.app.open_console)
         self.surface.secondary(row, "数据管理", self._open_data_manager)
         self.surface.secondary(row, "3D 查看器", self._open_viewer)
         self.surface.secondary(row, "重新读取标定", self._reload_state)

@@ -36,13 +36,17 @@ class ConsoleWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.configure(bg=BG)
-        self.geometry("900x560")
+        # 做大：任务表 5 行 + 日志 14 行在 560 高里挤成一条缝。
+        # 屏幕逻辑 1600x1000 下 1100x780 放得下，且仍可拖拽缩放。
+        self.geometry("1100x780")
+        self.minsize(760, 520)
         self.surface = Surface(self)
 
         box = self.surface.card(
             self, "任务",
             "卡住时在这里中断：直接关窗口不会杀掉子进程，相机可能仍被占着。"
             "「中断」先试优雅退出，3 秒不退再强制结束整棵进程树。")
+        box.columnconfigure(0, weight=1)         # 任务表也要横向铺满，否则右侧留白
         frame = ttk.Frame(box)
         frame.grid(row=1, column=0, columnspan=9, sticky="we", pady=(4, 4))
         cols = ("id", "title", "pid", "elapsed", "status")
@@ -64,11 +68,15 @@ class ConsoleWindow(tk.Toplevel):
         self.surface.secondary(row, "中断全部", self._stop_all)
         self.surface.secondary(row, "打开日志文件", self._open_log_file)
 
-        logbox = self.surface.card(self, "运行日志", "")
+        # fill="both", expand=True：日志区必须随窗口长，否则窗口放大之后
+        # 内容仍是左上角一块（2026-10-28 截图就是这个）。
+        logbox = self.surface.card(self, "运行日志", "",
+                                   fill="both", expand=True)
         self.text = tk.Text(logbox, height=14, wrap="none", state="disabled",
                             font=("Consolas", 9), bg="#f8fafc")
         self.text.grid(row=1, column=0, columnspan=9, sticky="nsew")
         logbox.rowconfigure(1, weight=1)
+        logbox.columnconfigure(0, weight=1)     # 列也要权重，否则只长高不长宽
         bar2 = ttk.Scrollbar(logbox, orient="vertical", command=self.text.yview)
         bar2.grid(row=1, column=9, sticky="ns")
         self.text.configure(yscrollcommand=bar2.set)
