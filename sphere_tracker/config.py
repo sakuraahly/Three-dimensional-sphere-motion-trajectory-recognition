@@ -281,6 +281,9 @@ class CameraConfig:
     cy: float = -1.0
     hfov_deg: float = 60.0             # 水平视场角，用于估算 fx
     ball_diameter_m: float = 0.04      # 球直径（米），40 mm 约等于乒乓球
+    # 畸变系数 (k1, k2, p1, p2, k3)。空 = 没有畸变模型（不标定的旧行为）。
+    # 由 `config/mono_calibration.json` 经 `calib.mono_calib.apply_to` 填入。
+    distortion: tuple[float, ...] = ()
     enable_3d: bool = True
 
 

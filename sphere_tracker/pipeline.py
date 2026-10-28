@@ -126,6 +126,7 @@ class SpherePipeline:
         self.camera = CameraModel(
             width=w, height=h, fx=c.fx, fy=c.fy, cx=c.cx, cy=c.cy,
             hfov_deg=c.hfov_deg, ball_diameter_m=c.ball_diameter_m,
+            distortion=getattr(c, "distortion", None),
         )
 
     # ------------------------------------------------------------------
@@ -230,7 +231,10 @@ class SpherePipeline:
         ):
             # 用"原始观测"的圆心与半径做三维重建：半径直接决定深度，
             # 用滤波后的半径会引入滞后，深度就会跟着飘。
-            z = self.camera.depth_from_radius(best.radius)
+            # **必须带上圆心坐标**：有畸变模型时要按该位置的局部缩放校正半径，
+            # 否则同一个球在画面边缘会比中心"看起来更大"，深度随之偏近
+            # （2026-10-28 接 P1a 时发现只传半径等于校正没生效）。
+            z = self.camera.depth_from_radius(best.radius, best.x, best.y)
             if np.isfinite(z) and 0.01 < z < 100.0:
                 pos = self.camera.backproject(best.x, best.y, z)
                 state.z = float(z)

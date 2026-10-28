@@ -156,6 +156,42 @@ def add_stereo_source_args(
     return ap
 
 
+def apply_mono_calibration(cfg, args) -> str:
+    """把单目内参（含畸变）填进 ``cfg.camera``，返回一句**来源说明**。
+
+    优先级：``--focal``（显式临时覆盖）> 标定文件 > ``hfov_deg`` 估算。
+    返回的这句话由调用方打印 —— 单目测深的绝对尺度完全取决于焦距，
+    "这个 fx 是标出来的还是猜的"必须每次都写在脸上（计划书 §3.4）。
+
+    没有标定文件**不是错误**：那是"还没标"，程序照旧跑，只是精度按估算走。
+    """
+    from calib.mono_calib import apply_to, load_mono
+
+    path = getattr(args, "mono_calib", None)
+    calib = None
+    if not getattr(args, "no_mono_calib", False):
+        calib = load_mono(path) if path else None
+
+    if calib is not None:
+        apply_to(calib, cfg.camera)
+        note = (f"内参：{Path(path).name}  fx={calib.fx:.1f}  "
+                f"主点=({calib.cx:.0f},{calib.cy:.0f})  "
+                f"畸变={'有' if calib.has_distortion else '无'}  "
+                f"RMS={calib.rms_px:.2f} px")
+    elif getattr(args, "no_mono_calib", False):
+        note = (f"内参：按 --no-mono-calib 忽略标定，"
+                f"焦距按 {cfg.camera.hfov_deg:g}° 视场估算")
+    else:
+        note = (f"内参：没有标定文件（{path}）—— "
+                f"焦距按 {cfg.camera.hfov_deg:g}° 视场估算，"
+                f"1% 焦距误差 = 0.6 m 处 6 mm")
+
+    if getattr(args, "focal", None):
+        cfg.camera.fx = args.focal
+        note += f"；--focal 又覆盖为 {args.focal:.0f}"
+    return note
+
+
 def add_mono_pipeline_args(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """补上**单目**链路的八个公共参数。
 
@@ -232,6 +268,12 @@ def add_mono_pipeline_args(ap: argparse.ArgumentParser) -> argparse.ArgumentPars
     ap.add_argument("--horizon", type=float, default=None, help="预测未来多少秒")
     ap.add_argument("--gravity-fit", action="store_true",
                     help="三维预测时使用已知重力约束")
+    ap.add_argument("--mono-calib",
+                    default=str(ROOT / "config" / "mono_calibration.json"),
+                    help="单目内参标定文件（默认 config/mono_calibration.json）。"
+                         "存在就自动使用，**含畸变系数**；没有则按 hfov 估算焦距")
+    ap.add_argument("--no-mono-calib", action="store_true",
+                    help="忽略标定文件、按 hfov 估算焦距（用来对比标定前后的差别）")
     return ap
 
 

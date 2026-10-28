@@ -363,6 +363,7 @@ class CameraModel:
         cy: float = -1.0,
         hfov_deg: float = 60.0,
         ball_diameter_m: float = 0.04,
+        distortion: Sequence[float] | None = None,
     ) -> None:
         self.width = int(width)
         self.height = int(height)
@@ -374,28 +375,108 @@ class CameraModel:
         self.fy = float(fy) if fy and fy > 0 else self.fx
         self.cx = float(cx) if cx is not None and cx >= 0 else self.width / 2.0
         self.cy = float(cy) if cy is not None and cy >= 0 else self.height / 2.0
+        # 畸变系数 (k1, k2, p1, p2, k3)，缺省为空 = 没有畸变模型。
+        # **无畸变时下面所有去畸变路径都直接短路**，所以不标定的用户零开销。
+        d = np.asarray([] if distortion is None else distortion, np.float64).ravel()
+        self.distortion: tuple[float, ...] = (
+            tuple(float(x) for x in d[:5]) + (0.0,) * max(0, 5 - d[:5].size)
+            if d.size else ())
         self.calibrated = bool(fx and fx > 0)
 
+    # -- 畸变 -----------------------------------------------------------------
+    @property
+    def has_distortion(self) -> bool:
+        """有没有可用的畸变模型。全 0 等同于"没有"。"""
+        return bool(self.distortion) and any(abs(x) > 1e-12 for x in self.distortion)
+
+    @property
+    def _K(self) -> np.ndarray:
+        return np.array([[self.fx, 0.0, self.cx],
+                         [0.0, self.fy, self.cy],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    @property
+    def _D(self) -> np.ndarray:
+        return np.asarray(self.distortion or (0.0,) * 5, np.float64)
+
+    def undistort_points(self, uv) -> np.ndarray:
+        """畸变像素坐标 -> 无畸变像素坐标。**没有畸变模型时原样返回**。
+
+        为什么必须做在这里而不是"每帧 undistort 整张图"：整帧去畸变在 1080p
+        下每帧要 5–10 ms，而检测是在降分辨率上跑的（``--detect-width``），
+        在错误的尺度上去畸变还会把两件事搅在一起。点级校正只在你真正要
+        三维坐标的那几步付代价，且与检测分辨率无关。
+        """
+        pts = np.asarray(uv, np.float64).reshape(-1, 2)
+        if not self.has_distortion:
+            return pts
+        out = cv2.undistortPoints(pts.reshape(-1, 1, 2), self._K, self._D,
+                                  P=self._K)
+        return out.reshape(-1, 2)
+
+    def distort_points(self, uv) -> np.ndarray:
+        """无畸变像素坐标 -> 畸变像素坐标（画图用；没有畸变时原样返回）。"""
+        pts = np.asarray(uv, np.float64).reshape(-1, 2)
+        if not self.has_distortion:
+            return pts
+        x = (pts[:, 0] - self.cx) / self.fx
+        y = (pts[:, 1] - self.cy) / self.fy
+        obj = np.stack([x, y, np.ones_like(x)], axis=1).reshape(-1, 1, 3)
+        out, _ = cv2.projectPoints(obj, np.zeros(3), np.zeros(3), self._K, self._D)
+        return out.reshape(-1, 2)
+
+    def undistort_radius(self, u: float, v: float, r_px: float) -> float:
+        """畸变图上的像素半径 -> 无畸变半径（8 个方向取中位）。
+
+        为什么取中位而不是直接量水平半径：球在画面边缘时畸变会把它压成椭圆，
+        长轴与短轴差几个百分点，取任一方向都会引入方向性偏差。
+        """
+        if not self.has_distortion or r_px <= 0:
+            return float(r_px)
+        ang = np.arange(8) * (math.pi / 4.0)
+        ring = np.stack([u + r_px * np.cos(ang),
+                         v + r_px * np.sin(ang)], axis=1)
+        centre = self.undistort_points(np.array([[u, v]]))[0]
+        pts = self.undistort_points(ring)
+        return float(np.median(np.linalg.norm(pts - centre, axis=1)))
+
     # -- 单目测深：球在图像里的像素半径与距离成反比 ------------------------
-    def depth_from_radius(self, radius_px: float) -> float:
-        """由像素半径反推球心到相机的距离（米）。半径 -> 0 时返回 inf。"""
+    def depth_from_radius(self, radius_px: float,
+                          u: float | None = None,
+                          v: float | None = None) -> float:
+        """由像素半径反推球心到相机的距离（米）。半径 -> 0 时返回 inf。
+
+        给了 ``u, v`` 且有畸变模型时，先把半径校正到无畸变尺度再算 ——
+        否则同一个球在画面边缘会比在中心"看起来更大"，深度随之偏近。
+        """
         if radius_px <= 1e-6:
             return float("inf")
+        r = radius_px if (u is None or v is None) else self.undistort_radius(u, v, radius_px)
         f = 0.5 * (self.fx + self.fy)
-        return f * (self.ball_diameter_m / 2.0) / radius_px
+        return f * (self.ball_diameter_m / 2.0) / r
 
     def backproject(self, u: float, v: float, z: float) -> np.ndarray:
-        """像素 + 深度 -> 相机坐标系下的三维点 (X, Y, Z)，单位米，Z 向前。"""
+        """像素 + 深度 -> 相机坐标系下的三维点 (X, Y, Z)，单位米，Z 向前。
+
+        有畸变模型时**先把像素校正到无畸变坐标**——反投影公式只对无畸变的
+        针孔成像成立，直接拿畸变坐标代入会在画面边缘偏出好几厘米。
+        """
+        if self.has_distortion:
+            u, v = (float(x) for x in self.undistort_points(np.array([[u, v]]))[0])
         x = (u - self.cx) * z / self.fx
         y = (v - self.cy) * z / self.fy
         return np.array([x, y, z], dtype=np.float64)
 
     def project(self, point3d: np.ndarray) -> tuple[float, float]:
-        """三维点 -> 像素坐标。"""
+        """三维点 -> 像素坐标（有畸变模型时把结果投回畸变图，画图才对得上）。"""
         x, y, z = (float(v) for v in point3d[:3])
         if abs(z) < 1e-9:
             z = 1e-9
-        return self.cx + self.fx * x / z, self.cy + self.fy * y / z
+        u = self.cx + self.fx * x / z
+        v = self.cy + self.fy * y / z
+        if self.has_distortion:
+            u, v = (float(a) for a in self.distort_points(np.array([[u, v]]))[0])
+        return u, v
 
 
 def estimate_focal_from_known_ball(

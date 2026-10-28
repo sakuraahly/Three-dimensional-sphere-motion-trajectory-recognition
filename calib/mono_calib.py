@@ -45,7 +45,7 @@ from .stereo_calib import CalibConfig, calibrate_mono_points
 
 __all__ = [
     "MonoCalib", "MonoCalibError", "QUALITY",
-    "calibrate_mono", "save_mono", "load_mono", "report_text",
+    "calibrate_mono", "save_mono", "load_mono", "report_text", "apply_to",
     "SCHEMA", "VERSION",
 ]
 
@@ -336,6 +336,21 @@ def load_mono(path: str | Path) -> MonoCalib | None:
         return MonoCalib.from_dict(raw)
     except (OSError, ValueError, MonoCalibError, KeyError, TypeError):
         return None
+
+
+def apply_to(calib: MonoCalib, camera) -> None:
+    """把标定写进任意带 ``fx/fy/cx/cy`` 属性的对象（``CameraConfig`` 等）。
+
+    用 duck typing 而不是 import ``sphere_tracker.config``：``calib`` 是下层，
+    不该反过来依赖上层配置类 —— 那会让"标定库"只能给这一个上层用。
+    ``distortion`` 只在目标对象确实有该属性时才写，兼容老配置对象。
+    """
+    camera.fx = float(calib.fx)
+    camera.fy = float(calib.fy)
+    camera.cx = float(calib.cx)
+    camera.cy = float(calib.cy)
+    if hasattr(camera, "distortion"):
+        camera.distortion = tuple(float(x) for x in calib.D)
 
 
 def report_text(calib: MonoCalib) -> str:

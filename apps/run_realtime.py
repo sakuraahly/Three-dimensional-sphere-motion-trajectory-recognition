@@ -53,7 +53,8 @@ from sphere_tracker.sources import (
     quiet_repeated_grab_warnings,
 )
 from sphere_tracker.stats import FramePump, Health
-from apps._common import add_mono_pipeline_args, log_environment, setup_logging
+from apps._common import (add_mono_pipeline_args, apply_mono_calibration,
+                          log_environment, setup_logging)
 from apps._window import WindowManager
 
 _log = logging.getLogger("realtime")
@@ -140,8 +141,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         cfg.detector.color = ColorConfig.preset(args.preset)
     if args.ball_diameter:
         cfg.camera.ball_diameter_m = args.ball_diameter
-    if args.focal:
-        cfg.camera.fx = args.focal
+    # 内参：标定文件（含畸变）优先，--focal 再覆盖；**来源每次都打印**
+    print(f"[{apply_mono_calibration(cfg, args)}]")
     if args.horizon:
         cfg.predict.horizon_s = args.horizon
     if args.predict:

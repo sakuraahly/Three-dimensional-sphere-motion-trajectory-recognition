@@ -26,7 +26,7 @@ from sphere_tracker.config import AppConfig, ColorConfig, load_config
 from sphere_tracker.detectors import registry  # noqa: F401  （import 即注册：R1）
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import open_source
-from apps._common import add_mono_pipeline_args
+from apps._common import add_mono_pipeline_args, apply_mono_calibration
 from apps._window import WindowManager
 
 WINDOW = "run_video"
@@ -57,8 +57,8 @@ def main() -> int:
         cfg.detector.color = ColorConfig.preset(args.preset)
     if args.ball_diameter:
         cfg.camera.ball_diameter_m = args.ball_diameter
-    if args.focal:
-        cfg.camera.fx = args.focal
+    # 内参：标定文件（含畸变）优先，--focal 再覆盖；**来源每次都打印**
+    print(f"[{apply_mono_calibration(cfg, args)}]")
     if args.predict:
         cfg.predict.method = args.predict
     if args.horizon:
