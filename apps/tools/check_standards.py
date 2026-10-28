@@ -121,8 +121,6 @@ KNOWN_MENTIONS: dict[str, str] = {
     # 否则白名单退化成永久豁免 —— 工具自带的 vanished 检测会当场报红。
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_bench.py":
         "§2.5 计划新建：会话工作台",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/calibrate_mono.py":
-        "§3.3 计划新建：单目内参标定入口（--dir）",
     # ---- 2026-10-28：mono_calib 与它的测试**已实现**，豁免删除 ----
     # 仍属"尚未实现"的只剩 `apps/calibrate_mono.py`（P1b 入口）。
     # ---- 2026-10-28：`_capture.json` **已实现**（P0b），豁免条目随之删除 ----
@@ -130,8 +128,6 @@ KNOWN_MENTIONS: dict[str, str] = {
     # 落地后该豁免变成**死条目**，`selftest_doc_facts` 第 3/4/5 节连锁变红
     # （死条目让"删掉注入引用后应恢复通过"也失败）。
     # 这条注释是给后来者的说明，不是豁免 —— 别照着它再往白名单里加回去。
-    "docs/待办清单.md:apps/calibrate_mono.py":
-        "B-100 登记的正是「它还没有」这件事本身（同计划 §3.3 计划新建）",
     # ---- 仓库外（`STC/`）：两处都是在**陈述"这个脚本不存在"** ----
     # 2026-10-24 前 `STC/` 引用从不进 problems，这条豁免等于空转；
     # 现在按 `ROOT.parent` 解析后它真的会被判失效，所以必须给出理由。

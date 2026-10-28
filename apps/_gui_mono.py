@@ -71,13 +71,17 @@ class MonoWindow(tk.Toplevel):
         self.minsize(780, 560)
         self.surface = Surface(self)
 
-        self.var_camera = tk.StringVar(value="main")
-        self.var_cols = tk.StringVar(value="8")
-        self.var_rows = tk.StringVar(value="5")
-        self.var_square = tk.StringVar(value="25")
-        self.var_target = tk.StringVar(value="15")
-        self.var_diameter = tk.StringVar(value="40")
-        self.var_focal = tk.StringVar(value="")          # 手动覆盖；空 = 用标定值
+        # 记住上次填的值（GuiPrefs 只存输入；派生值在那里会被拒绝）
+        prefs = app.prefs
+        self.var_camera = tk.StringVar(value=prefs.get_str("mono.camera", "main"))
+        self.var_cols = tk.StringVar(value=prefs.get_str("board.cols", "8"))
+        self.var_rows = tk.StringVar(value=prefs.get_str("board.rows", "5"))
+        self.var_square = tk.StringVar(value=prefs.get_str("board.square_mm", "25"))
+        self.var_target = tk.StringVar(value=prefs.get_str("mono.target", "15"))
+        self.var_diameter = tk.StringVar(
+            value=prefs.get_str("mono.diameter_mm", "40"))
+        self.var_focal = tk.StringVar(
+            value=prefs.get_str("mono.focal_override", ""))   # 空 = 用标定值
 
         # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
@@ -333,6 +337,18 @@ class MonoWindow(tk.Toplevel):
                "--ball-diameter", self.var_diameter.get().strip() or "40"]
         self.app.tasks.start(cmd, f"离线单目：{Path(path).name}")
         self.status.set_status(f"已启动离线单目：{Path(path).name}", "info")
+
+    def on_close(self) -> None:
+        """关窗时记住输入。**只存输入**：fx/就绪度由 GuiPrefs 主动拒绝。"""
+        p = self.app.prefs
+        p.set("mono.camera", self.var_camera.get().strip())
+        p.set("board.cols", self.var_cols.get().strip())
+        p.set("board.rows", self.var_rows.get().strip())
+        p.set("board.square_mm", self.var_square.get().strip())
+        p.set("mono.target", self.var_target.get().strip())
+        p.set("mono.diameter_mm", self.var_diameter.get().strip())
+        p.set("mono.focal_override", self.var_focal.get().strip())
+        p.save()
 
     def _stop_my_tasks(self) -> None:
         ok = self.app.tasks.stop_all(graceful=True)

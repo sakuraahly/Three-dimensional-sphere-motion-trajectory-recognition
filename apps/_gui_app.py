@@ -41,7 +41,7 @@ from apps._gui_widgets import (ACCENT, BG, FONT_FAMILY, INK, MUTED, OK, WARN,
                                ScrollPage, StatusBar, Surface, init_style)
 from apps._task_runner import ROOT, TaskRunner
 
-__all__ = ["AppState", "App", "HubWindow", "run"]
+__all__ = ["GuiPrefs", "AppState", "App", "HubWindow", "run"]
 
 MONO_CALIB_PATH = ROOT / "config" / "mono_calibration.json"
 STEREO_CALIB_PATH = ROOT / "config" / "stereo_calibration"
@@ -50,6 +50,63 @@ STEREO_CALIB_PATH = ROOT / "config" / "stereo_calibration"
 # --------------------------------------------------------------------------- #
 # 状态：只读文件，不缓存写回
 # --------------------------------------------------------------------------- #
+class GuiPrefs:
+    """记住用户改过的输入（``config/gui_state.json``）。**只存输入，不存派生**。
+
+    为什么必须划这条线（计划书 §2.7）：基线、夹角、fx、stereo_mode、就绪度都
+    能从标定与装置档案读出来。把它们抄进界面状态文件，就又多了一份会和标定
+    分叉的真相 —— 旧界面"顶栏模式下拉框 vs 标定 meta"就是这类问题的现场。
+    所以这里有一份 ``FORBIDDEN`` 清单，写进去**直接抛异常**，而不是靠"约定别写"。
+
+    加载失败不报错：用户可能删了文件或手改坏了，回落默认值即可，
+    这不该阻止程序启动（同 `load_mono` 的口径）。
+    """
+
+    PATH = ROOT / "config" / "gui_state.json"
+    FORBIDDEN = ("baseline_mm", "angle_deg", "stereo_mode", "rms",
+                 "coverage", ".fx", "fx_")
+
+    def __init__(self) -> None:
+        self.data: dict = {}
+        self.load()
+
+    def load(self) -> None:
+        try:
+            raw = json.loads(self.PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.data = {}
+            return
+        self.data = raw if isinstance(raw, dict) else {}
+
+    def get_str(self, key: str, default: str = "") -> str:
+        v = self.data.get(key)
+        return default if v is None else str(v)
+
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        v = self.data.get(key)
+        return v if isinstance(v, bool) else default
+
+    def set(self, key: str, value) -> None:
+        if self._forbidden(key):
+            raise ValueError(
+                f"gui_state 不许存派生值：{key!r}（它必须从标定/装置档案读）")
+        self.data[key] = value
+
+    @classmethod
+    def _forbidden(cls, key: str) -> bool:
+        low = key.lower()
+        return any(f in low for f in cls.FORBIDDEN)
+
+    def save(self) -> None:
+        try:
+            self.PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.PATH.write_text(
+                json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8")
+        except OSError:
+            pass                    # 存不下不该打断用户正在做的事
+
+
 class AppState:
     """所有窗口共读的状态快照。``reload()`` 重新从文件读一遍。
 
@@ -251,6 +308,7 @@ class App(tk.Tk):
         self.withdraw()                                 # 门厅才是用户看到的窗口
 
         self.state = AppState()
+        self.prefs = GuiPrefs()
         self._log_lines: list[str] = []
         self._log_listeners: list = []
         self.tasks = TaskRunner(self, on_log=self._on_task_log,

@@ -116,12 +116,12 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：13 个可执行脚本 + 13 个私有模块
+### `apps/` 顶层：14 个可执行脚本 + 13 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
 | 主线（4） | `run_stereo_video.py` `run_all.py` `run_realtime.py` `run_video.py` | 离线双目三维重建 / 一条命令编排 3→6 / 实时单目 / 离线单目 |
-| 标定与录制（3） | `record_stereo.py` `calibrate_stereo.py` `verify_stereo.py` | 双路录制（含 session.json）/ 自动标定 / 标定复检 |
+| 标定与录制（4） | `record_stereo.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` | 双路录制（含 session.json）/ 自动标定 / **单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）** / 标定复检 |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
 | 私有模块（13） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗**） |

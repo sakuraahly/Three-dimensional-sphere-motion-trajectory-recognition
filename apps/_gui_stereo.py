@@ -217,15 +217,21 @@ class StereoWindow(tk.Toplevel):
         self.minsize(800, 580)
         self.surface = Surface(self)
 
+        # 记住上次填的值。**方法不存**：它由窗口模式决定（平行=joint、大角度=chain），
+        # 存下来会让"同一窗口上次改过的方法"和"窗口代表哪种几何"打架。
+        prefs = app.prefs
         default_method = "joint" if mode == "parallel" else "chain"
         self.var_method = tk.StringVar(value=METHODS[default_method][0])
-        self.var_target = tk.StringVar(value="40")
-        self.var_cols = tk.StringVar(value="8")
-        self.var_rows = tk.StringVar(value="5")
-        self.var_square = tk.StringVar(value="25")
-        self.var_stationary = tk.StringVar(value="3")
-        self.var_sharpness = tk.StringVar(value="800")
-        self.var_relaxed = tk.BooleanVar(value=False)
+        self.var_target = tk.StringVar(value=prefs.get_str("stereo.target", "40"))
+        self.var_cols = tk.StringVar(value=prefs.get_str("board.cols", "8"))
+        self.var_rows = tk.StringVar(value=prefs.get_str("board.rows", "5"))
+        self.var_square = tk.StringVar(value=prefs.get_str("board.square_mm", "25"))
+        self.var_stationary = tk.StringVar(
+            value=prefs.get_str("stereo.stationary_px", "3"))
+        self.var_sharpness = tk.StringVar(
+            value=prefs.get_str("stereo.min_sharpness", "800"))
+        self.var_relaxed = tk.BooleanVar(
+            value=prefs.get_bool("stereo.relaxed", False))
         self.var_left = tk.StringVar(value="left")
         self.var_right = tk.StringVar(value="right")
         self.var_session = tk.StringVar(value="")
@@ -589,6 +595,20 @@ class StereoWindow(tk.Toplevel):
             [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
             "3D 查看器")
         self.status.set_status(f"正在打开 3D 查看器：{src.parent.name}", "info")
+
+    def on_close(self) -> None:
+        """关窗时记住输入（会话路径与相机角色不存：前者每次新选，后者从
+        ``config/cameras.json`` 读）。"""
+        p = self.app.prefs
+        p.set("stereo.target", self.var_target.get().strip())
+        p.set("board.cols", self.var_cols.get().strip())
+        p.set("board.rows", self.var_rows.get().strip())
+        p.set("board.square_mm", self.var_square.get().strip())
+        p.set("stereo.stationary_px", self.var_stationary.get().strip())
+        p.set("stereo.min_sharpness", self.var_sharpness.get().strip())
+        p.set("stereo.relaxed", bool(self.var_relaxed.get()))
+        p.set("stereo.seconds", self.var_seconds.get().strip())
+        p.save()
 
     def _stop_my_tasks(self) -> None:
         ok = self.app.tasks.stop_all(graceful=True)
