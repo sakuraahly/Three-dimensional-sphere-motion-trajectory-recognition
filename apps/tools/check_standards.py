@@ -137,8 +137,11 @@ KNOWN_MENTIONS: dict[str, str] = {
         "§3.5 计划新建：单目内参回收回归测试",
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:_task_runner.py":
         "§6 P2 同上，派发表里的简写（全称 `apps/_task_runner.py`）",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:_capture.json":
-        "§3.1 计划新建：采集目录边车元数据（每目录自包含），不是仓库里已存在的文件",
+    # ---- 2026-10-28：`_capture.json` **已实现**（P0b），豁免条目随之删除 ----
+    # 它原先在这里有一条"§3.1 计划新建"的豁免。`capture_board.write_capture_sidecar`
+    # 落地后该豁免变成**死条目**，`selftest_doc_facts` 第 3/4/5 节连锁变红
+    # （死条目让"删掉注入引用后应恢复通过"也失败）。
+    # 这条注释是给后来者的说明，不是豁免 —— 别照着它再往白名单里加回去。
     "docs/待办清单.md:apps/calibrate_mono.py":
         "B-100 登记的正是「它还没有」这件事本身（同计划 §3.3 计划新建）",
     # ---- 仓库外（`STC/`）：两处都是在**陈述"这个脚本不存在"** ----

@@ -46,7 +46,10 @@
 from __future__ import annotations
 
 import argparse
+import datetime
+import json
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -76,6 +79,58 @@ _FOCUS_DEFAULTS = CaptureConfig()
 
 # 粗检用的宽度：960 宽在 1440p 上约 30~50 ms，够实时对准；精确复核仍用全分辨率。
 GATE_WORK_WIDTH = 960
+
+# 采集边车文件名。**每个保存目录各写一份自包含的**（双路模式 out_left /
+# out_right 两个目录各一份，不写父目录单文件）—— 目录被单独复制/移动后，
+# 元数据必须仍然跟着自己的那批图。
+SIDECAR_NAME = "_capture.json"
+SIDECAR_SCHEMA = "capture-board/1"
+
+
+def _tool_version() -> str:
+    """工具版本：git 短哈希；取不到写 "unknown"（不为它新增依赖）。"""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ROOT),
+            capture_output=True, text=True, timeout=5, check=True)
+        v = proc.stdout.strip()
+        if v:
+            return v
+    except Exception as exc:                                 # noqa: BLE001
+        log.debug("取 git 版本失败（边车写 unknown）：%s", exc)
+    return "unknown"
+
+
+def write_capture_sidecar(out_dir: Path, spec: BoardSpec, *, camera: str,
+                          width: int, height: int, fps: float,
+                          backend: str, count: int) -> Path:
+    """把采集元数据写成 ``<out_dir>/_capture.json``，返回边车路径。
+
+    为什么必须有（2026-10-27 计划书 §3.1 ②）：此前采集只写日志不落盘，
+    收完图再改面板的 cols/rows 拿旧图去标定，检测静默报"0 张检出"且不解释。
+    有了边车，这批图能**自证**"用什么板、哪路相机、什么分辨率拍的"。
+
+    纯函数：不开相机、不建窗口 —— 自测与 GUI 都能直接调。
+    失败抛 OSError，由调用方转成错误输出（写不进元数据与写不进图同一待遇，
+    不许静默吞掉）。
+    """
+    payload = {
+        "schema": SIDECAR_SCHEMA,
+        "board": {"cols": spec.cols, "rows": spec.rows,
+                  "square_mm": spec.square_mm},
+        "camera": camera,
+        "width": int(width),
+        "height": int(height),
+        "fps": float(fps),
+        "backend": backend,
+        "captured_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "count": int(count),
+        "tool_version": _tool_version(),
+    }
+    path = out_dir / SIDECAR_NAME
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return path
 
 # 版式常量见下方 `GUIDE_MARGIN` / `GUIDE_AREA_RANGE` / `CANVAS_MIN`。
 # 原来这里有个 `BOTH_VIEW_HEIGHT = 720`：它把两路各缩到 720 高再 hstack →
@@ -579,6 +634,16 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     print(f"共保存 {len(saved)} 张 → {out_dir}")
     if 0 < len(saved) < 3:
         print("至少需要 3 张才能标定，建议 15 张覆盖画面四角")
+    # 边车最后写：count 必须是**实际落盘**的张数（含提前退出/没到 target 的情况）
+    try:
+        sidecar = write_capture_sidecar(
+            out_dir, spec, camera=args.camera or args.side or "",
+            width=src.info.width, height=src.info.height, fps=src.info.fps,
+            backend=src.info.backend, count=len(saved))
+    except OSError as exc:
+        print(f"[错误] 元数据边车写不进：{out_dir / SIDECAR_NAME}（{exc}）")
+        return 1
+    log.info("元数据边车 %s（count=%d）", sidecar, len(saved))
     return 0 if len(saved) >= args.target else 3
 
 
@@ -732,6 +797,20 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
             cv2.destroyAllWindows()
 
     print(f"共保存 {saved} 对 → {out_left} ; {out_right}")
+    # 每个目录各写一份**自包含**的边车：count 按"该目录里的图数"算（= 对数，
+    # 每对在两个目录各落一张、文件名 pair_* 前后一致）。
+    for out_dir, camera, info in (
+            (out_left, args.camera_left or "left", src_l.info),
+            (out_right, args.camera_right or "right", src_r.info)):
+        try:
+            sidecar = write_capture_sidecar(
+                out_dir, spec, camera=camera, width=info.width,
+                height=info.height, fps=info.fps, backend=info.backend,
+                count=saved)
+        except OSError as exc:
+            print(f"[错误] 元数据边车写不进：{out_dir / SIDECAR_NAME}（{exc}）")
+            return 1
+        log.info("元数据边车 %s（count=%d）", sidecar, saved)
     return 0 if saved >= args.target else 3
 
 
@@ -740,7 +819,11 @@ def main() -> int:
     args = ap.parse_args()
     _check_args(ap, args)
 
-    spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
+    try:
+        spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
+    except ValueError as exc:
+        print(f"[参数错误] {exc}")
+        return 2
 
     if args.both:
         out_left = _make_dir(args.out_left)
