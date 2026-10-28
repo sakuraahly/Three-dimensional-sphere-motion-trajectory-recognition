@@ -163,7 +163,7 @@ CHAIN_STAGE_TEXT = {
               "只用右相机，同样覆盖四角与不同倾角；"
               "自动连拍：板停稳就会自动存，不用按键"),
     "ref": ("拍参考图（双路同时）",
-            "一块板同时给左右两路拍；**板固定后不要再碰**，"
+            "一块板同时给左右两路拍；板固定后不要再碰，"
             "自动连拍会自己存够目标张数"),
 }
 
@@ -476,7 +476,10 @@ class Launcher(tk.Tk):
         self._bind_scroll()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_MS, self._poll)
-        self.after(200, self._refresh_cameras)     # 启动时就把当前设备填进下拉
+        # 启动时只**枚举**设备填进下拉，_refresh_cameras(probe=False) 不打开相机：
+        # 原来这里走 probe=True，界面一出现就真开相机（亮灯 + 白等二三十秒），
+        # 而用户可能只是想看一眼界面。要实测能不能出图，点「刷新并检测相机」。
+        self.after(200, lambda: self._refresh_cameras(probe=False))
         # 首帧量出真实宽度后立刻按它换行一次（<Configure> 也会触发，
         # 这里只是保证打开就已经是对的，不会先闪一下错的换行）。
         self.after(0, self._reflow)
@@ -679,10 +682,10 @@ class Launcher(tk.Tk):
             "  两光轴近乎平行；标定会做 FOV 裁剪对齐，取两路共同可见区。\n"
             "  适合同一根横梁上的并排相机（B 远小于 D）。\n\n"
             "angled（大角度 / 90°）\n"
-            "  两光轴夹角大（近似直角）；**各自用原始画面**，不做 FOV 裁剪；\n"
+            "  两光轴夹角大（近似直角）；各自用原始画面，不做 FOV 裁剪；\n"
             "  输出坐标系为 left_camera。适合 B ≈ 2·D 的 90° 装置。\n\n"
             "auto（自动判定）\n"
-            "  按标定记录 / 会话记录推断上面哪一种；**仅作输入**，\n"
+            "  按标定记录 / 会话记录推断上面哪一种；仅作输入，\n"
             "  解析结果不写回档案、不落盘。没有依据时按平行处理。\n\n"
             "提示：当前生效的档案与几何提示常驻在窗口顶部那条深蓝横条上。",
             parent=self)
@@ -993,7 +996,7 @@ class Launcher(tk.Tk):
 
         self._hint(basic, "② 标定板（必须和手上那张纸完全一致）")
         self.calib_cols = self._param_entry(
-            basic, "内角点·列", "8", "**内角点**数，不是方格数：8×5 内角点 = 9×6 方格")
+            basic, "内角点·列", "8", "内角点数，不是方格数：8×5 内角点 = 9×6 方格")
         self.calib_rows = self._param_entry(basic, "内角点·行", "5")
         self.calib_square = self._param_entry(
             basic, "方格边长 mm", "25", "★ 必须用尺子量实际边长，别信打印设置")
@@ -1028,22 +1031,23 @@ class Launcher(tk.Tk):
         self._refresh_res_note()
 
         # ---- 高级 ----
-        self._hint(adv, "这几项**都是拿精度换成功率**，不确定就别动")
+        self._hint(adv, "这几项都是拿精度换成功率，不确定就别动")
         # ⚠️ **默认值直接填进输入框**（用户要求）。原来这些框是**空的**，
         # 只在说明里写"留空=默认 3" —— 那等于让用户自己去记默认值是多少，
         # 而且"空"与"默认"在界面上分不出来。现在填上真实默认值，
         # 说明改成"清空 = 不启用这一项"（因为这些参数是**不传就不启用**的）。
         self.calib_stationary = self._param_entry(
-            adv, "停稳上限 px", "3", "清空 = 用程序内置默认；这条**同时替代左右同步**，"
+            adv, "停稳上限 px", "3", "清空 = 用程序内置默认；这条同时替代左右同步，"
                                      "调大到 10 以上会让两路拍到不同位姿、R/T 系统性偏")
         self.calib_sharp = self._param_entry(
-            adv, "额外绝对下限（focus；默认 800 实际不触发，真正生效的是相对中位数 40%）", "800",
-            "清空 = 用程序内置默认。程序只拒「明显比本组中位数糊」的帧（<40%）；"
-            "这一格是额外的绝对下限，默认值低于相机能检出棋盘的下限，所以平时不起作用。"
-            "想让门更严就调大，但会成片拒收。")
+            adv, "清晰度下限（focus）", "800",
+            "800 是程序默认值，低于相机能检出棋盘的下限，所以平时不构成闸门；"
+            "真正生效的是「相对本组中位数 40%」——只拒明显比同组糊的帧。"
+            "只有调大才会更严，但会成片拒收（清空 = 不传，仍用程序默认 800）。")
         self.calib_relaxed = tk.BooleanVar(value=False)
-        self._param_check(adv, "放宽模式（手持拍摄：一次放松 6 条门限）",
+        self._param_check(adv, "放宽模式（手持拍摄：放宽收图门限；停稳 / 清晰度若已填，按你填的）",
                           self.calib_relaxed,
+                          "只放宽没填的那几项；停稳 / 清晰度这两格填了就以你的值为准。"
                           "用完必须复检极线误差；不达标请处理光照/支撑后关掉它重标")
 
         self._hint(adv, "④ 后端与核对留证")
@@ -1056,14 +1060,14 @@ class Launcher(tk.Tk):
         # 默认仍是 auto（= 脚本默认），**不替用户改行为**，只是把选择权交出来。
         self.calib_backend = self._param_combo(
             adv, "相机后端", ["auto", "dshow", "msmf"], "auto",
-            hint="auto = 脚本默认（MSMF）。**MSMF 打开慢**（本机实测两路 34.6 s vs "
+            hint="auto = 脚本默认（MSMF）。MSMF 打开慢（本机实测两路 34.6 s vs "
                  "DSHOW 11.8 s）；两台相机必须用同一个后端，所以只在这里选一次")
         # 基线留空是**有意的**：程序不知道你的装置中心距，编不出来。
         # 说明里必须讲清"不填 = 这道护栏关着"，而不是让人以为没差。
         self.calib_baseline = self._param_entry(
-            adv, "预期基线 mm", "", "★ 两镜头中心距。**只有填了才会核对基线** ——"
+            adv, "预期基线 mm", "", "★ 两镜头中心距。只有填了才会核对基线 ——"
                                     "不填这道护栏就是关着的（程序无法替你猜这个值）。"
-                                    "**每次重新摆相机都要重新量**，别照抄旧数字")
+                                    "每次重新摆相机都要重新量，别照抄旧数字")
         self.calib_savepairs = self._param_path(
             adv, "存图像对", "存下来才能离线复查/重标（出问题时唯一能回答「哪一对错了」）",
             is_dir=True)
@@ -1097,7 +1101,7 @@ class Launcher(tk.Tk):
             "第 1 步 · 相机标定",
             "左右约定：人面对镜头时，左手边那台为“左”。第一次用请先点"
             "『相机设备管理（识别/固定）』，程序会逐个显示画面让你确认哪台是左、哪台是右；"
-            "笔记本内置 / 红外这类**不打算用**的相机，就在那个画面里按 n 标成「无关」"
+            "笔记本内置 / 红外这类不打算用的相机，就在那个画面里按 n 标成「无关」"
             "（自动挑相机会跳过它）。确认后左右下拉选 left / right 就行，不用再管编号"
             "（编号会随插口漂移）。")
         self.calib_mode = tk.StringVar(value="skip")
@@ -1181,8 +1185,8 @@ class Launcher(tk.Tk):
         self._wrapped.append((self.calib_skip_fov_note, "card"))
         self.calib90_note = ttk.Label(
             box, style="Hint.TLabel", wraplength=CARD_HINT_WRAP,
-            text="90° 装置：两路各用**原始画面**，不做 FOV 裁剪对齐；坐标系为 "
-                 "left_camera。前提是两路**有共同可见区**（棋盘要同时出现在左右画面里），"
+            text="90° 装置：两路各用原始画面，不做 FOV 裁剪对齐；坐标系为 "
+                 "left_camera。前提是两路有共同可见区（棋盘要同时出现在左右画面里），"
                  "且基线 B 应约为工作距离的 2 倍（B≈2·D）。不满足就别用这个大角度入口。")
         self.calib90_note.grid(row=12, column=0, columnspan=9, sticky="w", pady=(0, 2))
         self._wrapped.append((self.calib90_note, "card"))
@@ -1219,7 +1223,7 @@ class Launcher(tk.Tk):
             "单板链式 = 两路几乎看不到同一区域，靠“板不动”的参考图定外参。\n"
             "内参段板可以移动；参考段板必须固定在两路都能看全整块的位置，"
             "一次双路同拍，左右之间不会再有时间差。\n"
-            "流程：按顺序拍完三段图（**停稳就自动存，不用按键**），再点最下面的"
+            "流程：按顺序拍完三段图（停稳就自动存，不用按键），再点最下面的"
             "『开始链式标定』。采集窗口里按 q 可提前结束，已拍的图会保留。")
         body = ttk.Frame(box)
         body.grid(row=1, column=0, columnspan=9, sticky="we", pady=(2, 4))
@@ -1389,7 +1393,7 @@ class Launcher(tk.Tk):
             self._append(
                 f"[链式标定] 失败（返回码 {task.exit_code}）。"
                 f"日志：{task.log_path or '见上方输出'}。"
-                "下一步：先确认两张参考图是**板没动过**的（位置/角度一致），"
+                "下一步：先确认两张参考图是板没动过的（位置/角度一致），"
                 "再检查每一段是否都拍到完整棋盘；改完补拍那一段重试。")
             return
         self._refresh_profile_line()
@@ -1798,22 +1802,28 @@ class Launcher(tk.Tk):
         s = self._wb_selected()
         if s is None:
             return
-        if self.method.get() != "specular":
-            self.method.set("specular")
-            self._append("[工作台] 点选球心属于金属球路径，已切换到 specular。")
-        self._pick_stereo_seed(str(s.path), offer_run=False)
+        # 点选球心属于金属球路径：③ 会用 specular 跑；但**不许改第 2 步的下拉框**
+        # —— 那是用户填过的输入。有日志不等于有交代（B-98）。
+        self._append(f"[工作台] 点选球心属于金属球路径：③ 会用 specular 运行，"
+                     f"未改你的检测方法（第 2 步仍是 {self.method.get()}）。")
+        self._pick_stereo_seed(str(s.path), offer_run=False, method="specular")
 
     def _wb_run(self) -> None:
         s = self._wb_selected()
         if s is None:
             return
-        if s.has_seeds and self.method.get() != "specular":
-            self.method.set("specular")
-            self._append("[工作台] 检测到 seeds.json，使用 specular 跑离线双目。")
-        if self.method.get() == "specular" and not s.has_seeds:
-            messagebox.showinfo("跑离线双目", "还没有点选球心；先点『② 点选球心』。")
-            return
-        args = self._offline_stereo_args(str(s.path))
+        # 会话里已有 seeds.json 就必须用 specular 跑；但**不改第 2 步的下拉框**：
+        # 改成"本次运行的本地覆盖 + 日志说明"（B-98）。
+        if s.has_seeds:
+            method = "specular"
+            self._append(f"[工作台] 本次用 specular 运行（会话已有点选球心），"
+                         f"未改你的检测方法（第 2 步仍是 {self.method.get()}）。")
+        else:
+            method = self.method.get()
+            if method == "specular":
+                messagebox.showinfo("跑离线双目", "还没有点选球心；先点『② 点选球心』。")
+                return
+        args = self._offline_stereo_args(str(s.path), method=method)
         args += ["--pairing", "canary" if self.wb_canary.get() else "index"]
         self._run(args, f"离线双目 {s.id}")
         self.after(1500, self._wb_refresh)
@@ -2045,13 +2055,21 @@ class Launcher(tk.Tk):
         self._run(cmd, f"录制双目（{duration} 秒）",
                   on_done=self._after_record_task)
 
-    def _offline_stereo_args(self, session_dir: str) -> list[str]:
+    def _offline_stereo_args(self, session_dir: str, *,
+                             method: str | None = None) -> list[str]:
+        """拼 `apps/run_stereo_video.py` 的命令行。
+
+        ``method`` 是**本次运行**的检测方法覆盖：工作台②/③ 读到 seeds.json 时
+        必须用 specular 跑，但**不许动第 2 步的下拉框**（那是用户填过的输入，
+        B-98）。省略时用面板当前值 —— 面板仍是唯一的默认来源。
+        """
+        used = method or self.method.get()
         args = [PY, str(ROOT / "apps" / "run_stereo_video.py"), session_dir,
-                "--method", self.method.get()]
+                "--method", used]
         preset = self.preset.get()
         if preset and preset != "不使用":
             args += ["--preset", preset]
-        if self.method.get() == "specular":
+        if used == "specular":
             seed = Path(session_dir) / "derived" / "seeds.json"
             if seed.exists():
                 args += ["--seed-json", str(seed)]
@@ -2061,8 +2079,13 @@ class Launcher(tk.Tk):
         return args
 
     def _pick_stereo_seed(self, session_dir: str | None = None,
-                          offer_run: bool = True) -> bool:
-        """打开点选窗口；保存成功返回 True。"""
+                          offer_run: bool = True, *,
+                          method: str | None = None) -> bool:
+        """打开点选窗口；保存成功返回 True。
+
+        ``method``：点选完成后「现在运行？」那一步用的检测方法覆盖（有 seed 的
+        会话必须 specular），**不改第 2 步的下拉框**（B-98）。
+        """
         if session_dir is None:
             session_dir = filedialog.askdirectory(
                 title="选择双目会话目录（含 session.json）",
@@ -2080,7 +2103,12 @@ class Launcher(tk.Tk):
         self._append(f"seed 已保存：{picker.result}")
         if offer_run and messagebox.askyesno(
                 "点选完成", "seed 已保存。现在运行离线双目三维？"):
-            self._run(self._offline_stereo_args(str(session_dir)), "离线双目三维")
+            use = method or self.method.get()
+            if use != self.method.get():
+                self._append(f"[工作台] 本次用 {use} 运行（seed 已保存），"
+                             f"未改你的检测方法（第 2 步仍是 {self.method.get()}）。")
+            self._run(self._offline_stereo_args(str(session_dir), method=use),
+                      "离线双目三维")
         return True
 
     def _confirm_stereo_cameras(self, left: str, right: str) -> bool:
@@ -2116,7 +2144,7 @@ class Launcher(tk.Tk):
             messagebox.showerror(
                 "相机对不上，先处理再标定",
                 f"{exc}\n\n"
-                "标定必须用**两台确定的外接相机**：用错相机或多台相机分不清时，"
+                "标定必须用两台确定的外接相机：用错相机或多台相机分不清时，"
                 "标定结果会系统性错误，而结果表面上看是正常的。")
             return False
 
@@ -2153,7 +2181,7 @@ class Launcher(tk.Tk):
             messagebox.showerror(
                 "左右指向了同一台相机",
                 f"左 -> #{sizes.get('left', ('?', '?'))[1]}，右 -> #{sizes.get('right', ('?', '?'))[1]}\n\n"
-                "标定需要**两台不同的**相机。请跑 `启动程序.bat setup` 重新确认。")
+                "标定需要两台不同的相机。请跑 `启动程序.bat setup` 重新确认。")
             return False
         return True
 
@@ -2349,10 +2377,10 @@ class Launcher(tk.Tk):
                 "标定 90° 装置（大角度）",
                 "接下来会按【90° 装置】标定：\n"
                 "  · 模式强制为 angled（大角度 / 近似直角）\n"
-                "  · 跳过 FOV 对齐 —— 两路各用**原始画面**，不裁剪、不缩放\n"
+                "  · 跳过 FOV 对齐 —— 两路各用原始画面，不裁剪、不缩放\n"
                 "  · 输出三维坐标系为 left_camera\n\n"
                 "前提（不满足就别用这个入口）：\n"
-                "  1. 两路**有共同可见区** —— 棋盘要能同时出现在左右画面里；\n"
+                "  1. 两路有共同可见区 —— 棋盘要能同时出现在左右画面里；\n"
                 "  2. 基线 B 约为工作距离的 2 倍（B≈2·D，例如 D=0.30 m 时 B≈600 mm）。\n\n"
                 "不确定装置属于哪一类？先点『基线夹角估算』，或看顶部那条装置状态。",
                 parent=self):
@@ -2388,8 +2416,15 @@ class Launcher(tk.Tk):
         cmd += self._backend_args()
         self._run(cmd, f"标定前置检查（左{left} / 右{right}：两路是否都看到棋盘）")
 
-    def _refresh_cameras(self) -> None:
-        """把下拉项换成"当前实际设备"（编号 | 名字 | 端口），并保留角色名选项。"""
+    def _refresh_cameras(self, *, probe: bool = True) -> None:
+        """把下拉项换成"当前实际设备"（编号 | 名字 | 端口），并保留角色名选项。
+
+        ``probe=True``（默认）：「刷新并检测相机」按钮走这条 —— 枚举之后**再真开一次**
+        相机（`cameras.py probe`），回答"它现在活着吗、有几台能出图"。
+        ``probe=False``：启动时走这条 —— **只枚举设备，不打开相机**。界面一出现就
+        真开相机是隐私观感问题（相机灯亮），也是每次启动的固定成本（实测 23.9 s）。
+        要实测出图，用户自己点「刷新并检测相机」，日志会说清这一步没开硬件。
+        """
         try:
             from sphere_tracker import camera_registry as cr
             devices = cr.list_devices()
@@ -2423,20 +2458,24 @@ class Launcher(tk.Tk):
             self._append(cr.format_device_table(devices, reg=reg))
             self._append("左/右可直接选 left / right（按设备身份，换 USB 口也不漂）；"
                          "也可选具体编号应急。")
-            # 必须说清这个按钮的**能力边界**：它只列"系统里存在哪些设备"，
-            # 不打开相机，所以**回答不了"相机现在活着吗"**。
-            # 用户 2026-10-18 的反馈正是："刷新设备列表和检查映射不能保证有用"。
-            self._append("接下来会自动**实测**每台能不能出图（下面另起一个任务）。")
+            # 必须说清这个按钮的能力边界：只点「刷新并检测相机」才真开相机实测；
+            # 启动时那次枚举不碰硬件，所以"相机现在活着吗"这个问题它还回答不了。
+            # （用户 2026-10-18 反馈："刷新设备列表和检查映射不能保证有用"。）
+            if probe:
+                self._append("接下来会实测每台能不能出图（下面另起一个任务）。")
+                # 枚举 ≠ 能用：立刻再跑一次真开相机的探测，让这个按钮真的回答问题。
+                self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"),
+                           "probe", "--max-index", "3"],
+                          "相机探测（真的开一次：有几台能出图、在哪个后端）")
+            else:
+                self._append("本次只枚举了设备，未打开相机（相机灯不会亮）。"
+                             "要逐台实测能不能出图，点『刷新并检测相机』。")
             if reg.ignored:
                 names = "、".join((s.name or f"#{s.index}") for s in reg.ignored)
                 self._append(f"已标为「无关」（自动挑相机会跳过）：{names}")
             else:
                 self._append("提示：不打算用的相机（笔记本内置 / 红外）可以在"
                              "『相机设备管理』的画面里按 n 标成「无关」。")
-            # 枚举 ≠ 能用：立刻再跑一次**真开相机**的探测，让这个按钮真的回答问题。
-            self._run([PY, str(ROOT / "apps" / "tools" / "cameras.py"),
-                       "probe", "--max-index", "3"],
-                      "相机探测（真的开一次：有几台能出图、在哪个后端）")
         else:
             self._append("没有枚举到设备（非 Windows 或系统枚举不可用），"
                          "只能按编号使用。")
@@ -2698,7 +2737,7 @@ class Launcher(tk.Tk):
         # ② 强杀（含子树）
         why = self._force_kill_tree(pid)
         if why:
-            self._append(f"[任务 {task.tid}] ⚠ 强制结束**没成功**：{why}")
+            self._append(f"[任务 {task.tid}] ⚠ 强制结束没成功：{why}")
             task.kill_note = f"强制结束未成功（{why}）"
         else:
             self._append(f"[任务 {task.tid}] 已强制结束整棵进程树")
@@ -2722,7 +2761,7 @@ class Launcher(tk.Tk):
                                   + (f"（{task.kill_note}）" if task.kill_note else ""))
                 self._append(
                     f"[任务 {task.tid}] ⚠ 停完仍有 {len(alive)} 个进程存活（{alive}）——"
-                    f"**相机可能仍被占着**，请确认后再启动新任务")
+                    f"相机可能仍被占着，请确认后再启动新任务")
                 return False
             time.sleep(0.05)
 
@@ -2818,7 +2857,7 @@ class Launcher(tk.Tk):
         """
         box = self._card(
             "任务",
-            "这里列出启动器起过的每个程序。**卡住时用它中断** ——"
+            "这里列出启动器起过的每个程序。卡住时用它中断 ——"
             "直接关启动器窗口是不会杀掉子进程的，相机可能仍被占着。"
             "「中断」先试优雅退出（让它自己收尾），3 秒不退再强制结束整棵进程树。")
         cols = ("id", "title", "pid", "elapsed", "status")
@@ -2926,7 +2965,7 @@ class Launcher(tk.Tk):
         if not self.stop_task(t, graceful=True):
             messagebox.showwarning(
                 "没停下来",
-                f"任务 {t.tid}「{t.title}」**没能停掉**：\n{t.kill_note or '原因不明'}\n\n"
+                f"任务 {t.tid}「{t.title}」没能停掉：\n{t.kill_note or '原因不明'}\n\n"
                 "它可能仍占着相机。可以在任务表里再点一次「中断」，"
                 "或直接去看它的日志文件。")
         self._refresh_tasks()
@@ -2941,14 +2980,14 @@ class Launcher(tk.Tk):
             return
         if not messagebox.askyesno(
                 "强制结束？",
-                f"任务 {t.tid}「{t.title}」会被**立刻杀掉**（含子进程树），"
+                f"任务 {t.tid}「{t.title}」会被立刻杀掉（含子进程树），"
                 "它来不及保存已完成的结果。\n\n确定吗？"):
             return
         if not self.stop_task(t, graceful=False):
             messagebox.showwarning(
                 "没能强制结束",
-                f"任务 {t.tid}「{t.title}」**还在跑**：\n{t.kill_note or '原因不明'}\n\n"
-                "常见原因是权限不足。**相机可能仍被它占着** —— "
+                f"任务 {t.tid}「{t.title}」还在跑：\n{t.kill_note or '原因不明'}\n\n"
+                "常见原因是权限不足。相机可能仍被它占着 —— "
                 "请用任务管理器结束它，或注销后重试。")
         self._refresh_tasks()
 
@@ -3027,7 +3066,7 @@ class Launcher(tk.Tk):
             if not messagebox.askyesno(
                     "仍有任务在运行",
                     f"还有 {len(running)} 个任务在跑：{names}{more}。\n\n"
-                    "退出启动器会**把它们一并结束**（否则相机等资源可能一直被占着）。\n"
+                    "退出启动器会把它们一并结束（否则相机等资源可能一直被占着）。\n"
                     "确定退出吗？"):
                 return
             self._append("[退出] 正在结束仍在运行的任务…")
@@ -3039,9 +3078,9 @@ class Launcher(tk.Tk):
                 left = [t for t in running if t.running]
                 messagebox.showwarning(
                     "有任务没停下来",
-                    f"{len(running)} 个任务里有 {len(left)} 个**没能结束**："
+                    f"{len(running)} 个任务里有 {len(left)} 个没能结束："
                     + "、".join(f"{t.tid}「{t.title}」(PID {t.proc.pid})" for t in left[:4])
-                    + "\n\n启动器关闭后它们**仍在运行**，相机等资源会一直被占着。\n"
+                    + "\n\n启动器关闭后它们仍在运行，相机等资源会一直被占着。\n"
                       "请用 Windows 任务管理器结束这些 PID，或注销后重试。")
         self.destroy()
 

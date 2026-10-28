@@ -133,6 +133,55 @@ def _fov_or_none(estimate_fn, *, mode: str, require_fov: bool):
         return None, f"{type(exc).__name__}: {exc}"
 
 
+# ---- 「宽松预设」（`--relaxed`）：手持拍摄时一次性放宽的收图门槛 ----
+#
+# 键 = `CaptureConfig` 的字段名；值 = 放宽后的门槛。**每一条都是"用精度换成功率"**。
+# 单独放成 dict 的唯一原因：日志要说真话 —— `--stationary-px` / `--min-sharpness`
+# 一旦显式给出就会**后写覆盖**这里的两项，而旧日志一律说"都放松了"，
+# 用户因此以为最影响收图成功率的两项被放宽了（B-97）。
+RELAXED_PRESET: dict[str, float] = {
+    "stationary_max_px": 10.0,   # 允许手更抖；代价 = 两路位姿差变大
+    "min_sharpness": 400.0,      # 额外绝对下限（只有高于 SB 检出下限时才真拦）
+    "min_area_ratio": 0.008,     # 允许板更远；代价 = 单像素误差占比变大
+    "min_margin_px": 6.0,        # 允许更贴边；代价 = 边缘畸变没被约束住
+    "min_brightness": 25.0,
+    "max_brightness": 245.0,
+}
+
+# 能被命令行/面板显式顶回的两项：出现在日志里要用人话（带参数名，便于对照）
+_PRESET_OVERRIDE_LABELS = {
+    "stationary_max_px": "停稳上限（--stationary-px）",
+    "min_sharpness": "清晰度下限（--min-sharpness）",
+}
+
+
+def relaxed_note(stationary_px: float | None,
+                 min_sharpness: float | None) -> list[str]:
+    """`--relaxed` 的**如实**说明：几条真生效、哪几条被显式参数顶回。
+
+    纯函数（不碰相机、不读 argparse 的命名空间），便于无相机自测。
+
+    条数由实际入参算、不写死：`--stationary-px` / `--min-sharpness` 一旦显式
+    给出，`cap_kw` 后写覆盖预设值，那两项就**没有**放宽。旧文案一律说
+    "都放松了 / 一次放松 6 条"，与真实取值相反（B-97）。
+    """
+    overridden: list[str] = []
+    if stationary_px is not None:
+        overridden.append("stationary_max_px")
+    if min_sharpness is not None:
+        overridden.append("min_sharpness")
+    effective = [name for name in RELAXED_PRESET if name not in overridden]
+    lines = [f"⚠ 已启用 --relaxed（手持预设）：预设共 {len(RELAXED_PRESET)} 项，"
+             f"生效 {len(effective)} 项、被你的显式参数覆盖 {len(overridden)} 项。"]
+    if overridden:
+        names = "、".join(_PRESET_OVERRIDE_LABELS.get(n, n) for n in overridden)
+        lines.append(f"   被覆盖的（按你给的值，不是预设值）：{names}")
+    lines.append("   这是用精度换成功率：用完必须复检极线误差。")
+    lines.append("   如果标定完极线误差 > 0.3 px，或者代进去三维抖得厉害，")
+    lines.append("   请处理好光照与支撑、去掉 --relaxed 重标一次。")
+    return lines
+
+
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
@@ -1180,18 +1229,10 @@ def main() -> int:
         require_stationary=(src.kind != "dir"),
     )
     if args.relaxed:
-        # 手持预设。**每一条都是"用精度换成功率"**，所以逐条说清代价：
-        cap_kw.update(
-            stationary_max_px=10.0,   # 允许手更抖；代价=两路位姿差变大
-            min_sharpness=400.0,      # 额外的绝对下限（默认值高于 SB 检出下限时才会真拦）
-            min_area_ratio=0.008,     # 允许板更远；代价=单像素误差占比变大
-            min_margin_px=6.0,        # 允许更贴边；代价=边缘畸变没被约束住
-            min_brightness=25.0,
-            max_brightness=245.0,
-        )
-        print("⚠ 已启用 --relaxed（手持预设）：门限都放松了，**这是用精度换成功率**。")
-        print("   如果标定完 极线误差 > 0.3 px，或者代进去三维抖得厉害，")
-        print("   请处理好光照与支撑、去掉 --relaxed 重标一次。")
+        # 手持预设：先整组套上，再用显式参数覆盖（顺序不变 = 行为不变）。
+        cap_kw.update(RELAXED_PRESET)
+        for line in relaxed_note(args.stationary_px, args.min_sharpness):
+            print(line)
         print()
     if args.stationary_px is not None:
         cap_kw["stationary_max_px"] = float(args.stationary_px)
