@@ -46,17 +46,35 @@ class ConsoleWindow(tk.Toplevel):
             self, "任务",
             "卡住时在这里中断：直接关窗口不会杀掉子进程，相机可能仍被占着。"
             "「中断」先试优雅退出，3 秒不退再强制结束整棵进程树。")
-        box.columnconfigure(0, weight=1)         # 任务表也要横向铺满，否则右侧留白
+        # 表格要**双向**拉伸：只写 sticky="we" 时 frame 的高度按"内容请求高度"
+        # 算，而 Treeview 的 height=5 与字体行高对不上时会溢出——按钮行就压在
+        # 第 2 行上（2026-10-28 用户截图）。
+        box.columnconfigure(0, weight=1)         # 横向铺满
+        # ⚠ **必须走游标**：写死 row=1 时游标仍停在 1（card() 的 hint 占了 row=0
+        # 之后只推到 1），于是紧随其后的 action_row 也拿到 row=1 ——
+        # 按钮直接压在第 2 行上（2026-10-28 用户截图）。
+        row_tree = self.surface._next_row(box)
+        box.rowconfigure(row_tree, weight=1)     # 纵向：表格行吃掉多余空间
         frame = ttk.Frame(box)
-        frame.grid(row=1, column=0, columnspan=9, sticky="we", pady=(4, 4))
+        frame.grid(row=row_tree, column=0, columnspan=9, sticky="nsew",
+                   pady=(4, 4))
         cols = ("id", "title", "pid", "elapsed", "status")
         heads = ("#", "任务", "PID", "已运行", "状态")
-        widths = (4, 34, 8, 9, 14)
+        # ⚠ 列宽单位是**像素**（`ttk.Treeview.column(width=)` 吃像素，不是字符数）。
+        # 之前按字符数的直觉写成 (4, 34, 8, 9, 14)，结果"任务"列只有 34 px，
+        # 标题被裁成"管理"两个字、行内文字还挤在一起（2026-10-28 用户截图）。
+        widths = (46, 380, 84, 96, 96)
         self.tree = ttk.Treeview(frame, columns=cols, show="headings",
-                                 height=5, selectmode="browse")
+                                 height=6, selectmode="browse")
         for c, h, w in zip(cols, heads, widths):
-            self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="w" if c in ("title", "status") else "center")
+            # 列头跟内容的对齐方式一致：标题/状态左对齐，其余居中
+            self.tree.heading(c, text=h,
+                              anchor="w" if c in ("title", "status") else "center")
+            self.tree.column(c, width=w, minwidth=w,
+                             # 只有标题列吸收额外宽度：窗口放大时该变宽的是
+                             # "任务"（它最长），不是 PID / 已运行 这种短字段。
+                             stretch=(c == "title"),
+                             anchor="w" if c in ("title", "status") else "center")
         bar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=bar.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -74,11 +92,11 @@ class ConsoleWindow(tk.Toplevel):
                                    fill="both", expand=True)
         self.text = tk.Text(logbox, height=14, wrap="none", state="disabled",
                             font=("Consolas", 9), bg="#f8fafc")
-        self.text.grid(row=1, column=0, columnspan=9, sticky="nsew")
-        logbox.rowconfigure(1, weight=1)
+        self.text.grid(row=0, column=0, columnspan=9, sticky="nsew")
+        logbox.rowconfigure(0, weight=1)
         logbox.columnconfigure(0, weight=1)     # 列也要权重，否则只长高不长宽
         bar2 = ttk.Scrollbar(logbox, orient="vertical", command=self.text.yview)
-        bar2.grid(row=1, column=9, sticky="ns")
+        bar2.grid(row=0, column=9, sticky="ns")
         self.text.configure(yscrollcommand=bar2.set)
         for line in app.recent_log():
             self._append(line)
