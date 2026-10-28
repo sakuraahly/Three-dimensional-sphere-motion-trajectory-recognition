@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -376,13 +377,21 @@ class App(tk.Tk):
             win.destroy()
 
     def recent_visualization(self) -> Path | None:
-        """最近一个**真有** ``visualization.json`` 的目录（按修改时间）。
+        """最近一个**真有** ``visualization.json`` 的会话目录（按目录名里的时间戳）。
 
-        为什么需要它：``view_3d.py`` 的 ``source`` 是**必填位置参数**，不给就
-        ``exit 2``，界面上表现成"点了没反应"（2026-10-28 用户报的就是这个）。
-        所以打开查看器之前必须先拿到一个真实存在的源；拿不到就别启动进程。
+        两个用途不同、别混：
+        - 这里只回答"打开查看器时先给哪一个"（一个默认值，**窗口内随时可换**）；
+        - 查看器内那个下拉由 ``apps/view_3d.scan_sources`` 提供（全部会话）。
+
+        为什么用目录名而不是 mtime：跑一次离线会重写 ``derived/``，把"昨天录、
+        今天补跑"的老会话 mtime 刷成今天 —— 按 mtime 排会把它顶成"最近"，
+        默认值每次都漂。这个坑 ``apps/_workbench.scan_sessions`` 已经吃过一次。
+
+        为什么不直接 import ``view_3d.scan_sources``：那个模块会拉起 matplotlib
+        （TkAgg），门厅启动完全不需要它。宁可两处各写一遍这条**一行规则**，
+        也不给启动路径加一个重量级依赖；规则写在两边注释里互指。
         """
-        cands: list[tuple[float, Path]] = []
+        cands: list[tuple[str, Path]] = []
         for base in (ROOT / "data" / "sessions", ROOT / "data"):
             try:
                 subs = [d for d in base.iterdir() if d.is_dir()]
@@ -393,7 +402,8 @@ class App(tk.Tk):
                     f = d / rel
                     try:
                         if f.is_file():
-                            cands.append((f.stat().st_mtime, f))
+                            m = re.match(r"(\d{8}-\d{6})", d.name)
+                            cands.append((m.group(1) if m else "", f))
                             break
                     except OSError:
                         continue
@@ -570,7 +580,9 @@ class HubWindow(tk.Toplevel):
         self.app.tasks.start(
             [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
             "3D 查看器")
-        self.status.set_status(f"正在打开 3D 查看器：{src.parent.name}", "info")
+        self.status.set_status(
+            f"正在打开 3D 查看器：{src.parent.name}"
+            f"（窗口内「数据源」可换任意会话）", "info")
 
     def _open_legacy(self) -> None:
         from tkinter import messagebox

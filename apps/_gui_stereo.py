@@ -594,7 +594,9 @@ class StereoWindow(tk.Toplevel):
         self.app.tasks.start(
             [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
             "3D 查看器")
-        self.status.set_status(f"正在打开 3D 查看器：{src.parent.name}", "info")
+        self.status.set_status(
+            f"正在打开 3D 查看器：{src.parent.name}"
+            f"（窗口内「数据源」可换任意会话）", "info")
 
     def on_close(self) -> None:
         """关窗时记住输入（会话路径与相机角色不存：前者每次新选，后者从

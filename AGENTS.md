@@ -292,7 +292,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_viz_scale.py` | `viz.scale`：整张图的**所有叠加**都随画布一起缩放（不只是预测线） |
 | `selftest_capture_health.py` | 采集健康度：**「相机没了」必须与「球没动」分得开**（`read_errors` / `stalled()`） |
 | `selftest_camera_presence.py` | 没有相机时**必须立刻说清并指对方向**（判定可注入，沙箱里可跑全分支） |
-| `selftest_launcher_params.py` | 启动器标定参数面板：**默认是正式档**（40/20）、留空不传、非法输入被拦住 |
+| `selftest_launcher_params.py` | 启动器标定参数面板：**默认是正式档**（40/20）、留空不传、非法输入被拦住；录制前体检「模式 vs 标定」；**3D 查看器能换任意会话**（切到没视频的会话不许留旧画面、坏源不毁当前视图） |
 | `selftest_task_manager.py` | 任务管理器：能中断、**子进程树一起收干净**（「看着停了其实还在」是最难发现的） |
 | `selftest_window_mode.py` | 窗口全屏：**所有**视频窗口都接上 `apps/_window.py`；Esc 在全屏时只退全屏、不关程序；不抢已用的键 |
 | `selftest_mutation_guards.py` | **变异自证总集**：把 13 处"当初的缺陷"逐个放回去，证明对应判据**真的会红**（改源码前有备份/恢复 + SHA256 校验；锚点不唯一就跳过）。**慢**，属 full 档 |

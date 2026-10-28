@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -25,6 +26,7 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image, ImageTk
+from tkinter import filedialog, messagebox
 
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
@@ -76,17 +78,97 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
     return [min(xs), min(ys), min(zs)], [max(xs), max(ys), max(zs)]
 
 
+#: 会话结果最多列几个（够选就行；下拉太长反而难找）
+SOURCE_LIMIT = 40
+
+
+def scan_sources(limit: int = SOURCE_LIMIT,
+                 roots: tuple[Path, ...] | None = None) -> list[Path]:
+    """所有**真有**三维结果的会话，新的在前。
+
+    扫两层：`data/sessions/<会话>/derived/` 与 `data/<会话>/derived/`
+    （早期会话直接放在 `data/` 下，那时还没有 `sessions/`）。
+    `roots` 只给测试用：判据要能造临时会话，不能依赖这台机器录过什么。
+
+    **排序用目录名里的 `YYYYMMDD-HHMMSS`，不用文件 mtime**：
+    跑一次离线会重写 `derived/`，把老会话的 mtime 刷成今天 —— 按 mtime 排会把
+    "昨天录、今天补跑"的会话顶到第一条，默认选中就漂了。
+    这个坑 `apps/_workbench.scan_sessions` 已经吃过一次，判据写在它的 docstring 里。
+    """
+    bases = roots if roots is not None else (ROOT / "data" / "sessions", ROOT / "data")
+    found: dict[Path, Path] = {}
+    for base in bases:
+        if not base.is_dir():
+            continue
+        for name in ("visualization.json", "traj3d.json"):
+            for f in base.glob(f"*/derived/{name}"):
+                sess = f.parent.parent
+                # 同一个会话两种都写时，优先 visualization.json（它带视频叠加信息）
+                if sess not in found or f.name == "visualization.json":
+                    found[sess] = f
+
+    def key(f: Path) -> tuple[str, float]:
+        name = f.parent.parent.name
+        m = re.match(r"(\d{8}-\d{6})", name)
+        try:
+            return (m.group(1) if m else "", f.stat().st_mtime)
+        except OSError:
+            return (m.group(1) if m else "", 0.0)
+
+    return sorted(found.values(), key=key, reverse=True)[:max(1, limit)]
+
+
+def source_label(f: Path) -> str:
+    """下拉里显示的名字：会话目录名（`session.json` 有 label 就接在后面）。"""
+    sess = f.parent.parent
+    try:
+        tag = str(json.loads((sess / "session.json").read_text(encoding="utf-8"))
+                  .get("label") or "").strip()
+    except Exception:                                       # noqa: BLE001
+        tag = ""
+    return f"{sess.name}  {tag}" if tag else sess.name
+
+
 class Viewer3D:
     def __init__(self, root: tk.Tk, data: dict, video_path: str | Path | None = None,
                  auto_video: bool = True) -> None:
         self.root = root
+        self.playing = False
+        self.speed = 1.0
+        self._syncing = False
+        self.cap: cv2.VideoCapture | None = None
+        self._left_raw = None
+        self._right_raw = None
+        self._sources: list[Path] = []
+        self._apply(data, video_path, auto_video)
+        try:
+            self._build()
+            self._redraw()
+        except Exception:
+            # 构造中途失败（多 Tk 根、matplotlib 后端、无显示…）也必须把视频
+            # 句柄放掉：Windows 上不放，`annotated.mp4` 会一直被占着，
+            # 现象是"临时目录删不掉 / 文件删了还在"（WinError 32）。
+            self._release_cap()
+            raise
+
+    def _apply(self, data: dict, video_path: str | Path | None,
+               auto_video: bool) -> None:
+        """装入一份数据。**所有随会话变化的状态都必须在这里重置**。
+
+        换会话只调它 + 刷新控件，**不重建窗口**：视频 canvas / 3D 画布 / 滑杆
+        都是持久的，重建会把用户的窗口尺寸、当前视角、播放速度一起丢掉。
+
+        `_left_raw / _right_raw` 也要清：新会话如果没有视频，`_update_video`
+        会走 `_render_video`，而它还留着上一个会话的解码帧 —— 屏幕上就会出现
+        "标题换了、画面还是上一条"的假象，且不报任何错。
+        """
+        self._release_cap()
+        self._left_raw = None
+        self._right_raw = None
         self.data = data
         self.points = data["trajectory"]
         self.n = len(self.points)
         self.idx = 0
-        self.playing = False
-        self.speed = 1.0
-        self._syncing = False
         self.video_error = ""
         self.video_disabled = (video_path is None or video_path == "") and not auto_video
         self.lo, self.hi = bounds_of(self.points)
@@ -104,8 +186,19 @@ class Viewer3D:
                 self.cap.release()
                 self.cap = None
         self.root.title(f"3D 轨迹 · {data.get('session', '')} · {self.n} points")
-        self._build()
-        self._redraw()
+
+    def open_source(self, path: str | Path) -> None:
+        """切到另一个会话 / 文件。
+
+        **先 `load_view` 再改状态**：加载失败（目录里没有 json、schema 不对、
+        轨迹为空）时 `self` 一点没动，调用方弹个提示即可，正在看的东西不会消失。
+        """
+        data = load_view(path)
+        self._apply(data, None, True)
+        self.slider.configure(to=max(0, self.n - 1))
+        self.slider.set(0)
+        self._redraw()                       # 内含 _reset_view / _update_video / _status
+        self._sync_source_row()
 
     def _resolve_video(self, explicit: str | Path | None, auto: bool) -> Path | None:
         if explicit:
@@ -179,6 +272,22 @@ class Viewer3D:
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
         self.status.pack(side="bottom", fill="x")
+
+        # ---- 数据源：换会话 ----
+        # 2026-10-28 用户报："打开后自动选最近会话，且不能改"。
+        # 以前源只来自命令行位置参数，换一个就得关窗重开（界面那边也只能给
+        # "最近一个"）。这里给一个下拉 + 目录浏览，两条路都能换，
+        # **换的时候不重建窗口**（窗口尺寸/视角/播放速度都保留）。
+        src = ttk.Frame(self.root, padding=(8, 2))
+        src.pack(side="bottom", fill="x")     # 先 pack status 再 pack 它 → 落在 status 上方
+        ttk.Label(src, text="数据源").pack(side="left")
+        self.source_box = ttk.Combobox(src, width=38, state="readonly")
+        self.source_box.pack(side="left", padx=(8, 4))
+        self.source_box.bind("<<ComboboxSelected>>", self._on_pick_source)
+        ttk.Button(src, text="打开目录…", width=10,
+                   command=self._on_browse_source).pack(side="left")
+        self.source_note = ttk.Label(src, text="")
+        self.source_note.pack(side="left", padx=(10, 0))
         # 先给控制条/状态栏留位置，再把四宫格填满剩余空间；
         # 否则 grid 的 expand 会把后面的 pack 控件压成 1px。
         grid.pack(fill="both", expand=True, padx=4, pady=4)
@@ -189,6 +298,61 @@ class Viewer3D:
         self.root.bind("<Right>", self._on_right)
         self.root.bind("<Home>", lambda _e: self._reset_view())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._refresh_sources()
+
+    # ------------------------------------------------------------------
+    # 换数据源
+    # ------------------------------------------------------------------
+    def _refresh_sources(self) -> None:
+        """重扫会话列表并勾住当前源。"""
+        self._sources = scan_sources()
+        self.source_box["values"] = [source_label(f) for f in self._sources]
+        self.source_note.configure(
+            text=f"共 {len(self._sources)} 个会话有结果" if self._sources else
+                 "没有找到会话结果（data/sessions/*/derived/）")
+        self._sync_source_row()
+
+    def _sync_source_row(self) -> None:
+        """让下拉框停在**当前真的在看的那一个**上。
+
+        换源失败时也要调它：否则下拉会停在一个没打开的名字上，
+        用户以为在看他选的那个，实际屏幕上还是上一个。
+        """
+        cur = str(self.data.get("_path") or "")
+        for i, f in enumerate(self._sources):
+            if str(f) == cur:
+                self.source_box.current(i)
+                return
+        self.source_box.set("")
+
+    def _on_pick_source(self, _event=None) -> None:
+        i = self.source_box.current()
+        if 0 <= i < len(self._sources):
+            self._switch_to(self._sources[i])
+
+    def _on_browse_source(self) -> None:
+        d = filedialog.askdirectory(
+            title="选择会话目录（含 derived/visualization.json）",
+            initialdir=str(ROOT / "data" / "sessions"), parent=self.root)
+        if not d:
+            return
+        try:
+            f = resolve_json(d)                 # 目录 -> 具体 json（会校验存在性）
+        except Exception as exc:                # noqa: BLE001
+            messagebox.showwarning("这里没有三维结果", f"{d}\n\n{exc}", parent=self.root)
+            return
+        self._switch_to(f)
+
+    def _switch_to(self, f: Path) -> None:
+        if str(f) == str(self.data.get("_path") or ""):
+            return                              # 已经是它，别白重载
+        try:
+            self.open_source(f)
+        except Exception as exc:                # noqa: BLE001
+            # 换失败必须**保持原视图**（open_source 里先 load 后改状态，所以
+            # 走到这里 self 还没被动过），只把下拉拉回去。
+            messagebox.showwarning("这个源打不开", f"{f}\n\n{exc}", parent=self.root)
+            self._sync_source_row()
 
     def _fit_video_rows(self, _event=None) -> None:
         """顶上两格锁 16:9，避免 cover-crop 切掉左右叠加文字。"""
@@ -211,10 +375,23 @@ class Viewer3D:
             return
         self._step(1)
 
-    def _on_close(self) -> None:
+    def _release_cap(self) -> None:
         if self.cap is not None:
             self.cap.release()
+            self.cap = None
+
+    def close(self) -> None:
+        """释放视频句柄并关窗。
+
+        单独提出来是因为**测试也会开窗**，而它必须走同一条释放路径：
+        Windows 上 `cap` 不 release，`annotated.mp4` 就一直被占着 ——
+        关掉查看器之后删不掉、覆盖不了，报"另一个程序正在使用此文件"。
+        """
+        self._release_cap()
         self.root.destroy()
+
+    def _on_close(self) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     def _limits(self):
@@ -282,7 +459,11 @@ class Viewer3D:
             y0 = max(0, (nh - h) // 2)
             img = img[y0:y0 + h, x0:x0 + w]
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+            # `master=canvas` 不能省：同一个进程里若有**另一个** Tk 根
+            # （测试里先建过 App、或以后把查看器嵌进别的窗口），不带 master 的
+            # PhotoImage 会绑到"默认根"上，用在另一个 Tk 的 canvas 上就是
+            # `image "pyimageN" doesn't exist`。独立进程跑看不出来。
+            photo = ImageTk.PhotoImage(Image.fromarray(rgb), master=canvas)
             setattr(self, attr, photo)
             canvas.create_image(0, 0, anchor="nw", image=photo)
 

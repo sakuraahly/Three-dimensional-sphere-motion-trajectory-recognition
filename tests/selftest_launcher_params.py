@@ -115,6 +115,145 @@ def _set(entry, val: str) -> None:
         entry.insert(0, val)
 
 
+def _check_view_3d_switch() -> list[tuple[str, bool]]:
+    """8d. 3D 查看器能换任意会话（2026-10-28）。
+
+    用户原话："3D 查看器打开后自动选最近会话，且不能改"。
+
+    换源本身看着简单（再 `load_view` 一次），但有两个**不报错**的坑：
+    ① `_left_raw/_right_raw` 是上一个会话的解码帧，新会话若没有视频，
+    `_update_video` 会把它俩原样画出来 —— 标题换了、画面还是上一条；
+    ② 坏源若"先改状态再加载"，会把正在看的会话弄没。
+
+    全部用**临时会话**：判据不能依赖"这台机器录过什么"（B-27 的教训：
+    干净 checkout 上会假红）。
+    """
+    import cv2
+    import numpy as np
+    import tkinter as tk
+
+    from apps.view_3d import Viewer3D, load_view, scan_sources
+
+    def mk(base: Path, name: str, *, n: int = 3, video: bool = True) -> Path:
+        sess = base / name
+        (sess / "derived").mkdir(parents=True, exist_ok=True)
+        pts = [{"xyz": [0.01 * i, 0.0, 1.0 + 0.001 * i], "frame": i, "t": 0.01 * i}
+               for i in range(n)]
+        (sess / "derived" / "visualization.json").write_text(json.dumps({
+            "schema": "sphere-stereo-visualization", "version": 1,
+            "session": name, "trajectory": pts,
+            "coordinate_system": "left_camera", "unit": "m",
+            "stereo_mode": "parallel"}, ensure_ascii=False), encoding="utf-8")
+        if video:
+            # 文件名必须是 annotated.mp4（`_resolve_video` 只认它）；
+            # 项目"别用 mp4v"那条针对录制/叠加，这里的合成帧没有标记。
+            dst = sess / "derived" / "annotated.mp4"
+            vw = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"),
+                                 5.0, (128, 64))
+            if not vw.isOpened():
+                raise RuntimeError(f"视频写不了：{dst}")
+            for i in range(6):
+                vw.write(np.full((64, 128, 3), 40 + i * 25, np.uint8))
+            vw.release()
+        return sess
+
+    checks: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        old = mk(base, "20260101-000000", video=False)
+        new = mk(base, "20260202-000000", video=False)
+        # 故意反着设：名字旧的 mtime 是"刚刚"、名字新的是一天前。
+        # 按 mtime 排会得到 [旧, 新]，正确顺序是 [新, 旧]。
+        now = time.time()
+        os.utime(old / "derived" / "visualization.json", (now, now))
+        os.utime(new / "derived" / "visualization.json",
+                 (now - 86400, now - 86400))
+        got = [f.parent.parent.name for f in scan_sources(roots=(base,))]
+        checks.append((f"会话列表按目录名倒序、不被 mtime 带跑（{got}）",
+                       got == ["20260202-000000", "20260101-000000"]))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        a = mk(base, "20260101-000000", n=5, video=True)
+        b = mk(base, "20260202-000000", n=9, video=True)
+        root = tk.Tk()
+        root.withdraw()
+        v = None
+        try:
+            v = Viewer3D(root, load_view(a / "derived" / "visualization.json"))
+            n0, title0 = v.n, root.title()
+            v.idx = 3
+            v.open_source(b / "derived" / "visualization.json")
+            checks += [
+                ("换会话后点数换成新的（5 → 9）", v.n == 9 and n0 == 5),
+                ("游标归零（不沿用上一个会话的帧号）", v.idx == 0),
+                ("标题与滑杆上限都跟着换",
+                 root.title() != title0 and "20260202-000000" in root.title()
+                 and int(float(v.slider.cget("to"))) == 8),
+            ]
+        finally:
+            if v is not None:
+                v.close()       # 释放 cap，否则临时目录删不掉（WinError 32）
+            else:
+                root.destroy()
+
+    # 切到"没有视频"的会话：必须清掉上一段的解码帧
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        a = mk(base, "20260101-000000", n=4, video=True)
+        b = mk(base, "20260202-000000", n=4, video=False)
+        root = tk.Tk()
+        root.withdraw()
+        v = None
+        try:
+            v = Viewer3D(root, load_view(a / "derived" / "visualization.json"))
+            had = v._left_raw is not None and v._right_raw is not None
+            v.open_source(b / "derived" / "visualization.json")
+            checks += [
+                ("切换前确实解码到了帧（否则这条是空跑）", had),
+                ("新会话没视频 → 两路都是 None（不是旧帧）",
+                 v._left_raw is None and v._right_raw is None),
+                ("cap 也关掉了（不占文件句柄）", v.cap is None),
+            ]
+        finally:
+            if v is not None:
+                v.close()
+            else:
+                root.destroy()
+
+    # 坏源：抛错，但不能把正在看的会话弄没
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        a = mk(base, "20260101-000000", n=6, video=False)
+        empty = base / "20260303-000000"
+        empty.mkdir()
+        root = tk.Tk()
+        root.withdraw()
+        v = None
+        try:
+            v = Viewer3D(root, load_view(a / "derived" / "visualization.json"))
+            before_path, before_n = str(v.data.get("_path")), v.n
+            raised = False
+            try:
+                v.open_source(empty)
+            except Exception:                               # noqa: BLE001
+                raised = True
+            checks += [
+                ("坏源抛错（不是静默忽略）", raised),
+                # 用 .get：坏实现可能已把 data 清掉，"路径没了"也要算红，
+                # 而不是让测试自己 KeyError 崩掉（崩掉看不出是哪一条）
+                ("当前视图没变（路径与点数都还是原来那个）",
+                 str(v.data.get("_path")) == before_path and v.n == before_n),
+            ]
+        finally:
+            if v is not None:
+                v.close()
+            else:
+                root.destroy()
+
+    return checks
+
+
 def main() -> int:
     print("=" * 70)
     print("启动器标定参数面板自测（读取 / 校验 / 默认正式档）")
@@ -545,6 +684,12 @@ def main() -> int:
          and "_confirm_record_plan(plan)" in mod_src),
     ]
     for label, good in checks_plan:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
+
+    # ---- 8d. 3D 查看器能换任意会话 ----
+    print("----- 8d. 3D 查看器：能换任意会话，换坏不毁当前视图 -----")
+    for label, good in _check_view_3d_switch():
         print(f"  [{'通过' if good else '不达标'}] {label}")
         results.append((label, good))
 
