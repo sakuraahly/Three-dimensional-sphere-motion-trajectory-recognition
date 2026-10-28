@@ -317,6 +317,33 @@ class App(tk.Tk):
                     pass
             win.destroy()
 
+    def recent_visualization(self) -> Path | None:
+        """最近一个**真有** ``visualization.json`` 的目录（按修改时间）。
+
+        为什么需要它：``view_3d.py`` 的 ``source`` 是**必填位置参数**，不给就
+        ``exit 2``，界面上表现成"点了没反应"（2026-10-28 用户报的就是这个）。
+        所以打开查看器之前必须先拿到一个真实存在的源；拿不到就别启动进程。
+        """
+        cands: list[tuple[float, Path]] = []
+        for base in (ROOT / "data" / "sessions", ROOT / "data"):
+            try:
+                subs = [d for d in base.iterdir() if d.is_dir()]
+            except OSError:
+                continue
+            for d in subs:
+                for rel in ("derived/visualization.json", "visualization.json"):
+                    f = d / rel
+                    try:
+                        if f.is_file():
+                            cands.append((f.stat().st_mtime, f))
+                            break
+                    except OSError:
+                        continue
+        if not cands:
+            return None
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return cands[0][1]
+
     def open_console(self):
         from apps._gui_console import ConsoleWindow
         return self.open_window("console", "任务管理器和运行日志", ConsoleWindow)
@@ -474,9 +501,18 @@ class HubWindow(tk.Toplevel):
             "数据管理")
 
     def _open_viewer(self) -> None:
+        """打开 3D 查看器 —— **必须带源**（view_3d 的 source 是必填参数）。"""
+        src = self.app.recent_visualization()
+        if src is None:
+            # 没有源就**不启动**：盲启的结果是进程 exit 2、用户看到"没反应"
+            self.status.set_status(
+                "还没有可看的三维结果。先在某个会话上跑一次「离线三维」，"
+                "它会写出 visualization.json，然后这里就能打开", "warn")
+            return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "view_3d.py")],
+            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
             "3D 查看器")
+        self.status.set_status(f"正在打开 3D 查看器：{src.parent.name}", "info")
 
     def _open_legacy(self) -> None:
         from tkinter import messagebox

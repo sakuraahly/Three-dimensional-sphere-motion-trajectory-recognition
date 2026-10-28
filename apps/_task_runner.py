@@ -110,6 +110,7 @@ class Task:
     stop_reason: str = ""
     kill_note: str = ""          # 停止失败的原因（"没杀干净"必须有出口）
     lines: int = 0
+    stdout_lines: int = 0        # 子进程真正吐出的行数（判"启动即退且没输出"）
     on_done: Callable[["Task"], None] | None = None
 
     @property
@@ -368,6 +369,7 @@ class TaskRunner:
         assert proc.stdout is not None
         for line in proc.stdout:
             body = line.rstrip()
+            task.stdout_lines += 1
             self._task_log(task, body)                      # 每行都落盘
             self._log_queue.put(f"[{task.tid}] {body}")
         proc.wait()
@@ -382,6 +384,26 @@ class TaskRunner:
             self._task_log(task, f"日志文件：{task.log_path}")
         self._log_queue.put(tail)
         self._done_queue.put(task.tid)
+
+    def _report_failure(self, task: Task) -> None:
+        """非 0 退出时说人话；**启动即退**的要直接指出"多半是参数不对"。
+
+        为什么必须有这一条：界面上点了按钮之后"什么都没发生"是用户最不能接受的
+        反馈（2026-10-28 用户报"3D 查看器点了没反应"）。根因是子进程 argparse
+        直接 exit 2，而错误只落在日志里、没人会去翻。
+        这一条是**机制层兜底**：下次谁再漏传一个必填参数，也会被它抓住，
+        不用等用户发现"点了没反应"。
+        """
+        if task.exit_code in (0, None):
+            return
+        if task.elapsed() < 5.0 and task.stdout_lines <= 2:
+            self._emit(
+                f"[任务 {task.tid}] 启动即失败（返回码 {task.exit_code}，几乎没有输出）"
+                f" —— 多半是参数不对，不是程序坏了。命令：{task.cmdline()}")
+        else:
+            self._emit(
+                f"[任务 {task.tid}] 失败：返回码 {task.exit_code}；"
+                f"完整输出：{task.log_path or '（未落盘）'}")
 
     def pump_once(self) -> None:
         """把队列里的日志与完成事件排空一次（可手动驱动，供无界面测试）。"""
@@ -399,6 +421,8 @@ class TaskRunner:
                 break
             task = next((t for t in self._tasks if t.tid == tid), None)
             changed = True
+            if task is not None:
+                self._report_failure(task)
             if task is not None and task.on_done is not None:
                 try:
                     task.on_done(task)

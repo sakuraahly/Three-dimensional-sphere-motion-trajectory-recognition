@@ -316,10 +316,23 @@ class MonoWindow(tk.Toplevel):
                                "要停请到「日志与任务」里中断", "info")
 
     def _start_video(self) -> None:
-        cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"),
+        """离线视频：**先选文件再启动**。
+
+        run_video.py 的 path 是必填位置参数，它自己不会弹选择框 ——
+        原来那句"会提示选视频文件"是错的，盲启的结果是 exit 2、点了没反应。
+        """
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择要处理的视频", parent=self,
+            filetypes=[("视频", "*.mp4 *.avi *.mkv *.mov *.m4v"),
+                       ("所有文件", "*.*")])
+        if not path:
+            self.status.set_status("没有选视频，已取消", "info")
+            return
+        cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), path,
                "--ball-diameter", self.var_diameter.get().strip() or "40"]
-        self.app.tasks.start(cmd, "离线单目视频")
-        self.status.set_status("已启动离线单目（会提示选视频文件）", "info")
+        self.app.tasks.start(cmd, f"离线单目：{Path(path).name}")
+        self.status.set_status(f"已启动离线单目：{Path(path).name}", "info")
 
     def _stop_my_tasks(self) -> None:
         ok = self.app.tasks.stop_all(graceful=True)

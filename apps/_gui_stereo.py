@@ -401,8 +401,31 @@ class StereoWindow(tk.Toplevel):
                                "info")
 
     def _open_viewer(self) -> None:
+        """打开 3D 查看器 —— 必须带源：优先当前会话，其次最近一个真有结果的门录。
+
+        view_3d 的 source 是必填位置参数，不给就 exit 2（表现为"点了没反应"）。
+        """
+        session = self.var_session.get().strip()
+        if session:
+            cand = Path(session)
+            src = next((cand / rel for rel in ("derived/visualization.json",
+                                               "visualization.json")
+                        if (cand / rel).is_file()), None)
+            if src is None:
+                self.status.set_status(
+                    f"这个会话还没有 visualization.json：先在上面的"
+                    f"「跑离线三维」跑一次，再来查看", "warn")
+                return
+        else:
+            src = self.app.recent_visualization()
+            if src is None:
+                self.status.set_status(
+                    "先选一个会话并跑一次「跑离线三维」，才有三维结果可看", "warn")
+                return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "view_3d.py")], "3D 查看器")
+            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
+            "3D 查看器")
+        self.status.set_status(f"正在打开 3D 查看器：{src.parent.name}", "info")
 
     def _stop_my_tasks(self) -> None:
         ok = self.app.tasks.stop_all(graceful=True)
