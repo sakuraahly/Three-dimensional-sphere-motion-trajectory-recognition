@@ -25,12 +25,13 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from apps._gui_widgets import BG, ScrollPage, StatusBar, Surface
+from apps._gui_widgets import BG, INK, MUTED, WARN, ScrollPage, StatusBar, Surface
 from apps._collapsible import CollapsibleSection
 from apps._task_runner import ROOT
 
@@ -48,6 +49,158 @@ METHODS = {
               "板不必被两路同时看到：各拍一组内参图，再用一块固定参考板把两路串起来。"
               "90 度这类几乎看不到同一区域的装置用它。产物就是本窗口要的 angled。"),
 }
+
+
+# --------------------------------------------------------------------------- #
+# 会话选择：三态过滤（匹配 / 不匹配 / 未记录）
+# --------------------------------------------------------------------------- #
+def scan_sessions(base: Path | None = None) -> list[dict]:
+    """读 ``data/sessions/*/session.json`` 的摘要。
+
+    只读 JSON、**不构造 ``Session`` 对象**：几十个会话也能瞬间列完，
+    而且不会因为某一份坏文件把整个列表打断。
+
+    ``mode`` 字段可能是 ``None`` —— 那表示**这份会话没有记录装置模式**。
+    老会话都缺这个字段（``record_stereo`` 写入 ``stereo_mode`` 是
+    ``a137766`` 才加的），所以**不能默认成 parallel**。
+    """
+    root = base if base is not None else ROOT / "data" / "sessions"
+    rows: list[dict] = []
+    try:
+        dirs = sorted((d for d in root.iterdir() if d.is_dir()),
+                      key=lambda d: d.name, reverse=True)
+    except OSError:
+        return rows
+    for d in dirs:
+        sj = d / "session.json"
+        if not sj.is_file():
+            continue
+        try:
+            raw = json.loads(sj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        left = raw.get("left") if isinstance(raw.get("left"), dict) else {}
+        rows.append({
+            "path": d,
+            "id": d.name,
+            "label": str(raw.get("label") or ""),
+            "created": str(raw.get("created") or ""),
+            "mode": raw.get("stereo_mode"),
+            # 会话里帧数叫 frame_count（实测 20261024-173619: 301 帧），不是 frames
+            "frames": left.get("frame_count") or "",
+        })
+    return rows
+
+
+class SessionPicker(tk.Toplevel):
+    """选一段会话：列出磁盘上的会话，按装置模式**三态**标注。
+
+    为什么要有它：旧界面把"会话目录"做成输入框，用户得自己记住并粘贴路径 ——
+    那是"把该由系统做的事转嫁给用户"。
+
+    为什么是三态而不是两态：老会话没有 ``stereo_mode`` 字段。两态（匹配/不匹配）
+    会把它们当成 parallel，于是 90° 装置录的会话在平行窗里看起来"可用" ——
+    **比不过滤更糟**。所以第三态叫"未记录"，如实标注、让人自己确认。
+    """
+
+    COLS = (("id", "目录", 130), ("label", "标签", 150),
+            ("created", "创建时间", 150), ("mode", "模式", 100),
+            ("frames", "帧数", 70))
+
+    def __init__(self, parent, *, mode: str, on_pick, current: str = "") -> None:
+        super().__init__(parent)
+        self.mode = mode
+        self.on_pick = on_pick
+        self.title("选择会话 · "
+                   + ("平行双目" if mode == "parallel" else "大角度双目"))
+        self.geometry("820x560")
+        self.minsize(680, 440)
+        self.configure(bg=BG)
+        self.surface = Surface(self)
+        self.var_all = tk.BooleanVar(value=False)
+        self._rows = scan_sessions()
+
+        box = self.surface.card(
+            self, "会话",
+            "这里列出 data/sessions 下的会话。默认只显示与当前窗口同一种装置几何的；"
+            "老会话没有记录装置模式，标为「未记录」—— 用之前请自己确认它是哪种装置录的。")
+        ttk.Checkbutton(box, text="显示不属于本窗口模式的会话（标灰，选中时会说明风险）",
+                        variable=self.var_all,
+                        command=self._refresh).grid(
+            row=self.surface._next_row(box), column=0, columnspan=9,
+            sticky="w", pady=(2, 0))
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=16, pady=(8, 0))
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLS],
+                                 show="headings", selectmode="browse")
+        for key, title, width in self.COLS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width,
+                             anchor="w" if key in ("id", "label", "created") else "center")
+        bar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=bar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        for tag, colour in (("ok", INK), ("mismatch", MUTED), ("unknown", WARN)):
+            self.tree.tag_configure(tag, foreground=colour)
+        self.tree.bind("<Double-1>", lambda _e: self._accept())
+        self.tree.bind("<Return>", lambda _e: self._accept())
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", padx=16, pady=10)
+        self.surface.primary(actions, "用这个会话", self._accept)
+        self.surface.secondary(actions, "取消", self.destroy)
+
+        self._refresh()
+        if current:
+            try:
+                self.tree.selection_set(str(Path(current)))
+                self.tree.see(str(Path(current)))
+            except tk.TclError:
+                pass
+
+    # ---------- 三态 ----------
+    def _state_of(self, row: dict) -> tuple[str, str]:
+        raw = row.get("mode")
+        if raw is None or str(raw).strip() == "":
+            return "未记录", "这份会话没记录装置模式，用之前请确认是哪套装置录的"
+        if str(raw) == self.mode:
+            return "匹配", ""
+        return "不匹配", f"这段会话是按 {raw} 几何录的，用本窗解算会得到错的深度"
+
+    def _refresh(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        shown = 0
+        for row in self._rows:
+            state, _why = self._state_of(row)
+            if state == "不匹配" and not self.var_all.get():
+                continue
+            tag = {"匹配": "ok", "不匹配": "mismatch", "未记录": "unknown"}[state]
+            label = row["label"] or ("（无标签）" if state != "未记录" else "（无标签）")
+            mode_text = row["mode"] if row["mode"] else "未记录"
+            self.tree.insert("", "end", iid=str(row["path"]),
+                             values=(row["id"], label, row["created"],
+                                     mode_text, row["frames"]),
+                             tags=(tag,))
+            shown += 1
+        if shown == 0:
+            self.tree.insert("", "end", iid="__none__",
+                             values=("（没有会话）", "", "", "", ""), tags=("mismatch",))
+
+    def _accept(self) -> None:
+        sel = self.tree.selection()
+        if not sel or sel[0] == "__none__":
+            return
+        row = next((r for r in self._rows if str(r["path"]) == sel[0]), None)
+        if row is None:
+            return
+        _state, why = self._state_of(row)
+        self.on_pick(sel[0], why)
+        self.destroy()
 
 
 class StereoWindow(tk.Toplevel):
@@ -232,7 +385,7 @@ class StereoWindow(tk.Toplevel):
         ttk.Label(line, text="会话目录").pack(side="left")
         ttk.Entry(line, textvariable=self.var_session, width=46).pack(
             side="left", padx=(8, 8))
-        ttk.Button(line, text="最近的…", command=self._pick_latest).pack(
+        ttk.Button(line, text="选择…", command=self._pick_session).pack(
             side="left")
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "跑离线三维", self._start_offline)
@@ -365,24 +518,24 @@ class StereoWindow(tk.Toplevel):
         self.status.set_status(f"正在录制 {self.var_seconds.get() or '10'} 秒 → "
                                f"{out.name}；录完用它做第 4 步", "info")
 
-    def _pick_latest(self) -> None:
-        """把最近一次录制目录填进来（不弹窗让人手抄路径）。"""
-        base = ROOT / "data"
-        try:
-            dirs = [d for d in base.iterdir() if d.is_dir()]
-            dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-        except OSError:
-            dirs = []
-        if not dirs:
-            self.status.set_status("data\\ 下还没有会话目录，先做第 3 步录制", "warn")
-            return
-        self.var_session.set(str(dirs[0]))
-        self.status.set_status(f"已选最近的会话：{dirs[0].name}", "ok")
+    def _pick_session(self) -> None:
+        """打开会话选择器（按本窗模式三态过滤）。"""
+        SessionPicker(self, mode=self.mode, on_pick=self._set_session,
+                      current=self.var_session.get().strip())
+
+    def _set_session(self, path: str, why: str = "") -> None:
+        """选中一个会话。``why`` 非空表示"它不属于本窗模式"，必须说出来。"""
+        self.var_session.set(path)
+        name = Path(path).name
+        if why:
+            self.status.set_status(f"已选 {name} —— 注意：{why}", "warn")
+        else:
+            self.status.set_status(f"已选会话：{name}", "ok")
 
     def _start_offline(self) -> None:
         session = self.var_session.get().strip()
         if not session:
-            self.status.set_status("先选一个会话目录（点「最近的…」）", "warn")
+            self.status.set_status("先选一个会话（点「选择…」）", "warn")
             return
         cmd = [sys.executable, str(ROOT / "apps" / "run_stereo_video.py"),
                session, "--stereo-mode", self.mode]
@@ -393,7 +546,7 @@ class StereoWindow(tk.Toplevel):
     def _start_seed(self) -> None:
         session = self.var_session.get().strip()
         if not session:
-            self.status.set_status("先选一个会话目录", "warn")
+            self.status.set_status("先选一个会话（点「选择…」）", "warn")
             return
         cmd = [sys.executable, str(ROOT / "apps" / "seed_picker.py"), session]
         self.app.tasks.start(cmd, "点选球心")
