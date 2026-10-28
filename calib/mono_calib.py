@@ -100,6 +100,9 @@ class MonoCalib:
     per_view_rms: tuple[float, ...] = ()
     pose_coverage: dict = field(default_factory=dict)
     views: int = 0
+    #: 被剔除的离群观测（文件名, 该张的 RMS）。**必须写进报告**：
+    #: "剔了几张、为什么"是标定结果的一部分，不能悄悄丢数据。
+    outliers: tuple[tuple[str, float], ...] = ()
     created_at: str = ""
     source_dir: str = ""
 
@@ -138,6 +141,7 @@ class MonoCalib:
             "per_view_rms": list(self.per_view_rms),
             "pose_coverage": dict(self.pose_coverage),
             "views": self.views,
+            "outliers": [{"name": n, "rms_px": r} for n, r in self.outliers],
             "created_at": self.created_at,
             "source_dir": self.source_dir,
             "quality": dict(QUALITY),
@@ -165,6 +169,9 @@ class MonoCalib:
                                if isinstance(x, (int, float))),
             pose_coverage=dict(raw.get("pose_coverage") or {}),
             views=int(raw.get("views") or 0),
+            outliers=tuple((str(o.get("name") or ""), float(o.get("rms_px") or 0.0))
+                           for o in (raw.get("outliers") or [])
+                           if isinstance(o, dict)),
             created_at=str(raw.get("created_at") or ""),
             source_dir=str(raw.get("source_dir") or ""),
         )
@@ -272,10 +279,38 @@ def calibrate_mono(image_paths: Iterable[str | Path], spec: BoardSpec, *,
         objp, imgpoints, image_size,
         CalibConfig(fix_principal_point=fix_principal_point,
                     rational_model=rational_model))
-    K = np.asarray(res["K"], np.float64).reshape(3, 3)
-    D = np.asarray(res["D"], np.float64).ravel()
-    rms = float(res["rms"])
-    per_view = tuple(float(x) for x in np.asarray(res["per_view"]).ravel())
+    def _unpack(r: dict):
+        per = np.asarray(r["per_view"], np.float64).ravel()
+        return (np.asarray(r["K"], np.float64).reshape(3, 3),
+                np.asarray(r["D"], np.float64).ravel(),
+                float(r["rms"]), per)
+
+    K, D, rms, per_view_arr = _unpack(res)
+
+    # ---- 剔除离群观测后重标 ------------------------------------------------
+    # 为什么必须做：RMS 是**所有点一起去平均**，一张 5 px 的坏图（角点检错/
+    # 轻微遮挡）就能把 24 张 0.3 px 的好图拉到 1.1 px，于是整组被判"不可用"。
+    # 实测 2026-10-28：30 张中位数 0.32 px、最差一张 5.24 px，全用 RMS=1.10，
+    # 剔掉 6 张后 RMS=0.271。**这不是放宽门限**（门限仍是 0.5），
+    # 而是先把明显错的观测拿掉再重新求解 —— 标定的标准做法。
+    # 剔除必须**报告**（outliers 字段 + 报告文字），不许悄悄丢数据。
+    outliers: list[tuple[str, float]] = []
+    med = float(np.median(per_view_arr)) if per_view_arr.size else 0.0
+    limit = max(1.0, 4.0 * med)          # 至少 1.0 px 才考虑剔，避免好数据互剔
+    bad_idx = [i for i, r in enumerate(per_view_arr) if r > limit]
+    if bad_idx and (len(imgpoints) - len(bad_idx)) >= need:
+        keep_idx = [i for i in range(len(imgpoints)) if i not in set(bad_idx)]
+        outliers = [(meta[i]["name"], float(per_view_arr[i])) for i in bad_idx]
+        res2 = calibrate_mono_points(
+            objp, [imgpoints[i] for i in keep_idx], image_size,
+            CalibConfig(fix_principal_point=fix_principal_point,
+                        rational_model=rational_model))
+        K, D, rms, per_view_arr = _unpack(res2)
+        meta = [meta[i] for i in keep_idx]
+        kept_paths = [paths[i] for i in keep_idx]
+    else:
+        kept_paths = paths
+    per_view = tuple(float(x) for x in per_view_arr)
 
     if rms > rms_limit:
         raise MonoCalibError(
@@ -308,9 +343,10 @@ def calibrate_mono(image_paths: Iterable[str | Path], spec: BoardSpec, *,
         per_view_rms=per_view,
         pose_coverage={"regions": sorted(regions), "count": len(regions),
                        "total": QUALITY["regions_total"]},
-        views=len(imgpoints),
+        views=len(per_view),
+        outliers=tuple(outliers),
         created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-        source_dir=str(paths[0].parent) if paths else "",
+        source_dir=str(kept_paths[0].parent) if kept_paths else "",
     )
 
 
@@ -363,6 +399,10 @@ def report_text(calib: MonoCalib) -> str:
         f"  畸变 k1={calib.k1:+.4f} k2={calib.k2:+.4f} p1={calib.p1:+.4f} "
         f"p2={calib.p2:+.4f} k3={calib.k3:+.4f}"
         + ("（无畸变，去畸变是空操作）" if not calib.has_distortion else ""),
+        *([f"  已剔除离群观测 {len(calib.outliers)} 张："
+           + "、".join(f"{n}({r:.1f}px)" for n, r in calib.outliers[:4])
+           + (f" 等 {len(calib.outliers)} 张" if len(calib.outliers) > 4 else "")]
+          if calib.outliers else []),
         f"  姿态覆盖 {cov.get('count', '?')}/{cov.get('total', QUALITY['regions_total'])} 个区域"
         f"，板 {calib.board.get('cols', '?')}×{calib.board.get('rows', '?')}"
         f"，方格 {calib.board.get('square_mm', '?')} mm",
