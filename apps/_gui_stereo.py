@@ -105,8 +105,13 @@ class StereoWindow(tk.Toplevel):
                    "也不必在每个姿态都看到同一块板。深度靠原始像素三角测量。")
         box = self.surface.card(parent, "① 装置检查", premise.replace("**", ""))
         self.lbl_rig = self.surface.hint(box, "检查中…")
+        # 相机身份属于 L1，**不许进折叠区**：它是装置的物理身份，不是高级参数。
+        # 旧界面让人手填 left/right，填错就静默用错相机 —— 这里只显示、
+        # 只能通过「换相机…」改（读 config/cameras.json）。
+        self.lbl_cams = self.surface.hint(box, "读取相机…")
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "检查装置", self._check_setup)
+        self.surface.secondary(actions, "换相机…", self._open_cameras)
         self.surface.secondary(actions, "重新读取标定", self._reload_state)
 
     # ------------------------------------------------------------------ #
@@ -257,6 +262,13 @@ class StereoWindow(tk.Toplevel):
         if angle is not None:
             bits.append(f"夹角 {angle:.1f}°")
         self.lbl_rig.configure(text="｜".join(bits))
+        # 相机身份：只读 config/cameras.json，改它只能通过「换相机…」
+        try:
+            self.lbl_cams.configure(
+                text="相机：" + st.camera_role_text("left")
+                     + "｜" + st.camera_role_text("right"))
+        except Exception:                                   # noqa: BLE001
+            self.lbl_cams.configure(text="相机：读取失败（config/cameras.json）")
         if self.lbl_method is not None:
             self._refresh_method_hint()
         self.status.set_status("就绪" if ready else "第 2 步的标定还不匹配本窗口",
@@ -280,6 +292,15 @@ class StereoWindow(tk.Toplevel):
     # ------------------------------------------------------------------ #
     # 动作
     # ------------------------------------------------------------------ #
+    def _open_cameras(self) -> None:
+        """打开相机设备管理（复用 apps/tools/cameras.py，不新写第二个界面）。"""
+        self.app.tasks.start(
+            [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
+             "identify"], "相机设备管理")
+        self.status.set_status(
+            "相机设备管理已启动：逐个索引显示画面，确认哪台是左、哪台是右；"
+            "改完回来点「重新读取标定」刷新显示", "info")
+
     def _check_setup(self) -> None:
         cmd = [sys.executable, str(ROOT / "apps" / "tools" / "check_stereo_setup.py")]
         self.app.tasks.start(cmd, "双目装置检查")

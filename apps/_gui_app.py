@@ -116,6 +116,33 @@ class AppState:
             return None
         return raw if isinstance(raw, dict) else None
 
+    # ---------- 相机角色（唯一来源 config/cameras.json） ----------
+    def camera_roles(self) -> dict:
+        """读 ``config/cameras.json`` 的 roles 表。
+
+        界面**只读**这张表，**不提供手打角色名的输入框** —— 角色是设备的身份，
+        不是用户该记的字符串（旧界面让人填 left/right，填错就静默用错相机）。
+        """
+        path = ROOT / "config" / "cameras.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        roles = raw.get("roles") if isinstance(raw, dict) else None
+        return roles if isinstance(roles, dict) else {}
+
+    def camera_role_text(self, role: str) -> str:
+        """``left`` → ``left = Integrated IR Camera，索引 2``；未固定就直说。"""
+        info = self.camera_roles().get(role)
+        if not isinstance(info, dict):
+            return f"{role}：未固定（启动时自动挑）"
+        bits = [f"{role} = {info.get('name') or '未知型号'}"]
+        if info.get("index") is not None:
+            bits.append(f"索引 {info.get('index')}")
+        if not info.get("verified"):
+            bits.append("未确认")
+        return "，".join(bits)
+
     # ---------- 派生（只读，不写回） ----------
     def stereo_mode(self) -> str | None:
         """标定里记的模式。**唯一来源是标定 meta**，不是任何界面控件。"""
@@ -406,6 +433,8 @@ class HubWindow(tk.Toplevel):
             "这些是跨模式的东西：会话与数据、三维查看、日志。"
             "它们不属于某一种装置，所以放在门厅而不是某个模式窗里。")
         row = self.surface.action_row(box)
+        # 相机设备放第一个：没有相机身份，标定/录制都没有起点，它比"数据管理"更靠前
+        self.surface.secondary(row, "相机设备", self._open_cameras)
         self.surface.secondary(row, "日志与任务", self.app.open_console)
         self.surface.secondary(row, "数据管理", self._open_data_manager)
         self.surface.secondary(row, "3D 查看器", self._open_viewer)
@@ -420,6 +449,22 @@ class HubWindow(tk.Toplevel):
         self._refresh()
         ok, msg = True, "已重新读取装置与标定状态"
         self.status.set_status(msg, "ok" if ok else "warn")
+
+    def _open_cameras(self) -> None:
+        """打开相机设备管理（识别 / 固定 / 标无关）。
+
+        为什么复用 ``apps/tools/cameras.py`` 而不是在新界面里重画一个：
+        它已经处理了"两台各自只在不同的后端下出图"这种真机状态
+        （``probe`` 逐后端×逐编号实测），重画一遍只会分叉。
+        ``identify`` 是交互式的，会自己开 cv2 窗口让人逐个确认。
+        """
+        self.app.tasks.start(
+            [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
+             "identify"],
+            "相机设备管理")
+        self.status.set_status(
+            "相机设备管理已启动：会逐个索引显示画面，确认哪台是左、哪台是右。"
+            "改完回到门厅点「重新读取标定」刷新显示", "info")
 
     def _open_data_manager(self) -> None:
         # 数据管理是独立进程（apps/data_manager.py），不嵌进本进程：

@@ -106,6 +106,8 @@ class MonoWindow(tk.Toplevel):
         # 状态行
         # 状态行走 surface.hint：登记换行 + 由游标分配行号（不写死 row=1）
         self.lbl_calib = self.surface.hint(box, "检查中…")
+        # 相机身份放 L1（同双目窗的道理）：没有它就没法确认用的是哪台
+        self.lbl_cams = self.surface.hint(box, "读取相机…")
 
         # L1：只有板参数（三个必需值）合在一行 —— 它们是一件事（这块板长什么样），
         # 拆成三行会让首屏输入控件数超标，也让"8×5、25 mm"读起来不像一句话。
@@ -127,6 +129,7 @@ class MonoWindow(tk.Toplevel):
         actions = self.surface.action_row(box)
         self.btn_capture = self.surface.primary(actions, "拍标定图",
                                                 self._start_capture)
+        self.surface.secondary(actions, "换相机…", self._open_cameras)
         self.btn_calibrate = self.surface.secondary(actions, "标定内参",
                                                     self._start_calibrate)
         if not MONO_CALIB_APP.exists():
@@ -176,8 +179,22 @@ class MonoWindow(tk.Toplevel):
     # ------------------------------------------------------------------ #
     # 状态
     # ------------------------------------------------------------------ #
+    def _open_cameras(self) -> None:
+        """打开相机设备管理（复用 apps/tools/cameras.py）。"""
+        self.app.tasks.start(
+            [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
+             "identify"], "相机设备管理")
+        self.status.set_status(
+            "相机设备管理已启动：逐个索引确认；单目默认用自动挑的那台，"
+            "要固定成 main 角色请在管理界面里 pin", "info")
+
     def _refresh_state(self) -> None:
         st = self.app.state
+        try:
+            self.lbl_cams.configure(
+                text="相机：" + st.camera_role_text("main"))
+        except Exception:                                   # noqa: BLE001
+            self.lbl_cams.configure(text="相机：读取失败（config/cameras.json）")
         ready, text = st.mono_status()
         clean = text.replace("**", "")
         self.lbl_calib.configure(
