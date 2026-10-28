@@ -79,6 +79,7 @@ from stereo.fov_align import (                              # noqa: E402
 from stereo.stereo_mode import (                             # noqa: E402
     optical_axes_angle_deg, resolve_auto,
 )
+from stereo.record_plan import output_size, plan_record     # noqa: E402
 from sphere_tracker.camera_registry import (                 # noqa: E402
     load_registry,
     resolve_camera_arg,
@@ -480,6 +481,29 @@ def main() -> int:
         print(f"[错误] 找不到标定：{calib_base.with_suffix('.npz')}")
         return 1
 
+    # ---- 开相机之前先判定"这个组合能不能录" ----
+    # 这个判定只依赖标定文件与 --stereo-mode/--width/--height，**不需要相机**。
+    # 放在这里是因为 `_open_pair` 会真的申请两台相机：2026-10-28 用 parallel
+    # 标定按 angled 录，相机白开一次、会话目录白建一个，才在 validate_capture_size
+    # 撞到一行只讲现象不讲出路的报错。判定前移后，代价从"开相机 + 建会话"
+    # 降到"读一个 npz"。
+    # 读失败（文件损坏等）不在这里报：后面的 `_copy_calibration` 与 FOV 分支
+    # 文案更具体，这里抢着报会把它盖掉。
+    try:
+        _pre = plan_record(StereoRig.load(calib_base),
+                           mode_choice=args.stereo_mode,
+                           width=args.width, height=args.height)
+    except Exception:                                       # noqa: BLE001
+        _pre = None
+    if _pre is not None and not _pre.ok:
+        print(f"[错误] {_pre.headline}")
+        for _line in _pre.detail:
+            print(f"       · {_line}")
+        for _i, _fix in enumerate(_pre.fixes, 1):
+            print(f"       {_i}) {_fix}")
+        LOG.error("录制参数不成立，未开相机：%s", _pre.headline)
+        return 2
+
     cams, code = _open_pair(args)
     if code != 0:
         return code
@@ -533,9 +557,9 @@ def main() -> int:
                 print("[FOV] 标定记录里带裁剪/缩放参数，但模式为 angled：忽略它。")
                 LOG.warning("angled 模式忽略标定 meta.fov=%s", fov.to_dict())
             fov = None
-        out_w, out_h = ((int(fov.target_size[0]), int(fov.target_size[1]))
-                        if fov is not None and fov.active
-                        else (int(args.width), int(args.height)))
+        # 写盘尺寸只由 `stereo.record_plan.output_size` 决定：体检与录制必须先
+        # 算出**同一个数**，否则"界面说能录、后端说不能"就是必然的。
+        out_w, out_h = output_size(mode, fov, args.width, args.height)
         # 依据是 **1440p 全尺寸（3.68MP）** 的历史实测（约 24.07fps，242/300 帧）；
         # 现在 FOV 对齐后写盘只有 1718x972（1.67MP，约 45% 像素），30fps 稳定
         # （2026-10-24：301 帧/10.002s）。只有写盘像素数真的很大时才提示。

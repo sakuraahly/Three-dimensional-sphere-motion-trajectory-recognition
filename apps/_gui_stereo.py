@@ -508,6 +508,16 @@ class StereoWindow(tk.Toplevel):
         self._refresh_state()
 
     def _start_record(self) -> None:
+        # 录制仍走 `--stereo-mode auto`（= 按标定），所以不会出现"模式选错"
+        # 那种必然失败；但**标定本身与本窗模式不匹配**时录出来也是白录
+        # （录的是另一套几何，第 4 步必然跑不通）。这里先拦一次，文案与
+        # 第 2 步的状态栏同一来源，不另写一份判据。
+        ready, why = (self.app.state.parallel_status() if self.mode == "parallel"
+                      else self.app.state.angled_status())
+        if not ready:
+            self.status.set_status(
+                f"先解决标定再录：{why.replace('**', '')}", "warn")
+            return
         out = ROOT / "data" / (self.var_label.get().strip() or "stereo_session")
         cmd = [sys.executable, str(ROOT / "apps" / "record_stereo.py"),
                "--left", self.var_left.get().strip() or "left",

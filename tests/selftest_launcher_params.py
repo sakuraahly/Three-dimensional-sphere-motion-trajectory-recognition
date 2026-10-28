@@ -475,6 +475,79 @@ def main() -> int:
     print(f"  [{'通过' if backend_ok else '不达标'}] 录制也读取相机后端（不再只影响标定）")
     results.append(("录制也读取相机后端（不再只影响标定）", backend_ok))
 
+    # ---- 8c. 录制参数体检：模式与标定必须一致 ----
+    #
+    # 2026-10-28 真机：把「双目模式」从 auto 改成 angled，分辨率仍是 2560x1440，
+    # 点录制后得到「标定内参基于 1718x972，当前录制请求 2560x1440」。
+    # 链路没错（angled 忽略 FOV 是有意的），错在**三个独立控件**可以组合成
+    # 一个从定义上不成立的方案，而判定发生在相机已开、会话目录已建之后。
+    #
+    # 这里全部用**合成标定**：判据不能依赖"这台机器恰好标定过"
+    # （B-27 的教训：干净 checkout 上会假红）。
+    print("----- 8c. 录制参数体检：模式与标定必须一致（不能等开相机才发现）-----")
+    from stereo.record_plan import output_size, plan_record
+
+    par_fov = {"reference_side": "left", "crop_side": "right",
+               "crop_rect": [404, 195, 1718, 973], "target_size": [1718, 972],
+               "scale": 0.664875885304807, "method": "sift",
+               "inliers": 296, "quality": 0.512998266897747}
+    par_rig = SimpleNamespace(stereo_mode="parallel", image_size=(1718, 972),
+                              meta={"stereo_mode": "parallel", "fov": par_fov})
+    ang_rig = SimpleNamespace(stereo_mode="angled", image_size=(2560, 1440),
+                              meta={"stereo_mode": "angled"})
+
+    p_auto = plan_record(par_rig, mode_choice="auto", width=2560, height=1440)
+    p_par = plan_record(par_rig, mode_choice="parallel", width=2560, height=1440)
+    p_ang = plan_record(par_rig, mode_choice="angled", width=2560, height=1440)
+    p_1080 = plan_record(par_rig, mode_choice="auto", width=1920, height=1080)
+    p_ang_ok = plan_record(ang_rig, mode_choice="angled", width=2560, height=1440)
+    p_ang_par = plan_record(ang_rig, mode_choice="parallel", width=2560, height=1440)
+    # 尺寸凑对了、但模式错：parallel 标定**没有 FOV**、内参就是 2560x1440，
+    # 所以写盘尺寸与内参完全一致（尺寸判据放行），只有"模式必须一致"这条能拦。
+    # 这才是更坏的情形：录得下来、不报错，但 R/T 用的是平行假设。
+    par_raw = SimpleNamespace(stereo_mode="parallel", image_size=(2560, 1440),
+                              meta={"stereo_mode": "parallel"})
+    p_raw_ang = plan_record(par_raw, mode_choice="angled", width=2560, height=1440)
+    ang_fixes = " ".join(p_ang.fixes)
+
+    checks_plan = [
+        ("parallel + FOV：auto 放行，写盘 = 标定裁剪后的 1718x972",
+         p_auto.ok and p_auto.save_size == (1718, 972)),
+        ("parallel 标定 + angled 模式：**拦下**（这次真机事故的组合）",
+         (not p_ang.ok) and p_ang.mode_conflict),
+        ("拦下时说清了是模式冲突（不是让人以为分辨率没调好）",
+         "parallel" in p_ang.headline and "angled" in p_ang.headline),
+        ("给出了可执行的一步（改回 auto 或去重标），不是只报现象",
+         "auto" in ang_fixes and "重标" in ang_fixes),
+        ("1080 装不下标定裁剪区 [404+1718]：拦下",
+         (not p_1080.ok) and not p_1080.mode_conflict),
+        ("angled 标定 + angled 录：放行（2560x1440 = 内参）",
+         p_ang_ok.ok and p_ang_ok.save_size == (2560, 1440)),
+        ("反向也拦：angled 标定 + parallel 模式",
+         (not p_ang_par.ok) and p_ang_par.mode_conflict),
+        ("尺寸凑对了但模式错也拦（写盘 2560x1440 == 内参，只有模式判据能抓）",
+         (not p_raw_ang.ok) and p_raw_ang.mode_conflict
+         and p_raw_ang.save_size == p_raw_ang.calib_size == (2560, 1440)),
+        ("output_size 是唯一来源：angled 显式忽略 FOV，parallel 用它",
+         output_size("angled", None, 2560, 1440) == (2560, 1440)
+         and output_size("parallel", None, 2560, 1440) == (2560, 1440)),
+        ("record_stereo 用同一个 output_size（不自己再算一份）",
+         "out_w, out_h = output_size(mode, fov" in record_src),
+        ("录制入口在开相机前先体检（否则相机白开、空会话白建）",
+         # 锚点用**调用点**的写法：`_open_pair(args)` 这个串在 `def _open_pair(args)`
+         # 那行也会匹配，拿它比顺序会永远比到函数定义处。
+         "plan_record(StereoRig.load(calib_base)" in record_src
+         and "cams, code = _open_pair(args)" in record_src
+         and record_src.index("plan_record(StereoRig.load(calib_base)")
+         < record_src.index("cams, code = _open_pair(args)")),
+        ("旧窗口录制前会体检，未通过就不启动",
+         "plan = self._record_plan()" in mod_src
+         and "_confirm_record_plan(plan)" in mod_src),
+    ]
+    for label, good in checks_plan:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+        results.append((label, good))
+
     # ---- 8b. 90° 装置标定入口 / 模式标签 / 画质诊断（2026-10-24 加）----
     #
     # 守卫三件界面契约：

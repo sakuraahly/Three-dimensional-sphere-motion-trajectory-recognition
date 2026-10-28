@@ -1679,12 +1679,20 @@ class Launcher(tk.Tk):
     def _after_record_task(self, task: Task) -> None:
         """录制结束 -> 只对新目录自动校验（P2）。"""
         if task.exit_code != 0:
-            self._append(
-                f"[工作台] 录制失败（返回码 {task.exit_code}）。"
-                "可能原因：相机被占用 / 标定分辨率与请求不一致 / 左或右相机没出图。"
-                "下一步：点『第 1 步』的『刷新并检测相机』确认识别，"
-                "或在『装置档案』里改用 90° 模式；详细报错见上方日志。"
-                "（不自动校验旧会话）")
+            # 按退出码分流，不再列一串"可能原因"让人猜：
+            # 2 是**约定好的**"参数/标定不成立"（record_stereo 在开相机前就退），
+            # 这时上面已经打印了结论与 1) 2) 改法，再猜一遍只会盖掉那句话。
+            if task.exit_code == 2:
+                self._append(
+                    "[工作台] 录制被拒绝（返回码 2）：参数或标定不成立，没有开相机。"
+                    "上面第一行 [错误] 就是结论，紧跟的 1) 2) 是可直接照做的改法；"
+                    "改完再点一次录制即可，不用重启。")
+            else:
+                self._append(
+                    f"[工作台] 录制失败（返回码 {task.exit_code}）。"
+                    "常见原因：相机被占用 / 左或右相机没出图 / 无损自检没通过。"
+                    "下一步：点『第 1 步』的『刷新并检测相机』确认识别；"
+                    "详细报错见上方日志。")
             self._wb_refresh()
             return
         from apps._workbench import scan_sessions
@@ -2028,6 +2036,55 @@ class Launcher(tk.Tk):
         ] + ([] if self.calib_backend.get() == "auto"
              else ["--backend", self.calib_backend.get()])
 
+    def _record_plan(self):
+        """录制前体检：读标定 + 当前「双目模式」「分辨率」，回答能不能录。
+
+        返回 `RecordPlan`；读不到标定就返回 ``None``（交给 record_stereo.py 去报，
+        它那句"找不到标定：路径"更具体）。**不碰相机、不写盘**。
+
+        为什么要在这里做：这三个值是三个独立的下拉框，而它们只有很少几种组合
+        成立。以前判定发生在 `record_stereo` 里 —— 相机已经打开、会话目录已经
+        建好之后，用户看到的是一段只讲现象不讲出路的报错（2026-10-28 真机：
+        parallel 标定 + angled 模式，白开一次相机）。
+        """
+        from calib.params import StereoRig
+        from stereo.record_plan import plan_record
+        try:
+            width, height = (int(v) for v in self.calib_res.get().split("x"))
+            rig = StereoRig.load(ROOT / "config" / "stereo_calibration")
+        except Exception:                                   # noqa: BLE001
+            return None
+        return plan_record(rig, mode_choice=self.stereo_mode_var.get(),
+                           width=width, height=height)
+
+    def _confirm_record_plan(self, plan) -> bool:
+        """结论不成立时把话说清；"模式选错"给一键纠正。True = 继续录。
+
+        为什么不只是弹个警告：用户此刻的意图是"我要录"，而多数情况只是
+        模式下拉忘了改回来。让他自己去翻控件，等于把一次点击变成三次点击
+        加一次记忆负担 —— 而这正是"界面不替人做推断"的典型。
+        """
+        if not plan.mode_conflict:
+            # 尺寸/裁剪区这类问题改模式也救不了，只能告诉他改哪里。
+            messagebox.showwarning("这个组合录不了", plan.describe(), parent=self)
+            return False
+        if not messagebox.askyesno(
+                "这个组合录不了",
+                plan.describe() + "\n\n"
+                "现在把「双目模式」改成 auto（= 按标定）并继续录制？\n"
+                "选「否」就什么都不做，你可以先去按 90° 重标定。",
+                parent=self):
+            return False
+        self.stereo_mode_var.set("auto")
+        retry = self._record_plan()
+        if retry is not None and retry.ok:
+            self._append(retry.describe())
+            return True
+        messagebox.showwarning(
+            "改成 auto 还不够", (retry.describe() if retry is not None
+                                 else "读不到标定，无法判断。"), parent=self)
+        return False
+
     def _start_record(self) -> None:
         if self.calib_left.get() == "auto" or self.calib_right.get() == "auto":
             messagebox.showwarning(
@@ -2047,6 +2104,9 @@ class Launcher(tk.Tk):
         label = simpledialog.askstring(
             "录制双目", "标签（可空；会写进 session.json）", initialvalue="", parent=self)
         if label is None:
+            return
+        plan = self._record_plan()
+        if plan is not None and not plan.ok and not self._confirm_record_plan(plan):
             return
         cmd = self._record_args(str(duration), label)
         self._append(f"录制：{duration} 秒；开始后闪一次光，结束前再闪一次。")
