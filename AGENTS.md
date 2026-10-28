@@ -104,7 +104,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
-| **相机 / 标定**（10） | `cameras.py` `list_cameras.py` `camera_quality.py` `capture_board.py` `check_stereo_setup.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` `set_world_frame.py` | 课题主线（含"按空格存棋盘图"的采集工具，供链式/单板标定用；以及"拍一张地面棋盘图定世界系"） |
+| **相机 / 标定**（11） | `cameras.py` `list_cameras.py` `camera_quality.py` `capture_board.py` `check_stereo_setup.py` `check_chain_inputs.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` `set_world_frame.py` | 课题主线（含"按空格存棋盘图"的采集工具，供链式/单板标定用；"**chain 输入自检**：拍完先跑，5 秒查出姿态覆盖不足与参考段板动了"；以及"拍一张地面棋盘图定世界系"） |
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
 | **文档与事实**（5） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` `build_sbom.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落）、生成 / 更新 SBOM |
 | **数据 / 会话**（1） | `check_dataset.py` | 校验录制会话（视频 / 标定 / 同步） |
