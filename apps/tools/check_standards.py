@@ -123,10 +123,8 @@ KNOWN_MENTIONS: dict[str, str] = {
         "§2.5 计划新建：会话工作台",
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/calibrate_mono.py":
         "§3.3 计划新建：单目内参标定入口（--dir）",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:calib/mono_calib.py":
-        "§3.2 计划新建：单目内参标定库",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:tests/selftest_mono_calib.py":
-        "§3.5 计划新建：单目内参回收回归测试",
+    # ---- 2026-10-28：mono_calib 与它的测试**已实现**，豁免删除 ----
+    # 仍属"尚未实现"的只剩 `apps/calibrate_mono.py`（P1b 入口）。
     # ---- 2026-10-28：`_capture.json` **已实现**（P0b），豁免条目随之删除 ----
     # 它原先在这里有一条"§3.1 计划新建"的豁免。`capture_board.write_capture_sidecar`
     # 落地后该豁免变成**死条目**，`selftest_doc_facts` 第 3/4/5 节连锁变红
