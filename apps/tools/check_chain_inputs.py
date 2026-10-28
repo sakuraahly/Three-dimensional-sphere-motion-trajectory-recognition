@@ -30,7 +30,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+# 按**标记**上溯到含 `sphere_tracker/` 的祖先，不数层数：
+# 数层数（parent.parent.parent）在文件被移动、或有人加一层包装目录时会静默指错，
+# 而 `selftest_entrypoints` 对这条是硬的（本项目明确的规矩）。
+ROOT = next(p for p in Path(__file__).resolve().parents
+            if (p / "sphere_tracker").is_dir())
 sys.path.insert(0, str(ROOT))
 
 from calib.board import BoardSpec, detect_board          # noqa: E402
