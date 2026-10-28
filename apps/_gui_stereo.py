@@ -79,6 +79,12 @@ class StereoWindow(tk.Toplevel):
         self.var_label = tk.StringVar(value="")
         self.var_seconds = tk.StringVar(value="10")
 
+        # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
+        # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
+        # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
+        self.status = StatusBar(self, on_log=app.open_console,
+                                on_stop=self._stop_my_tasks)
+        self.status.pack(fill="x", side="bottom")
         page = ScrollPage(self, self.surface)
         page.pack(fill="both", expand=True)
         body = page.content
@@ -86,9 +92,6 @@ class StereoWindow(tk.Toplevel):
         self._build_step2(body)
         self._build_step3(body)
         self._build_step4(body)
-        self.status = StatusBar(self, on_log=app.open_console,
-                                on_stop=self._stop_my_tasks)
-        self.status.pack(fill="x", side="bottom")
         self._refresh_state()
 
     # ------------------------------------------------------------------ #
@@ -101,9 +104,7 @@ class StereoWindow(tk.Toplevel):
                    "大角度双目的前提：两路夹角大（接近直角），不必平行、"
                    "也不必在每个姿态都看到同一块板。深度靠原始像素三角测量。")
         box = self.surface.card(parent, "① 装置检查", premise.replace("**", ""))
-        self.lbl_rig = ttk.Label(box, text="", style="Hint.TLabel")
-        self.lbl_rig.grid(row=1, column=0, columnspan=9, sticky="w",
-                          pady=(2, 8))
+        self.lbl_rig = self.surface.hint(box, "检查中…")
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "检查装置", self._check_setup)
         self.surface.secondary(actions, "重新读取标定", self._reload_state)
@@ -119,9 +120,7 @@ class StereoWindow(tk.Toplevel):
                 "完全看不到同一区域就用单板链式 —— 板固定不动，左右各拍一组，"
                 "再用同一块板把两路串起来。链式产物直接能在第 4 步用。")
         box = self.surface.card(parent, "② 标定", hint)
-        self.lbl_calib = ttk.Label(box, text="", style="Hint.TLabel")
-        self.lbl_calib.grid(row=1, column=0, columnspan=9, sticky="w",
-                            pady=(2, 8))
+        self.lbl_calib = self.surface.hint(box, "检查中…")
 
         # L1：目标对数 + 板参数（一行）
         line = ttk.Frame(box)
@@ -151,9 +150,10 @@ class StereoWindow(tk.Toplevel):
                               values=[v[0] for v in METHODS.values()])
             cb.pack(side="left", padx=(8, 0))
             cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_method_hint())
-            self.lbl_method = ttk.Label(box, text="", style="Hint.TLabel")
-            self.lbl_method.grid(row=self.surface._next_row(box), column=0,
-                                 columnspan=9, sticky="w", pady=(2, 0))
+            # 必须走 surface.hint：手工 ttk.Label 既没有 wraplength、也不在
+            # 换行登记表里，长说明会被 grid 单元格直接裁掉（2026-10-28 截图里
+            # 「…本窗口要的 angled」末尾的 d 就是这么丢的）。
+            self.lbl_method = self.surface.hint(box, "")
         else:
             self.lbl_method = None
             self.surface.hint(

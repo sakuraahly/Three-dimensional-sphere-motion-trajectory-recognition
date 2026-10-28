@@ -79,15 +79,18 @@ class MonoWindow(tk.Toplevel):
         self.var_diameter = tk.StringVar(value="40")
         self.var_focal = tk.StringVar(value="")          # 手动覆盖；空 = 用标定值
 
+        # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
+        # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
+        # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
+        self.status = StatusBar(self, on_log=app.open_console,
+                                on_stop=self._stop_my_tasks)
+        self.status.pack(fill="x", side="bottom")
         page = ScrollPage(self, self.surface)
         page.pack(fill="both", expand=True)
         body = page.content
         self._build_step1(body)
         self._build_step2(body)
         self._build_step3(body)
-        self.status = StatusBar(self, on_log=app.open_console,
-                                on_stop=self._stop_my_tasks)
-        self.status.pack(fill="x", side="bottom")
         self._refresh_state()
 
     # ------------------------------------------------------------------ #
@@ -101,9 +104,8 @@ class MonoWindow(tk.Toplevel):
             "拍图用棋盘：一张 A4 打印的棋盘，在画面里上下左右都摆一摆，"
             "至少 8 个不同姿态（挤在中央会让畸变系数失真）。")
         # 状态行
-        self.lbl_calib = ttk.Label(box, text="", style="Hint.TLabel")
-        self.lbl_calib.grid(row=1, column=0, columnspan=9, sticky="w",
-                            pady=(2, 8))
+        # 状态行走 surface.hint：登记换行 + 由游标分配行号（不写死 row=1）
+        self.lbl_calib = self.surface.hint(box, "检查中…")
 
         # L1：只有板参数（三个必需值）合在一行 —— 它们是一件事（这块板长什么样），
         # 拆成三行会让首屏输入控件数超标，也让"8×5、25 mm"读起来不像一句话。
@@ -156,9 +158,8 @@ class MonoWindow(tk.Toplevel):
         self.surface.hint(box, "手动填 fx 会覆盖标定值 —— 只在你确定相机换过、"
                                "又来不及重标时用。")
 
-        self.lbl_budget = ttk.Label(box, text="", style="Hint.TLabel")
-        self.lbl_budget.grid(row=20, column=0, columnspan=9, sticky="w",
-                             pady=(8, 4))
+        # 误差预算行走游标（原来写死 row=20，加了控件就会撞）
+        self.lbl_budget = self.surface.hint(box, "填一个球直径才能算误差预算")
 
     # ------------------------------------------------------------------ #
     # ③ 开始

@@ -346,13 +346,16 @@ class HubWindow(tk.Toplevel):
         self.surface = Surface(self)
 
         self._build_brand()
+        # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
+        # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
+        # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
+        self.status = StatusBar(self, on_log=app.open_console)
+        self.status.pack(fill="x", side="bottom")
         page = ScrollPage(self, self.surface)
         page.pack(fill="both", expand=True)
         body = page.content
         self._build_mode_cards(body)
         self._build_toolbar(body)
-        self.status = StatusBar(self, on_log=app.open_console)
-        self.status.pack(fill="x", side="bottom")
         self._refresh()
 
     # ---------- 品牌条 ----------
@@ -387,13 +390,14 @@ class HubWindow(tk.Toplevel):
         )
         for key, title, desc, opener in specs:
             box = self.surface.card(parent, title, desc)
-            row_status = ttk.Label(box, text="", style="Hint.TLabel")
-            row_status.grid(row=1, column=0, columnspan=9, sticky="w",
-                            pady=(2, 6))
+            # 状态行用 surface.hint 建：它会把标签登记进换行表，视口变宽时
+            # 一起重排。直接 ttk.Label + 写死 row=1 会与 action_row 撞行，
+            # 也会在窄窗口里被截断（2026-10-28 截图就是这么发现的）。
+            status_lab = self.surface.hint(box, "检查中…")
             actions = self.surface.action_row(box)
             # 每张卡只有一个主按钮：进入。工具类动作统一放下面工具条。
             self.surface.primary(actions, "进入", opener)
-            self._cards[key] = {"status": row_status}
+            self._cards[key] = {"status": status_lab}
 
     # ---------- 工具条 ----------
     def _build_toolbar(self, parent) -> None:

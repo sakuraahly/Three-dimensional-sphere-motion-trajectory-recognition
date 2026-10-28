@@ -125,6 +125,11 @@ class Surface:
             # columnspan 给足：卡片里最多用到第 4 列，多跨几列免得被挤成两行
             lab.grid(row=0, column=0, columnspan=9, sticky="w", pady=(0, 8))
             self._wrapped.append((lab, "card"))
+            # ⚠ 说明占了 row=0，**必须把游标推到 1**，否则第一个 action_row /
+            # param_* 会拿到 row=0 直接压在这段文字上。2026-10-28 截图里
+            # 主按钮确实压住了卡片说明 —— 这是旧界面"文字盖住输入框"的同款 bug，
+            # 换了个方向又犯了一次。所以推进游标这件事写在这里，不靠调用方记得。
+            setattr(box, "_next_row", 1)
         return box
 
     # ---------- 参数行 ----------
