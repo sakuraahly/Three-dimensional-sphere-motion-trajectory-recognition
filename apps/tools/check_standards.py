@@ -108,6 +108,39 @@ KNOWN_MENTIONS: dict[str, str] = {
         "§9.5 反向自证的**注入示例**，举例说明用的假文件名",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:New-Project.ps1":
         "§2.1 在陈述「`STC/scripts/` 里只有 New-Project.ps1」——是在讲仓库外有什么",
+    # ---- 2026-10-27 计划书：**按具体引用豁免**（同理，不整份放过） ----
+    # 这些是本轮「单目主线与 GUI 分窗」计划 §2.5 / §3 / §5 列明要新建的文件，
+    # 目前尚不存在 —— 计划的引用对象是"将要新建"，不是漂移。
+    # ⚠️ 工具自带 vanished 检测：这些文件一旦落盘，本段必须删掉，
+    # 否则就退化成"永久豁免"（2026-10-24 已清过 23 条，别重犯）。
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_task_runner.py":
+        "§2.5 计划新建：任务进程管理（从 Launcher 抽出，零 Tk 依赖）",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_widgets.py":
+        "§2.5 计划新建：卡片/参数行/作用域标签/折叠/状态条",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_app.py":
+        "§2.5 计划新建：App(Tk root) + AppState + 窗口单例表 + 门厅",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_mono.py":
+        "§2.5 计划新建：单目模式窗三步",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_stereo.py":
+        "§2.5 计划新建：双目模式窗四步（mode 参数化）",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_bench.py":
+        "§2.5 计划新建：会话工作台",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_console.py":
+        "§2.5 计划新建：任务表 + 日志",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/calibrate_mono.py":
+        "§3.3 计划新建：单目内参标定入口（--dir）",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:calib/mono_calib.py":
+        "§3.2 计划新建：单目内参标定库",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:tests/selftest_gui_budget.py":
+        "§5.1 计划新建：防止 GUI 再长回去的预算测试",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:tests/selftest_mono_calib.py":
+        "§3.5 计划新建：单目内参回收回归测试",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:_task_runner.py":
+        "§6 P2 同上，派发表里的简写（全称 `apps/_task_runner.py`）",
+    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:_capture.json":
+        "§3.1 计划新建：采集目录边车元数据（每目录自包含），不是仓库里已存在的文件",
+    "docs/待办清单.md:apps/calibrate_mono.py":
+        "B-100 登记的正是「它还没有」这件事本身（同计划 §3.3 计划新建）",
     # ---- 仓库外（`STC/`）：两处都是在**陈述"这个脚本不存在"** ----
     # 2026-10-24 前 `STC/` 引用从不进 problems，这条豁免等于空转；
     # 现在按 `ROOT.parent` 解析后它真的会被判失效，所以必须给出理由。
