@@ -113,30 +113,20 @@ KNOWN_MENTIONS: dict[str, str] = {
     # 目前尚不存在 —— 计划的引用对象是"将要新建"，不是漂移。
     # ⚠️ 工具自带 vanished 检测：这些文件一旦落盘，本段必须删掉，
     # 否则就退化成"永久豁免"（2026-10-24 已清过 23 条，别重犯）。
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_task_runner.py":
-        "§2.5 计划新建：任务进程管理（从 Launcher 抽出，零 Tk 依赖）",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_widgets.py":
-        "§2.5 计划新建：卡片/参数行/作用域标签/折叠/状态条",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_app.py":
-        "§2.5 计划新建：App(Tk root) + AppState + 窗口单例表 + 门厅",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_mono.py":
-        "§2.5 计划新建：单目模式窗三步",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_stereo.py":
-        "§2.5 计划新建：双目模式窗四步（mode 参数化）",
+    # ---- 2026-10-28：下列文件**已实现**，豁免条目随之删除 ----
+    # _task_runner / _gui_widgets / _gui_app / _gui_console / _gui_mono /
+    # _gui_stereo / tests/selftest_gui_budget 全部已落盘，故本段只剩
+    # **尚未实现**的四项（_gui_bench / calibrate_mono / mono_calib /
+    # selftest_mono_calib）。它们一旦落地也必须删掉本段条目，
+    # 否则白名单退化成永久豁免 —— 工具自带的 vanished 检测会当场报红。
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_bench.py":
         "§2.5 计划新建：会话工作台",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_console.py":
-        "§2.5 计划新建：任务表 + 日志",
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/calibrate_mono.py":
         "§3.3 计划新建：单目内参标定入口（--dir）",
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:calib/mono_calib.py":
         "§3.2 计划新建：单目内参标定库",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:tests/selftest_gui_budget.py":
-        "§5.1 计划新建：防止 GUI 再长回去的预算测试",
     "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:tests/selftest_mono_calib.py":
         "§3.5 计划新建：单目内参回收回归测试",
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:_task_runner.py":
-        "§6 P2 同上，派发表里的简写（全称 `apps/_task_runner.py`）",
     # ---- 2026-10-28：`_capture.json` **已实现**（P0b），豁免条目随之删除 ----
     # 它原先在这里有一条"§3.1 计划新建"的豁免。`capture_board.write_capture_sidecar`
     # 落地后该豁免变成**死条目**，`selftest_doc_facts` 第 3/4/5 节连锁变红
