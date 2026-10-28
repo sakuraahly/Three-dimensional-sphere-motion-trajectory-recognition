@@ -164,6 +164,39 @@ def main() -> int:
             stars = [t for t in texts if "**" in t]
             print(f"  未渲染 Markdown = {len(stars)}（必须为 0）")
             results.append((f"{name} 无 Markdown 星号", not stars))
+
+        # ---------- 界面契约（2026-10-28 增，防回退） ----------
+        # 守的是本轮踩过的坑：分窗时把跨模式工具与装置身份弄丢/藏起来，
+        # 用户找不到相机管理、也看不出左右相机是哪台（B-103/B-104/B-106）。
+        print("\n----- 入口与相机身份（防回退） -----")
+        hub_texts = " ".join(collect_texts(app.hub))
+        for label, needle in (("门厅有「相机设备」入口", "相机设备"),
+                              ("门厅有「任务管理器和运行日志」入口",
+                               "任务管理器和运行日志")):
+            ok = needle in hub_texts
+            print(f"  [{'通过' if ok else '不达标'}] {label}")
+            results.append((label, ok))
+
+        for name, win in windows:
+            if name == "console":
+                continue
+            texts = " ".join(collect_texts(win))
+            ok = "相机" in texts
+            print(f"  [{'通过' if ok else '不达标'}] {name} 第①步显示相机身份")
+            results.append((f"{name} 第①步显示相机身份", ok))
+
+        try:
+            from apps._gui_stereo import SessionPicker, scan_sessions
+            rows = scan_sessions()
+            ok_scan = isinstance(rows, list)
+            ok_cls = callable(SessionPicker)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"  会话模块导入失败：{exc}")
+            rows, ok_scan, ok_cls = [], False, False
+        print(f"  [{'通过' if ok_scan else '不达标'}] 会话扫描可用（{len(rows)} 个）")
+        print(f"  [{'通过' if ok_cls else '不达标'}] 会话选择器可导入")
+        results.append(("会话扫描可用", ok_scan))
+        results.append(("会话选择器可导入", ok_cls))
     finally:
         try:
             app.destroy()
