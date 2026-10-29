@@ -35,7 +35,7 @@ from apps._gui_widgets import BG, INK, MUTED, WARN, ScrollPage, StatusBar, Surfa
 from apps._collapsible import CollapsibleSection
 from apps._task_runner import ROOT
 
-__all__ = ["StereoWindow"]
+__all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds"]
 
 CHAIN_ROOT = ROOT / "outputs" / "chain_frames"
 
@@ -94,6 +94,23 @@ def scan_sessions(base: Path | None = None) -> list[dict]:
     return rows
 
 
+def pick_seeds(parent, session_dir: str | Path) -> Path | None:
+    """打开点选球心窗口（复用 ``apps.seed_picker.SeedPicker``），返回保存的路径或 None。
+
+    为什么是进程内而不是 ``tasks.start`` 起子进程：``apps/seed_picker.py`` 只有类、
+    **没有 ``__main__``**，`python apps/seed_picker.py <会话>` 会立刻以 0 退出、
+    什么窗口都不开 —— 这正是"点了没反应"的形状。经典界面也是
+    ``SeedPicker(self, ...) + wait_window``，这里沿用同一做法，不重画第二个点选界面。
+
+    延迟 import：它依赖 numpy/cv2，而第 ①②③④ 步的其它功能不需要。
+    """
+    from apps.seed_picker import SeedPicker
+
+    picker = SeedPicker(parent, str(session_dir))
+    parent.wait_window(picker)
+    return picker.result
+
+
 class SessionPicker(tk.Toplevel):
     """选一段会话：列出磁盘上的会话，按装置模式**三态**标注。
 
@@ -103,34 +120,42 @@ class SessionPicker(tk.Toplevel):
     为什么是三态而不是两态：老会话没有 ``stereo_mode`` 字段。两态（匹配/不匹配）
     会把它们当成 parallel，于是 90° 装置录的会话在平行窗里看起来"可用" ——
     **比不过滤更糟**。所以第三态叫"未记录"，如实标注、让人自己确认。
+
+    ``mode=None`` 表示**跨装置**（会话工作台用）：不按几何过滤、也不标不匹配 ——
+    工作台要处理磁盘上任意一段会话，"只看本窗模式"在那里是错的过滤。
     """
 
     COLS = (("id", "目录", 130), ("label", "标签", 150),
             ("created", "创建时间", 150), ("mode", "模式", 100),
             ("frames", "帧数", 70))
 
-    def __init__(self, parent, *, mode: str, on_pick, current: str = "") -> None:
+    def __init__(self, parent, *, mode: str | None, on_pick,
+                 current: str = "") -> None:
         super().__init__(parent)
         self.mode = mode
         self.on_pick = on_pick
-        self.title("选择会话 · "
-                   + ("平行双目" if mode == "parallel" else "大角度双目"))
+        self.title("选择会话 · " + {
+            "parallel": "平行双目", "angled": "大角度双目",
+        }.get(str(mode), "任意装置"))
         self.geometry("820x560")
         self.minsize(680, 440)
         self.configure(bg=BG)
         self.surface = Surface(self)
-        self.var_all = tk.BooleanVar(value=False)
+        # 跨装置时"显示全部"没有意义：直接置真，也不放那个复选框
+        self.var_all = tk.BooleanVar(value=mode is None)
         self._rows = scan_sessions()
 
         box = self.surface.card(
             self, "会话",
             "这里列出 data/sessions 下的会话。默认只显示与当前窗口同一种装置几何的；"
             "老会话没有记录装置模式，标为「未记录」—— 用之前请自己确认它是哪种装置录的。")
-        ttk.Checkbutton(box, text="显示不属于本窗口模式的会话（标灰，选中时会说明风险）",
-                        variable=self.var_all,
-                        command=self._refresh).grid(
-            row=self.surface._next_row(box), column=0, columnspan=9,
-            sticky="w", pady=(2, 0))
+        if mode is not None:
+            ttk.Checkbutton(
+                box, text="显示不属于本窗口模式的会话（标灰，选中时会说明风险）",
+                variable=self.var_all,
+                command=self._refresh).grid(
+                row=self.surface._next_row(box), column=0, columnspan=9,
+                sticky="w", pady=(2, 0))
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=16, pady=(8, 0))
@@ -164,6 +189,9 @@ class SessionPicker(tk.Toplevel):
 
     # ---------- 三态 ----------
     def _state_of(self, row: dict) -> tuple[str, str]:
+        if self.mode is None:
+            # 跨装置：不存在"不匹配"这回事，三态退回一态
+            return "匹配", ""
         raw = row.get("mode")
         if raw is None or str(raw).strip() == "":
             return "未记录", "这份会话没记录装置模式，用之前请确认是哪套装置录的"
@@ -400,6 +428,8 @@ class StereoWindow(tk.Toplevel):
         row2 = self.surface.action_row(box)
         self.surface.secondary(row2, "点选球心", self._start_seed)
         self.surface.secondary(row2, "打开 3D 查看器", self._open_viewer)
+        # 第 ④ 步只管"当前会话"；要换一段历史会话从中间接着做，去工作台
+        self.surface.secondary(row2, "历史会话…", self._open_bench)
 
     # ------------------------------------------------------------------ #
     # 状态
@@ -566,10 +596,16 @@ class StereoWindow(tk.Toplevel):
         if not session:
             self.status.set_status("先选一个会话（点「选择…」）", "warn")
             return
-        cmd = [sys.executable, str(ROOT / "apps" / "seed_picker.py"), session]
-        self.app.tasks.start(cmd, "点选球心")
-        self.status.set_status("点选球心的窗口会单独打开；点完回到这里跑第 4 步",
-                               "info")
+        saved = pick_seeds(self, session)
+        if saved is None:
+            self.status.set_status("没有保存球心（窗口被关掉或左右没点完）", "warn")
+            return
+        self.status.set_status(
+            f"球心已保存：{Path(saved).name}；现在跑第 ④ 步会用 specular 解算", "ok")
+
+    def _open_bench(self) -> None:
+        """打开会话工作台。带上当前会话，用户接着做 ①–⑤ 而不是再选一遍。"""
+        self.app.open_bench(self.var_session.get().strip() or None)
 
     def _open_viewer(self) -> None:
         """打开 3D 查看器 —— 必须带源：优先当前会话，其次最近一个真有结果的门录。

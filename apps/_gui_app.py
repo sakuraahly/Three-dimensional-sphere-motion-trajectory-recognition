@@ -8,9 +8,12 @@
       ├ HubWindow            门厅：三张模式卡 + 工具条   ← 唯一入口
       ├ MonoWindow           单目：① 内参 ② 球与量程 ③ 开始
       ├ StereoWindow(parallel / angled)  双目：① 装置 ② 标定 ③ 采集 ④ 分析
+      ├ BenchWindow          会话工作台：任意一段会话的 ①–⑤
       └ ConsoleWindow        任务表 + 日志               ← 单例，随时可开
 
 只有两种窗口关系：**门厅 → 模式窗**（关模式窗回门厅）、**任意窗 → 控制台**。
+工作台由"门厅工具条"或"双目窗第 ④ 步的历史会话…"打开，是模式窗的下游：
+它不反过来打开模式窗，也不复制模式窗的状态。
 禁止：模式窗之间互相跳；任何窗口里出现"模式"下拉框（模式 = 你进的哪个窗口）；
 任何一步要求用户"记住一个路径再去另一个窗口粘贴"。
 
@@ -429,6 +432,18 @@ class App(tk.Tk):
         return self.open_window(key, title,
                                 lambda app: StereoWindow(app, mode=mode))
 
+    def open_bench(self, session=None):
+        """打开会话工作台（①–⑤，单例）。
+
+        已开着时**就地换会话**，不再开第二个窗口：工作台的对象是"一段会话"，
+        开两个工作台就变成两份"当前会话"，用户又得猜哪个是真的。
+        """
+        from apps._gui_bench import BenchWindow
+        win = self.open_window("bench", "会话工作台", BenchWindow)
+        if session is not None and hasattr(win, "select_session"):
+            win.select_session(session)
+        return win
+
     # ---------- 退出 ----------
     def close_app(self) -> None:
         running = self.tasks.running()
@@ -533,6 +548,9 @@ class HubWindow(tk.Toplevel):
         self.surface.secondary(row, "任务管理器和运行日志", self.app.open_console)
         self.surface.secondary(row, "数据管理", self._open_data_manager)
         self.surface.secondary(row, "3D 查看器", self._open_viewer)
+        # 工作台在这里出现，是因为它的对象是"任意一段历史会话"，
+        # 不属于某一种装置；当前会话的 ①–⑤ 在双目窗第 ④ 步就地做。
+        self.surface.secondary(row, "会话工作台", self.app.open_bench)
         self.surface.secondary(row, "重新读取标定", self._reload_state)
         # 过渡入口：旧界面还没删完，明确标注并给出它将消失的时间点，
         # 而不是让用户自己猜"两个入口哪个是真的"。
