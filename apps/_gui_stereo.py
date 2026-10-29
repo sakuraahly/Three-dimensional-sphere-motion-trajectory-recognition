@@ -35,7 +35,9 @@ from apps._gui_widgets import BG, INK, MUTED, WARN, ScrollPage, StatusBar, Surfa
 from apps._collapsible import CollapsibleSection
 from apps._task_runner import ROOT
 
-__all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds"]
+__all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
+           "board_args", "chain_dirs", "calibrate_args", "record_args",
+           "record_out_dir"]
 
 CHAIN_ROOT = ROOT / "outputs" / "chain_frames"
 
@@ -49,6 +51,154 @@ METHODS = {
               "板不必被两路同时看到：各拍一组内参图，再用一块固定参考板把两路串起来。"
               "90 度这类几乎看不到同一区域的装置用它。产物就是本窗口要的 angled。"),
 }
+
+
+# --------------------------------------------------------------------------- #
+# 命令行拼装：界面取值 → argv，**不依赖 Tk** 的纯函数
+# --------------------------------------------------------------------------- #
+# 为什么抽成模块级函数（2026-10-29）
+# ----------------------------------
+# 这两段拼装原来内联在 `_start_calibrate` / `_start_record` 里，而
+# `tests/selftest_gui_budget.py` 只守控件数量与文案 —— 也就是说**新窗口真正
+# 干活的那几行没有任何判据看着**："界面上选的板参数有没有正确进到
+# calibrate_stereo 的命令行"，只能靠人眼看一遍。
+# 老窗口（`启动程序.py` 的 `_calibrate_args` / `_record_args`）里同一件事有
+# 7 节判据守着，新窗口却是空的 —— 这才是必须补的缺口。
+# 抽出来的函数不碰 Tk、不读控件，判据才能直接调它；**行为与抽之前逐字等价**，
+# 抽的时候没有顺手"修正"任何默认值。
+BOARD_DEFAULTS = {"cols": "8", "rows": "5", "square": "25", "target": "40"}
+_BOARD_FLAGS = (("cols", "--cols"), ("rows", "--rows"),
+                ("square", "--square"), ("target", "--target"))
+
+
+def board_args(board: dict | None) -> list[str]:
+    """棋盘参数四项（内角点列/行、方格边长、目标对数）。
+
+    留空 = 用脚本自己的默认档（8×5 / 25mm / 40 对），**不是**非法输入：
+    这几个框在界面上本来就带着默认值，用户清空只是"这一次用默认"。
+    真正的坑在另一头 —— "留空也传一个空串"：`--cols ""` 会在标定程序里
+    被 `int()` 直接咬死，而报错的地方离用户的操作十万八千里。
+    """
+    out: list[str] = []
+    for key, flag in _BOARD_FLAGS:
+        raw = str((board or {}).get(key) or "").strip()
+        out += [flag, raw or BOARD_DEFAULTS[key]]
+    return out
+
+
+def chain_dirs(root: Path | None = None) -> dict[str, Path]:
+    """链式标定的四个目录（左右各一组 + 参考段的双路同拍图）。"""
+    base = root if root is not None else CHAIN_ROOT
+    return {"left": base / "left", "right": base / "right",
+            "ref_left": base / "ref_left", "ref_right": base / "ref_right"}
+
+
+def calibrate_args(method: str, board: dict | None = None,
+                   left: str = "left", right: str = "right",
+                   mode: str = "parallel", *,
+                   stationary: str = "", sharpness: str = "",
+                   relaxed: bool = False, backend: str = "",
+                   dirs: dict | None = None) -> list[str]:
+    """双目标定的完整 argv。
+
+    三条分支的差别**只在参数**，不在文案：
+
+    - ``chain``：``--method chain --same-board --left-dir/--right-dir``；
+      参考段真有图时才加 ``--pair-frame``（指向不存在的目录等于给后端一个
+      必然失败的证据，不如不提）。
+    - ``joint_skip_fov``：仍是共同求解，但**模式写死 angled** —— 按重叠视场
+      裁剪正是大角度装置要跳过的那一步。
+    - ``joint``：带**本窗口**的模式（平行窗 parallel / 大角度窗 angled）。
+
+    ``--skip-fov`` 不属于这里任何一条：它只属于旧界面那个"90° 装置"专用入口。
+    新窗口的等效做法是选 `joint_skip_fov`（它走 ``--stereo-mode angled``，
+    后端据此不再做 FOV 对齐），把这个 flag 混进普通 joint 会同时改变裁剪与
+    内参口径，属于静默改行为。
+
+    ``backend`` 只在调用方给出**具体**后端（dshow/msmf）时才下传：
+    ``auto`` 是脚本自己的默认值，替用户写死一遍等于把"没选"伪装成"选了"。
+    **两台相机共用这一个参数** —— 出现两次意味着有人给左右各拼了一份，
+    那会拼出"左 dshow / 右 msmf"这种直接把一路弄挂的组合。
+    """
+    cmd = [sys.executable, str(ROOT / "apps" / "calibrate_stereo.py")]
+    if method == "chain":
+        d = dirs if dirs is not None else chain_dirs()
+        cmd += ["--method", "chain", "--same-board",
+                "--left-dir", str(d["left"]),
+                "--right-dir", str(d["right"])] + board_args(board)
+        # 参考段的双路同拍图作为"同一块板"的证据
+        if Path(d["ref_left"]).exists():
+            cmd += ["--pair-frame", str(d["ref_left"]), "--pair-camera", "left"]
+    else:
+        cmd += ["--method", "joint"] + board_args(board)
+        if method == "joint_skip_fov":
+            cmd += ["--stereo-mode", "angled"]
+        else:
+            cmd += ["--stereo-mode", mode]
+        cmd += ["--left", str(left or "").strip() or "left",
+                "--right", str(right or "").strip() or "right"]
+    # 高级项：只有用户真的填了才下传（空 = 让后端用自己的默认值）
+    if str(stationary or "").strip():
+        cmd += ["--stationary-px", str(stationary).strip()]
+    if str(sharpness or "").strip():
+        cmd += ["--min-sharpness", str(sharpness).strip()]
+    if relaxed:
+        cmd += ["--relaxed"]
+    if str(backend or "").strip() and str(backend).strip() != "auto":
+        cmd += ["--backend", str(backend).strip()]
+
+    # `--min-pairs` **必须传**，否则"试标定档"必然失败（2026-10-29 查出的功能缺口）。
+    #
+    # 链条：`calibrate_stereo` 的 `--min-pairs` 默认 20；而收图一旦达到
+    # 「目标对数」就停（`calib/capture.py:274` `full = count >= cfg.target_pairs`）。
+    # 于是把目标改成 8 的人会看到：收 8 对 → 停 → 8 < 20 → `:278 enough` 判假
+    # → 标定失败。他只想快速验证通路，却被判"对数不足"。
+    #
+    # 旧界面把这个值放在「高级」里可填；新窗口没有这个框，所以在这里兜住：
+    # 取 `min(20, target)` —— target ≥ 20 时与脚本默认**完全一致**（不改变语义），
+    # 只有试标定档才下调到 target 本身（够 target 就能过）。
+    _target = str((board or {}).get("target") or "").strip() or BOARD_DEFAULTS["target"]
+    try:
+        _pairs = int(_target)
+    except ValueError:
+        _pairs = 0
+    if _pairs > 0:
+        cmd += ["--min-pairs", str(min(20, _pairs))]
+    return cmd
+
+
+def record_args(*, left: str = "left", right: str = "right", duration: str = "10",
+                out: str, mode: str | None = None) -> list[str]:
+    """双目录制的 argv。
+
+    **故意不传 ``--stereo-mode``**（B-107 的教训）：录制要按标定走 ``auto``，
+    模式由 `stereo.record_plan.plan_record` 从标定里读。传平行/大角度都可能
+    与当前标定不符 —— 后果是相机先白开、会话目录先建好，然后在检查里才报
+    "模式冲突"，白等一轮；传 ``auto`` 又只是把脚本默认值写死一遍。
+    所以 ``mode`` 只在调用方给出**非 auto** 的显式值时才下传，其余一律不提。
+
+    分辨率/帧率/后端也**不传**：录制程序会按标定校验尺寸（`validate_capture_size`），
+    界面再写一份数字只会多一处漂移。要改这些，先给它们加控件 —— 那时再把
+    对应的关键字参数接上。
+    """
+    cmd = [sys.executable, str(ROOT / "apps" / "record_stereo.py"),
+           "--left", str(left or "").strip() or "left",
+           "--right", str(right or "").strip() or "right",
+           "--duration", str(duration or "").strip() or "10",
+           "--out", str(out)]
+    if mode and str(mode).strip() and str(mode).strip() != "auto":
+        cmd += ["--stereo-mode", str(mode).strip()]
+    return cmd
+
+
+def record_out_dir(label: str, root: Path | None = None) -> Path:
+    """录制输出目录：``data/<标签>``，标签留空用 ``stereo_session``。
+
+    为什么不用 `record_stereo.py --out` 的默认值（``data/sessions``）：那样
+    两段录制会落进同一个目录、互相覆盖。标签即目录名，是这里早就定下的约定。
+    """
+    base = root if root is not None else ROOT
+    return base / "data" / (str(label or "").strip() or "stereo_session")
 
 
 # --------------------------------------------------------------------------- #
@@ -489,8 +639,9 @@ class StereoWindow(tk.Toplevel):
             [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
              "identify"], "相机设备管理")
         self.status.set_status(
-            "相机设备管理已启动：逐个索引显示画面，确认哪台是左、哪台是右；"
-            "改完回来点「重新读取标定」刷新显示", "info")
+            "已打开相机设备管理：每台最多等 30 秒（慢相机实测 ~24 秒），"
+            "日志里会逐台报进度，别关窗口。只想绑左右可直接用 pin（不开相机，秒级）",
+            "info")
 
     def _check_setup(self) -> None:
         cmd = [sys.executable, str(ROOT / "apps" / "tools" / "check_stereo_setup.py")]
@@ -498,47 +649,23 @@ class StereoWindow(tk.Toplevel):
         self.status.set_status("正在检查装置（只报告，不改配置），结果会打到日志",
                                "info")
 
-    def _chain_dirs(self) -> dict[str, Path]:
-        return {"left": CHAIN_ROOT / "left", "right": CHAIN_ROOT / "right",
-                "ref_left": CHAIN_ROOT / "ref_left",
-                "ref_right": CHAIN_ROOT / "ref_right"}
-
     def _start_calibrate(self) -> None:
         method = self._method_key()
-        board = ["--cols", self.var_cols.get().strip() or "8",
-                 "--rows", self.var_rows.get().strip() or "5",
-                 "--square", self.var_square.get().strip() or "25",
-                 "--target", self.var_target.get().strip() or "40"]
-        cmd = [sys.executable, str(ROOT / "apps" / "calibrate_stereo.py")]
+        cmd = calibrate_args(
+            method,
+            {"cols": self.var_cols.get(), "rows": self.var_rows.get(),
+             "square": self.var_square.get(), "target": self.var_target.get()},
+            self.var_left.get(), self.var_right.get(), self.mode,
+            stationary=self.var_stationary.get(),
+            sharpness=self.var_sharpness.get(),
+            relaxed=bool(self.var_relaxed.get()))
         if method == "chain":
-            dirs = self._chain_dirs()
-            cmd += ["--method", "chain", "--same-board",
-                    "--left-dir", str(dirs["left"]),
-                    "--right-dir", str(dirs["right"])] + board
-            # 参考段的双路同拍图作为"同一块板"的证据
-            pair = dirs["ref_left"]
-            if pair.exists():
-                cmd += ["--pair-frame", str(pair), "--pair-camera", "left"]
             self.status.set_status(
                 f"链式标定要四个目录的图：{CHAIN_ROOT.name}\\left、right、"
                 f"ref_left、ref_right。缺图会报缺哪一段", "info")
         else:
-            cmd += ["--method", "joint"] + board
-            if method == "joint_skip_fov":
-                cmd += ["--stereo-mode", "angled"]
-            else:
-                cmd += ["--stereo-mode", self.mode]
-            cmd += ["--left", self.var_left.get().strip() or "left",
-                    "--right", self.var_right.get().strip() or "right"]
             self.status.set_status("正在标定：会打开两个取景窗，板停稳自动存图",
                                    "info")
-        # 高级项：只有用户真的填了才下传（空 = 让后端用自己的默认值）
-        if self.var_stationary.get().strip():
-            cmd += ["--stationary-px", self.var_stationary.get().strip()]
-        if self.var_sharpness.get().strip():
-            cmd += ["--min-sharpness", self.var_sharpness.get().strip()]
-        if self.var_relaxed.get():
-            cmd += ["--relaxed"]
         self.app.tasks.start(cmd, "双目标定", on_done=self._on_calibrated)
 
     def _on_calibrated(self, _task) -> None:
@@ -556,12 +683,9 @@ class StereoWindow(tk.Toplevel):
             self.status.set_status(
                 f"先解决标定再录：{why.replace('**', '')}", "warn")
             return
-        out = ROOT / "data" / (self.var_label.get().strip() or "stereo_session")
-        cmd = [sys.executable, str(ROOT / "apps" / "record_stereo.py"),
-               "--left", self.var_left.get().strip() or "left",
-               "--right", self.var_right.get().strip() or "right",
-               "--duration", self.var_seconds.get().strip() or "10",
-               "--out", str(out)]
+        out = record_out_dir(self.var_label.get())
+        cmd = record_args(left=self.var_left.get(), right=self.var_right.get(),
+                          duration=self.var_seconds.get(), out=str(out))
         self.app.tasks.start(cmd, "双目录制")
         self.status.set_status(f"正在录制 {self.var_seconds.get() or '10'} 秒 → "
                                f"{out.name}；录完用它做第 4 步", "info")
