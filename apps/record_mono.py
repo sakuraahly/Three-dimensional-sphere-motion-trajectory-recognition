@@ -17,7 +17,7 @@
 
 用法::
 
-    python apps/record_mono.py                          # 默认 10 秒到 data/mono_takes/
+    python apps/record_mono.py                          # 默认 10 秒到 data/mono/<时间>/clip.mkv
     python apps/record_mono.py --duration 30 --label 白球_1m
     python apps/record_mono.py --camera main --width 1920 --height 1080 --fps 30
     python apps/record_mono.py --no-preview             # 不看预览（更省 CPU）
@@ -50,7 +50,11 @@ CODECS = {
     "mp4v": ("mp4v", ".mp4", "MP4（有损，体积小、随处可播）"),
 }
 WINDOW = "record_mono"
-DEFAULT_OUT_DIR = ROOT / "data" / "mono_takes"
+# 与 `apps/_gui_mono.py` 的落点**必须一致**：GUI 传的是
+# `data/mono/<时间戳>/clip.mkv`，CLI 不给 --out 时也生成同样形态的目录。
+# 以前这里叫 `data/mono_takes/` 且是平铺文件，于是"CLI 直录"与"GUI 录"
+# 落在两个地方，`data/mono/` 下看不到 CLI 录的东西（2026-10-29 统一）。
+DEFAULT_OUT_DIR = ROOT / "data" / "mono"
 
 
 def _backend_const(name: str) -> int:
@@ -85,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--codec", choices=sorted(CODECS), default="hfyuv",
                     help="编码器（默认 hfyuv 无损）")
     ap.add_argument("--out", default=None,
-                    help=f"输出路径（默认 {DEFAULT_OUT_DIR.relative_to(ROOT)}/<时间>.<扩展名>）")
+                    help=f"输出路径（默认 {DEFAULT_OUT_DIR.relative_to(ROOT)}/<时间>/clip.<扩展名>）")
     ap.add_argument("--label", default="", help="给这段视频起个名字（写进元数据）")
     ap.add_argument("--no-preview", action="store_true", help="不显示预览窗口")
     args = ap.parse_args(argv)
@@ -119,8 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     fps = float(src.info.fps or args.fps)
     print(f"[相机] {src.info.backend}  {w}x{h} @ {fps:.1f} fps")
 
+    # 默认落成"会话目录"形态（与 GUI 一致）：data/mono/<YYYYMMDD-HHMMSS>/clip.<ext>
     out = Path(args.out) if args.out else (
-        DEFAULT_OUT_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}{ext}")
+        DEFAULT_OUT_DIR / time.strftime("%Y%m%d-%H%M%S") / f"clip{ext}")
     if out.suffix.lower() not in (".mkv", ".mp4", ".avi"):
         out = out.with_suffix(ext)                          # 扩展名与编码器对齐
     out.parent.mkdir(parents=True, exist_ok=True)
