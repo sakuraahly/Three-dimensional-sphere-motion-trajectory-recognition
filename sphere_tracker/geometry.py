@@ -362,9 +362,19 @@ class CameraModel:
         cx: float = -1.0,
         cy: float = -1.0,
         hfov_deg: float = 60.0,
-        ball_diameter_m: float = 0.04,
+        ball_diameter_m: float = -1.0,
         distortion: Sequence[float] | None = None,
     ) -> None:
+        # 球径**没有默认值**，必须由调用方显式给出。原因：它曾有三份默认值
+        # （这里 0.04、`AppConfig` 0.04、GUI 40 mm），而单目测深 `Z=f·D/(2r)`
+        # 对它 1:1 敏感 —— 三个数不一致时，同一条视频换个入口跑就换一个答案。
+        # 现在唯一口径是**有效直径**（名义 25 mm 的球 → 21.6 mm，检测器半径
+        # 系统性偏小 13.6%），依据见交接文档 §35.2。传 -1 等于没传，当场报错，
+        # 而不是悄悄用一个谁都记不住的旧默认值。
+        if ball_diameter_m is None or float(ball_diameter_m) <= 0:
+            raise ValueError(
+                "CameraModel 必须显式给出 ball_diameter_m（有效直径：名义 25 mm 的球"
+                " 约 21.6 mm，见交接文档 §35.2）—— 这个参数没有安全的默认值")
         self.width = int(width)
         self.height = int(height)
         self.ball_diameter_m = float(ball_diameter_m)

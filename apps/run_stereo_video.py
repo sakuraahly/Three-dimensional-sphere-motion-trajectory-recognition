@@ -87,7 +87,10 @@ def _make_pipeline(cfg: AppConfig, rig: StereoRig, side: str) -> SpherePipeline:
     pipe.camera = CameraModel(
         width=int(rig.image_size[0]), height=int(rig.image_size[1]),
         fx=float(K[0, 0]), fy=float(K[1, 1]), cx=float(K[0, 2]), cy=float(K[1, 2]),
-        ball_diameter_m=0.04,
+        # 与 `AppConfig.camera.ball_diameter_m` 同口径：有效直径（名义 25 mm 的球
+        # 在 specular 下反推约 21.6 mm，见交接文档 §35.2）。这个分支不参与三角化，
+        # 但两处填不同的数会让"单目读数"随调用路径变，属于最难查的那类漂移。
+        ball_diameter_m=0.0216,
     )
     return pipe
 

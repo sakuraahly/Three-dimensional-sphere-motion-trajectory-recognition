@@ -280,7 +280,12 @@ class CameraConfig:
     cx: float = -1.0                   # -1 表示用图像中心
     cy: float = -1.0
     hfov_deg: float = 60.0             # 水平视场角，用于估算 fx
-    ball_diameter_m: float = 0.04      # 球直径（米），40 mm 约等于乒乓球
+    # 球直径（米）。⚠️ 这里要填**有效直径**，不是卡尺量到的名义值：
+    # 检测器给的像素半径系统性偏小（specular 实测 −13.6%），而单目测深是
+    # `Z = f·D/(2r)` —— D 只有与 r 同口径才自洽。名义 25 mm 的球 → 21.6 mm。
+    # 依据 `apps/tools/mono_vs_stereo.py --truth-diameter-mm 25`（交接文档 §35.2）；
+    # 填名义值会让深度系统性偏大 15.7%（1 m 处 157 mm）。
+    ball_diameter_m: float = 0.0216
     # 畸变系数 (k1, k2, p1, p2, k3)。空 = 没有畸变模型（不标定的旧行为）。
     # 由 `config/mono_calibration.json` 经 `calib.mono_calib.apply_to` 填入。
     distortion: tuple[float, ...] = ()

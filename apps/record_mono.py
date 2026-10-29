@@ -231,7 +231,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("下一步：")
-    print(f"  python apps/run_video.py {out} --ball-diameter 40")
+    # 21.6 是**有效直径**（名义 25 mm，检测器半径偏小 13.6%），别改成 25 —— 见交接文档 §35.2
+    print(f"  python apps/run_video.py {out} --ball-diameter 21.6")
     return 0
 
 
