@@ -370,6 +370,22 @@ def _mono_session_checks() -> list[tuple[str, bool]]:
     src = (repo / "apps" / "_gui_mono.py").read_text(encoding="utf-8")
     ck("单目窗仍提供「本次录制存到」与「历史会话」",
        "本次录制存到" in src and "历史会话" in src)
+
+    # ---- 球径留空时命令行传什么（2026-10-29 增，纯函数、不需要 Tk） ----
+    # 守的坑：三处 ``or "40"`` 让"界面显示 21.6、命令行传 40"成立过。
+    # Z ∝ D，40 对这颗 21.6 的球等于让深度偏大 85%，而界面上看不出来。
+    # 断言的是**函数返回值**（界面与命令行共用同一个入口），
+    # 把兜底改回 "40" 这条立刻红 —— 反向自证见交接文档。
+    from apps._gui_mono import EFFECTIVE_DIAMETER_MM, diameter_arg
+
+    want = f"{EFFECTIVE_DIAMETER_MM:g}"
+    ck("球径留空 → 命令行用有效直径（不是旧默认 40）",
+       diameter_arg("") == want and diameter_arg("40") == "40",
+       f"空→{diameter_arg('')!r}，填 40→{diameter_arg('40')!r}")
+    ck("球径只有空白 → 也退回有效直径",
+       diameter_arg("   ") == want, repr(diameter_arg("   ")))
+    ck("球径填了就用填的（用户的数不被兜底顶掉）",
+       diameter_arg(" 30 ") == "30", repr(diameter_arg(" 30 ")))
     return out
 
 
@@ -454,6 +470,120 @@ def main() -> int:
             ok = "相机" in texts
             print(f"  [{'通过' if ok else '不达标'}] {name} 第①步显示相机身份")
             results.append((f"{name} 第①步显示相机身份", ok))
+
+        # ---------- 单目窗：球径留空时命令行到底传了什么 ----------
+        # 守的坑（2026-10-29）：三处 ``or "40"`` 兜底让"界面显示 21.6、命令行
+        # 传 40"成为可能。Z ∝ D，那等于用户拿着偏大 85% 的深度当测量，
+        # 而界面上一个字都看不出来。
+        # 为什么断言的是**命令行实际拿到什么**、而不是源码里有没有某个字面量：
+        # 后者一改写法（抽函数、换常量）就失效，且抓不到"留空走另一条分支"。
+        # 这一条可以反向自证：把兜底改回 "40"，这里立刻红。
+        from apps._gui_mono import EFFECTIVE_DIAMETER_MM, LEGACY_DIAMETER
+
+        mono = dict(windows)["mono"]
+        captured: list[list[str]] = []
+
+        class _StubTasks:
+            """只收集命令行，不真起进程（否则测试会去开相机）。"""
+
+            def start(self, cmd, *_a, **_k):
+                captured.append(list(cmd))
+
+        real_tasks = mono.app.tasks
+        mono.app.tasks = _StubTasks()
+        try:
+            mono.var_diameter.set("")           # 用户把输入框清空
+            mono._start_realtime()
+        finally:
+            mono.app.tasks = real_tasks
+        got = ""
+        if captured and "--ball-diameter" in captured[0]:
+            cmd = captured[0]
+            got = cmd[cmd.index("--ball-diameter") + 1]
+        try:
+            ok_diam = (got != LEGACY_DIAMETER
+                       and abs(float(got) - EFFECTIVE_DIAMETER_MM) < 1e-9)
+        except ValueError:
+            ok_diam = False
+        print(f"  [{'通过' if ok_diam else '不达标'}] 单目窗球径留空 → "
+              f"命令行 --ball-diameter {got or '(缺失)'}"
+              f"（应为 {EFFECTIVE_DIAMETER_MM:g}，不是旧默认 {LEGACY_DIAMETER}）")
+        results.append(("单目窗球径留空传有效直径", ok_diam))
+
+        # ---------- 单目窗：离线视频传不传 fx、焦距估计传不传球径 ----------
+        # 与上面同源的失效方式：界面里填了、命令行里没有（或反过来）。
+        # 用假的会话目录 + 桩掉 find_clip，避免真去读磁盘、也避免弹文件选择框。
+        import apps._gui_mono as mono_mod
+
+        class _FakeSess:
+            path = Path("outputs/_fake_mono_session")
+
+        real_find = mono_mod.find_clip
+        real_sess = mono._session
+        mono.app.tasks = _StubTasks()
+        try:
+            mono_mod.find_clip = lambda _p: Path("outputs/_fake_mono_session/clip.mkv")
+            mono._session = _FakeSess()
+
+            captured.clear()
+            mono.var_diameter.set("")
+            mono.var_focal.set("1500")
+            mono._start_video()
+            cmd = captured[0] if captured else []
+            ok_fx = ("--focal" in cmd
+                     and cmd[cmd.index("--focal") + 1] == "1500")
+            print(f"  [{'通过' if ok_fx else '不达标'}] 离线视频：fx 填 1500 → "
+                  f"命令里有 --focal 1500（实际 {' '.join(cmd[-6:]) or '(无命令)'}）")
+            results.append(("离线视频传手动 fx", ok_fx))
+
+            captured.clear()
+            mono.var_focal.set("")
+            mono._start_video()
+            cmd = captured[0] if captured else []
+            ok_nofx = "--focal" not in cmd
+            print(f"  [{'通过' if ok_nofx else '不达标'}] 离线视频：fx 留空 → "
+                  f"命令里没有 --focal（实际 {' '.join(cmd[-6:]) or '(无命令)'}）")
+            results.append(("离线视频留空不传 fx", ok_nofx))
+
+            captured.clear()
+            mono.var_focal.set("abc")
+            mono._start_video()
+            cmd = captured[0] if captured else []
+            note = mono.status._label.cget("text")
+            ok_badfx = "--focal" not in cmd and "不是数字" in note
+            print(f"  [{'通过' if ok_badfx else '不达标'}] fx 填非数字 → 不传且状态条提示"
+                  f"（状态条尾部：…{note[-30:]}）")
+            results.append(("fx 非数字不静默", ok_badfx))
+
+            captured.clear()
+            mono.var_focal.set("")
+            mono._start_focal_estimate()
+            cmd = captured[0] if captured else []
+            got_d = (cmd[cmd.index("--ball-diameter") + 1]
+                     if "--ball-diameter" in cmd else "")
+            ok_est = got_d == f"{EFFECTIVE_DIAMETER_MM:g}"
+            print(f"  [{'通过' if ok_est else '不达标'}] 单点焦距估计：留空 → 传 "
+                  f"--ball-diameter {got_d or '(缺失)'}（应为 "
+                  f"{EFFECTIVE_DIAMETER_MM:g}）")
+            results.append(("焦距估计传球径", ok_est))
+
+            # 换了球：框里写 30，命令里就必须是 30（f 与 D 同比例，错一个都白标）
+            captured.clear()
+            mono.var_diameter.set("30")
+            mono._start_focal_estimate()
+            cmd = captured[0] if captured else []
+            got_d30 = (cmd[cmd.index("--ball-diameter") + 1]
+                       if "--ball-diameter" in cmd else "")
+            ok_est30 = got_d30 == "30"
+            print(f"  [{'通过' if ok_est30 else '不达标'}] 单点焦距估计：框里填 30 → "
+                  f"传 --ball-diameter {got_d30 or '(缺失)'}（应为 30）")
+            results.append(("焦距估计用框里的球径", ok_est30))
+        finally:
+            mono_mod.find_clip = real_find
+            mono._session = real_sess
+            mono.var_focal.set("")
+            mono.var_diameter.set("")
+            mono.app.tasks = real_tasks
 
         try:
             from apps._gui_stereo import SessionPicker, scan_sessions

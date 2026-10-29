@@ -7,14 +7,19 @@
 用法::
 
     # 用实时画面：把球放在尺子量好的 1 米处，等检测框稳定后按 s
-    python apps/tools/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.04
+    python apps/tools/calibrate_focal.py --camera 0 --distance 1.0 --ball-diameter 0.0216
 
     # 用一张照片
     python apps/tools/calibrate_focal.py --image assets/images/ball_at_1m.png --distance 1.0
+
+``--ball-diameter`` 要填**有效**直径：本工具解的是 ``f = 2·r_px·Z/D``，而 r_px 来自
+检测器。检测器量的是高光斑、比球轮廓小 13.6%（实测，见 docs/交接文档.md §35.2），
+所以 D 用名义值会让 f **低估** 13.6%，与单目窗填错球径是同一个坑，两处必须一致。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -56,7 +61,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image", default=None)
     p.add_argument("--video", default=None)
     p.add_argument("--distance", type=float, required=True, help="球心到相机的实际距离（米）")
-    p.add_argument("--ball-diameter", type=float, default=0.04, help="球直径（米）")
+    # 默认 0.0216 = 有效直径（名义 25 mm × 0.864），与单目窗默认值同一个来源。
+    # help 里的 %% 是 argparse 的转义：它在渲染前会做一次 % 格式化，
+    # 写成 "13.6%）" 会让 --help 直接抛 ValueError（实测踩过）。
+    p.add_argument("--ball-diameter", type=float, default=0.0216,
+                   help="球直径（米，填「有效」直径；名义 25 mm 的球在 specular "
+                        "下约 21.6 mm，因为高光半径偏小 13.6%%）")
     # 默认值与可选清单都来自插件注册表（2026-10-26）：此前这里硬写 "fusion"，
     # 而真默认是 "color" —— 同一台机器上两个入口的默认行为不同，很难被发现。
     p.add_argument("--method", default=default_detector(), choices=detector_names())
@@ -67,6 +77,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None)
     p.add_argument("--save", default="config/sphere_config.json")
     return p.parse_args()
+
+
+def _write_focal_provenance(path, *, fx: float, radius_px: float,
+                            distance_m: float, ball_diameter_m: float) -> None:
+    """把这次估计的出处写进 json：fx 是按"哪个 D、多远、多少像素半径"解出来的。
+
+    为什么要写：f 与 D 是同一个公式里的两个量（``f = 2·r_px·Z/D``），单看一个
+    fx 数字无法判断它是不是按**另一颗球**算的 —— 换了球却没改 D，fx 会静默错
+    一个比例，而配置里没有任何痕迹。
+
+    写法刻意只加**一个顶层键**：加载端 ``_merge_dataclass`` 会忽略未知字段，
+    所以"带这个键的文件"旧代码照样能读，"没有这个键的旧文件"新代码也照样能读。
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        data["focal_estimate"] = {
+            "fx_px": round(float(fx), 2),
+            "ball_diameter_mm": round(float(ball_diameter_m) * 1000.0, 2),
+            "distance_m": float(distance_m),
+            "radius_px": round(float(radius_px), 3),
+            "note": "单点估计 f = 2·r_px·Z/D；D 是有效直径（高光半径比轮廓小约 13.6%）",
+        }
+        Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                              encoding="utf-8")
+    except (OSError, ValueError):
+        # 写不进去不该让"fx 已经存好了"看起来像失败：provenance 是附加信息
+        pass
 
 
 def main() -> int:
@@ -125,6 +162,9 @@ def main() -> int:
             cfg.camera.cx = frame.shape[1] / 2.0
             cfg.camera.cy = frame.shape[0] / 2.0
             p = save_config(cfg, args.save)
+            _write_focal_provenance(p, fx=cfg.camera.fx, radius_px=med,
+                                    distance_m=args.distance,
+                                    ball_diameter_m=args.ball_diameter)
             print(f"像素半径中位数 {med:.2f} px  ->  fx = {cfg.camera.fx:.1f} px，已保存到 {p}")
     src.release()
     cv2.destroyAllWindows()

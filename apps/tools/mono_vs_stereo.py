@@ -19,8 +19,9 @@
 它不会在统计里表现成"噪声"，只会表现成"整体偏了"。
 
 会话里**没有**记录球直径（`session.json` 只记录相机、标定、同步；
-`run_stereo_video.py` 里那个 ``ball_diameter_m=0.04`` 只是喂给跑不用的单目分支，
-不是实测值）。所以直接填 40 mm 然后得出"单目很准/很不准"，是自欺。
+`run_stereo_video.py` 里那个 ``ball_diameter_m`` 只是喂给用不到的单目分支，
+且它 2026-10-29 起换成有效直径 0.0216，仍然不是"这段录像量的真值"）。
+所以直接填一个界面上现成的数、然后得出"单目很准/很不准"，是自欺。
 
 本工具因此先做**反推**：``D_eff = 2·r·Z_stereo / f``，逐帧算，然后看分布。
 
@@ -44,6 +45,9 @@
     python apps/tools/mono_vs_stereo.py --session data/sessions/20261024-173619 --max-frames 120
     python apps/tools/mono_vs_stereo.py --session <会话> --method specular --diameter 0.0206
                                         # 已知球径时直接给定，跳过反推
+    python apps/tools/mono_vs_stereo.py --session <会话> --truth-diameter-mm 25
+                                        # 卡尺量过真值：追加「名义 vs 有效」一节
+                                        # （k = D_eff/D_true、Z 的系统偏差、两行对照）
 
 退出码：0 = 跑完并出了数；1 = 跑不起来（缺种子/缺视频/检不到球，带原因）。
 """
@@ -80,6 +84,13 @@ _MAX_RADIUS_JUMP = 0.08
 #: 细化射线在给定半径附近的搜索半宽（像素）。只有 30 帧/秒的连续帧用它，
 #: 半径本身逐帧缓慢变化，不需要宽搜索；宽了反而容易抓到背景。
 _REFINE_SEARCH = 3.0
+
+#: 第 4 步的反例球径 = **旧**默认值（2026-10-29 之前界面与 config 用的 40 mm）。
+#: 为什么写死而不是读 ``AppConfig().camera.ball_diameter_m``：那个默认值已经改成
+#: 有效直径 0.0216，跟着它走的话这一节会打印"按默认值猜 ⟹ 0% 偏差"——
+#: 自相矛盾（标题是"D 填错的代价"），§35.2 里"差 80 倍"也就再也复现不出来。
+#: 这一节讲的是**历史代价**，必须固定在历史值上。
+_LEGACY_DEFAULT_D_M = 0.04
 
 
 # --------------------------------------------------------------------------- #
@@ -297,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="直接指定 fx（像素），优先于标定文件")
     ap.add_argument("--diameter", type=float, default=None,
                     help="已知球直径（米）。不给则用 D_eff 反推")
+    ap.add_argument("--truth-diameter-mm", type=float, default=None,
+                    help="球的真实（名义）直径，毫米。给了才追加「名义 vs 有效」一节；"
+                         "不给则输出与本参数加入前逐字节一致")
     ap.add_argument("--bins", type=int, default=3,
                     help="按双目 Z 分几档（默认 3：近/中/远）")
     args = ap.parse_args(argv)
@@ -589,18 +603,18 @@ def main(argv: list[str] | None = None) -> int:
         print("  判断：误差与速度无强相关 —— 当作半径测量的随机噪声看待即可")
     print()
 
-    # ---- 尺度项：拿 config 默认 40 mm 当反例 ----
+    # ---- 尺度项：拿**旧**默认 40 mm 当反例 ----
     print("-" * 78)
     print("第 4 步：尺度项（D 填错的代价）")
     print("-" * 78)
     print("  Z ∝ D 是纯线性：D 偏 x% ⟹ Z 全帧同号偏 x%")
     scale_rel = 0.0
     if not args.diameter:
-        default_d = AppConfig().camera.ball_diameter_m
+        default_d = _LEGACY_DEFAULT_D_M
         ratio = default_d / d_med
         scale_rel = abs(ratio - 1.0)
-        print(f"  若按 AppConfig 默认 D={default_d * 1000:.0f} mm 猜（而这颗球反推是 "
-              f"{d_med * 1000:.1f} mm）")
+        print(f"  若按旧默认 D={default_d * 1000:.0f} mm 猜（2026-10-29 前界面/配置的默认值；"
+              f"这颗球反推是 {d_med * 1000:.1f} mm）")
         print(f"    ⟹ 全部帧的 Z 都乘 {ratio:.3f}，"
               f"即 {scale_rel * 100:.0f}% 的系统偏差 —— "
               f"在 {np.median(z_s):.2f} m 处就是 {scale_rel * np.median(z_s) * 1000:.0f} mm")
@@ -629,7 +643,8 @@ def main(argv: list[str] | None = None) -> int:
     if scale_rel > 0:
         eq_1m_b = scale_rel * 1000.0
         print(f"    绝对尺度全错，等效相对误差 = |D_猜/D_真 − 1| = {scale_rel * 100:.0f}%"
-              f"（按 40 mm 默认值猜这颗 {d_med * 1000:.1f} mm 的球）")
+              f"（按旧默认 {_LEGACY_DEFAULT_D_M * 1000:.0f} mm 猜这颗 "
+              f"{d_med * 1000:.1f} mm 的球）")
         print(f"    ⟹  1 m 处等效 {eq_1m_b:.0f} mm", end="")
         if ratio_1m == ratio_1m:
             print(f"，是双目的 {eq_1m_b / stereo_1m:.0f} 倍")
@@ -658,6 +673,64 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  所以\"单目 {rel_med * z_med * 1000:.1f} mm\"的意思是"
           f"\"和双目差 {rel_med * z_med * 1000:.1f} mm\"，不是\"错这么多\"。")
     print("=" * 78)
+
+    # ---- 名义直径 vs 有效直径（只有给了真值才打） ----
+    # 为什么单独加一节而不是改上面的表：上面所有数字都以"中位 D_eff"为 D，
+    # 那是在回答"半径算法本身多准"；这一节回答的是"填进界面的那个数该填多少"。
+    # 两个问题的答案差 13.6%，混在一张表里必然被读错。
+    if args.truth_diameter_mm and args.truth_diameter_mm > 0:
+        d_true = float(args.truth_diameter_mm) / 1000.0
+        k = d_med / d_true                      # 半径偏差因子：有效/名义
+        z_bias = 1.0 / k - 1.0                  # Z = f·D/(2r)，D 填名义而 r 偏小
+
+        def _z_for(d_m: float) -> np.ndarray:
+            """同第 2 步的口径（含 R1 旋转）算一遍 Z，只为让两行能对上那张表。
+
+            刻意不抽出去复用上面的循环：那个循环还要同时产出 x/y，
+            合并会让"这一节新增、不改既有输出"这个前提变得难以确认。
+            """
+            out = []
+            for o, _s in paired:
+                z = f_eff * (d_m / 2.0) / max(o.r_und, 1e-6)
+                p_raw = cam.backproject(o.u, o.v, z)
+                p_rect = rig.R1 @ p_raw if rig.R1 is not None else p_raw
+                out.append(float(p_rect[2]))
+            return np.array(out)
+
+        stats = {}
+        for tag, d_m in (("名义", d_true), ("有效", d_med)):
+            err = _z_for(d_m) - z_s
+            stats[tag] = (float(np.median(np.abs(err) / np.maximum(z_s, 1e-9))),
+                          float(np.median(err)))
+
+        print("-" * 78)
+        print(f"第 5 步：名义直径 vs 有效直径（真值 D = {d_true * 1000:.1f} mm）")
+        print("-" * 78)
+        print(f"  半径偏差因子 k = D_eff / D_true = {d_med * 1000:.2f} / "
+              f"{d_true * 1000:.1f} = {k:.3f}"
+              f"（实测半径比真实轮廓小 {(1 - k) * 100:.1f}%）")
+        print(f"  直接用名义直径：Z 的系统偏差 (1/k − 1) = {z_bias * 100:+.1f}%"
+              f"（{z_med:.2f} m 处 {z_bias * z_med * 1000:+.0f} mm，"
+              f"1 m 处 {z_bias * 1000:+.0f} mm）")
+        print()
+        print("  " + _pad("情形", 22) + _pad("填的 D(mm)", 12)
+              + _pad("|ΔZ|/Z 中位", 14) + "ΔZ 中位(mm)")
+        for tag in ("名义", "有效"):
+            rel_r, dz_r = stats[tag]
+            d_fill = d_true if tag == "名义" else d_med
+            print("  " + _pad(f"Z 用{tag}直径", 22)
+                  + _pad(f"{d_fill * 1000:.2f}", 12)
+                  + _pad(_pct(rel_r), 14) + f"{dz_r * 1000:+.1f}")
+        print(f"  结论：这台球（名义 {d_true * 1000:.0f} mm）在这套检测器下应填的有效直径"
+              f" ≈ {d_med * 1000:.1f} mm；填名义值会让深度系统性偏大 {z_bias * 100:.1f}%")
+        print("  边界：k 的分子是 vs 双目的反推值，不是 vs 真值的测量 ——")
+        if sigma06 == sigma06:
+            sig_here = sigma06 * (z_med / 0.6) ** 2          # mm，按 σ ∝ Z² 换算
+            print(f"        双目自身的深度 σ ≈ {sigma06:.2f} mm @0.6 m "
+                  f"（在 {z_med:.2f} m 约 {sig_here:.1f} mm，"
+                  f"占 {sig_here / (z_med * 1000) * 100:.1f}%），"
+                  "这是 k 的不确定度主项；13.6% 这个量级不受影响。")
+        print("=" * 78)
     return 0
 
 

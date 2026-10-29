@@ -47,15 +47,77 @@ CALIB_FRAME_DIR = ROOT / "outputs" / "mono_calib_frames"
 # 误差预算的假设（写在界面上，不许藏起来）
 ASSUMED = {"dr_px": 0.2, "dD_mm": 0.2, "df_rel": 0.01}
 
+#: 半径**系统**偏差的实测值（交接文档 §35.2）：specular 的亚像素半径量的是高光斑，
+#: 比球的真实轮廓小，于是反推出的等效直径 21.6 mm 只有名义 25 mm 的 86.4%。
+#: 这里只作**文案与默认值**的来源，绝不乘进 Z —— 把一个可复核的实测偏差
+#: 做成隐式常数，就再也没人看得出 Z 为什么偏了。
+MEASURED_RADIUS_SHRINK = 0.136
+
+#: 这台球的名义（卡尺）直径与**有效**直径。两者的区别是这一整轮的重点：
+#: 名义值描述"球有多大"，有效值描述"这套检测器量出来的球有多大"，
+#: ``Z = f·D/(2r)`` 里的 D 必须是后者，否则公式和测量对象不自洽。
+NOMINAL_DIAMETER_MM = 25.0
+EFFECTIVE_DIAMETER_MM = round(NOMINAL_DIAMETER_MM * (1 - MEASURED_RADIUS_SHRINK), 1)
+
+#: 旧版本的默认球径。窗口关闭时会把输入框无条件写回 prefs，所以磁盘上的这个值
+#: 与"用户真的想要 40"无法区分 —— 迁移只认这一个字面值，且只做一次。
+LEGACY_DIAMETER = "40"
+
+
+def diameter_arg(text: str) -> str:
+    """把"框里的球径（mm）"变成命令行要传的值：空 / 空白 → 有效直径。
+
+    为什么留空要有兜底而不是"不传"：``run_video`` / ``run_realtime`` 的
+    ``--ball-diameter`` 默认是 ``None``，再落到 ``AppConfig.camera`` —— 不传就
+    会拿库默认值算，而界面上显示的又是另一个数（实测踩过：显示 21.6、传 40）。
+    清空输入框是常见动作（改到一半、想重填），所以这里不能让它变成"用别的数"。
+
+    抽成模块级纯函数是为了能被测：界面上"点什么按钮传什么参"只有抓 argv 才看得见。
+    """
+    return (text or "").strip() or f"{EFFECTIVE_DIAMETER_MM:g}"
+
+
+def migrate_legacy_diameter(prefs) -> str:
+    """把旧默认球径一次性迁移成有效直径；返回给状态条的一句话（没迁移则空串）。
+
+    为什么允许改一次"用户存过的值"：``40`` 不是谁的选择，是旧版默认值被
+    ``_save_prefs`` 无条件持久化的结果，而界面上看不出这层来历。不迁移的话，
+    兜底值改成 21.6 等于没改（键一直存在，永远读不到兜底）。
+
+    为什么要有 flag：迁移完以后用户可能**真的**想要 40（比如换了一颗大球）。
+    没有 flag 的话，每次开窗都会把他填的 40 再改回来 —— 那比不迁移更糟。
+    所以"做过迁移决定"这件事本身要落盘，值只在恰好等于旧默认时才动。
+    """
+    if prefs.get_str("mono.diameter_migrated_eff", "") == "1":
+        return ""
+    # flag 先落：即使本次值不是 40（新装的机器、或用户已经自己改过），
+    # 也要记住"这条 profile 已经过了迁移这一关"，否则以后他填 40 又会被改。
+    prefs.set("mono.diameter_migrated_eff", "1")
+    if prefs.get_str("mono.diameter_mm", "").strip() != LEGACY_DIAMETER:
+        prefs.save()
+        return ""
+    new = f"{EFFECTIVE_DIAMETER_MM:g}"
+    prefs.set("mono.diameter_mm", new)
+    prefs.save()
+    return (f"球直径已从旧默认 {LEGACY_DIAMETER} 改为有效直径 {new}"
+            f"（名义 {NOMINAL_DIAMETER_MM:g} mm，高光半径偏小 "
+            f"{MEASURED_RADIUS_SHRINK * 100:.1f}%）；若你确实想用别的值，直接改这一栏")
+
 
 def error_budget(fx: float, diameter_mm: float,
-                 distances_m: tuple[float, ...] = (0.3, 0.6, 1.0)) -> list[tuple[float, float]]:
+                 distances_m: tuple[float, ...] = (0.3, 0.6, 1.0),
+                 radius_bias: float = 0.0) -> list[tuple[float, float]]:
     """每个工作距离上的 Z 误差（mm，RSS 合成）。
 
     ``Z = f·D/(2r)`` 取对数微分：``dZ/Z = df/f + dD/D − dr/r``，
     而 ``r = f·D/(2Z)``，所以三项都能用已知量算出来。
     这是**解析传播**，不是实测噪声 —— 它回答"量级是多少"，
     不回答"这台机器上具体多少"（后者要静置 30 s 量 std(r)）。
+
+    ``radius_bias`` 是半径的**相对系统偏差**（正 = 量大了），默认 0.0，
+    代表"用户填的是有效直径"这一前提成立。为什么要单独给参数：前三项都是
+    随机项，13.6% 的半径偏差是**全帧同号**的系统项，混进 RSS 会低估它
+    （1 m 处随机项合起来才几毫米，系统项是 157 mm）。
     """
     out: list[tuple[float, float]] = []
     for z_m in distances_m:
@@ -65,8 +127,11 @@ def error_budget(fx: float, diameter_mm: float,
             continue
         d_df = z * ASSUMED["df_rel"]                     # 焦距项
         d_dD = z * (ASSUMED["dD_mm"] / diameter_mm)      # 球径项
-        d_dr = z * (ASSUMED["dr_px"] / r)                # 半径噪声项
-        rss = (d_df ** 2 + d_dD ** 2 + d_dr ** 2) ** 0.5
+        d_dr = z * (ASSUMED["dr_px"] / r)                # 半径随机噪声项
+        # 系统项：r_meas = r·(1+b) ⟹ Z 偏 −b/(1+b)，所以分子取 |b| 的分式形式
+        # 而不是直接把 b 当成 Z 的偏差（填 25 实际该填 21.6 时是 +15.7%，不是 13.6%）
+        d_bias = z * (abs(radius_bias) / (1.0 + radius_bias)) if radius_bias else 0.0
+        rss = (d_df ** 2 + d_dD ** 2 + d_dr ** 2 + d_bias ** 2) ** 0.5
         out.append((z_m, rss))
     return out
 
@@ -254,8 +319,13 @@ class MonoWindow(tk.Toplevel):
         self.var_rows = tk.StringVar(value=prefs.get_str("board.rows", "5"))
         self.var_square = tk.StringVar(value=prefs.get_str("board.square_mm", "25"))
         self.var_target = tk.StringVar(value=prefs.get_str("mono.target", "15"))
+        # 兜底值是**有效**直径（21.6），不是卡尺量的 25：标签写的是"有效值"，
+        # 而 ``Z = f·D/(2r)`` 里的 r 来自检测器（系统性偏小 13.6%），
+        # 填名义值会让 Z 全帧偏大 15.7%。旧默认 40 由 migrate 一次性改掉。
+        self._diameter_note = migrate_legacy_diameter(prefs)
         self.var_diameter = tk.StringVar(
-            value=prefs.get_str("mono.diameter_mm", "40"))
+            value=prefs.get_str("mono.diameter_mm",
+                                f"{EFFECTIVE_DIAMETER_MM:g}"))
         self.var_focal = tk.StringVar(
             value=prefs.get_str("mono.focal_override", ""))   # 空 = 用标定值
         self.var_record_secs = tk.StringVar(
@@ -281,9 +351,12 @@ class MonoWindow(tk.Toplevel):
         self._build_step2(body)
         self._build_step3(body)
         self._refresh_state()
-        # 上面那句"给你换了一台"必须最后说：_refresh_state 会把状态条改回"就绪"
-        if self._camera_note:
-            self.status.set_status(self._camera_note, "warn")
+        # 上面那几句必须最后说：_refresh_state 会把状态条改回"就绪"。
+        # 两句都成立时用分号连起来，不让后一句把前一句顶掉 —— 它们都在说
+        # "界面里有个值和你上次看到的不一样"，少一句用户就会以为是自己点错了。
+        _notes = [n for n in (self._camera_note, self._diameter_note) if n]
+        if _notes:
+            self.status.set_status("；".join(_notes), "warn")
 
     # ------------------------------------------------------------------ #
     # ① 内参
@@ -344,6 +417,15 @@ class MonoWindow(tk.Toplevel):
         self.surface.secondary(row2, "打开标定图文件夹", self._open_frames_dir)
         self.btn_estimate = self.surface.secondary(
             row2, "替代：单点焦距估计", self._start_focal_estimate)
+        # 这句话必须写在按钮旁边，不能只放在点下去之后的状态条里：
+        # 用户是在"要不要用这个替代方案"的那一刻需要它。
+        # 旧文案（"球径误差会算进 fx、再正算深度时乘第二次"）是错的 ——
+        # 两处用的是同一个 D，错的是"换了球却不改框里的值"，不是误差叠加。
+        self.surface.hint(
+            box,
+            "替代方案用的是第②步填的球直径：同一颗球、同一个 D，两处同源，"
+            "所以不叠加；但换了球一定要改第②步那一栏，否则 fx 会按旧球径算错"
+            "（f = 2·r·Z/D，D 错多少，fx 就错多少）。")
 
     # ------------------------------------------------------------------ #
     # ② 球与量程
@@ -360,7 +442,9 @@ class MonoWindow(tk.Toplevel):
         row = ttk.Frame(box)
         row.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                  sticky="w", pady=(4, 0))
-        ttk.Label(row, text="球直径 mm").pack(side="left")
+        # 「有效值」三个字必须进标签：这个数不是卡尺量的名义直径，而是"填进去能
+        # 让 Z 对上"的那个数。写成"球直径"会让人直接填 25，然后整体偏大 15.7%。
+        ttk.Label(row, text="球直径（有效值）").pack(side="left")
         ent = ttk.Entry(row, textvariable=self.var_diameter, width=8)
         ent.pack(side="left", padx=(8, 16))
         ent.bind("<KeyRelease>", lambda _e: self._refresh_budget())
@@ -370,9 +454,21 @@ class MonoWindow(tk.Toplevel):
         ent2.bind("<KeyRelease>", lambda _e: self._refresh_budget())
         self.surface.hint(box, "手动填 fx 会覆盖标定值 —— 只在你确定相机换过、"
                                "又来不及重标时用。")
+        # 有效值和名义值的差距是**实测**的（交接文档 §35.2），不是保守估计，
+        # 所以必须摆在输入框正下方，而不是折叠进"高级"里。
+        self.surface.hint(
+            box,
+            f"名义 {NOMINAL_DIAMETER_MM:g} mm 的球在这套检测器下约填 "
+            f"{EFFECTIVE_DIAMETER_MM:g} mm —— 高光半径偏小 "
+            f"{MEASURED_RADIUS_SHRINK * 100:.1f}%，填名义值会让深度偏大 "
+            f"{(1 / (1 - MEASURED_RADIUS_SHRINK) - 1) * 100:.1f}%",
+            style="Warn.TLabel")
 
         # 误差预算行走游标（原来写死 row=20，加了控件就会撞）
         self.lbl_budget = self.surface.hint(box, "填一个球直径才能算误差预算")
+        # 系统偏差单独一行、**永远在**：预算函数没法知道用户填的是名义还是有效值，
+        # 所以不猜，只把这条实测偏差摆在旁边让人自己核对。
+        self.lbl_budget_sys = self.surface.hint(box, "", style="Warn.TLabel")
 
     # ------------------------------------------------------------------ #
     # ③ 录制与识别
@@ -648,6 +744,15 @@ class MonoWindow(tk.Toplevel):
         return float(fx) if isinstance(fx, (int, float)) and fx > 0 else None
 
     def _refresh_budget(self) -> None:
+        # 这一行**先写、且无论球径填没填都在**：预算的随机项（0.2 px / 0.2 mm）
+        # 加起来远小于实测的 13.6% 系统偏差，只打随机项等于骗人。
+        # 界面无法判断框里填的是名义值还是有效值（两个都是合法数字），
+        # 所以不猜，把这条系统项作为固定事实摆在结果旁边。
+        z_bias = 1.0 / (1.0 - MEASURED_RADIUS_SHRINK) - 1.0
+        self.lbl_budget_sys.configure(
+            text=f"半径系统偏差：若填名义直径（不是反推的有效值），额外 +"
+                 f"{MEASURED_RADIUS_SHRINK * 100:.1f}%（Z 上为 +{z_bias * 100:.1f}%，"
+                 f"1 m 处约 {z_bias * 1000:.0f} mm；实测，见交接文档 §35.2）")
         try:
             d = float(self.var_diameter.get().strip() or "0")
         except ValueError:
@@ -828,11 +933,21 @@ class MonoWindow(tk.Toplevel):
         self._refresh_state()
 
     def _start_focal_estimate(self) -> None:
-        cmd = [sys.executable, str(FOCAL_ESTIMATOR)] + self._common_camera_args()
+        """单点焦距估计：**球径必须传框里那个值**，不能让它吃库里的默认值。
+
+        ``calibrate_focal`` 解的是 ``f = 2·r_px·Z/D``。用户在框里填的 D 就是这套
+        检测器的有效直径；这个入口若按别的 D 算（比如库默认），解出来的 f 会
+        直接错一个比例（换球后 30 / 21.6 = 1.39 倍）—— 那不是误差项叠加，
+        是拿错了输入。
+        """
+        cmd = ([sys.executable, str(FOCAL_ESTIMATOR),
+                "--ball-diameter", self._diameter_arg()]
+               + self._common_camera_args())
         self.app.tasks.start(cmd, "单点焦距估计")
         self.status.set_status(
-            "单点焦距估计会打开一个取景窗：把球放在已知距离上点一下。"
-            "注意它把球径误差算进 fx，再正算深度时会乘第二次", "warn")
+            f"单点焦距估计会打开一个取景窗：把球放在已知距离上点一下。"
+            f"它按框里的有效直径 {self._diameter_arg()} mm 解 fx，"
+            "并把这次估计的出处一起写进配置", "warn")
 
     def _open_frames_dir(self) -> None:
         try:
@@ -842,18 +957,45 @@ class MonoWindow(tk.Toplevel):
         except Exception as exc:                        # noqa: BLE001
             self.status.set_status(f"打不开文件夹：{exc}", "warn")
 
+    def _diameter_arg(self) -> str:
+        """框里的球径 → 命令行值（留空退回有效直径，见模块级 ``diameter_arg``）。"""
+        return diameter_arg(self.var_diameter.get())
+
+    def _focal_arg(self) -> tuple[int | None, str]:
+        """(命令行要传的 fx, 给状态条的提示)。
+
+        三种输入分开对待：留空 → 不传（标签就写着"留空用标定值"）；
+        正数 → 传；**填了但不是正数 → 不传，但要说一句**。第三种若也静默，
+        用户"填了 1500"和"什么都没填"在界面上完全一样 —— 与"显示 21.6 却传 40"
+        是同一类静默失效，只是这次失效的是 fx。
+        """
+        raw = self.var_focal.get().strip()
+        if not raw:
+            return None, ""
+        fx = self._current_fx()
+        if fx is None:
+            # 说清"退回去的是哪个数"：只说"仍用标定值"在没标定的机器上等于没说
+            cal = (self.app.state.mono or {}).get("fx")
+            tail = (f"标定值 fx={float(cal):.0f}"
+                    if isinstance(cal, (int, float)) and cal > 0
+                    else "标定值（当前没有标定，会按 60° 视场估）")
+            return None, f"fx 那一栏「{raw}」不是数字，已忽略，仍用{tail}"
+        return int(fx), ""
+
     def _start_realtime(self) -> None:
         cmd = [sys.executable, str(ROOT / "apps" / "run_realtime.py"),
-               "--ball-diameter", self.var_diameter.get().strip() or "40"]
+               "--ball-diameter", self._diameter_arg()]
         cmd += self._common_camera_args()
-        fx = self._current_fx()
-        if fx is not None and self.var_focal.get().strip():
-            cmd += ["--focal", str(int(fx))]            # 只有手动覆盖才传
+        fx, fx_note = self._focal_arg()
+        if fx is not None:
+            cmd += ["--focal", str(fx)]                 # 只有手动覆盖才传
         if MONO_CALIB_JSON.exists():
             cmd += ["--config", str(MONO_CALIB_JSON)]
         self.app.tasks.start(cmd, "实时单目识别")
-        self.status.set_status("已启动实时识别，画面在它自己的窗口里；"
-                               "要停请到「日志与任务」里中断", "info")
+        self.status.set_status(
+            ("已启动实时识别，画面在它自己的窗口里；"
+             "要停请到「日志与任务」里中断" + (f"。注意：{fx_note}" if fx_note else "")),
+            "warn" if fx_note else "info")
 
     def _start_video(self) -> None:
         """离线视频：有当前会话就直接处理它，没有才让用户选文件。
@@ -863,17 +1005,23 @@ class MonoWindow(tk.Toplevel):
         摘要就知道**的事实，而不是靠人记。
         """
         clip = find_clip(self._session.path) if self._session is not None else None
+        fx, fx_note = self._focal_arg()
         if clip is not None:
             derived = clip.parent / "derived"
             cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), str(clip),
-                   "--ball-diameter", self.var_diameter.get().strip() or "40",
+                   "--ball-diameter", self._diameter_arg(),
                    "--out", str(derived / "annotated.mp4"),
                    "--csv", str(derived / "traj.csv")]
+            if fx is not None:
+                # 与「开始实时」同口径：框里填了就传，不许静默不生效。
+                cmd += ["--focal", str(fx)]
             self.app.tasks.start(cmd, f"离线单目：{clip.parent.name}",
                                  on_done=lambda _task: self._on_detected())
             self.status.set_status(
                 f"已启动离线单目：{self._short(clip)}；结果写进 "
-                f"{self._short(derived)}/（跑完摘要会变成「已检测」）", "info")
+                f"{self._short(derived)}/（跑完摘要会变成「已检测」）"
+                + (f"。注意：{fx_note}" if fx_note else ""),
+                "warn" if fx_note else "info")
             return
 
         # 兜底走文件选择框：run_video.py 的 path 是必填位置参数，它自己不会弹
@@ -887,11 +1035,15 @@ class MonoWindow(tk.Toplevel):
             self.status.set_status("没有选视频，已取消", "info")
             return
         cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), path,
-               "--ball-diameter", self.var_diameter.get().strip() or "40"]
+               "--ball-diameter", self._diameter_arg()]
+        if fx is not None:
+            cmd += ["--focal", str(fx)]
         self.app.tasks.start(cmd, f"离线单目：{Path(path).name}")
         self.status.set_status(
             f"已启动离线单目：{Path(path).name}（这个文件不在会话目录里，"
-            f"结果不会写进任何 derived/）", "info")
+            f"结果不会写进任何 derived/）"
+            + (f"。注意：{fx_note}" if fx_note else ""),
+            "warn" if fx_note else "info")
 
     def _on_detected(self) -> None:
         """离线检测结束：重读会话，让摘要在"已录，未检测"和"已检测"之间翻转。"""
