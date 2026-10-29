@@ -103,6 +103,52 @@ def _tool_version() -> str:
     return "unknown"
 
 
+def _camera_identity(want: str | None) -> dict:
+    """把"用哪台相机"翻译成**身份**（纯读 ``config/cameras.json``，不碰设备）。
+
+    为什么非要有（2026-10-29）：边车原来只写 ``"camera": "left"`` —— 那只是**角色名**，
+    不是身份。``config/cameras.json`` 里 ``left`` 指向的设备可以换、可以离线后回退到
+    别的索引，事后拿到 61 张图和一句 "left"，根本查不出是哪台相机拍的。实测同一目录
+    里 fx 在 1268~1457 之间差 15%，却无法归因到设备 —— 就是这条缺口的代价。
+
+    取不到就返回空值，**不抛**：元数据写不全不应该让一趟采集白跑（真正的失败是写不进
+    文件，那由调用方按 OSError 处理）。
+    """
+    out = {"camera_name": "", "camera_identity": "",
+           "camera_port": "", "camera_index": None}
+    text = (want or "").strip()
+    if not text:
+        return out
+    reg = cr.load_registry()
+    spec: cr.RoleSpec | None = None
+    low = text.lower()
+    if text.isdigit():
+        idx = int(text)
+        out["camera_index"] = idx           # 显式索引本身就是采集用的那个号
+        for rs in reg.roles.values():
+            if idx in (rs.capture_index, rs.index):
+                spec = rs
+                break
+    elif low.startswith(("name:", "id:", "port:")):
+        attr, needle = {"name": "name", "id": "identity",
+                        "port": "port"}[low.split(":", 1)[0]]
+        needle = low.split(":", 1)[1].strip()
+        for rs in reg.roles.values():
+            if needle and needle in str(getattr(rs, attr)).lower():
+                spec = rs
+                break
+    else:
+        spec = reg.roles.get(text)          # 角色名
+    if spec is not None:
+        out["camera_name"] = str(spec.name or "")
+        out["camera_identity"] = str(spec.identity or "")
+        out["camera_port"] = str(spec.port or "")
+        # capture_index 是 OpenCV 实际用的号；没验证过才退回 PnP 序号。
+        out["camera_index"] = (spec.capture_index if spec.capture_index is not None
+                               else spec.index)
+    return out
+
+
 def write_capture_sidecar(out_dir: Path, spec: BoardSpec, *, camera: str,
                           width: int, height: int, fps: float,
                           backend: str, count: int) -> Path:
@@ -121,6 +167,9 @@ def write_capture_sidecar(out_dir: Path, spec: BoardSpec, *, camera: str,
         "board": {"cols": spec.cols, "rows": spec.rows,
                   "square_mm": spec.square_mm},
         "camera": camera,
+        # 角色名之外再记**设备身份**（四件套）。原有的 "camera" 键保留不动：
+        # 已经有边车文件与读它的代码按它走，改名等于制造第二份真相。
+        **_camera_identity(camera),
         "width": int(width),
         "height": int(height),
         "fps": float(fps),
