@@ -67,6 +67,8 @@ import numpy as np  # noqa: E402
 from _common import log_environment, setup_logging  # noqa: E402
 from apps._window import DEFAULT_WINDOW_SIZE, WindowManager  # noqa: E402
 from calib.board import BoardObservation, BoardSpec, detect_board  # noqa: E402
+from calib.board_coverage import (  # noqa: E402
+    REF_STILL_PX, REGIONS_TOTAL, coverage_ok, reference_shift, region_of)
 from calib.capture import CaptureConfig, focus_gate  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
 from sphere_tracker.sources import open_source  # noqa: E402
@@ -321,9 +323,108 @@ def _board_metrics(obs: BoardObservation, shape) -> tuple[float, float]:
     return area, edge
 
 
+def capture_stage(objective: str | None, out_dir: Path | None) -> str:
+    """这一段是内参段（``intr``）还是参考段（``ref``）？
+
+    为什么需要分：两段的"进度"是**两个不同的问题** —— 内参段要问"板摆到过
+    画面的哪些角"，参考段要问"板是不是还一动没动"。混成一个数字会互相误导
+    （参考段板不动，覆盖永远是 1/5，看起来像没拍）。
+
+    默认 ``auto`` 从保存目录名推断（链式标定的目录就是 ``ref_left`` /
+    ``ref_right`` 与 ``left`` / ``right``），这样 GUI 那条调用链**不用改**就能
+    得到正确提示；``--stage`` 可显式覆盖，避免有人把参考图存进别的名字。
+    """
+    if objective in ("intr", "ref"):
+        return str(objective)
+    name = (out_dir.name if out_dir is not None else "").lower()
+    return "ref" if "ref" in name else "intr"
+
+
+def lane_progress(stage: str, covered: set[int],
+                  obs: BoardObservation,
+                  ref_base: np.ndarray | None) -> dict:
+    """一路的 HUD 进度：内参段给覆盖集合，参考段给与第一张的位移。纯函数。
+
+    参考段的位移要**用当前帧**算（不是用已存下的上一张）：提示的意义是
+    "你现在手别动"，等保存完再说就已经晚了。基准固定为**第一张已保存的**图 ——
+    相邻两张比会漏掉缓慢单向漂移（每张挪 4 px，四张就漂了 12 px）。
+
+    没检出 / 还没有基准张时返回 ``None`` 值：调用方据此显示占位，
+    而不是把"没法判"画成"0 px，很稳"。
+    """
+    if stage == "ref":
+        if ref_base is None or not obs.found or obs.corners is None:
+            return {"ref_shift": None}
+        shift, _pair = reference_shift([ref_base, obs.corners.reshape(-1, 2)])
+        return {"ref_shift": shift}
+    return {"coverage": (set(covered), REGIONS_TOTAL)}
+
+
+def _paint_progress(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
+                    fs: float, coverage, ref_shift) -> None:
+    """在指标行**上方**再画一行进度：``覆盖 2/5 ▮▮▯▯▯`` 或 ``参考段位移 148 px``。
+
+    为什么单独一行、单独配色：用户拍的时候眼睛只扫两三处。把"这一张合不合格"
+    （绿/橙的原因行）和"整段还差什么"（覆盖/位移）混在一句里，前者会淹没后者 ——
+    今天那次事故就是 15 张全部"合格"，整段却废了。
+
+    颜色语义有意区分：覆盖不够是**橙色**（继续拍还能补，别慌），
+    参考段板在动是**红色 + 明确指令**（这一张已经废了，手必须停下）。
+    """
+    if coverage is None and ref_shift is None:
+        return
+    pad = int(10 * fs)
+    lh = int(24 * fs)
+    top = y0 + h - int(42 * fs) - lh
+    if top < y0:
+        return                                   # 格子太矮（缩到极小的窗口），宁可不画
+    text = ""
+    color = (232, 232, 232)
+    if coverage is not None:
+        got, total = coverage
+        # "够不够"由库里那条判据回答（QUALITY.min_regions），这里不写 4
+        color = (80, 220, 120) if coverage_ok(got) else (60, 180, 255)
+        text = f"覆盖 {len(got)}/{total}"
+    else:
+        if ref_shift is None:
+            text = "参考段：等第一张存下来"
+            color = (200, 200, 200)
+        elif ref_shift > REF_STILL_PX:
+            text = f"参考段位移 {ref_shift:.0f} px  板在动，别挪"
+            color = (70, 70, 245)                # BGR 红：与"合格绿"拉开最大距离
+        else:
+            text = f"参考段位移 {ref_shift:.0f} px  稳"
+            color = (80, 220, 120)
+
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs * 0.78, 1)
+    gap = int(6 * fs)
+    side = int(13 * fs)
+    # 方块宽度先算进来再画底：否则方块落在深色底之外，压在画面亮部就看不见
+    n_box = (coverage[1] if coverage is not None else 0)
+    box_w = n_box * (side + gap) + int(12 * fs) if n_box else 0
+    cv2.rectangle(canvas, (x0, top),
+                  (x0 + tw + int(22 * fs) + box_w, top + lh + pad // 2),
+                  (26, 26, 26), -1)
+    cv2.putText(canvas, text, (x0 + int(10 * fs), top + th + int(4 * fs)),
+                cv2.FONT_HERSHEY_SIMPLEX, fs * 0.78, color, 1, cv2.LINE_AA)
+
+    # 内参段再补 5 个小方块：只给 "2/5" 用户不知道缺哪个角，画出格子才指得动。
+    if coverage is None:
+        return
+    bx = x0 + tw + int(22 * fs)
+    for idx in range(n_box):
+        cx = bx + idx * (side + gap)
+        if cx + side > x0 + w - int(8 * fs):
+            break
+        fill = (80, 220, 120) if idx in coverage[0] else (70, 70, 245)
+        cv2.rectangle(canvas, (cx, top + lh // 2 - side // 2),
+                      (cx + side, top + lh // 2 + side // 2), fill, -1)
+
+
 def _paint_lane(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
                 frame: np.ndarray, spec: BoardSpec, obs: BoardObservation,
-                *, ok: bool, reason: str, title: str) -> None:
+                *, ok: bool, reason: str, title: str,
+                coverage=None, ref_shift=None) -> None:
     """一路画面 + 引导框 + 角点 + 指标，画进画布的 (x0, y0, w, h) 格子里。
 
     **角点与文字都画在画布坐标系里**（先算缩放比再映射）。反过来做（在原图上画、
@@ -373,6 +474,10 @@ def _paint_lane(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
     cv2.putText(canvas, head, (x0 + int(10 * fs), y0 + int(30 * fs)),
                 cv2.FONT_HERSHEY_SIMPLEX, fs, color, thick, cv2.LINE_AA)
 
+    # 3.5) 整段进度（覆盖度 / 参考段位移）：画在指标行上方，压在深色底上，
+    #      与"这一帧合不合格"分开 —— 两件事混一句，后者会被前者淹没。
+    _paint_progress(canvas, x0, y0, w, h, fs, coverage, ref_shift)
+
     area, edge = _board_metrics(obs, frame.shape)
     if np.isfinite(area):
         lo, hi = GUIDE_AREA_RANGE
@@ -406,7 +511,8 @@ def _compose(lanes: list[dict], size: tuple[int, int], footer: str,
         w = cw if i < n - 1 else (W - x0)            # 最后一格吃掉余数，右边缘不留黑缝
         _paint_lane(canvas, x0, 0, w, body, lane["frame"], lane["spec"],
                     lane["obs"], ok=lane["ok"], reason=lane["reason"],
-                    title=lane["title"])
+                    title=lane["title"], coverage=lane.get("coverage"),
+                    ref_shift=lane.get("ref_shift"))
         if i:                                        # 格间分隔线：高对比画面下否则会糊成一片
             cv2.line(canvas, (x0, 0), (x0, body), (90, 90, 90), 1, cv2.LINE_AA)
     # 底部状态栏：进度 + 两路是否"同时"满足 + 按键
@@ -463,6 +569,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--source-right", default=None, help="--both 自测：右路视频源")
     ap.add_argument("--timeout", type=float, default=0.0,
                     help="最多跑多少秒（0=不限；视频源下按秒计时）")
+    ap.add_argument("--stage", choices=["auto", "intr", "ref"], default="auto",
+                    help="这一段拍的是什么：intr=内参（HUD 显示覆盖几个区域）、"
+                         "ref=参考（HUD 显示与第一张的位移）、auto=按保存目录名推断"
+                         "（含 ref 的是参考段，默认）")
     ap.add_argument("--no-show", action="store_true", help="不建窗口（自测/后台）")
     return ap
 
@@ -530,6 +640,12 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     saved: list[Path] = []
     prev_corners: np.ndarray | None = None
     focus_hist: list[float] = []      # 已存帧的 focus（相对判据的基准）
+    # 整段进度（判据来自 calib.board_coverage，这里只攒状态）：
+    #   intr —— 已保存的图覆盖了哪几个区域；
+    #   ref  —— 第一张已保存的角点当基准，之后每帧与它比位移。
+    stage = capture_stage(args.stage, out_dir)
+    covered: set[int] = set()
+    ref_base: np.ndarray | None = None
     stable = 0
     last_save_ts: float | None = None
     last_cat = ""
@@ -567,7 +683,8 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                           f"{src.info.width}x{src.info.height}   {hint}")
                 canvas = _compose(
                     [{"title": f"{args.side or '相机'}", "frame": frame,
-                      "obs": obs, "ok": can, "reason": reason, "spec": spec}],
+                      "obs": obs, "ok": can, "reason": reason, "spec": spec,
+                      **lane_progress(stage, covered, obs, ref_base)}],
                     _canvas_size(VIEW_SINGLE), footer, can)
                 wins.show(VIEW_SINGLE, canvas)
                 pressed = cv2.waitKey(1) & 0xFF
@@ -620,6 +737,14 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                 return 1
             saved.append(path)
             focus_hist.append(float(acc.focus))
+            # 整段进度只在**真正落盘**时更新：被拒的帧没进这批图，不该算"拍到了"。
+            if stage == "ref":
+                if ref_base is None and acc.corners is not None:
+                    ref_base = acc.corners.reshape(-1, 2).copy()   # 第一张当基准
+            elif acc.corners is not None:
+                idx = region_of(acc.corners, gray.shape[:2])
+                if idx >= 0:
+                    covered.add(idx)
             verb = "自动保存" if not manual else "已保存"
             print(f"{verb} {len(saved)}/{args.target}  {name}  "
                   f"（focus {acc.focus:.0f}，原始清晰度 {acc.sharpness:.0f}，位移 {still:.1f} px）")
@@ -682,6 +807,13 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
     prev_r: np.ndarray | None = None
     focus_hist_l: list[float] = []      # 两路各记各的（两路画质可以差很多）
     focus_hist_r: list[float] = []
+    # 整段进度**两路各算各的**：两路的视野与摆位本来就不同，
+    # 把覆盖度合成一个数会掩盖"右路只有 3/5"这种单边短板（今天的实况）。
+    stage = capture_stage(args.stage, out_left)
+    covered_l: set[int] = set()
+    covered_r: set[int] = set()
+    ref_base_l: np.ndarray | None = None
+    ref_base_r: np.ndarray | None = None
     stable = 0
     last_save_ts: float | None = None
     last_cat = ""
@@ -729,9 +861,11 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
                           f"空格 立即存   q 退出   {wins.fullscreen_hint()}")
                 canvas = _compose(
                     [{"title": "左", "frame": fl, "obs": obs_l, "ok": can_l,
-                      "reason": why_l, "spec": spec},
+                      "reason": why_l, "spec": spec,
+                      **lane_progress(stage, covered_l, obs_l, ref_base_l)},
                      {"title": "右", "frame": fr, "obs": obs_r, "ok": can_r,
-                      "reason": why_r, "spec": spec}],
+                      "reason": why_r, "spec": spec,
+                      **lane_progress(stage, covered_r, obs_r, ref_base_r)}],
                     _canvas_size(VIEW_BOTH), footer, both_ok)
                 wins.show(VIEW_BOTH, canvas)
                 pressed = cv2.waitKey(1) & 0xFF
@@ -785,6 +919,21 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
             saved = n
             focus_hist_l.append(float(acc_l.focus))
             focus_hist_r.append(float(acc_r.focus))
+            # 两路进度各自更新（与单路同一套口径，见 capture_stage / lane_progress）
+            if stage == "ref":
+                if ref_base_l is None and acc_l.corners is not None:
+                    ref_base_l = acc_l.corners.reshape(-1, 2).copy()
+                if ref_base_r is None and acc_r.corners is not None:
+                    ref_base_r = acc_r.corners.reshape(-1, 2).copy()
+            else:
+                if acc_l.corners is not None:
+                    idx_l = region_of(acc_l.corners, gl.shape[:2])
+                    if idx_l >= 0:
+                        covered_l.add(idx_l)
+                if acc_r.corners is not None:
+                    idx_r = region_of(acc_r.corners, gr.shape[:2])
+                    if idx_r >= 0:
+                        covered_r.add(idx_r)
             print(f"已存第 {n} 对（左 {n} / 右 {n}）  {name}  "
                   f"（focus 左 {acc_l.focus:.0f} / 右 {acc_r.focus:.0f}；"
                   f"原始清晰度 {acc_l.sharpness:.0f} / {acc_r.sharpness:.0f}）")

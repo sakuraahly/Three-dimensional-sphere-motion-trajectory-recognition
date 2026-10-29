@@ -38,13 +38,31 @@ ROOT = next(p for p in Path(__file__).resolve().parents
 sys.path.insert(0, str(ROOT))
 
 from calib.board import BoardSpec, detect_board          # noqa: E402
-from calib.mono_calib import QUALITY, _region_index      # noqa: E402
+from calib.board_coverage import (                        # noqa: E402
+    REF_STILL_PX, coverage_regions, reference_shift)
+from calib.mono_calib import QUALITY                      # noqa: E402
 
-#: 参考段"板没动"的判据：同一角点在不同张之间的最大位移（像素）。
-#: 实测：板不动时 < 2 px（亚像素抖动）；板挪 11° 时几十上百 px。
-REF_STILL_PX = 5.0
-#: 内参段每路至少几张（与 calibrate_stereo 的 chain 门槛一致）
-MIN_VIEWS_PER_SIDE = 15
+# `REF_STILL_PX` 与两条判据本身都住在 `calib/board_coverage.py` ——
+# 采集窗口的 HUD 直接调同一份，这里不再定义任何数字。
+# 本文件只保留"打印成给人看的话"这件事。
+
+#: chain 的**硬门槛**：`apps/calibrate_stereo.py` 的 `_run_chain` 只在
+#: `len(c_left) < 3 or len(c_right) < 3` 时拒绝。少于这个数**标定跑不了**，
+#: 所以本工具也按 3 判"不能跑"。
+MIN_VIEWS_HARD = 3
+#: **建议**张数，不是门槛：少于它标定仍然能跑，但内参精度会差 ——
+#: 而 chain 的外参完全押在内参上（`T_AB = I`，外参误差 ≈ 内参误差 × 基线），
+#: 所以少了要**警告**，不是拒绝。
+#:
+#: 原来这里写的是 `MIN_VIEWS_PER_SIDE = 15`，注释还写"与 calibrate_stereo 的
+#: chain 门槛一致"——**不准确**：那边代码里的门槛是 3，15 只是提示文案里的建议。
+#: 同一个概念项目里有三个数，别搞混：
+#:   3  = chain 硬门槛（本文件 `MIN_VIEWS_HARD`）
+#:   8  = `calib/mono_calib.QUALITY["min_views"]`，单目标定用
+#:   15 = 建议张数（本文件 `MIN_VIEWS_ADVICE`）
+#: 混用后果很具体：拍了 12 张、覆盖 5/5 的用户会被本工具判"不能跑"，
+#: 而标定其实能跑 —— 于是白补拍一轮。
+MIN_VIEWS_ADVICE = 15
 #: 内参段建议的倾斜：只用角点外接框的"短边/长边"比粗略判断有没有斜
 #: （不做 PnP，因为这里还没有内参可依赖）
 
@@ -69,10 +87,15 @@ def check_intrinsics(d: Path, spec: BoardSpec, side: str) -> tuple[list[str], bo
     if not d.is_dir():
         return [f"{side}：目录不存在 {d}"], False
     files = sorted(list(d.glob("*.png")) + list(d.glob("*.jpg")))
-    if len(files) < MIN_VIEWS_PER_SIDE:
-        problems.append(f"{side}：只有 {len(files)} 张，至少 {MIN_VIEWS_PER_SIDE} 张")
+    if len(files) < MIN_VIEWS_HARD:
+        problems.append(f"{side}：只有 {len(files)} 张，chain 标定至少要 "
+                        f"{MIN_VIEWS_HARD} 张")
+    elif len(files) < MIN_VIEWS_ADVICE:
+        # 能跑，但要让人知道代价：内参误差会原样乘进基线（外参 T_AB = I）
+        print(f"  [警告] {side}：只有 {len(files)} 张（建议 ≥{MIN_VIEWS_ADVICE}）"
+              f"—— 标定能跑，但内参误差会乘进基线")
 
-    regions: dict[int, int] = {}
+    views: list[tuple] = []
     bad: list[str] = []
     areas: list[float] = []
     for p in files:
@@ -80,22 +103,19 @@ def check_intrinsics(d: Path, spec: BoardSpec, side: str) -> tuple[list[str], bo
         if obs is None:
             bad.append(f"{p.name}（{why}）")
             continue
-        c = obs.corners.reshape(-1, 2)
-        cx, cy = float(c[:, 0].mean()), float(c[:, 1].mean())
-        idx = _region_index(cx, cy, shape[1], shape[0])
-        if idx >= 0:
-            regions[idx] = regions.get(idx, 0) + 1
+        views.append((obs.corners.reshape(-1, 2), shape))
         areas.append(obs.area_ratio)
         if obs.area_ratio < QUALITY["min_area_ratio"]:
             bad.append(f"{p.name}（板太小 {obs.area_ratio:.1%}）")
 
+    covered, total = coverage_regions(views)
     n_ok = len(files) - len(bad)
-    print(f"  {side}: {len(files)} 张，可用 {n_ok}，覆盖 {len(regions)}/5 个区域 "
-          f"{sorted(regions)}，板占画面 {min(areas):.1%}~{max(areas):.1%}"
+    print(f"  {side}: {len(files)} 张，可用 {n_ok}，覆盖 {len(covered)}/{total} 个区域 "
+          f"{sorted(covered)}，板占画面 {min(areas):.1%}~{max(areas):.1%}"
           if areas else f"  {side}: {len(files)} 张，全部不可用")
-    if len(regions) < QUALITY["min_regions"]:
+    if len(covered) < QUALITY["min_regions"]:
         problems.append(
-            f"{side}：姿态只覆盖 {len(regions)}/5 个区域（至少 {QUALITY['min_regions']}）"
+            f"{side}：姿态只覆盖 {len(covered)}/{total} 个区域（至少 {QUALITY['min_regions']}）"
             f" —— 板要摆到画面四角与中央，不能一直放中间")
     if bad:
         problems.append(f"{side}：{len(bad)} 张不可用：" + "、".join(bad[:4])
@@ -121,8 +141,7 @@ def check_reference(d: Path, spec: BoardSpec, side: str) -> tuple[list[str], boo
     if len(corners) < 2:
         problems.append(f"{side}：可用参考图只有 {len(corners)} 张（至少 2 张）")
         return problems, False
-    base = corners[0]
-    spread = max(float(np.abs(c - base).max()) for c in corners[1:])
+    spread, _worst = reference_shift(corners)
     print(f"  {side}: {len(corners)} 张，角点最大位移 {spread:.1f} px "
           f"（门限 {REF_STILL_PX:.0f}）")
     if spread > REF_STILL_PX:

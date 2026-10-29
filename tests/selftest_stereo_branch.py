@@ -473,6 +473,47 @@ def T_of(tx: float) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+def test_angled_self_tests() -> bool:
+    """90° 链路的三个模块**自带**自测，但一直只在 `__main__` 里跑。
+
+    `stereo/angled.py` / `stereo/angled_geometry.py` / `calib/angled_quality.py`
+    各有一个 `_self_test()`：造 90° 装置（`R` = 绕 Y 转 90°、`T=(0.4,0,0)`）、
+    把三个真值点投影到两路、故意塞一个"极线外的干扰点"、断言选对候选，
+    且 3D 误差 < 1e-6 m、极线距离 < 1e-9 px、重投影残差 < 1e-6 px。
+
+    它们写得比这里能补的任何东西都细（连 `distance_m`、`radius_left`、`t`
+    是否原样拷贝都验），所以**不重写**，只把它们接进回归防线 ——
+    在此之前 `run_tests.py` 从不执行它们，等于"验证存在、但没人跑"。
+
+    边界要说清：这条只验**几何**（真值投影 -> 匹配 -> 三角测量）。
+    "渲染 + 检测"那一环由本文件的 parallel 场景覆盖（检测器是同一套代码，
+    装置不同不影响它），所以 angled 没有单独的渲染测试 —— 这是有意省略，
+    不是忘了。真机 90° 一轮仍然是 `B-08`（要相机）。
+    """
+    print("----- 90° 三模块的自带自测（几何：真值投影 -> 匹配 -> 三角） -----")
+    import contextlib
+    import importlib
+    import io
+
+    ok = True
+    for name in ("stereo.angled", "stereo.angled_geometry", "calib.angled_quality"):
+        mod = importlib.import_module(name)
+        buf = io.StringIO()
+        try:
+            # 吞掉它们自己的 PASS 行（每模块十几行），失败时再把尾部打出来
+            with contextlib.redirect_stdout(buf):
+                mod._self_test()                       # noqa: SLF001 —— 它就是这个模块的验证入口
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  [不达标] {name}._self_test 抛出 {type(exc).__name__}: {exc}")
+            for line in buf.getvalue().splitlines()[-3:]:
+                print(f"           {line}")
+            ok = False
+            continue
+        n = len([ln for ln in buf.getvalue().splitlines() if ln.strip()])
+        print(f"  [通过] {name}._self_test（{n} 条断言全过）")
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目链路端到端自测（合成真值）")
     ap.add_argument("--scenario", default="all", choices=["clean", "realistic", "all"])
@@ -487,6 +528,9 @@ def main() -> int:
     print()
 
     sign_ok = test_baseline_sign()
+    print()
+
+    angled_ok = test_angled_self_tests()
     print()
 
     scenarios = ["clean", "realistic"] if args.scenario == "all" else [args.scenario]
@@ -547,8 +591,9 @@ def main() -> int:
               f"（{'>' if gain > 1.5 else '≤'} 1.5，说明同步{'确实必要' if gain > 1.5 else '影响有限'}）")
         print()
 
-    print("判定结果：" + ("全部通过" if (ok and sign_ok) else "有不达标项"))
-    return 0 if (ok and sign_ok) else 1
+    all_ok = ok and sign_ok and angled_ok
+    print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
