@@ -71,6 +71,11 @@ APPS = (
     # 于是它既不能全屏、窗口也拖不动（AUTOSIZE + 固定 2560x720 拼图）。
     # 用户的原话是"所有程序的视频显示窗口都要有全屏模式"—— 这就是漏掉的那个。
     "apps/tools/capture_board.py",
+    # 2026-10-29 补：单目录制的预览窗**从来没进过这张表**，于是它用了一个
+    # 早就不成立的签名 `wins.ensure(WINDOW)`（签名是 `ensure(name, image)`）——
+    # 真机表现是"倒计时走完、开录那一刻"抛 TypeError，10 秒白等。
+    # 顺带它也因此一直没有全屏（直接 imshow）。
+    "apps/record_mono.py",
 )
 # 这些程序里 `f` 已经被别的功能占用，全屏只能留给 F11。
 # **抢掉别人已用的键比没有全屏更糟** —— 那是把一个既有功能弄坏。
@@ -176,6 +181,32 @@ def main() -> int:
                 stragglers.append(f"{rel}:{i + 1}")
     print(f"  直接 cv2.imshow(...) 的位置：{stragglers or '无'}")
     ck("没有绕开助手的 cv2.imshow（否则那个窗口没全屏）", not stragglers)
+
+    # ---- 7. 调用签名：ensure/show 必须给 image ----
+    #
+    # 为什么要按 AST 数参数（2026-10-29 真机）：`record_mono` 写的是
+    # `wins.ensure(WINDOW)`，而签名是 `ensure(name, image)`。后果不是"窗口不好看"，
+    # 是**倒计时结束、开录那一刻 TypeError**，10 秒录像白等一场。
+    # `py_compile` 查不出（语法合法）、`gui_budget` 不扫它、而这个文件当时
+    # 根本不在 APPS 里 —— 三条防线一条都没拦住。
+    # 用 AST 而不是 grep：跨行调用、关键字参数都能正确计数。
+    import ast
+    print("----- 7. 窗口助手的调用签名（ensure / show 必须带 image）-----")
+    bad_calls: list[str] = []
+    for rel in APPS:
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("ensure", "show")
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "wins"):
+                if len(node.args) != 2:
+                    bad_calls.append(
+                        f"{rel}:{node.lineno} 调 .{node.func.attr}() 只给了 "
+                        f"{len(node.args)} 个位置参数")
+    print(f"  参数个数不对的调用：{bad_calls or '无'}")
+    ck("ensure / show 都带 image（否则真机跑到那一步才 TypeError）", not bad_calls)
 
     # ---- 6. 版式：画布尺寸必须跟着窗口走（窗口 / 全屏两种尺寸都验）----
     #

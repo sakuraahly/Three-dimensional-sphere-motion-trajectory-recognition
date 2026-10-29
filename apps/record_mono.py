@@ -155,9 +155,11 @@ def main(argv: list[str] | None = None) -> int:
             left = t_end - time.monotonic()
             cv2.putText(frame, f"starting in {left:.1f}s", (24, 48),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
-            wins.ensure(WINDOW)
-            cv2.imshow(WINDOW, frame)
-            if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
+            wins.show(WINDOW, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if wins.handle_key(WINDOW, key, frame):
+                continue
+            if key in (ord("q"), 27):
                 print("[取消] 倒计时里退出")
                 writer.release()
                 src.release()
@@ -185,9 +187,11 @@ def main(argv: list[str] | None = None) -> int:
                 el = time.monotonic() - t0
                 cv2.putText(shown, f"REC  {frames} f  {el:.1f}s", (24, 48),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-                wins.ensure(WINDOW)
-                cv2.imshow(WINDOW, shown)
-                if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
+                wins.show(WINDOW, shown)
+                key = cv2.waitKey(1) & 0xFF
+                if wins.handle_key(WINDOW, key, shown):
+                    continue
+                if key in (ord("q"), 27):
                     print("[录制] 用户停止")
                     break
             if stop_at is not None and time.monotonic() >= stop_at:
