@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -111,6 +113,15 @@ def cmd_list(args) -> int:
 
     if not devices and not args.probe:
         print("\n提示：加 --probe 可以不管枚举、直接逐个索引试开一次。")
+
+    # 末尾固定放一句"更快的路"：`identify` 要**真的开相机**（慢相机 24 秒/台），
+    # 而大多数人只是想"把左/右绑到这两台名字上"—— 那条路 `pin` 秒级完成。
+    # 放在末尾是因为用户看完设备表，正好在决定"下一步做什么"。
+    print()
+    for line in _pin_hint_lines(
+            devices, "只想把左/右绑到某台设备、不打算逐台确认画面？"
+                     "按名字绑身份即可（秒级，不开相机、不碰编号）："):
+        print(line)
     return 0
 
 
@@ -129,7 +140,7 @@ _KEY_HINT = "l=左相机  r=右相机  n=无关(这台不要用)  m=单目主相
 _backend_used: dict[int, str] = {}
 
 
-def _open_preview(index: int, backend: int):
+def _open_preview(index: int, backend: int, *, enumerated: bool = False):
     """按**给定的那一个后端**打开预览；返回 (src, 后端名)，打不开返回 (None, None)。
 
     ## 为什么**绝不**在这里换后端（2026-10-18 第三次修正，用户实测反馈）
@@ -150,15 +161,48 @@ def _open_preview(index: int, backend: int):
     所以这里只做一件事：**在同一个后端内**开一个编号。
     想确认"另一台在别的后端下能不能出图"，用 cameras.py probe（它逐后端
     分别列出，本来就**不下结论说"哪台是哪台"**），或显式 --backend dshow。
+
+    ## 2026-10-29：开之前先说"要等多久"，开完说"用了多久"
+
+    用户报"相机管理卡死"，实测是**每台最坏等 30 秒**、6 台连着 = 3 分钟一个
+    窗口都不出现，而这段时间**一个字都不打** —— 只能被理解成卡死。
+    所以这里必须把等待**显式说出来**：开头一行、结果一行（带耗时）、
+    等待期间每 5 秒一行（`_WaitTicker`）。
+
+    失败时还会区分 `enumerated`：**"枚举不到这个编号"** 和 **"在清单里却开不出图"**
+    是两件不同的事（前者查线/查编号漂移，后者查占用/拔插/换后端），
+    而旧文案对两者都只说"打不开"。
     """
     from sphere_tracker.sources import backend_name
 
     used_name = backend_name(backend)
+    # 为什么把"整台上限"也写出来：首帧 30 秒只是**一个分辨率**的上限，
+    # 出不了图时会再降分辨率试一次，整台最多 `PREVIEW_BUDGET_S` 秒。
+    # 只说 30 秒，用户在第 35 秒会以为"说好的 30 秒呢、是不是又卡死了"。
+    print(f"  正在打开 #{index}（{used_name}）…最多等 "
+          f"{PREVIEW_FIRST_FRAME_S:.0f} 秒（首帧；整台上限 "
+          f"{PREVIEW_BUDGET_S:.0f} 秒）", flush=True)
+    tick = _WaitTicker(index, used_name)
+    tick.start()
+    t0 = time.perf_counter()
     try:
         src = _try_open(index, backend)
     except RuntimeError as exc:
-        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")
+        took = time.perf_counter() - t0
+        tick.stop()
+        # 为什么把"枚举不到"和"在线却开不出图"分成两句话：
+        # 原来的 `✘ 打不开` 两种情况同一个词，而**处置完全不同** ——
+        # 前者是没插/编号漂（去 list、pin），后者是设备在但没帧（拔插、查占用、
+        # 换后端）。本机实测 #0 就是后者（在线、MSMF 30.8 s 打不开），
+        # 用户当时把这种"慢失败"一律读成了"程序卡死/相机坏了"。
+        why = ("在线但开不出图" if enumerated else "设备清单里没有这台")
+        print(f"  ✘ #{index}（{used_name}）{why}，用了 {took:.1f} s："
+              f"{_first_line(exc)}", flush=True)
         return None, None
+    finally:
+        tick.stop()
+    took = time.perf_counter() - t0
+    print(f"  ✔ #{index}（{used_name}）出图了，用了 {took:.1f} s", flush=True)
     _backend_used[index] = used_name
     return src, used_name
 
@@ -193,6 +237,58 @@ PREVIEW_FIRST_FRAME_S = 30.0
 
 # 单台预览的**总**预算：要能容纳上面那次首帧等待 + 一次分辨率降级。
 PREVIEW_BUDGET_S = 40.0
+
+# 等相机出图时，每隔几秒说一句"还在等"。
+#
+# 为什么是 5 秒：用户点完「换相机…」之后，如果 3 分钟里**一个字都没有**，
+# 他只能判断成"卡死"并去关窗口 —— 而这 3 分钟其实一直在正常等待
+#（每台最多 `PREVIEW_FIRST_FRAME_S` 秒，慢相机实测 ~24 秒/台）。
+# 5 秒一行既够密（看得出程序还活着），又不会把屏幕刷满。
+_WAIT_TICK_S = 5.0
+
+
+class _WaitTicker:
+    """阻塞等待期间定时打印"已等 X 秒"的守护线程。
+
+    ## 为什么要另起一条线程说话
+
+    `CameraSource(...)` 是**在构造函数里开相机**的：从构造到返回，主线程完全
+    被占住，没有任何回调/钩子能插进去（2026-10-29 查过 `sphere_tracker/sources.py`
+    —— 它只有 `_log()` 打自己的日志，而"等第一帧"那个循环里**一句话都不打**）。
+    用户等 24 秒看不到输出，就认为程序死了。
+
+    所以这里只做一件事：**读时钟、打印**。它不碰 `CameraSource`、不碰 cv2、
+    不改任何状态，因此和正在开相机的那条线程**没有共享状态**，不需要锁。
+    `daemon=True` 保证用户 Ctrl+C 时它不会拖住进程。
+
+    为什么不用 `\\r` 原地覆盖：`CameraSource` 自己也会往 stdout 打日志
+    （`试 MSMF @ 1920x1080…`、`✔ … 打开成功`），两股输出抢同一行会糊成一片。
+    """
+
+    def __init__(self, index: int, backend_name: str,
+                 tick_s: float = _WAIT_TICK_S,
+                 budget_s: float = PREVIEW_BUDGET_S) -> None:
+        self._index, self._backend = index, backend_name
+        self._tick_s, self._budget_s = tick_s, budget_s
+        self._t0 = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._t0 = time.perf_counter()
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._tick_s):
+            el = time.perf_counter() - self._t0
+            print(f"    … 还在等 #{self._index}（{self._backend}）出第一帧："
+                  f"已等 {el:.0f} 秒（整台上限 {self._budget_s:.0f} 秒）"
+                  f"（慢相机实测 ~24 秒才有画面，别关窗口）", flush=True)
 
 
 def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
@@ -242,7 +338,11 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
     """
     label = _preview_label(index, entry)
     try:
-        src, backend_used = _open_preview(index, backend)
+        # `enumerated` 决定失败文案：编号在 PnP 清单里 = "在线却开不出图"，
+        # 不在清单里 = "枚举不到这个编号"。没有名字的一律按"没枚举到"算
+        # （`cmd_identify` 对查不到的索引塞的是一个空白 DeviceEntry）。
+        src, backend_used = _open_preview(index, backend,
+                                          enumerated=bool(entry.name))
     except RuntimeError as exc:
         print(f"  #{index} 打不开：{_first_line(exc)}")
         return None
@@ -493,11 +593,7 @@ def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     而它正是"名字不可靠时该怎么办"的关键指引，错不起。
     现在从 `list_devices()` 取**真实存在**、且未被标「无关」/未被判为内置的设备。
     """
-    reg = cr.load_registry()
-    usable = [d for d in devices
-              if d.name
-              and not cr.is_device_ignored(d, reg)
-              and not cr.is_avoided(d.name, reg.settings)]
+    usable = _usable_for_pin(devices)
     if len(usable) < 2:
         return ["     python apps/tools/cameras.py list   # 先看有哪些设备名可用"]
     a, b = usable[0], usable[1]
@@ -507,6 +603,115 @@ def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     ]
 
 
+def _usable_for_pin(devices: list[cr.DeviceEntry]) -> list[cr.DeviceEntry]:
+    """能拿来当 `pin` 示例的设备：有名字、没被标「无关」、不是内置/红外。
+
+    单独抽出来是为了让 `_pin_hint_lines()` 能判断"示例够不够两台" ——
+    提示语和示例必须**同一套判据**，否则会出现"提示说可以照抄"、
+    下面却只给了一行 `list` 的自相矛盾。
+    """
+    reg = cr.load_registry()
+    return [d for d in devices
+            if d.name
+            and not cr.is_device_ignored(d, reg)
+            and not cr.is_avoided(d.name, reg.settings)]
+
+
+def _pin_hint_lines(devices: list[cr.DeviceEntry], lead: str) -> list[str]:
+    """一条"跳过开相机、按名字绑身份"的提示块（含可复制的两行命令）。
+
+    为什么要专门做成提示块（2026-10-29）：`pin` 是**秒级**的快路，
+    却只藏在 `--help` 里 —— 用户在 identify 里为每台等 30 秒时，
+    完全不知道还有这条路。提示词**必须**和实际示例一起打，
+    光说"用 pin"没人会去翻帮助找参数格式。
+
+    示例一律走 `_pin_example_lines()`（从**当前真实设备名**生成），
+    不另拼一份 —— 两份示例迟早对不上。
+    """
+    lines = [lead, *_pin_example_lines(devices)]
+    n = len(_usable_for_pin(devices))
+    if n < 2:
+        # 少于两台时上面只能给一行 `list` 提示，读起来像"没有示例可用" ——
+        # 说明白**为什么**没有，比让用户自己去猜"是不是工具坏了"强。
+        lines.append(f"     （当前只枚举到 {n} 台可用设备：另一台没插、被标成「无关」")
+        lines.append("       或被判为内置/红外；插好后重跑 list，上面就是现成的两行）")
+    return lines
+
+
+# 头部先报这几个角色（其余自定义角色排在后面）—— left/right/main 是启动器
+# 实际会用的三个，先报它们才能对上用户的直觉。
+_HEADER_ROLES = ("left", "right", "main")
+
+
+def _role_expected(spec: cr.RoleSpec) -> str:
+    """把 `RoleSpec` 拼成"期望 名字 … / 端口 …"（有哪个写哪个）。
+
+    不写死任何值、也不复用 `resolve_role` 的报错文本 —— 那段报错很详细，
+    但它是给"解析失败"用的整块提示，塞进一行头部会淹没其它信息。
+
+    只有名字和端口**都没有**时才写身份：InstanceId 又把端口编在里面、
+    又特别长，三者一起打会把这一行拖成两屏（实测那行 90+ 字）。
+    """
+    parts = []
+    if spec.name:
+        parts.append(f"名字 {spec.name}")
+    if spec.port:
+        parts.append(f"端口 {spec.port}")
+    if not parts and spec.identity:
+        parts.append(f"身份 {spec.identity}")
+    return " / ".join(parts) if parts else "配置里没记任何身份信息"
+
+
+def _role_status_lines(devices: list[cr.DeviceEntry]) -> list[str]:
+    """每个已配置角色**现在指向哪台**：✔ 身份对上 / ⚠ 只是旧索引兜底 / ✘ 不在线。
+
+    ## 为什么放在 identify 的最前面（2026-10-29）
+
+    用户点「换相机…」时的处境经常是"配置先错了"：本机实测 `left` 绑的那台
+    **枚举不到**，而 `right` 绑的恰好是在线的那台（左右绑反 + left 离线）。
+    这时逐台开相机只会得到一串 ✘ —— 用户看到的是"程序有问题"，
+    真正该做的是重新 `pin`。先把角色指向报出来，"配置错"和"开不出图"
+    才分得开（前者不用开相机就能看见）。
+
+    全程**不开相机**：`resolve_role(interactive=False)` 只做 identity/port/name
+    静态匹配，毫秒级。
+
+    返回空列表 = 配置里一个角色都没有（此时整段不打，免得开局就吓人）。
+    """
+    reg = cr.load_registry()
+    if not reg.roles:
+        return []
+    order = [r for r in _HEADER_ROLES if r in reg.roles]
+    order += [r for r in sorted(reg.roles) if r not in order]
+
+    out: list[str] = []
+    for role in order:
+        spec = reg.roles[role]
+        try:
+            got = cr.resolve_role(role, reg=reg, devices=devices, interactive=False)
+        except RuntimeError:
+            out.append(f"  ✘ 角色 {role} 当前不在线（期望 {_role_expected(spec)}）")
+            continue
+        if got.how == "index-fallback":
+            # ⚠ 千万别把它写成 ✔：`index-fallback` = 身份/端口都没对上，
+            # 只是蒙了配置里的旧编号。换过 USB 口 / 换过机器时这个编号会漂，
+            # 而**它照样能把画面开出来** —— 用户会以为绑定是对的。
+            out.append(f"  ⚠ 角色 {role} 身份/端口没对上，只是按旧索引 "
+                       f"#{got.index} 兜底 —— 换过 USB 口/换过机器时索引会漂，"
+                       f"先确认这一台是不是它")
+            continue
+        how_cn = {"identity": "身份", "port": "端口", "name": "名字",
+                  "manual": "手动指定"}.get(got.how, got.how)
+        shown = f"#{got.index}"
+        if got.entry is not None and got.entry.name:
+            shown += f" {got.entry.name}"
+        out.append(f"  ✔ 角色 {role} → {shown}（按{how_cn}对上）")
+
+    out.append("  （以上只是身份匹配，不开相机：✔/⚠ 只代表\"这台在设备清单里\"，"
+               "能不能出图看下面逐台的 ✔/✘）")
+    return out
+
+
 def cmd_identify(args) -> int:
     devices = cr.list_devices()
     by_order = {d.order: d for d in devices}
@@ -514,6 +719,40 @@ def cmd_identify(args) -> int:
     if not indices:
         print("没有可识别的索引。先跑 python apps/tools/cameras.py list 看看设备。")
         return 1
+
+    # ---- "要等多久"必须在**动手之前**说清（2026-10-29，用户报"卡死"）----
+    #
+    # 用户点「换相机…」后 2~3 分钟一个窗口都不出现，就判定卡死。真实原因是
+    # 逐台开、每台最坏 `PREVIEW_FIRST_FRAME_S` 秒（慢相机实测 ~24 秒/台），
+    # 而这段时间**一句话都不打**。所以：先报总预算，再报"还能只挑几台"，
+    # 最后给出**不用开相机**的快路（pin）。
+    n = len(indices)
+    worst = n * PREVIEW_FIRST_FRAME_S
+    extra = f"（约 {worst / 60:.0f} 分钟）" if worst >= 60 else ""
+    print(f"共 {n} 台待识别，最坏约 {n}×{PREVIEW_FIRST_FRAME_S:.0f} 秒{extra}"
+          f"；慢相机实测 ~24 秒/台。")
+    if not args.indices:
+        # 只在**用户没指定**时提示：已经写了 --indices 还提示一次，读起来像没生效。
+        print(f"  只想确认某几台：加 --indices "
+              f"{','.join(str(i) for i in indices[:2])}（逗号分隔，其余整台跳过）")
+    for line in _pin_hint_lines(
+            devices, "想跳过这 30 秒/台的等待？按名字绑身份即可（不开相机）："):
+        print(line)
+    print()
+
+    # ---- 角色现在指向哪台（纯静态匹配，**不开相机**，毫秒级）--------------
+    #
+    # 为什么要在开相机之前先报：本机 2026-10-29 的真实状态是"left 绑的那台
+    # 枚举不到、right 绑的倒是在线"—— 也就是说用户点「换相机…」之前，
+    # 配置已经错了。不先说出来，用户只会看到一堆窗口、并把"配置错"当成"程序卡"。
+    #
+    # 边界：**只提示、不阻止**。`--indices` 是用户显式指定的编号，绝不能拿
+    # 角色解析去否决它（否则就是"我写了 --indices 0 它却不给我看"）。
+    role_lines = _role_status_lines(devices)
+    for line in role_lines:
+        print(line)
+    if role_lines:
+        print()
 
     # ---- 选定**本次会话唯一**的后端（绝不在索引之间切换）-----------------
     #

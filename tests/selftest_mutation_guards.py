@@ -195,12 +195,18 @@ MUTATIONS: list[dict[str, str]] = [
         "why": "_open_preview 早退分支返回单值 None —— 调用点解包两个值 → "
                "TypeError，**整个 identify 崩掉**（我引入过的真崩溃）",
         # 2026-10-18：_open_preview 拆出 _try_open 后，旧锚点失效。
-        # 重新钉在**当前**那唯一一处 (None, None) 早退分支上。
-        "old": '    except RuntimeError as exc:\n'
-               '        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")\n'
+        # 2026-10-29：加「等多久 + 在线/不在线」文案后**又失效一次** ——
+        # 那次改动把那行 print 整个换掉了，于是注入命中 0 处、本条判据静默失效
+        # （变异自证自己报了"锚点失效"，这正是它存在的意义）。
+        # 现在钉在**当前**唯一那处早退分支上：连 `why = ...` 一起带上 ——
+        # 文件里还有三处 `return None, None`（在 `_parse_pick` 里），只给返回行不唯一。
+        "old": '        why = ("在线但开不出图" if enumerated else "设备清单里没有这台")\n'
+               '        print(f"  ✘ #{index}（{used_name}）{why}，用了 {took:.1f} s："\n'
+               '              f"{_first_line(exc)}", flush=True)\n'
                '        return None, None',
-        "new": '    except RuntimeError as exc:\n'
-               '        print(f"  #{index}（{used_name}）打不开：{_first_line(exc)}")\n'
+        "new": '        why = ("在线但开不出图" if enumerated else "设备清单里没有这台")\n'
+               '        print(f"  ✘ #{index}（{used_name}）{why}，用了 {took:.1f} s："\n'
+               '              f"{_first_line(exc)}", flush=True)\n'
                "        return None          # ← 注入：形状不一致",
     },
     {

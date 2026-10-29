@@ -575,9 +575,13 @@ class HubWindow(tk.Toplevel):
             [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
              "identify"],
             "相机设备管理")
+        # 文案必须提"要等多久"：`identify` 逐台开相机，`PREVIEW_FIRST_FRAME_S=30`
+        # 是**实测**值（慢相机 ~24 秒才给首帧，调小会让它在界面上彻底消失）。
+        # 以前只说"已启动"，用户等 30 秒没窗口就判断成卡死（2026-10-29 报的）。
         self.status.set_status(
-            "相机设备管理已启动：会逐个索引显示画面，确认哪台是左、哪台是右。"
-            "改完回到门厅点「重新读取标定」刷新显示", "info")
+            "已打开相机设备管理：每台最多等 30 秒（慢相机实测 ~24 秒），"
+            "日志里会逐台报进度，别关窗口。只想绑左右可直接用 pin（不开相机，秒级）",
+            "info")
 
     def _open_data_manager(self) -> None:
         # 数据管理是独立进程（apps/data_manager.py），不嵌进本进程：
