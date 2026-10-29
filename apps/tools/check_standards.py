@@ -113,16 +113,14 @@ KNOWN_MENTIONS: dict[str, str] = {
     # 目前尚不存在 —— 计划的引用对象是"将要新建"，不是漂移。
     # ⚠️ 工具自带 vanished 检测：这些文件一旦落盘，本段必须删掉，
     # 否则就退化成"永久豁免"（2026-10-24 已清过 23 条，别重犯）。
-    # ---- 2026-10-28：下列文件**已实现**，豁免条目随之删除 ----
-    # _task_runner / _gui_widgets / _gui_app / _gui_console / _gui_mono /
-    # _gui_stereo / tests/selftest_gui_budget 全部已落盘，故本段只剩
-    # **尚未实现**的四项（_gui_bench / calibrate_mono / mono_calib /
-    # selftest_mono_calib）。它们一旦落地也必须删掉本段条目，
-    # 否则白名单退化成永久豁免 —— 工具自带的 vanished 检测会当场报红。
-    "docs/planbooks/2026-10-27_单目主线与GUI分窗.md:apps/_gui_bench.py":
-        "§2.5 计划新建：会话工作台",
-    # ---- 2026-10-28：mono_calib 与它的测试**已实现**，豁免删除 ----
-    # 仍属"尚未实现"的只剩 `apps/calibrate_mono.py`（P1b 入口）。
+    # ---- 2026-10-29：这份计划书列的文件**全部落地**，本段豁免清空 ----
+    # 曾经在这里的有：_task_runner / _gui_widgets / _gui_app / _gui_console /
+    # _gui_mono / _gui_stereo / _gui_bench / calibrate_mono / mono_calib /
+    # selftest_mono_calib / tests/selftest_gui_budget，以及 capture_board 的
+    # `_capture.json`。每落地一个就必须删一条（工具自带的 vanished 检测会逼你删），
+    # 否则白名单退化成"永久豁免" —— 2026-10-24 已清过 23 条，别重犯。
+    # 留这段说明是提醒：**计划书里的"计划新建"不该再进白名单**，
+    # 要豁免也只能按具体引用给、并在文件落地当天删掉。
     # ---- 2026-10-28：`_capture.json` **已实现**（P0b），豁免条目随之删除 ----
     # 它原先在这里有一条"§3.1 计划新建"的豁免。`capture_board.write_capture_sidecar`
     # 落地后该豁免变成**死条目**，`selftest_doc_facts` 第 3/4/5 节连锁变红

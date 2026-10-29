@@ -100,7 +100,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
    也不要放 `assets/`（那是入库的静态素材）。`data/` 默认不入库，
    **必须单独备份**；一次采集 = 一个目录 + `session.json`。
 
-### `apps/tools/` 里其实是四组东西
+### `apps/tools/` 里其实是五组东西
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -108,6 +108,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
 | **文档与事实**（5） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` `build_sbom.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落）、生成 / 更新 SBOM |
 | **数据 / 会话**（1） | `check_dataset.py` | 校验录制会话（视频 / 标定 / 同步） |
+| **性能 / 剖析**（1） | `profile_stages.py` | 分段计时（读帧 / 检测 / 跟踪 / 配对 / 三角测量）：给"优化哪里"提供数据，**先量再决定** |
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。
@@ -116,7 +117,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：15 个可执行脚本 + 13 个私有模块
+### `apps/` 顶层：15 个可执行脚本 + 14 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -124,7 +125,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | 标定与录制（5） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（13） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗**） |
+| 私有模块（13） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
