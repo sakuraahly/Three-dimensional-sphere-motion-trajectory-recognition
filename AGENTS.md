@@ -100,7 +100,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
    也不要放 `assets/`（那是入库的静态素材）。`data/` 默认不入库，
    **必须单独备份**；一次采集 = 一个目录 + `session.json`。
 
-### `apps/tools/` 里其实是五组东西
+### `apps/tools/` 里其实是六组东西
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -109,6 +109,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | **文档与事实**（5） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` `build_sbom.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落）、生成 / 更新 SBOM |
 | **数据 / 会话**（1） | `check_dataset.py` | 校验录制会话（视频 / 标定 / 同步） |
 | **性能 / 剖析**（1） | `profile_stages.py` | 分段计时（读帧 / 检测 / 跟踪 / 配对 / 三角测量）：给"优化哪里"提供数据，**先量再决定** |
+| **单目 / 对比**（1） | `mono_vs_stereo.py` | 单目按球径先验估深 vs 双目三角测量，逐帧比 Z / X / Y；球径未知时反推等效直径 `D_eff = 2rZ/f` 并看它稳不稳（**不瞎填一个 40 mm 然后下结论**） |
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。
