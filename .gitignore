@@ -93,3 +93,7 @@ data/sessions/*
 data/raw/*
 data/calib_pairs/*
 data/calib/*
+# 单目会话（2026-10-29 起）：data/mono/<时间戳>/clip.mkv + session.json + derived/
+# 漏这条的后果不是"多几个未跟踪文件"：HuffYUV 1920x1080 约 82 MB/s，10 秒 ≈ 800 MB，
+# 一次 `git add -A` 就能把几百 MB 无损视频塞进仓库，而且再也拿不出来。
+data/mono/*
