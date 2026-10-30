@@ -804,6 +804,184 @@ def test_mono_visualization_contract() -> bool:
     return all(k for _l, k in checks)
 
 
+def test_valid_frame_gate_contract() -> bool:
+    """第 10 节：`--seed` 与"有效帧"口径（2026-10-30 增）。
+
+    ## 为什么这一节存在
+
+    上一版的"检出"= 检测器给了东西。同一段录像（`20261029-205522`）实测：
+
+    ==========  ==============  ==================
+    方法        有输出          真的落在球上
+    ==========  ==============  ==================
+    color       0/40            0%
+    hough       139/144 = 96%   **2/144 = 1.4%**
+    ==========  ==============  ==================
+
+    hough 那 96% 是书架/椅子上的小圆（r≈11~13 px），球的半径约 91 px。
+    也就是说"有输出"这个口径**本身**就是那个"看起来成功"的 bug。
+
+    本节的判据只钉**能钉住的部分**（纯函数，不需要素材）：
+
+    1. `--seed x,y,r` 写得不对必须报错退出，不许猜；
+    2. 跳变护栏只回退半径、帧仍算有效；带越界要**整帧**不算；
+    3. **给了种子时带锚在种子半径上**（`seed_r × [0.75, 1.35]`），不许锚滚动
+       中位 —— 旧 `derived/traj.csv` 里 277 帧半径全是 11 px（真值 91），
+       中位就是 11，锚中位等于自证，每帧都"在带内"；
+    4. 四段报告的拆项**加得起来**（无检测 + 半径不一致 = 总数 − 有效帧），
+       且没有种子时必须明说"半径未经确认、绝对深度不可信"；
+    5. 丢失按连续段报，不逐帧一行；
+    6. 退出码仍然以有效帧为准（0 有效 → 2），且诊断里给 `--seed` 这条出路。
+
+    ⚠️ **本节不声称能验证**"有效帧就是那颗球"。实测：给了**错误**种子
+    （书架上的 `300,200,20`）时，CSRT 老实跟住那块纹理，细化每帧都在它周围
+    找到边缘，量出 19.5 px（IQR 18.2~20.0），落在种子带 `[15, 27]` 内，
+    60/60 全过门。**种子只能把门的锚点钉死，锚错了它照样自洽地错** ——
+    种子带挡的是"跟丢后锁到别处"，不是"一开始就点错"。
+    """
+    print("----- 10. --seed 与「有效帧」口径 -----")
+    import json
+    import tempfile
+
+    from apps.run_video import (MAX_RADIUS_JUMP, RADIUS_BAND, RADIUS_WINDOW,
+                                SEED_BAND_HI, SEED_BAND_LO, RadiusGate,
+                                build_vis, consistency_lines, hit_report,
+                                loss_segments, parse_seed)
+
+    checks: list[tuple[str, bool]] = []
+
+    def ck(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
+        checks.append((label, ok))
+
+    # ---- 1. --seed 解析 ----
+    seed = parse_seed("895,718,88")
+    ck("--seed 895,718,88 解析成 (895,718,88)", seed == (895.0, 718.0, 88.0), str(seed))
+    for bad in ("1,2", "a,b,c", "1,2,0", "1,2,-3", ""):
+        try:
+            parse_seed(bad)
+            ok = False
+        except SystemExit:
+            ok = True
+        ck(f"非法 --seed {bad!r} → 报错退出（不猜）", ok)
+
+    # ---- 3. 带必须锚在**种子半径**上，不能锚滚动中位 ----
+    # 这一段守两个东西：① 顺序（先护栏后判带，带就永远触发不了，8% < 25%）；
+    # ② 锚点（锚滚动中位是**自证**的：一屋子 11 px 的小圆中位就是 11）。
+    g2 = RadiusGate(seed_radius=88.0)
+    r_used2, verdict2 = g2.accept(11.0)      # 旧 traj.csv 的半径中位
+    ck(f"种子 88 px 下，旧 csv 的 11 px（-{1 - 11 / 88:.0%}）→ 整帧被拒",
+       r_used2 is None and verdict2 == "inconsistent" and g2.inconsistent == 1,
+       f"verdict={verdict2} 带={g2.band()}")
+    ck("被拒的帧不进入已接受半径序列（不污染后面的统计）",
+       g2.radii == [] and abs(g2.r_prev - 88.0) < 1e-6, f"radii={g2.radii}")
+    ck(f"上界给到 +{SEED_BAND_HI:.0%}（球被甩近时半径会变大，实测 +5%）",
+       RadiusGate(seed_radius=88.0).accept(88.0 * (1 + SEED_BAND_HI - 0.01))[0]
+       is not None)
+    ck(f"下界 -{SEED_BAND_LO:.0%} 之外整帧拒（锁到小球）",
+       RadiusGate(seed_radius=88.0).accept(88.0 * (1 - SEED_BAND_LO - 0.01))[0]
+       is None)
+    ck("没给种子时才退回滚动中位（±25%），且它仍能触发",
+       RadiusGate().accept(11.0)[0] is not None)   # 前 2 帧样本不足，不过带
+    g3 = RadiusGate()
+    for _ in range(3):
+        g3.accept(11.0)
+    ck("无种子 + 滚动中位：偏离中位 2×25% 仍被拒（带不是死代码）",
+       g3.accept(11.0 * (1 + 2 * RADIUS_BAND))[0] is None and g3.inconsistent == 1)
+
+    # ---- 3b. 跳变护栏在种子带之后才生效：两者分工不重叠 ----
+    g4 = RadiusGate(seed_radius=90.0)
+    g4.accept(90.0)
+    g4.accept(90.4)
+    r_used4, verdict4 = g4.accept(90.0 * (1.0 + 2 * MAX_RADIUS_JUMP))
+    ck("带内但跳 16% → jump、沿用上一帧半径（帧仍算有效）",
+       verdict4 == "jump" and abs(r_used4 - 90.4) < 1e-6 and g4.jumps == 1,
+       f"verdict={verdict4} r={r_used4:.2f}")
+
+    # ---- 4. 四段报告：拆项加得起来，尺度必须交代 ----
+    lines = consistency_lines(
+        total=10, accepted=7, no_detection=2, inconsistent=1, jumps=3,
+        radii=[90.0, 91.0, 92.0], jump_ratios=[0.003, 0.009, 0.014],
+        bad_frames=[3, 4, 5, 9], fps=35.0, seed=None)
+    txt = "\n".join(lines)
+    ck("有效帧写成 7/10 = 70.0%（分母是读到的帧数）", "7/10 = 70.0%" in txt)
+    ck("拆项加得起来：无检测 2 + 半径不一致 1 = 10 − 7",
+       "无检测 2" in txt and "半径不一致 1" in txt and 10 - 7 == 2 + 1)
+    ck("跳变护栏单独报**次数**（回退半径不丢帧，混进拆分会加不平）",
+       "跳变护栏触发 3 次" in txt)
+    ck("半径给中位与 IQR（只看中位看不出逐帧抖动）",
+       "半径 91.0 px" in txt and "IQR" in txt)
+    ck("丢失按**连续段**报（2 段：帧 3..5、帧 9..9）",
+       "连续丢失 2 段" in txt and "帧 3..5" in txt and "帧 9..9" in txt,
+       txt.splitlines()[-2][:40])
+    ck("没给种子 → `[尺度]` 明说半径未经确认、绝对深度不可信",
+       "[尺度] 无人工种子：半径未经确认，绝对深度不可信" in txt, "")
+    seeded_txt = "\n".join(consistency_lines(
+        total=2, accepted=2, no_detection=0, inconsistent=0, jumps=0,
+        radii=[90.0, 90.1], jump_ratios=[0.001], bad_frames=[],
+        fps=35.0, seed=(895.0, 718.0, 88.0)))
+    ck("给了种子 → `[尺度]` 报锚点与接受区间（66.0~118.8）",
+       "人工种子 88 px 锚定" in seeded_txt and "66.0~118.8" in seeded_txt)
+    ck("一帧都没过门时不编造半径统计",
+       "半径统计无数据" in "\n".join(consistency_lines(
+           total=5, accepted=0, no_detection=5, inconsistent=0, jumps=0,
+           radii=[], jump_ratios=[], bad_frames=[0, 1, 2, 3, 4],
+           fps=35.0, seed=None)))
+    ck("无丢失时打「无」，而不是空着",
+       consistency_lines(total=2, accepted=2, no_detection=0, inconsistent=0,
+                         jumps=0, radii=[90.0, 90.0], jump_ratios=[0.0],
+                         bad_frames=[], fps=35.0, seed=None)[-2].strip()
+       == "[丢失]   无")
+
+    # ---- 5. 丢失分段（纯函数）----
+    ck("连续段把单帧也当一个段",
+       loss_segments([5]) == [(5, 5)] and loss_segments([]) == [])
+    ck("段之间断开不合并",
+       loss_segments([1, 2, 3, 7, 8]) == [(1, 3), (7, 8)])
+
+    # ---- 6. 退出码以**有效帧**为准 ----
+    code, lines0 = hit_report(0, 60, "hough", detector_error="跟丢")
+    txt0 = "\n".join(lines0)
+    ck("0 有效帧 → 退出码 2", code == 2, f"EXIT={code}")
+    ck("0 有效帧的诊断给出 --seed 这条出路（金属球只能人工点一下）",
+       "--seed" in txt0 and "金属" in txt0)
+    ck("0 有效帧的诊断带上检测器自述原因（不然只能靠猜）", "跟丢" in txt0)
+    ck("有效帧 59/60 → 退出码 0（有数据不假装失败）", hit_report(59, 60, "hough")[0] == 0)
+
+    # ---- 7. 可视化文件能溯源：这条轨迹是不是种子跟出来的 ----
+    rows = [{"frame": i, "t": i / 30.0, "coasting": 0,
+             "X_m": 0.01 * i, "Y_m": 0.0, "Z_m": 0.16} for i in range(4)]
+    vis = build_vis(rows, session="s", source="clip.mkv", ball_diameter_mm=21.6,
+                    fx=1387.5, seed=(895.0, 718.0, 88.0),
+                    accepted_frames=4, rejected_frames=2)
+    ck("vis 里有 seed（半年后能看出是人工种子跟出来的）",
+       vis is not None and vis["seed"] == [895.0, 718.0, 88.0], str(vis and vis["seed"]))
+    ck("vis 里有 accepted/rejected 帧数",
+       vis is not None and vis["accepted_frames"] == 4 and vis["rejected_frames"] == 2)
+    auto = build_vis(rows, session="s", source="clip.mkv", ball_diameter_mm=21.6,
+                     fx=1387.5)
+    ck("没给种子时 seed 落成 null（不是缺字段 —— 缺字段会被读成「没这个功能」）",
+       auto is not None and "seed" in auto and auto["seed"] is None)
+    ck("没给种子 → scale_unverified=true（尺度没人背书，落盘要能看出来）",
+       auto is not None and auto.get("scale_unverified") is True)
+    ck("给了种子 → scale_unverified=false",
+       vis is not None and vis.get("scale_unverified") is False)
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "visualization.json"
+        assert vis is not None
+        f.write_text(json.dumps(vis, ensure_ascii=False), encoding="utf-8")
+        ck("落盘后仍是合法 JSON（种子是元组，不转 list 会写不出来）",
+           json.loads(f.read_text(encoding="utf-8"))["seed"] == [895.0, 718.0, 88.0])
+
+    ck(f"窗口长度 {RADIUS_WINDOW} 帧 ≈ 0.86 s @35 fps（覆盖不了更长的目标切换）",
+       RADIUS_WINDOW == 30)
+
+    print(f"  共 {len(checks)} 项：" + ("全部通过" if all(k for _l, k in checks)
+                                      else "有不达标项"))
+    return all(k for _l, k in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("叠加层缩放自测（viz.scale：整张图所有元素一起缩放）")
@@ -820,7 +998,8 @@ def main() -> int:
                test_display_width_contract,
                test_detect_width_rescales_coordinates,
                test_hud_text_is_immune_to_display_width,
-               test_mono_visualization_contract):
+               test_mono_visualization_contract,
+               test_valid_frame_gate_contract):
         results.append(fn())
         print()
     ok = all(results)

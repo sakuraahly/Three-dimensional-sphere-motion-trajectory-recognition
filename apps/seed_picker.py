@@ -1,19 +1,30 @@
-"""GUI 点选双目 seed：左图点球心，右图点球心，自动估半径并写 seeds.json。
+"""GUI 点选 seed：双目的``SeedPicker``（左右各点球心）与单目的``MonoSeedPicker``。
 
 为什么单独成文件
 ----------------
 `启动程序.py` 已经 1600+ 行；点选窗口是独立的交互组件，放这里更容易测
 （不依赖主界面布局）。它不是命令行程序，只被 GUI import。
 
-约定：
+双目约定（``SeedPicker``）：
 - 点击坐标映射回**原始 1920x1080**，不是缩放后的画布坐标；
 - 半径先用点击点附近的 Hough 圆估计，估不到就用宽度/32 的保守默认；
 - 保存到 `<session>/derived/seeds.json`，格式见 `stereo/visualization.py`。
+
+单目约定（``MonoSeedPicker``，2026-10-30 增）：
+- 同样把点击坐标映射回原图（纯函数 ``canvas_to_image``）；
+- **半径不靠 Hough**：第一点球心、第二点球边，两点距离就是半径。
+  实测这颗镀铬球 Hough 给 68~69 px，人工两点给 91 px，而
+  ``Z = f·D/(2r)`` 里 r 错 24% 就是深度错 24%，且**每帧同号**（系统项，
+  平均不掉）。所以半径必须由人点出来；
+- 保存到 `<session>/derived/seed.json`，键为 x / y / radius / frame /
+  image_size / created，供 `apps/run_video.py --seed x,y,r` 使用。
 """
 
 from __future__ import annotations
 
+import json
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -31,6 +42,56 @@ if str(ROOT) not in sys.path:
 from stereo.visualization import write_seeds  # noqa: E402
 
 PREVIEW_W, PREVIEW_H = 760, 428
+
+#: 单目预览固定 760 宽（与双目同宽，用户不用适应两套尺度），高度按原图比例算。
+MONO_PREVIEW_W = 760
+
+
+# --------------------------------------------------------------------------- #
+# 纯函数（无 Tk）：坐标映射 / 两点定圆 / 深度换算
+# --------------------------------------------------------------------------- #
+# 为什么这三个要抽成模块级函数：它们是"点在哪 → 写进 seed.json → 进命令行"这条
+# 链上唯一会**静默算错**的地方（缩放比写反、半径用了直径、mm/m 搞混）。
+# 它们不碰控件，所以没有显示器也能断言 —— 判据在 tests/selftest_gui_budget.py。
+def canvas_to_image(x: float, y: float, scale: float,
+                    offset: tuple[float, float] = (0.0, 0.0)
+                    ) -> tuple[float, float]:
+    """画布坐标 → 原图坐标：``(画布 - 偏移) / 缩放比``。
+
+    ``scale`` 是"画布 1 px 对应原图多少 px"（缩放到 760 宽时 < 1）。
+    先减偏移再除缩放：反过来会把偏移也缩放，平移一叠加就整片错位。
+    """
+    if scale <= 0:
+        raise ValueError(f"scale 必须为正数，收到 {scale!r}")
+    ox, oy = float(offset[0]), float(offset[1])
+    return ((float(x) - ox) / scale, (float(y) - oy) / scale)
+
+
+def radius_from_points(p1: tuple[float, float],
+                       p2: tuple[float, float]) -> float:
+    """两点定圆：第一点是圆心，两点距离就是半径。
+
+    为什么用"球边那一点"而不是"Hough 估半径"：见模块 docstring —— 这颗镜面球
+    Hough 半径系统性偏小 24%，而 Z 反比于 r，偏小就直接把深度顶大。
+    """
+    return float(np.hypot(float(p2[0]) - float(p1[0]),
+                          float(p2[1]) - float(p1[1])))
+
+
+def z_estimate_m(fx: float | None, diameter_mm: float | None,
+                 radius_px: float | None) -> float | None:
+    """``Z = f·D/(2r)``，返回米；任一项缺失/非正 → ``None``（不猜）。
+
+    单位是这条链上最容易错的地方：D 在界面上是 mm、Z 要 m，所以先 /1000。
+    直接照抄公式不换单位，深度会大 1000 倍 —— 而"1000 m"看起来像没测到。
+    """
+    try:
+        f, d, r = float(fx or 0), float(diameter_mm or 0), float(radius_px or 0)
+    except (TypeError, ValueError):
+        return None
+    if f <= 0 or d <= 0 or r <= 0:
+        return None
+    return f * (d / 1000.0) / (2.0 * r)
 
 
 class SeedPicker(tk.Toplevel):
@@ -320,3 +381,216 @@ class SeedPicker(tk.Toplevel):
         self.result = path
         messagebox.showinfo("保存 seed", f"已保存：\n{path}", parent=self)
         self.destroy()
+
+
+class MonoSeedPicker(tk.Toplevel):
+    """模态窗口：单目会话里点一下球心、再点一下球边，写 ``seed.json``。
+
+    返回 ``self.result`` = seed.json 路径，或 None（取消）。
+
+    为什么要人点两下（第一性原理，不是"图省事"）
+    --------------------------------------------
+    这颗球是镀铬镜面球，背景是宿舍（书架 / 塑料袋 / 挂着的白衣服）。
+    288 帧实测：``color`` 0/288 落在球上，``hough`` 96% 有输出但只有 1.4%
+    落在球上、半径中位 69.5 px；真半径约 91 px。也就是说**没有任何可靠的
+    自动初始化**（`sphere_tracker/detectors/specular.py` 的 docstring 早写过
+    "不假装全自动"）。而半径是 Z 的分母：69.5 对 91 会让整条轨迹近 30% 偏近，
+    且是系统项，平均不掉。
+
+    所以这里做两件事与双目版**刻意不同**：
+    1. 半径来自第二点（用户点的球边），**不调 Hough**；
+    2. 窗口里只显示一路图（单目只有一路，硬套双目会多出一个假的"右路"）。
+    """
+
+    def __init__(self, parent, session_dir: str | Path, *,
+                 fx: float | None = None, diameter_mm: float | None = None,
+                 frame_index: int = 0) -> None:
+        super().__init__(parent)
+        self.title("点选单目球心")
+        self.transient(parent)
+        self.grab_set()
+        self.session_dir = Path(session_dir)
+        self.frame_index = int(frame_index)
+        # fx / 球径由调用方传：界面第②步那一栏就是唯一真相，
+        # 在这里再读一遍配置等于造第二份口径（两边不一致时没人看得出）。
+        self.fx = float(fx) if fx else None
+        self.diameter_mm = float(diameter_mm) if diameter_mm else None
+        self.center: tuple[float, float] | None = None      # 原图坐标
+        self.edge: tuple[float, float] | None = None
+        self.radius = 0.0                                   # 原图像素
+        self.frame: np.ndarray | None = None
+        self.scale = 1.0
+        self._photo = None
+        self.result: Path | None = None
+        self._build()
+        self._load()
+
+    # ------------------------------------------------------------------
+    def _build(self) -> None:
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill="x")
+        ttk.Label(top, text="先点球心，再点球的边缘（两点距离就是半径）。"
+                            "再点一次会从头开始。半径不用估：你点哪就是哪。").pack(anchor="w")
+
+        body = ttk.Frame(self, padding=(10, 0))
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(body, width=MONO_PREVIEW_W, height=428,
+                                bg="#111827", highlightthickness=0)
+        self.canvas.pack()
+        self.canvas.bind("<Button-1>", self._on_click)
+
+        # 三行读数：球心 / 半径 / Z。分成三行而不是一句话，
+        # 是因为用户核对的是三个**独立的数**，挤一行就得自己拆。
+        info = ttk.Frame(self, padding=(10, 8, 10, 0))
+        info.pack(fill="x")
+        self.lbl_center = ttk.Label(info, text="球心：还没点")
+        self.lbl_center.pack(anchor="w")
+        self.lbl_radius = ttk.Label(info, text="半径：还没点球边")
+        self.lbl_radius.pack(anchor="w")
+        self.lbl_z = ttk.Label(info, text="约 Z = —（点完球边才有）")
+        self.lbl_z.pack(anchor="w")
+        # 为什么 Z 前面写"约"：D 用的是**有效**直径（21.6 mm，反推值），
+        # 不是卡尺量的名义直径 25 mm。少这个字，用户会把 0.16 m 当测量结果。
+        ttk.Label(info, style="Hint.TLabel",
+                  text="Z 是按球径先验反推的（不是视差测量），球径填错多少，"
+                       "深度就错多少；这一路只适合看趋势。").pack(anchor="w")
+
+        bottom = ttk.Frame(self, padding=10)
+        bottom.pack(fill="x")
+        self.status = ttk.Label(bottom, text="等待点击球心")
+        self.status.pack(side="left")
+        ttk.Button(bottom, text="保存 seed", command=self._save).pack(side="right", padx=4)
+        ttk.Button(bottom, text="重新点", command=self._reset).pack(side="right", padx=4)
+        ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right", padx=4)
+
+    # ------------------------------------------------------------------
+    def _read_frame(self) -> np.ndarray | None:
+        """读会话里那段原始视频的首帧（``clip.*``）。"""
+        from apps._mono_sessions import find_clip
+
+        clip = find_clip(self.session_dir)
+        if clip is None:
+            return None
+        cap = cv2.VideoCapture(str(clip))
+        try:
+            if not cap.isOpened():
+                return None
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_index)
+            ok, frame = cap.read()
+            return frame if ok else None
+        finally:
+            cap.release()
+
+    def _load(self) -> None:
+        self.frame = self._read_frame()
+        if self.frame is None:
+            messagebox.showerror("点选球心",
+                                 "读不到这段会话的视频（clip.mkv）；"
+                                 "先录一段或从「历史会话…」挑一段。", parent=self)
+            self.destroy()
+            return
+        h, w = self.frame.shape[:2]
+        self.scale = MONO_PREVIEW_W / float(w)
+        ch = max(1, int(round(h * self.scale)))
+        # 画布尺寸必须跟着缩放比走：写死 428 时，非 16:9 的录像会被压扁，
+        # 用户点到的位置和原图就对不上了（而读数看起来完全正常）。
+        self.canvas.configure(width=MONO_PREVIEW_W, height=ch)
+        small = cv2.resize(self.frame, (MONO_PREVIEW_W, ch),
+                           interpolation=cv2.INTER_AREA)
+        self._photo = ImageTk.PhotoImage(
+            Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
+        self._redraw()
+
+    # ------------------------------------------------------------------
+    def _on_click(self, event) -> None:
+        if self.frame is None:
+            return
+        point = canvas_to_image(event.x, event.y, self.scale)
+        if self.center is None:
+            self.center, self.edge, self.radius = point, None, 0.0
+            self.status.configure(text="球心已定；现在点球的边缘")
+        elif self.edge is None:
+            self.edge = point
+            self.radius = radius_from_points(self.center, point)
+            if self.radius < 1.0:
+                # 同一点点两次 = 半径 0：不是"很小"，是没有给出信息。
+                self.edge, self.radius = None, 0.0
+                self.status.configure(text="两次点在同一处（半径 0）；请点到球边")
+            else:
+                self.status.configure(text="半径已定；可以保存，或再点一次重来")
+        else:
+            # 第三次点击 = 重新开始（圆心换成这一点，半径清空）。
+            # 不要求先按"重新点"：点错了最自然的动作就是直接在正确位置再点一下。
+            self.center, self.edge, self.radius = point, None, 0.0
+            self.status.configure(text="已重新开始：球心定在新位置，请再点球边")
+        self._redraw()
+
+    def _reset(self) -> None:
+        self.center = self.edge = None
+        self.radius = 0.0
+        self.status.configure(text="等待点击球心")
+        self._redraw()
+
+    def _redraw(self) -> None:
+        self.canvas.delete("all")
+        if self._photo is not None:
+            self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+        self.lbl_center.configure(
+            text=(f"球心：({self.center[0]:.0f}, {self.center[1]:.0f})"
+                  if self.center else "球心：还没点"))
+        self.lbl_radius.configure(
+            text=(f"半径：{self.radius:.1f} px" if self.radius > 0
+                  else "半径：还没点球边"))
+        z = z_estimate_m(self.fx, self.diameter_mm, self.radius)
+        if z is None:
+            why = ("还没点球边" if self.radius <= 0
+                   else "缺焦距或球径，先在第②步填好")
+            self.lbl_z.configure(text=f"约 Z = —（{why}）")
+        else:
+            self.lbl_z.configure(
+                text=f"约 Z = {z:.3f} m"
+                     f"（按 D={self.diameter_mm:g} mm、fx={self.fx:.0f} px 换算）")
+        if self.center is not None:
+            cx, cy = self.center[0] * self.scale, self.center[1] * self.scale
+            self.canvas.create_line(cx - 12, cy, cx + 12, cy, fill="#22c55e", width=2)
+            self.canvas.create_line(cx, cy - 12, cx, cy + 12, fill="#22c55e", width=2)
+            if self.radius > 0:
+                sr = self.radius * self.scale
+                self.canvas.create_oval(cx - sr, cy - sr, cx + sr, cy + sr,
+                                        outline="#22c55e", width=2)
+            if self.edge is not None:
+                ex, ey = self.edge[0] * self.scale, self.edge[1] * self.scale
+                self.canvas.create_oval(ex - 3, ey - 3, ex + 3, ey + 3,
+                                        outline="#f59e0b", width=2)
+
+    # ------------------------------------------------------------------
+    def _save(self) -> None:
+        if self.center is None or self.radius <= 0:
+            messagebox.showwarning("保存 seed", "先点球心，再点球边。", parent=self)
+            return
+        if self.frame is None:
+            return
+        h, w = self.frame.shape[:2]
+        payload = {
+            "x": round(float(self.center[0]), 2),
+            "y": round(float(self.center[1]), 2),
+            "radius": round(float(self.radius), 2),
+            "frame": self.frame_index,
+            "image_size": [int(w), int(h)],
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        path = self.session_dir / "derived" / "seed.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("保存 seed", f"写不进 {path}：{exc}", parent=self)
+            return
+        # 印路径而不是只说"已保存"：这个文件就是 --seed 的来源，
+        # 用户要能自己去核对/删掉它（删掉就退回自动检测）。
+        print(f"seed 已保存：{path}")
+        self.result = path
+        messagebox.showinfo("保存 seed", f"已保存：\n{path}", parent=self)
+        self.destroy()
+

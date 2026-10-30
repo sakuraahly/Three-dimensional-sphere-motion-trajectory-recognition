@@ -294,6 +294,102 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     return out
 
 
+def _mono_seed_checks() -> list[tuple[str, bool]]:
+    """人工种子（2026-10-30 增）：**不需要 Tk** 的那一半判据。
+
+    为什么要有这一节
+    ----------------
+    镜面球（镀铬、宿舍背景）没有可靠的自动初始化：288 帧实测 ``color`` 0/288
+    落在球上、``hough`` 只有 1.4%、半径中位 69.5 px 而真值约 91 px。
+    于是"点一下球"成了唯一正路 —— 而它整条链是
+    ``点击 → canvas_to_image → 半径(via 第二点) → seed.json → --seed x,y,r``，
+    中间任何一环写反（缩放比取倒数、半径用了直径、mm 当 m、带着另一套分辨率的
+    坐标）都**不会报错**，只会让轨迹悄悄偏移。所以每一环都要有断言。
+
+    这一节不碰 Tk：坐标映射 / 两点定圆 / 深度换算 / 读 seed.json 全是纯函数，
+    没有显示器也照跑（跳过 = 未验证）。
+    """
+    import json
+    import tempfile
+
+    from apps._gui_mono import SEED_DETECTOR, detector_choices, seed_arg_from_file
+    from apps.seed_picker import canvas_to_image, radius_from_points, z_estimate_m
+
+    out: list[tuple[str, bool]] = []
+
+    def ck(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
+        out.append((label, ok))
+
+    # ---- 画布 → 原图 ----
+    # 缩放比取倒数（乘而不是除）是最容易犯的错：760 宽的预览点 (400,300)
+    # 会算成 (160,120)，于是种子落在左上角、跟踪立刻跟丢。
+    px = canvas_to_image(400, 300, 0.4, (0.0, 0.0))
+    ck("画布 → 原图：scale=0.4 时 (400,300) → (1000,750)",
+       abs(px[0] - 1000.0) < 1e-6 and abs(px[1] - 750.0) < 1e-6, f"实际 {px}")
+
+    # ---- 两点定圆 ----
+    r = radius_from_points((100.0, 100.0), (100.0, 190.0))
+    ck("两点定圆：球心 (100,100) 到球边 (100,190) → 半径 90",
+       abs(r - 90.0) < 1e-9, f"实际 r={r:g}")
+
+    # ---- Z = f·D/(2r)，D 是 mm、Z 要 m ----
+    z = z_estimate_m(1387.5, 21.6, 91.0)
+    want = 1387.5 * 0.0216 / (2 * 91.0)
+    ck("深度换算：fx 1387.5 / D 21.6 mm / r 91 px → Z 约 0.165 m（mm→m 没漏）",
+       z is not None and abs(z - want) < 1e-12, f"实际 Z={z}，应为 {want:.6f}")
+
+    with tempfile.TemporaryDirectory(prefix="mono_seed_") as tmp:
+        sess = Path(tmp) / "20260101-000000"
+        (sess / "derived").mkdir(parents=True)
+        seed = sess / "derived" / "seed.json"
+        seed.write_text(json.dumps({"x": 100, "y": 50, "radius": 91, "frame": 0,
+                                    "image_size": [1920, 1080],
+                                    "created": "2026-01-01 00:00:00"},
+                                   ensure_ascii=False), encoding="utf-8")
+
+        # ---- 读 seed.json → --seed 的值 ----
+        value, note = seed_arg_from_file(seed, image_size=(1920, 1080))
+        try:
+            parsed = [float(v) for v in value.split(",")]
+        except ValueError:
+            parsed = []
+        ck("有 seed.json → --seed 的值就是文件里的 x,y,r（3 个数，能直接解析）",
+           parsed == [100.0, 50.0, 91.0] and not note,
+           f"值 {value!r}，提示 {note!r}")
+
+        # 检测器名必须真的在注册表里：写错一个字母，run_video 会在 argparse
+        # 就退出（"点了没反应"），而界面照样显示"已按种子跟踪"。
+        ck("带种子时强制用的检测器在注册表里（specular）",
+           SEED_DETECTOR == "specular" and SEED_DETECTOR in detector_choices(),
+           f"{SEED_DETECTOR} in {list(detector_choices())}")
+
+        # ---- 分辨率不符：坐标是另一套画布的 ----
+        other, other_note = seed_arg_from_file(seed, image_size=(1280, 720))
+        ck("种子分辨率与录像不符 → 不用它（退回自动检测），并说明原因",
+           other == "" and "对不上" in other_note, f"值 {other!r}，提示 {other_note!r}")
+
+        # ---- 读不动 / 字段不全：一律不抛 ----
+        broken = sess / "derived" / "broken.json"
+        broken.write_text("{坏掉的", encoding="utf-8")
+        b_value, b_note = seed_arg_from_file(broken, image_size=(1920, 1080))
+        ck("seed.json 坏了 → 不抛，值空 + 一句话",
+           b_value == "" and bool(b_note), f"值 {b_value!r}，提示 {b_note!r}")
+
+        gone_value, gone_note = seed_arg_from_file(sess / "derived" / "nope.json")
+        ck("seed.json 不存在 → 不抛，值空 + 一句话",
+           gone_value == "" and bool(gone_note),
+           f"值 {gone_value!r}，提示 {gone_note!r}")
+
+        seed.write_text(json.dumps({"x": 100, "y": 50}, ensure_ascii=False),
+                        encoding="utf-8")
+        m_value, m_note = seed_arg_from_file(seed)
+        ck("缺 radius 的 seed.json → 不用（半径是 Z 的分母，不能猜）",
+           m_value == "" and "radius" in m_note, f"值 {m_value!r}，提示 {m_note!r}")
+    return out
+
+
 def _summary(results: list[tuple[str, bool]]) -> int:
     print()
     ok = 0
@@ -398,6 +494,7 @@ def main() -> int:
     # 结构判据可以跳过，参数拼装不行 —— 跳过的那部分一律不算验证过。
     results: list[tuple[str, bool]] = _stereo_param_checks()
     results += _mono_session_checks()
+    results += _mono_seed_checks()
 
     try:
         from apps._gui_app import App
@@ -482,6 +579,16 @@ def main() -> int:
 
         mono = dict(windows)["mono"]
         captured: list[list[str]] = []
+
+        # ---------- 单目窗：「点选球心」在没会话时必须是灰的（2026-10-30 增） ----------
+        # 一进窗口就没有当前会话，此时可点只会弹一句"先录一段" ——
+        # 可点却干不了事的按钮比灰着的按钮更伤人（与「看 3D」同一条道理）。
+        seed_texts = " ".join(collect_texts(mono))
+        seed_off = "disabled" in mono.btn_seed.state()
+        ok_seed_ui = ("点选球心" in seed_texts) and seed_off
+        print(f"  [{'通过' if ok_seed_ui else '不达标'}] 单目窗有「点选球心」，"
+              f"没会话时禁用（state={mono.btn_seed.state()}）")
+        results.append(("点选球心无会话时禁用", ok_seed_ui))
 
         class _StubTasks:
             """只收集命令行，不真起进程（否则测试会去开相机）。"""
@@ -688,6 +795,86 @@ def main() -> int:
             print(f"  [{'通过' if ok_rt else '不达标'}] 来源=实时 → 调 run_realtime.py"
                   f"（{' '.join(cmd[1:2]) or '(无命令)'}）")
             results.append(("开始识别按来源分发", ok_rt))
+
+            # ---------- 单目窗：点了球心之后命令行带什么（2026-10-30 增） ----------
+            # 守的坑：用户辛苦点完两点，命令行里没有 --seed（或 --method 还是
+            # 自动那个检测器）—— 界面写着"已按种子跟踪"，实际仍在全图瞎找，
+            # 那颗镜面球只有 1.4% 的帧会碰巧落在球上。
+            import json
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="mono_seed_cmd_") as tmp:
+                sess = Path(tmp) / "20260102-000000"
+                (sess / "derived").mkdir(parents=True)
+                clip = sess / "clip.mkv"
+                clip.write_bytes(b"")               # find_clip 已被桩掉，只是要个路径
+                seed = sess / "derived" / "seed.json"
+                seed.write_text(json.dumps({
+                    "x": 812, "y": 530, "radius": 91, "frame": 0,
+                    "image_size": [1920, 1080],
+                    "created": "2026-01-02 00:00:00"},
+                    ensure_ascii=False), encoding="utf-8")
+
+                class _SeedSess:
+                    path = sess
+                    width = 1920
+                    height = 1080
+                    error = ""              # 真 MonoSession 有这个字段（坏会话时非空）
+
+                mono_mod.find_clip = lambda _p: clip
+                mono._session = _SeedSess()
+                # 可点性：会话里有视频时必须能点。永远灰着的按钮 = 整个功能不可达，
+                # 而"灰着"在截图里看起来完全正常。
+                mono._sync_seed_button()
+                ok_on = "disabled" not in mono.btn_seed.state()
+                print(f"  [{'通过' if ok_on else '不达标'}] 会话有视频时「点选球心」"
+                      f"可点（state={mono.btn_seed.state()}）")
+                results.append(("点选球心在会话就绪后可点", ok_on))
+                mono.app.tasks = _StubTasks()
+                mono.var_source.set(SOURCE_OFFLINE)
+                mono.var_focal.set("")
+                mono.var_diameter.set("")
+
+                captured.clear()
+                mono.var_detector.set("color")      # 用户没动检测器：默认 color
+                mono._start_video()
+                cmd = captured[0] if captured else []
+                got_seed = cmd[cmd.index("--seed") + 1] if "--seed" in cmd else ""
+                got_m = cmd[cmd.index("--method") + 1] if "--method" in cmd else ""
+                ok_seed = (got_seed == "812,530,91" and got_m == "specular"
+                           and mono.var_detector.get() == "specular")
+                print(f"  [{'通过' if ok_seed else '不达标'}] 有 seed.json → 命令行 "
+                      f"--seed {got_seed or '(缺失)'} 且 --method "
+                      f"{got_m or '(缺失)'}（下拉也同步成 {mono.var_detector.get()!r}）")
+                results.append(("有种子时命令行带 --seed 且检测器 specular", ok_seed))
+
+                # 反向：把文件删掉 → 不许再带 --seed。
+                # 否则就是"跟踪一个不存在的位置"，而且界面不会有任何提示。
+                seed.unlink()
+                mono.var_detector.set("color")
+                captured.clear()
+                mono._start_video()
+                cmd = captured[0] if captured else []
+                ok_noseed = "--seed" not in cmd
+                print(f"  [{'通过' if ok_noseed else '不达标'}] 没有 seed.json → "
+                      f"命令行不带 --seed（实际 {' '.join(cmd) or '(无命令)'}）")
+                results.append(("没有种子时不传 --seed", ok_noseed))
+
+                # 分辨率不符的种子：要退回自动检测，而不是把旧坐标套到新画布上
+                seed.write_text(json.dumps({
+                    "x": 812, "y": 530, "radius": 91, "frame": 0,
+                    "image_size": [1280, 720],
+                    "created": "2026-01-02 00:00:00"},
+                    ensure_ascii=False), encoding="utf-8")
+                mono.var_detector.set("color")
+                captured.clear()
+                mono._start_video()
+                cmd = captured[0] if captured else []
+                note = mono.status._label.cget("text")
+                ok_bad = "--seed" not in cmd and "对不上" in note
+                print(f"  [{'通过' if ok_bad else '不达标'}] 种子分辨率不符 → 不传 "
+                      f"--seed 且状态条说明（尾部：…{note[-34:]}）")
+                results.append(("种子分辨率不符时退回自动检测", ok_bad))
+
             print(f"  检测器候选 = {list(detector_choices())}"
                   f"（默认 {mono.var_detector.get()!r}）")
         finally:

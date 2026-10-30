@@ -108,6 +108,55 @@ SOURCE_REALTIME = "实时（相机）"
 SOURCE_OFFLINE = "离线（当前会话）"
 SOURCE_CHOICES = (SOURCE_OFFLINE, SOURCE_REALTIME)
 
+#: 有种子时**强制**用的检测器名（必须是注册表里的名字，见 `detector_choices()`）。
+#: 为什么强制：``--seed`` 只有 specular 认（它按点给的圆心/半径做局部跟踪），
+#: 别的检测器收到种子会直接忽略 —— 命令里带着 ``--seed 100,50,91`` 却仍在
+#: 全图找圆，是"看起来用了种子、实际没有"的静默失效。
+SEED_DETECTOR = "specular"
+
+#: 种子文件在会话里的位置（与其它派生结果同处 ``derived/``）。
+SEED_NAME = "seed.json"
+
+
+def seed_arg_from_file(path, *, image_size=None) -> tuple[str, str]:
+    """读 ``seed.json`` → (``--seed`` 的值, 一句提示)；值空 = 不能用。
+
+    为什么抽成模块级纯函数：它是"用户点的那两下 → 命令行"之间唯一会**静默失效**
+    的一环。文件里有 x/y/r、命令行里却没有（或带着**另一套分辨率**的坐标），
+    界面上一个字都看不出来，只有轨迹悄悄偏移。抽出来才能在没有显示器的
+    机器上断言（判据在 ``tests/selftest_gui_budget.py``）。
+
+    分辨率必须核对：种子是"点在哪"的像素坐标，换一段不同尺寸的录像后
+    同一组数字指向完全不同的位置 —— 那比没有种子更糟（会跟错目标）。
+    所以 **不许抛**：任何读不动/不合法都退回自动检测，并把原因交给状态条。
+    """
+    import json
+
+    p = Path(path)
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "", f"种子文件读不了（{type(exc).__name__}），退回自动检测"
+    if not isinstance(raw, dict):
+        return "", "种子文件不是对象，退回自动检测"
+    try:
+        x, y = float(raw["x"]), float(raw["y"])
+        r = float(raw["radius"])
+    except (KeyError, TypeError, ValueError):
+        return "", "种子文件缺 x / y / radius，退回自动检测"
+    if r <= 0:
+        return "", "种子半径不是正数，退回自动检测"
+    size = raw.get("image_size")
+    if image_size and isinstance(size, (list, tuple)) and len(size) == 2:
+        try:
+            if (int(size[0]), int(size[1])) != (int(image_size[0]), int(image_size[1])):
+                return "", (f"种子是在 {int(size[0])}x{int(size[1])} 上点的，"
+                            f"这段录像是 {int(image_size[0])}x{int(image_size[1])}，"
+                            f"坐标对不上，退回自动检测")
+        except (TypeError, ValueError):
+            pass          # 种子里的 image_size 写坏了：坐标本身还能用，不因此丢掉
+    return f"{x:g},{y:g},{r:g}", ""
+
 
 def diameter_arg(text: str) -> str:
     """把"框里的球径（mm）"变成命令行要传的值：空 / 空白 → 有效直径。
@@ -198,10 +247,15 @@ class MonoSessionPicker(tk.Toplevel):
             ("frames", "帧数", 65), ("state", "状态", 110))
 
     def __init__(self, parent, *, root: Path, on_pick,
-                 current: Path | None = None) -> None:
+                 current: Path | None = None, on_root_change=None) -> None:
         super().__init__(parent)
         self.root_dir = Path(root)
         self.on_pick = on_pick
+        # 换存放目录是"会话从哪来"的问题，入口就该在列出会话的地方。
+        # 2026-10-30 从第③步挪到这里：那一步的按钮预算是 5（判据在
+        # tests/selftest_gui_budget.py），而「点选球心」比它更常用 ——
+        # 镜面球没有可靠的自动初始化，每段录像几乎都要点一下。
+        self.on_root_change = on_root_change
         self.title("历史会话 · 单目")
         self.geometry("860x520")
         self.minsize(680, 400)
@@ -241,7 +295,19 @@ class MonoSessionPicker(tk.Toplevel):
         self.surface.primary(actions, "用这个会话", self._accept)
         self.surface.secondary(actions, "移到回收站", self._delete)
         self.surface.secondary(actions, "刷新", self._rescan)
+        # 兜底入口：默认 data/mono 装不下时换个盘，或把散落的录像放到新目录里。
+        self.surface.secondary(actions, "换目录…", self._change_root)
         self.surface.secondary(actions, "取消", self.destroy)
+        # 这句必须写在按钮下面：它刚从第③步搬过来，如果只有点开才知道是干什么的，
+        # 就等于从一个坑换到另一个坑。写清"平时不用动"和"它不搬已有会话"，
+        # 免得有人在会话丢了之后拿它当"修复"用。
+        notes = ttk.Frame(self)
+        notes.pack(fill="x", padx=16, pady=(0, 10))
+        self.surface.hint(
+            notes,
+            "「换目录…」平时不用动：只有会话根目录被移走、或录像改放到别的磁盘时，"
+            "才用它把上面的列表指到新位置。它只改「以后再录的存哪」，"
+            "不搬动已有会话，也不修复已经丢了的目录。")
 
         self._refresh()
         if current is not None:
@@ -291,6 +357,29 @@ class MonoSessionPicker(tk.Toplevel):
     def _rescan(self) -> None:
         self._rows = scan_mono_sessions(self.root_dir)
         self._refresh()
+
+    def _change_root(self) -> None:
+        """换会话根目录（兜底）：默认自动生成 data/mono/<时间戳>/，正常不用点。
+
+        为什么留在这里而不是第③步：「换目录」回答的是"会话从哪来"，
+        与本窗口列出的东西是同一个问题；而第③步的按钮预算只有 5，
+        那个位置留给了更常用的「点选球心」。
+        """
+        from tkinter import filedialog
+        chosen = filedialog.askdirectory(
+            title="选择单目会话的存放位置（每段录制在下面建一个时间戳目录）",
+            initialdir=str(self.root_dir), parent=self)
+        if not chosen:
+            return
+        self.root_dir = Path(chosen)
+        # 换根后**必须重扫**：不重扫的话列表还挂着旧目录的行，
+        # 点「用这个会话」就会把一个不在新根下的路径当成当前会话。
+        self._rescan()
+        if self.on_root_change is not None:
+            self.on_root_change(self.root_dir)
+        self.lbl_note.configure(
+            text=f"已换到 {self._short(self.root_dir)}；这里列出的是新目录下的会话",
+            style="Hint.TLabel")
 
     def _accept(self) -> None:
         row = self._selected()
@@ -393,6 +482,10 @@ class MonoWindow(tk.Toplevel):
         _root_txt = prefs.get_str("mono.session_root", "")
         self._session_root = Path(_root_txt) if _root_txt else MONO_SESSIONS_ROOT
         self._session: MonoSession | None = None
+        #: 当前会话里那份种子文件（有 = 「开始识别」走人工种子的跟踪）。
+        #: **每次刷新都从磁盘重取**：它不是输入，是派生事实；缓存久了就会
+        #: 与磁盘分叉（用户删了 seed.json，界面还在说"会用种子"）。
+        self._seed_json: Path | None = None
 
         # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
@@ -581,7 +674,17 @@ class MonoWindow(tk.Toplevel):
         self.surface.secondary(actions, "开始识别", self._start_by_source)
         self.btn_view3d = self.surface.secondary(actions, "看 3D", self._open_3d)
         self.surface.secondary(actions, "历史会话…", self._pick_session)
-        self.surface.secondary(actions, "换目录…", self._change_root)
+        # 镜面球没有可靠的自动初始化（实测 color 0/288 落在球上、hough 只有 1.4%，
+        # 半径中位 69.5 px vs 真值 91 px），所以"点一下球"是这类录像的唯一正路。
+        # 按钮预算 5 已被占满，于是把「换目录…」挪进「历史会话…」（见该窗口的说明）。
+        self.btn_seed = self.surface.secondary(actions, "点选球心", self._pick_seed)
+        self.btn_seed.state(["disabled"])       # 没会话/没视频时不可点，见 _sync_seed_button
+        self.surface.hint(
+            box,
+            "球是镜面的（镀铬、反光）时，自动检测会把书架/衣服当球：先录一段，"
+            "再点「点选球心」——第一点球心、第二点球边（半径不靠自动估），"
+            "之后「开始识别」用它跟踪，检测器会自动切成 specular。"
+            "换会话存放目录的入口在「历史会话…」里。")
 
     def _start_by_source(self) -> None:
         """「开始识别」：按上面的下拉决定走实时还是离线。
@@ -723,6 +826,10 @@ class MonoWindow(tk.Toplevel):
             self._session = self._reload_session()
         cur = self._session
         self._sync_view3d_button()
+        self._sync_seed_button()
+        # 种子路径每次都从磁盘重取（不是输入，是派生事实）：用户删掉 seed.json
+        # 之后界面若还在说"会用种子跟踪"，就是第二份会和磁盘分叉的真相。
+        self._seed_json = self._seed_path()
         if cur is None:
             self.lbl_session_dir.configure(text=self._preview_dir())
             self.lbl_session.configure(
@@ -769,6 +876,98 @@ class MonoWindow(tk.Toplevel):
         except tk.TclError:                 # 窗口已销毁
             pass
 
+    # ------------------------------------------------------------------ #
+    # 人工种子（点选球心）
+    # ------------------------------------------------------------------ #
+    def _clip_path(self) -> Path | None:
+        """当前会话那段原始视频；没有/坏会话 → ``None``（别让点击落到空上）。"""
+        cur = self._session
+        if cur is None or cur.error:
+            return None
+        return find_clip(cur.path)
+
+    def _seed_path(self) -> Path | None:
+        """当前会话的 ``derived/seed.json``；不存在 → ``None``。"""
+        cur = self._session
+        if cur is None or cur.error:
+            return None
+        p = Path(cur.path) / "derived" / SEED_NAME
+        return p if p.is_file() else None
+
+    def _seed_for_command(self, clip) -> tuple[str, str]:
+        """这段 clip 对应的种子 → (``--seed`` 的值, 提示)；值空 = 不传种子。
+
+        为什么按 ``clip.parent`` 找而不是 ``self._session``：走"选文件"兜底分支时
+        那段视频不在任何会话里，拿会话的种子去跟踪等于让它跟别的画面。
+        """
+        if clip is None:
+            return "", ""
+        path = Path(clip).parent / "derived" / SEED_NAME
+        if not path.is_file():
+            return "", ""
+        return seed_arg_from_file(path, image_size=self._image_size())
+
+    def _sync_seed_button(self) -> None:
+        """「点选球心」只在**会话里真有视频**时可点。
+
+        理由同 `_sync_view3d_button`：可点却弹一句"先录一段"的按钮，
+        比灰着（旁边有说明）更让人以为界面坏了。
+        """
+        btn = getattr(self, "btn_seed", None)
+        if btn is None:                     # 第③步还没建（构造顺序）
+            return
+        try:
+            btn.state(["!disabled"] if self._clip_path() is not None else ["disabled"])
+        except tk.TclError:                 # 窗口已销毁
+            pass
+
+    def _pick_seed(self) -> None:
+        """进程内打开单目点选窗，存了种子就把检测器切成 specular。
+
+        为什么是进程内（照 `apps/_gui_stereo.pick_seeds`）：``seed_picker.py``
+        只有类、没有 ``__main__``，``python apps/seed_picker.py`` 会立刻以 0
+        退出、什么窗口都不开 —— 那正是"点了没反应"的形状。
+        """
+        clip = self._clip_path()
+        if clip is None:
+            self.status.set_status(
+                "当前会话里没有视频：先「录制视频」，或从「历史会话…」挑一段已录好的",
+                "warn")
+            return
+        from apps.seed_picker import MonoSeedPicker
+
+        try:
+            diameter = float(self._diameter_arg())
+        except ValueError:
+            diameter = None                 # 框里写坏了就当没有：Z 那行会说明缺什么
+        picker = MonoSeedPicker(self, clip.parent, fx=self._current_fx(),
+                                diameter_mm=diameter)
+        self.wait_window(picker)
+        if not self._alive():
+            return
+        if picker.result is None:
+            self.status.set_status(
+                "没有保存种子：这段录像仍按自动检测跑（这颗球大概率检不出）", "info")
+            return
+        self._refresh_session()
+        value, note = seed_arg_from_file(picker.result,
+                                         image_size=(self._image_size()))
+        if not value:
+            self.status.set_status(f"种子存了但用不上：{note}", "warn")
+            return
+        self.var_detector.set(SEED_DETECTOR)
+        self.status.set_status(
+            f"种子已存：{self._short(Path(picker.result))}（球心 x,y 半径 = {value}）。"
+            f"点「开始识别」就按它跟踪，检测器已切成 {SEED_DETECTOR}"
+            f"（这颗球自动检测只能认到 1.4%，别再让它自己找）", "ok")
+
+    def _image_size(self) -> tuple[int, int] | None:
+        """当前会话的宽高（用来核对种子坐标是不是同一套画布）。读不到 → None。"""
+        cur = self._session
+        if cur is None or not cur.width or not cur.height:
+            return None
+        return (int(cur.width), int(cur.height))
+
     def _open_3d(self) -> None:
         """打开 3D 查看器。**单目也有三维**：``Z = f·D/(2r)``。
 
@@ -793,7 +992,8 @@ class MonoWindow(tk.Toplevel):
         MonoSessionPicker(
             self, root=self._session_root,
             current=self._session.path if self._session is not None else None,
-            on_pick=self._on_session_picked)
+            on_pick=self._on_session_picked,
+            on_root_change=self._on_root_changed)
 
     def _on_session_picked(self, path: str) -> None:
         if not self._alive():
@@ -812,15 +1012,14 @@ class MonoWindow(tk.Toplevel):
                 f"当前会话换成 {cur.id}（{cur.state}）；"
                 f"「开始识别」（来源「离线」）会直接处理它", "info")
 
-    def _change_root(self) -> None:
-        """换会话根目录（兜底）：默认自动生成 data/mono/<时间戳>/，正常不用点。"""
-        from tkinter import filedialog
-        chosen = filedialog.askdirectory(
-            title="选择单目会话的存放位置（每段录制在下面建一个时间戳目录）",
-            initialdir=str(self._session_root), parent=self)
-        if not chosen:
-            return
-        self._session_root = Path(chosen)
+    def _on_root_changed(self, new_root: Path) -> None:
+        """点选窗里换了存放目录：当前会话作废，只记住新根。
+
+        为什么要作废当前会话：它不在新根下了，"当前会话"若还指着旧目录，
+        接下来的检测/删除都在用户看不见的地方动 —— 换目录的本意是"以后录的
+        放到这里"，不是"把手上这段搬走"。
+        """
+        self._session_root = Path(new_root)
         self._session = None
         self._refresh_session()
         self.status.set_status(
@@ -1157,10 +1356,19 @@ class MonoWindow(tk.Toplevel):
         2026-10-29 增两件事：**显式传检测器**（界面选了 color 却跑别的、
         或反过来，都是静默失效）与 **``--vis-json``**（单目本来就有三维，
         以前只是从来没落盘，于是"主界面只能看双目"看起来像"单目没有 3D"）。
+
+        2026-10-30 增：当前会话有 ``derived/seed.json`` 时带 ``--seed x,y,r``，
+        并把检测器**强制**成 specular —— 那颗镜面球自动检测只能认到 1.4%，
+        用户点了球还让它自己找，等于白点。
         """
+        clip = find_clip(self._session.path) if self._session is not None else None
+        # 种子在**产生命令行之前**定：因为它会改写检测器（specular），
+        # 而 --method 跟着检测器走。放在后面拼，就是"带了种子却跑了别的检测器"。
+        seed_value, seed_note = self._seed_for_command(clip)
+        if seed_value:
+            self.var_detector.set(SEED_DETECTOR)     # 下拉框同步显示，不留两套口径
         method = self._method_arg()
         auto = self.var_detector.get() == SMART
-        clip = find_clip(self._session.path) if self._session is not None else None
         fx, fx_note = self._focal_arg()
         if clip is not None:
             derived = clip.parent / "derived"
@@ -1170,19 +1378,23 @@ class MonoWindow(tk.Toplevel):
                    "--out", str(derived / "annotated.mp4"),
                    "--csv", str(derived / "traj.csv"),
                    "--vis-json", str(derived / "visualization.json")]
+            if seed_value:
+                cmd += ["--seed", seed_value]
             if fx is not None:
                 # 与实时那边同口径：框里填了就传，不许静默不生效。
                 cmd += ["--focal", str(fx)]
             self._auto_retry_pending = auto
             self.app.tasks.start(cmd, f"离线单目：{clip.parent.name}（{method}）",
-                                 on_done=self._on_detected)
+                                  on_done=self._on_detected)
             self.status.set_status(
                 f"已启动离线单目：{self._short(clip)}（检测器 {method}）；结果写进 "
                 f"{self._short(derived)}/（跑完摘要会变成「已检测」，"
                 f"那时才能点「看 3D」）"
                 + ("。auto：若一帧都没检出会自动换 hough 重跑" if auto else "")
-                + (f"。注意：{fx_note}" if fx_note else ""),
-                "warn" if fx_note else "info")
+                + (f"。用你点的种子跟踪（{seed_value}），不再自动检测" if seed_value else "")
+                + (f"。注意：{fx_note}" if fx_note else "")
+                + (f"。注意：{seed_note}" if seed_note else ""),
+                "warn" if (fx_note or seed_note) else "info")
             return
 
         # 兜底走文件选择框：run_video.py 的 path 是必填位置参数，它自己不会弹
