@@ -80,6 +80,7 @@ config/*
 *.pth
 # 训练报告是本地产物（含本机绝对路径），只作证据留在本地
 models/*.report.json
+models/*.conf.json
 *.onnx
 
 # ---------- 自己录制的素材 ----------

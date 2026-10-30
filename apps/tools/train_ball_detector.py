@@ -72,7 +72,19 @@ EVAL_CONF = 0.02
 #: 阈值表的行。0.25 = 运行时默认（``DetectorConfig.yolo_conf``），加两档更宽的：
 #: 20 epoch 的模型在 val 上最高分中位只有 ~0.06，0.25 一刀下去是 0 检出 ——
 #: 只报默认值会把"阈值不匹配"误读成"模型没学会"。也加一档更严的做对照。
-CONF_GRID = (0.02, 0.05, 0.10, 0.25, 0.50)
+#: 表里的每一行都会被算出来，推荐阈值也只从这张表里挑（一次推理，不重复跑）。
+CONF_GRID = (0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.25, 0.50)
+#: 推荐阈值的扫描网格（升序）。比 ``CONF_GRID`` 少一档 0.50：那一档是"更严"的对照，
+#: 不可能成为"用最小代价换回大部分召回"的答案。
+#: 为什么从 0.02 起步而不是 0：conf=0 在 ultralytics 里等价于"全部输出"，
+#: 误检会铺满画面；而模型分数中位是 0.055 量级，0.02 已经足够宽。
+RECOMMEND_CONF_GRID = (0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.25)
+#: 推荐阈值的两条判据（"用最小的代价换回大部分召回"的量化版）：
+#: - 30 px 命中率不低于**最高命中率的这个比例**（少了说明确实丢了召回）；
+#: - 有检出的图不少于**带框图数的这个比例**（否则等于"大部分帧还是空的"）。
+#: 两条都满足的**最严**阈值才是答案：再往上提就要掉召回，往下放只是多收误检。
+RECALL_KEEP = 0.8
+DETECT_COVERAGE = 0.5
 #: 按**标签框长边**分桶（像素）。24 px 的球在 imgsz=640 下只剩 8 px，
 #: 拿一个平均值会把这种"必然检不到"的样本藏起来，所以要分开报。
 SIZE_BUCKETS = ((0.0, 48.0, "<48 px"), (48.0, 120.0, "48~120 px"), (120.0, 1e9, ">120 px"))
@@ -412,6 +424,96 @@ def size_bucket(side_px: float) -> str:
         if lo <= side_px < hi:
             return name
     return SIZE_BUCKETS[-1][2]
+
+
+def recommend_conf(by_conf: dict[str, dict], *, n_with_boxes: int,
+                   grid: tuple[float, ...] = RECOMMEND_CONF_GRID) -> tuple[float, dict] | None:
+    """从阈值表里挑"开箱默认值"，返回 ``(conf, 那一行)``；挑不出返回 ``None``。
+
+    判据（2026-10-30）：取同时满足
+
+    - ``30 px 命中率 ≥ RECALL_KEEP × 最高命中率``，且
+    - ``检出图数 ≥ DETECT_COVERAGE × 带框图数``
+
+    的阈值 —— 也就是"用最小的代价换回大部分召回"。
+
+    **扫描方向是"从最严往宽"，取第一个满足的**，这一点必须写清：命中率随阈值升高
+    单调下降，所以**升序取第一个永远返回网格里最小的那档**（0.02），而那恰好是
+    误检最多的一档 —— 与这条规则自己的用意（"不要取命中率最高那档"）相反。
+    降序扫描得到的才是"在保住大部分召回的前提下**最严**的门槛"：能提多高就提多高，
+    直到召回要掉下去为止。
+
+    **为什么不取命中率最高那档**：检测器在下游是**种子**，误检比漏检贵 ——
+    一个背景圆会把跟踪器带偏，而且看起来像一条正常轨迹（`docs/交接文档.md` §40.9）。
+    反过来，取"最干净"的高阈值就是现在这个 bug：召回直接归零。
+
+    全都不满足（模型根本没学会，所有档位命中率都≈0）时返回 ``None``：
+    这种情况不该往 sidecar 里写一个假阈值，让运行时退回配置默认值是更诚实的做法。
+    """
+    rows: list[tuple[float, dict]] = []
+    for conf in grid:
+        row = by_conf.get(f"{conf:.2f}")
+        if row is None:
+            continue
+        rows.append((float(conf), row))
+    if not rows:
+        return None
+    best_recall = max(float(row.get("recall_30px") or 0.0) for _c, row in rows)
+    if best_recall <= 0.0:
+        return None
+    need = DETECT_COVERAGE * max(1, n_with_boxes)
+    for conf, row in reversed(rows):          # 从最严往宽扫，理由见 docstring
+        if float(row.get("recall_30px") or 0.0) < RECALL_KEEP * best_recall:
+            continue
+        if int(row.get("n_matched") or 0) < need:
+            continue
+        return conf, row
+    return None
+
+
+def conf_sidecar_payload(center: dict, *, dataset: str) -> tuple[dict, dict] | None:
+    """组出 ``models/ball_yolo.conf.json`` 的内容，返回 ``(内容, 被选中的那一行)``。
+
+    没有可用推荐值时返回 ``None``（理由见 ``recommend_conf``）。
+    第二个返回值只用于打印，不落盘 —— 用它拼屏幕上的说明，可以避免在 main 里
+    再算一遍 ``recommend_conf``。
+
+    ``median_top1_conf`` 一起写进去，是因为它是"为什么需要这份 sidecar"的唯一证据：
+    分数中位 0.055 对上默认门槛 0.25，就是 0 检出。
+    ``scan`` 保留整张扫描表，让半年后的人能复核"为什么是这一档"，而不是只能相信数字。
+    """
+    headline = center.get("headline") or {}
+    rec = recommend_conf(center.get("by_conf") or {},
+                         n_with_boxes=int(headline.get("n_val_with_boxes") or 0))
+    if rec is None:
+        return None
+    conf, row = rec
+    payload = {
+        "recommended_conf": float(conf),
+        "median_top1_conf": headline.get("median_top1_conf"),
+        "dataset": str(dataset),
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "scan": [
+            {"conf": float(text), "recall_30px": float(r.get("recall_30px") or 0.0),
+             "n_matched": int(r.get("n_matched") or 0)}
+            for text, r in (center.get("by_conf") or {}).items()
+            if float(text) in {float(c) for c in RECOMMEND_CONF_GRID}
+        ],
+    }
+    return payload, row
+
+
+def write_conf_sidecar(out_path: Path, payload: dict) -> Path:
+    """把推荐阈值写到**权重旁边**：``models/ball_yolo.pt`` → ``models/ball_yolo.conf.json``。
+
+    后缀常量取自 ``sphere_tracker.detectors.neural``（运行时按同一后缀读回去）：
+    两边各写一份字面量，迟早漂成"写了但没人读"。
+    """
+    from sphere_tracker.detectors.neural import CONF_SIDECAR_SUFFIX
+
+    path = out_path.with_suffix(CONF_SIDECAR_SUFFIX)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def _threshold_row(deltas: list[float], with_boxes: int, n_all: int,
@@ -802,6 +904,24 @@ def main(argv: list[str] | None = None) -> int:
     center = evaluate(model, stats, imgsz=args.imgsz, device=args.device)
     for line in summary_lines(center):
         print(line)
+
+    # ---- 阈值 sidecar：让"训完就能用"不依赖用户去改配置 ----
+    # 没有它，运行时用配置默认 0.25，而这份权重的分数中位在 0.05 量级 ⟹ 0 检出，
+    # 用户看到的却是"模型没学会"。
+    sidecar = conf_sidecar_payload(center, dataset=str(stats.root))
+    if sidecar is None:
+        print("[阈值] val 上没有一档满足推荐条件（命中率全为 0），不写 sidecar："
+              "运行时退回配置默认值 —— 这时候的问题是模型/数据，不是门槛")
+    else:
+        payload, row = sidecar
+        conf_path = write_conf_sidecar(out_path, payload)
+        print(f"[阈值] 推荐 conf={payload['recommended_conf']:g}"
+              f"（val 30 px 命中 {row['recall_30px'] * 100:.0f}%、"
+              f"检出 {row['n_matched']}/{center['headline']['n_val_with_boxes']} 张带框图；"
+              f"top-1 分数中位 {payload['median_top1_conf']:.2f}）→ {conf_path}")
+        print("       规则：升序扫 " + "/".join(f"{c:g}" for c in RECOMMEND_CONF_GRID)
+              + f"，取第一个命中 ≥ {RECALL_KEEP:.0%}×最高命中、"
+              f"且检出图 ≥ {DETECT_COVERAGE:.0%}×带框图的阈值（不是命中率最高那档）")
 
     report = {
         "schema": "ball-detector-report",

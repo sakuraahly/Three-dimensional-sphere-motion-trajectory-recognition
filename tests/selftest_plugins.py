@@ -30,6 +30,9 @@ fusion 的成员拼错（不在注册表里）           `fusion_members += ["co
 自训模型也按 `[32]` 过滤                    `resolve_classes_filter` 恒返回配置    exit=1
 自动优选覆盖显式权重                        去掉"显式路径不替换"的分支             exit=1
 前置检查放行 1 个会话                        `MIN_SESSIONS = 1`                    exit=1
+采纳 sidecar 的推荐阈值却不生效              删掉 `_adopt_recommended_conf` 的赋值   exit=1
+推荐阈值退回"升序取第一个"（永远 0.02）       `reversed(rows)` → `rows`              exit=1
+`--conf` 缺省又变回 0.25                     `default=0.25`                         exit=1
 ==========================================  ====================================  ========
 
 用法::
@@ -389,6 +392,164 @@ def _check_train_tool_preflight() -> list[tuple[str, bool]]:
     return checks
 
 
+def _check_conf_calibration() -> list[tuple[str, bool]]:
+    """自训权重旁的推荐阈值（sidecar）：只该在"自动权重 + 用户没表态"时生效。
+
+    现场：20 epoch 权重在 val 上 top-1 分数**中位 0.055**，而 ``yolo_conf`` 默认 0.25，
+    于是一刀切下去 689 张带框图一张不剩 —— 用户看到"训完了还是什么都没有"，
+    结论就成了"这个 YOLO 完全没用"。所以训练端把"该用多少"写进权重旁边的 sidecar，
+    运行时在用户没说话时照着用。
+
+    这里守的是**四条"不许替用户做主"**（显式权重 / 显式 --conf / 配置里写了别的值 /
+    sidecar 读不到），以及"采纳这个动作真的写进了配置"。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _Path
+
+    from sphere_tracker.detectors.neural import (SELF_TRAINED_WEIGHTS, YoloDetector,
+                                                 conf_is_explicit, load_recommended_conf,
+                                                 mark_conf_explicit, resolve_effective_conf)
+
+    checks: list[tuple[str, bool]] = []
+    default_conf = DetectorConfig().yolo_conf
+    with tempfile.TemporaryDirectory() as td:
+        root = _Path(td)
+        (root / "models").mkdir()
+        (root / SELF_TRAINED_WEIGHTS).write_bytes(b"")      # 空文件就够：只判存在
+        sidecar = root / "models" / "ball_yolo.conf.json"
+        sidecar.write_text(json.dumps({"recommended_conf": 0.05,
+                                       "median_top1_conf": 0.055}), encoding="utf-8")
+
+        got = resolve_effective_conf(DetectorConfig(), SELF_TRAINED_WEIGHTS, auto=True, root=root)
+        checks.append(("自动优选权重 + 用户没给 --conf → 采用 sidecar 的 0.05", got == 0.05))
+
+        no_auto = resolve_effective_conf(DetectorConfig(), SELF_TRAINED_WEIGHTS,
+                                        auto=False, root=root)
+        checks.append(("显式 --weights（auto=False）→ 不采用（他自己挑的权重，门槛也归他）",
+                       no_auto is None))
+
+        explicit = DetectorConfig()
+        mark_conf_explicit(explicit)
+        checks.append(("显式 --conf 0.25（值恰好等于配置默认）→ 不覆盖",
+                       conf_is_explicit(explicit)
+                       and resolve_effective_conf(explicit, SELF_TRAINED_WEIGHTS,
+                                                  auto=True, root=root) is None))
+
+        from_file = DetectorConfig()
+        from_file.yolo_conf = 0.10
+        checks.append(("配置文件里写了 0.10 → 不覆盖（那也是用户的选择）",
+                       resolve_effective_conf(from_file, SELF_TRAINED_WEIGHTS,
+                                              auto=True, root=root) is None))
+
+        # "采纳"这个动作本身：删掉 _adopt_recommended_conf 里的赋值，这两条立刻红
+        det = YoloDetector(DetectorConfig())
+        adopted = det._adopt_recommended_conf(SELF_TRAINED_WEIGHTS, auto=True, root=root)  # noqa: SLF001
+        checks.append((f"采纳动作真的写进了 cfg（{det.cfg.yolo_conf:g}，detect() 每帧读它）",
+                       adopted == 0.05 and abs(det.cfg.yolo_conf - 0.05) < 1e-9))
+
+        det2 = YoloDetector(DetectorConfig())
+        mark_conf_explicit(det2.cfg)
+        checks.append(("显式 conf 时采纳动作什么都不做",
+                       det2._adopt_recommended_conf(SELF_TRAINED_WEIGHTS,  # noqa: SLF001
+                                                    auto=True, root=root) is None
+                       and det2.cfg.yolo_conf == default_conf))
+
+        sidecar.write_text("{ 这不是 json", encoding="utf-8")
+        checks.append(("sidecar 损坏 → 返回 None（不抛：可选文件不许拖垮整段录像）",
+                       load_recommended_conf(SELF_TRAINED_WEIGHTS, root=root) is None))
+        sidecar.write_text(json.dumps({"recommended_conf": 0}), encoding="utf-8")
+        checks.append(("sidecar 值越界（0）→ 当作没写",
+                       load_recommended_conf(SELF_TRAINED_WEIGHTS, root=root) is None))
+        sidecar.unlink()
+        checks.append(("sidecar 缺失 → 退回配置默认值",
+                       load_recommended_conf(SELF_TRAINED_WEIGHTS, root=root) is None
+                       and resolve_effective_conf(DetectorConfig(), SELF_TRAINED_WEIGHTS,
+                                                  auto=True, root=root) is None))
+    return checks
+
+
+def _check_conf_recommend_rule() -> list[tuple[str, bool]]:
+    """训练端"推荐阈值"的规则：取**保住 80% 命中且过半图有检出**的最严门槛。
+
+    用真实扫描表（``models/ball_yolo.report.json`` 的 20 epoch 结果）当样例：
+    0.02 → 88% / 617 图，0.03 → 79% / 557，0.05 → 49% / 348，0.08 → 23% / 166。
+    所以答案必须是 0.03：再往上提（0.05）召回腰斩，往下放（0.02）只多收误检。
+    """
+    tool = _load_train_tool()
+    checks: list[tuple[str, bool]] = []
+
+    scan = {f"{c:.2f}": {"recall_30px": r, "n_matched": m} for c, r, m in (
+        (0.02, 0.8795, 617), (0.03, 0.7939, 557), (0.05, 0.4920, 348),
+        (0.08, 0.2337, 166), (0.10, 0.1379, 100), (0.15, 0.0247, 18),
+        (0.25, 0.0, 0))}
+    rec = tool.recommend_conf(scan, n_with_boxes=689)
+    rec_text = f"{rec[0]:g}" if rec else "无"
+    checks.append((f"真实扫描表 → {rec_text}（应为 0.03："
+                   "保住 80% 命中前提下最严，而不是命中率最高的 0.02）",
+                   rec is not None and abs(rec[0] - 0.03) < 1e-9))
+
+    # 覆盖率那条独立起作用：0.03 命中够但检出图太少，答案要往后挪
+    thin = {"0.02": {"recall_30px": 0.88, "n_matched": 689},
+            "0.03": {"recall_30px": 0.87, "n_matched": 300},
+            "0.05": {"recall_30px": 0.85, "n_matched": 400}}
+    rec_thin = tool.recommend_conf(thin, n_with_boxes=689)
+    checks.append(("检出覆盖率不足（300 < 半数 344）时跳过该档 → 退到 0.05",
+                   rec_thin is not None and abs(rec_thin[0] - 0.05) < 1e-9))
+
+    dead = {f"{c:.2f}": {"recall_30px": 0.0, "n_matched": 0}
+            for c in tool.RECOMMEND_CONF_GRID}
+    checks.append(("全表命中率为 0（模型没学会）→ 不给推荐值（不往 sidecar 写假阈值）",
+                   tool.recommend_conf(dead, n_with_boxes=689) is None))
+
+    pair = tool.conf_sidecar_payload(
+        {"headline": {"n_val_with_boxes": 689, "median_top1_conf": 0.055}, "by_conf": scan},
+        dataset="outputs/ball_dataset")
+    needed = ("recommended_conf", "median_top1_conf", "dataset", "created")
+    checks.append(("sidecar 的四个必填键都在",
+                   pair is not None and all(k in pair[0] for k in needed)))
+
+    # 反向自证：把 RECALL_KEEP 放到 0.2，"最严"就一路爬到 0.25 —— 说明断言钉在这条规则上
+    original = tool.RECALL_KEEP
+    try:
+        tool.RECALL_KEEP = 0.2
+        loose = tool.recommend_conf(
+            {"0.02": {"recall_30px": 0.90, "n_matched": 620},
+             "0.25": {"recall_30px": 0.30, "n_matched": 600}}, n_with_boxes=689)
+    finally:
+        tool.RECALL_KEEP = original
+    checks.append(("阈值语义：RECALL_KEEP 放松到 0.2 时同一张表会选 0.25（规则真的在起作用）",
+                   loose is not None and abs(loose[0] - 0.25) < 1e-9
+                   and original == 0.8))
+    return checks
+
+
+def _check_run_video_conf_flags() -> list[tuple[str, bool]]:
+    """``run_video`` 的两个旋钮必须"未指定"与"指定了默认值"可区分。
+
+    ``--conf`` 的缺省值**绝不能**是 0.25：那样"用户没说话"和"用户说了 0.25"
+    在配置里长得一模一样，阈值校准会替一个明确表过态的人改门槛。
+    """
+    from apps import run_video as rv
+
+    checks: list[tuple[str, bool]] = []
+    old = sys.argv
+    try:
+        sys.argv = ["run_video.py", "x.mkv"]
+        quiet = rv.parse_args()
+        sys.argv = ["run_video.py", "x.mkv", "--conf", "0.25", "--imgsz", "960"]
+        loud = rv.parse_args()
+    finally:
+        sys.argv = old
+    checks.append(("run_video：--conf 默认是 None（能区分「没给」与「给了 0.25」）",
+                   quiet.conf is None))
+    checks.append(("run_video：--imgsz 默认是 None（不覆盖配置里的 yolo_imgsz）",
+                   quiet.imgsz is None))
+    checks.append(("run_video：显式 --conf / --imgsz 照收",
+                   loud.conf == 0.25 and loud.imgsz == 960))
+    return checks
+
+
 def _check_radius_evidence() -> list[tuple[str, bool]]:
     """无种子时"检测器框半径有没有边缘证据"的判定（run_video 的 [半径] 那行）。
 
@@ -465,6 +626,10 @@ def main() -> int:
                   + _check_weights_preference()
                   + _check_train_tool_preflight())),
         ("7. 半径证据（无种子时 [半径] 告警）", _check_radius_evidence),
+        ("8. 阈值校准（sidecar / 推荐规则 / --conf 缺省值）",
+         lambda: (_check_conf_calibration()
+                  + _check_conf_recommend_rule()
+                  + _check_run_video_conf_flags())),
     ):
         print(f"----- {section} -----")
         got = fn()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import cv2
+import json
 import math
 import numpy as np
 from pathlib import Path
@@ -21,6 +22,104 @@ COCO_CLASS_COUNT = 80
 
 #: 自训单类球检测器的默认落点（``apps/tools/train_ball_detector.py --out``）。
 SELF_TRAINED_WEIGHTS = "models/ball_yolo.pt"
+
+#: 建议置信度阈值 sidecar 的后缀。训练结束时写在**权重旁边**（``ball_yolo.pt`` →
+#: ``ball_yolo.conf.json``）。
+#:
+#: 为什么需要它（2026-10-30 实测）：20 epoch 的 ``models/ball_yolo.pt`` 在 val 上
+#: top-1 分数**中位只有 0.055**，而 ``DetectorConfig.yolo_conf`` 默认 0.25 ——
+#: 0.25 不是"滤掉误检"，是把 689 张带框图**一张不剩**地滤掉。用户看到的现象是
+#: "我训完了，检测还是什么都没有"，于是判断"这个 YOLO 完全没用"。
+#: 阈值该取多少**只有训练那边知道**（它手里有带标注的 val），所以由它写下来，
+#: 运行时在"用户没说过该用多少"的前提下照着用。
+CONF_SIDECAR_SUFFIX = ".conf.json"
+
+#: 显式给过 ``--conf`` 的配置（``id(配置) → 配置``）。
+#:
+#: 为什么要外挂一份记忆：``config.py`` 是公开契约（另一支在改），加一个
+#: ``yolo_conf_explicit`` 字段会把"一次运行里的输入来源"写进持久配置；
+#: 而这里要回答的恰恰是"**这一次**的 conf 是人给的吗"。同理不能拿
+#: ``cfg.yolo_conf != 0.25`` 去推断 —— 用户显式写 ``--conf 0.25`` 时值不变，
+#: 但那仍然是他的选择，覆盖它等于把他的选择藏起来。
+#: 存**强引用**而不是只存 id：只存 id 时对象被回收后 id 会被复用，
+#: 下一个配置可能被误判成"显式"。
+_EXPLICIT_CONF: dict[int, DetectorConfig] = {}
+
+
+def mark_conf_explicit(cfg: DetectorConfig) -> None:
+    """声明"这份配置的 ``yolo_conf`` 是用户显式给的"，运行时不再按 sidecar 校准。
+
+    只有 ``apps/run_video.py`` 在 ``--conf`` 出现时调用；别的入口不给就是不标记，
+    于是它们仍然享受"开箱能用"的默认校准。
+    """
+    _EXPLICIT_CONF[id(cfg)] = cfg
+
+
+def conf_is_explicit(cfg: DetectorConfig) -> bool:
+    """这份配置的 ``yolo_conf`` 是否由用户显式指定（见 ``mark_conf_explicit``）。"""
+    return _EXPLICIT_CONF.get(id(cfg)) is cfg
+
+
+def conf_sidecar_path(weights: str, *, root: Path | None = None) -> Path:
+    """``models/ball_yolo.pt`` → ``<项目根>/models/ball_yolo.conf.json``。"""
+    root = _PROJECT_ROOT if root is None else Path(root)
+    path = Path(str(weights).replace("\\", "/"))
+    if not path.is_absolute():
+        path = root / path
+    return path.with_suffix(CONF_SIDECAR_SUFFIX)
+
+
+def load_recommended_conf(weights: str, *, root: Path | None = None) -> float | None:
+    """读权重旁的 sidecar，返回建议阈值；缺失 / 损坏 / 越界一律返回 ``None``。
+
+    这里**绝不抛**：sidecar 是"锦上添花"的校准信息，读不到就该退回配置值继续跑。
+    为了一个可选文件让整段录像跑不起来，是拿次要的东西换掉主要的东西。
+    越界（≤0 或 ≥1）也当没写：0 会把所有像素都当球，1 会滤掉一切，
+    两个极端都比"用配置默认值"更糟。
+    """
+    path = conf_sidecar_path(weights, root=root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        value = float(payload.get("recommended_conf"))
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < value < 1.0) or not math.isfinite(value):
+        return None
+    return value
+
+
+def resolve_effective_conf(cfg: DetectorConfig, weights: str, *, auto: bool,
+                          root: Path | None = None) -> float | None:
+    """返回"这次该采用的推荐阈值"，``None`` = 不动配置。
+
+    四个条件缺一不可，每个都对应一种"不许替用户做主"的场景：
+
+    1. ``auto``：权重是**自动优选**出来的。用户显式 ``--weights`` 时他知道自己要哪份
+       权重，也就该由他自己决定门槛；
+    2. 用户没显式给 ``--conf``（见 ``mark_conf_explicit``）；
+    3. 配置里的值仍是**默认值**。配置文件里写了 0.10 同样是用户的选择；
+    4. sidecar 里有一个可用值，且和当前值不同（相同就没有"采用"这回事）。
+    """
+    if not auto or conf_is_explicit(cfg):
+        return None
+    default = float(DetectorConfig().yolo_conf)
+    if abs(float(cfg.yolo_conf) - default) > 1e-9:
+        return None
+    value = load_recommended_conf(weights, root=root)
+    if value is None or abs(value - float(cfg.yolo_conf)) <= 1e-9:
+        return None
+    return value
+
+
+def conf_notice(adopted: float, default: float) -> str:
+    """采用推荐阈值时的那一行。**必须打**：它解释"为什么跑出来的和配置不一样"。"""
+    return (f"[阈值] 自训权重建议 conf={adopted:g}（配置默认 {default:g} 会把所有框滤掉），"
+            "已采用；要覆盖请显式 --conf")
 
 
 def resolve_effective_weights(weights: str, *, root: Path | None = None) -> tuple[str, bool]:
@@ -119,6 +218,12 @@ class YoloDetector(BaseDetector):
     ``resolve_effective_weights``。自训模型是单类（0=ball），
     所以类别过滤只对 COCO-80 生效（见 ``resolve_classes_filter``）。
 
+    **阈值也一起校准**：同一份权重旁边若有一份 ``*.conf.json``（训练端在 val 上
+    扫出来的推荐阈值），且这次是自动优选权重的、用户又没显式给过 ``--conf``，
+    就采用它并打一行 ``[阈值]`` 说明 —— 见 ``resolve_effective_conf``。理由是
+    分数尺度：20 epoch 的权重在 val 上 top-1 分数中位只有 0.055，默认 0.25 会把
+    所有框滤掉，"训完了还是什么都没有"就是这么来的。
+
     安装：pip install ultralytics
     """
 
@@ -159,7 +264,26 @@ class YoloDetector(BaseDetector):
             # 显式指定的也要打一行：跑完只剩日志时，"3 epoch 的权重还是 20 epoch 的"
             # 决定了这份结果是能用的还是仅供流程验证，而日志里本来一个字都没有。
             print(f"[模型] 用显式指定的权重 {weights}")
+        # 阈值校准：只在"权重是自动优选的 + 用户没说过 conf"时才用 sidecar。
+        # 顺序上放在加载成功之后 —— 权重都加载不了，谈门槛没有意义。
+        self._adopt_recommended_conf(weights, auto=auto)
         return self._model
+
+    def _adopt_recommended_conf(self, weights: str, *, auto: bool,
+                                root: Path | None = None) -> float | None:
+        """把权重旁 sidecar 的推荐阈值装进 ``self.cfg``；返回采用的值（没采用则 ``None``）。
+
+        抽成独立方法是为了能被**直接断言**：真正"采纳"这个动作发生在这里，
+        只测 ``resolve_effective_conf`` 的话，把这一句赋值删掉测试也不会红 ——
+        而那正是"看起来校准了、其实没生效"的典型形态。
+        """
+        adopted = resolve_effective_conf(self.cfg, weights, auto=auto, root=root)
+        if adopted is None:
+            return None
+        default_conf = float(DetectorConfig().yolo_conf)
+        self.cfg.yolo_conf = adopted      # detect() 每帧读它，改在这里就够
+        print(conf_notice(adopted, default_conf))
+        return adopted
 
     def detect(self, frame: np.ndarray, ctx=None) -> list[Detection]:
         model = self._ensure_model()
