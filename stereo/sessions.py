@@ -11,7 +11,7 @@
 
     from stereo.sessions import create_session, save_session, load_session, validate_session
 
-    session_dir, s = create_session("data/sessions", label="ball01")
+    session_dir, s = create_session("data/stereo", label="ball01")
     s.left = CameraInfo(role="left", video="left.mkv", width=1920, height=1080, frame_count=300)
     ...
     save_session(s, session_dir)

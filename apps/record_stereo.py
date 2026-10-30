@@ -88,6 +88,7 @@ from sphere_tracker.sources import (                         # noqa: E402
     INDEX_BACKEND,
     CameraSource,
 )
+from sphere_tracker.paths import STEREO_ROOT                 # noqa: E402
 from sphere_tracker.video_profiles import DEFAULT_FPS, RECORD_DEFAULT      # noqa: E402
 from stereo.sessions import (                                # noqa: E402
     CalibrationInfo,
@@ -446,7 +447,8 @@ def main() -> int:
                          "ffv1（更通用但很慢）")
     ap.add_argument("--duration", type=float, default=10.0, help="录制秒数")
     ap.add_argument("--countdown", type=float, default=3.0)
-    ap.add_argument("--out", default=str(ROOT / "data" / "sessions"))
+    # 新会话一律写到 `data/stereo/`（这是**写**路径，所以只认新根，不扫旧位置）
+    ap.add_argument("--out", default=str(STEREO_ROOT))
     ap.add_argument("--calib", default=str(ROOT / "config" / "stereo_calibration"))
     ap.add_argument("--baseline-mm", type=float, default=None,
                     help="物理基线（只作核对；不填则会话里不记）")

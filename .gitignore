@@ -90,6 +90,8 @@ assets/videos/*
 # 一次采集 = 一个目录（两路无损视频 + session.json + 标定快照），体积大、不可再生。
 # 只保留 README；会话必须单独备份（外部硬盘 / 网盘），不要指望 git。
 data/sessions/*
+# 2026-10-30：双目会话搬到 data/stereo/（与 data/mono/ 对称）；旧目录仍会读
+data/stereo/*
 data/raw/*
 data/calib_pairs/*
 data/calib/*

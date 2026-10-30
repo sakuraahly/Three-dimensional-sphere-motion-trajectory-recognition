@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -38,11 +39,10 @@ from apps._gui_stereo import SessionPicker, pick_seeds
 from apps._gui_widgets import BG, ScrollPage, StatusBar, Surface
 from apps._task_runner import ROOT
 from apps._workbench import SessionSummary, scan_sessions, summarize_session
+from sphere_tracker.paths import stereo_roots
 
 __all__ = ["BenchWindow", "STEPS", "step_states", "summary_text",
            "next_step_text", "offline_cmd", "visualization_path"]
-
-SESSIONS_ROOT = ROOT / "data" / "sessions"
 
 #: ①–⑤ 的键。顺序即界面顺序，也即"按这个顺序做"。
 STEPS = ("check", "seed", "run", "view", "export")
@@ -384,6 +384,18 @@ class BenchWindow(tk.Toplevel):
 
 def _latest_session() -> Path | None:
     """最近一段会话。排序规则交给 ``_workbench.scan_sessions``（按目录名时间戳，
-    不按 mtime —— 补跑一次离线会把 mtime 刷成今天，默认值就漂了）。"""
-    rows = scan_sessions(SESSIONS_ROOT, limit=1)
-    return rows[0].path if rows else None
+    不按 mtime —— 补跑一次离线会把 mtime 刷成今天，默认值就漂了）。
+
+    旧位置也要看（``stereo_roots()``）：工作台的默认会话是**读**，迁移前后都得选得中。
+    两个根各自取最新的那一段，再在这两段之间比 —— 段内排序仍由 `_workbench` 定，
+    这里只比两段的目录名（`YYYYMMDD-HHMMSS` 可直接字符串比较，不规范的退回 mtime）。
+    """
+    rows = [r for root in stereo_roots() for r in scan_sessions(root, limit=1)]
+    if not rows:
+        return None
+
+    def key(s: SessionSummary) -> tuple[str, float]:
+        m = re.match(r"(\d{8}-\d{6})", s.id)
+        return (m.group(1) if m else "", s.path.stat().st_mtime)
+
+    return max(rows, key=key).path

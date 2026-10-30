@@ -33,6 +33,9 @@
 命令行界面少了 `f` / `s` 菜单项           从 ACTIONS 里删一个键                       exit=1
 `run_all.py` 跳步时不说明原因             把 `_skip(...)` 的 reason 改成空串          exit=1
 `run_all.py` 把"跳过"当"通过"             退出码固定返回 0                            exit=1
+数据目录又出现裸拼 `data/sessions`         往 `apps/run_all.py` 塞                     exit=1
+                                          `X = ROOT / "data" / "sessions"`
+`stereo_roots()` 顺序反过来               把元组改成 (旧, 新)                        exit=1
 ========================================  ==========================================  ========
 
 用法::
@@ -612,6 +615,141 @@ def test_path_bootstrap_is_marker_based() -> bool:
     return not violations
 
 
+#: 裸拼 `data/sessions` 的三种形态：
+#: ① 整串成一个字面量 —— `"data/sessions"` / `'data\\sessions'`
+#: ② 两段各自成串再拼 —— `ROOT / "data" / "sessions"` / `Path("data", "sessions")`
+#: ③ f-string 拼出来的真路径 —— `f"data/sessions/{sid}"`（必须是 f 前缀 + 开头就命中，
+#:    避免把 `help="data/sessions/<id> 目录或 session.json"` 这类**说明文字**也算进来）
+#: `[/\\,]` 同时接受 `/`、`\` 与逗号（`os.path.join` / `Path(...)` 的写法），
+#: `\s*` 允许跨行 —— 8 处旧代码里就有换行写的。
+_BARE_LAYOUT = (
+    re.compile(r"""['"]\s*data\s*[/\\]+\s*sessions\s*['"]""", re.IGNORECASE),
+    re.compile(r"""['"]\s*data\s*['"]\s*[/\\,]\s*['"]\s*sessions\s*['"]""",
+               re.IGNORECASE),
+    re.compile(r"""(?<![A-Za-z0-9_])(?:rf|fr|f)['"]\s*data\s*[/\\]+\s*sessions""",
+               re.IGNORECASE),
+)
+
+
+def _code_only(src: str) -> str:
+    """去掉注释但**保留字符串**（路径是字符串，字符串才是要找的东西）。
+
+    不按 `#` 截断：本项目里 `"#0f4c81"` 这类颜色常量到处都是，按 `#` 截会把代码
+    截成半句，正则反而永远匹配不到真正的问题。
+    """
+    import io
+    import tokenize as _tokenize
+
+    out: list[str] = []
+    try:
+        for tok in _tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type == _tokenize.COMMENT:
+                continue
+            out.append(tok.string)
+    except (_tokenize.TokenError, IndentationError, SyntaxError):
+        return src            # 解析不了就退回原文：宁可多报，不要漏报
+    return " ".join(out)
+
+
+def test_data_layout_single_source() -> bool:
+    """`data/` 的目录名只在一处定义：`sphere_tracker/paths.py`。
+
+    ## 为什么它是主判据
+
+    `data/sessions` 这个字面量曾经**散在 8 处**（`data_manager` / `record_stereo` /
+    `check_dataset` / `view_3d` / `_gui_app` / `_gui_bench` / `_gui_stereo` / 文档）。
+    而 `data/sessions` 里只有**双目**会话、单目另起 `data/mono` —— 于是"会话"在磁盘上
+    指两个不同东西（2026-10-29 用户原话："data 下面 session 和 mono 命名有歧义"）。
+    只要还允许各处自己拼路径，改布局就必然漏几处，漏掉的几处**不会报错** ——
+    只会静默读写一个空目录。这正是本项目反复吃过的形状。
+
+    ## 三条断言分别防什么
+
+    1. **不许裸拼接**：递归扫 `apps/` 与 `stereo/`（`apps/tools/` 也在内）。
+       这不是代码风格，是"还有没有第二份真相"。
+    2. **顺序即优先级**：`stereo_roots()` 第一项必须是新的 `STEREO_ROOT`。
+       顺序反了不会崩，只会在"新旧位置各有一段同名会话"时**选中旧的那段**。
+    3. **兼容真的有效**：在 `STEREO_ROOT` 与 `LEGACY_STEREO_ROOT` 各造一段临时会话，
+       断言默认扫描（不传参数）**两条都列得出来**。只在注释里写"兼容旧位置"不算数。
+
+    ## 反向自证（改了就会红）
+
+    往 `apps/run_all.py` 里塞一行 `X = ROOT / "data" / "sessions"` → 断言 1 报出
+    该文件并返回 False（实测输出见交接报告）。
+    """
+    import shutil
+
+    from sphere_tracker.paths import LEGACY_STEREO_ROOT, STEREO_ROOT, stereo_roots
+
+    print("----- 数据目录只有一个来源 -----")
+    checks: list[tuple[str, bool]] = []
+
+    # ---- 1. 不许有裸拼接 ----
+    targets = sorted((ROOT / "apps").rglob("*.py")) + \
+        sorted((ROOT / "stereo").rglob("*.py"))
+    offenders: list[str] = []
+    for path in targets:
+        try:
+            src = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for pat in _BARE_LAYOUT:
+            for m in pat.finditer(_code_only(src)):
+                # token 化后行号会错位，报"文件 + 命中文本"足够定位（单个文件都短）
+                offenders.append(
+                    f"{path.relative_to(ROOT).as_posix()} 命中 {m.group(0)!r}")
+    for line in offenders:
+        print(f"    [不达标] {line}")
+    checks.append((f"{len(targets)} 个文件里没有裸拼 data/sessions"
+                   f"（发现 {len(offenders)} 处）", not offenders))
+
+    # ---- 2. stereo_roots() 新的在前 ----
+    roots = stereo_roots()
+    order_ok = bool(roots) and roots[0] == STEREO_ROOT \
+        and STEREO_ROOT in roots and LEGACY_STEREO_ROOT in roots
+    print(f"  stereo_roots() = {[r.relative_to(ROOT).as_posix() for r in roots]}")
+    checks.append(("stereo_roots() 第一项是新的 data/stereo（新旧都在元组里）", order_ok))
+
+    # ---- 3. 新旧两个根都能被扫到（造真目录，跑完删） ----
+    # 名字用 1990 开头：按目录名倒序排永远在最后，不会顶掉界面上的"最近会话"。
+    probes = {"new": STEREO_ROOT / "19900101-000001-layout-probe",
+              "old": LEGACY_STEREO_ROOT / "19900101-000002-layout-probe"}
+    found_default: list[str] = []
+    found_per_root: list[str] = []
+    err = ""
+    try:
+        for p in probes.values():
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "session.json").write_text(
+                '{"label": "布局探针", "left": {"frame_count": 1}}', encoding="utf-8")
+
+        from apps._gui_stereo import scan_sessions as gui_scan
+        names = {p.name for p in probes.values()}
+        found_default = [r["id"] for r in gui_scan() if r["id"] in names]
+
+        # 库层也验一遍：单根 list_sessions 在新/旧根上各能列出自己那一段
+        from stereo.sessions import list_sessions
+        for key, root in (("new", STEREO_ROOT), ("old", LEGACY_STEREO_ROOT)):
+            if probes[key] in list_sessions(root):
+                found_per_root.append(key)
+    except Exception as exc:                            # noqa: BLE001
+        err = f"{type(exc).__name__}: {exc}"
+    finally:
+        for p in probes.values():
+            shutil.rmtree(p, ignore_errors=True)
+
+    print(f"  默认扫描 scan_sessions() 列出：{sorted(found_default)}"
+          f"{'  ' + err if err else ''}")
+    checks.append(("默认扫描同时列出新位置与旧位置的会话（兼容真的有效，不是注释）",
+                   len(found_default) == 2))
+    checks.append((f"库层 list_sessions 在两个根上各能列出（{sorted(found_per_root)}）",
+                   len(found_per_root) == 2))
+
+    for label, good in checks:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+    return all(good for _label, good in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("入口一致性自测（三个入口 -> 同一个测试运行器 / 规范检查器）")
@@ -624,6 +762,7 @@ def main() -> int:
                test_agreement_across_entrypoints,
                test_every_cli_parses,
                test_path_bootstrap_is_marker_based,
+               test_data_layout_single_source,
                test_shared_arg_blocks,
                test_run_all_orchestrator):
         results.append(fn())

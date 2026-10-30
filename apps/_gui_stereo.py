@@ -34,6 +34,7 @@ from tkinter import ttk
 from apps._gui_widgets import BG, INK, MUTED, WARN, ScrollPage, StatusBar, Surface
 from apps._collapsible import CollapsibleSection
 from apps._task_runner import ROOT
+from sphere_tracker.paths import stereo_roots
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
@@ -194,8 +195,10 @@ def record_args(*, left: str = "left", right: str = "right", duration: str = "10
 def record_out_dir(label: str, root: Path | None = None) -> Path:
     """录制输出目录：``data/<标签>``，标签留空用 ``stereo_session``。
 
-    为什么不用 `record_stereo.py --out` 的默认值（``data/sessions``）：那样
+    为什么不用 `record_stereo.py --out` 的默认值（``data/stereo``）：那样
     两段录制会落进同一个目录、互相覆盖。标签即目录名，是这里早就定下的约定。
+    （⚠️ 这里拼的仍是 ``data/<标签>``，**没有**进 ``data/stereo/``：改它会连带改
+    `tests/selftest_gui_budget.py` 里钉死这条行为的断言，留给单独一次改动。）
     """
     base = root if root is not None else ROOT
     return base / "data" / (str(label or "").strip() or "stereo_session")
@@ -204,17 +207,41 @@ def record_out_dir(label: str, root: Path | None = None) -> Path:
 # --------------------------------------------------------------------------- #
 # 会话选择：三态过滤（匹配 / 不匹配 / 未记录）
 # --------------------------------------------------------------------------- #
-def scan_sessions(base: Path | None = None) -> list[dict]:
-    """读 ``data/sessions/*/session.json`` 的摘要。
+def scan_sessions(base: Path | tuple[Path, ...] | None = None) -> list[dict]:
+    """读 ``data/stereo/*/session.json``（以及旧位置 ``data/sessions/*``）的摘要。
 
     只读 JSON、**不构造 ``Session`` 对象**：几十个会话也能瞬间列完，
     而且不会因为某一份坏文件把整个列表打断。
+
+    ``base`` 不传 = 扫 ``stereo_roots()``（新的在前），迁移前后都列得全；
+    传一个目录/tuple 只扫那些（测试要造临时会话，不能依赖这台机器录过什么）。
+    同一个会话名两边都在时只留**新的那份**（先扫到的），避免迁移中途列表出现两行同名。
 
     ``mode`` 字段可能是 ``None`` —— 那表示**这份会话没有记录装置模式**。
     老会话都缺这个字段（``record_stereo`` 写入 ``stereo_mode`` 是
     ``a137766`` 才加的），所以**不能默认成 parallel**。
     """
-    root = base if base is not None else ROOT / "data" / "sessions"
+    if base is None:
+        roots: tuple[Path, ...] = stereo_roots()
+    elif isinstance(base, (str, Path)):
+        roots = (Path(base),)
+    else:
+        roots = tuple(Path(b) for b in base)
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for root in roots:
+        for row in _scan_one_root(root):
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            rows.append(row)
+    rows.sort(key=lambda r: r["id"], reverse=True)
+    return rows
+
+
+def _scan_one_root(root: Path) -> list[dict]:
+    """扫单个根的直接子目录（新→旧按目录名），返回还没去重的行。"""
     rows: list[dict] = []
     try:
         dirs = sorted((d for d in root.iterdir() if d.is_dir()),
@@ -297,7 +324,8 @@ class SessionPicker(tk.Toplevel):
 
         box = self.surface.card(
             self, "会话",
-            "这里列出 data/sessions 下的会话。默认只显示与当前窗口同一种装置几何的；"
+            "这里列出 data/stereo 下的会话（旧位置 data/sessions 也一起列）。"
+            "默认只显示与当前窗口同一种装置几何的；"
             "老会话没有记录装置模式，标为「未记录」—— 用之前请自己确认它是哪种装置录的。")
         if mode is not None:
             ttk.Checkbutton(

@@ -38,6 +38,7 @@ from apps._data_export import (  # noqa: E402
     normalize_output,
     scan_items,
 )
+from sphere_tracker.paths import STEREO_ROOT, ensure_dirs  # noqa: E402
 
 ACCENT = "#0f4c81"
 MUTED = "#6b7280"
@@ -75,7 +76,10 @@ def _parse_dt(text: str, end: bool = False) -> datetime | None:
 # 拒绝 `..`、绝对路径与符号链接逃逸；写之前**必须**留一份备份，
 # 再写同目录临时文件 `os.replace` 原子替换。**绝不**直接 `json.dump` 覆盖。
 # ----------------------------------------------------------------------
-SESSIONS_ROOT = ROOT / "data" / "sessions"
+#: 面板默认打开的双目会话根。从 `sphere_tracker/paths.py` 取而不是自己拼 ——
+#: 之前这里写 `ROOT / "data" / "sessions"`，与另外 7 处各存一份，改名必漏。
+#: 这一处只做默认值：用户点『数据目录…』或传 `--root` 仍可打开任意根（含旧位置）。
+SESSIONS_ROOT = STEREO_ROOT
 BAK_PREFIX = "session.json.bak-"
 
 
@@ -538,7 +542,7 @@ class DataManager(tk.Tk):
     # ------------------------------------------------------------------
     def choose_root(self) -> None:
         path = filedialog.askdirectory(
-            parent=self, title="选择数据目录（sessions 的父目录）",
+            parent=self, title="选择数据目录（放会话的直接父目录，默认 data/stereo）",
             initialdir=str(self.root_dir))
         if not path:
             return
@@ -834,8 +838,10 @@ class DataManager(tk.Tk):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="数据管理 · 脱敏导出")
-    ap.add_argument("--root", default=str(ROOT / "data" / "sessions"))
+    ap.add_argument("--root", default=str(STEREO_ROOT))
     args = ap.parse_args()
+    # 新布局的根可能还没建（第一次跑 / 还没迁移）—— 面板不该因为"目录未创建"打不开
+    ensure_dirs()
     app = DataManager(Path(args.root))
     app.mainloop()
     return 0

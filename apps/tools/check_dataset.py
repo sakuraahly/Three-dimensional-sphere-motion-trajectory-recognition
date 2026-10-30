@@ -1,9 +1,10 @@
-"""校验 `data/sessions/<id>/` 里的采集会话：视频 / 标定 / 同步是否自洽。
+"""校验 `data/stereo/<id>/` 里的采集会话：视频 / 标定 / 同步是否自洽。
 
 用法::
 
-    python apps/tools/check_dataset.py data/sessions/20261019-101500
-    python apps/tools/check_dataset.py --root data/sessions          # 全部
+    python apps/tools/check_dataset.py data/stereo/20261019-101500
+    python apps/tools/check_dataset.py --root data/stereo             # 换个根
+    python apps/tools/check_dataset.py                               # 全部（新旧根都扫）
     python apps/tools/check_dataset.py --strict ...                  # warning 也算失败
 
 为什么是单独一个工具
@@ -34,13 +35,15 @@ if str(ROOT) not in sys.path:
 from stereo.sessions import (  # noqa: E402
     describe, list_sessions, load_session, validate_session,
 )
+from sphere_tracker.paths import stereo_roots  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="校验双目采集会话")
-    ap.add_argument("paths", nargs="*", help="会话目录（默认扫描 --root）")
-    ap.add_argument("--root", default=str(ROOT / "data" / "sessions"),
-                    help="会话根目录（默认 data/sessions）")
+    ap.add_argument("paths", nargs="*", help="会话目录（默认扫描 --root 下全部）")
+    # 默认不写死一个根：这是**读**路径，迁移前后都要能列到会话，所以交给 stereo_roots()
+    ap.add_argument("--root", default=None,
+                    help="会话根目录（默认 data/stereo 与旧位置 data/sessions 都扫）")
     ap.add_argument("--strict", action="store_true",
                     help="warning 也当失败（[提示] 只是告知，永不影响退出码）")
     return ap.parse_args()
@@ -70,10 +73,19 @@ def main() -> int:
     args = parse_args()
     paths = [Path(p) for p in args.paths]
     if not paths:
-        paths = list_sessions(args.root)
+        # 新的根在前（stereo_roots 的返回顺序）：同一个会话名两边都有时，只查新的那份，
+        # 否则迁移中途会把同一段会话查两遍、计数翻倍
+        roots = [Path(args.root)] if args.root else list(stereo_roots())
+        seen: set[str] = set()
+        for root in roots:
+            for p in list_sessions(root):
+                if p.name in seen:
+                    continue
+                seen.add(p.name)
+                paths.append(p)
         if not paths:
-            print(f"没有找到会话：{args.root}")
-            print("下一步：先录制一次（P1 录制器），或把已有会话放进 data/sessions/<id>/")
+            print("没有找到会话：" + "、".join(str(r) for r in roots))
+            print("下一步：先录制一次（P1 录制器），或把已有会话放进 data/stereo/<id>/")
             return 0
 
     total_e = total_w = total_n = 0

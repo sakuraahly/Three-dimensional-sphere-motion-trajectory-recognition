@@ -395,7 +395,12 @@ class App(tk.Tk):
         也不给启动路径加一个重量级依赖；规则写在两边注释里互指。
         """
         cands: list[tuple[str, Path]] = []
-        for base in (ROOT / "data" / "sessions", ROOT / "data"):
+        # 延迟 import：`sphere_tracker` 的包初始化会拉起 cv2/numpy，而门厅启动不需要
+        # （本项目已有先例：不为了一个默认值给启动路径加重量级依赖）。
+        # 这里仍是**读**路径，所以用 stereo_roots() + `data/` 根（早期会话直接放 data/ 下）。
+        from sphere_tracker.paths import DATA_ROOT, stereo_roots
+
+        for base in (*stereo_roots(), DATA_ROOT):
             try:
                 subs = [d for d in base.iterdir() if d.is_dir()]
             except OSError:
