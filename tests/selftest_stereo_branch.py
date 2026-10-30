@@ -753,8 +753,8 @@ def test_low_rate_advice() -> bool:
         ("主要是没检出 -> 指向种子", "specular" in miss and "seeds.json" in miss),
         ("混合型 -> 不许说『左右都检出了』", "左右都检出了" not in mixed),
         ("混合型 -> 仍指出先补检测", "specular" in mixed),
-        ("三种都指向结束时的 [诊断]",
-         all("详见结束时的 [诊断]" in m for m in (flat, wide, miss, mixed))),
+        ("四种都指向结束时的 [诊断]（统一括号收尾）",
+         all("（详见结束时的 [诊断]）" in m for m in (flat, wide, miss, mixed))),
         ("都带上门限，便于对照",
          all("max_epipolar=8px" in m for m in (flat, wide, miss, mixed))),
     ]
