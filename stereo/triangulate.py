@@ -39,6 +39,17 @@ _LOGGER = logging.getLogger(__name__)
 SILENT_FAILURE_MIN_FRAMES = 20
 # 配对率低于这个值：不抛错（也许只是遮挡严重），但必须留下一条明确警告。
 LOW_MATCH_RATE = 0.05
+# 配对率低于这个值：额外把"极线几何对不对"**量出来**给人看（见 geometry_lines）。
+# 取 10% 而不是上面的 5%：5% 才警告的话，1/30（3.3%）这种"几乎全废"的结果
+# 在沉默区里待着；而 10% 已经低到"再看也不会是遮挡"的量级。
+LOW_MATCH_RATE_REPORT = 0.10
+# 几何一致性诊断：样本少于这个帧数就不报 —— 20 帧以下的中位数只会误导。
+GEOM_MIN_SAMPLES = 20
+# 实测极线偏差中位 / 标定自报 rms 超过这个倍数 -> 判"录像与标定不一致"。
+# 4 倍是"再考虑测量噪声也解释不了"的量级（本项目的标定自报本身已含 rms 与 max）。
+GEOM_SUSPECT_RATIO = 4.0
+# 没有标定自报值时的绝对判据：中位偏差超过 3 px 就算可疑（默认门限 2.5 px 的量级）。
+GEOM_SUSPECT_PX = 3.0
 
 
 @dataclass
@@ -197,6 +208,12 @@ class StereoReconstructor:
     # 非致命诊断（配对率过低等）；由 update() 追加，供日志/报告读取
     warnings: list[str] = field(default_factory=list)
     _low_rate_warned: bool = field(default=False, repr=False)
+    #: 给人看的会话目录（**只进报错文案**，不参与任何计算）：0 配对时要直接告诉用户
+    #: `--seed-json <会话>/derived/seeds.json` 该填什么路径，重建器自己没有会话概念。
+    source_hint: str = ""
+    #: 几何一致性诊断的样本：两路都检出时，**校正后** v 差的最小值（px），逐帧一条。
+    #: 只测量、不参与配对，用来在低配对率时说清"是几何对不上，还是检测丢了"。
+    dy_samples: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # ---- 使用点护栏：none_raw（链式/未校正）不能走 parallel 重建 ----
@@ -245,6 +262,12 @@ class StereoReconstructor:
         if not right_dets:
             self.n_no_right += 1
             return None
+        # 几何诊断的样本：两路都有检出的帧才量，量的是**校正后**的 v 差
+        # （原始像素的 y 差里混着畸变与校正旋转，不能拿去跟标定的 epipolar_rms 比）。
+        # 取候选里最小的那个 —— 那才是"最像对应点"的偏差，最不容易冤枉几何。
+        y1 = rectify_point_left(self.rig, left.x, left.y)[1]
+        self.dy_samples.append(min(
+            abs(y1 - rectify_point_right(self.rig, c.x, c.y)[1]) for c in right_dets))
         matched, dy = match_epipolar(self.rig, left, right_dets, self.cfg)
         if matched is None:
             self.n_rejected += 1
@@ -276,22 +299,210 @@ class StereoReconstructor:
             msg = (f"截至第 {self.n_frames} 帧：parallel 模式配对率极低，"
                    f"匹配 {self.n_matched} / 总数 {self.n_frames}"
                    f"（{rate * 100:.1f}% < {LOW_MATCH_RATE * 100:.0f}%）。"
-                   f"本模式只比较 y 方向、max_epipolar={self.cfg.max_epipolar_px:g}px；"
-                   "若装置是大角度，请用 --stereo-mode angled 重跑；"
-                   "否则检查标定是否被碰动、左右是否接反。")
+                   + self._low_rate_advice())
             self.warnings.append(msg)
             _LOGGER.warning(msg)
 
+    def dominant_cause(self) -> str:
+        """这一趟的**主要矛盾**：``"detect"`` / ``"match"`` / ``"mixed"``。
+
+        `_match_frame` 每帧只会落进三个计数器之一，所以
+        ``n_no_left + n_no_right + n_rejected == n_frames`` 恒成立 ——
+        "全被拒"等价于两个缺帧计数都是 0，"没检出"等价于 ``n_rejected == 0``。
+
+        判据只在这里写一次：0 配对的报错、运行期的低配对率告警都调它。
+        2026-10-30 就是两处各写一套才互相打架 —— 告警说"若装置是大角度，
+        请用 angled 重跑"，结束时的 [诊断] 却说"几何与标定不符"。
+        """
+        if self.n_rejected == 0:
+            return "detect"
+        if self.n_no_left + self.n_no_right == 0:
+            return "match"
+        return "mixed"
+
+    def _optical_axis_angle_deg(self) -> float | None:
+        """两光轴夹角（度）：优先 `rig.angle_deg`，其次 `rig.meta`，最后从 `rig.R` 算。
+
+        全取不到就返回 ``None`` —— 宁可不提 angled，也不要编一个角度去建议用户
+        换模式。算法直接用 `stereo.stereo_mode.optical_axes_angle_deg`（入口
+        `run_stereo_video` 打印的是同一个函数），不在这里另算一套。
+        """
+        raw = getattr(self.rig, "angle_deg", None)
+        if raw is None:
+            raw = (getattr(self.rig, "meta", None) or {}).get("angle_deg")
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return None
+        R = getattr(self.rig, "R", None)
+        if R is None:
+            return None
+        try:
+            from .stereo_mode import optical_axes_angle_deg
+            return float(optical_axes_angle_deg(R))
+        except Exception:                                   # noqa: BLE001
+            return None                                  # 诊断路径不该因它崩
+
+    def _angled_suggestion(self) -> str:
+        """「试 angled」这半句，只在装置**标称**就是大角度时才给（否则空串）。
+
+        判据只有两条：本模式是 parallel，且光轴夹角 > 2°。2° 的门槛很松
+        （本项目的平行装置实测 0.7°），它挡的是"根本没这回事"的情况 ——
+        2026-10-30 那份数据夹角 0.7°，却被无条件建议"用 angled 重跑"，
+        而它交会角只有 3.6~4.8°（< angled 门限 5°），照做 100% 被拒。
+        """
+        if not self._is_parallel():
+            return ""
+        angle = self._optical_axis_angle_deg()
+        if angle is None or angle <= 2.0:
+            return ""
+        return f"装置标称光轴夹角 {angle:.1f}°（> 2°），也可试 --stereo-mode angled"
+
+    def _low_rate_advice(self) -> str:
+        """低配对率那一句建议。分支口径与 `_zero_match_message` **同源**（`dominant_cause`）。
+
+        为什么不能无条件写"若装置是大角度，请用 --stereo-mode angled 重跑"
+        （2026-10-30 实测）：那段录像的交会角只有 3.6~4.8°（< angled 的门限
+        `min_angle_deg=5.0`）、残差 3.9~7.2 px（> `max_reproj_px=3.0`），真按它说的
+        改，angled 会 100% 被拒 —— 把人从一个坑引到另一个坑，而且和结束时的
+        [诊断]（"几何与标定不符"）直接打架。
+
+        运行期只给一行：完整的三步建议在结束时的 [诊断]/报错里，这里重复一遍
+        只会把日志刷长。
+        """
+        base = f"本模式只比较 y 方向、max_epipolar={self.cfg.max_epipolar_px:g}px；"
+        # 收尾统一成括号形式，三支完全一致：读者一眼知道完整结论在下面。
+        end = "（详见结束时的 [诊断]）。"
+        kind = self.dominant_cause()
+        seeds = (f"{self.source_hint}/derived/seeds.json" if self.source_hint
+                 else "<会话目录>/derived/seeds.json")
+        if kind == "detect":
+            return (base + "主要问题是检测器没给出圆心（有帧缺左/缺右）；"
+                    f"镜面球可加 --method specular --seed-json {seeds}" + end)
+        if kind == "mixed":
+            # 混合型不能写成"左右都检出了"（那样是假话）：有帧缺、也有帧被拒。
+            return (base + "既有帧没检出、也有候选被门限拒掉：先补检测"
+                    f"（镜面球用 --method specular --seed-json {seeds}），"
+                    "再看门限与标定" + end)
+        advice = (base + "左右都检出了、是候选被门限拒掉：检查标定是否被碰动、"
+                          "左右是否接反")
+        hint = self._angled_suggestion()
+        if hint:
+            advice += "；" + hint
+        return advice + end
+
     def _zero_match_message(self) -> str:
+        """0 配对时的报错。**按分项给不同建议** —— 三种原因的下一步完全不同。
+
+        为什么不能把三种原因混成一句、建议只指向 angled（2026-10-30 实测）：
+        用户那次失败的真实原因是"左路 20 帧一帧都没检出"（镜面球 + 默认 `color`
+        检测器，见交接文档 §39.3），却被告知"装置夹角可能远大于 parallel 的假设，
+        用 angled 重跑" —— 照做只会再失败一次，因为问题根本不在几何。
+
+        判据：`_match_frame` 里每一帧只会落进三个计数器之一，所以
+        ``n_no_left + n_no_right + n_rejected == n_frames`` 恒成立，
+        于是"纯检测问题"等价于 ``n_rejected == 0``，"纯配对问题"等价于
+        ``n_no_left == n_no_right == 0``，其余是两者都有。
+        """
         cfg = self.cfg
-        return (
-            f"parallel 模式下 0 个配对（共 {self.n_frames} 帧）："
-            f"装置夹角可能远大于 parallel 的假设（当前模式下只比较 y 方向、"
-            f"max_epipolar={cfg.max_epipolar_px:g}px）。"
-            f"分项：左路缺 {self.n_no_left} 帧 / 右路无候选 {self.n_no_right} 帧 / "
-            f"有候选但被极线或视差条件拒掉 {self.n_rejected} 帧。"
-            f"下一步：用 --stereo-mode angled 重跑，或重新标定。"
-        )
+        n = self.n_frames
+        det_miss = self.n_no_left + self.n_no_right
+        # 路径没给就写成占位符：宁可像一个模板，也不要凭空编一个会话路径。
+        seeds = (f"{self.source_hint}/derived/seeds.json" if self.source_hint
+                 else "<会话目录>/derived/seeds.json")
+        head = (f"parallel 模式下 0 个配对（共 {n} 帧）。分项："
+                f"左路缺 {self.n_no_left} 帧 / 右路无候选 {self.n_no_right} 帧 / "
+                f"有候选但被极线或视差条件拒掉 {self.n_rejected} 帧。")
+
+        detect_advice = (
+            "检测器根本没给出圆心 —— 这一条与极线、装置夹角、标定**都无关**，"
+            "先别改 --stereo-mode。镜面/高光球在 color/hough 下常常恒为 0 检出，"
+            f"下一步：--method specular --seed-json {seeds}"
+            "（GUI 上是第 3 步『点选球心』）。")
+        match_advice = (
+            f"两路都检出了，候选被 y 方向门限拒掉（max_epipolar="
+            f"{cfg.max_epipolar_px:g}px，本模式只比较 y）。下一步：重新标定"
+            "（相机可能被碰动）；或确认极线偏差分布后再决定是否放宽 --max-epipolar")
+        hint = self._angled_suggestion()
+        if hint:
+            match_advice += "；" + hint
+        match_advice += "。"
+
+        kind = self.dominant_cause()
+        if kind == "detect":
+            msg = head + "原因：每一帧都至少有一路没检出 —— " + detect_advice
+        elif kind == "match":
+            msg = head + "原因：" + match_advice
+        else:
+            msg = (head + f"原因：检测（{det_miss} 帧）与配对（{self.n_rejected} 帧）各占一部分，"
+                   "两条都要查。\n  第 1 步 检测：" + detect_advice
+                   + "\n  第 2 步 若检测补上后仍然配不上：" + match_advice)
+        return msg + self._geometry_suffix()
+
+    def _geometry_suffix(self) -> str:
+        """把几何一致性诊断接在报错后面（样本不足时 `geometry_lines()` 是空的）。"""
+        lines = self.geometry_lines()
+        return "" if not lines else "\n" + "\n".join(lines)
+
+    def geometry_lines(self) -> list[str]:
+        """量出"这段录像的极线几何对不对"，只测量、不改任何门限。
+
+        为什么必须由程序说出来：低配对率时用户唯一看到的是"配不上"，最自然的
+        反应就是把 `--max_epipolar` 往上调。2026-10-30 那场实测是 中位 12.4 px
+        vs 标定自报 0.56 px（差 22 倍）—— 那是"录像和标定对不上"，调到 15 px
+        能"跑通"，但配上的点残差 3.9~7.2 px、交会角 4.3°，本来就是错的。
+        所以这里给的是"重新标定"，不是"放宽"。
+
+        样本不足（两路都检出的帧 < `GEOM_MIN_SAMPLES`）时返回空：20 帧以下
+        的中位数会误导人，宁可不说。标定自报值取不到时省略那半句，**不编数**。
+        """
+        n = len(self.dy_samples)
+        if n < GEOM_MIN_SAMPLES:
+            return []
+        a = np.asarray(self.dy_samples, np.float64)
+        med = float(np.median(a))
+        p95 = float(np.percentile(a, 95))
+        lines = [f"[诊断] 左右圆心的 y 差实测：中位 {med:.1f} px（p95 {p95:.1f}，n={n}）"]
+
+        quality = getattr(self.rig, "quality", None) or {}
+        try:
+            rms = float(quality.get("epipolar_rms", float("nan")))
+            worst = float(quality.get("epipolar_max", float("nan")))
+        except (TypeError, ValueError):
+            rms = worst = float("nan")
+        has_ref = math.isfinite(rms) and rms > 0
+        if has_ref:
+            tail = f"（max {worst:.2f}）" if math.isfinite(worst) else ""
+            lines.append(f"       这段录像的标定自报 极线误差 {rms:.2f} px{tail}")
+            suspect = med / rms >= GEOM_SUSPECT_RATIO and med >= GEOM_SUSPECT_PX
+            lead = f"相差 {med / rms:.0f} 倍："
+        else:
+            # 没有自报值就只比绝对值，别拿"不知道"当"没问题"，也别编一个比值。
+            suspect = med >= GEOM_SUSPECT_PX
+            lead = ""
+        if suspect:
+            lines.append(f"       → {lead}录制时的实际几何与标定不一致"
+                         "（相机被碰动 / 改过对焦 / 换过装置）")
+            lines.append("       → 继续放宽 max_epipolar 只会把错误配对变成数字，"
+                         "建议**重新标定**")
+        elif has_ref:
+            lines.append(f"       → 与标定相符（{med / rms:.1f} 倍）：极线几何没问题，"
+                         "低配对率另有原因（检测丢失 / 遮挡 / 配对策略）")
+        else:
+            lines.append("       → 实测值本身也不大：极线几何看起来没问题，"
+                         "低配对率另有原因（检测丢失 / 遮挡 / 配对策略）")
+        return lines
+
+    def low_match_diagnostic(self, low_rate: float = LOW_MATCH_RATE_REPORT) -> list[str]:
+        """配对率低于 `low_rate` 时给出几何一致性诊断，否则返回空列表。
+
+        `low_rate` 留成参数只为一件事：判据能直接钉住"低于 10% 就说"这个行为，
+        而不用去跑一段视频。调用方一律用默认值。
+        """
+        if self.n_frames == 0 or self.match_rate >= low_rate:
+            return []
+        return self.geometry_lines()
 
     def diagnostics(self) -> dict:
         """结构化诊断（计数 + 配对率 + 警告），给报告/日志用。"""

@@ -28,6 +28,10 @@
 ⚠️ 默认检测器是 `color`，适合**哑光纯色球**。金属/高光球（例如摆锤）用
 `color` 会锁到背景高光；可试 `--method hough --min-radius 6 --max-radius 15`，
 但真实纹理背景下 Hough 仍有误检 —— 这是检测问题，不是三角测量问题。
+
+例外（会自动处理）：会话里有 `derived/seeds.json`（GUI『点选球心』留下的种子）时，
+只要**没显式给 `--method`**，就自动改用 `specular` + 该种子。镜面球在 `color` 下
+恒为 0 检出，若不自动接管，用户看到的会是"0 配对 + 装置夹角"这种指错方向的结论。
 """
 
 from __future__ import annotations
@@ -108,6 +112,38 @@ def _mode_guard(mode: str, rectification: str) -> tuple[str, bool]:
     if mode == "parallel" and is_uncorrected(rectification):
         return "angled", True
     return mode, False
+
+
+def _pick_detector(method: str, method_given: bool, seeds_path: Path,
+                   detect_width: int) -> tuple[str, str]:
+    """决定这次用哪个检测器，返回 ``(方法, 要打印的一行说明)``。**纯函数**（只读种子文件）。
+
+    为什么"有种子就换 specular"必须做在这里、而且判据是"用户有没有显式给 --method"：
+
+    - 镜面球在 `color` / `hough` 下恒为 0 检出（交接文档 §39.3：40 帧 0 检出），
+      而会话里就存着 GUI 点选过的 `derived/seeds.json`。不接管的话，用户得到的
+      结论是"0 配对 + 装置夹角可能太大" —— 方向完全是错的。
+    - 判据必须是"用户没给 `--method`"，不能写成"值等于默认值"：argparse 里两者
+      无法区分（`default="color"` 与显式 `--method color` 得到同一个值）。所以
+      参数定义用 `default=argparse.SUPPRESS`，让属性只在显式给定时才存在。
+      这比扫 `sys.argv` 可靠 —— argparse 允许前缀缩写（`--meth color`）与
+      `--method=color` 两种写法，手写扫描得自己补全，容易漏。
+    - 显式 `--method color` 时 **不换**：用户明确指定了就照做，悄悄换掉会让人
+      怀疑"我明明说了用 color"。
+    - `detect_width` 非 0 时不换：specular 的种子是原图坐标，缩放会错位，
+      换了只会一路撞到后面"specular 暂不支持 --detect-width"的报错。
+    - 种子文件坏了**不抛**：退回原方法并说明。一个坏 json 不该让整条链路崩掉，
+      而且此时用户需要的是"种子坏了"这句人话，不是一段 traceback。
+    """
+    if method_given or detect_width or not seeds_path.exists():
+        return method, ""
+    try:
+        load_seeds(seeds_path)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return method, f"[警告] {seeds_path} 读不出来（{exc}），继续用 {method} 检测器"
+    return "specular", (
+        "[种子] 会话里有 derived/seeds.json → 自动改用 specular + 该种子"
+        "（镜面球用 color/hough 检不到；要覆盖请显式 --method）")
 
 
 def _world_block(world: WorldFrame | None, arr, base_frame: str) -> tuple[np.ndarray | None, dict]:
@@ -307,7 +343,10 @@ def row_unmatched(frame: int, t: float, det_l, det_r) -> list:
 def main() -> int:
     ap = argparse.ArgumentParser(description="离线双目三维轨迹（读会话）")
     ap.add_argument("session", help="data/sessions/<id> 目录或 session.json")
-    ap.add_argument("--method", default=default_method("detector"),
+    # `default=argparse.SUPPRESS`：不传时 **属性不存在**，这样才能区分
+    # "用户显式 --method color" 与 "什么也没说，落到默认 color"。
+    # 理由见 `_pick_detector`：这个区别决定要不要自动接管成 specular + 种子。
+    ap.add_argument("--method", default=argparse.SUPPRESS,
                     choices=method_names("detector"),
                     help="检测方法（默认 %s）。可选：%s" % (
                         default_method("detector"),
@@ -366,6 +405,14 @@ def main() -> int:
     args = ap.parse_args()
 
     session_dir, s = load_session(args.session)
+    # ---- 检测方法：用户显式给了就照做，否则有种子就自动接管 ----
+    method_given = hasattr(args, "method")
+    method = getattr(args, "method", default_method("detector"))
+    seeds_path = (Path(args.seed_json) if args.seed_json
+                  else session_dir / "derived" / "seeds.json")
+    method, method_note = _pick_detector(method, method_given, seeds_path, args.detect_width)
+    if method_note:
+        print(method_note)
     try:
         origin = tuple(float(v) for v in args.origin.split(","))
         if len(origin) != 3:
@@ -508,9 +555,13 @@ def main() -> int:
         return 1
 
     cfg = AppConfig()
-    cfg.detector.method = args.method
-    if args.method == "specular" and args.max_epipolar is None:
+    cfg.detector.method = method
+    if method == "specular" and args.max_epipolar is None:
         args.max_epipolar = 8.0
+        # 8 px 本身也是个**经验值**，不是从几何推出来的：它只放宽了"能不能配上"，
+        # 不改善任何精度。2026-10-30 实测那段会话 dy 中位 12.4 px（标定自报 0.56 px），
+        # 8 px 也只放过 1/30 —— 那种情况是"录像和标定对不上"，不要靠继续往上调来救，
+        # 去看程序打出的 [诊断] 几何一致性那几行，然后重标定。
         print("[specular] 极线门限 2.5px 对人工 seed/CSRT 太紧，默认放宽到 8px")
     cfg.detector.min_radius = float(args.min_radius)
     cfg.detector.max_radius = float(args.max_radius)
@@ -520,7 +571,7 @@ def main() -> int:
         cfg.detector.color = ColorConfig.preset(args.preset)
     pipe_l = _make_pipeline(cfg, rig, "left")
     pipe_r = _make_pipeline(cfg, rig, "right")
-    if args.method == "specular":
+    if method == "specular":
         def _seed_arg(text: str, what: str):
             try:
                 parts = [float(v) for v in text.split(",")]
@@ -535,12 +586,19 @@ def main() -> int:
             print("[错误] --method specular 暂不支持 --detect-width："
                   "种子坐标是原图坐标，缩放会错位。")
             return 2
-        seed_path = Path(args.seed_json) if args.seed_json else (session_dir / "derived" / "seeds.json")
         seed_json = None
-        if seed_path.exists():
-            seed_json = load_seeds(seed_path)
+        if seeds_path.exists():
+            try:
+                seed_json = load_seeds(seeds_path)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                # 走到这里说明用户是**显式**要 specular 的（自动接管那条路已在
+                # `_pick_detector` 里退回原检测器）。此时静默换回 color 只会得到
+                # "0 检出"这个更难查的现象，所以停下来说清楚是哪一步坏了。
+                print(f"[错误] 种子文件不可用：{seeds_path}（{exc}）")
+                print("  重开『② 点选球心』重新保存，或改用 --seed/--seed-right。")
+                return 2
         elif args.seed_json:
-            print(f"[错误] --seed-json 不存在：{seed_path}")
+            print(f"[错误] --seed-json 不存在：{seeds_path}")
             return 2
         if args.seed or args.seed_right:
             if not args.seed or not args.seed_right:
@@ -564,7 +622,7 @@ def main() -> int:
             seed_r = (float(seed_json["right"]["x"]), float(seed_json["right"]["y"]),
                       float(seed_json["right"]["radius"]))
             seed_frame = int(seed_json.get("seed_frame", args.seed_frame))
-            print(f"[specular] 读标准 seed：{seed_path}")
+            print(f"[specular] 读标准 seed：{seeds_path}")
         else:
             print("[错误] --method specular 需要球心种子：")
             print("  GUI：第 3 步「点选球（双目 seed）」；")
@@ -591,7 +649,11 @@ def main() -> int:
         rec = AngledReconstructor(rig, AngledMatchConfig(max_epipolar_px=epi))
     else:
         epi = 2.5 if args.max_epipolar is None else args.max_epipolar
-        rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=epi))
+        # `source_hint` 只进"0 配对"的报错文案：那句话要能直接告诉用户
+        # `--seed-json <会话>/derived/seeds.json` 长什么样，重建器自己不知道会话在哪。
+        # 用 as_posix()：文案里再拼 "/derived/seeds.json"，混着反斜杠会像坏路径。
+        rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=epi),
+                                  source_hint=session_dir.as_posix())
     # `--out` 让产物**不落在会话目录里**（2026-10-27 补）。
     #
     # 为什么需要：做对照实验时（换方法 / 换 seed / 换门限）会连着跑好几次，
@@ -696,12 +758,21 @@ def main() -> int:
     elapsed = time.perf_counter() - t0
     print()
     print(f"处理：{n_pairs} 对，{elapsed:.1f}s（{n_pairs/max(elapsed,1e-6):.1f} 对/s）")
+    # 括号里写清楚"被什么拒的"：parallel 在**配对**阶段只有极线/视差两条门，
+    # 交会角与残差根本不参与筛选（它们是三角化之后才有的量）。原来一律写
+    # "极线/交会角/残差"，会让人以为角度也被判过，从而去调不存在的东西。
+    reject_why = ("极线/视差条件" if mode == "parallel" else "极线/交会角/残差")
     print(f"匹配：{rec.n_matched}/{n_pairs}（{rec.match_rate*100:.1f}%）  "
           f"无左={rec.n_no_left} 无右={rec.n_no_right} "
-          f"拒绝={rec.n_rejected}（极线/交会角/残差）")
+          f"拒绝={rec.n_rejected}（{reject_why}）")
+    # 配对率低时把"几何对不对"量出来：用户看到的 3.3% 背后常常是"这段录像和
+    # 它的标定对不上"，不说出来，下一个人还会去调 --max-epipolar（而那不是原因）。
+    # 0 配对的情形走的是异常那条路，诊断已经拼在报错里。
+    for line in rec.low_match_diagnostic():
+        print(line)
     if n_pairs and rec.n_matched == 0:
         print("[诊断] 0 匹配，先别继续调 pairing；按下面顺序查：")
-        if args.method == "specular" and "seed_l" in locals() and "seed_r" in locals():
+        if method == "specular" and "seed_l" in locals() and "seed_r" in locals():
             print(f"  1) seed 半径：左 {seed_l[2]:.1f} / 右 {seed_r[2]:.1f}；"
                   "CSRT 框会按 1.8×半径放大，过大时框进衣服/背景")
             print("     重开『② 点选球心』，点球心后滚轮把圆贴到球边缘；"
@@ -713,7 +784,7 @@ def main() -> int:
             print(f"  2) 右路跟丢为主；右检测器："
                   f"{getattr(pipe_r.detector, 'last_error', '') or '(无错误信息)'}")
         else:
-            print("  2) 左右都检测到了，但被极线/交会角/残差拒绝："
+            print(f"  2) 左右都检测到了，但被{reject_why}拒绝："
                   "检查两路 seed 是否都在球心、是否同一时刻；"
                   "可先用 --pairing index 对照")
         print("  3) 当前会话若继续 0 匹配，建议重录并在第 0 帧重新点选，"

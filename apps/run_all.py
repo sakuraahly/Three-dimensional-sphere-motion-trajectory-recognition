@@ -186,15 +186,31 @@ def plan_steps(
                     "tri", f"会话不完整：缺 {'、'.join(missing)} —— 会话可能没录完或被清理，需重录",
                     explicit))
                 continue
+            # 会话里有点选过的种子（`derived/seeds.json`）时**不传 `--method`**，
+            # 让 `run_stereo_video` 自己接管成 specular + 这份种子。
+            #
+            # 为什么只做"传不传"、不在这里再判一次"该用哪个检测器"（2026-10-30）：
+            # GUI 的双目窗本来就不传 `--method`，而这里原来写死传 `--method color`，
+            # 于是**同一套产品两条路行为不同** —— 一键流程 0 检出、GUI 能跑通；
+            # 而镜面球在 color 下恒为 0 检出（交接文档 §39.3）。
+            # 判据只留一处：下游 `_pick_detector` 是唯一实现，这里不再复制一份。
+            seed = session / "derived" / "seeds.json"
+            auto_seed = detector is None and seed.exists()
             det = detector or _detector_from_session(data)
-            cmd = [PY, str(root / "apps" / "run_stereo_video.py"), str(session), "--method", det]
-            if det == "specular":
-                seed = session / "derived" / "seeds.json"
-                if seed.exists():
+            cmd = [PY, str(root / "apps" / "run_stereo_video.py"), str(session)]
+            if not auto_seed:
+                cmd += ["--method", det]
+                if det == "specular" and seed.exists():
                     cmd += ["--seed-json", str(seed)]
             if stereo_mode != "auto":
                 cmd += ["--stereo-mode", stereo_mode]
-            note = "" if detector else f"检测器取自{'会话配置' if det != 'color' else '默认值'}：{det}"
+            if detector:
+                note = ""
+            elif auto_seed:
+                note = ("会话里有 seeds.json：不传 --method，"
+                        "由 run_stereo_video 自动用 specular + 该种子")
+            else:
+                note = f"检测器取自{'会话配置' if det != 'color' else '默认值'}：{det}"
             out.append(_pending("tri", cmd, note))
             continue
 

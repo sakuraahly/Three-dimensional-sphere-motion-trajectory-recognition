@@ -21,6 +21,12 @@
   2. **双目比单目强多少**：同一个球，单目靠像素半径推深度（Z=fR/r），
      双目靠三角测量。两条路都比一遍，避免"以为用了双目其实还在靠半径"。
 
+另外钉两条**入口层让用户少踩坑**的判据（2026-10-30 补，都是真实现场翻车过的）：
+  3. 会话里有 `derived/seeds.json` 且没显式给 `--method` -> 自动用 specular；
+  4. `parallel` 0 配对的报错要**按分项**给建议（"没检出"不能引向 angled）；
+  5. 配对率低时要把"极线偏差 vs 标定自报"量出来——几何对不上时说"重新标定"，
+     而不是让人继续调 `--max-epipolar`。
+
     python tests/selftest_stereo_branch.py
     python tests/selftest_stereo_branch.py --scenario clean
     python tests/selftest_stereo_branch.py --write-video
@@ -473,6 +479,133 @@ def T_of(tx: float) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+def test_seed_auto_detector() -> bool:
+    """会话里有种子时该用哪个检测器 —— 判据是"用户有没有显式 --method"。
+
+    现场（2026-10-30）：GUI 点「离线三维重建」跑 `data/stereo/20261021-151144`，
+    3 秒后抛"0 配对，装置夹角可能远大于 parallel 的假设"。真实原因是默认检测器
+    `color` 对镜面球恒为 0 检出（交接文档 §39.3），而正确做法所需的一切
+    （用 specular + 会话里那份 seeds.json）都已经躺在会话目录里，只是没人用。
+
+    这里不跑视频，只钉 `_pick_detector` 的**判据**，因为它最容易写错成
+    "值等于默认值就换" —— 那样显式 `--method color` 会被悄悄改掉，
+    用户下次就不敢相信自己敲的命令了。
+    """
+    print("----- 有种子 / 没种子 / 显式 --method 时，检测器怎么选 -----")
+    import json as _json
+    import tempfile
+
+    from apps.run_stereo_video import _pick_detector
+    from stereo.visualization import SEEDS_SCHEMA, VERSION
+
+    checks: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        good = tmp / "seeds.json"
+        good.write_text(_json.dumps({
+            "schema": SEEDS_SCHEMA, "version": VERSION, "seed_frame": 0,
+            "left": {"x": 100.0, "y": 200.0, "radius": 20.0},
+            "right": {"x": 90.0, "y": 210.0, "radius": 19.0},
+        }, ensure_ascii=False), encoding="utf-8")
+        broken = tmp / "broken.json"
+        broken.write_text("{ 这不是 json", encoding="utf-8")
+        missing = tmp / "missing.json"
+
+        got, note = _pick_detector("color", False, good, 0)
+        checks.append(("没给 --method + 有种子 -> 用 specular", got == "specular"))
+        checks.append(("自动切换必须打印原因（含『种子』）", "种子" in note))
+
+        got, note = _pick_detector("color", True, good, 0)
+        checks.append(("显式 --method color -> 不许被改，且不打印",
+                       got == "color" and not note))
+
+        got, _ = _pick_detector("hough", True, good, 0)
+        checks.append(("显式 --method hough -> 不许被改", got == "hough"))
+
+        got, note = _pick_detector("color", False, broken, 0)
+        checks.append(("种子文件坏了 -> 退回 color，不抛且留警告",
+                       got == "color" and "警告" in note))
+
+        got, note = _pick_detector("color", False, missing, 0)
+        checks.append(("没有种子文件 -> 保持 color、不啰嗦", got == "color" and not note))
+
+        got, _ = _pick_detector("color", False, good, 960)
+        checks.append(("给了 --detect-width -> 不换（种子是原图坐标，缩放会错位）",
+                       got == "color"))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_zero_match_message() -> bool:
+    """0 配对的报错必须区分"检测器没检出"与"有候选但配不上"。
+
+    现场那句话原来把三种原因揉成一句、建议永远指向 `--stereo-mode angled`：
+    左路 20 帧全空（检测问题）也被指去改几何，照着做只会再失败一次。
+
+    判据依据：`_match_frame` 每帧只会落进三个计数器之一，所以
+    ``左路缺 + 右路无候选 + 被拒 == 总帧数`` 恒成立 —— 因此
+    "纯检测问题"等价于"被拒 == 0"，"纯配对问题"等价于两个缺帧计数都是 0。
+    """
+    print("----- 0 配对报错：分项不同，建议必须不同 -----")
+    rig = build_rig()                       # 合成平行装置，光轴夹角约 0.9°
+    # 90° 装置：只有这种几何才该被建议"试 angled"（判据见 `_angled_suggestion`）
+    rig_angled = build_rig()
+    rig_angled.R = cv2.Rodrigues(np.radians([0.0, 90.0, 0.0]))[0]
+
+    def make(*, r=None, **counts) -> "StereoReconstructor":
+        rec = StereoReconstructor(r if r is not None else rig,
+                                  MatchConfig(max_epipolar_px=2.5))
+        for k, v in counts.items():
+            setattr(rec, k, v)
+        return rec
+
+    only_det = make(n_frames=20, n_no_left=20, n_no_right=0, n_rejected=0)
+    m_det = only_det._zero_match_message()                      # noqa: SLF001
+    only_rej = make(r=rig_angled, n_frames=20, n_no_left=0, n_no_right=0, n_rejected=20)
+    m_rej = only_rej._zero_match_message()                      # noqa: SLF001
+    flat_rej = make(n_frames=20, n_no_left=0, n_no_right=0, n_rejected=20)
+    m_flat = flat_rej._zero_match_message()                     # noqa: SLF001
+    mixed = make(r=rig_angled, n_frames=20, n_no_left=13, n_no_right=0, n_rejected=7)
+    m_mix = mixed._zero_match_message()                         # noqa: SLF001
+    hinted = make(n_frames=20, n_no_left=20, n_rejected=0)
+    hinted.source_hint = "data/stereo/20261021-151144"
+    m_hint = hinted._zero_match_message()                       # noqa: SLF001
+
+    checks = [
+        ("全是没检出 -> 建议 specular + 种子", "specular" in m_det and "seeds.json" in m_det),
+        ("全是没检出 -> **不许**再提 angled", "angled" not in m_det),
+        ("全是配对被拒（90° 装置）-> 才建议 angled", "angled" in m_rej),
+        ("全是配对被拒 -> 不提 specular（那不是这里的原因）", "specular" not in m_rej),
+        ("全是配对被拒（夹角 0.9° 的平行装置）-> 不许提 angled",
+         "angled" not in m_flat and "标定" in m_flat),
+        ("两种都有 -> 两段建议都在", "specular" in m_mix and "angled" in m_mix),
+        ("给了会话路径 -> 报错里就是可复制的完整路径",
+         "data/stereo/20261021-151144/derived/seeds.json" in m_hint),
+    ]
+
+    # 光测文案不够：真实抛出来的 RuntimeError 也必须带着新文案
+    rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=2.5))
+    raised = ""
+    try:
+        for i in range(20):
+            rec.update(i / 30.0, None, [])
+    except RuntimeError as exc:
+        raised = str(exc)
+    checks.append(("20 帧全没检出时抛的 RuntimeError 指向检测器",
+                   "specular" in raised and "angled" not in raised))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+# --------------------------------------------------------------------------
 def test_angled_self_tests() -> bool:
     """90° 链路的三个模块**自带**自测，但一直只在 `__main__` 里跑。
 
@@ -514,6 +647,125 @@ def test_angled_self_tests() -> bool:
     return ok
 
 
+def test_geometry_diagnostic() -> bool:
+    """低配对率时必须由程序自己说出"录像和标定对不上"，而不是让人去调门限。
+
+    现场数据（2026-10-30，`data/stereo/20261021-151144`）：实测极线偏差中位
+    12.4 px，而该会话标定自报 `epipolar_rms` 0.56 px —— 差 22 倍。往
+    `--max-epipolar` 上调能"跑通"，但配上的点残差 3.9~7.2 px、交会角 4.3°，
+    本来就是错的：这是几何问题，代码只能把它**说清楚**，不能修。
+
+    判据要的是方向性：坏几何必须出现"重新标定"、好几何**不许**出现；
+    样本不足时宁可不说话。反向自证：把 `stereo/triangulate.py` 的
+    `LOW_MATCH_RATE_REPORT` 从 0.10 改成 0.0（等于永不出诊断），第 1 条立刻红。
+    """
+    print("----- 低配对率诊断：极线偏差 vs 标定自报 -----")
+    rig = build_rig()
+    # build_rig() 的 quality 是 0.0（合成真值、没跑标定），这里换成该会话的真实值
+    rig.quality = {"epipolar_rms": 0.56, "epipolar_max": 1.53}
+
+    def make(median_dy: float, n: int = 60, matched: int = 2) -> StereoReconstructor:
+        rec = StereoReconstructor(rig, MatchConfig())
+        rec.n_frames = 60
+        rec.n_matched = matched
+        rec.dy_samples = [median_dy] * n
+        return rec
+
+    bad = "\n".join(make(12.4).low_match_diagnostic())
+    # 低配对率 + 几何相符：这是"另找原因"的另一种组合（球被挡、检测丢失等）
+    good = "\n".join(make(0.8).low_match_diagnostic())
+
+    checks = [
+        ("dy 中位 12.4 px（标定自报 0.56）-> 建议重新标定", "重新标定" in bad),
+        ("同一句里要给出标定自报值作对照", "标定自报" in bad and "0.56" in bad),
+        ("同一句里要有实测中位数", "12.4" in bad),
+        ("dy 中位 0.8 px -> 不许说重新标定", "重新标定" not in good),
+        ("dy 中位 0.8 px -> 明确说几何没问题", "与标定相符" in good),
+        ("样本 < 20 帧 -> 一句话都不说（中位数会误导）",
+         make(12.4, n=10).low_match_diagnostic() == []),
+        ("配对率不低（58/60）-> 不插话",
+         make(12.4, matched=58).low_match_diagnostic() == []),
+    ]
+
+    # 标定里没有 epipolar_rms 时：省略那半句，但不许编一个比值
+    bare = build_rig()                       # quality 里 rms=0.0 -> 视为"没有自报值"
+    rec_bare = StereoReconstructor(bare, MatchConfig())
+    rec_bare.n_frames, rec_bare.n_matched = 60, 2
+    rec_bare.dy_samples = [12.4] * 60
+    text_bare = "\n".join(rec_bare.low_match_diagnostic())
+    checks.append(("没有标定自报值 -> 不提『标定自报』", "标定自报" not in text_bare))
+    checks.append(("没有标定自报值 -> 仍能凭绝对值判可疑", "重新标定" in text_bare))
+
+    # 0 配对走的是异常那条路，诊断也必须带上
+    rec0 = StereoReconstructor(rig, MatchConfig(max_epipolar_px=2.5))
+    rec0.n_frames, rec0.n_matched, rec0.n_rejected = 60, 0, 60
+    rec0.dy_samples = [12.4] * 60
+    m0 = rec0._zero_match_message()                            # noqa: SLF001
+    checks.append(("0 配对的报错里也要带几何诊断",
+                   "左右圆心的 y 差实测" in m0 and "重新标定" in m0))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_low_rate_advice() -> bool:
+    """运行期那条"配对率极低"的告警，不许再无条件把人引向 angled。
+
+    现场（2026-10-30）：第一行日志是
+    「…若装置是大角度，请用 --stereo-mode angled 重跑…」，而同一段数据
+    交会角只有 3.6~4.8°（< angled 门限 5.0°）、残差 3.9~7.2 px（> 3.0 px），
+    照做 100% 被拒；更糟的是它和结束时的 [诊断]（"几何与标定不符"）直接矛盾。
+
+    所以：branches 用语 `dominant_cause()`（与 0 配对报错同源），
+    angled 只在"parallel 且标称夹角 > 2°"时才提，末尾一律指向 [诊断]。
+    """
+    print("----- 运行期低配对率告警：不许无条件引导 angled -----")
+    rig = build_rig()                       # 平行装置，夹角约 0.9°
+    rig_angled = build_rig()
+    rig_angled.R = cv2.Rodrigues(np.radians([0.0, 90.0, 0.0]))[0]
+
+    def make(r, **counts) -> "StereoReconstructor":
+        rec = StereoReconstructor(r, MatchConfig(max_epipolar_px=8.0))
+        for k, v in counts.items():
+            setattr(rec, k, v)
+        return rec
+
+    # 低配对率 + 有候选但被拒（本项目的真实现场：1/30）
+    flat = make(rig, n_frames=30, n_matched=1, n_rejected=29).      \
+        _low_rate_advice()                                          # noqa: SLF001
+    wide = make(rig_angled, n_frames=30, n_matched=1, n_rejected=29). \
+        _low_rate_advice()                                          # noqa: SLF001
+    # 低配对率 + 主要是没检出
+    miss = make(rig, n_frames=30, n_matched=1, n_no_left=29, n_rejected=0). \
+        _low_rate_advice()                                          # noqa: SLF001
+    # 低配对率 + 混合（有帧缺、也有帧被拒）：不许谎称"左右都检出了"
+    mixed = make(rig, n_frames=30, n_matched=1, n_no_left=7, n_rejected=22). \
+        _low_rate_advice()                                          # noqa: SLF001
+
+    checks = [
+        ("夹角 0.9° 的平行装置 -> 告警里不许出现 angled", "angled" not in flat),
+        ("同时要保留『检查标定/左右是否接反』", "标定" in flat and "接反" in flat),
+        ("90° 装置 -> 才允许提 angled", "angled" in wide),
+        ("主要是没检出 -> 说检测器没给出圆心", "检测器没给出圆心" in miss),
+        ("主要是没检出 -> 指向种子", "specular" in miss and "seeds.json" in miss),
+        ("混合型 -> 不许说『左右都检出了』", "左右都检出了" not in mixed),
+        ("混合型 -> 仍指出先补检测", "specular" in mixed),
+        ("三种都指向结束时的 [诊断]",
+         all("详见结束时的 [诊断]" in m for m in (flat, wide, miss, mixed))),
+        ("都带上门限，便于对照",
+         all("max_epipolar=8px" in m for m in (flat, wide, miss, mixed))),
+    ]
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目链路端到端自测（合成真值）")
     ap.add_argument("--scenario", default="all", choices=["clean", "realistic", "all"])
@@ -531,6 +783,18 @@ def main() -> int:
     print()
 
     angled_ok = test_angled_self_tests()
+    print()
+
+    seed_ok = test_seed_auto_detector()
+    print()
+
+    msg_ok = test_zero_match_message()
+    print()
+
+    geom_ok = test_geometry_diagnostic()
+    print()
+
+    advice_ok = test_low_rate_advice()
     print()
 
     scenarios = ["clean", "realistic"] if args.scenario == "all" else [args.scenario]
@@ -591,7 +855,8 @@ def main() -> int:
               f"（{'>' if gain > 1.5 else '≤'} 1.5，说明同步{'确实必要' if gain > 1.5 else '影响有限'}）")
         print()
 
-    all_ok = ok and sign_ok and angled_ok
+    all_ok = (ok and sign_ok and angled_ok and seed_ok and msg_ok
+              and geom_ok and advice_ok)
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1
 
