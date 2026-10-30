@@ -585,6 +585,122 @@ def main() -> int:
             mono.var_diameter.set("")
             mono.app.tasks = real_tasks
 
+        # ---------- 单目窗：检测器下拉 / --vis-json / 「看 3D」（2026-10-29 增）----------
+        # 守的是用户报的那个问题的**上游**：「单目那里没有查看器」。
+        # 三条判据分别对应三处可能"界面有、命令行没有"的静默失效：
+        #   ① 界面选了 hough，命令行还是 color（这颗球 color 40 帧检出 0 帧）；
+        #   ② 跑完检测但没写 visualization.json（于是"看 3D"永远灰着）；
+        #   ③ smart 承诺"0 检出自动换 hough"，实际没有真的重跑。
+        from apps._gui_mono import (SOURCE_OFFLINE, SOURCE_REALTIME,
+                                   detector_choices)
+
+        captured.clear()
+        mono.app.tasks = _StubTasks()
+        try:
+            mono_mod.find_clip = lambda _p: Path("outputs/_fake_mono_session/clip.mkv")
+            mono._session = _FakeSess()
+            mono.var_diameter.set("")
+            mono.var_focal.set("")
+
+            mono.var_detector.set("hough")
+            mono._start_video()
+            cmd = captured[0] if captured else []
+            got_m = cmd[cmd.index("--method") + 1] if "--method" in cmd else ""
+            ok_m = got_m == "hough"
+            print(f"  [{'通过' if ok_m else '不达标'}] 检测器选 hough → 命令行 "
+                  f"--method {got_m or '(缺失)'}（界面选了必须真的传下去）")
+            results.append(("单目窗检测器真的进命令行", ok_m))
+
+            got_vis = cmd[cmd.index("--vis-json") + 1] if "--vis-json" in cmd else ""
+            ok_vis = got_vis.replace("\\", "/").endswith(
+                "_fake_mono_session/derived/visualization.json")
+            print(f"  [{'通过' if ok_vis else '不达标'}] 离线检测带 --vis-json → "
+                  f"{got_vis or '(缺失)'}（落在会话 derived/ 里，「看 3D」才找得到）")
+            results.append(("离线检测导出可视化", ok_vis))
+
+            # smart：起步用 color，且记下"0 检出就换 hough"
+            captured.clear()
+            mono.var_detector.set("smart")
+            mono._start_video()
+            cmd = captured[0] if captured else []
+            got_auto = cmd[cmd.index("--method") + 1] if "--method" in cmd else ""
+            print(f"  [{'通过' if got_auto == 'color' else '不达标'}] smart 第一遍用 "
+                  f"--method {got_auto or '(缺失)'}（smart 不是注册表里的名字，"
+                  f"起步只能给 color）")
+            results.append(("smart 起步用 color", got_auto == "color"))
+
+            class _FailTask:
+                """桩：模拟 run_video 的 0 检出（退出码 2）。"""
+                exit_code = 2
+
+            captured.clear()
+            mono._on_detected(_FailTask())
+            cmd = captured[0] if captured else []
+            got_retry = cmd[cmd.index("--method") + 1] if "--method" in cmd else ""
+            ok_retry = got_retry == "hough"
+            print(f"  [{'通过' if ok_retry else '不达标'}] smart 遇到退出码 2 → 自动重跑 "
+                  f"--method {got_retry or '(缺失)'}（承诺了就得真的重跑）")
+            results.append(("smart 0 检出自动换 hough", ok_retry))
+
+            # 「看 3D」：没有结果时必须禁用（可点却打不开的按钮最伤信任）
+            mono._session = _FakeSess()
+            mono._refresh_session()
+            disabled = "disabled" in mono.btn_view3d.state()
+            print(f"  [{'通过' if disabled else '不达标'}] 没有三维结果时「看 3D」禁用"
+                  f"（state={mono.btn_view3d.state()}）")
+            results.append(("看 3D 无结果时禁用", disabled))
+
+            # 有结果 → 启用，且命令里真的是 view_3d.py + 那个文件
+            import json
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="mono_view_") as tmp:
+                sess = Path(tmp) / "20260101-000000"
+                (sess / "derived").mkdir(parents=True)
+                vis = sess / "derived" / "visualization.json"
+                vis.write_text(json.dumps({
+                    "schema": "sphere-mono-visualization", "version": 1,
+                    "mode": "mono", "session": sess.name,
+                    "trajectory": [{"frame": 0, "t": 0.0, "xyz": [0, 0, 1.0],
+                                    "confident": True}]}), encoding="utf-8")
+
+                class _RealSess:
+                    path = sess
+
+                mono._session = _RealSess()
+                mono._refresh_session()
+                enabled = "disabled" not in mono.btn_view3d.state()
+                captured.clear()
+                mono._open_3d()
+                cmd = captured[0] if captured else []
+                ok_3d = (enabled and any("view_3d.py" in x for x in cmd)
+                         and any(str(vis) == x for x in cmd))
+                print(f"  [{'通过' if ok_3d else '不达标'}] 有结果时「看 3D」可点，"
+                      f"命令 = {Path(cmd[1]).name if len(cmd) > 1 else '(无)'} "
+                      f"+ …（enabled={enabled}）")
+                results.append(("看 3D 打开查看器", ok_3d))
+
+            # 「开始识别」按来源分发：实时不能误落到离线（那会去找 clip 而静默失败）
+            captured.clear()
+            mono.var_source.set(SOURCE_REALTIME)
+            mono._start_by_source()
+            cmd = captured[0] if captured else []
+            ok_rt = any("run_realtime.py" in x for x in cmd)
+            print(f"  [{'通过' if ok_rt else '不达标'}] 来源=实时 → 调 run_realtime.py"
+                  f"（{' '.join(cmd[1:2]) or '(无命令)'}）")
+            results.append(("开始识别按来源分发", ok_rt))
+            print(f"  检测器候选 = {list(detector_choices())}"
+                  f"（默认 {mono.var_detector.get()!r}）")
+        finally:
+            mono_mod.find_clip = real_find
+            mono._session = real_sess
+            mono.var_focal.set("")
+            mono.var_diameter.set("")
+            mono.var_detector.set("color")
+            mono.var_source.set(SOURCE_OFFLINE)
+            mono._auto_retry_pending = False
+            mono.app.tasks = real_tasks
+            mono._refresh_session()
+
         try:
             from apps._gui_stereo import SessionPicker, scan_sessions
             rows = scan_sessions()

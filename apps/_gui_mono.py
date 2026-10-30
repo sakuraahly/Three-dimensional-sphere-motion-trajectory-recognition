@@ -36,6 +36,7 @@ from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
                                  delete_mono_session, find_clip,
                                  scan_mono_sessions, sync_from_take)
 from apps._task_runner import ROOT
+from sphere_tracker.plugins import names as plugin_names      # noqa: E402
 
 __all__ = ["MonoWindow", "MonoSessionPicker"]
 
@@ -62,6 +63,50 @@ EFFECTIVE_DIAMETER_MM = round(NOMINAL_DIAMETER_MM * (1 - MEASURED_RADIUS_SHRINK)
 #: 旧版本的默认球径。窗口关闭时会把输入框无条件写回 prefs，所以磁盘上的这个值
 #: 与"用户真的想要 40"无法区分 —— 迁移只认这一个字面值，且只做一次。
 LEGACY_DIAMETER = "40"
+
+#: 离线/实时识别用的检测器候选。
+#:
+#: **候选名一律来自注册表**（`plugin_names("detector")`），不在本文件里手写一份 ——
+#: `selftest_plugins` 的 R7 就是守这条的：名字清单只准注册表一份，否则新增一个
+#: 检测器时下拉里永远看不到它（本项目最贵的一类漂移）。顺序 = 注册顺序，
+#: 也就是 `plugins.names()` 文档里说的"下拉框展示顺序"。
+#:
+#: 唯一不在注册表里的是 ``smart``：它是本窗的行为（先用 color，退出码 2 就换
+#: hough 重跑），不是一个检测器。
+#:
+#: 为什么这个下拉必须存在（2026-10-29 现场）：这颗球在画面里颜色不突出，
+#: 默认 ``color`` 40 帧里检出 **0 帧**（CSV 的 x/y 全空），而 ``hough`` 95%、
+#: ``fusion`` 82.5%。没有这个下拉，用户只能撞同一面墙 —— 而墙看起来像"跑完了"。
+#:
+#: ``smart`` **不是**注册表里的检测器，是本窗的行为：先用 color 跑，
+#: 退出码 2（0 检出）就自动换 hough 重跑一遍。实时那边没法"重跑一遍录像"，
+#: 所以 smart 在实时里退化成 color（状态条会说明）。
+#:
+#: 为什么叫 smart 而不是 auto：`selftest_gui_budget` 有一条硬判据
+#: 「窗口里不许出现 auto / parallel / angled」——那是**双目模式**的词，
+#: 出现在单目窗会让人以为又能切模式。换名字比放宽判据好：
+#: 判据守的是真问题，只是这个词撞了车。
+SMART = "smart"
+
+
+def detector_choices() -> tuple[str, ...]:
+    """下拉候选：注册表里的全部检测器 + ``smart``。
+
+    **每次调用都重读注册表**（而不是 import 时算一次）：插件是各模块 import 时
+    自己登记的，算早了就会漏掉后登记的检测器 —— 那种漏法在界面上看不出来。
+    """
+    return tuple(plugin_names("detector")) + (SMART,)
+
+#: 界面文案（不许只写在注释里）：用户是在"要不要换检测器"的那一刻需要它。
+DETECTOR_HINT = ("球颜色不突出时 color 会 0 检出（本机实测 0/40 帧），改 hough（95%）"
+                 "或 fusion（82.5%）。smart = 先 color，0 检出自动换 hough 重跑一遍。")
+
+#: 识别来源：相机实时 / 当前会话录像（离线）。合在一个下拉里是为了**留住按钮预算**
+#: （第③步按钮 ≤5，判据在 tests/selftest_gui_budget.py）——
+#: 实时与离线本来就是同一个动作的两种输入，放一个主操作后面比并排两个按钮更准。
+SOURCE_REALTIME = "实时（相机）"
+SOURCE_OFFLINE = "离线（当前会话）"
+SOURCE_CHOICES = (SOURCE_OFFLINE, SOURCE_REALTIME)
 
 
 def diameter_arg(text: str) -> str:
@@ -330,6 +375,17 @@ class MonoWindow(tk.Toplevel):
             value=prefs.get_str("mono.focal_override", ""))   # 空 = 用标定值
         self.var_record_secs = tk.StringVar(
             value=prefs.get_str("mono.record_seconds", "10"))
+        # 检测器：默认 color（快），但**必须能换** —— 见 detector_choices() 的说明。
+        # 存过的值可能已经不合法（名字改过/注册表删了某个检测器）：认不出就回落 color，
+        # 别把一个不存在的名字带进命令行（那样 run_video 会在 argparse 就退出）。
+        _saved_det = prefs.get_str("mono.detector", "")
+        self.var_detector = tk.StringVar(
+            value=_saved_det if _saved_det in detector_choices() else "color")
+        self.var_source = tk.StringVar(
+            value=(prefs.get_str("mono.source", "") or SOURCE_OFFLINE)
+            if prefs.get_str("mono.source", "") in SOURCE_CHOICES else SOURCE_OFFLINE)
+        # auto 链路的状态：只有 auto 才在 0 检出后自动换 hough 重跑一次
+        self._auto_retry_pending = False
 
         # 会话：**只记用户显式换过的根目录**（默认 data/mono）。
         # 不记"上次选中的会话"—— 那是磁盘现状，属于派生值，抄进界面状态就又多
@@ -478,7 +534,7 @@ class MonoWindow(tk.Toplevel):
             parent, "③ 录制与识别",
             "先录一段：只写相机原图，不叠任何标注，所以录完可以换参数反复检测。"
             "每录一段自动建一个会话目录（与双目同构：session.json 记相机/分辨率/"
-            "帧数，检测结果写进 derived/），录完直接点「离线视频」——它处理的就是"
+            "帧数，检测结果写进 derived/），录完直接点「开始识别」（来源选「离线」）——它处理的就是"
             "当前会话，结果也回写进同一个 derived/。没有内参时焦距按 60° 视场估算，"
             "状态条会写明 —— 那种结果只能看趋势，不能当测量。")
         line = ttk.Frame(box)
@@ -488,6 +544,25 @@ class MonoWindow(tk.Toplevel):
         ttk.Entry(line, textvariable=self.var_record_secs, width=6).pack(
             side="left", padx=(8, 12))
         ttk.Label(line, text="（0 = 按 q 停止）", style="Hint.TLabel").pack(side="left")
+
+        # 检测器与识别来源合成一行：它们一起回答"用什么、跑在哪"，
+        # 拆成两行只会把第③步撑长（首屏装不下三步是 2026-10-28 的问题）。
+        pick = ttk.Frame(box)
+        pick.grid(row=self.surface._next_row(box), column=0, columnspan=9,
+                  sticky="w", pady=(6, 0))
+        ttk.Label(pick, text="检测器").pack(side="left")
+        # 只读下拉，不给手打：名字必须与注册表一致（打错 run_video 直接退出）
+        ttk.Combobox(pick, values=list(detector_choices()), width=9,
+                     state="readonly",
+                     textvariable=self.var_detector).pack(side="left", padx=(8, 16))
+        ttk.Label(pick, text="识别来源").pack(side="left")
+        ttk.Combobox(pick, values=list(SOURCE_CHOICES), width=16,
+                     state="readonly",
+                     textvariable=self.var_source).pack(side="left", padx=(8, 0))
+        self.surface.hint(box, DETECTOR_HINT)
+        self.surface.hint(box, "「离线」处理当前会话的录像：结果写进 derived/，"
+                               "跑完「看 3D」才会亮；「实时」直接开相机，不落盘，"
+                               "也没有 3D 结果（单目三维靠球径先验，需要落盘的轨迹）。")
 
         # 会话目录只显示、不手打：路径由时间戳自动生成，人没必要记它。
         sess = ttk.Frame(box)
@@ -501,10 +576,24 @@ class MonoWindow(tk.Toplevel):
 
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "录制视频", self._start_record)
+        # 实时/离线合成**一个**主操作：第③步按钮预算是 5（selftest_gui_budget 会数），
+        # 而"看 3D"是单目唯一的可视化入口，必须挤进来 —— 它比多一个并列按钮值。
+        self.surface.secondary(actions, "开始识别", self._start_by_source)
+        self.btn_view3d = self.surface.secondary(actions, "看 3D", self._open_3d)
         self.surface.secondary(actions, "历史会话…", self._pick_session)
         self.surface.secondary(actions, "换目录…", self._change_root)
-        self.surface.secondary(actions, "开始实时", self._start_realtime)
-        self.surface.secondary(actions, "离线视频", self._start_video)
+
+    def _start_by_source(self) -> None:
+        """「开始识别」：按上面的下拉决定走实时还是离线。
+
+        为什么不保留两个并列按钮：第③步的按钮预算 ≤5，而"看 3D"必须有位置；
+        更重要的是实时与离线是**同一个动作的两种输入**（相机 / 录像），
+        放在一个主操作后面才是它们的真实关系。
+        """
+        if self.var_source.get() == SOURCE_REALTIME:
+            self._start_realtime()
+        else:
+            self._start_video()
 
     def _start_record(self) -> None:
         """录制单目视频（只写原图）：**先建会话目录，再让录制器往里写**。
@@ -544,7 +633,7 @@ class MonoWindow(tk.Toplevel):
             level = "warn"
         self.status.set_status(
             f"已开始录制 {secs} 秒 → {self._short(sess_dir)}/（有倒计时，"
-            f"看到 REC 才开始动）。录完点「离线视频」直接检测这段会话" + warn, level)
+            f"看到 REC 才开始动）。录完点「开始识别」直接检测这段会话" + warn, level)
 
     def _on_recorded(self, sess_dir: Path) -> None:
         """录制任务结束：把 sidecar 的实测值补进 session.json，再刷新摘要。
@@ -573,7 +662,7 @@ class MonoWindow(tk.Toplevel):
                 "看哪台能出图；日志里这一段也有逐台结果" + note, "warn")
             return
         self.status.set_status(
-            f"录好了：{cur.summary()}{note}。点「离线视频」开始检测，"
+            f"录好了：{cur.summary()}{note}。点「开始识别」（来源「离线」）开始检测，"
             f"结果写进 derived/", "ok")
 
     # ------------------------------------------------------------------ #
@@ -633,6 +722,7 @@ class MonoWindow(tk.Toplevel):
         if self._session is not None:
             self._session = self._reload_session()
         cur = self._session
+        self._sync_view3d_button()
         if cur is None:
             self.lbl_session_dir.configure(text=self._preview_dir())
             self.lbl_session.configure(
@@ -655,7 +745,48 @@ class MonoWindow(tk.Toplevel):
         else:
             self.lbl_session.configure(
                 text="当前会话 " + cur.summary() +
-                     "；点「离线视频」开始检测（结果写进 derived/）", style="Warn.TLabel")
+                     "；点「开始识别」（来源「离线」）开始检测（结果写进 derived/）", style="Warn.TLabel")
+
+    def _vis_path(self) -> Path | None:
+        """当前会话的三维可视化文件（没有就 ``None``）。"""
+        cur = self._session
+        if cur is None:
+            return None
+        p = Path(cur.path) / "derived" / "visualization.json"
+        return p if p.is_file() else None
+
+    def _sync_view3d_button(self) -> None:
+        """「看 3D」只在**真有结果**时可点。
+
+        可点却打开就报错、或点了什么都不发生的按钮，比没有这个按钮更让人
+        怀疑整个界面（"是不是坏了"）。所以这里按磁盘事实启用/禁用。
+        """
+        btn = getattr(self, "btn_view3d", None)
+        if btn is None:                     # 第③步还没建（构造顺序）
+            return
+        try:
+            btn.state(["!disabled"] if self._vis_path() is not None else ["disabled"])
+        except tk.TclError:                 # 窗口已销毁
+            pass
+
+    def _open_3d(self) -> None:
+        """打开 3D 查看器。**单目也有三维**：``Z = f·D/(2r)``。
+
+        为什么不自己画一个小窗：查看器（``apps/view_3d.py``）已经会读单目的
+        ``sphere-mono-visualization``、会切会话、会同步视频。再写一份就是第二份真相。
+        """
+        vis = self._vis_path()
+        if vis is None:
+            self.status.set_status(
+                "当前会话还没有三维结果：先点「开始识别」（来源「离线」）跑一遍检测，"
+                "它会把 derived/visualization.json 写出来", "warn")
+            return
+        self.app.tasks.start(
+            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(vis)],
+            f"3D 查看：{self._session.id if self._session is not None else vis.parent.name}")
+        self.status.set_status(
+            f"已打开 3D 查看器：{self._short(vis)}（单目深度由球径先验得到，"
+            f"D={self._diameter_arg()} mm；不是视差测量）", "info")
 
     def _pick_session(self) -> None:
         """历史会话：选中后回填成当前会话，后续检测/查看都用它。"""
@@ -679,7 +810,7 @@ class MonoWindow(tk.Toplevel):
         else:
             self.status.set_status(
                 f"当前会话换成 {cur.id}（{cur.state}）；"
-                f"「离线视频」会直接处理它", "info")
+                f"「开始识别」（来源「离线」）会直接处理它", "info")
 
     def _change_root(self) -> None:
         """换会话根目录（兜底）：默认自动生成 data/mono/<时间戳>/，正常不用点。"""
@@ -982,9 +1113,25 @@ class MonoWindow(tk.Toplevel):
             return None, f"fx 那一栏「{raw}」不是数字，已忽略，仍用{tail}"
         return int(fx), ""
 
+    def _method_arg(self) -> str:
+        """下拉里的检测器 → ``--method`` 的值。
+
+        ``auto`` 不是注册表里的检测器（``run_video`` 的 choices 里没有它），
+        所以命令行起步只能给 ``color``；真正的"自动换"由 ``_on_detected``
+        看到退出码 2 之后再做（见 ``_start_video``）。
+        """
+        name = (self.var_detector.get() or "").strip()
+        if name not in detector_choices():
+            # 存过的旧值/外部改坏：回落默认，但**不许静默**（下面会写进状态条）
+            return "color"
+        return "color" if name == SMART else name
+
     def _start_realtime(self) -> None:
         cmd = [sys.executable, str(ROOT / "apps" / "run_realtime.py"),
-               "--ball-diameter", self._diameter_arg()]
+               "--ball-diameter", self._diameter_arg(),
+               # 检测器必须显式传：界面选了却不传，等于"显示 hough、实际跑 color"，
+               # 与"显示 21.6 却传 40"是同一类静默失效。
+               "--method", self._method_arg()]
         cmd += self._common_camera_args()
         fx, fx_note = self._focal_arg()
         if fx is not None:
@@ -992,34 +1139,48 @@ class MonoWindow(tk.Toplevel):
         if MONO_CALIB_JSON.exists():
             cmd += ["--config", str(MONO_CALIB_JSON)]
         self.app.tasks.start(cmd, "实时单目识别")
+        auto_note = ("。auto 在实时里退化成 color（实时没有录像可以重跑）"
+                     if self.var_detector.get() == SMART else "")
         self.status.set_status(
             ("已启动实时识别，画面在它自己的窗口里；"
-             "要停请到「日志与任务」里中断" + (f"。注意：{fx_note}" if fx_note else "")),
+             "要停请到「日志与任务」里中断"
+             + (f"。注意：{fx_note}" if fx_note else "") + auto_note),
             "warn" if fx_note else "info")
 
     def _start_video(self) -> None:
-        """离线视频：有当前会话就直接处理它，没有才让用户选文件。
+        """离线识别：有当前会话就直接处理它，没有才让用户选文件。
 
         为什么优先当前会话：会话管理存在的意义就是"不用再记文件在哪"。
         结果写回同一个会话的 derived/ —— 于是"有没有跑过检测"变成**看一眼
         摘要就知道**的事实，而不是靠人记。
+
+        2026-10-29 增两件事：**显式传检测器**（界面选了 color 却跑别的、
+        或反过来，都是静默失效）与 **``--vis-json``**（单目本来就有三维，
+        以前只是从来没落盘，于是"主界面只能看双目"看起来像"单目没有 3D"）。
         """
+        method = self._method_arg()
+        auto = self.var_detector.get() == SMART
         clip = find_clip(self._session.path) if self._session is not None else None
         fx, fx_note = self._focal_arg()
         if clip is not None:
             derived = clip.parent / "derived"
             cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), str(clip),
                    "--ball-diameter", self._diameter_arg(),
+                   "--method", method,
                    "--out", str(derived / "annotated.mp4"),
-                   "--csv", str(derived / "traj.csv")]
+                   "--csv", str(derived / "traj.csv"),
+                   "--vis-json", str(derived / "visualization.json")]
             if fx is not None:
-                # 与「开始实时」同口径：框里填了就传，不许静默不生效。
+                # 与实时那边同口径：框里填了就传，不许静默不生效。
                 cmd += ["--focal", str(fx)]
-            self.app.tasks.start(cmd, f"离线单目：{clip.parent.name}",
-                                 on_done=lambda _task: self._on_detected())
+            self._auto_retry_pending = auto
+            self.app.tasks.start(cmd, f"离线单目：{clip.parent.name}（{method}）",
+                                 on_done=self._on_detected)
             self.status.set_status(
-                f"已启动离线单目：{self._short(clip)}；结果写进 "
-                f"{self._short(derived)}/（跑完摘要会变成「已检测」）"
+                f"已启动离线单目：{self._short(clip)}（检测器 {method}）；结果写进 "
+                f"{self._short(derived)}/（跑完摘要会变成「已检测」，"
+                f"那时才能点「看 3D」）"
+                + ("。auto：若一帧都没检出会自动换 hough 重跑" if auto else "")
                 + (f"。注意：{fx_note}" if fx_note else ""),
                 "warn" if fx_note else "info")
             return
@@ -1035,25 +1196,56 @@ class MonoWindow(tk.Toplevel):
             self.status.set_status("没有选视频，已取消", "info")
             return
         cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), path,
-               "--ball-diameter", self._diameter_arg()]
+               "--ball-diameter", self._diameter_arg(),
+               "--method", method]
         if fx is not None:
             cmd += ["--focal", str(fx)]
-        self.app.tasks.start(cmd, f"离线单目：{Path(path).name}")
+        # 不在会话里的文件也给 --vis-json，落在它旁边（用户明确选了文件，
+        # "看 3D"按钮指不到它，但产物本身得留下）
+        side = Path(path).with_name("visualization.json")
+        cmd += ["--vis-json", str(side)]
+        self._auto_retry_pending = auto
+        self.app.tasks.start(cmd, f"离线单目：{Path(path).name}（{method}）",
+                             on_done=self._on_detected)
         self.status.set_status(
-            f"已启动离线单目：{Path(path).name}（这个文件不在会话目录里，"
-            f"结果不会写进任何 derived/）"
+            f"已启动离线单目：{Path(path).name}（检测器 {method}；这个文件不在"
+            f"会话目录里，结果不会写进任何 derived/，可视化落在 {side.name}）"
             + (f"。注意：{fx_note}" if fx_note else ""),
             "warn" if fx_note else "info")
 
-    def _on_detected(self) -> None:
-        """离线检测结束：重读会话，让摘要在"已录，未检测"和"已检测"之间翻转。"""
+    def _on_detected(self, task=None) -> None:
+        """离线检测结束：按退出码说话，再重读会话摘要。
+
+        **退出码是这段唯一的结论**：``run_video`` 在 0 检出时返回 2（并且不写
+        CSV/可视化/标注视频）。以前这里不看退出码，于是"0 检出"被报成
+        "derived/ 里没看到结果，去看日志" —— 用户得自己翻日志才知道
+        是检测器选错了。现在当场说清楚，并（auto 时）自动换 hough 重跑。
+        """
         if not self._alive():
             return
+        code = getattr(task, "exit_code", None)
+        if self._auto_retry_pending and code == 2:
+            # auto 的全部意义就在这里：用户不知道"这颗球 color 看不见"，
+            # 界面替他试一次 hough，而不是让他自己去读那段诊断。
+            self._auto_retry_pending = False
+            self.var_detector.set("hough")
+            self.status.set_status(
+                "color 一帧都没检出（退出码 2），auto 已自动换 hough 重跑一遍…", "warn")
+            self._start_video()
+            return
+        self._auto_retry_pending = False
         self._refresh_session()
         cur = self._session
         if cur is not None and cur.has_result:
             self.status.set_status(
-                f"{cur.id}：结果已写进 derived/（annotated.mp4 + traj.csv）", "ok")
+                f"{cur.id}：结果已写进 derived/"
+                f"（annotated.mp4 + traj.csv + visualization.json）；"
+                f"点「看 3D」看图", "ok")
+        elif code == 2:
+            self.status.set_status(
+                "一帧都没检出（退出码 2）：检测器不适合这颗球。"
+                "把「检测器」换成 hough（本机实测 95%）或 fusion 再跑一次；"
+                "csv/可视化/标注视频都没有写，别把它们当成结果", "warn")
         else:
             self.status.set_status(
                 "检测任务结束了，但 derived/ 里没看到结果：到"
@@ -1070,6 +1262,10 @@ class MonoWindow(tk.Toplevel):
         p.set("mono.diameter_mm", self.var_diameter.get().strip())
         p.set("mono.focal_override", self.var_focal.get().strip())
         p.set("mono.record_seconds", self.var_record_secs.get().strip())
+        # 检测器与来源是**输入**（用户的选择），要记住：这颗球 color 看不见，
+        # 每次开窗都回到 color 等于每次都让他再撞一遍墙。
+        p.set("mono.detector", self.var_detector.get().strip())
+        p.set("mono.source", self.var_source.get().strip())
         # 只存"用户换过的根目录"这个输入；当前选中的会话属于磁盘现状，不存
         p.set("mono.session_root", str(self._session_root))
         p.save()

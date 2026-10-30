@@ -1,13 +1,26 @@
 """离线 3D 轨迹查看器：读取标准 `visualization.json`，交互播放。
 
+**单目 / 双目都能看**（2026-10-29 增）。两种数据的 schema 不同名、
+尺度来源也不同，但 `trajectory` 的字段形状一致（`frame` / `t` / `xyz`），
+所以画图逻辑只有一份：
+
+    sphere-stereo-visualization   双目：深度靠**视差**（Z 是真测量）
+    sphere-stereo-trajectory      双目旧格式（samples）
+    sphere-mono-visualization     单目：深度靠**球径先验** Z=f·D/(2r)
+
+单目那条必须在界面上常驻一句话说明尺度来历 —— 让人拿它当视差测量用，
+比不给他这个功能更糟。所以打开单目时标题栏带 `[单目]`、图下方常驻一行
+「深度由球径先验得到（D=… mm），不是视差测量」。
+
 用法：
-    python apps/view_3d.py data/sessions/20261019-221550
-    python apps/view_3d.py data/sessions/20261019-221550/derived/visualization.json
-    python apps/view_3d.py data/sessions/20261019-221550 --check
+    python apps/view_3d.py data/stereo/20261019-221550
+    python apps/view_3d.py data/mono/20261029-205522
+    python apps/view_3d.py data/stereo/20261019-221550 --check
 
 只依赖 matplotlib + Tkinter（环境已有），不依赖网络、不依赖 stereo 包。
 坐标系由 `visualization.json` 的 `coordinate_system` 决定：**X 右 / Y 下 / Z 前**
-（单位米）；parallel 是校正后左相机系，angled 是原始左相机系。
+（单位米）；parallel 是校正后左相机系，angled 是原始左相机系，
+mono-camera 是单目相机系（主点在画面中心或标定主点）。
 """
 
 from __future__ import annotations
@@ -34,8 +47,14 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# 数据根目录只有 `sphere_tracker/paths.py` 说了算：以前 `data/sessions` 这个
+# 字面量散在 8 处，于是"会话"在磁盘上指了两个东西（见该模块 docstring）。
+from sphere_tracker.paths import MONO_ROOT, STEREO_ROOT, stereo_roots  # noqa: E402
+
 VIS_SCHEMA = "sphere-stereo-visualization"
 TRAJ_SCHEMA = "sphere-stereo-trajectory"
+MONO_SCHEMA = "sphere-mono-visualization"
+SCHEMAS = (VIS_SCHEMA, TRAJ_SCHEMA, MONO_SCHEMA)
 
 
 def resolve_json(path: str | Path) -> Path:
@@ -51,12 +70,22 @@ def resolve_json(path: str | Path) -> Path:
     return p
 
 
+def is_mono(data: dict) -> bool:
+    """这份数据是不是单目的。
+
+    认两个标记：schema 是单目那个（正常情况），或 ``mode == "mono"``
+    （别人手写的文件、将来加了新 schema 但语义仍是单目时）。
+    **不靠目录名猜**：单目会话可能被拷到 `data/` 下，路径不能当类型用。
+    """
+    return data.get("schema") == MONO_SCHEMA or data.get("mode") == "mono"
+
+
 def load_view(path: str | Path) -> dict:
     p = resolve_json(path)
     data = json.loads(p.read_text(encoding="utf-8"))
     schema = data.get("schema")
-    if schema not in (VIS_SCHEMA, TRAJ_SCHEMA):
-        raise ValueError(f"不是 {VIS_SCHEMA}/{TRAJ_SCHEMA}：{schema}")
+    if schema not in SCHEMAS:
+        raise ValueError(f"不是 {'/'.join(SCHEMAS)}：{schema}")
     if int(data.get("version", 0)) != 1:
         raise ValueError(f"不支持的 version：{data.get('version')}")
     points = data.get("trajectory")
@@ -84,10 +113,17 @@ SOURCE_LIMIT = 40
 
 def scan_sources(limit: int = SOURCE_LIMIT,
                  roots: tuple[Path, ...] | None = None) -> list[Path]:
-    """所有**真有**三维结果的会话，新的在前。
+    """所有**真有**三维结果的会话（单目 + 双目），新的在前。
 
-    扫两层：`data/sessions/<会话>/derived/` 与 `data/<会话>/derived/`
-    （早期会话直接放在 `data/` 下，那时还没有 `sessions/`）。
+    扫三个地方（2026-10-29 按类型分目录之后）：
+
+    - ``stereo_roots()`` 各自的 ``*/derived/``（`data/stereo` 与旧的 `data/sessions`）
+    - ``MONO_ROOT/*/derived/``（`data/mono`）
+    - ``data/*/derived/``（最早期的会话直接放在 `data/` 下，那时两个子目录都没有）
+
+    路径**一律从 `sphere_tracker/paths.py` 来**，不在这里再写 `ROOT/"data"/...`
+    —— 那正是"会话"这个词有两个意思的起点。
+
     `roots` 只给测试用：判据要能造临时会话，不能依赖这台机器录过什么。
 
     **排序用目录名里的 `YYYYMMDD-HHMMSS`，不用文件 mtime**：
@@ -95,7 +131,14 @@ def scan_sources(limit: int = SOURCE_LIMIT,
     "昨天录、今天补跑"的会话顶到第一条，默认选中就漂了。
     这个坑 `apps/_workbench.scan_sessions` 已经吃过一次，判据写在它的 docstring 里。
     """
-    bases = roots if roots is not None else (ROOT / "data" / "sessions", ROOT / "data")
+    if roots is not None:
+        bases = tuple(roots)
+    else:
+        # dict.fromkeys 去重保序：`data/stereo` 不存在时不多扫一遍。
+        # `MONO_ROOT.parent` 就是 `data/` 本身 —— 用它而不是再写一遍字面量，
+        # 这样"data 在哪"仍然只有 paths.py 一个来源。
+        bases = tuple(dict.fromkeys(
+            (*stereo_roots(), MONO_ROOT, MONO_ROOT.parent)))
     found: dict[Path, Path] = {}
     for base in bases:
         if not base.is_dir():
@@ -118,15 +161,35 @@ def scan_sources(limit: int = SOURCE_LIMIT,
     return sorted(found.values(), key=key, reverse=True)[:max(1, limit)]
 
 
+def source_kind(f: Path) -> str:
+    """这个结果文件属于哪种数据：``"mono"`` / ``"stereo"`` / ``""``（读不出来）。
+
+    **读文件里的 schema，不看路径**：单目会话可以被拷到 `data/` 下（早期位置），
+    按目录判会把类型说错，而类型正是下拉里那个前缀要说的事。
+    文件坏了就返回空串 —— 下拉里只显示名字，选它会当场报错，不静默。
+    """
+    try:
+        schema = json.loads(Path(f).read_text(encoding="utf-8")).get("schema")
+    except (OSError, ValueError):
+        return ""
+    return "mono" if schema == MONO_SCHEMA else ("stereo" if schema in SCHEMAS else "")
+
+
 def source_label(f: Path) -> str:
-    """下拉里显示的名字：会话目录名（`session.json` 有 label 就接在后面）。"""
+    """下拉里显示的名字：``[单目]``/``[双目]`` 前缀 + 会话目录名（有 label 就接上）。
+
+    前缀不是装饰：单目与双目的 **Z 不是一回事**（先验 vs 视差），
+    混在一个列表里而看不出哪个是哪个，等于让人拿先验当测量。
+    """
     sess = f.parent.parent
     try:
         tag = str(json.loads((sess / "session.json").read_text(encoding="utf-8"))
                   .get("label") or "").strip()
     except Exception:                                       # noqa: BLE001
         tag = ""
-    return f"{sess.name}  {tag}" if tag else sess.name
+    kind = {"mono": "[单目]", "stereo": "[双目]"}.get(source_kind(f), "[?]")
+    name = f"{sess.name}  {tag}" if tag else sess.name
+    return f"{kind} {name}"
 
 
 class Viewer3D:
@@ -169,6 +232,7 @@ class Viewer3D:
         self.points = data["trajectory"]
         self.n = len(self.points)
         self.idx = 0
+        self.mono = is_mono(data)
         self.video_error = ""
         self.video_disabled = (video_path is None or video_path == "") and not auto_video
         self.lo, self.hi = bounds_of(self.points)
@@ -178,14 +242,36 @@ class Viewer3D:
             self.video_error = f"视频打不开：{self.video_path}"
             self.cap.release()
             self.cap = None
-        if self.cap is not None:
+        if self.cap is not None and not self.mono:
+            # 只有双目才要求左右并排：单目的标注视频就是一路画面，
+            # 拿 2:1 去卡它会把每一段单目会话都判成"视频不能看"。
             vw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             vh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             if vw > 0 and vh > 0 and vw < vh * 1.8:
                 self.video_error = f"视频不是左右并排（{vw}x{vh}），按 2:1 切分会错"
                 self.cap.release()
                 self.cap = None
-        self.root.title(f"3D 轨迹 · {data.get('session', '')} · {self.n} points")
+        kind = "[单目] " if self.mono else "[双目] "
+        self.root.title(f"3D 轨迹 · {kind}{data.get('session', '')} · {self.n} points")
+        self._sync_mono_note()
+
+    def _sync_mono_note(self) -> None:
+        """单目时把"尺度从哪来"常驻在图下方；双目时清空。
+
+        为什么不用弹窗：每次换会话都弹一次，用户第三次就会条件反射点掉，
+        等于没提示。常驻一行不打扰，但一直在。
+        """
+        note = getattr(self, "mono_note", None)
+        if note is None:
+            return
+        if not self.mono:
+            note.configure(text="")
+            return
+        d = self.data.get("ball_diameter_mm")
+        d_txt = f"{float(d):g}" if isinstance(d, (int, float)) else "?"
+        note.configure(
+            text=f"单目深度由球径先验得到（D={d_txt} mm，Z=f·D/(2r)），"
+                 f"尺度依赖这个数；不是视差测量")
 
     def open_source(self, path: str | Path) -> None:
         """切到另一个会话 / 文件。
@@ -272,6 +358,11 @@ class Viewer3D:
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
         self.status.pack(side="bottom", fill="x")
+        # 单目尺度的常驻说明（在图/状态条之间，不弹窗）。先 pack 的在下层，
+        # 所以它出现在状态条**上方** —— 与"图下方"的直觉一致。
+        self.mono_note = ttk.Label(self.root, padding=(10, 2), anchor="w",
+                                   foreground="#b45309")
+        self.mono_note.pack(side="bottom", fill="x")
 
         # ---- 数据源：换会话 ----
         # 2026-10-28 用户报："打开后自动选最近会话，且不能改"。
@@ -299,6 +390,7 @@ class Viewer3D:
         self.root.bind("<Home>", lambda _e: self._reset_view())
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_sources()
+        self._sync_mono_note()
 
     # ------------------------------------------------------------------
     # 换数据源
@@ -308,8 +400,9 @@ class Viewer3D:
         self._sources = scan_sources()
         self.source_box["values"] = [source_label(f) for f in self._sources]
         self.source_note.configure(
-            text=f"共 {len(self._sources)} 个会话有结果" if self._sources else
-                 "没有找到会话结果（data/sessions/*/derived/）")
+            text=f"共 {len(self._sources)} 个会话有结果（单目 + 双目）"
+                 if self._sources else
+                 "没有找到会话结果（data/stereo、data/mono 下都没有 derived/）")
         self._sync_source_row()
 
     def _sync_source_row(self) -> None:
@@ -331,9 +424,12 @@ class Viewer3D:
             self._switch_to(self._sources[i])
 
     def _on_browse_source(self) -> None:
+        # 起始目录优先给双目根（最常见），它不存在就退回 `data/` ——
+        # 给一个不存在的目录，对话框会从"我的电脑"开起，用户得多点好几下。
+        start = STEREO_ROOT if STEREO_ROOT.is_dir() else MONO_ROOT.parent
         d = filedialog.askdirectory(
             title="选择会话目录（含 derived/visualization.json）",
-            initialdir=str(ROOT / "data" / "sessions"), parent=self.root)
+            initialdir=str(start), parent=self.root)
         if not d:
             return
         try:
@@ -427,16 +523,20 @@ class Viewer3D:
         self.ax.set_xlabel("X right (m)")
         self.ax.set_ylabel("Y down (m)")
         self.ax.set_zlabel("Z forward (m)")
-        self.ax.set_title(f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
+        self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
+                          f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
         self.canvas.draw_idle()
         self._update_video()
         self._status()
 
     def _render_video(self) -> None:
-        for raw, canvas, attr in (
-            (self._left_raw, self.video_l, "_left_photo"),
-            (self._right_raw, self.video_r, "_right_photo"),
+        for raw, canvas, attr, empty in (
+            (self._left_raw, self.video_l, "_left_photo", ""),
+            # 单目没有第二路：右格写清楚"这里本来就不该有画面"，
+            # 否则用户看到空白会以为是解码失败。
+            (self._right_raw, self.video_r, "_right_photo",
+             "单目会话只有一路画面" if self.mono else ""),
         ):
             canvas.delete("all")
             w = max(2, canvas.winfo_width())
@@ -446,7 +546,7 @@ class Viewer3D:
             if raw is None:
                 canvas.create_text(
                     w // 2, h // 2, fill="#94a3b8", anchor="center",
-                    text=self.video_error or (
+                    text=empty or self.video_error or (
                         "视频已关闭（--no-video）" if getattr(self, "video_disabled", False)
                         else "未找到 annotated.mp4"))
                 continue
@@ -482,8 +582,13 @@ class Viewer3D:
             return
         self.video_error = ""
         h, w = img.shape[:2]
-        self._left_raw = img[:, : w // 2].copy()
-        self._right_raw = img[:, w // 2:].copy()
+        if self.mono:
+            # 单目视频是一路画面，整幅放进左格（右格保持 None，见 _render_video）
+            self._left_raw = img
+            self._right_raw = None
+        else:
+            self._left_raw = img[:, : w // 2].copy()
+            self._right_raw = img[:, w // 2:].copy()
         self._render_video()
 
     def _status(self) -> None:
@@ -491,10 +596,12 @@ class Viewer3D:
         frame = p.get("frame", self.idx)
         t = p.get("t", 0.0)
         x, y, z = p["xyz"]
+        mode = ("mono" if self.mono
+                else self.data.get("stereo_mode", "parallel"))
         self.status.configure(
             text=f"frame {frame}   t={float(t):.3f}s   "
                  f"X={float(x):.4f}  Y={float(y):.4f}  Z={float(z):.4f} m   "
-                 f"模式={self.data.get('stereo_mode', 'parallel')}   "
+                 f"模式={mode}   "
                  f"坐标={self.data.get('coordinate_system', '?')}")
 
     # ------------------------------------------------------------------
@@ -549,10 +656,15 @@ def main() -> int:
         return 1
     lo, hi = bounds_of(data["trajectory"])
     if args.check:
+        mono = is_mono(data)
         print(f"文件：{data['_path']}")
-        print(f"schema={data.get('schema')} version={data.get('version')}")
+        print(f"schema={data.get('schema')} version={data.get('version')} "
+              f"mode={'mono' if mono else 'stereo'}")
         print(f"session={data.get('session')} points={len(data['trajectory'])}")
         print(f"coordinate_system={data.get('coordinate_system')} unit={data.get('unit')}")
+        if mono:
+            # 尺度来源必须进 --check 的输出：它是这份数据能不能当测量的前提
+            print(f"ball_diameter_mm={data.get('ball_diameter_mm')} fx={data.get('fx')}")
         print(f"bounds min={lo} max={hi}")
         if args.no_video:
             print("video=disabled (--no-video)")
@@ -573,7 +685,8 @@ def main() -> int:
             cap.release()
             max_frame = max(int(p.get("frame", 0)) for p in data["trajectory"])
             print(f"video_frames={vn} size={vw}x{vh} max_point_frame={max_frame}")
-            if vw < vh * 1.8:
+            if not mono and vw < vh * 1.8:
+                # 只有双目要求左右并排；单目就是一路画面，卡 2:1 会把它判死
                 print("[错误] 视频不是左右并排（需要约 2:1）")
                 return 1
             if max_frame >= vn:

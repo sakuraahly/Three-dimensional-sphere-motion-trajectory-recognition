@@ -677,6 +677,133 @@ def test_detect_width_rescales_coordinates() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_mono_visualization_contract() -> bool:
+    """第 9 节：单目三维可视化的 schema / 扫描 / 0 检出判据（2026-10-29 增）。
+
+    ## 为什么这一节存在
+
+    用户原话："主界面 3D 查看器只能查看双目会话的内容，单目那里没有查看器"。
+    查下去比"没有入口"更糟：单目离线检测**什么都没测到却静默报成功**
+    （现场 288 帧的一段，默认 ``color`` 40 帧里检出 0 帧，退出码 0、
+    CSV 写出但 x/y 全空）。三件事必须钉住：
+
+    1. 单目**本来就有**三维（``Z=f·D/(2r)``），导出的文件要能被查看器读；
+    2. 那个文件**不能冒充双目** —— schema 必须不同名（尺度来源不同：
+       先验 vs 视差），把 `mode` 读成 mono；
+    3. 0 检出不写空文件、且退出码非 0；低检出警告但仍 exit 0。
+
+    全部用 `tempfile`：判据不许依赖这台机器录过什么。
+    """
+    print("----- 9. 单目可视化：schema / 扫描 / 检出判据 -----")
+    import json
+    import tempfile
+
+    from apps.run_video import (LOW_HIT_RATE, build_vis, hit_report,
+                                session_name)
+    from apps.view_3d import (MONO_SCHEMA, is_mono, load_view, scan_sources,
+                             source_label)
+
+    checks: list[tuple[str, bool]] = []
+
+    def ck(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
+        checks.append((label, ok))
+
+    # ---- 1. 生产者 → 磁盘 → 查看器：一条真链路 ----
+    rows = [{"frame": i, "t": round(i / 30, 5), "coasting": 0 if i % 5 else 1,
+             "X_m": 0.01 * i, "Y_m": 0.02, "Z_m": 0.8 + 0.001 * i}
+            for i in range(6)]
+    rows.append({"frame": 6, "t": 0.2, "coasting": ""})   # 没有 position_3d 的行
+    with tempfile.TemporaryDirectory() as tmp:
+        sess = Path(tmp) / "20260101-000000"
+        (sess / "derived").mkdir(parents=True)
+        vis = build_vis(rows, session=session_name(sess / "clip.mkv"),
+                        source="clip.mkv", ball_diameter_mm=21.6, fx=1387.5,
+                        created="2026-01-01 00:00:00")
+        assert vis is not None
+        f = sess / "derived" / "visualization.json"
+        f.write_text(json.dumps(vis, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        data = load_view(f)
+        ck("查看器能读单目文件，且点数 = 有 position_3d 的行数（6，不是 7）",
+           len(data["trajectory"]) == 6, f"{len(data['trajectory'])} 点")
+        ck("mode 读成 mono（不冒充双目）",
+           data.get("mode") == "mono" and is_mono(data),
+           f"schema={data.get('schema')} mode={data.get('mode')}")
+        ck("schema 与双目**不同名**（同名会让下游以为在读视差测量）",
+           data.get("schema") == MONO_SCHEMA
+           and data.get("schema") != "sphere-stereo-visualization",
+           str(data.get("schema")))
+        ck("尺度来源可追溯（D / fx 都落盘，不是缺省值）",
+           abs(float(data["ball_diameter_mm"]) - 21.6) < 1e-6
+           and abs(float(data["fx"]) - 1387.5) < 1e-6,
+           f"D={data.get('ball_diameter_mm')} fx={data.get('fx')}")
+        ck("confident = not coasting（跟踪器外推的点不许算可信）",
+           [p["confident"] for p in data["trajectory"]]
+           == [not bool(r.get("coasting")) for r in rows[:6]],
+           str([p["confident"] for p in data["trajectory"]]))
+
+        found = scan_sources(roots=(Path(tmp),))
+        ck("扫描能把单目会话列进来（以前只扫双目根）",
+           [q.parent.parent.name for q in found] == ["20260101-000000"],
+           str([q.name for q in found]))
+        if found:
+            label = source_label(found[0])
+            ck("下拉文案带 [单目] 前缀（一眼分出类型）",
+               label.startswith("[单目]"), label)
+
+        # ---- 2. 空轨迹 / 错 schema：必须抛错，不许"读进来 0 点" ----
+        bad = Path(tmp) / "bad_schema" / "derived"
+        bad.mkdir(parents=True)
+        (bad / "visualization.json").write_text(
+            json.dumps({"schema": "sphere-visualization", "version": 1,
+                        "trajectory": [{"xyz": [0, 0, 1]}]}), encoding="utf-8")
+        try:
+            load_view(bad / "visualization.json")
+            ck("错 schema 抛错（没有被当成双目放过）", False)
+        except ValueError as exc:
+            ck("错 schema 抛错（没有被当成双目放过）", True, str(exc)[:40])
+
+        empty = Path(tmp) / "empty" / "derived"
+        empty.mkdir(parents=True)
+        (empty / "visualization.json").write_text(
+            json.dumps({"schema": MONO_SCHEMA, "version": 1, "mode": "mono",
+                        "trajectory": []}), encoding="utf-8")
+        try:
+            load_view(empty / "visualization.json")
+            ck("空轨迹抛错（空文件不许被当成「有结果」）", False)
+        except ValueError:
+            ck("空轨迹抛错（空文件不许被当成「有结果」）", True)
+
+    # ---- 3. 生产侧的判据：0 检出 / 低检出 / 正常 ----
+    ck("0 检出 → build_vis 返回 None（不写空文件）",
+       build_vis([{"frame": 0, "t": 0.0, "coasting": ""}],
+                 session="s", source="c.mkv", ball_diameter_mm=21.6,
+                 fx=1000.0) is None)
+
+    code, lines = hit_report(0, 40, "color")
+    txt = "\n".join(lines)
+    ck("0 检出 → 退出码 2（不是 0）", code == 2, f"EXIT={code}")
+    ck("0 检出的诊断里写了当前检测器 + 该改试哪个",
+       "color" in txt and "--method hough" in txt and "--method fusion" in txt,
+       txt.splitlines()[1].strip() if len(lines) > 1 else "")
+    ck("0 检出的诊断说清了「为什么不静默」（提到「看起来成功」）",
+       "看起来成功" in txt)
+
+    code_w, lines_w = hit_report(3, 40, "motion")
+    ck(f"低检出（7.5% < {LOW_HIT_RATE:.0%}）→ 退出码仍是 0（有数据不假装失败）",
+       code_w == 0 and any("[警告]" in ln for ln in lines_w),
+       f"EXIT={code_w}")
+
+    code_ok, lines_ok = hit_report(38, 40, "hough")
+    ck("正常检出 → 退出码 0 且不告警", code_ok == 0 and not lines_ok)
+
+    print(f"  共 {len(checks)} 项：" + ("全部通过" if all(k for _l, k in checks)
+                                      else "有不达标项"))
+    return all(k for _l, k in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("叠加层缩放自测（viz.scale：整张图所有元素一起缩放）")
@@ -692,7 +819,8 @@ def main() -> int:
                test_content_area_grows_with_k_squared,
                test_display_width_contract,
                test_detect_width_rescales_coordinates,
-               test_hud_text_is_immune_to_display_width):
+               test_hud_text_is_immune_to_display_width,
+               test_mono_visualization_contract):
         results.append(fn())
         print()
     ok = all(results)
