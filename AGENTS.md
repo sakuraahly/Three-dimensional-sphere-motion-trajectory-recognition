@@ -110,6 +110,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | **数据 / 会话**（2） | `check_dataset.py` `migrate_data_layout.py` | 校验录制会话（视频 / 标定 / 同步）；把旧布局 `data/sessions/*` 搬到 `data/stereo/*`（可 `--dry-run`，同名绝不覆盖，幂等可重跑） |
 | **性能 / 剖析**（1） | `profile_stages.py` | 分段计时（读帧 / 检测 / 跟踪 / 配对 / 三角测量）：给"优化哪里"提供数据，**先量再决定** |
 | **单目 / 对比**（1） | `mono_vs_stereo.py` | 单目按球径先验估深 vs 双目三角测量，逐帧比 Z / X / Y；球径未知时反推等效直径 `D_eff = 2rZ/f` 并看它稳不稳（**不瞎填一个 40 mm 然后下结论**） |
+| **球检测器**（2） | `export_ball_dataset.py` `train_ball_detector.py` | 把"点选 + 跟踪"的结果自举成 YOLO 数据集（**按会话切分**，正/负样本都收），再微调 `yolo11n` 并用**圆心误差**（不是 mAP）验收；训完 `models/ball_yolo.pt` 会被 `YoloDetector` 自动优选 |
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。

@@ -288,6 +288,22 @@ def _plot_trajectory(arr: np.ndarray, path: Path, smoothed: np.ndarray | None = 
     plt.close(fig)
 
 
+#: `traj3d.csv` 的列顺序（**唯一来源**）。写入时必须每一行都等长，
+#: 否则 `csv.DictReader` 会把后面的列整体左移而不报错 —— 2026-10-30 实测过：
+#: 少写一个 `confident`，读出来就是 `method_left` 的字符串（"track"），
+#: 于是"按 confident==0 过滤"永远得到 0 行，且没人能看出问题在哪。
+CSV_HEADER = ["frame", "t", "matched", "X", "Y", "Z", "u_left", "v_left",
+              "u_right", "v_right", "epipolar_px", "residual_px", "confident",
+              "method_left", "method_right"]
+
+
+def row_unmatched(frame: int, t: float, det_l, det_r) -> list:
+    """未配对帧的一行 CSV。**长度必须等于 `CSV_HEADER`**（有判据守着）。"""
+    return [frame, f"{t:.4f}", 0, "", "", "", "", "", "", "", "", 0, 0,
+            "" if det_l is None else det_l.method,
+            "" if det_r is None else det_r.method]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="离线双目三维轨迹（读会话）")
     ap.add_argument("session", help="data/sessions/<id> 目录或 session.json")
@@ -625,9 +641,13 @@ def main() -> int:
             n_pairs += 1
 
             if pt is None:
-                rows.append([n_pairs - 1, f"{t:.4f}", 0, "", "", "", "", "", "", "", "", 0,
-                             "" if det_l is None else det_l.method,
-                             "" if det_r is None else det_r.method])
+                # ⚠️ 这一行的字段数**必须**和 header 一样（15 个）。
+                # 2026-10-30 实测：这里原来只有 14 个（少了 `confident`），于是
+                # 所有未匹配行的 `confident` 列读出来是 `method_left`（"track"/"specular"），
+                # 后面每一列都整体左移一格。`csv.DictReader` 不会报错，只会给错值 ——
+                # 这正是本项目最贵的那类"看起来成功"。任何按 `confident == 0` 过滤的
+                # 分析都会得到 0 行，且找不到原因。
+                rows.append(row_unmatched(n_pairs - 1, t, det_l, det_r))
             else:
                 trail_l.append(pt.u_left)
                 trail_r.append(pt.u_right)
@@ -661,9 +681,13 @@ def main() -> int:
         if writer is not None:
             writer.release()
 
-    header = ["frame", "t", "matched", "X", "Y", "Z", "u_left", "v_left",
-              "u_right", "v_right", "epipolar_px", "residual_px", "confident",
-              "method_left", "method_right"]
+    header = CSV_HEADER
+    # 每一行都必须与表头等长：列错位不会报错，只会让下游读到错值。
+    bad = [(i, len(r)) for i, r in enumerate(rows) if len(r) != len(header)]
+    if bad:
+        raise SystemExit(
+            f"[错误] rows 里有 {len(bad)} 行列数与表头不一致（表头 {len(header)} 列），"
+            f"前 3 个：{bad[:3]}。写出去会是一份列错位的 CSV，宁可现在失败。")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(header)

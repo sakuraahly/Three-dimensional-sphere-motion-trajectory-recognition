@@ -22,7 +22,13 @@ def resolve_weights(weights: str) -> str:
     p = Path(weights)
     if p.is_absolute():
         return str(p) if p.exists() else p.name
-    root = Path(__file__).resolve().parents[1]
+    # 本文件在 sphere_tracker/detectors/base.py：
+    #   parents[0]=detectors  parents[1]=sphere_tracker  parents[2]=**仓库根**
+    # 2026-10-30 之前这里写的是 parents[1]，于是 `models/yolo11n.pt` 永远解析不到，
+    # 静默退回裸文件名 `yolo11n.pt` —— ultralytics 会去自己的缓存目录找/下载，
+    # 表面一切正常，实际用的**不是仓库里那份权重**。自训权重更直接：报
+    # FileNotFoundError，而错误信息里显示的仍是配置里的旧名字，指不到真因。
+    root = Path(__file__).resolve().parents[2]
     candidate = root / p
     if candidate.exists():
         return str(candidate)

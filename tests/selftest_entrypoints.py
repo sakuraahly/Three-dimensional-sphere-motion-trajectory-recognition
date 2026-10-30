@@ -750,6 +750,515 @@ def test_data_layout_single_source() -> bool:
     return all(good for _label, good in checks)
 
 
+# ----------------------------------------------------------------------
+# 第 11 节：YOLO 数据集导出
+# ----------------------------------------------------------------------
+TOOL_EXPORT = ROOT / "apps" / "tools" / "export_ball_dataset.py"
+
+#: 夹具里的视频尺寸。取 64×48 而不是正方形，是**故意的**：正方形画面下
+#: "宽度除以 W、高度除以 H" 与 "都除以 max(W,H)" 碰巧等价，测不出区别。
+FAKE_W, FAKE_H = 64, 48
+FAKE_FRAMES = 8
+
+
+def _tiny_video(path: Path, frames: int = FAKE_FRAMES) -> None:
+    """造一段**真能解码**的微型视频（MJPG 内容的 AVI，文件名照生产布局叫 .mkv）。
+
+    为什么不真解码录制会话：真数据 300 帧 1920×1080，一条测试几十秒，
+    而这里要验的是"按帧号取图 + 归一化"，跟容器格式无关。
+    `cv2.VideoCapture` 只嗅内容、不认扩展名（实测），所以 AVI 存成 .mkv 一样能开 ——
+    这样"会话内文件叫 clip.mkv / left.mkv"这条生产约定也不用为测试让步。
+    """
+    import cv2
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 10,
+                             (FAKE_W, FAKE_H))
+    if not writer.isOpened():
+        raise RuntimeError("本机 cv2 写不出 MJPG，无法构造微型视频")
+    try:
+        for i in range(frames):
+            # 纯色帧：标注只依赖 CSV，画面内容不参与任何断言
+            writer.write(np.full((FAKE_H, FAKE_W, 3), (i * 30) % 255, np.uint8))
+    finally:
+        writer.release()
+
+
+def _fake_calib(path: Path, focal: float = 100.0) -> None:
+    """最小可用标定：只给导出要用的 `P1[0,0]`（焦距）与 `image_size`。
+
+    故意把焦距设成 100 这种整数值：`r = f·D/(2Z)` 就能口算，
+    期望标签可以写在断言里而不是"跑一遍抄下来"。
+    """
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    eye = np.eye(3)
+    p1 = eye.copy()
+    p1[0, 0] = p1[1, 1] = focal
+    p1[0, 2], p1[1, 2] = FAKE_W / 2, FAKE_H / 2
+    np.savez(path, K1=eye, D1=np.zeros(5), K2=eye, D2=np.zeros(5),
+             R=eye, T=np.array([-0.06, 0.0, 0.0]),
+             image_size=np.array([FAKE_W, FAKE_H]), P1=p1, P2=p1)
+
+
+#: 四段假会话：两段单目 + 两段双目。
+#: 为什么是 2+2 而不是 1+1：切分按**类型**分层后，"每类至少 1 段进 val"要求每类 >=2 段，
+#: 1+1 的夹具连"正常导出"都做不了（工具会正确地拒绝）。2+2 才能验分层本身。
+MONO_IDS = ("20990101-000001", "20990102-000001")
+STEREO_IDS = ("20990103-000001", "20990104-000001")
+
+
+def _make_mono_session(data: Path, sid: str) -> None:
+    sess = data / "mono" / sid
+    _tiny_video(sess / "clip.mkv")
+    (sess / "derived").mkdir(parents=True, exist_ok=True)
+    (sess / "derived" / "seed.json").write_text(json.dumps({
+        "x": 30.0, "y": 20.0, "radius": 10.0, "frame": 0,
+        "image_size": [FAKE_W, FAKE_H], "created": "2099-01-01 00:00:00",
+    }), encoding="utf-8")
+    # **带 BOM 写**：run_video.py 写出来的 traj.csv 就是 utf-8-sig，
+    # 工具的读法必须扛住（否则第一列名变成 \ufeffframe，整段会话"没跟踪结果"）
+    (sess / "derived" / "traj.csv").write_text(
+        "frame,t,detected,x,y,radius_px,radius_refined_px,gate\n"
+        "0,0.0,1,30.0,20.0,9.0,10.0,ok\n"
+        "1,0.03,1,31.0,21.0,9.0,10.0,ok\n"
+        "2,0.06,1,32.0,22.0,9.0,10.0,ok\n"
+        "3,0.09,0,,,,,no_detection\n"
+        "4,0.12,0,,,,,no_detection\n"
+        "5,0.15,0,,,,,no_detection\n",
+        encoding="utf-8-sig")
+
+
+def _make_stereo_session(data: Path, sid: str, *, legacy_rows: bool = False) -> None:
+    """造一段双目会话。
+
+    `legacy_rows=True` 时**照抄 2026-10-30 之前的坏形状**（未匹配行只有 14 格，
+    漏掉 confident），用来保证"修复前录的老文件仍然导得对"。一半夹具写新形状、
+    一半写老形状，两条读取路径都被踩到；只写一种的话，另一种就是没人管的死角。
+    """
+    sess = data / "stereo" / sid
+    _tiny_video(sess / "left.mkv")
+    _fake_calib(sess / "calib" / "stereo_calibration.npz")
+    (sess / "derived").mkdir(parents=True, exist_ok=True)
+    (sess / "derived" / "seeds.json").write_text(json.dumps({
+        "schema": "sphere-stereo-seeds", "version": 1, "session": sid,
+        "image_size": [FAKE_W, FAKE_H], "seed_frame": 0, "source": "gui_click",
+        "left": {"x": 30.0, "y": 20.0, "radius": 8.0},
+        "right": {"x": 10.0, "y": 20.0, "radius": 8.0},
+    }), encoding="utf-8")
+
+    order = ("frame", "t", "matched", "X", "Y", "Z", "u_left", "v_left",
+             "u_right", "v_right", "epipolar_px", "residual_px", "confident",
+             "method_left", "method_right")
+
+    def row(frame: int, matched: int, values: dict) -> str:
+        cells = {"frame": frame, "t": f"{frame * 0.03:.2f}", "matched": matched}
+        cells.update(values)
+        if not matched:
+            if legacy_rows:
+                # 老文件的坏形状：confident 那一格缺失，method 两列顶上来
+                return ",".join(str(cells.get(k, "")) for k in order[:12]) + ",track,track"
+            return ",".join(str(cells.get(k, "")) for k in order)   # confident 位是 0
+        return ",".join(str(cells.get(k, "")) for k in order)
+
+    # Z=0.4 m、f=100 → r = 100*0.025/(2*0.4) = 3.125 px（口算可验）
+    lines = [
+        row(i, 1, {"X": 0.01, "Y": 0.02, "Z": 0.4,
+                   "u_left": 30.0 + i, "v_left": 20.0 + i,
+                   "u_right": 10.0 + i, "v_right": 20.0 + i,
+                   "epipolar_px": 0.5, "residual_px": 0.3,
+                   "confident": 1, "method_left": "track", "method_right": "track"})
+        for i in range(3)
+    ] + [row(i, 0, {"confident": 0}) for i in (3, 4, 5)]
+    (sess / "derived" / "traj3d.csv").write_text(
+        ",".join(order) + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _make_export_fixture(root: Path, mono_ids: tuple[str, ...] = MONO_IDS,
+                         stereo_ids: tuple[str, ...] = STEREO_IDS) -> Path:
+    """造假会话，布局照生产：`<root>/mono|stereo/<id>/`。
+
+    每段都放 frame 0/1/2 三个正样本 + 3/4/5 三个负样本候选 —— **同一个帧号在各段里都有**，
+    这样才能验"同帧号必须落到不同 split"（按帧切就会当场露馅）。
+
+    第二段双目写**修复前的老 CSV 形状**，第二段单目留作"只有 1 段"那条断言的素材来源。
+    """
+    data = root / "data"
+    for sid in mono_ids:
+        _make_mono_session(data, sid)
+    for i, sid in enumerate(stereo_ids):
+        _make_stereo_session(data, sid, legacy_rows=(i == 1))
+    return data
+
+
+def _run_export(*args: str) -> tuple[int, str, str]:
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run([sys.executable, str(TOOL_EXPORT), *args], cwd=str(ROOT),
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", env=env, timeout=180)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _stems(root: Path) -> set[str]:
+    """`images/train` 下每个文件所属的会话前缀（文件名形如 `<id>_000123.jpg`）。"""
+    if not root.is_dir():
+        return set()
+    return {p.stem.rsplit("_", 1)[0] for p in root.glob("*.jpg")}
+
+
+def _leaks(out: Path) -> list[str]:
+    """同一段会话同时出现在 train 与 val —— 只要非空就是数据泄漏。"""
+    return sorted(_stems(out / "images" / "train") & _stems(out / "images" / "val"))
+
+
+def test_export_ball_dataset() -> bool:
+    """第 11 节：`apps/tools/export_ball_dataset.py` 的标注口径与按会话切分。
+
+    这个工具不产生任何物理结论，只做"跟踪结果 → YOLO 格式"。但它有**两个**能悄悄
+    毁掉训练、而且不会报错的地方，所以每一处都用可执行断言钉住：
+
+    1. **归一化口径**。YOLO 的 `cx/cy/w/h` 是**逐轴**归一化的（`w = 像素宽 / W`）。
+       球在像素里必须是正方框，所以 `w·W` 与 `h·H` 必须相等。
+       若把宽高都除以 `max(W,H)`，非正方形画面（本项目 1718×972）上的框会变椭圆；
+       而这件事**训练不会崩**，只会让框贴着球的一半或包住半个画面。夹具因此刻意用
+       64×48：正方形画面下两种写法恰好等价，测不出来。
+    2. **按会话切分**。同一段里相邻帧差 33 ms，按帧随机切 = 让 val 见过 train 的邻帧，
+       mAP 会好看得离谱，而这件事**不会报错**。见本节最后的反向自证。
+
+    其余断言（负样本是空文件、`--max-width` 不改标签、1 段必须拒绝、dry-run 不落盘）
+    都是"少一个就会静默错"的契约条款。
+    """
+    print("----- 11. YOLO 数据集导出（标注来自跟踪结果） -----")
+    checks: list[tuple[str, bool]] = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_root = Path(tmp)
+        data = _make_export_fixture(tmp_root)
+        out = tmp_root / "out"
+
+        # ---- 11.1 正常导出（4 段会话：2 单目 + 2 双目，每类 1 段进 val） ----
+        code, stdout, stderr = _run_export(
+            "--all", "--data-root", str(data), "--out", str(out),
+            "--val-sessions", "2", "--negatives", "--neg-every", "2")
+        print(f"  导出：exit={code}；--val-sessions 2；--negatives --neg-every 2")
+        if code != 0:
+            print(f"    stderr: {stderr.strip().splitlines()[-1:] or '无'}")
+        report_path = out / "export_report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+        print(f"  报告 keys：{sorted(report)[:6]} ...（共 {len(report)} 项）")
+
+        checks.append(("导出退出码 0", code == 0))
+        checks.append(("dataset.yaml 与 export_report.json 都生成了",
+                       (out / "dataset.yaml").is_file() and report_path.is_file()))
+
+        # ---- 11.2 数量对得上 ----
+        # 每段 3 个正样本 + 负样本 3 帧按 every=2 采样得 2 帧（3、5）→ 5 张；
+        # 4 段 = 2 段 train（10）+ 2 段 val（10）
+        counts = {}
+        for split in ("train", "val"):
+            counts[split] = (
+                len(list((out / "images" / split).glob("*.jpg"))),
+                len(list((out / "labels" / split).glob("*.txt"))),
+            )
+        print(f"  images/labels：train={counts['train']} val={counts['val']}（期望 (10, 10)）")
+        checks.append(("train/val 的图片与标签数量都是 10 且一一对应",
+                       counts["train"] == (10, 10) and counts["val"] == (10, 10)))
+
+        # ---- 11.3 负样本是空文件（YOLO 的"无目标"写法，不是缺文件） ----
+        empty = {}
+        for split in ("train", "val"):
+            empty[split] = sum(1 for p in (out / "labels" / split).glob("*.txt")
+                               if not p.read_text(encoding="utf-8").strip())
+        print(f"  空 label（负样本）：train={empty['train']} val={empty['val']}（期望各 4）")
+        checks.append(("负样本落地为**空文件**且数量=4/4",
+                       empty["train"] == 4 and empty["val"] == 4))
+
+        # ---- 11.4 标签格式：5 个字段、归一化到 0~1、像素里是正方框 ----
+        bad_fields: list[str] = []
+        not_square: list[str] = []
+        out_of_range: list[str] = []
+        for split in ("train", "val"):
+            for p in sorted((out / "labels" / split).glob("*.txt")):
+                text = p.read_text(encoding="utf-8").strip()
+                if not text:
+                    continue
+                parts = text.split()
+                if len(parts) != 5 or parts[0] != "0":
+                    bad_fields.append(f"{p.name}:{text!r}")
+                    continue
+                vals = [float(v) for v in parts[1:]]
+                if not all(0.0 <= v <= 1.0 for v in vals):
+                    out_of_range.append(f"{p.name}:{text!r}")
+                # 还原成像素：宽乘 W、高乘 H，球必须是正方框
+                w_px = vals[2] * FAKE_W
+                h_px = vals[3] * FAKE_H
+                if abs(w_px - h_px) > 1e-3:
+                    not_square.append(f"{p.name}: w_px={w_px:.4f} h_px={h_px:.4f}")
+        print(f"  字段数不是 5 / 类号不是 0：{bad_fields or '无'}")
+        print(f"  值越界：{out_of_range or '无'}；像素边长不相等：{not_square or '无'}")
+        checks.append(("每个标签都是 `0 cx cy w h` 五段", not bad_fields))
+        checks.append(("四个坐标都在 0~1（真归一化了）", not out_of_range))
+        checks.append(("`w·W == h·H`：球在**像素**里是正方框（不是都除以 max(W,H)）",
+                       not not_square))
+
+        # 双目那段的半径来自几何：r = f·D/(2Z) = 100·0.025/(2·0.4) = 3.125 px
+        # 框边长 = 2·r·1.15 = 7.1875 px → w = 7.1875/64 = 0.112305
+        stereo_lbl = sorted((out / "labels" / "val").glob(f"{STEREO_IDS[-1]}_*.txt"))
+        got_w = 0.0
+        for p in stereo_lbl:
+            text = p.read_text(encoding="utf-8").strip()
+            if text:
+                got_w = float(text.split()[3])
+                break
+        expect_w = 2 * (100.0 * 0.025 / (2 * 0.4)) * 1.15 / FAKE_W
+        print(f"  双目 w：实际 {got_w:.6f}，几何+1.15 期望 {expect_w:.6f}")
+        checks.append(("双目半径走的是几何式（f·D/2Z）再乘 box_inflate",
+                       abs(got_w - expect_w) < 1e-5))
+
+        # 单目没有 Z，半径只能取 CSV 的 radius_refined_px（=10.0，**不是** radius_px 的 9.0）：
+        # 框边长 = 2·10·1.15 = 23 px → w = 23/64 = 0.359375
+        mono_lbl = sorted((out / "labels" / "val").glob(f"{MONO_IDS[-1]}_*.txt"))
+        got_mono = 0.0
+        for p in mono_lbl:
+            text = p.read_text(encoding="utf-8").strip()
+            if text:
+                got_mono = float(text.split()[3])
+                break
+        expect_mono = 2 * 10.0 * 1.15 / FAKE_W
+        print(f"  单目 w：实际 {got_mono:.6f}，refined+1.15 期望 {expect_mono:.6f}")
+        checks.append(("单目半径取 radius_refined_px（不是平滑后的 radius_px）",
+                       abs(got_mono - expect_mono) < 1e-5))
+
+        # ---- 11.5 dataset.yaml 三件套 ----
+        yaml_text = (out / "dataset.yaml").read_text(encoding="utf-8") \
+            if (out / "dataset.yaml").is_file() else ""
+        checks.append(("dataset.yaml 有 path/train/val/names 且类名是 ball",
+                       all(k in yaml_text for k in ("path:", "train: images/train",
+                                                    "val: images/val", "0: ball"))))
+
+        # ---- 11.6 报告里该有的字段一个不少 ----
+        need = ("created", "sessions", "images", "boxes", "box_inflate", "max_width",
+                "box_side_px", "skipped", "val_sessions")
+        missing = [k for k in need if k not in report]
+        side = report.get("box_side_px") or {}
+        print(f"  报告缺字段：{missing or '无'}；box_side_px={side}")
+        checks.append((f"export_report.json 含 {len(need)} 个必备字段", not missing))
+        checks.append(("box_side_px 有 中位/最小/最大",
+                       all(k in side for k in ("median", "min", "max"))))
+        splits_in_report = sorted(s["split"] for s in report.get("sessions", []))
+        print(f"  报告里的 split：{splits_in_report}；kind_counts={report.get('kind_counts')}")
+        checks.append(("报告里的 split 是 2 train / 2 val",
+                       splits_in_report == ["train", "train", "val", "val"]))
+        # 分层：每类各 1 段进 val —— 这是 team-lead 2026-10-30 要求的规则
+        kind_counts = report.get("kind_counts") or {}
+        print(f"  切分说明：{report.get('split_notes')}")
+        checks.append(("按类型分层：mono 与 stereo 各 1 段进 val",
+                       kind_counts.get("mono") == {"train": 1, "val": 1}
+                       and kind_counts.get("stereo") == {"train": 1, "val": 1}))
+
+        # ---- 11.7 跨会话不泄漏：同帧号必须分居两侧 ----
+        leaks = _leaks(out)
+        # 同一个帧号 000001 在两段会话里都存在，若按帧切它们会同时落进两个 split
+        f1 = {split: sorted(p.name for p in (out / "images" / split).glob("*_000001.jpg"))
+              for split in ("train", "val")}
+        print(f"  同时出现在两边的会话：{leaks or '无'}")
+        print(f"  frame 000001 的归属：train={f1['train']} val={f1['val']}")
+        checks.append(("没有会话同时出现在 train 与 val", not leaks))
+        checks.append(("同一个帧号在两段会话里 → 分居 train / val",
+                       bool(f1["train"]) and bool(f1["val"])
+                       and f1["train"] != f1["val"]))
+        checks.append(("val 里正好是每类 id 最大的那一段",
+                       _stems(out / "images" / "val") == {MONO_IDS[-1], STEREO_IDS[-1]}))
+
+        # ---- 11.8 --max-width 只改像素，不改标签 ----
+        out_small = tmp_root / "out_small"
+        code_s, _o, _e = _run_export(
+            "--all", "--data-root", str(data), "--out", str(out_small),
+            "--val-sessions", "2", "--negatives", "--neg-every", "2",
+            "--max-width", "32")
+        import cv2
+        img = cv2.imread(str(next((out_small / "images" / "train").glob("*.jpg"))))
+        same_labels = True
+        for split in ("train", "val"):
+            for p in (out / "labels" / split).glob("*.txt"):
+                q = out_small / "labels" / split / p.name
+                if not q.is_file() or q.read_text(encoding="utf-8") != p.read_text(encoding="utf-8"):
+                    same_labels = False
+        print(f"  --max-width 32：exit={code_s}；存出的图 {img.shape[1]}x{img.shape[0]}；"
+              f"标签逐字相同={same_labels}")
+        checks.append(("--max-width 真的缩了图（64 → 32）",
+                       code_s == 0 and img is not None and img.shape[1] == 32))
+        checks.append(("缩小后归一化标签**一字不改**", same_labels))
+
+        # ---- 11.9 只有 1 段：必须拒绝（1 段不能既训又验） ----
+        only_mono = tmp_root / "only_mono" / "data"
+        _make_export_fixture(tmp_root / "only_mono",
+                             mono_ids=(MONO_IDS[0],), stereo_ids=())
+        code1, out1, _err1 = _run_export(
+            "--all", "--data-root", str(only_mono), "--out", str(tmp_root / "out1"))
+        print(f"  只有 1 段：exit={code1}；提到'不能既训又验'={'不能既训又验' in out1}")
+        checks.append(("只有 1 段会话时拒绝导出（退出码 2）", code1 == 2))
+        checks.append(("拒绝时说明原因（含'不能既训又验'）", "不能既训又验" in out1))
+        checks.append(("拒绝时不落任何产物", not (tmp_root / "out1").exists()))
+
+        # ---- 11.9b 每类各 1 段：分层后无 val 可用 -> 也必须拒绝 ----
+        # 这是 2026-10-30 那条"单目全落进 val"的镜像问题：一旦要求分层，
+        # "1 单目 + 1 双目"就不能既训又验了（哪一类都没法两边各留一段）。
+        one_each = tmp_root / "one_each"
+        _make_export_fixture(one_each, mono_ids=(MONO_IDS[0],),
+                             stereo_ids=(STEREO_IDS[0],))
+        code_e, out_e, _e = _run_export(
+            "--all", "--data-root", str(one_each / "data"),
+            "--out", str(tmp_root / "oute"), "--val-sessions", "1")
+        print(f"  每类各 1 段：exit={code_e}；提到'凑够 2 段'={'凑够 2 段' in out_e}")
+        checks.append(("每类各 1 段时拒绝（分层后没有可用的 val 段）", code_e == 2))
+        checks.append(("拒绝时指明'没有类型凑够 2 段'", "凑够 2 段" in out_e))
+
+        # ---- 11.9c 单目只有 1 段 + 双目 2 段：单目整段进 train（team-lead 要的规则） ----
+        one_mono = tmp_root / "one_mono"
+        _make_export_fixture(one_mono, mono_ids=(MONO_IDS[0],), stereo_ids=STEREO_IDS)
+        out_strat = tmp_root / "out_strat"
+        code_t, out_t, _e = _run_export(
+            "--all", "--data-root", str(one_mono / "data"), "--out", str(out_strat),
+            "--val-sessions", "1")
+        train_kinds = _stems(out_strat / "images" / "train")
+        val_stems = _stems(out_strat / "images" / "val")
+        note_ok = "mono 只有 1 段" in out_t and "未被验证" in out_t
+        print(f"  单目 1 段 + 双目 2 段：exit={code_t}；val={sorted(val_stems)}；"
+              f"train 含单目={MONO_IDS[0] in train_kinds}；提示={note_ok}")
+        checks.append(("单目不足 2 段 -> 整段进 train，val 只含双目",
+                       code_t == 0 and val_stems == {STEREO_IDS[-1]}
+                       and MONO_IDS[0] in train_kinds))
+        checks.append(("并在输出里写明'该类型未被验证'（不是静默处理）", note_ok))
+
+        # ---- 11.9d --no-stratify-kind 退回旧规则（按 id 取最后 K 段） ----
+        out_flat = tmp_root / "out_flat"
+        code_f, out_f, _e = _run_export(
+            "--all", "--data-root", str(data), "--out", str(out_flat),
+            "--val-sessions", "1", "--no-stratify-kind")
+        print(f"  --no-stratify-kind：exit={code_f}；val={sorted(_stems(out_flat / 'images' / 'val'))}")
+        checks.append(("--no-stratify-kind 退回'最后 K 段'（val 是 id 最大的那一段）",
+                       code_f == 0
+                       and _stems(out_flat / "images" / "val") == {STEREO_IDS[-1]}))
+
+        # ---- 11.10 --val-sessions 越界：报错而不是截断 ----
+        # 分层后上限是 sum(每类段数-1)：2+2 段 -> K <= 2
+        code_k, out_k, _e = _run_export(
+            "--all", "--data-root", str(data), "--out", str(tmp_root / "outk"),
+            "--val-sessions", "3")
+        print(f"  --val-sessions 3（4 段、每类 2 段，上限 2）：exit={code_k}")
+        checks.append(("K 超过分层上限时退出码 2", code_k == 2))
+
+        # ---- 11.11 --dry-run 不落盘 ----
+        out_dry = tmp_root / "out_dry"
+        code_d, out_d, _e = _run_export(
+            "--all", "--data-root", str(data), "--out", str(out_dry),
+            "--val-sessions", "2", "--dry-run")
+        print(f"  --dry-run：exit={code_d}；目录存在={out_dry.exists()}；"
+              f"打印了统计={'框边长' in out_d}")
+        checks.append(("--dry-run 退出 0 且**一个文件都没写**",
+                       code_d == 0 and not out_dry.exists()))
+        checks.append(("--dry-run 仍然打印统计（不是静默空跑）", "框边长" in out_d))
+
+        # ---- 11.12 重跑同一个 --out：上次多出来的帧必须被清掉 ----
+        # 不清的后果是**静默泄漏**：换 --val-sessions 后旧文件还在旧 split 里，
+        # 同一帧同时进 train 与 val，训练照跑、mAP 虚高、没人发现。
+        out_reuse = tmp_root / "out_reuse"
+        _run_export("--all", "--data-root", str(data), "--out", str(out_reuse),
+                    "--val-sessions", "2", "--negatives", "--neg-every", "2")
+        code_r, _o_r, _e_r = _run_export(
+            "--all", "--data-root", str(data), "--out", str(out_reuse),
+            "--val-sessions", "2")                      # 这次不要负样本 -> 上次那些成了残留
+        reuse = {split: (len(list((out_reuse / "images" / split).glob("*.jpg"))),
+                         len(list((out_reuse / "labels" / split).glob("*.txt"))))
+                 for split in ("train", "val")}
+        stale_empty = sum(1 for p in (out_reuse / "labels").rglob("*.txt")
+                          if not p.read_text(encoding="utf-8").strip())
+        print(f"  重跑同一目录（去掉负样本）：exit={code_r}；train={reuse['train']} "
+              f"val={reuse['val']}（期望各 (6, 6)）；残留空标签={stale_empty}")
+        checks.append(("重跑同一目录会清掉上次的残留（数量回到 6/6，空标签 0）",
+                       code_r == 0 and reuse["train"] == (6, 6)
+                       and reuse["val"] == (6, 6) and stale_empty == 0))
+
+        # ---- 11.13 不给 --session/--all：列清单 + 退出码 2，不静默挑一段 ----
+        code_n, out_n, _e = _run_export("--data-root", str(data),
+                                        "--out", str(tmp_root / "outn"))
+        listed = all(sid in out_n for sid in MONO_IDS + STEREO_IDS)
+        print(f"  不给选择：exit={code_n}；列出 4 段={listed}")
+        checks.append(("不给 --session/--all 时列出可用会话并退出 2",
+                       code_n == 2 and listed))
+
+        # ==================================================================
+        # 11.14 反向自证：把"按会话切"换成"按帧随机切"，泄漏检查必须红
+        # ==================================================================
+        # 直接改文件会把仓库搞脏，所以 import 进来**改函数对象**再跑同一个 main()。
+        # `frame_split` 是"这一帧进哪个 split"的唯一出口；改成按帧号散列后就等于
+        # "按帧随机切"，同段会话必然同时出现在 images/train 与 images/val。
+        import contextlib
+        import importlib.util
+        import io
+
+        spec = importlib.util.spec_from_file_location("_export_probe", TOOL_EXPORT)
+        mod = importlib.util.module_from_spec(spec)
+        # 必须先登记到 sys.modules：`@dataclass` 会回查 `sys.modules[cls.__module__]`，
+        # 没登记就 `NoneType has no __dict__`（第一次跑就是这么炸的）
+        sys.modules["_export_probe"] = mod
+        spec.loader.exec_module(mod)
+        original = mod.frame_split
+
+        def _per_frame(_session, frame, _splits):
+            return "val" if (frame.index * 7) % 3 == 0 else "train"
+
+        out_bad = tmp_root / "out_bad"
+        mod.frame_split = _per_frame
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                mod.main(["--all", "--data-root", str(data), "--out", str(out_bad),
+                          "--val-sessions", "2"])
+            bad_leaks = _leaks(out_bad)
+        finally:
+            mod.frame_split = original        # 无论成败都要还原，否则后面的断言全被污染
+
+        out_restored = tmp_root / "out_restored"
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.main(["--all", "--data-root", str(data), "--out", str(out_restored),
+                      "--val-sessions", "2"])
+        restored_leaks = _leaks(out_restored)
+
+        print(f"  改成正向（按会话）：泄漏 {restored_leaks or '无'}")
+        if bad_leaks:
+            print(f"    [不达标] 改成'按帧随机切'后，同一会话出现在两个 split：{bad_leaks}")
+            print(f"    [通过] 反向自证有效：泄漏检查能抓住按帧切")
+        else:
+            print("    [不达标] 改成按帧切居然没泄漏 —— 说明检查器是空转的")
+        print(f"    [通过] 还原后泄漏 {restored_leaks or '无'}，恢复正常")
+        checks.append(("反向自证：改成按帧切 → 泄漏检查报红", bool(bad_leaks)))
+        checks.append(("还原成按会话切 → 泄漏消失（检查不是空转）", not restored_leaks))
+
+        # ==================================================================
+        # 11.15 CSV 写入侧的列错位判据（team-lead 2026-10-30 修的那处）
+        # ==================================================================
+        # 为什么这条要放进"入口一致性"测试：`traj3d.csv` 是**跨模块的契约**，
+        # 写它的（`apps/run_stereo_video.py`）与读它的（导出器 / 可视化）不在一个文件里。
+        # 未匹配行少写一格不会崩、不会报警，只会让"按 confident 过滤"永远得到 0 行 ——
+        # 2026-10-30 实测就是这样静默丢了全部负样本。等长断言 + 这一条一起守。
+        from apps import run_stereo_video as RSV
+
+        row = RSV.row_unmatched(7, 0.21, None, None)
+        print(f"  row_unmatched 长度 {len(row)}，CSV_HEADER 长度 {len(RSV.CSV_HEADER)}，"
+              f"confident 位={row[12]!r}")
+        checks.append(("row_unmatched 与 CSV_HEADER 等长（列错位会立刻被发现）",
+                       len(row) == len(RSV.CSV_HEADER)))
+        checks.append(("未匹配行的 confident 位是 0（不是空串、也不是方法名）",
+                       RSV.CSV_HEADER[12] == "confident" and row[12] == 0))
+
+    for label, good in checks:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+    return all(good for _label, good in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("入口一致性自测（三个入口 -> 同一个测试运行器 / 规范检查器）")
@@ -764,7 +1273,8 @@ def main() -> int:
                test_path_bootstrap_is_marker_based,
                test_data_layout_single_source,
                test_shared_arg_blocks,
-               test_run_all_orchestrator):
+               test_run_all_orchestrator,
+               test_export_ball_dataset):
         results.append(fn())
         print()
     ok = all(results)
