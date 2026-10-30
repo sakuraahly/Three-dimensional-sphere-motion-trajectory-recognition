@@ -27,6 +27,9 @@ GUI 退回手写清单                            `METHODS = ["color", "hough", 
 `resolve` 未知名字改回 fallback             `return default_factory`              exit=1
 fusion 的成员拼错（不在注册表里）           `fusion_members += ["colour"]`        exit=1
 库内 import `apps.`                         在 `stereo/` 里加 `import apps.x`     exit=1
+自训模型也按 `[32]` 过滤                    `resolve_classes_filter` 恒返回配置    exit=1
+自动优选覆盖显式权重                        去掉"显式路径不替换"的分支             exit=1
+前置检查放行 1 个会话                        `MIN_SESSIONS = 1`                    exit=1
 ==========================================  ====================================  ========
 
 用法::
@@ -236,6 +239,215 @@ def _check_wiring() -> list[tuple[str, bool]]:
     return checks
 
 
+def _load_train_tool():
+    """按文件路径加载 ``apps/tools/train_ball_detector.py``（``apps/tools`` 不是包）。
+
+    必须是**路径加载**而不是 ``import apps.tools.x``：``apps/tools`` 下没有
+    ``__init__.py``，包导入会失败。模块顶层刻意没 import ultralytics/torch，
+    所以这里在没有 GPU、甚至没装 ultralytics 的机器上也能加载。
+    """
+    path = ROOT / "apps" / "tools" / "train_ball_detector.py"
+    spec = importlib.util.spec_from_file_location("train_ball_detector_selftest", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"加载不了 {path}")
+    module = importlib.util.module_from_spec(spec)
+    # 必须先登记进 sys.modules：模块里有 @dataclass，dataclasses 会去
+    # sys.modules[cls.__module__] 取命名空间，没登记就是 None.__dict__ 直接炸。
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeYolo:
+    """够 YoloDetector.detect() 用的假模型：不推理、只记下传进来的 kwargs。"""
+
+    def __init__(self, names) -> None:
+        self.names = names
+        self.kwargs: dict | None = None
+
+    def predict(self, frame, **kwargs):
+        self.kwargs = kwargs
+        return []                      # 空结果：本测试只关心"类别过滤传了没有"
+
+
+def _check_yolo_classes_filter() -> list[tuple[str, bool]]:
+    """自训单类模型被 ``classes=[32]`` 过滤 = 永远 0 检出（看着像"没学会"）。"""
+    import numpy as np
+
+    from sphere_tracker.detectors.neural import YoloDetector
+
+    checks: list[tuple[str, bool]] = []
+    frame = np.zeros((32, 32, 3), dtype=np.uint8)
+
+    cfg = DetectorConfig()             # 默认 yolo_classes == [32]
+    det = YoloDetector(cfg)
+    det._model = _FakeYolo({0: "ball"})   # noqa: SLF001
+    det.detect(frame)
+    single = dict(det._model.kwargs or {})   # noqa: SLF001
+    checks.append(("自训单类模型（names 只有 0）→ 不传 classes（否则永远 0 框）",
+                   "classes" not in single))
+
+    det2 = YoloDetector(cfg)
+    det2._model = _FakeYolo({i: f"c{i}" for i in range(80)})   # noqa: SLF001
+    det2.detect(frame)
+    coco = dict(det2._model.kwargs or {})     # noqa: SLF001
+    checks.append((f"COCO-80 模型 → 仍按配置传 classes={cfg.yolo_classes}",
+                   coco.get("classes") == list(cfg.yolo_classes or [])))
+    return checks
+
+
+def _check_weights_preference() -> list[tuple[str, bool]]:
+    """默认权重 + 存在 models/ball_yolo.pt → 自动优选；显式路径不被覆盖。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from sphere_tracker.detectors.neural import (SELF_TRAINED_WEIGHTS,
+                                                 resolve_effective_weights)
+    from sphere_tracker.detectors.base import resolve_weights
+
+    checks: list[tuple[str, bool]] = []
+    default = DetectorConfig().yolo_weights
+    with tempfile.TemporaryDirectory() as td:
+        root = _Path(td)
+        (root / "models").mkdir()
+        self_trained = root / SELF_TRAINED_WEIGHTS
+        self_trained.write_bytes(b"")            # 空文件就够：只判存在
+
+        got, auto = resolve_effective_weights(default, root=root)
+        checks.append((f"默认权重 + 自训权重存在 → 自动切到 {SELF_TRAINED_WEIGHTS}", auto and got == SELF_TRAINED_WEIGHTS))
+
+        # base.resolve_weights 曾经把项目根算成 sphere_tracker/，于是仓库自带的
+        # models/yolo11n.pt 被解析成裸文件名（→ ultralytics 去别处找/下载）。
+        # 这条守住"仓库里那份权重能被真正找到"，别再退回文件名。
+        resolved = _Path(resolve_weights(default))
+        checks.append(("base.resolve_weights 把相对路径解析成仓库根下的绝对路径",
+                       resolved.is_absolute() and resolved.is_file()))
+
+        explicit = "models/my_ball_v2.pt"
+        got2, auto2 = resolve_effective_weights(explicit, root=root)
+        checks.append(("显式指定的权重不会被自动优选覆盖", (not auto2) and got2 == explicit))
+
+        self_trained.unlink()
+        got3, auto3 = resolve_effective_weights(default, root=root)
+        checks.append(("没有自训权重时保持默认权重（不凭空换路径）",
+                       (not auto3) and got3 == default))
+    return checks
+
+
+def _check_train_tool_preflight() -> list[tuple[str, bool]]:
+    """训练工具的前置检查是纯函数 —— 直接喂数字，不造数据集、不训模型。"""
+    import contextlib
+    import io
+
+    tool = _load_train_tool()
+    checks: list[tuple[str, bool]] = []
+
+    few_sessions = tool.preflight_problems(1, 500, True)
+    checks.append(("前置检查：会话数 < 2 要给出「会话」原因",
+                   len(few_sessions) == 1 and "会话" in few_sessions[0]))
+    few_boxes = tool.preflight_problems(3, 10, True)
+    checks.append((f"前置检查：正样本 < {tool.MIN_POSITIVE_BOXES} 要给出「框」原因",
+                   len(few_boxes) == 1 and str(tool.MIN_POSITIVE_BOXES) in few_boxes[0]))
+    no_dep = tool.preflight_problems(3, 500, False)
+    checks.append(("前置检查：没有 ultralytics 要给出安装命令（不是 traceback）",
+                   any("pip install ultralytics" in p for p in no_dep)))
+    checks.append(("前置检查：都满足时没有原因",
+                   tool.preflight_problems(3, 500, True) == []))
+
+    checks.append(("会话解析：前缀取到下划线前一段",
+                   tool.parse_session("s20261029_1430_f0001") == "s20261029"))
+    checks.append(("会话解析：解析不出归「未知会话」（不许一图一会话，那样检查永远通过）",
+                   tool.parse_session("IMG1234") == "未知会话"))
+
+    # 分桶边界：三个桶必须首尾相接、无重叠也无缝
+    checks.append(("尺寸分桶：<48 / 48~120 / >120 三档落在正确桶里",
+                   [tool.size_bucket(v) for v in (20, 48, 119.9, 120, 500)]
+                   == ["<48 px", "48~120 px", "48~120 px", ">120 px", ">120 px"]))
+
+    # 报告口径：运行时阈值下 0 检出必须说"不能当种子"，不能用中位去安慰
+    zero = {"headline": {"runtime_conf": 0.25, "n_val_with_boxes": 689, "n_val_images": 733,
+                         "n_detected": 0, "median_px": None, "p90_px": None,
+                         "recall_30px": 0.0, "recall_30px_all": 0.0}}
+    zero_text = "\n".join(tool.summary_lines(zero))
+    checks.append(("运行时阈值 0 检出 → 结论必须是「不能当种子」",
+                   "不能当种子" in zero_text and "圆心精度" in zero_text))
+
+    good = {"headline": {"runtime_conf": 0.25, "n_val_with_boxes": 689, "n_val_images": 733,
+                         "n_detected": 689, "median_px": 5.0, "p90_px": 12.0,
+                         "recall_30px": 0.95, "recall_30px_all": 0.9,
+                         "radius_median_rel_error": 0.02}}
+    good_text = "\n".join(tool.summary_lines(good))
+    checks.append(("命中率达标 → 结论才允许说「可以当种子用」",
+                   "可以当种子用" in good_text and "不能当种子" not in good_text))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = tool.main(["--dry-run", "--data", str(ROOT / "outputs" / "_no_such_dataset_")])
+    text = buf.getvalue()
+    checks.append(("数据集不存在：--dry-run 退出码 2 且说明原因",
+                   code == 2 and "不存在" in text and "退出码 2" in text))
+    return checks
+
+
+def _check_radius_evidence() -> list[tuple[str, bool]]:
+    """无种子时"检测器框半径有没有边缘证据"的判定（run_video 的 [半径] 那行）。
+
+    合成图的构造刻意分两种：
+    - **整圈**都有边（实心圆盘）：轮廓 100% 有梯度 → 必须判 ok；
+    - **只有 1/3 圆弧**有边：对应现场那颗镜面球（实测下半圈暗对暗，整圈只有 25%~35%）。
+      这里不用"正好一半"当弱样例：0.5 就是阈值本身，半个圆测出来 0.51，
+      拿它做断言等于在阈值上跳舞，改一行无关代码就会翻。
+    """
+    import numpy as np
+    import cv2
+
+    from apps import run_video as rv
+
+    checks: list[tuple[str, bool]] = []
+
+    def full_disk() -> "np.ndarray":
+        img = np.full((320, 320), 20, np.uint8)
+        cv2.circle(img, (160, 160), 90, 200, -1)
+        return img
+
+    def partial_arc() -> "np.ndarray":
+        img = np.full((320, 320), 20, np.uint8)
+        # 200°~320° 的扇形：约 1/3 圈有边，其余与背景同灰度（真实里的"暗对暗"）
+        cv2.ellipse(img, (160, 160), (90, 90), 0, 200, 320, 200, -1)
+        return img
+
+    s_full, v_full = rv.radius_evidence(full_disk(), 160, 160, 90)
+    checks.append((f"整圈有边 → ok（支持度 {s_full:.2f} ≥ {rv.RADIUS_EVIDENCE_MIN_SUPPORT}）",
+                   v_full == "ok" and s_full >= rv.RADIUS_EVIDENCE_MIN_SUPPORT))
+
+    s_weak, v_weak = rv.radius_evidence(partial_arc(), 160, 160, 90)
+    checks.append((f"只有 1/3 圈有边 → weak（支持度 {s_weak:.2f} < 0.5）",
+                   v_weak == "weak" and s_weak < 0.5))
+
+    # 初值偏大/偏小（框半宽常见的两种误差方向）也不能凭空变成"有证据"
+    near = [rv.radius_evidence(partial_arc(), 160, 160, r)[1] for r in (76, 104)]
+    checks.append(("半径偏 ±15% 时同样判 weak（不许靠别处的边凑数）",
+                   near == ["weak", "weak"]))
+
+    text_weak = "\n".join(rv.radius_evidence_lines(121.0, s_weak, "weak"))
+    checks.append(("weak 文案必须写明「未经边缘验证」并给出深度影响",
+                   "未经边缘验证" in text_weak and "Z = f·D/(2r)" in text_weak))
+    text_ok = "\n".join(rv.radius_evidence_lines(91.0, s_full, "ok"))
+    checks.append(("ok 文案不许出现「未经边缘验证」",
+                   "未经边缘验证" not in text_ok))
+
+    # 反向自证：阈值 0.0 时，"只有 1/3 圈"也必须判 ok —— 说明这条测试真的在守阈值
+    original = rv.RADIUS_EVIDENCE_MIN_SUPPORT
+    try:
+        rv.RADIUS_EVIDENCE_MIN_SUPPORT = 0.0
+        flipped = rv.radius_evidence(partial_arc(), 160, 160, 90)[1]
+    finally:
+        rv.RADIUS_EVIDENCE_MIN_SUPPORT = original
+    checks.append(("阈值语义：MIN_SUPPORT 降到 0 时同一张图会判 ok（说明断言钉在阈值上）",
+                   flipped == "ok" and original == 0.5))
+    return checks
+
+
 def main() -> int:
     print("=" * 70)
     print("插件注册表自测（清单唯一 / 未知名字报错 / 默认唯一 / 边界）")
@@ -248,6 +460,11 @@ def main() -> int:
         ("3. 唯一清单（R7）", _check_no_manual_lists),
         ("4. 库边界（R5）", _check_library_boundary),
         ("5. 与 config / 工厂的一致性", _check_wiring),
+        ("6. YOLO 自训接入（类别过滤 / 权重优选 / 训练前置检查）",
+         lambda: (_check_yolo_classes_filter()
+                  + _check_weights_preference()
+                  + _check_train_tool_preflight())),
+        ("7. 半径证据（无种子时 [半径] 告警）", _check_radius_evidence),
     ):
         print(f"----- {section} -----")
         got = fn()

@@ -432,9 +432,106 @@ def parse_args() -> argparse.Namespace:
         help="人工种子：球心像素坐标与像素半径，如 --seed 895,718,88。"
              "给了它就会自动切到 specular（只有它对镜面球有效）；"
              "没有它，脚本只能报「半径自洽的圆」，不能保证那是球")
+    p.add_argument(
+        "--weights", default=None, metavar="PATH",
+        help="YOLO 权重路径，覆盖配置里的 yolo_weights（只对 --method yolo / yolo_sam 生效）。"
+             "不传时：配置仍是默认权重且 models/ball_yolo.pt 存在 → 自动用自训权重")
+    p.add_argument(
+        "--classes", default=None, metavar="0,32",
+        help="只保留这些类别号（逗号分隔），覆盖配置里的 yolo_classes。"
+             "只有 COCO-80 权重需要它；自训单类球模型（0=ball）一律用全部类别，传了也不生效")
+    p.add_argument(
+        "--conf", type=float, default=None, metavar="0.25",
+        help="YOLO 置信度门（覆盖配置里的 yolo_conf，只对 --method yolo / yolo_sam 生效）。"
+             "自训模型刚训完分数可能偏低，可临时调到 0.05~0.1 看是不是这个门把框全滤掉了")
     p.add_argument("--max-frames", type=int, default=0, help=">0 时只处理前 N 帧")
     p.add_argument("--no-show", action="store_true", help="不弹窗（批处理用）")
     return p.parse_args()
+
+
+#: 无人工种子时，判断"检测器给的半径到底有没有边缘证据"的三个门（2026-10-30）。
+#:
+#: 为什么需要它：YOLO 给的是**框半宽**，镜面球的框通常比球大一圈；而
+#: ``refine_circle_subpixel`` 只在 ±3 px 内找边缘，够不到真轮廓 —— 半径就停在
+#: 框半宽上，``Z=f·D/(2r)`` 直接错同一个比例（实测 49.8 vs 91.2 px = 深度差 1.8 倍），
+#: 而屏幕上还是「100% 有效帧」。门只能证伪跳变，证伪不了起点。
+#:
+#: 为什么不是"宽搜找到真半径"：在真实帧上量过，这颗镜面球下半圈是暗对暗、
+#: 整圈只有 25%~35% 有梯度；扫一遍取最高分永远挑到球内部反射的亮斑
+#: （r≈27~34 的分数比真轮廓高一倍）。**没有证据时猜一个半径，比不猜更危险**，
+#: 所以这里只回答"能不能验证"，不负责"猜一个更好的"。
+RADIUS_EVIDENCE_MIN_SUPPORT = 0.5   # 轮廓上至少一半采样点要有沿半径的梯度
+RADIUS_EVIDENCE_MIN_DELTA = 0.05    # 且要比 ±15% 的两圈明显更像边缘（否则是"到处都有边"）
+RADIUS_EVIDENCE_NEIGHBOR = 0.15
+
+
+def radius_evidence(gray: np.ndarray, cx: float, cy: float,
+                    r: float) -> tuple[float, str]:
+    """返回 ``(轮廓支持度, 判定)``，判定 ∈ ``{"ok", "weak"}``。
+
+    判定"这个半径有没有边缘证据"的办法是**对照**，不是绝对值：
+    在 r 和它的 ±15% 两圈上各算一次"沿半径方向梯度占比"，
+    - 支持度 ≥ 0.5（球轮廓至少有半圈有边），且
+    - 与两圈的差 ≥ 0.05（说明 r 这一圈确实比里外更像边缘）
+    才算 ok。只比绝对值的坑：满画面纹理时每一圈都是 0.5，那不代表找到了轮廓。
+
+    纯函数：不读视频、不看全局状态，可以直接喂合成图断言。
+    """
+    from sphere_tracker.geometry import circle_radial_gradient_stats
+
+    if gray is None or r is None or r < 3.0:
+        return 0.0, "weak"
+    support = float(circle_radial_gradient_stats(gray, float(cx), float(cy), float(r))[0])
+    lo = float(circle_radial_gradient_stats(
+        gray, float(cx), float(cy), float(r) * (1.0 - RADIUS_EVIDENCE_NEIGHBOR))[0])
+    hi = float(circle_radial_gradient_stats(
+        gray, float(cx), float(cy), float(r) * (1.0 + RADIUS_EVIDENCE_NEIGHBOR))[0])
+    delta = max(abs(support - lo), abs(support - hi))
+    verdict = "ok" if (support >= RADIUS_EVIDENCE_MIN_SUPPORT
+                       and delta >= RADIUS_EVIDENCE_MIN_DELTA) else "weak"
+    return support, verdict
+
+
+def radius_evidence_lines(radius: float, support: float, verdict: str) -> list[str]:
+    """把判定翻成人话。抽成纯函数是为了能断言"weak 必须说未经验证"。
+
+    不拒绝出结果：有中心、有近似半径，比 0 帧有用；但必须说清它是**未验证**的，
+    否则下一个人会把 1.8 倍的深度当成测量值。有种子时**不打印**（用户点的半径就是基准）。
+    """
+    if verdict == "ok":
+        return [f"[半径] {radius:.1f} px（来自检测器框半宽；轮廓 {support * 100:.0f}% 有梯度，"
+                "边缘验证通过）"]
+    return [
+        f"[半径] {radius:.1f} px（来自检测器框半宽，**未经边缘验证**："
+        f"球轮廓只有 {support * 100:.0f}% 有梯度）",
+        "  · 影响：Z = f·D/(2r)，半径偏 15% 就是深度偏 15%",
+        "  · 要准确深度：点一次「点选球心」，或换背景更干净的一段",
+    ]
+
+
+def parse_classes(text: str) -> list[int]:
+    """把 ``--classes 0,1`` 解析成 ``[0, 1]``；写错就报错退出（不静默用默认值）。
+
+    为什么不接受"解析失败就当没给"：类别过滤写错的后果是**永远 0 检出**，
+    而 0 检出在屏幕上和"模型没学会"长得一模一样。宁可当场停下来说清楚格式。
+    顺带把中文逗号也当分隔符 —— 中文输入法下出这个字符太常见了。
+    """
+    parts = [s.strip() for s in str(text).replace("，", ",").split(",") if s.strip()]
+    if not parts:
+        raise SystemExit(
+            f"[错误] --classes 至少要有一个类别号，收到 {text!r}。例如：--classes 0 或 --classes 0,32")
+    out: list[int] = []
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError:
+            raise SystemExit(
+                f"[错误] --classes 里每项都要是整数类别号，收到 {part!r}。"
+                "例如：--classes 0,32（自训单类球模型是 0）") from None
+        if value < 0:
+            raise SystemExit(f"[错误] --classes 的类别号不能是负数，收到 {value}")
+        out.append(value)
+    return out
 
 
 def main() -> int:
@@ -443,6 +540,17 @@ def main() -> int:
     cfg = load_config(args.config) if args.config else AppConfig()
     if args.method:
         cfg.detector.method = args.method
+    # 权重与类别号在**方法确定之后**覆盖：两者只对 yolo / yolo_sam 有意义，
+    # 覆盖的是同一个 DetectorConfig，不影响 color/hough。
+    if args.weights:
+        cfg.detector.yolo_weights = args.weights
+    if args.classes is not None:
+        cfg.detector.yolo_classes = parse_classes(args.classes)
+    if args.conf is not None:
+        # 为什么需要这个旋钮（2026-10-30 实测）：刚训完 3 个 epoch 的模型最高分只有
+        # 0.04，而默认 yolo_conf=0.25 会让整段录像 0 检出 —— 现象和"权重没接上"
+        # 一模一样。没有这个旋钮，用户只能去改配置文件才能判断到底是哪一种。
+        cfg.detector.yolo_conf = args.conf
     # 给了种子就等于说"我指的就是这颗球，跟住它"。而 color/hough 不接受种子，
     # 会继续在整幅画面里找自己那一票 —— 本仓库那段录像上它锁定的是书架上的小圆
     # （r≈11~13 px，而球约 91 px）。所以自动切到唯一吃种子的 specular，并说明原因：
@@ -503,6 +611,7 @@ def main() -> int:
     total = 0
     coast = 0
     no_detection = 0  # 检测器本帧没给候选
+    radius_note_done = False   # "[半径]" 那行只打一次：288 行同样的警告等于没警告
     bad_frames: list[int] = []   # 没通过的帧号（按连续段统计丢失用）
     try:
         while True:
@@ -526,6 +635,14 @@ def main() -> int:
                 # pipeline 内部也算过灰度图，但那是它的局部变量；不碰
                 # sphere_tracker/* 的前提下只能在这里再算一次（开销主要在 Sobel）
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # 判一次"这个半径有没有边缘证据"。只在无种子、且半径来自**检测框**
+                # 时做：有种子时用户点的半径就是基准；color/hough 的半径本来就
+                # 来自轮廓，不需要再问一遍"它是不是轮廓"。
+                if not radius_note_done and seed is None and det.extra.get("box") is not None:
+                    support, evidence = radius_evidence(gray, det.x, det.y, det.radius)
+                    for line in radius_evidence_lines(det.radius, support, evidence):
+                        print(line)
+                    radius_note_done = True
                 r_anchor = gate.r_prev if gate.r_prev is not None else float(det.radius)
                 _rx, _ry, r_ref = refine_circle_subpixel(
                     gray, float(det.x), float(det.y), float(r_anchor),
