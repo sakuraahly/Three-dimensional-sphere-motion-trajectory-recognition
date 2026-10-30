@@ -104,49 +104,12 @@ def _tool_version() -> str:
 
 
 def _camera_identity(want: str | None) -> dict:
-    """把"用哪台相机"翻译成**身份**（纯读 ``config/cameras.json``，不碰设备）。
+    """沿用一个老名字：实现已搬到 `sphere_tracker.camera_registry.describe_identity`。
 
-    为什么非要有（2026-10-29）：边车原来只写 ``"camera": "left"`` —— 那只是**角色名**，
-    不是身份。``config/cameras.json`` 里 ``left`` 指向的设备可以换、可以离线后回退到
-    别的索引，事后拿到 61 张图和一句 "left"，根本查不出是哪台相机拍的。实测同一目录
-    里 fx 在 1268~1457 之间差 15%，却无法归因到设备 —— 就是这条缺口的代价。
-
-    取不到就返回空值，**不抛**：元数据写不全不应该让一趟采集白跑（真正的失败是写不进
-    文件，那由调用方按 OSError 处理）。
+    搬家的理由：单目录像（`apps/record_mono.py`）也要写同一份身份，
+    两处各写一份迟早漂移成"一处记 name、一处只记 index"。
     """
-    out = {"camera_name": "", "camera_identity": "",
-           "camera_port": "", "camera_index": None}
-    text = (want or "").strip()
-    if not text:
-        return out
-    reg = cr.load_registry()
-    spec: cr.RoleSpec | None = None
-    low = text.lower()
-    if text.isdigit():
-        idx = int(text)
-        out["camera_index"] = idx           # 显式索引本身就是采集用的那个号
-        for rs in reg.roles.values():
-            if idx in (rs.capture_index, rs.index):
-                spec = rs
-                break
-    elif low.startswith(("name:", "id:", "port:")):
-        attr, needle = {"name": "name", "id": "identity",
-                        "port": "port"}[low.split(":", 1)[0]]
-        needle = low.split(":", 1)[1].strip()
-        for rs in reg.roles.values():
-            if needle and needle in str(getattr(rs, attr)).lower():
-                spec = rs
-                break
-    else:
-        spec = reg.roles.get(text)          # 角色名
-    if spec is not None:
-        out["camera_name"] = str(spec.name or "")
-        out["camera_identity"] = str(spec.identity or "")
-        out["camera_port"] = str(spec.port or "")
-        # capture_index 是 OpenCV 实际用的号；没验证过才退回 PnP 序号。
-        out["camera_index"] = (spec.capture_index if spec.capture_index is not None
-                               else spec.index)
-    return out
+    return cr.describe_identity(want)
 
 
 def write_capture_sidecar(out_dir: Path, spec: BoardSpec, *, camera: str,

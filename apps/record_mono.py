@@ -223,6 +223,12 @@ def main(argv: list[str] | None = None) -> int:
         "seconds": round(elapsed, 2),
         "camera": {"requested": args.camera, "index": index,
                    "backend": src.info.backend},
+        # 设备**身份**（不只是角色名）。为什么非要有（2026-10-30）：单目深度
+        # Z = f·D/(2r) 里的 f 来自另一次标定，而那份标定只能证明"当时叫 left"。
+        # 如果中间换过相机（或 USB 重插后索引漂了），fx 就是错的，Z 会按同比例错，
+        # 事后却查不出原因 —— 只写 {"requested":"left","index":0} 正是这个漏洞。
+        # 取不到设备名时是空串，不抛（元数据不全不该让一趟采集白跑）。
+        **cr.describe_identity(args.camera),
         "note": "只写相机原图，不含任何检测叠加层；可直接喂 apps/run_video.py",
     }
     meta_path = out.with_suffix(out.suffix + ".json")

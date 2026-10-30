@@ -1059,6 +1059,56 @@ def _parse_spec_list(raw) -> list[RoleSpec]:
     return out
 
 
+def describe_identity(want: str | None) -> dict:
+    """把"用哪台相机"翻译成**设备身份**（纯读 ``config/cameras.json``，不碰设备）。
+
+    为什么这个函数放在这里而不是某个工具里（2026-10-30）：需要它的地方已经有两处
+    —— 标定板采集（`apps/tools/capture_board.py`）和单目录像（`apps/record_mono.py`）。
+    两处各写一份，迟早会漂移成"一处记 name、一处只记 index"，那正是这条元数据
+    当初要解决的问题。身份只有一种定义，就只该有一份实现。
+
+    动机（2026-10-29 的实测）：边车原来只写 ``"camera": "left"`` —— 那只是**角色名**。
+    ``config/cameras.json`` 里 ``left`` 指向的设备可以换、可以离线后回退到别的索引，
+    事后拿到 61 张图和一句 "left"，根本查不出是哪台相机拍的。实测同一目录里
+    fx 在 1268~1457 之间差 15%，却无法归因到设备 —— 就是这条缺口的代价。
+
+    取不到就返回空值，**不抛**：元数据写不全不应该让一趟采集白跑。
+    """
+    out = {"camera_name": "", "camera_identity": "",
+           "camera_port": "", "camera_index": None}
+    text = (want or "").strip()
+    if not text:
+        return out
+    reg = load_registry()
+    spec: RoleSpec | None = None
+    low = text.lower()
+    if text.isdigit():
+        idx = int(text)
+        out["camera_index"] = idx           # 显式索引本身就是采集用的那个号
+        for rs in reg.roles.values():
+            if idx in (rs.capture_index, rs.index):
+                spec = rs
+                break
+    elif low.startswith(("name:", "id:", "port:")):
+        attr, needle = {"name": "name", "id": "identity",
+                        "port": "port"}[low.split(":", 1)[0]]
+        needle = low.split(":", 1)[1].strip()
+        for rs in reg.roles.values():
+            if needle and needle in str(getattr(rs, attr)).lower():
+                spec = rs
+                break
+    else:
+        spec = reg.roles.get(text)          # 角色名
+    if spec is not None:
+        out["camera_name"] = str(spec.name or "")
+        out["camera_identity"] = str(spec.identity or "")
+        out["camera_port"] = str(spec.port or "")
+        # capture_index 是 OpenCV 实际用的号；没验证过才退回 PnP 序号。
+        out["camera_index"] = (spec.capture_index if spec.capture_index is not None
+                               else spec.index)
+    return out
+
+
 def save_registry(reg: Registry, path: str | Path | None = None) -> Path:
     """写 `config/cameras.json`（这是用户显式动作，写不进去就让它报错）。"""
     p = Path(path) if path else _CFG
