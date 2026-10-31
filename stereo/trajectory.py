@@ -19,6 +19,9 @@ try:                                # scipy 是规划依赖；没有就退化为
 except Exception:                   # noqa: BLE001
     savgol_filter = None
 
+#: 可选的平滑方法名（**唯一清单**：CLI 的 `choices` 也读这里，别再手写一份）。
+SMOOTH_METHODS = ("savgol", "kalman")
+
 
 def savgol_trajectory(
     t: np.ndarray,
@@ -133,3 +136,69 @@ class Kalman3D:
     @property
     def velocity(self) -> np.ndarray | None:
         return None if self.x is None else self.x[3:].copy()
+
+
+def jitter_rms(xyz: np.ndarray) -> float:
+    """三维抖动的**相对**指标：二阶中心差分的 RMS（米）。
+
+    为什么能用它
+    ------------
+    逐帧三角测量的抖动是高频的，而真实运动在一个窗口内近似低阶多项式；
+    二阶差分 `p[i+1] - 2·p[i] + p[i-1]` 压掉低频趋势、放大高频噪声，
+    所以"平滑后它明显变小"就等价于"把噪声去掉了"。
+
+    两条限制（必须知道）
+    ------------------
+    - 它**同时包含真实加速度**（平抛段约 `g·Δt²`），因此只能用于**同一序列
+      平滑前后**的相对对比，**不是**绝对精度，**不能**跨会话/跨场景比大小；
+    - 假设采样近似等间隔（不等间隔时前后同权，比值仍可用）。
+
+    N<3（凑不出一个二阶差分）返回 0.0。
+    """
+    arr = np.asarray(xyz, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"xyz 必须是 (N,3)，现在是 {arr.shape}")
+    if len(arr) < 3:
+        return 0.0
+    d2 = np.diff(arr, n=2, axis=0)
+    return float(np.sqrt(np.mean(np.sum(d2 ** 2, axis=1))))
+
+
+def smooth_trajectory(
+    t: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    method: str = "savgol",
+    window: int = 11,
+    polyorder: int = 2,
+    process_var: float = 1e-4,
+    measure_var: float = 1e-3,
+) -> tuple[np.ndarray, dict]:
+    """按 `method` 平滑 (N,3) 三维点，返回 ``(smoothed, params)``。
+
+    - ``method="savgol"``：逐轴 S-G。多项式阶 2 能**精确保留恒定加速度**，
+      所以对平抛段只有去噪、没有滞后 —— 这是默认，也是数据选出来的（见
+      `docs/planbooks/2026-10-31_M4轨迹平滑接主流程.md` §4 的证伪实验）。
+    - ``method="kalman"``：常速度 `Kalman3D`。**只作对照**：常速度模型在平抛
+      （有恒定加速度）与反弹（速度突变）处有**系统性滞后**，`q` 调大就几乎
+      不滤波、调小就严重偏；不要拿"它抖动更小"当更好的证据（那是削平了真实运动）。
+
+    `params` 是要写进 `traj3d.json` 的参数字典，便于复现。
+    """
+    arr = np.asarray(xyz, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise ValueError(f"xyz 必须是 (N,3)，现在是 {arr.shape}")
+    tt = np.asarray(t, dtype=np.float64).reshape(-1)
+    if tt.shape[0] != arr.shape[0]:
+        raise ValueError(f"t 与 xyz 长度不一致：{tt.shape[0]} vs {arr.shape[0]}")
+    if method == "savgol":
+        out = savgol_trajectory(tt, arr, window=window, polyorder=polyorder)
+        return out, {"window": int(window), "polyorder": int(polyorder)}
+    if method == "kalman":
+        kf = Kalman3D(process_var=process_var, measure_var=measure_var)
+        out = np.empty_like(arr)
+        for i, (ti, p) in enumerate(zip(tt, arr)):
+            r = kf.update(float(ti), p)
+            out[i] = p if r is None else r       # 非有限值：原样保留，不编造
+        return out, {"process_var": float(process_var), "measure_var": float(measure_var)}
+    raise ValueError(f"未知平滑方法 {method!r}（可选：{' / '.join(SMOOTH_METHODS)}）")

@@ -60,8 +60,8 @@ from sphere_tracker.plugins import default as default_method, names as method_na
 from sphere_tracker.plugins import describe                  # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
 from stereo import (  # noqa: E402
-    MatchConfig, PairSource, PredictConfig, StereoReconstructor,
-    fit_ballistic, predict, savgol_trajectory,
+    SMOOTH_METHODS, MatchConfig, PairSource, PredictConfig, StereoReconstructor,
+    fit_ballistic, jitter_rms, predict, smooth_trajectory,
 )
 from stereo.stereo_mode import (  # noqa: E402
     mode_label, optical_axes_angle_deg, resolve_auto,
@@ -391,7 +391,12 @@ def main() -> int:
                     help="auto=读 session/标定；angled=大角度（近似直角）")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
-    ap.add_argument("--smooth", action="store_true", help="另存 Savitzky-Golay 平滑后的三维 CSV")
+    ap.add_argument("--smooth", action="store_true",
+                    help="开启三维平滑：另存 traj3d_smoothed.csv，并把平滑结果与抖动指标"
+                         "写进 traj3d.json 的 smoothing 块（默认不开，保持旧行为）")
+    ap.add_argument("--smooth-method", choices=SMOOTH_METHODS, default="savgol",
+                    help="平滑方法（默认 savgol）。savgol 保留恒定加速度、无滞后；"
+                         "kalman=常速度 Kalman3D，对平抛/反弹段有系统滞后，仅作对照")
     ap.add_argument("--world-frame", default=str(ROOT / "config" / "world_frame.json"),
                     help="世界系文件（默认 config/world_frame.json）；存在且合法时额外写 "
                          "derived/traj3d_world.csv，traj3d.csv 仍是左相机系")
@@ -790,6 +795,8 @@ def main() -> int:
         print("  3) 当前会话若继续 0 匹配，建议重录并在第 0 帧重新点选，"
               "不要靠放大 --max-epipolar 硬吃错配")
     smoothed = None
+    smoothing_block: dict | None = None
+    smoothing_skip: str | None = None
     arr = rec.as_array() if rec.trajectory else np.zeros((0, 4), dtype=np.float64)
     if rec.trajectory:
         print(f"三维范围：X {arr[:,1].min():.3f}~{arr[:,1].max():.3f} m  "
@@ -797,15 +804,52 @@ def main() -> int:
               f"Z {arr[:,3].min():.3f}~{arr[:,3].max():.3f} m")
         res = np.array([p.residual_px for p in rec.trajectory])
         print(f"交会残差：中位 {np.median(res):.3f} px，最大 {res.max():.3f} px")
-        if args.smooth and len(arr) >= 3:
-            smoothed = savgol_trajectory(arr[:, 0], arr[:, 1:4], window=11, polyorder=2)
-            sm_path = out_dir / f"traj3d_smoothed{partial}.csv"
-            with open(sm_path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["t", "X", "Y", "Z"])
-                for ti, x, y, z in zip(arr[:, 0], smoothed[:, 0], smoothed[:, 1], smoothed[:, 2]):
-                    w.writerow([f"{ti:.4f}", f"{x:.6f}", f"{y:.6f}", f"{z:.6f}"])
-            print(f"平滑 CSV：{sm_path}")
+        if args.smooth:
+            if args.smooth_method == "kalman":
+                print("[平滑] 警告：kalman 是**常速度**模型，对平抛（恒定加速度）/反弹"
+                      "（速度突变）段有系统性滞后 —— 只作对照，正常出数请用默认 savgol。")
+            if len(arr) < 3:
+                smoothing_skip = f"可用三维点只有 {len(arr)} 个（<3），凑不出平滑窗口"
+                print(f"[平滑] 跳过：{smoothing_skip}")
+            else:
+                smoothed, sm_params = smooth_trajectory(
+                    arr[:, 0], arr[:, 1:4], method=args.smooth_method)
+                jit_before = jitter_rms(arr[:, 1:4])
+                jit_after = jitter_rms(smoothed)
+                # 抖动是"同一序列前后对比"的相对量；前值为 0（如三点共线）时不给百分比，
+                # 免得用 0/0 编出一个好看的数字。
+                reduction = (None if jit_before <= 0.0
+                             else (1.0 - jit_after / jit_before) * 100.0)
+                sm_path = out_dir / f"traj3d_smoothed{partial}.csv"
+                with open(sm_path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(["t", "X", "Y", "Z"])
+                    for ti, x, y, z in zip(arr[:, 0], smoothed[:, 0],
+                                           smoothed[:, 1], smoothed[:, 2]):
+                        w.writerow([f"{ti:.4f}", f"{x:.6f}", f"{y:.6f}", f"{z:.6f}"])
+                print(f"平滑 CSV：{sm_path}")
+                print(f"[平滑] 方法={args.smooth_method} 参数={sm_params}；"
+                      f"抖动 RMS 前 {jit_before * 1e3:.2f} mm → 后 {jit_after * 1e3:.2f} mm"
+                      + ("" if reduction is None else f"（下降 {reduction:.1f}%）"))
+                # frame 与 arr 同序（rec.as_array 的追加顺序 = matched 行的顺序，
+                # 与下面 world CSV 用的是同一个对齐假设）；对不上就写 null，不编造。
+                frames: list[int | None] = [int(r[0]) for r in rows if int(r[2]) == 1]
+                if len(frames) != len(arr):
+                    frames = [None] * len(arr)
+                smoothing_block = {
+                    "method": args.smooth_method,
+                    "params": sm_params,
+                    "jitter_rms_before_m": jit_before,
+                    "jitter_rms_after_m": jit_after,
+                    "jitter_reduction_pct": reduction,
+                    "source_csv": f"derived/{sm_path.name}",
+                    # points 与 samples 同坐标系（本块不做世界系变换）
+                    "points": [{"frame": fr, "t": float(ti),
+                                "xyz": [float(x), float(y), float(z)]}
+                               for fr, ti, x, y, z in zip(
+                                   frames, arr[:, 0], smoothed[:, 0],
+                                   smoothed[:, 1], smoothed[:, 2])],
+                }
         if not args.no_plot:
             plot_path = out_dir / f"traj3d{partial}.png"
             _plot_trajectory(arr, plot_path, smoothed)
@@ -880,6 +924,11 @@ def main() -> int:
             else:
                 payload["predictions"] = None
                 payload["predictions_skipped"] = pred_block.get("skipped", "原因未知")
+            # 平滑块：**总是**写键（没开就写 null），这样"旧文件没这个键"与
+            # "这次没开平滑"能分开；points 与 samples 同坐标系，不做世界系变换。
+            payload["smoothing"] = smoothing_block
+            if smoothing_block is None and smoothing_skip:
+                payload["smoothing_skipped"] = smoothing_skip
             traj_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
         except Exception as exc:                            # noqa: BLE001

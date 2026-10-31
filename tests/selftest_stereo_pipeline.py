@@ -26,6 +26,7 @@ import numpy as np
 
 from calib import StereoRig
 from stereo import (
+    SMOOTH_METHODS,
     Kalman3D,
     MatchConfig,
     PredictConfig,
@@ -35,10 +36,12 @@ from stereo import (
     find_offset,
     fit_ballistic,
     fuse_depth,
+    jitter_rms,
     match_epipolar,
     mono_depth,
     predict,
     savgol_trajectory,
+    smooth_trajectory,
     stereo_depth,
     timestamp_offset,
 )
@@ -202,6 +205,19 @@ def test_trajectory_fusion() -> bool:
     truth_ahead = np.array([0.20 * t_ahead, 0.10 + 0.05 * t_ahead, 1.00 + 0.30 * t_ahead])
     pred_err = float(np.linalg.norm(pred - truth_ahead)) if pred is not None else 1e9
 
+    # ---- M4：抖动指标 + 平滑分派（savgol / kalman）----
+    # 抖动 = 二阶中心差分 RMS；这里是"同一序列平滑前后"的相对量（真值线性，故只有噪声）。
+    jit_before = jitter_rms(noisy)
+    jit_after = jitter_rms(smooth)
+    jit_red = (1.0 - jit_after / jit_before) * 100.0 if jit_before > 0 else 0.0
+    sm_kal, sm_kal_params = smooth_trajectory(t, noisy, method="kalman")
+    sm_sg, sm_sg_params = smooth_trajectory(t, noisy, method="savgol")
+    bad_method = False
+    try:
+        smooth_trajectory(t, noisy, method="nope")
+    except ValueError:
+        bad_method = True
+
     z_s = stereo_depth(90.0, 900.0, 0.100)          # 900*0.1/90 = 1.000
     z_m = mono_depth(18.0, 900.0, 0.040)            # 900*0.04/(2*18) = 1.000
     z_f, sig_f = fuse_depth(z_s, 0.010, z_m, 0.050)
@@ -210,6 +226,14 @@ def test_trajectory_fusion() -> bool:
     checks = [
         (f"Savitzky-Golay 降噪（RMSE {rmse_before:.4f} -> {rmse_after:.4f}）",
          rmse_after < rmse_before * 0.8),
+        (f"抖动 RMS（二阶差分）{jit_before * 1e3:.2f} -> {jit_after * 1e3:.2f} mm，"
+         f"下降 {jit_red:.1f}%（M4 验收 ≥50%）",
+         jit_before > 0.0 and jit_red >= 50.0),
+        (f"smooth_trajectory 分派：savgol {sm_sg_params} / kalman {sm_kal_params}；"
+         f"形状 {sm_sg.shape}/{sm_kal.shape}；未知方法报错={bad_method}",
+         sm_sg.shape == noisy.shape and sm_kal.shape == noisy.shape
+         and bool(np.all(np.isfinite(sm_sg))) and bool(np.all(np.isfinite(sm_kal)))
+         and bad_method and set(SMOOTH_METHODS) == {"savgol", "kalman"}),
         (f"Kalman 外推 0.2 s 误差 {pred_err*1000:.1f} mm", pred_err < 0.05),
         (f"双目深度 Z={z_s:.3f} m / 单目 Z={z_m:.3f} m",
          abs(z_s - 1.0) < 1e-6 and abs(z_m - 1.0) < 1e-6),
@@ -281,6 +305,14 @@ def test_predict3d() -> bool:
     why_n: list[str] = []
     idx_noise = detect_bounce(tn, pn, cfg, why_n)
 
+    # ---- 5. 平滑不得移动反弹拐点（M4 验收：≤2 帧）----
+    # 放在 pn 之后算，避免多吃 rng 状态影响上面"纯噪声"那条判据。
+    bounce_noisy = bounce_pts + rng.normal(0.0, 3e-3, bounce_pts.shape)
+    bounce_sg = savgol_trajectory(tt, bounce_noisy, window=11, polyorder=2)
+    why_s: list[str] = []
+    idx_s = detect_bounce(tt, bounce_sg, cfg, why_s)
+    idx_s_err = abs(idx_s - truth_idx) if idx_s is not None else 10 ** 6
+
     checks = [
         (f"解析解：n={getattr(st, 'n', 0)}，v0 误差 {err_v:.1e} m/s，"
          f"p(t_ref) 误差 {err_p:.1e} m，rms={getattr(st, 'rms_m', float('nan')):.1e}",
@@ -299,6 +331,9 @@ def test_predict3d() -> bool:
         (f"0.4 s 反弹：检出索引 {idx}（真值 {truth_idx}，{len(tt)} 点，"
          f"±2 帧内）；{why_b[0][:46] if why_b else '无'}",
          idx is not None and idx_err <= 2),
+        (f"平滑后反弹拐点：S-G 检出 {idx_s}（真值 {truth_idx}，误差 {idx_s_err} 帧，"
+         f"≤2 帧）；{why_s[0][:40] if why_s else '无'}",
+         idx_s is not None and idx_s_err <= 2),
         (f"纯噪声（无反弹）-> {idx_noise}（必须为 None）；"
          f"{why_n[0][:34] if why_n else '无'}",
          idx_noise is None),

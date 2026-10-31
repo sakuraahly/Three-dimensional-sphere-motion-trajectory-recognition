@@ -48,7 +48,13 @@ from .timestamp_pair import (
     read_time_sidecar,
     sidecar_for_video,
 )
-from .trajectory import Kalman3D, savgol_trajectory
+from .trajectory import (
+    SMOOTH_METHODS,
+    Kalman3D,
+    jitter_rms,
+    savgol_trajectory,
+    smooth_trajectory,
+)
 from .predict3d import (
     BallisticState,
     PredictConfig,
@@ -101,6 +107,9 @@ __all__ = [
     "apply_offset",
     "Kalman3D",
     "savgol_trajectory",
+    "smooth_trajectory",
+    "jitter_rms",
+    "SMOOTH_METHODS",
     "PredictConfig",
     "BallisticState",
     "fit_ballistic",
