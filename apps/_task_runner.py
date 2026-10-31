@@ -9,7 +9,8 @@
 - **零 Tk 依赖**：不 import tkinter；定时轮询用注入的 ``schedule`` 函数，
   因此可以在无显示器环境（CI）里被测试；
 - **一个进程一份**：``App`` 持有唯一实例，各窗口只订阅 ``on_log`` / ``on_change``；
-- 对外只有 ``start / stop / stop_all / tasks / running / on_log / on_change``。
+- 对外只有 ``start / stop / stop_all / tasks / running / on_log / on_change``
+  以及**统一结束回调** ``add_finish_listener / remove_finish_listener``。
 
 搬过来的每个"为什么"注释都保留 —— 那些是这个模块唯一的价值：
 ``taskkill`` 返回 0 不代表杀掉了、``Popen.terminate`` 只杀直接子进程、
@@ -32,10 +33,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-__all__ = ["ROOT", "Task", "TaskRunner", "alive_pids", "child_pids", "POLL_MS"]
+__all__ = ["ROOT", "Task", "TaskRunner", "alive_pids", "child_pids", "POLL_MS",
+           "TAIL_LINES"]
 
 ROOT = Path(__file__).resolve().parent.parent
 POLL_MS = 200
+
+#: 任务结束时留在 ``Task.tail`` 里的最后几行输出。
+#:
+#: 为什么留尾巴而不是"到日志里自己翻"：失败时用户要的是**当场一句原因**。
+#: 8 行的上限是实测折中 —— argparse 的报错在最后两行，OpenCV 的
+#: "can't open camera"也在一屏之内，再多就只是噪声。
+TAIL_LINES = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -112,6 +121,31 @@ class Task:
     lines: int = 0
     stdout_lines: int = 0        # 子进程真正吐出的行数（判"启动即退且没输出"）
     on_done: Callable[["Task"], None] | None = None
+    #: 谁起的任务（``"mono"`` / ``"stereo"`` …）。空串 = 没登记归属。
+    #:
+    #: 为什么需要它：统一结束回调是**全局**的（一个进程一份 TaskRunner），
+    #: 没有归属时单目窗会收到双目窗任务的失败 —— 状态条在别人的窗口里
+    #: 说别人的事，比不说更让人糊涂。按标题字符串匹配又会被"标题改一个字"
+    #: 悄悄弄坏，所以归属必须是**显式写上去的**（窗口起完任务就填这一栏）。
+    owner: str = ""
+    #: 最后 ``TAIL_LINES`` 行输出：失败时状态条要能直接引用原因。
+    tail: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        """正常跑完（返回码 0，且不是被用户停掉的）。
+
+        为什么把"被停掉"排除在成功外：``stop()`` 之后 ``proc.wait()`` 可能
+        得到 0（子进程自己收拾干净退出），但那**不是任务的结果**，
+        界面上写"完成"会让用户以为结果可用。
+        """
+        return self.exit_code == 0 and not self.stop_reason
+
+    def tail_text(self, n: int = 3) -> str:
+        """最后 ``n`` 行拼成一句（没有输出时给一句人话，不留空）。"""
+        if not self.tail:
+            return "（没有任何输出）"
+        return " / ".join(self.tail[-n:])
 
     @property
     def running(self) -> bool:
@@ -148,9 +182,40 @@ class TaskRunner:
         self._sel_tid: int | None = None
         self._log_queue: queue.Queue = queue.Queue()
         self._done_queue: queue.Queue = queue.Queue()
+        self._finish_listeners: list[Callable[[Task], None]] = []
         self._stopping = False
         if root is not None:
             root.after(poll_ms, self._poll)
+
+    # ---------- 统一结束回调 ----------
+    def add_finish_listener(self, cb: Callable[[Task], None]) -> None:
+        """订阅"**任何一个任务结束**"（成功与失败都来）。
+
+        为什么需要它（2026-10-31 现场）：窗口里"点完按钮就再无下文"是用户
+        最不能接受的状态。以前每个按钮要各自传 ``on_done``，漏传一个
+        （拍标定图 / 焦距估计 / 实时识别全都漏了）就永远停在"已开始…"，
+        而失败时更是连一句"失败了"都没有 —— **失败没有出口**。
+        这里给一条统一出口：谁关心结局就订一次，而不是每加一个按钮再写一份
+        回调（"同一件事 N 份实现"正是本项目最贵的反模式）。
+
+        回调在**主线程**执行（由 ``pump_once`` 从 Tk 的 ``after`` 驱动），
+        所以可以直接碰控件；回调抛异常只记账，不影响其它订阅者。
+        """
+        if cb not in self._finish_listeners:
+            self._finish_listeners.append(cb)
+
+    def remove_finish_listener(self, cb: Callable[[Task], None]) -> None:
+        """退订。窗口销毁前必须调 —— 否则回调会在已销毁的窗口上碰控件。"""
+        if cb in self._finish_listeners:
+            self._finish_listeners.remove(cb)
+
+    def _notify_finished(self, task: Task) -> None:
+        for cb in list(self._finish_listeners):
+            try:
+                cb(task)
+            except Exception as exc:                        # noqa: BLE001
+                self._emit(f"[任务 {task.tid}] 结束回调失败：{exc}")
+
 
     # ---------- 查询 ----------
     def tasks(self) -> list[Task]:
@@ -173,10 +238,17 @@ class TaskRunner:
         ``CREATE_NEW_PROCESS_GROUP`` 是"能优雅中断"的前提：只有新进程组才能
         收到 ``CTRL_BREAK_EVENT``。没有它，中断只能换成硬杀 ——
         而硬杀对"正在写标定结果"的程序是有害的。
+
+        ``stdin=DEVNULL`` 是**兜底**，不是洁癖：子进程继承控制台 stdin 时，
+        任何一句 ``input()``（实测 ``stereo/pair_source.py`` 在"没有 tty"的
+        路径上就会等一个回车）会**无限期挂住** —— 任务永远不结束、状态条
+        永远停在"已开始…"、父进程还拿着相机。库层已经把那条交互改成非交互了，
+        但这里是**所有**子进程的出口：以后谁再写一句 ``input()`` 也只会立刻
+        拿到 EOF 并报错退出，而不是把界面吊死。
         """
         kw: dict = dict(cwd=str(ROOT), stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT, text=True,
-                        encoding="utf-8", errors="replace", bufsize=1)
+                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                        text=True, encoding="utf-8", errors="replace", bufsize=1)
         if os.name == "nt":
             kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -370,6 +442,9 @@ class TaskRunner:
         for line in proc.stdout:
             body = line.rstrip()
             task.stdout_lines += 1
+            task.tail.append(body)
+            if len(task.tail) > TAIL_LINES:                 # 只要尾巴，别把整段留在内存
+                del task.tail[0]
             self._task_log(task, body)                      # 每行都落盘
             self._log_queue.put(f"[{task.tid}] {body}")
         proc.wait()
@@ -423,6 +498,10 @@ class TaskRunner:
             changed = True
             if task is not None:
                 self._report_failure(task)
+                # 顺序有意为之：先统一出口（"失败 + 日志路径"），再跑这个任务
+                # 专门的 on_done —— 后者知道更多上下文，允许把话术说得更准
+                # （例如"一帧都没检出，换 hough"比"返回码 2"有用）。
+                self._notify_finished(task)
             if task is not None and task.on_done is not None:
                 try:
                     task.on_done(task)

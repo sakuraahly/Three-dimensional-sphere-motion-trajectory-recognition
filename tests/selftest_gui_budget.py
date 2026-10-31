@@ -250,7 +250,7 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
                             "--target", "40"]), " ".join(c2))
 
     # ---- 对标老窗口 §8：录制参数 ----
-    out_dir = record_out_dir("ball01")
+    out_dir = record_out_dir()
     r = record_args(left="left", right="right", duration="10", out=str(out_dir))
     check("录制：调用 apps/record_stereo.py",
           any("record_stereo.py" in x for x in r), " ".join(r))
@@ -265,12 +265,19 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     check("录制：左右与时长留空 = left/right/10（不传空串）",
           _has_seq(r2, ["--left", "left"])
           and _has_seq(r2, ["--duration", "10"]), " ".join(r2))
-    check("录制：标签 → data/<标签>",
-          record_out_dir("ball01") == ROOT / "data" / "ball01",
-          str(record_out_dir("ball01")))
-    check("录制：标签留空 → data/stereo_session",
-          record_out_dir("   ") == ROOT / "data" / "stereo_session",
-          str(record_out_dir("   ")))
+    # 2026-10-31：`--out` 的语义改成会话**根**（时间戳子目录由 record_stereo 的
+    # `create_session` 建，重名由它加 -01），标签改走 `--label` 进 session.json。
+    # 旧断言"标签 → data/<标签>"因此不再成立，换成这两条（口径仍各只有一处）。
+    from sphere_tracker.paths import stereo_roots
+
+    check("录制：--out 落在会话扫描根里（否则录完第④步/工作台都列不出来）",
+          any(Path(record_out_dir()).resolve() == Path(p).resolve()
+              for p in stereo_roots()), str(record_out_dir()))
+    check("录制：标签 → --label（不拼路径；空白不传）",
+          _has_seq(record_args(out=str(out_dir), label="ball01"),
+                   ["--label", "ball01"])
+          and "--label" not in record_args(out=str(out_dir), label="   "),
+          " ".join(record_args(out=str(out_dir), label="ball01")))
 
     # ---- 结构：拼装必须留在函数里，不许被抄回方法（否则上面全部失效）----
     # 这条守的是"抽出来"这件事本身：只要有人把 argv 拼装又写回
@@ -467,21 +474,26 @@ def _mono_session_checks() -> list[tuple[str, bool]]:
     ck("单目窗仍提供「本次录制存到」与「历史会话」",
        "本次录制存到" in src and "历史会话" in src)
 
-    # ---- 球径留空时命令行传什么（2026-10-29 增，纯函数、不需要 Tk） ----
-    # 守的坑：三处 ``or "40"`` 让"界面显示 21.6、命令行传 40"成立过。
-    # Z ∝ D，40 对这颗 21.6 的球等于让深度偏大 85%，而界面上看不出来。
-    # 断言的是**函数返回值**（界面与命令行共用同一个入口），
-    # 把兜底改回 "40" 这条立刻红 —— 反向自证见交接文档。
+    # ---- 球径：界面是 mm、命令行是米（2026-10-31 改口径） ----
+    # 守的坑本来有两条：三处 ``or "40"`` 让"界面显示 21.6、命令行传 40"成立过；
+    # 现在多了一条更狠的 —— **单位**。界面按 mm 收（标签「球直径（有效值）」，
+    # 默认 21.6），而 ``--ball-diameter`` 与 ``AppConfig.ball_diameter_m`` 按米收
+    # （``sphere_tracker/config.py`` = 0.0216）。原样传 21.6 等于"球有 21.6 米大"，
+    # 实测 ``data/mono/20261029-205522`` 上 40 帧**一个三维点都没有**。
+    # 所以这里的期望值全部是米，并多看一条"永远 < 1"。
     from apps._gui_mono import EFFECTIVE_DIAMETER_MM, diameter_arg
 
-    want = f"{EFFECTIVE_DIAMETER_MM:g}"
-    ck("球径留空 → 命令行用有效直径（不是旧默认 40）",
-       diameter_arg("") == want and diameter_arg("40") == "40",
+    want = f"{EFFECTIVE_DIAMETER_MM / 1000.0:g}"
+    ck("球径留空 → 命令行用有效直径（米，不是旧默认 40）",
+       diameter_arg("") == want and diameter_arg("40") == "0.04",
        f"空→{diameter_arg('')!r}，填 40→{diameter_arg('40')!r}")
     ck("球径只有空白 → 也退回有效直径",
        diameter_arg("   ") == want, repr(diameter_arg("   ")))
-    ck("球径填了就用填的（用户的数不被兜底顶掉）",
-       diameter_arg(" 30 ") == "30", repr(diameter_arg(" 30 ")))
+    ck("球径填了就用填的，且换算成米（mm ÷ 1000）",
+       diameter_arg(" 30 ") == "0.03", repr(diameter_arg(" 30 ")))
+    ck("反向：界面填 21.6（mm）→ 命令行 0.0216（米），不许出现 21.6",
+       diameter_arg("21.6") == "0.0216" and float(diameter_arg("21.6")) < 1,
+       f"{diameter_arg('21.6')!r}")
     return out
 
 
@@ -572,10 +584,14 @@ def main() -> int:
         # 守的坑（2026-10-29）：三处 ``or "40"`` 兜底让"界面显示 21.6、命令行
         # 传 40"成为可能。Z ∝ D，那等于用户拿着偏大 85% 的深度当测量，
         # 而界面上一个字都看不出来。
+        # 2026-10-31 再补一条**单位**：界面按 mm 收，命令行按米收。期望值因此
+        # 是 0.0216 而不是 21.6 —— 传 21.6 会让 run_video 一个三维点都不给。
         # 为什么断言的是**命令行实际拿到什么**、而不是源码里有没有某个字面量：
         # 后者一改写法（抽函数、换常量）就失效，且抓不到"留空走另一条分支"。
-        # 这一条可以反向自证：把兜底改回 "40"，这里立刻红。
+        # 这一条可以反向自证：把 ``diameter_arg`` 里的 ``/ 1000`` 去掉，这里立刻红。
         from apps._gui_mono import EFFECTIVE_DIAMETER_MM, LEGACY_DIAMETER
+
+        want_m = EFFECTIVE_DIAMETER_MM / 1000.0
 
         mono = dict(windows)["mono"]
         captured: list[list[str]] = []
@@ -609,12 +625,13 @@ def main() -> int:
             got = cmd[cmd.index("--ball-diameter") + 1]
         try:
             ok_diam = (got != LEGACY_DIAMETER
-                       and abs(float(got) - EFFECTIVE_DIAMETER_MM) < 1e-9)
+                       and abs(float(got) - want_m) < 1e-9)
         except ValueError:
             ok_diam = False
         print(f"  [{'通过' if ok_diam else '不达标'}] 单目窗球径留空 → "
               f"命令行 --ball-diameter {got or '(缺失)'}"
-              f"（应为 {EFFECTIVE_DIAMETER_MM:g}，不是旧默认 {LEGACY_DIAMETER}）")
+              f"（应为 {want_m:g} 米 = {EFFECTIVE_DIAMETER_MM:g} mm，"
+              f"不是旧默认 {LEGACY_DIAMETER}，也不是 {EFFECTIVE_DIAMETER_MM:g}）")
         results.append(("单目窗球径留空传有效直径", ok_diam))
 
         # ---------- 单目窗：离线视频传不传 fx、焦距估计传不传球径 ----------
@@ -668,23 +685,45 @@ def main() -> int:
             cmd = captured[0] if captured else []
             got_d = (cmd[cmd.index("--ball-diameter") + 1]
                      if "--ball-diameter" in cmd else "")
-            ok_est = got_d == f"{EFFECTIVE_DIAMETER_MM:g}"
+            ok_est = got_d == f"{want_m:g}"
             print(f"  [{'通过' if ok_est else '不达标'}] 单点焦距估计：留空 → 传 "
                   f"--ball-diameter {got_d or '(缺失)'}（应为 "
-                  f"{EFFECTIVE_DIAMETER_MM:g}）")
+                  f"{want_m:g} 米 = {EFFECTIVE_DIAMETER_MM:g} mm）")
             results.append(("焦距估计传球径", ok_est))
 
-            # 换了球：框里写 30，命令里就必须是 30（f 与 D 同比例，错一个都白标）
+            # 换了球：框里写 30（mm），命令里就必须是 0.03（米）——
+            # f 与 D 同比例，错一个都白标；单位错了更是差三个数量级。
             captured.clear()
             mono.var_diameter.set("30")
             mono._start_focal_estimate()
             cmd = captured[0] if captured else []
             got_d30 = (cmd[cmd.index("--ball-diameter") + 1]
                        if "--ball-diameter" in cmd else "")
-            ok_est30 = got_d30 == "30"
+            ok_est30 = got_d30 == "0.03"
             print(f"  [{'通过' if ok_est30 else '不达标'}] 单点焦距估计：框里填 30 → "
-                  f"传 --ball-diameter {got_d30 or '(缺失)'}（应为 30）")
+                  f"传 --ball-diameter {got_d30 or '(缺失)'}（应为 0.03 米）")
             results.append(("焦距估计用框里的球径", ok_est30))
+
+            # ---- 反向断言：命令行球径**永远是米**，必须 < 1 ----
+            # 界面那一栏写的是 21.6（mm），所以"传下去的值"一定是 0.0216。
+            # 谁把 ``diameter_arg`` 里的 ``/1000`` 去掉，这一条立刻红；
+            # 而 21.6 米的球会让 run_video 一个三维点都不给（实测 40 帧全丢），
+            # 界面上却只写"已完成"—— 那正是最坏的一类静默失效。
+            captured.clear()
+            mono.var_diameter.set("21.6")
+            mono._start_video()
+            cmd = captured[0] if captured else []
+            got_216 = (cmd[cmd.index("--ball-diameter") + 1]
+                       if "--ball-diameter" in cmd else "")
+            try:
+                as_m = float(got_216)
+            except ValueError:
+                as_m = 999.0
+            ok_unit = 0 < as_m < 1 and abs(as_m - 0.0216) < 1e-9
+            print(f"  [{'通过' if ok_unit else '不达标'}] 界面填 21.6 mm → 命令行 "
+                  f"--ball-diameter {got_216 or '(缺失)'}（必须是米且 <1，"
+                  f"出现 21.6 这种数就是单位断了）")
+            results.append(("单目窗球径永远是米（<1）", ok_unit))
         finally:
             mono_mod.find_clip = real_find
             mono._session = real_sess

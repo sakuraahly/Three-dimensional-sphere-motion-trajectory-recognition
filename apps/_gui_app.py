@@ -42,7 +42,8 @@ from pathlib import Path
 from tkinter import ttk
 
 from apps._gui_widgets import (ACCENT, BG, FONT_FAMILY, INK, MUTED, OK, WARN,
-                               ScrollPage, StatusBar, Surface, init_style)
+                               ScrollPage, StatusBar, Surface, fit_to_content,
+                               init_style)
 from apps._task_runner import ROOT, TaskRunner
 
 __all__ = ["GuiPrefs", "AppState", "App", "HubWindow", "run"]
@@ -275,8 +276,14 @@ class AppState:
 # --------------------------------------------------------------------------- #
 # 窗口尺寸（沿用旧界面的工作区计算，避免窗口顶出屏幕）
 # --------------------------------------------------------------------------- #
-def _fit_window(root: tk.Misc) -> tuple[int, int]:
-    """给主窗口一个"装得下、不压任务栏"的尺寸。返回 (w, h)。"""
+def work_area(root: tk.Misc) -> tuple[int, int]:
+    """屏幕**可用工作区**（扣除任务栏）。返回 (w, h)。
+
+    为什么单独成一个函数：门厅/模式窗/工作台的"窗口能多高"都要同一个数。
+    各自 ``winfo_screenheight()`` 会连任务栏一起算进去，于是按内容算出的高度
+    正好把自己压在任务栏下面 —— 用户看到的是"窗口最下面一截被挡住"，
+    与写死一个太大常数是同一个后果。
+    """
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     if sys.platform == "win32":
@@ -290,6 +297,12 @@ def _fit_window(root: tk.Misc) -> tuple[int, int]:
                 screen_h = int(rect.bottom - rect.top)
         except Exception:                                   # noqa: BLE001
             pass
+    return screen_w, screen_h
+
+
+def _fit_window(root: tk.Misc) -> tuple[int, int]:
+    """给主窗口一个"装得下、不压任务栏"的尺寸。返回 (w, h)。"""
+    screen_w, screen_h = work_area(root)
     w = min(980, max(760, screen_w - 120))
     h = min(760, max(560, screen_h - 140))
     return w, h
@@ -313,6 +326,7 @@ class App(tk.Tk):
 
         self.state = AppState()
         self.prefs = GuiPrefs()
+        self._work: tuple[int, int] | None = None
         self._log_lines: list[str] = []
         self._log_listeners: list = []
         self.tasks = TaskRunner(self, on_log=self._on_task_log,
@@ -322,6 +336,13 @@ class App(tk.Tk):
         self.hub = HubWindow(self)
         self.hub.protocol("WM_DELETE_WINDOW", self.close_app)
         self.hub.focus_force()
+
+    # ---------- 屏幕可用高度（各窗口按内容算高度时的上限来源） ----------
+    def work_area(self) -> tuple[int, int]:
+        """可用工作区 (w, h)。进程内不变，读一次记住。"""
+        if self._work is None:
+            self._work = work_area(self)
+        return self._work
 
     # ---------- 日志缓冲 ----------
     def _on_task_log(self, text: str) -> None:
@@ -482,26 +503,34 @@ class HubWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.configure(bg=BG)
-        w, h = _fit_window(self)
-        self.geometry(f"{w}x{h}")
-        self.minsize(min(820, w), min(520, h))
         self.surface = Surface(self)
 
-        self._build_brand()
+        self.brand = self._build_brand()
         # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
         # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
         self.status = StatusBar(self, on_log=app.open_console)
         self.status.pack(fill="x", side="bottom")
-        page = ScrollPage(self, self.surface)
-        page.pack(fill="both", expand=True)
-        body = page.content
+        self._page = ScrollPage(self, self.surface)
+        self._page.pack(fill="both", expand=True)
+        body = self._page.content
         self._build_mode_cards(body)
         self._build_toolbar(body)
         self._refresh()
+        # 高度也按内容算（2026-10-31）：原来用 `_fit_window` 的 760，内容要 768，
+        # 于是门厅永远差 8 px —— 不多，但"一屏看全"就成了一句假话。
+        # `extra` 给的是顶部那条品牌栏：它不在滚动页里，但同样占客户区。
+        # 必须先 `update_idletasks` 再取它的高度 —— 否则量到的是 1（还没排版），
+        # 窗口照样矮 87 px。
+        self.update_idletasks()
+        w, _h = _fit_window(self)
+        height = fit_to_content(self, self._page, self.status, width=w,
+                                screen_h=app.work_area()[1],
+                                extra=self.brand.winfo_reqheight())
+        self.minsize(min(820, w), min(520, height))
 
     # ---------- 品牌条 ----------
-    def _build_brand(self) -> None:
+    def _build_brand(self) -> tk.Frame:
         head = tk.Frame(self, bg=ACCENT)
         head.pack(fill="x")
         tk.Label(head, text="球形物体三维运动轨迹识别", bg=ACCENT, fg="white",
@@ -510,6 +539,7 @@ class HubWindow(tk.Toplevel):
         tk.Label(head, text="先选装置类型，再按窗口里的三步走；参数只在用到它的那一步出现",
                  bg=ACCENT, fg="#dbeafe", font=(FONT_FAMILY, 10)).pack(
             anchor="w", padx=20, pady=(2, 12))
+        return head
 
     # ---------- 三张模式卡 ----------
     def _build_mode_cards(self, parent) -> None:
@@ -591,9 +621,20 @@ class HubWindow(tk.Toplevel):
     def _open_data_manager(self) -> None:
         # 数据管理是独立进程（apps/data_manager.py），不嵌进本进程：
         # 它自己会开 Tk 窗口，嵌进来会变成第二个 Tk 根。
+        #
+        # 状态条必须说一句（2026-10-31 走查缺陷 #2）：它是个独立进程，
+        # 起得慢或起来就退出时，按钮"看起来什么都没发生"——
+        # 同一排的「相机设备」「3D 查看器」都写了状态，只有这个没写。
+        # 只说"看哪里"，**不去读任务对象**：状态条是给用户看的，
+        # 不该因为拿不到 `task.log_path` 就整条不写。
         self.app.tasks.start(
             [sys.executable, str(ROOT / "apps" / "data_manager.py")],
             "数据管理")
+        self.status.set_status(
+            "已启动数据管理（它是独立窗口，首次启动要几秒）。"
+            "没看到窗口就点「任务管理器和运行日志」——那里有这条任务的输出；"
+            "起来了但不知道数据在哪，那个窗口自己会列 data/ 下的会话",
+            "info")
 
     def _open_viewer(self) -> None:
         """打开 3D 查看器 —— **必须带源**（view_3d 的 source 是必填参数）。"""
@@ -607,8 +648,11 @@ class HubWindow(tk.Toplevel):
         self.app.tasks.start(
             [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
             "3D 查看器")
+        # 会话名，不是 `src.parent.name` —— 离线结果在 `<会话>/derived/` 里，
+        # `parent.name` 永远是 derived（与双目窗同一处口径，见 `session_name_of`）。
+        from apps._gui_stereo import session_name_of
         self.status.set_status(
-            f"正在打开 3D 查看器：{src.parent.name}"
+            f"正在打开 3D 查看器：{session_name_of(src)}"
             f"（窗口内「数据源」可换任意会话）", "info")
 
     def _open_legacy(self) -> None:

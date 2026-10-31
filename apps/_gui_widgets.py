@@ -30,10 +30,12 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from apps._gui_geometry import fit_height
+
 __all__ = [
     "BG", "ACCENT", "INK", "MUTED", "WARN", "OK", "FONT_FAMILY",
-    "CARD_HINT_WRAP", "PARAM_HINT_WRAP",
-    "init_style", "Surface", "ScrollPage", "StatusBar",
+    "CARD_HINT_WRAP", "PARAM_HINT_WRAP", "INLINE_NOTE_WRAP",
+    "init_style", "Surface", "ScrollPage", "StatusBar", "fit_to_content",
 ]
 
 # 配色沿用旧界面（不换皮：换肤会把 199 个控件的视觉经验全部作废，见计划书 §8）
@@ -47,6 +49,7 @@ FONT_FAMILY = "Microsoft YaHei UI"
 
 CARD_HINT_WRAP = 820      # 初值；实际由 Surface.reflow 按视口宽度刷新
 PARAM_HINT_WRAP = 720     # 初值；同上
+INLINE_NOTE_WRAP = 520    # 按钮行里的原因文字，封顶（再宽就等于"一句说明撑满整卡"）
 
 
 def init_style(root: tk.Misc) -> ttk.Style:
@@ -100,13 +103,19 @@ class Surface:
         ``viewport`` 是内容区宽度（不是窗口宽度）。卡片左右各留 16 px padding
         再加 14 px 内边距，所以卡片说明比视口窄约 80；参数说明还要再让出
         标签列，取 160。下限 320/280 是为了窄窗口下不至于一个词一行。
+
+        ``inline`` 是按钮行里那段原因文字：它要让出**按钮占掉的宽度**，
+        所以比视口窄 360（实测一行 4 个按钮约 300 + 边距 60），上限 520。
         """
         card_wrap = max(320, int(viewport) - 80)
         param_wrap = max(280, int(viewport) - 160)
+        inline_wrap = max(220, min(INLINE_NOTE_WRAP, int(viewport) - 360))
         alive: list[tuple[ttk.Label, str]] = []
         for lab, kind in self._wrapped:
+            wrap = {"card": card_wrap, "param": param_wrap,
+                    "inline": inline_wrap}.get(kind, param_wrap)
             try:
-                lab.configure(wraplength=card_wrap if kind == "card" else param_wrap)
+                lab.configure(wraplength=wrap)
                 alive.append((lab, kind))
             except tk.TclError:
                 continue                        # 已被销毁的标签：静默移出登记表
@@ -159,6 +168,25 @@ class Surface:
         lab.grid(row=self._next_row(parent), column=indent, columnspan=5,
                  sticky="w", pady=(0, 4))
         self._wrapped.append((lab, "param"))
+        return lab
+
+    def inline_note(self, row: ttk.Frame, text: str = "") -> ttk.Label:
+        """按钮行里的说明（在按钮**右边**，不单独占一行）。
+
+        为什么要有它（2026-10-31，工作台 ⑤ 被挤出首屏）
+        ------------------------------------------------
+        "这一步为什么不能点"原本占一行：即使**空着**，一个空 TLabel 也有
+        27 px 行高 —— 5 张卡就是 135 px，正好把 ⑤ 推到首屏下面。而它解释的
+        只是旁边那个按钮，放在同一行本来就更近。
+
+        ``row`` 必须是 :meth:`action_row` 的返回值（那是一个 pack 容器）；
+        宽度登记为 ``kind="inline"``，随视口重排但封顶 520 —— 再宽就等于
+        "一行说明撑满整卡"，那正是旧界面文字把界面撑爆的形状。
+        """
+        lab = ttk.Label(row, text=text, style="Hint.TLabel",
+                        wraplength=INLINE_NOTE_WRAP)
+        lab.pack(side="left", padx=(10, 4))
+        self._wrapped.append((lab, "inline"))
         return lab
 
     def param_entry(self, parent: tk.Misc, label: str, value: str = "",
@@ -318,3 +346,31 @@ class StatusBar(ttk.Frame):
             self._label.configure(text=text, style=style)
         except tk.TclError:
             pass
+
+
+def fit_to_content(win: tk.Misc, page: ScrollPage, status: StatusBar, *,
+                   width: int, screen_h: int, extra: int = 0) -> int:
+    """把窗口高度调成"内容 + 状态条（+ 滚动页之外的固定高度）"，封顶为屏幕可用高度。
+
+    为什么在**建完之后**量、而不是建之前算：内容高度由 ``wraplength`` 后的
+    实际折行、按钮内边距、ttk 主题的行高共同决定，手算必然漂。所以先按内容
+    建好（此时窗口还没显示，量到的 ``winfo_reqheight`` 就是最终值），再一次性
+    把尺寸交出去 —— 用户不会看到窗口先开后缩的中间态。
+
+    ``extra`` 是滚动页**之外**的固定高度（门厅顶部那条品牌栏就是这种：
+    它不在 ScrollPage 里，但同样占客户区）。漏掉它，窗口就永远矮这么多，
+    表现为"最下面一截要滚 8 px"——门厅正是这么差了 8 px。
+
+    调用方必须在**所有卡片建完、``_reload``/``_refresh`` 之后**调它：
+    状态行、原因行的文字会随数据变，量早了就是量一个还没写完的界面。
+
+    装不下（返回高度 - 状态条 < 内容）时不报错、也不裁：``ScrollPage`` 本来
+    就是为此存在的（窄屏/小屏的兜底）。这条路径不该被当成正常态 ——
+    ``tests/selftest_window_mode.py`` 里有一条硬判据盯着"每一步都在视口里"。
+    """
+    win.update_idletasks()
+    content = page.content.winfo_reqheight()
+    height = fit_height(content, screen_h=screen_h,
+                        status=status.winfo_reqheight() + int(extra))
+    win.geometry(f"{int(width)}x{int(height)}")
+    return int(height)

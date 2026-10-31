@@ -126,9 +126,10 @@ def main() -> int:
     app.update()
     results: list[tuple[str, bool]] = []
 
-    def ck(label: str, good: bool) -> None:
+    def ck(label: str, good: bool, detail: str = "") -> None:
         results.append((label, good))
-        print(f"  [{'通过' if good else '不达标'}] {label}")
+        print(f"  [{'通过' if good else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
 
     def pump(seconds: float = 0.5, target=None) -> None:
         """跑一会儿事件循环 —— 否则 `_poll` / `_refresh_tasks` 根本没执行。
@@ -337,6 +338,103 @@ def main() -> int:
                 app2.destroy()
             except Exception:                         # noqa: BLE001
                 pass
+
+    # ------------------------------------------------------------------ #
+    # 9. 统一结束回调 / 子进程 stdin（2026-10-31 增，测的是 apps/_task_runner.py）
+    # ------------------------------------------------------------------ #
+    #
+    # 为什么单独一段测**新**的任务运行器：上面 1–8 节测的是旧启动器
+    # （``启动程序.py``，它自带一套 ``start_task``/``stop_task``）。新界面
+    # 用的是 ``apps/_task_runner.py``，而"按钮点完就再无下文"正是它缺的东西：
+    # 每个按钮各自传 ``on_done``，漏传一个（拍标定图 / 焦距估计 / 实时识别
+    # 全都漏了）就永远停在"已开始…"；**失败只写日志，状态条一个字都不说**。
+    #
+    # 反向自证：把 ``pump_once`` 里的 ``self._notify_finished(task)`` 删掉，
+    # 下面第 1、3、4 条立刻红；把 ``_spawn`` 的 ``stdin=subprocess.DEVNULL``
+    # 去掉，第 7 条立刻红。
+    print("----- 9. 统一结束回调与 stdin（apps/_task_runner.py）-----")
+    import subprocess
+    import tempfile
+
+    import apps._task_runner as tr
+
+    with tempfile.TemporaryDirectory(prefix="task_runner_") as td:
+        runner = tr.TaskRunner(root=None, on_log=lambda _s: None,
+                               log_dir=Path(td))
+        finished: list = []
+        runner.add_finish_listener(finished.append)
+
+        def pump_until(tasks, seconds: float = 30.0) -> None:
+            end = time.monotonic() + seconds
+            while any(t.running for t in tasks) and time.monotonic() < end:
+                runner.pump_once()
+                time.sleep(0.05)
+            runner.pump_once()
+
+        # 归属是起完之后**填在任务上**的（窗口的 ``_start`` 就是这么做的）：
+        # ``start()`` 的签名必须保持 ``(cmd, title, on_done)`` —— 走查工具与
+        # gui_budget 都用老签名的桩替换它，加关键字参数会让它们当场 TypeError。
+        t_ok = runner.start([py, "-c", "print('half');print('done-ok')"],
+                            "自测-成功")
+        t_bad = runner.start(
+            [py, "-c", "import sys;print('bad-line');sys.exit(3)"],
+            "自测-失败")
+        t_ok.owner = "mono"
+        t_bad.owner = "mono"
+        pump_until([t_ok, t_bad])
+        got = {t.tid for t in finished}
+        ck("成功与失败的任务**都**调了结束回调（各一次）",
+           got == {t_ok.tid, t_bad.tid} and len(finished) == 2)
+        ck("成功任务：ok=True、返回码 0", t_ok.ok and t_ok.exit_code == 0)
+        ck("失败任务：ok=False，且回调照样被调（失败有出口）",
+           (not t_bad.ok) and t_bad.exit_code == 3 and t_bad in finished)
+        ck("回调带得回**日志尾**（失败原因不用翻日志才看得到）",
+           any("bad-line" in line for line in t_bad.tail),
+           )
+        ck("回调带得回归属（owner），别的窗口才不会被误伤",
+           t_ok.owner == "mono" and t_bad.owner == "mono")
+        ck("失败任务的日志文件真的落盘了", t_bad.log_path is not None
+           and t_bad.log_path.exists())
+
+        # 退订之后不许再回调（窗口关了还往已销毁的控件上写就是 TclError）
+        heard: list = []
+        cb = heard.append
+        runner.add_finish_listener(cb)
+        runner.remove_finish_listener(cb)
+        t_gone = runner.start([py, "-c", "print('bye')"], "自测-退订")
+        pump_until([t_gone])
+        ck("remove_finish_listener 之后不再回调", heard == [])
+
+        # ---- stdin：**不许**继承控制台 ----
+        # 为什么这条重要：子进程里任何一句 input()（``stereo/pair_source.py``
+        # 在没有 tty 的路径上就有一处）会等一个永远不会有人敲的回车 ——
+        # 任务永不结束、状态条永远"已开始…"、相机还被它占着。
+        seen_kw: dict = {}
+        real_popen = tr.subprocess.Popen
+
+        class _SpyPopen(real_popen):                # type: ignore[misc,valid-type]
+            def __init__(self, cmd, **kw):
+                seen_kw.update(kw)
+                super().__init__(cmd, **kw)
+
+        tr.subprocess.Popen = _SpyPopen
+        try:
+            t_in = runner.start([py, "-c", "print('x')"], "自测-stdin")
+        finally:
+            tr.subprocess.Popen = real_popen
+        pump_until([t_in])
+        ck("起子进程时 stdin 被重定向（不继承控制台）",
+           seen_kw.get("stdin") == subprocess.DEVNULL,
+           f"实际 stdin={seen_kw.get('stdin')!r}")
+
+        t_read = runner.start(
+            [py, "-c", "import sys;d=sys.stdin.read();print('readlen',len(d),flush=True)"],
+            "自测-读stdin")
+        pump_until([t_read], seconds=15.0)
+        ck("子进程读 stdin 立刻拿到 EOF（不会把界面吊死）",
+           (not t_read.running) and t_read.exit_code == 0
+           and any("readlen 0" in line for line in t_read.tail),
+           f"返回码 {t_read.exit_code}，尾巴 {t_read.tail}")
 
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]

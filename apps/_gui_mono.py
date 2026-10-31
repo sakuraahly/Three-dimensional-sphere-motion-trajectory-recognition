@@ -23,19 +23,22 @@
 
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from apps._gui_widgets import (BG, INK, MUTED, OK, WARN, ScrollPage, StatusBar,
-                               Surface)
+from apps._collapsible import CollapsibleSection
+from apps._gui_widgets import (BG, INK, MUTED, OK, PARAM_HINT_WRAP, WARN,
+                               ScrollPage, StatusBar, Surface)
 from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
                                  MonoSession, create_mono_session,
                                  delete_mono_session, find_clip,
                                  scan_mono_sessions, sync_from_take)
-from apps._task_runner import ROOT
+from apps._task_runner import ROOT, Task
 from sphere_tracker.plugins import names as plugin_names      # noqa: E402
 
 __all__ = ["MonoWindow", "MonoSessionPicker"]
@@ -63,6 +66,64 @@ EFFECTIVE_DIAMETER_MM = round(NOMINAL_DIAMETER_MM * (1 - MEASURED_RADIUS_SHRINK)
 #: 旧版本的默认球径。窗口关闭时会把输入框无条件写回 prefs，所以磁盘上的这个值
 #: 与"用户真的想要 40"无法区分 —— 迁移只认这一个字面值，且只做一次。
 LEGACY_DIAMETER = "40"
+
+#: 界面球径的默认值，**mm**（人量卡尺用的是 mm）；命令行那边要 m，见 `diameter_arg`。
+DEFAULT_DIAMETER_MM = float(EFFECTIVE_DIAMETER_MM)
+
+#: 本窗起任务时的归属标记（``TaskRunner.start(owner=...)``）。
+#: 统一结束回调是**全局**的，靠它才能只认自己起的任务，不把双目窗的
+#: 失败写到单目窗状态条上。按标题字符串匹配会被"标题改一个字"悄悄弄坏。
+OWNER = "mono"
+
+#: 相机枚举的进程内缓存时长（秒）。
+#:
+#: 为什么需要缓存：拿不到 pnputil 的机器上 ``list_devices()`` 会退到
+#: PowerShell ``Get-PnpDevice``，实测约 10 秒。用户"进门厅 → 单目 → 回门厅 →
+#: 再进单目"是常态，每次都等 10 秒等于把这功能做成不可用。
+DEVICE_CACHE_S = 30.0
+_DEVICE_CACHE: dict = {"at": 0.0, "devices": [], "note": ""}
+
+#: 相机下拉旁边那句解释（前后两段拼起来，枚举结果会改后半段）。
+#:
+#: 为什么必须写"不代表能出图"（2026-10-31 走查第 4 条）：角色那一栏只做
+#: **静态匹配**（身份/端口对不对得上），根本没开相机。而这台机器上有过
+#: "枚举得到 ≠ 拿得到帧"（aoni + MSMF 30.8 s 后报 -2147483638）。
+#: 不写这一句，用户会把这行当成"相机可用"，打不开时只会以为是自己点错了。
+CAMERA_HINT_BASE = ("「#编号」是此刻插着的设备，直接用；角色对上不代表能出图"
+                    "（没开过相机），要确认点「换相机…」。")
+
+
+def camera_hint_text(note: str) -> str:
+    return CAMERA_HINT_BASE + (note or "")
+
+
+def enumerate_devices() -> tuple[list, str]:
+    """真的去枚举相机；读不到就返回空表 + 一句人话，**绝不抛**。
+
+    这个函数**很慢**（见 ``DEVICE_CACHE_S``），只许在后台线程里调 ——
+    2026-10-31 之前它在 ``MonoWindow.__init__`` 的主线程里跑，于是点门厅
+    「进入（单目）」之后整个门厅冻住、窗才出现。
+    """
+    try:
+        from sphere_tracker import camera_registry as cr
+        return list(cr.list_devices()), ""
+    except Exception as exc:                            # noqa: BLE001
+        return [], f"（设备列表读不到：{type(exc).__name__}，只能按角色选）"
+
+
+def cached_devices(max_age: float = DEVICE_CACHE_S) -> tuple[list, str] | None:
+    """``max_age`` 秒内的枚举结果；没有 / 过期 → ``None``（调用方决定去后台枚举）。"""
+    at = float(_DEVICE_CACHE["at"])
+    if at <= 0 or (time.monotonic() - at) > max_age:
+        return None
+    return list(_DEVICE_CACHE["devices"]), str(_DEVICE_CACHE["note"])
+
+
+def store_devices_cache(devices: list, note: str) -> None:
+    """记下这次的枚举结果（与窗口无关：关窗也留着，下次进窗直接秒开）。"""
+    _DEVICE_CACHE["at"] = time.monotonic()
+    _DEVICE_CACHE["devices"] = list(devices)
+    _DEVICE_CACHE["note"] = note
 
 #: 离线/实时识别用的检测器候选。
 #:
@@ -158,8 +219,32 @@ def seed_arg_from_file(path, *, image_size=None) -> tuple[str, str]:
     return f"{x:g},{y:g},{r:g}", ""
 
 
+def diameter_mm_or_none(text: str) -> float | None:
+    """框里的球径（mm）→ 正数；空 / 非数字 / 非正 → ``None``。
+
+    为什么这里不兜底：调用方必须能分清「空」（用默认值，合理）与「填错了」
+    （也得用默认值，但**必须说一句**）。两者混成一个 ``None`` 就会出现
+    "用户填了 abc、界面拿 21.6 算、谁都没告诉他"（2026-10-31 走查第 5 条）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        mm = float(raw)
+    except ValueError:
+        return None
+    return mm if mm > 0 else None
+
+
 def diameter_arg(text: str) -> str:
-    """把"框里的球径（mm）"变成命令行要传的值：空 / 空白 → 有效直径。
+    """把框里的球径（**mm**）变成命令行要用的值（**米**）：空 / 非法 → 有效直径。
+
+    ⚠️ 这条 ``/1000`` 是 2026-10-31 实测出来的断链，别删：
+    界面按 mm 收（标签「球直径（有效值）」，默认 21.6），而 ``--ball-diameter``
+    和 ``AppConfig.ball_diameter_m``（``sphere_tracker/config.py`` = 0.0216）
+    按 **米** 收。原样传 21.6 等于告诉程序"球有 21.6 米大"，
+    ``run_video`` 于是**一帧有效三维点都没有**（``data/mono/20261029-205522``
+    实测 40 帧全丢），而日志只写"没有三维点"，界面还显示"已完成"。
 
     为什么留空要有兜底而不是"不传"：``run_video`` / ``run_realtime`` 的
     ``--ball-diameter`` 默认是 ``None``，再落到 ``AppConfig.camera`` —— 不传就
@@ -168,7 +253,29 @@ def diameter_arg(text: str) -> str:
 
     抽成模块级纯函数是为了能被测：界面上"点什么按钮传什么参"只有抓 argv 才看得见。
     """
-    return (text or "").strip() or f"{EFFECTIVE_DIAMETER_MM:g}"
+    mm = diameter_mm_or_none(text) or DEFAULT_DIAMETER_MM
+    return f"{mm / 1000.0:g}"
+
+
+def diameter_text_mm(text: str) -> str:
+    """给**界面文案**用的球径（mm）。与 ``diameter_arg`` 分开是为了不混单位。
+
+    状态条里写 ``D=21.6 mm`` 是对的（人量的是 mm）；写 ``D=0.0216`` 会让人
+    以为填错了单位。所以"进命令行用米、给人看用 mm"这两件事各有一个入口。
+    """
+    mm = diameter_mm_or_none(text) or DEFAULT_DIAMETER_MM
+    return f"{mm:g}"
+
+
+def diameter_problem(text: str) -> str:
+    """这个输入会不会被"默默换个数"？会的话返回要写进状态条的一句，否则空串。"""
+    raw = (text or "").strip()
+    if not raw:
+        return f"球径留空，按有效直径 {DEFAULT_DIAMETER_MM:g} mm 算"
+    if diameter_mm_or_none(raw) is None:
+        return (f"球径那一栏「{raw}」不是有效的毫米数，已按 {DEFAULT_DIAMETER_MM:g} mm "
+                f"算 —— 这里要填毫米（例如 21.6），不是 0.0216")
+    return ""
 
 
 def migrate_legacy_diameter(prefs) -> str:
@@ -434,7 +541,14 @@ class MonoWindow(tk.Toplevel):
         # "aoni webcam A25" 此刻枚举不到，而唯一在线的那台外接机被绑成了 `right`。
         # 设备候选 `#N 名字` 直接对应 `--camera N`（resolve_camera_arg 认纯数字），
         # 不依赖任何角色绑定，所以"角色配错了"也不会把单目堵死。
-        self._devices, self._device_note = self._list_devices()
+        #
+        # ⚠ 枚举**不许在主线程等**：拿不到 pnputil 时它退到 PowerShell
+        # ``Get-PnpDevice``（实测 ~10 s），那 10 秒里门厅整个冻住、窗才出现。
+        # 这里只读 30 秒内的缓存；冷的就先用"角色"开局，后台线程补设备。
+        self._devices, self._device_note = self._initial_devices()
+        self._enum_queue: queue.Queue = queue.Queue()
+        #: 用户还没自己动过相机下拉 → 设备枚举回来后可以替他换成更靠谱的默认值。
+        self._autopick = True
         _values = self._camera_values()
         # 存过的值可能已失效（角色改名、换端口导致名字变）：先整体匹配，
         # 再按 `#N` 认编号 —— 认不出才用默认值，别把失效的串带进命令行。
@@ -449,6 +563,9 @@ class MonoWindow(tk.Toplevel):
                                  f"已改成 {_default}（pin 好以后可以再选回来）")
             _saved = ""
         self.var_camera = tk.StringVar(value=_saved or _default)
+        # 存过值 = 用户自己选过，设备枚举回来后**不许**替他改（那会让他下次
+        # 又要重选一遍）；没存过才是"界面替他挑的默认值"，可以升级成在线设备。
+        self._autopick = not bool(_saved)
         self.var_cols = tk.StringVar(value=prefs.get_str("board.cols", "8"))
         self.var_rows = tk.StringVar(value=prefs.get_str("board.rows", "5"))
         self.var_square = tk.StringVar(value=prefs.get_str("board.square_mm", "25"))
@@ -500,12 +617,49 @@ class MonoWindow(tk.Toplevel):
         self._build_step2(body)
         self._build_step3(body)
         self._refresh_state()
+        # 统一结束回调：本窗所有按钮的"结局"都从这里出去（见 _task_runner 的
+        # ``add_finish_listener``）。注册放在建完控件之后 —— 回调会碰状态条。
+        self.app.tasks.add_finish_listener(self._on_task_finished)
+        # 相机枚举：冷的缓存才去起线程，暖的直接用（二次进窗秒开）。
+        if self._enum_pending:
+            self._start_device_enum()
         # 上面那几句必须最后说：_refresh_state 会把状态条改回"就绪"。
-        # 两句都成立时用分号连起来，不让后一句把前一句顶掉 —— 它们都在说
+        # 几句都成立时用分号连起来，不让后一句把前一句顶掉 —— 它们都在说
         # "界面里有个值和你上次看到的不一样"，少一句用户就会以为是自己点错了。
         _notes = [n for n in (self._camera_note, self._diameter_note) if n]
+        if self._enum_pending:
+            # 不挡路，但要说一句：否则下拉里暂时只有角色、没有设备，用户会
+            # 以为"这台机器只认角色"。约 10 秒是慢枚举的实测值。
+            _notes.append("正在枚举相机（约 10 秒，不用等它，下拉会自动补上「#编号」）")
         if _notes:
             self.status.set_status("；".join(_notes), "warn")
+
+    # ------------------------------------------------------------------ #
+    # 布局辅助（首屏预算）
+    # ------------------------------------------------------------------ #
+    def _advanced(self, parent, title: str) -> CollapsibleSection:
+        """在卡片里塞一个默认收起的折叠区。
+
+        为什么用 grid 而不是 pack：卡片里的兄弟控件都是 grid 放的，Tk 不允许
+        同一个容器混用两种几何管理器（会直接抛 TclError）。折叠区**内部**是它
+        自己的 Frame，那边统一用 pack（见 ``_hint_pack``）。
+        """
+        sec = CollapsibleSection(parent, title, expanded=False, padding=(10, 6))
+        sec.grid(row=self.surface._next_row(parent), column=0, columnspan=9,
+                 sticky="ew", pady=(6, 0))
+        return sec
+
+    def _hint_pack(self, parent, text: str, style: str = "Hint.TLabel"):
+        """折叠区里的说明行：pack 版 ``Surface.hint``。
+
+        为什么不用 ``Surface.hint``：它用 grid，而折叠区内部只有 pack（见上）。
+        换行宽度仍登记给 Surface —— 窗口变窄时要跟着回排，漏登记的话
+        折叠区里的长句会自己撑出一条横向滚动条。
+        """
+        lab = ttk.Label(parent, text=text, style=style, wraplength=PARAM_HINT_WRAP)
+        lab.pack(anchor="w", pady=(0, 4))
+        self.surface._wrapped.append((lab, "param"))
+        return lab
 
     # ------------------------------------------------------------------ #
     # ① 内参
@@ -513,10 +667,8 @@ class MonoWindow(tk.Toplevel):
     def _build_step1(self, parent) -> None:
         box = self.surface.card(
             parent, "① 标定内参（一次就够）",
-            "单目测深只用三样东西：焦距、球直径、球的像素半径。焦距必须标，"
-            "不能猜 —— 1% 的焦距误差在 0.6 m 处就是 6 mm。"
-            "拍图用棋盘：一张 A4 打印的棋盘，在画面里上下左右都摆一摆，"
-            "至少 8 个不同姿态（挤在中央会让畸变系数失真）。")
+            "单目测深全靠焦距、球直径、像素半径。焦距必须标"
+            "（1% 差 → 0.6 m 处 6 mm）。")
         # 状态行
         # 状态行走 surface.hint：登记换行 + 由游标分配行号（不写死 row=1）
         self.lbl_calib = self.surface.hint(box, "检查中…")
@@ -530,18 +682,42 @@ class MonoWindow(tk.Toplevel):
         ttk.Label(pick, text="用这台相机").pack(side="left")
         # width 给到 34：设备候选带名字（"#0 aoni webcam A25 left"），
         # 只给编号等于让用户靠猜 —— 名字才能当场判断"这台对不对"。
-        ttk.Combobox(pick, values=self._camera_values(), width=34,
-                     state="readonly",
-                     textvariable=self.var_camera).pack(side="left", padx=(8, 0))
-        self.surface.hint(box, "前半是配置里绑好的角色（left / right）；"
-                               "「#编号 名字」是此刻插着的设备，按编号直接用，"
-                               "不依赖角色绑定。" + self._device_note)
+        self.cb_camera = ttk.Combobox(pick, values=self._camera_values(), width=34,
+                                      state="readonly",
+                                      textvariable=self.var_camera)
+        self.cb_camera.pack(side="left", padx=(8, 0))
+        # 用户自己动过下拉，就再也不许"替他把默认值升级成在线设备" ——
+        # 那等于把他刚选的那台悄悄换掉。
+        self.cb_camera.bind("<<ComboboxSelected>>",
+                            lambda _e: setattr(self, "_autopick", False))
+        self.lbl_devices = self.surface.hint(box,
+                                             camera_hint_text(self._device_note))
 
-        # L1：只有板参数（三个必需值）合在一行 —— 它们是一件事（这块板长什么样），
-        # 拆成三行会让首屏输入控件数超标，也让"8×5、25 mm"读起来不像一句话。
-        line = ttk.Frame(box)
-        line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
-                  sticky="w", pady=(4, 0))
+        # 板参数（三个必需值）合在一行 —— 它们是一件事（这块板长什么样），
+        # 拆成三行会让"8×5、25 mm"读起来不像一句话；但它们**不在首屏**：
+        # 一次标定只填一次，之后几个月都不碰，却要吃掉 150 px。
+        actions = self.surface.action_row(box)
+        self.btn_capture = self.surface.primary(actions, "拍标定图",
+                                                self._start_capture)
+        self.btn_calibrate = self.surface.secondary(actions, "标定内参",
+                                                    self._start_calibrate)
+        if not MONO_CALIB_APP.exists():
+            self.btn_calibrate.state(["disabled"])
+        self.surface.secondary(actions, "换相机…", self._open_cameras)
+        self.surface.secondary(actions, "打开标定图文件夹", self._open_frames_dir)
+        self.btn_estimate = self.surface.secondary(
+            actions, "替代：单点焦距估计", self._start_focal_estimate)
+
+        # 为什么要折叠（2026-10-31 走查第 8 条）：首屏内容比视口高 382 px，
+        # 第③步整块（含「开始识别」）在屏幕外 —— 用户的第一反应是"按钮怎么找不到"。
+        # 折叠的是**一次标定只填一次**的东西；「拍标定图 / 标定内参」留在首屏。
+        adv = self._advanced(box, "高级：棋盘尺寸与替代标定")
+        self._hint_pack(
+            adv.content,
+            "拍标定图用棋盘：A4 打印一张，在画面里上下左右都摆一摆，"
+            "至少 8 个不同姿态（挤在中央会让畸变系数失真）。")
+        line = ttk.Frame(adv.content)
+        line.pack(anchor="w", pady=(0, 4))
         ttk.Label(line, text="棋盘内角点").pack(side="left")
         ttk.Entry(line, textvariable=self.var_cols, width=5).pack(
             side="left", padx=(8, 4))
@@ -551,27 +727,14 @@ class MonoWindow(tk.Toplevel):
         ttk.Label(line, text="方格边长 mm").pack(side="left")
         ttk.Entry(line, textvariable=self.var_square, width=6).pack(
             side="left", padx=(8, 0))
-        self.surface.hint(box, "内角点 = 棋盘格内部交叉点个数，不是格子数。"
-                               "手上那张纸写着 8×5 就填 8 和 5；方格边长按实际量。")
-
-        actions = self.surface.action_row(box)
-        self.btn_capture = self.surface.primary(actions, "拍标定图",
-                                                self._start_capture)
-        self.surface.secondary(actions, "换相机…", self._open_cameras)
-        self.btn_calibrate = self.surface.secondary(actions, "标定内参",
-                                                    self._start_calibrate)
-        if not MONO_CALIB_APP.exists():
-            self.btn_calibrate.state(["disabled"])
-        row2 = self.surface.action_row(box)
-        self.surface.secondary(row2, "打开标定图文件夹", self._open_frames_dir)
-        self.btn_estimate = self.surface.secondary(
-            row2, "替代：单点焦距估计", self._start_focal_estimate)
+        self._hint_pack(adv.content, "内角点 = 棋盘格内部交叉点个数，不是格子数。"
+                                     "手上那张纸写着 8×5 就填 8 和 5；方格边长按实际量。")
         # 这句话必须写在按钮旁边，不能只放在点下去之后的状态条里：
         # 用户是在"要不要用这个替代方案"的那一刻需要它。
         # 旧文案（"球径误差会算进 fx、再正算深度时乘第二次"）是错的 ——
         # 两处用的是同一个 D，错的是"换了球却不改框里的值"，不是误差叠加。
-        self.surface.hint(
-            box,
+        self._hint_pack(
+            adv.content,
             "替代方案用的是第②步填的球直径：同一颗球、同一个 D，两处同源，"
             "所以不叠加；但换了球一定要改第②步那一栏，否则 fx 会按旧球径算错"
             "（f = 2·r·Z/D，D 错多少，fx 就错多少）。")
@@ -597,12 +760,13 @@ class MonoWindow(tk.Toplevel):
         ent = ttk.Entry(row, textvariable=self.var_diameter, width=8)
         ent.pack(side="left", padx=(8, 16))
         ent.bind("<KeyRelease>", lambda _e: self._refresh_budget())
-        ttk.Label(row, text="焦距 fx（留空用标定值）").pack(side="left")
+        ttk.Label(row, text="焦距 fx（留空用标定值；手填会覆盖它）").pack(side="left")
         ent2 = ttk.Entry(row, textvariable=self.var_focal, width=8)
         ent2.pack(side="left", padx=(8, 0))
         ent2.bind("<KeyRelease>", lambda _e: self._refresh_budget())
-        self.surface.hint(box, "手动填 fx 会覆盖标定值 —— 只在你确定相机换过、"
-                               "又来不及重标时用。")
+        # 原来这里还挂一句"手动填 fx 会覆盖标定值…"的说明行（23 px）。
+        # 那句话并进了输入框标签：它必须被看见，但不必占一整行 ——
+        # 首屏每 20 px 都在决定「开始识别」出不出现（2026-10-31 走查第 8 条）。
         # 有效值和名义值的差距是**实测**的（交接文档 §35.2），不是保守估计，
         # 所以必须摆在输入框正下方，而不是折叠进"高级"里。
         self.surface.hint(
@@ -613,8 +777,11 @@ class MonoWindow(tk.Toplevel):
             f"{(1 / (1 - MEASURED_RADIUS_SHRINK) - 1) * 100:.1f}%",
             style="Warn.TLabel")
 
-        # 误差预算行走游标（原来写死 row=20，加了控件就会撞）
-        self.lbl_budget = self.surface.hint(box, "填一个球直径才能算误差预算")
+        # 误差预算行走游标（原来写死 row=20，加了控件就会撞）。
+        # 初值留空：这一行的内容由 `_refresh_budget` 按"框里到底填了什么"决定。
+        # 写一句"填一个球直径才能算误差预算"当占位是错的 —— 框里本来就有 21.6，
+        # 那句话在开窗那一刻就在骗人（2026-10-31 走查第 5 条）。
+        self.lbl_budget = self.surface.hint(box, "")
         # 系统偏差单独一行、**永远在**：预算函数没法知道用户填的是名义还是有效值，
         # 所以不猜，只把这条实测偏差摆在旁边让人自己核对。
         self.lbl_budget_sys = self.surface.hint(box, "", style="Warn.TLabel")
@@ -625,24 +792,14 @@ class MonoWindow(tk.Toplevel):
     def _build_step3(self, parent) -> None:
         box = self.surface.card(
             parent, "③ 录制与识别",
-            "先录一段：只写相机原图，不叠任何标注，所以录完可以换参数反复检测。"
-            "每录一段自动建一个会话目录（与双目同构：session.json 记相机/分辨率/"
-            "帧数，检测结果写进 derived/），录完直接点「开始识别」（来源选「离线」）——它处理的就是"
-            "当前会话，结果也回写进同一个 derived/。没有内参时焦距按 60° 视场估算，"
-            "状态条会写明 —— 那种结果只能看趋势，不能当测量。")
-        line = ttk.Frame(box)
-        line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
-                  sticky="w", pady=(4, 0))
-        ttk.Label(line, text="录制时长 秒").pack(side="left")
-        ttk.Entry(line, textvariable=self.var_record_secs, width=6).pack(
-            side="left", padx=(8, 12))
-        ttk.Label(line, text="（0 = 按 q 停止）", style="Hint.TLabel").pack(side="left")
-
+            "先录一段（只写原图，录完可换参数反复检测）：每段自动建一个会话目录，"
+            "结果写进 derived/。录完点「开始识别」处理当前会话；"
+            "没有内参时焦距按 60° 视场估算，那种结果只能看趋势。")
         # 检测器与识别来源合成一行：它们一起回答"用什么、跑在哪"，
         # 拆成两行只会把第③步撑长（首屏装不下三步是 2026-10-28 的问题）。
         pick = ttk.Frame(box)
         pick.grid(row=self.surface._next_row(box), column=0, columnspan=9,
-                  sticky="w", pady=(6, 0))
+                  sticky="w", pady=(4, 0))
         ttk.Label(pick, text="检测器").pack(side="left")
         # 只读下拉，不给手打：名字必须与注册表一致（打错 run_video 直接退出）
         ttk.Combobox(pick, values=list(detector_choices()), width=9,
@@ -652,19 +809,9 @@ class MonoWindow(tk.Toplevel):
         ttk.Combobox(pick, values=list(SOURCE_CHOICES), width=16,
                      state="readonly",
                      textvariable=self.var_source).pack(side="left", padx=(8, 0))
-        self.surface.hint(box, DETECTOR_HINT)
-        self.surface.hint(box, "「离线」处理当前会话的录像：结果写进 derived/，"
-                               "跑完「看 3D」才会亮；「实时」直接开相机，不落盘，"
-                               "也没有 3D 结果（单目三维靠球径先验，需要落盘的轨迹）。")
 
-        # 会话目录只显示、不手打：路径由时间戳自动生成，人没必要记它。
-        sess = ttk.Frame(box)
-        sess.grid(row=self.surface._next_row(box), column=0, columnspan=9,
-                  sticky="w", pady=(6, 0))
-        ttk.Label(sess, text="本次录制存到").pack(side="left")
-        self.lbl_session_dir = ttk.Label(sess, text="", style="Hint.TLabel")
-        self.lbl_session_dir.pack(side="left", padx=(8, 0))
-        # 摘要单独一行：录完 / 跑完检测后状态会变，必须一眼看出"录了但还没检测"
+        # 会话摘要：录完 / 跑完检测后状态会变，必须一眼看出"录了但还没检测"。
+        # 它在首屏（不在折叠里）—— 这是用户判断"下一步该点什么"的唯一依据。
         self.lbl_session = self.surface.hint(box, "")
 
         actions = self.surface.action_row(box)
@@ -679,12 +826,54 @@ class MonoWindow(tk.Toplevel):
         # 按钮预算 5 已被占满，于是把「换目录…」挪进「历史会话…」（见该窗口的说明）。
         self.btn_seed = self.surface.secondary(actions, "点选球心", self._pick_seed)
         self.btn_seed.state(["disabled"])       # 没会话/没视频时不可点，见 _sync_seed_button
-        self.surface.hint(
-            box,
+
+        # 折叠区：录制时长 + 三段落说明 + 会话路径。
+        # 为什么这些可以让位（2026-10-31 走查第 8 条）：首屏比视口高 382 px，
+        # 第③步整块（含「开始识别」）落在屏幕外，用户的结论是"按钮找不到"。
+        # 折叠的每一项都是"默认值就够用、想调才进来"的东西；而"录多久"这种
+        # 真正影响结果的数，写在折叠区标题里，收起时也看得见。
+        adv = self._advanced(box, "高级：录制时长、检测器说明、会话位置")
+        self._sync_record_summary(adv)
+        self.adv_step3 = adv
+        self.var_record_secs.trace_add(
+            "write", lambda *_a: self._sync_record_summary(adv))
+        line = ttk.Frame(adv.content)
+        line.pack(anchor="w", pady=(0, 4))
+        ttk.Label(line, text="录制时长 秒").pack(side="left")
+        ttk.Entry(line, textvariable=self.var_record_secs, width=6).pack(
+            side="left", padx=(8, 12))
+        ttk.Label(line, text="（0 = 按 q 停止）", style="Hint.TLabel").pack(side="left")
+        self._hint_pack(adv.content, DETECTOR_HINT)
+        self._hint_pack(
+            adv.content,
+            "「离线」处理当前会话的录像：结果写进 derived/，跑完「看 3D」才会亮；"
+            "「实时」直接开相机，不落盘，也没有 3D 结果"
+            "（单目三维靠球径先验，需要落盘的轨迹）。")
+        # 会话目录只显示、不手打：路径由时间戳自动生成，人没必要记它。
+        sess = ttk.Frame(adv.content)
+        sess.pack(anchor="w", pady=(0, 4))
+        ttk.Label(sess, text="本次录制存到").pack(side="left")
+        self.lbl_session_dir = ttk.Label(sess, text="", style="Hint.TLabel")
+        self.lbl_session_dir.pack(side="left", padx=(8, 0))
+        self._hint_pack(
+            adv.content,
             "球是镜面的（镀铬、反光）时，自动检测会把书架/衣服当球：先录一段，"
             "再点「点选球心」——第一点球心、第二点球边（半径不靠自动估），"
             "之后「开始识别」用它跟踪，检测器会自动切成 specular。"
             "换会话存放目录的入口在「历史会话…」里。")
+
+    def _sync_record_summary(self, section) -> None:
+        """折叠区标题里带上"现在录多久"：收起时也得看得见这个数。
+
+        为什么盯这一项：它直接决定录出来的长度，而它已经不在首屏了；
+        标题是唯一还能让人不点开就看到它的地方。
+        """
+        secs = self.var_record_secs.get().strip() or "10"
+        try:
+            section.set_summary(f"{secs} 秒"
+                                if secs.isdigit() else f"「{secs}」不是数字，按 10 秒")
+        except tk.TclError:
+            pass                                    # 窗口已销毁：标题没人看得到
 
     def _start_by_source(self) -> None:
         """「开始识别」：按上面的下拉决定走实时还是离线。
@@ -721,8 +910,8 @@ class MonoWindow(tk.Toplevel):
                "--camera", self._camera_arg(cam_label) or "0",
                "--duration", secs,
                "--out", str(out)]
-        self.app.tasks.start(cmd, f"单目录制 {secs}s",
-                             on_done=lambda _task: self._on_recorded(sess_dir))
+        self._start(cmd, f"单目录制 {secs}s",
+                    on_done=lambda task: self._on_recorded(sess_dir, task))
         self._select_session(sess_dir)
         self._refresh_session()
         # 角色离线就先说一句：录制任务会照跑，但它多半在"3 秒没拿到帧"那步失败，
@@ -738,14 +927,25 @@ class MonoWindow(tk.Toplevel):
             f"已开始录制 {secs} 秒 → {self._short(sess_dir)}/（有倒计时，"
             f"看到 REC 才开始动）。录完点「开始识别」直接检测这段会话" + warn, level)
 
-    def _on_recorded(self, sess_dir: Path) -> None:
+    def _on_recorded(self, sess_dir: Path, task=None) -> None:
         """录制任务结束：把 sidecar 的实测值补进 session.json，再刷新摘要。
 
         没有这一步，会话里就只有"本来要录什么"（宽高 0），而实测分辨率/帧率
         只有录制器知道 —— 那是它的自证元数据，不该让用户去别的文件里找。
+
+        ``task`` 是统一结束回调带上来的那条任务：**失败先说话**。旧版不看返回码，
+        录制进程挂掉之后只会说"会话里没有视频，八成是相机开不出图"——
+        那是猜的，而真实原因是清楚的（日志尾里就写着）。
         """
         if not self._alive():
             return                      # 窗口先被关了：结果已落盘，界面不用更新
+        if task is not None and not getattr(task, "ok", False):
+            self._select_session(sess_dir)
+            self._refresh_session()
+            self.status.set_status(
+                f"录制没成功（返回码 {task.exit_code}）：{task.tail_text(2)[:100]} "
+                f"—— {self._log_hint(task)}", "warn")
+            return
         note = ""
         try:
             if not sync_from_take(sess_dir):
@@ -936,10 +1136,10 @@ class MonoWindow(tk.Toplevel):
             return
         from apps.seed_picker import MonoSeedPicker
 
-        try:
-            diameter = float(self._diameter_arg())
-        except ValueError:
-            diameter = None                 # 框里写坏了就当没有：Z 那行会说明缺什么
+        # 这里要的是 **mm**（点选窗显示的是"球直径 21.6 mm"），而
+        # ``_diameter_arg`` 已经是米了 —— 直接 float 它会把球当成 0.0216 mm，
+        # 那一行 Z 估计会离谱到没人信。所以取框里的原值再解析。
+        diameter = diameter_mm_or_none(self.var_diameter.get())
         picker = MonoSeedPicker(self, clip.parent, fx=self._current_fx(),
                                 diameter_mm=diameter)
         self.wait_window(picker)
@@ -980,12 +1180,12 @@ class MonoWindow(tk.Toplevel):
                 "当前会话还没有三维结果：先点「开始识别」（来源「离线」）跑一遍检测，"
                 "它会把 derived/visualization.json 写出来", "warn")
             return
-        self.app.tasks.start(
+        self._start(
             [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(vis)],
             f"3D 查看：{self._session.id if self._session is not None else vis.parent.name}")
         self.status.set_status(
             f"已打开 3D 查看器：{self._short(vis)}（单目深度由球径先验得到，"
-            f"D={self._diameter_arg()} mm；不是视差测量）", "info")
+            f"D={self._diameter_mm_text()} mm；不是视差测量）", "info")
 
     def _pick_session(self) -> None:
         """历史会话：选中后回填成当前会话，后续检测/查看都用它。"""
@@ -1035,7 +1235,7 @@ class MonoWindow(tk.Toplevel):
         状态条必须写清"每台最多等 30 秒"：慢相机（aoni + MSMF）实测要 ~24 s
         才给第一帧，不说这句用户会以为卡死、把窗口关掉。
         """
-        self.app.tasks.start(
+        self._start(
             [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
              "identify"], "相机设备管理")
         self.status.set_status(
@@ -1080,16 +1280,27 @@ class MonoWindow(tk.Toplevel):
         # 所以不猜，把这条系统项作为固定事实摆在结果旁边。
         z_bias = 1.0 / (1.0 - MEASURED_RADIUS_SHRINK) - 1.0
         self.lbl_budget_sys.configure(
-            text=f"半径系统偏差：若填名义直径（不是反推的有效值），额外 +"
-                 f"{MEASURED_RADIUS_SHRINK * 100:.1f}%（Z 上为 +{z_bias * 100:.1f}%，"
-                 f"1 m 处约 {z_bias * 1000:.0f} mm；实测，见交接文档 §35.2）")
-        try:
-            d = float(self.var_diameter.get().strip() or "0")
-        except ValueError:
-            d = 0.0
-        if d <= 0:
-            self.lbl_budget.configure(text="填一个球直径才能算误差预算",
-                                      style="Warn.TLabel")
+            text=f"半径系统偏差：填名义直径（不是有效值）→ 深度额外 +"
+                 f"{z_bias * 100:.1f}%（1 m 处约 {z_bias * 1000:.0f} mm；实测）")
+        # 球径三态（2026-10-31 走查第 5 条）：**空** / **不是数字** / 可用，
+        # 三者要说三种话。旧版把它们混成"填一个球直径才能算误差预算" ——
+        # 用户明明填了 abc，界面却说"没填"，那是把人往错方向上推。
+        raw = self.var_diameter.get().strip()
+        d = diameter_mm_or_none(raw)
+        if not raw:
+            self.lbl_budget.configure(
+                text=f"球径那一栏是空的，所以算不了误差预算 —— 填毫米数，"
+                     f"这颗球填 {DEFAULT_DIAMETER_MM:g}（有效值）；"
+                     f"留空也行，识别时会按 {DEFAULT_DIAMETER_MM:g} mm 算",
+                style="Warn.TLabel")
+            return
+        if d is None:
+            self.lbl_budget.configure(
+                text=f"球径那一栏「{raw}」不是数字，所以算不了误差预算 —— "
+                     f"这里填毫米（例如 {DEFAULT_DIAMETER_MM:g}），"
+                     f"不是 {DEFAULT_DIAMETER_MM / 1000:.4f}（米是命令行那边的单位，"
+                     f"界面只认 mm）。改完这一行会自动重算",
+                style="Warn.TLabel")
             return
         fx = self._current_fx()
         if fx is None:
@@ -1111,20 +1322,71 @@ class MonoWindow(tk.Toplevel):
     # ------------------------------------------------------------------ #
     # 相机候选（角色 + 在线设备）
     # ------------------------------------------------------------------ #
-    @staticmethod
-    def _list_devices() -> tuple[list, str]:
-        """此刻插着的相机；读不到就返回空表 + 一句人话，**绝不抛**。
+    def _initial_devices(self) -> tuple[list, str]:
+        """进窗时手里能立刻拿到的设备列表，**绝不等枚举**。
 
-        为什么直接调库而不是跑 ``cameras.py list`` 子进程：子进程要等启动、
-        还要解析输出，窗口构造会被拖住；``camera_registry.list_devices()``
-        是同一个枚举函数（实测本机 0.19 s）。窗口晚出来一点可以接受，
-        但"点不动"不可以 —— 所以失败一律退化成只列角色。
+        为什么（2026-10-31 实测）：``camera_registry.list_devices()`` 在没有
+        pnputil 的机器上退到 PowerShell ``Get-PnpDevice``，约 10 秒 ——
+        原来它在 ``__init__`` 的主线程里跑，于是点门厅「进入（单目）」之后
+        整个门厅冻住、窗才出现。现在只读 30 秒内的缓存；冷的就先只列角色，
+        由后台线程补上设备（见 ``_start_device_enum``）。
         """
+        cached = cached_devices()
+        if cached is not None:
+            self._enum_pending = False
+            return cached
+        self._enum_pending = True
+        return [], "（正在枚举相机…约 10 秒；枚举完下拉会自动补上「#编号」）"
+
+    def _start_device_enum(self) -> None:
+        """后台枚举相机，结果回主线程填进下拉。
+
+        tkinter 的控件只能在**主线程**碰：工作线程只把结果丢进队列，主线程用
+        ``after`` 轮询取出。直接在工作线程里调 ``after`` 也能跑，但那依赖实现
+        细节；队列这条路在窗口被关掉时也不会往已销毁的窗口回调。
+        """
+        self._enum_pending = True
+
+        def work() -> None:
+            devices, note = enumerate_devices()
+            store_devices_cache(devices, note)     # 缓存与窗口无关：关窗也留着
+            self._enum_queue.put((devices, note))
+
+        threading.Thread(target=work, daemon=True,
+                         name="mono-enumerate-cameras").start()
+        self.after(120, self._poll_device_enum)
+
+    def _poll_device_enum(self) -> None:
         try:
-            from sphere_tracker import camera_registry as cr
-            return list(cr.list_devices()), ""
-        except Exception as exc:                            # noqa: BLE001
-            return [], f"（设备列表读不到：{type(exc).__name__}，只能按角色选）"
+            devices, note = self._enum_queue.get_nowait()
+        except queue.Empty:
+            if self._enum_pending and self._alive():
+                self.after(120, self._poll_device_enum)
+            return
+        self._apply_devices(devices, note)
+
+    def _apply_devices(self, devices: list, note: str) -> None:
+        """枚举回来了：补下拉、补说明，必要时换掉"当时只能按角色选"的默认值。"""
+        self._enum_pending = False
+        self._devices = list(devices)
+        self._device_note = note
+        if not self._alive():
+            return                                  # 窗口先关了：缓存仍然有效
+        values = self._camera_values()
+        try:
+            self.cb_camera.configure(values=values)
+            self.lbl_devices.configure(text=camera_hint_text(note))
+        except tk.TclError:
+            return
+        if self._autopick and values:
+            # 进窗时设备还没枚举到，默认值是按角色挑的（可能开不出画面）；
+            # 现在知道哪台在线了，替用户换上更靠谱的那个。
+            self.var_camera.set(self._default_camera(values))
+        self._refresh_state()
+        online = sum(1 for d in self._devices if getattr(d, "present", True))
+        self.status.set_status(
+            f"相机枚举完成：{online} 台在线" + (f"（{note}）" if note else "")
+            + "；「#编号」可以直接用，不必管角色绑定", "info")
 
     def _camera_values(self) -> list[str]:
         """下拉候选：角色在前、在线设备在后（``#N 名字``）。
@@ -1215,11 +1477,70 @@ class MonoWindow(tk.Toplevel):
         online = self._role_online(cam)
         if online is False:
             return base + "｜这台当前不在线，换「#编号」那个选项或重新 pin"
-        return base
+        if online is None:
+            # 设备还没枚举到：不知道在不在线，就别装作知道（也别说"在线"）
+            return base + "｜设备还没枚举到"
+        return base + "｜未开相机验证"
 
     # ------------------------------------------------------------------ #
     # 动作
     # ------------------------------------------------------------------ #
+    def _start(self, cmd: list[str], title: str, on_done=None):
+        """本窗起任务的**唯一入口**：打归属标记 + 接统一结束回调。
+
+        为什么收成一个函数（2026-10-31 B3 的根子）：以前每个按钮自己决定
+        传不传 ``on_done``，「拍标定图」「替代：单点焦距估计」「实时识别」
+        「看 3D」「换相机」都没传 —— 点完之后状态条永远停在"已开始…"，
+        失败也只写进日志。现在按钮只管拼命令，**结局**由 ``_on_task_finished``
+        统一写；以后加按钮不可能再漏接回调。
+
+        归属是起完之后**填在任务上**的（``Task.owner``），不是 ``start()`` 的
+        参数：走查工具与 gui_budget 都会用自己的桩替换 ``start`` 并保持老签名
+        （``start(cmd, title, on_done)``），多一个关键字参数会让它们当场
+        ``TypeError`` —— 那是"修好了界面、打死了验证工具"。桩返回的不是
+        ``Task``，所以这里按类型判定，不硬塞属性。
+        """
+        task = self.app.tasks.start(cmd, title, on_done=on_done)
+        if isinstance(task, Task):
+            task.owner = OWNER
+        return task
+
+    def _log_hint(self, task) -> str:
+        """任务日志的**短**路径：状态条只有窗口那么宽，绝对路径会把原因挤没。
+
+        状态条的标签不会换行（见 ``_gui_widgets.StatusBar``），实测 880 px 的窗口
+        只放得下约 95 个汉字。写成 ``D:\\MY_CODING_PROGRAM\\...\\outputs\\logs\\``
+        那种绝对路径时，"为什么失败"会被挤出血条外 —— 而日志文件里写的仍是
+        绝对路径，两边不矛盾，只是这里显示仓库内的相对路径。
+        """
+        p = getattr(task, "log_path", None)
+        return f"日志 {self._short(p)}" if p else "日志没落盘"
+
+    def _on_task_finished(self, task) -> None:
+        """TaskRunner 的统一出口：**成功与失败都会来**。
+
+        三种情况分开说，因为用户要的下一句话不同：
+        成功 → 结果在哪；被用户停掉 → 就说停掉了（别报成失败）；
+        失败 → 返回码 + **最后几行输出** + 日志路径（"去看日志"本身不是原因）。
+        有 ``on_done`` 的任务由它自己说（它知道更多上下文），这里只兜没有的。
+        """
+        if not self._alive() or getattr(task, "owner", "") != OWNER:
+            return
+        if task.ok:
+            if task.on_done is None:
+                self.status.set_status(
+                    f"「{task.title}」完成（返回码 0）：{task.tail_text(1)[:90]}"
+                    f" —— {self._log_hint(task)}", "ok")
+            return
+        if task.stop_reason:
+            self.status.set_status(
+                f"「{task.title}」{task.stop_reason}（返回码 {task.exit_code}），"
+                f"没跑完就没结果 —— {self._log_hint(task)}", "warn")
+            return
+        self.status.set_status(
+            f"「{task.title}」失败（返回码 {task.exit_code}）："
+            f"{task.tail_text(2)[:120]} —— {self._log_hint(task)}", "warn")
+
     def _common_camera_args(self) -> list[str]:
         """``--camera`` 参数：空值必须落成具体编号，``#N`` 只传 N。
 
@@ -1238,7 +1559,7 @@ class MonoWindow(tk.Toplevel):
                "--square", self.var_square.get().strip() or "25",
                "--target", self.var_target.get().strip() or "15",
                "--auto"] + self._common_camera_args()
-        self.app.tasks.start(cmd, "拍单目标定图")
+        self._start(cmd, "拍单目标定图")
         self.status.set_status(
             f"已开始拍图：板在每个姿态停稳约 1 秒就会自动存；"
             f"存够 {self.var_target.get() or '15'} 张自动结束。图在 "
@@ -1255,12 +1576,27 @@ class MonoWindow(tk.Toplevel):
                "--cols", self.var_cols.get().strip() or "8",
                "--rows", self.var_rows.get().strip() or "5",
                "--square", self.var_square.get().strip() or "25"]
-        self.app.tasks.start(cmd, "单目内参标定", on_done=self._on_calibrated)
+        self._start(cmd, "单目内参标定", on_done=self._on_calibrated)
         self.status.set_status("正在标定内参…", "info")
 
     def _on_calibrated(self, task) -> None:
+        """标定结束：**只有成功才回去刷新内参**。
+
+        旧版不看返回码，失败也 ``_refresh_state()`` —— 而它会把状态条写成
+        "就绪"，等于把"标定失败"报成"一切正常"（2026-10-31 走查第 B3 条）。
+        失败必须留在失败上：给返回码、日志尾、日志路径，三者缺一用户就得自己猜。
+        """
+        if not self._alive():
+            return
+        if not getattr(task, "ok", False):
+            self.status.set_status(
+                f"内参标定失败（返回码 {task.exit_code}）：{task.tail_text(2)[:100]} "
+                f"—— 常见原因是标定图不够或姿态太单一（要 8 个以上不同角度）；"
+                f"{self._log_hint(task)}", "warn")
+            return
         self.app.state.reload()
-        self._refresh_state()
+        self._refresh_state()          # 这一步会把状态条写回"就绪"，所以随后立刻覆盖
+        self.status.set_status("内参标定完成，已重新读取标定值（第①步那行会跟着变）", "ok")
 
     def _start_focal_estimate(self) -> None:
         """单点焦距估计：**球径必须传框里那个值**，不能让它吃库里的默认值。
@@ -1273,11 +1609,14 @@ class MonoWindow(tk.Toplevel):
         cmd = ([sys.executable, str(FOCAL_ESTIMATOR),
                 "--ball-diameter", self._diameter_arg()]
                + self._common_camera_args())
-        self.app.tasks.start(cmd, "单点焦距估计")
+        self._start(cmd, "单点焦距估计")
+        note = diameter_problem(self.var_diameter.get())
         self.status.set_status(
             f"单点焦距估计会打开一个取景窗：把球放在已知距离上点一下。"
-            f"它按框里的有效直径 {self._diameter_arg()} mm 解 fx，"
-            "并把这次估计的出处一起写进配置", "warn")
+            f"它按框里的有效直径 {self._diameter_mm_text()} mm 解 fx"
+            f"（命令行传的是米：{self._diameter_arg()} —— 两个数说的是同一颗球），"
+            "并把这次估计的出处一起写进配置"
+            + (f"。注意：{note}" if note else ""), "warn")
 
     def _open_frames_dir(self) -> None:
         try:
@@ -1288,8 +1627,17 @@ class MonoWindow(tk.Toplevel):
             self.status.set_status(f"打不开文件夹：{exc}", "warn")
 
     def _diameter_arg(self) -> str:
-        """框里的球径 → 命令行值（留空退回有效直径，见模块级 ``diameter_arg``）。"""
+        """框里的球径 → 命令行值（**米**；留空/写坏退回有效直径）。
+
+        口径与界面**故意不同**：界面按 mm 收、按 mm 显示，"进命令行"这一步
+        才换成米（``--ball-diameter`` 要米）。换算只在模块级 ``diameter_arg``
+        里做一次，窗口这边只负责把框里的字交给它。
+        """
         return diameter_arg(self.var_diameter.get())
+
+    def _diameter_mm_text(self) -> str:
+        """框里球径的 **mm** 文案（给状态条用）——和上面那个是同一颗球的两个单位。"""
+        return diameter_text_mm(self.var_diameter.get())
 
     def _focal_arg(self) -> tuple[int | None, str]:
         """(命令行要传的 fx, 给状态条的提示)。
@@ -1337,14 +1685,17 @@ class MonoWindow(tk.Toplevel):
             cmd += ["--focal", str(fx)]                 # 只有手动覆盖才传
         if MONO_CALIB_JSON.exists():
             cmd += ["--config", str(MONO_CALIB_JSON)]
-        self.app.tasks.start(cmd, "实时单目识别")
+        self._start(cmd, "实时单目识别")
         auto_note = ("。auto 在实时里退化成 color（实时没有录像可以重跑）"
                      if self.var_detector.get() == SMART else "")
+        d_note = diameter_problem(self.var_diameter.get())
         self.status.set_status(
-            ("已启动实时识别，画面在它自己的窗口里；"
-             "要停请到「日志与任务」里中断"
-             + (f"。注意：{fx_note}" if fx_note else "") + auto_note),
-            "warn" if fx_note else "info")
+            ("已启动实时识别（球径按 "
+             f"{self._diameter_mm_text()} mm 传给命令行 {self._diameter_arg()} m），"
+             "画面在它自己的窗口里；要停请到「任务管理器和运行日志」里中断"
+             + (f"。注意：{fx_note}" if fx_note else "")
+             + (f"。注意：{d_note}" if d_note else "") + auto_note),
+            "warn" if (fx_note or d_note) else "info")
 
     def _start_video(self) -> None:
         """离线识别：有当前会话就直接处理它，没有才让用户选文件。
@@ -1384,8 +1735,9 @@ class MonoWindow(tk.Toplevel):
                 # 与实时那边同口径：框里填了就传，不许静默不生效。
                 cmd += ["--focal", str(fx)]
             self._auto_retry_pending = auto
-            self.app.tasks.start(cmd, f"离线单目：{clip.parent.name}（{method}）",
-                                  on_done=self._on_detected)
+            self._start(cmd, f"离线单目：{clip.parent.name}（{method}）",
+                        on_done=self._on_detected)
+            d_note = diameter_problem(self.var_diameter.get())
             self.status.set_status(
                 f"已启动离线单目：{self._short(clip)}（检测器 {method}）；结果写进 "
                 f"{self._short(derived)}/（跑完摘要会变成「已检测」，"
@@ -1393,8 +1745,9 @@ class MonoWindow(tk.Toplevel):
                 + ("。auto：若一帧都没检出会自动换 hough 重跑" if auto else "")
                 + (f"。用你点的种子跟踪（{seed_value}），不再自动检测" if seed_value else "")
                 + (f"。注意：{fx_note}" if fx_note else "")
+                + (f"。注意：{d_note}" if d_note else "")
                 + (f"。注意：{seed_note}" if seed_note else ""),
-                "warn" if (fx_note or seed_note) else "info")
+                "warn" if (fx_note or seed_note or d_note) else "info")
             return
 
         # 兜底走文件选择框：run_video.py 的 path 是必填位置参数，它自己不会弹
@@ -1417,13 +1770,15 @@ class MonoWindow(tk.Toplevel):
         side = Path(path).with_name("visualization.json")
         cmd += ["--vis-json", str(side)]
         self._auto_retry_pending = auto
-        self.app.tasks.start(cmd, f"离线单目：{Path(path).name}（{method}）",
-                             on_done=self._on_detected)
+        self._start(cmd, f"离线单目：{Path(path).name}（{method}）",
+                    on_done=self._on_detected)
+        d_note = diameter_problem(self.var_diameter.get())
         self.status.set_status(
             f"已启动离线单目：{Path(path).name}（检测器 {method}；这个文件不在"
             f"会话目录里，结果不会写进任何 derived/，可视化落在 {side.name}）"
-            + (f"。注意：{fx_note}" if fx_note else ""),
-            "warn" if fx_note else "info")
+            + (f"。注意：{fx_note}" if fx_note else "")
+            + (f"。注意：{d_note}" if d_note else ""),
+            "warn" if (fx_note or d_note) else "info")
 
     def _on_detected(self, task=None) -> None:
         """离线检测结束：按退出码说话，再重读会话摘要。
@@ -1458,13 +1813,24 @@ class MonoWindow(tk.Toplevel):
                 "一帧都没检出（退出码 2）：检测器不适合这颗球。"
                 "把「检测器」换成 hough（本机实测 95%）或 fusion 再跑一次；"
                 "csv/可视化/标注视频都没有写，别把它们当成结果", "warn")
+        elif code not in (0, None):
+            # 非 0 也不是 2：程序自己报错了。**要说清原因和日志在哪** ——
+            # 只写"去看日志"等于把排查的第一步也交给用户。
+            self.status.set_status(
+                f"离线检测失败（返回码 {code}）：{task.tail_text(2)[:110]} "
+                f"—— {self._log_hint(task)}", "warn")
         else:
             self.status.set_status(
-                "检测任务结束了，但 derived/ 里没看到结果：到"
-                "「任务管理器和运行日志」看这一段有没有报错", "warn")
+                "检测任务返回 0，但 derived/ 里没看到结果："
+                "多半是这段录像在 0 检出与成功之间（去看看日志末几行），"
+                "换 hough 再跑一次最省事", "warn")
 
     def on_close(self) -> None:
-        """关窗时记住输入。**只存输入**：fx/就绪度由 GuiPrefs 主动拒绝。"""
+        """关窗时记住输入，并**退订统一结束回调**。"""
+        # 先退订：任务跑得比窗口久（录制 10 秒、检测几十秒），关窗后回调还会来，
+        # 那时碰控件就是对着已销毁的窗口调 Tcl（回调里虽有 _alive 兜着，
+        # 但"该退订就退订"比"靠每个回调自己记得检查"可靠）。
+        self.app.tasks.remove_finish_listener(self._on_task_finished)
         p = self.app.prefs
         p.set("mono.camera", self.var_camera.get().strip())
         p.set("board.cols", self.var_cols.get().strip())

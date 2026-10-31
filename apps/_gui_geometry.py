@@ -27,11 +27,19 @@
 
 `wrap_width()` 是同一套思路用在文字上：``wraplength`` 必须跟着视口走，
 写死一定会和实际窗口对不上（`启动程序.py` 里 820 被截断过一次）。
+
+`fit_height()` 是同一套思路用在**高度**上：模式窗的四个步骤加起来多高，
+由控件的 ``winfo_reqheight`` 说了算，屏幕可用高度只做封顶 —— 不再写死
+``geometry("920x800")``（2026-10-31 实测内容 881/950，第 ④ 步被裁）。
 """
 
 _FALLBACK_WINDOW: tuple[int, int] = (320, 240)
 
-__all__ = ["fit_window", "wrap_width"]
+#: 高度方向上，客户区之外必须让出的像素（标题栏 + 边框 + 一点呼吸）。
+#: 它是**总共**让出的量，不是每边各让一次（与 ``margin`` 同一口径）。
+WINDOW_CHROME_H = 48
+
+__all__ = ["fit_window", "wrap_width", "fit_height", "WINDOW_CHROME_H"]
 
 
 def _axis(screen: int, desired: int, margin: int, minimum: int) -> int:
@@ -88,6 +96,41 @@ def fit_window(screen_w: int, screen_h: int, *,
     x = max(0, (sw - width) // 2)
     y = max(0, (sh - height) // 2)
     return int(width), int(height), int(x), int(y)
+
+
+def fit_height(content: int, *, screen_h: int, status: int = 0,
+               chrome: int = WINDOW_CHROME_H,
+               minimum: int = 480) -> int:
+    """按**内容**算窗口客户区高度：``content + status``，上限是可用屏幕减 ``chrome``。
+
+    为什么需要它（2026-10-31，缺陷 #9/#10）
+    --------------------------------------
+    双目窗原来写死 ``geometry("920x800")``。四步内容实测 881（平行）/ 950
+    （大角度）—— 比 800 高，于是第 ④ 步的按钮被裁在窗口下沿。写死的高度
+    只是"上次放得下"，内容一长就骗人；而"再把数字调大"只是把同一件事往后推：
+    屏幕矮的机器上照样裁。
+
+    所以高度只有两个来源：**内容**与**屏幕**。取小者：
+
+    1. 内容 + 状态条 = 需要的高度（一次装全，不用滚）；
+    2. ``screen_h - chrome`` = 允许的高度（别把窗口顶出屏幕/压住任务栏）。
+
+    屏幕无效（``<= 0``，远程会话或 Tk 尚未初始化）时返回**内容**需要的高度，
+    而不是退回一个拍脑袋的常数 —— 量不出屏幕时，"按内容"仍是唯一有依据的答案。
+
+    ``status`` 是底部状态条自身的高度：它在内容区之外，但同样要占客户区。
+    ``minimum`` 只兜住"内容极短时窗口太扁"，不会把高度抬到 ``screen_h - chrome``
+    之上（屏幕比它更小时以屏幕为准，与 ``fit_window`` 同一顺序）。
+    """
+    need = int(content) + int(status)
+    sh = int(screen_h)
+    if sh <= 0:
+        return max(int(minimum), need)
+    cap = sh - int(chrome)
+    height = min(need, cap)
+    if height < int(minimum):
+        height = min(int(minimum), sh)          # 屏幕本身比 minimum 还小时取屏幕
+    return int(height)
 
 
 def wrap_width(viewport: int, *, chrome: int = 44, minimum: int = 240) -> int:
@@ -154,6 +197,26 @@ def _check_fit(label: str, screen: tuple[int, int],
     print(f"PASS fit_window {label}: {w}x{h} at ({x}, {y})")
 
 
+def _check_height(label: str, content: int, *, expected: int, **kwargs) -> None:
+    """校验 ``fit_height``：值、类型、不越屏、够不够装。"""
+    got = fit_height(content, **kwargs)
+    assert type(got) is int, f"{label}: 返回值必须是 int，实际 {got!r}"
+    assert got == expected, f"{label}: 期望 {expected}，实际 {got}"
+
+    sh = int(kwargs.get("screen_h", 0))
+    status = int(kwargs.get("status", 0))
+    chrome = int(kwargs.get("chrome", WINDOW_CHROME_H))
+    minimum = int(kwargs.get("minimum", 480))
+    if sh > 0:
+        assert got <= max(sh, minimum), f"{label}: 高度 {got} 超出屏幕 {sh}"
+        # 装得下就必须真的装得下：内容 + 状态条一格不少
+        if content + status <= sh - chrome:
+            assert got >= content + status, \
+                f"{label}: 内容需 {content + status}，却只给了 {got}"
+    print(f"PASS fit_height {label}: 内容 {content}"
+          f"{f' + 状态条 {status}' if status else ''} -> {got}")
+
+
 def _check_wrap(label: str, viewport: int,
                 expected: int, **kwargs) -> None:
     """校验一组 ``wrap_width``：值、类型、下限语义。"""
@@ -198,6 +261,25 @@ def _selftest() -> int:
     _check_fit("零屏幕 0x0", (0, 0), (320, 240, 0, 0))
     _check_fit("双负 -800x-600", (-800, -600), (320, 240, 0, 0))
 
+    # ---- fit_height：按内容算，受屏幕封顶 ----
+    # 本机屏幕逻辑高 1000 → 可用工作区 960（任务栏 40）；封顶 = 960 - 48 = 912。
+    _check_height("平行双目 内容 846 + 状态条 35（装得下）", 846,
+                  screen_h=960, status=35, expected=881)
+    _check_height("大角度双目 合并第④步按钮行后 868 + 状态条 35", 868,
+                  screen_h=960, status=35, expected=903)
+    _check_height("大角度双目 旧布局 915 超上限 → 封顶（剩下交给滚动）", 915,
+                  screen_h=960, status=35, expected=912)
+    _check_height("小屏（768）封顶，剩下交给滚动", 915,
+                  screen_h=768, status=35, expected=720)
+    _check_height("内容很短：不缩到 minimum 以下", 200, screen_h=960, status=35,
+                  expected=480)
+    _check_height("屏幕比 minimum 还矮：取屏幕", 200, screen_h=400, status=35,
+                  expected=400)
+    _check_height("屏幕无效（0）：按内容，不拍数字", 846, screen_h=0, status=35,
+                  expected=881)
+    _check_height("chrome 可覆盖", 846, screen_h=960, status=35, chrome=0,
+                  expected=881)
+
     # ---- wrap_width ----
     _check_wrap("零视口", 0, 240)
     _check_wrap("负视口", -100, 240)
@@ -212,7 +294,7 @@ def _selftest() -> int:
     _check_wrap("非正视口用自定义 minimum", -5, 300, minimum=300)
     _check_wrap("chrome=0", 300, 300, chrome=0)
 
-    print("PASS 全部自测通过（fit_window 18 组 / wrap_width 12 组）")
+    print("PASS 全部自测通过（fit_window 18 组 / fit_height 8 组 / wrap_width 12 组）")
     return 0
 
 

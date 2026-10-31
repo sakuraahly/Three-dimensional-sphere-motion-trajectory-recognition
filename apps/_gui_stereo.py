@@ -31,14 +31,15 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from apps._gui_widgets import BG, INK, MUTED, WARN, ScrollPage, StatusBar, Surface
+from apps._gui_widgets import (BG, INK, MUTED, WARN, ScrollPage, StatusBar,
+                               Surface, fit_to_content)
 from apps._collapsible import CollapsibleSection
 from apps._task_runner import ROOT
-from sphere_tracker.paths import stereo_roots
+from sphere_tracker.paths import STEREO_ROOT, stereo_roots
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
-           "record_out_dir"]
+           "record_out_dir", "check_setup_args", "session_name_of"]
 
 CHAIN_ROOT = ROOT / "outputs" / "chain_frames"
 
@@ -169,7 +170,8 @@ def calibrate_args(method: str, board: dict | None = None,
 
 
 def record_args(*, left: str = "left", right: str = "right", duration: str = "10",
-                out: str, mode: str | None = None) -> list[str]:
+                out: str, mode: str | None = None,
+                label: str = "") -> list[str]:
     """双目录制的 argv。
 
     **故意不传 ``--stereo-mode``**（B-107 的教训）：录制要按标定走 ``auto``，
@@ -177,6 +179,11 @@ def record_args(*, left: str = "left", right: str = "right", duration: str = "10
     与当前标定不符 —— 后果是相机先白开、会话目录先建好，然后在检查里才报
     "模式冲突"，白等一轮；传 ``auto`` 又只是把脚本默认值写死一遍。
     所以 ``mode`` 只在调用方给出**非 auto** 的显式值时才下传，其余一律不提。
+
+    ``--label`` 是**界面上的「标签」框**的唯一去处（2026-10-31 修）：
+    它写进 ``session.json`` 的 ``label`` 字段，会话列表「标签」列读的就是它。
+    上一版只拿标签去拼目录名（还拼错了根），于是录出来的每一段在列表里
+    都显示"（无标签）"—— 用户分不清哪个是哪次实验。
 
     分辨率/帧率/后端也**不传**：录制程序会按标定校验尺寸（`validate_capture_size`），
     界面再写一份数字只会多一处漂移。要改这些，先给它们加控件 —— 那时再把
@@ -187,21 +194,72 @@ def record_args(*, left: str = "left", right: str = "right", duration: str = "10
            "--right", str(right or "").strip() or "right",
            "--duration", str(duration or "").strip() or "10",
            "--out", str(out)]
+    # 空白标签不传：`--label ""` 与不传是同一件事，传空串只会让命令行更长
+    if str(label or "").strip():
+        cmd += ["--label", str(label).strip()]
     if mode and str(mode).strip() and str(mode).strip() != "auto":
         cmd += ["--stereo-mode", str(mode).strip()]
     return cmd
 
 
-def record_out_dir(label: str, root: Path | None = None) -> Path:
-    """录制输出目录：``data/<标签>``，标签留空用 ``stereo_session``。
+def record_out_dir(root: Path | None = None) -> Path:
+    """录制的 ``--out``：会话**根目录** ``data/stereo``（时间戳子目录由录制程序建）。
 
-    为什么不用 `record_stereo.py --out` 的默认值（``data/stereo``）：那样
-    两段录制会落进同一个目录、互相覆盖。标签即目录名，是这里早就定下的约定。
-    （⚠️ 这里拼的仍是 ``data/<标签>``，**没有**进 ``data/stereo/``：改它会连带改
-    `tests/selftest_gui_budget.py` 里钉死这条行为的断言，留给单独一次改动。）
+    为什么是根、不是 ``data/stereo/<时间戳>``（2026-10-31 修，缺陷 #3）
+    ------------------------------------------------------------------
+    ``record_stereo.py`` 的 ``--out`` 是**根**：它自己调
+    ``stereo.sessions.create_session(root)``，在 root 下新建
+    ``YYYYMMDD-HHMMSS``（同名已存在则加 ``-01`` 后缀）。所以：
+
+    - 传 ``data/stereo`` → 得到 ``data/stereo/20261031-181500``，会话扫描
+      （``sphere_tracker.paths.stereo_roots()`` = ``data/stereo`` + ``data/sessions``）
+      一眼就能列出它，第 ④ 步的「选择…」和工作台里都看得到；
+    - 传 ``data/stereo/<时间戳>`` 反而会再套一层 —— 除非在这里另写一份命名与
+      去重逻辑，那就成了"目录名有两处来源"。
+
+    上一版返回 ``data/<标签>``：既不在扫描范围里（录完永远列不出来，只能手打
+    路径），目录名又固定（第二段录制落进同一个目录、和第一段混在一起）。
+    标签现在走 ``--label`` 进 ``session.json``，**不再参与拼路径**。
     """
-    base = root if root is not None else ROOT
-    return base / "data" / (str(label or "").strip() or "stereo_session")
+    return root if root is not None else STEREO_ROOT
+
+
+def session_name_of(visualization: Path | str) -> str:
+    """一份 ``visualization.json`` 属于**哪一段会话**。
+
+    为什么不能直接 ``path.parent.name``（2026-10-31 走查缺陷 #6/#7）：
+    离线重建把结果写在 ``<会话>/derived/visualization.json``，于是
+    ``parent.name`` 永远是 ``derived`` —— 状态条说"正在打开 3D 查看器：derived"，
+    用户看不出打开的是哪一段。``derived`` 是会话里的**子目录**，不是会话。
+    """
+    p = Path(visualization).parent
+    return p.parent.name if p.name == "derived" else p.name
+
+
+def check_setup_args(*, left: str = "left", right: str = "right",
+                     board: dict | None = None) -> list[str]:
+    """「检查装置」的 argv（2026-10-31 修，缺陷 #4）。
+
+    为什么必须带参数：``check_stereo_setup.py`` 的两路画面来自
+    ``apps._common.add_stereo_source_args``，**不传 ``--left/--right`` 就等于
+    让它自己去猜**；它的 docstring 第一行给的就是 ``--left 0 --right 2`` 这种
+    显式用法。上一版一个参数都没传，检查程序只能按 ``auto`` 自己挑相机 ——
+    与第 ② 步标定用的两台不是同一对时，用户会按一个**别的装置**的结论去调
+    相机，而且界面还不回写结果（状态条永远停在"正在检查装置…"）。
+
+    相机取值可以是角色名（``left``/``right``，查 ``config/cameras.json``）
+    或索引，与 ``calibrate_stereo`` 同一套解析 —— 界面里那两个框就原样下传。
+    """
+    cmd = [sys.executable, str(ROOT / "apps" / "tools" / "check_stereo_setup.py"),
+           "--left", str(left or "").strip() or "left",
+           "--right", str(right or "").strip() or "right"]
+    b = board or {}
+    # 棋盘参数只下传用户真填了的：留空 = 脚本默认 8×5 / 25mm（同 `board_args` 的口径）
+    for key, flag in (("cols", "--cols"), ("rows", "--rows"), ("square", "--square")):
+        raw = str(b.get(key) or "").strip()
+        if raw:
+            cmd += [flag, raw]
+    return cmd
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +470,10 @@ class SessionPicker(tk.Toplevel):
 class StereoWindow(tk.Toplevel):
     """双目四步窗。``mode`` ∈ {``parallel``, ``angled``}。"""
 
+    #: 内容区宽度。高度**不写死**：建完之后按内容量（见 ``fit_to_content``）。
+    WIDTH = 920
+    WIDTH_MIN = 800
+
     def __init__(self, app, *, mode: str = "parallel") -> None:
         super().__init__(app)
         if mode not in ("parallel", "angled"):
@@ -419,10 +481,12 @@ class StereoWindow(tk.Toplevel):
         self.app = app
         self.mode = mode
         self.configure(bg=BG)
-        # 四步加起来超过 720 px：④ 的说明会被底部状态条压住（实测 120x6 px）。
-        # 给到 800 让四步展开后仍留出状态条的位置；屏幕逻辑高 1000，放得下。
-        self.geometry("920x800")
-        self.minsize(800, 580)
+        # 先给一个"先按内容量的意思"的初始尺寸：这只是建窗时的占位，
+        # 真正的高度在 __init__ 末尾由 fit_to_content 按内容算出来。
+        # **不要**再写死具体高度：写死的高度只代表"上次放得下"，
+        # 内容一长（2026-10-31 实测 881/950）就把第 ④ 步裁在窗口下沿。
+        self.geometry(f"{self.WIDTH}x600")
+        self.minsize(self.WIDTH_MIN, 560)
         self.surface = Surface(self)
 
         # 记住上次填的值。**方法不存**：它由窗口模式决定（平行=joint、大角度=chain），
@@ -452,14 +516,24 @@ class StereoWindow(tk.Toplevel):
         self.status = StatusBar(self, on_log=app.open_console,
                                 on_stop=self._stop_my_tasks)
         self.status.pack(fill="x", side="bottom")
-        page = ScrollPage(self, self.surface)
-        page.pack(fill="both", expand=True)
-        body = page.content
+        self._page = ScrollPage(self, self.surface)
+        self._page.pack(fill="both", expand=True)
+        body = self._page.content
+        self._cam_text = "相机：读取中…"
         self._build_step1(body)
         self._build_step2(body)
         self._build_step3(body)
         self._build_step4(body)
+        # 左/右相机一改，「检查装置」的可用性立刻跟着变：
+        # 否则用户清空一边后按钮还是亮的，点下去才被告知"填上再来"。
+        for _var in (self.var_left, self.var_right):
+            _var.trace_add("write", lambda *_a: self._sync_check_enabled())
         self._refresh_state()
+        # 最后一步：按**内容**定高度（上限 = 屏幕可用高度）。必须在
+        # `_refresh_state` 之后 —— 那一步会写状态行/原因行，量早了就是量一个
+        # 还没写完的界面，算出来的高度会偏小、第 ④ 步照样被裁。
+        fit_to_content(self, self._page, self.status, width=self.WIDTH,
+                       screen_h=self.app.work_area()[1])
 
     # ------------------------------------------------------------------ #
     # ① 装置检查
@@ -477,7 +551,7 @@ class StereoWindow(tk.Toplevel):
         # 只能通过「换相机…」改（读 config/cameras.json）。
         self.lbl_cams = self.surface.hint(box, "读取相机…")
         actions = self.surface.action_row(box)
-        self.surface.primary(actions, "检查装置", self._check_setup)
+        self.btn_check = self.surface.primary(actions, "检查装置", self._check_setup)
         self.surface.secondary(actions, "换相机…", self._open_cameras)
         self.surface.secondary(actions, "重新读取标定", self._reload_state)
 
@@ -603,11 +677,18 @@ class StereoWindow(tk.Toplevel):
             side="left")
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "跑离线三维", self._start_offline)
-        row2 = self.surface.action_row(box)
-        self.surface.secondary(row2, "点选球心", self._start_seed)
-        self.surface.secondary(row2, "打开 3D 查看器", self._open_viewer)
+        self.surface.secondary(actions, "点选球心", self._start_seed)
+        self.surface.secondary(actions, "打开 3D 查看器", self._open_viewer)
         # 第 ④ 步只管"当前会话"；要换一段历史会话从中间接着做，去工作台
-        self.surface.secondary(row2, "历史会话…", self._open_bench)
+        self.surface.secondary(actions, "历史会话…", self._open_bench)
+        # 四个按钮**同一行**（2026-10-31，缺陷 #9/#10）：
+        # 原先分成两行，多出一整行按钮 + 行距。实测四步内容为 846/915 px
+        # （平行/大角度），比当时的窗口 800 高 —— 第 ④ 步的按钮就被裁在
+        # 窗口下沿；合并成一行后是 799/868 px。
+        # 为什么不是"把次要按钮收进折叠区"：折叠区的标题本身要 28 px，
+        # 只省回一小半，却把「历史会话…」藏起来（那是用户从中间接着做的
+        # 唯一入口）。合并没有藏任何东西，省得也更多。
+        # 一行 4 个按钮仍在预算内（L1 按钮 ≤5、主操作恰好 1）。
 
     # ------------------------------------------------------------------ #
     # 状态
@@ -633,15 +714,29 @@ class StereoWindow(tk.Toplevel):
         self.lbl_rig.configure(text="｜".join(bits))
         # 相机身份：只读 config/cameras.json，改它只能通过「换相机…」
         try:
-            self.lbl_cams.configure(
-                text="相机：" + st.camera_role_text("left")
-                     + "｜" + st.camera_role_text("right"))
+            self._cam_text = ("相机：" + st.camera_role_text("left")
+                              + "｜" + st.camera_role_text("right"))
         except Exception:                                   # noqa: BLE001
-            self.lbl_cams.configure(text="相机：读取失败（config/cameras.json）")
+            self._cam_text = "相机：读取失败（config/cameras.json）"
+        self._sync_check_enabled()
         if self.lbl_method is not None:
             self._refresh_method_hint()
         self.status.set_status("就绪" if ready else "第 2 步的标定还不匹配本窗口",
                                "ok" if ready else "warn")
+
+    def _sync_check_enabled(self) -> None:
+        """「检查装置」能不能点：只看左右相机有没有填。
+
+        拿不到左右编号就让按钮**灰着并写出原因** —— 会让用户"点了等一个永远
+        不来的结果"的按钮，比灰着的按钮更伤人（2026-10-31 缺陷 #4）。
+        单独成一个方法是因为它还要跟着输入框变（见 ``__init__`` 里的 trace）。
+        """
+        has_roles = bool(self.var_left.get().strip()) and bool(self.var_right.get().strip())
+        self.btn_check.configure(state="normal" if has_roles else "disabled")
+        text = self._cam_text
+        if not has_roles:
+            text += "｜左/右有一边没填，「检查装置」不可用：先在「高级」里填上"
+        self.lbl_cams.configure(text=text)
 
     def _refresh_method_hint(self) -> None:
         if self.lbl_method is None:
@@ -672,10 +767,55 @@ class StereoWindow(tk.Toplevel):
             "info")
 
     def _check_setup(self) -> None:
-        cmd = [sys.executable, str(ROOT / "apps" / "tools" / "check_stereo_setup.py")]
-        self.app.tasks.start(cmd, "双目装置检查")
-        self.status.set_status("正在检查装置（只报告，不改配置），结果会打到日志",
-                               "info")
+        """① 检查装置：带**本窗口选的**左右相机，并把结论写回状态条。
+
+        为什么不能像上一版那样空手起进程（2026-10-31 缺陷 #4）
+        --------------------------------------------------
+        上一版 ``tasks.start([python, check_stereo_setup.py], "双目装置检查")``：
+        一个参数都没有，``on_done`` 也没有。后果有两条，用户都看得见：
+
+        1. 检查程序去查的相机不一定是第 ② 步要标定的那两台 —— 结论对了也是
+           "另一套装置"的结论；
+        2. 进程跑完（甚至退出）界面**一个字都不变**：状态条永远停在
+           "正在检查装置…"，用户只能猜。
+
+        现在：左右相机（与 ``calibrate_stereo`` 同一份取值）和棋盘参数一起
+        下传，``on_done`` 按退出码回写。
+        """
+        left, right = self.var_left.get().strip(), self.var_right.get().strip()
+        if not left or not right:
+            # 正常路径下按钮这时已经是灰的（见 `_refresh_state`）；
+            # 这里是"填了又清空"的兜底 —— 与其起一个必然白开的进程，不如说清原因
+            self.status.set_status(
+                "「检查装置」要知道检查哪两台相机：先在「高级：采集门限与相机」"
+                "里填上左/右（角色名或索引）", "warn")
+            return
+        cmd = check_setup_args(
+            left=left, right=right,
+            board={"cols": self.var_cols.get(), "rows": self.var_rows.get(),
+                   "square": self.var_square.get()})
+        self.app.tasks.start(cmd, "双目装置检查", on_done=self._on_checked)
+        self.status.set_status(
+            f"正在检查装置 {left} / {right}（只报告，不改配置）：会开两路取景窗，"
+            f"举着棋盘慢慢移动，按 q 可提前结束。结论会写回这里", "info")
+
+    def _on_checked(self, task) -> None:
+        """把「检查装置」的结果写回状态条 —— 成功/失败都要写，不能只有"正在…"。"""
+        code = task.exit_code
+        if code == 0:
+            self.status.set_status(
+                "装置检查通过：两路都能稳定看到棋盘，可以做第 ② 步标定"
+                "（逐项数字在运行日志里）", "ok")
+        elif code == 1:
+            self.status.set_status(
+                "装置检查没通过：运行日志里「标定前置检查结果」会写清是哪一路没看到"
+                "棋盘、重叠区多大", "warn")
+        elif code is None:
+            self.status.set_status("装置检查被中断了，没有结论（可以再点一次）", "warn")
+        else:
+            self.status.set_status(
+                f"装置检查没能跑起来（退出码 {code}）：多数是相机名/索引打不开，"
+                f"输出在运行日志里", "warn")
 
     def _start_calibrate(self) -> None:
         method = self._method_key()
@@ -711,12 +851,18 @@ class StereoWindow(tk.Toplevel):
             self.status.set_status(
                 f"先解决标定再录：{why.replace('**', '')}", "warn")
             return
-        out = record_out_dir(self.var_label.get())
+        out = record_out_dir()
         cmd = record_args(left=self.var_left.get(), right=self.var_right.get(),
-                          duration=self.var_seconds.get(), out=str(out))
+                          duration=self.var_seconds.get(), out=str(out),
+                          label=self.var_label.get())
         self.app.tasks.start(cmd, "双目录制")
-        self.status.set_status(f"正在录制 {self.var_seconds.get() or '10'} 秒 → "
-                               f"{out.name}；录完用它做第 4 步", "info")
+        label = self.var_label.get().strip()
+        # 落点写"根 + 新时间戳目录"：目录名由录制程序生成（它同时负责重名去重），
+        # 这里不猜具体时间，但必须说清"录完在第 ④ 步能选到它" —— 上一版落进
+        # `data/stereo_session`，不在扫描范围，用户录完在列表里找不到。
+        self.status.set_status(
+            f"正在录制 {self.var_seconds.get() or '10'} 秒 → data/stereo/ 下的新会话目录"
+            f"（标签「{label or '空'}」）；录完在第 ④ 步「选择…」里就能选它", "info")
 
     def _pick_session(self) -> None:
         """打开会话选择器（按本窗模式三态过滤）。"""
@@ -784,8 +930,9 @@ class StereoWindow(tk.Toplevel):
         self.app.tasks.start(
             [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
             "3D 查看器")
+        # 说**会话名**而不是 `src.parent.name`（那永远是 derived）
         self.status.set_status(
-            f"正在打开 3D 查看器：{src.parent.name}"
+            f"正在打开 3D 查看器：{session_name_of(src)}"
             f"（窗口内「数据源」可换任意会话）", "info")
 
     def on_close(self) -> None:
