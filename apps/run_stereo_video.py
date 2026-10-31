@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -61,10 +62,17 @@ from sphere_tracker.plugins import describe                  # noqa: E402
 from sphere_tracker.types import Detection                   # noqa: E402
 from stereo import (  # noqa: E402
     SMOOTH_METHODS, MatchConfig, PairSource, PredictConfig, StereoReconstructor,
-    fit_ballistic, jitter_rms, predict, smooth_trajectory,
+    fit_ballistic, geometry_verdict, jitter_rms, predict, smooth_trajectory,
 )
 from stereo.stereo_mode import (  # noqa: E402
     mode_label, optical_axes_angle_deg, resolve_auto,
+)
+from stereo.triangulate import (  # noqa: E402
+    EPI_GATE_K,
+    EPI_GATE_MAX_PX,
+    EPI_GATE_MIN_PX,
+    GEOM_MIN_SAMPLES,       # 几何守卫的样本下限
+    epipolar_gate_px,       # `--max-epipolar auto`：按标定自报极线 RMS 定门限
 )
 from stereo.visualization import (  # noqa: E402
     export_session_visualization,
@@ -114,8 +122,108 @@ def _mode_guard(mode: str, rectification: str) -> tuple[str, bool]:
     return mode, False
 
 
+def _resolve_max_epipolar(text, rig, mode: str) -> tuple[float, str]:
+    """把 ``--max-epipolar`` 解析成像素门限，返回 ``(门限, 要打印的一行说明或 "")``。
+
+    **纯函数**（除 ``rig.quality`` 之外不读任何东西）。三种输入：
+
+    - ``None``：给模式默认值（parallel 2.5 / angled 8），不打说明；
+    - ``"auto"``：只有 parallel（已极线校正）才有意义 —— 那时左右对应点的 y 差
+      本该是亚像素级，门限取"标定自报极线 RMS × ``EPI_GATE_K``"是有依据的。
+      angled 用**原始像素**、极线不水平，这个口径不成立，所以照旧用默认值并说明。
+      拿到了 ``auto`` 但标定没给可用 RMS 时，:func:`stereo.triangulate.
+      epipolar_gate_px` 会回退 2.5 —— 这里把"到底是算出来的还是回退的"讲清楚，
+      否则用户以为门限随标定走了，实际是常量。
+    - 数字或数字字符串：原样用（显式值必须被尊重）；读不懂就回退默认值并警告，
+      **不抛** —— 一个笔误不该让整段录像跑不起来。
+    """
+    default = 8.0 if mode == "angled" else 2.5
+    if text is None:
+        return default, ""
+    if isinstance(text, str) and text.strip().lower() == "auto":
+        if mode != "parallel":
+            return default, (
+                f"[门限] --max-epipolar auto 只在 parallel（已极线校正）下有意义；"
+                f"{mode} 用原始像素、极线不水平 → 仍用 {default:g}px")
+        quality = getattr(rig, "quality", None)
+        gate = epipolar_gate_px(quality)
+        rms = quality.get("epipolar_rms") if isinstance(quality, dict) else None
+        if isinstance(rms, (int, float)) and math.isfinite(rms) and rms > 0:
+            src = f"标定自报极线 RMS {rms:g}px × {EPI_GATE_K:g}"
+        else:
+            src = "标定没给出可用的 epipolar_rms → 回退 2.5px"
+        return gate, f"[门限] --max-epipolar auto → {gate:g}px（{src}）"
+    try:
+        return float(text), ""
+    except (TypeError, ValueError):
+        return default, f"[警告] --max-epipolar 读不懂：{text!r} → 用默认 {default:g}px"
+
+
+def _guard_step(armed: bool, guard_at: int, n_pairs: int, dy_samples, quality):
+    """几何守卫的一步判定。**纯函数、无副作用**：只回答"现在能不能判、判到什么"。
+
+    返回 ``(是否仍在等待判读, 判定或 None)``：
+
+    - 没武装 / 还没跑够 ``guard_at`` 对 → ``(armed, None)``（保持原状，不消耗机会）；
+    - 跑够了，但 :func:`stereo.triangulate.geometry_verdict` 返回 ``None``
+      （样本不足 ``GEOM_MIN_SAMPLES``）→ ``(True, None)``：**不消耗这次机会**，
+      下一帧接着看 —— 原来的 ``n_pairs == guard_at`` 写法在丢帧多时会一次也判不成，
+      然后永久放弃，那是一条假阴性路径；
+    - 判出来了 → ``(False, v)``，``v.suspect`` 由调用处决定是否早停。
+    """
+    if not armed or n_pairs < guard_at:
+        return armed, None
+    v = geometry_verdict(dy_samples, quality)
+    if v is None:
+        return True, None
+    return False, v
+
+
+def _auto_seed_pair(cfg: AppConfig, src: PairSource, max_try: int = 30):
+    """不点选：用 YOLO 在最早的若干**成对**帧上找球，返回 ``(seed_l, seed_r, 帧号)``。
+
+    **成对**是关键：种子必须左右两路来自**同一时刻**，否则 specular 的 CSRT 会在
+    左右各初始化到不同时刻球所在的位置上，三角化出来的点从一开始就错位 —— 而且
+    错得不像 bug，像"标定不准"。所以这里用 ``PairSource.read()``（它保证两路配对），
+    不用分别拿两个 VideoCapture 各读一帧。
+
+    找不到就返回 ``None`` 并**说明卡在哪**（没球 / 权重加载不了 / 越过视频末尾）——
+    调用处据此返回码 2，而不是拿一个编出来的圆心硬跑。
+
+    返回的半径来自 YOLO 框（框是外接矩形），**位置可信、半径不可信**；调用处会据此
+    写 seed 并把"半径仍来自框"讲给用户。
+    """
+    from sphere_tracker.detectors.factory import build_single_detector
+
+    det = build_single_detector("yolo", cfg.detector)
+    if det is None:
+        print("[自动种子] 没有可用的 yolo 检测器实现")
+        return None
+    for i in range(max_try):
+        ok, fl, fr = src.read()
+        if not ok or fl is None or fr is None:
+            print(f"[自动种子] 只读到 {i} 对就越过视频末尾，没找到球")
+            return None
+        cand_l, cand_r = det.detect(fl), det.detect(fr)
+        if not cand_l or not cand_r:
+            continue
+        a, b = cand_l[0], cand_r[0]
+        print(f"[自动种子] 第 {i} 对命中：左 {a.method} {a.score:.2f} "
+              f"({a.x:.1f},{a.y:.1f},r={a.radius:.1f})；"
+              f"右 {b.method} {b.score:.2f} ({b.x:.1f},{b.y:.1f},r={b.radius:.1f})")
+        if a.method == "yolo" or b.method == "yolo":
+            print("  ⚠ 至少一路的圆心**没钉到轮廓上**（method=yolo = 退回框中心）："
+                  "位置可用于初始化，但偏差比轮廓圆心大；半径来自框，不可信。")
+        return (a.x, a.y, a.radius), (b.x, b.y, b.radius), i
+    err = getattr(det, "last_error", None)
+    print(f"[自动种子] 前 {max_try} 对都没在两路同时找到球："
+          "确认球在画面里、且 yolo 权重能被加载（pip install ultralytics）。"
+          + (f"\n  检测器最后报错：{err}" if err else ""))
+    return None
+
+
 def _pick_detector(method: str, method_given: bool, seeds_path: Path,
-                   detect_width: int) -> tuple[str, str]:
+                   detect_width: int, auto_seed: bool = False) -> tuple[str, str]:
     """决定这次用哪个检测器，返回 ``(方法, 要打印的一行说明)``。**纯函数**（只读种子文件）。
 
     为什么"有种子就换 specular"必须做在这里、而且判据是"用户有没有显式给 --method"：
@@ -135,15 +243,25 @@ def _pick_detector(method: str, method_given: bool, seeds_path: Path,
     - 种子文件坏了**不抛**：退回原方法并说明。一个坏 json 不该让整条链路崩掉，
       而且此时用户需要的是"种子坏了"这句人话，不是一段 traceback。
     """
+    if auto_seed and not method_given and not detect_width:
+        return "specular", ("[自动种子] --auto-seed → 用 specular + 自动定位的球心"
+                            "（不点选；半径仍来自 YOLO 框，不可信）")
     if method_given or detect_width or not seeds_path.exists():
         return method, ""
     try:
-        load_seeds(seeds_path)
+        payload = load_seeds(seeds_path)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return method, f"[警告] {seeds_path} 读不出来（{exc}），继续用 {method} 检测器"
+    # 半径出身要在**每次**接管时复述，不能只在 --auto-seed 那一次说（独立 Critic 指出）：
+    # 自动种子把"半径来自 YOLO 框、不可信"写进了 seeds.json，但重跑时走的是这条
+    # 分支、原先一个字都不提 —— 那是一次静默的告知退化，而"不可信半径"恰好是
+    # 本项目最容易被当成"标定不准"的东西。
+    shown = ""
+    if isinstance(payload, dict) and payload.get("source") == "auto-yolo":
+        shown = "；⚠ 这份种子是 --auto-seed 自动定位的，半径来自 YOLO 框、不可信"
     return "specular", (
         "[种子] 会话里有 derived/seeds.json → 自动改用 specular + 该种子"
-        "（镜面球用 color/hough 检不到；要覆盖请显式 --method）")
+        f"（镜面球用 color/hough 检不到；要覆盖请显式 --method）{shown}")
 
 
 def _world_block(world: WorldFrame | None, arr, base_frame: str) -> tuple[np.ndarray | None, dict]:
@@ -367,6 +485,11 @@ def main() -> int:
                     help="specular 的 seeds.json（默认自动用 <session>/derived/seeds.json）")
     ap.add_argument("--seed-frame", type=int, default=0,
                     help="specular 在第几帧初始化（默认 0；种子坐标要对应这一帧）")
+    ap.add_argument("--auto-seed", action="store_true",
+                    help="不点选：自动改用 specular，并用 YOLO 在最前面若干**成对**帧里"
+                         "定位球心当种子（写进 <session>/derived/seeds.json）。"
+                         "只在没显式给 --method / --detect-width 时生效；"
+                         "半径仍来自 YOLO 框，不可信")
     ap.add_argument("--out", default=None, metavar="DIR",
                     help="把产物写到这个目录（traj3d.csv / annotated.mp4 / 预测 / 世界系）。"
                          "不给就写回 <session>/derived —— 做对照实验时用它，"
@@ -376,8 +499,10 @@ def main() -> int:
     ap.add_argument("--min-radius", type=float, default=8.0)
     ap.add_argument("--max-radius", type=float, default=200.0)
     ap.add_argument("--hough-max-radius", type=float, default=80.0)
-    ap.add_argument("--max-epipolar", type=float, default=None,
-                    help="极线门限（px）；缺省平行 2.5 / angled 8，显式值不被覆盖")
+    ap.add_argument("--max-epipolar", default=None, metavar="PX|auto",
+                    help="极线门限（px）；缺省平行 2.5 / angled 8，显式值不被覆盖。"
+                         "auto=按标定自报极线 RMS×%g 自适应（见 stereo.triangulate."
+                         "epipolar_gate_px）" % EPI_GATE_K)
     ap.add_argument("--sync-offset", type=int, default=None,
                     help="覆盖 session 的同步偏移（默认用 session.sync.offset）")
     ap.add_argument("--pairing", choices=("index", "timestamp", "canary"),
@@ -390,6 +515,10 @@ def main() -> int:
                     default="auto",
                     help="auto=读 session/标定；angled=大角度（近似直角）")
     ap.add_argument("--max-frames", type=int, default=0)
+    ap.add_argument("--geometry-guard", type=int, default=30, metavar="N",
+                    help="跑满 N 对后先判一次『录像几何 vs 标定』：对不上就早停"
+                         "（不白跑整段，也不产出看似正常的错数字）；0=关。默认 30。"
+                         "判据见 stereo.triangulate.geometry_verdict")
     ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
     ap.add_argument("--smooth", action="store_true",
                     help="开启三维平滑：另存 traj3d_smoothed.csv，并把平滑结果与抖动指标"
@@ -415,7 +544,8 @@ def main() -> int:
     method = getattr(args, "method", default_method("detector"))
     seeds_path = (Path(args.seed_json) if args.seed_json
                   else session_dir / "derived" / "seeds.json")
-    method, method_note = _pick_detector(method, method_given, seeds_path, args.detect_width)
+    method, method_note = _pick_detector(method, method_given, seeds_path,
+                                         args.detect_width, args.auto_seed)
     if method_note:
         print(method_note)
     try:
@@ -591,6 +721,12 @@ def main() -> int:
             print("[错误] --method specular 暂不支持 --detect-width："
                   "种子坐标是原图坐标，缩放会错位。")
             return 2
+        if args.auto_seed and seeds_path.exists():
+            # 用户的显式意图不能被静默忽略：已有种子更好（是人工点选的），所以照用它，
+            # 但必须说一声"你给的 --auto-seed 这次没生效、原因是什么"。
+            print("[自动种子] 会话里已有 derived/seeds.json → 直接用它"
+                  "（--auto-seed 不再自动定位）；要强制重新定位请先删掉它，"
+                  "或用 --seed/--seed-right 覆盖")
         seed_json = None
         if seeds_path.exists():
             try:
@@ -628,11 +764,30 @@ def main() -> int:
                       float(seed_json["right"]["radius"]))
             seed_frame = int(seed_json.get("seed_frame", args.seed_frame))
             print(f"[specular] 读标准 seed：{seeds_path}")
+        elif args.auto_seed:
+            found = _auto_seed_pair(cfg, src)
+            if found is None:
+                return 2
+            seed_l, seed_r, hit_index = found
+            # 搜索已经消费掉前 hit_index 对，"种子生效帧"要相对**剩下的**帧数：
+            # specular 的 seed_frame 是它自己 detect() 的调用次数，第一帧 = 0。
+            seed_frame = 0
+            if hit_index:
+                print(f"[自动种子] 搜索用掉了前 {hit_index} 对（不进产物）；"
+                      "种子在第一次处理时生效，可能滞后一帧以内")
+            try:
+                saved = write_seeds(session_dir, seed_l, seed_r, seed_frame=seed_frame,
+                                    image_size=tuple(src.image_size), source="auto-yolo",
+                                    note=f"YOLO 在第 {hit_index} 对自动定位（--auto-seed）")
+                print(f"[自动种子] 已写标准 seed：{saved}")
+            except Exception as exc:                        # noqa: BLE001
+                print(f"[警告] seed 写入失败（继续跑）：{exc}")
         else:
             print("[错误] --method specular 需要球心种子：")
             print("  GUI：第 3 步「点选球（双目 seed）」；")
             print("  或 CLI：--seed 左x,左y,左r --seed-right 右x,右y,右r")
-            print("  也可用 --seed-json <seeds.json>。自动初始化不可靠，故意不猜。")
+            print("  也可用 --seed-json <seeds.json>；不点选就用 --auto-seed"
+                  "（YOLO 自动定位，半径来自框、不可信）。")
             return 2
         pipe_l.detector.seed(*seed_l, frame_index=seed_frame)
         pipe_r.detector.seed(*seed_r, frame_index=seed_frame)
@@ -646,19 +801,28 @@ def main() -> int:
         pipe_l.set_detect_width(args.detect_width)
         pipe_r.set_detect_width(args.detect_width)
 
+    epi, epi_note = _resolve_max_epipolar(args.max_epipolar, rig, mode)
+    if epi_note:
+        print(epi_note)
     if mode == "angled":
         from stereo.angled import AngledMatchConfig, AngledReconstructor
-        epi = 8.0 if args.max_epipolar is None else args.max_epipolar
         if args.max_epipolar is None:
             print("[angled] 极线门限默认放宽到 8px（大角度下候选像素偏差更大）")
         rec = AngledReconstructor(rig, AngledMatchConfig(max_epipolar_px=epi))
     else:
-        epi = 2.5 if args.max_epipolar is None else args.max_epipolar
         # `source_hint` 只进"0 配对"的报错文案：那句话要能直接告诉用户
         # `--seed-json <会话>/derived/seeds.json` 长什么样，重建器自己不知道会话在哪。
         # 用 as_posix()：文案里再拼 "/derived/seeds.json"，混着反斜杠会像坏路径。
         rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=epi),
                                   source_hint=session_dir.as_posix())
+    # 录前几何守卫（`B-131`）：跑满 N 对就先判一次"录像几何 vs 标定"，对不上就早停。
+    # 放在这里而不是库层默认：`mono_vs_stereo` / `profile_stages` 会在同一批坏会话上
+    # 跑，默认拦下来会让它们从"出数"变成"崩"；那是入口层的决定，不该由库替它做。
+    guard_at = args.geometry_guard if args.geometry_guard > 0 else 0
+    guard_armed = bool(guard_at and mode == "parallel")
+    if guard_armed:
+        print(f"[几何守卫] 跑满 {guard_at} 对后先判一次极线几何，与标定对不上就早停"
+              "（--geometry-guard 0 可关）")
     # `--out` 让产物**不落在会话目录里**（2026-10-27 补）。
     #
     # 为什么需要：做对照实验时（换方法 / 换 seed / 换门限）会连着跑好几次，
@@ -691,6 +855,7 @@ def main() -> int:
     trail_l: list[tuple[float, float]] = []
     trail_r: list[tuple[float, float]] = []
     n_pairs = 0
+    center_src = {"contour": 0, "box": 0}   # 只看这两种；其它（非 specular）不计数
     t0 = time.perf_counter()
     try:
         while True:
@@ -706,6 +871,32 @@ def main() -> int:
             det_r = _as_detection(res_r)
             pt = rec.update(t, det_l, [det_r] if det_r is not None else [])
             n_pairs += 1
+
+            # 圆心口径的来源（S2a）：`center_source` 由**检测器**给，不随 `TrackState`
+            # 往下传，所以只在这里从流水线结果里取。用途只有一个 —— 几何守卫判读前
+            # 分清"几何坏了"还是"圆心没钉到轮廓上"（后者 y 差也会错开 ≈6 px）。
+            for _r in (res_l, res_r):
+                _d = getattr(_r, "detection", None)
+                _src = (_d.extra or {}).get("center_source") if _d is not None else None
+                if _src in center_src:
+                    center_src[_src] += 1
+
+            # 几何守卫（只在 parallel）：跑到 `--geometry-guard N` 对之后判一次。
+            # `dy_samples` 只在两路都检出的帧里攒，所以样本可能少于 N 对；攒够之前
+            # `geometry_verdict` 返回 None —— 那是"还没法判"，**不消耗这次机会**，
+            # 下一帧接着看。原来写的是 `n_pairs == guard_at`（只判一次），丢帧多时会
+            # 一次也没判成、然后永久放弃 —— 那是一条假阴性路径。
+            # 判出可疑就 `return 2`：**拒绝出数**。放宽门限能"跑通"，但那些点的
+            # 残差与交会角本来就是错的（`B-131`：dy 中位 12.4 px，残差 3.9~7.2 px）。
+            if guard_armed and n_pairs >= guard_at:
+                guard_armed, v = _guard_step(guard_armed, guard_at, n_pairs,
+                                             rec.dy_samples, getattr(rig, "quality", None))
+                if v is not None and v.suspect:
+                    _tot = center_src["contour"] + center_src["box"]
+                    _box = (center_src["box"] / _tot) if _tot else None
+                    print()
+                    print(rec.geometry_failure_message(v, _box))
+                    return 2
 
             if pt is None:
                 # ⚠️ 这一行的字段数**必须**和 header 一样（15 个）。
@@ -747,6 +938,13 @@ def main() -> int:
         src.release()
         if writer is not None:
             writer.release()
+
+    # 守卫开着却没判成：说清是"没样本"，不是"没问题"。不说的话，这一段会**静默地
+    # 跳过**几何判读 —— 用户以为守过了，其实一次都没判。
+    if guard_armed:
+        print(f"[几何守卫] 没能判读：两路同时检出的帧只有 {len(rec.dy_samples)} 个，"
+              f"不足 {GEOM_MIN_SAMPLES} 个。这是**没样本**，不是**没问题** —— "
+              "别拿它当几何 OK 的证据。")
 
     header = CSV_HEADER
     # 每一行都必须与表头等长：列错位不会报错，只会让下游读到错值。

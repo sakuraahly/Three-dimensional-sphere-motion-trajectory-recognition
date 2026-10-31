@@ -46,6 +46,7 @@ from stereo import (
     timestamp_offset,
 )
 from stereo.fov_align import FovAlignment, estimate_fov_alignment
+from stereo.triangulate import epipolar_gate_px
 from stereo.visualization import (
     build_trajectory_payload, export_session_visualization, load_seeds, write_seeds,
 )
@@ -177,6 +178,58 @@ def test_triangulate() -> bool:
     # 护栏不能误伤正常标定：stereo_rectify 的 rig 仍可构造
     checks.append(("stereo_rectify 标定不受护栏影响",
                    StereoReconstructor(rig).n_frames == 0))
+
+    # ---- 自适应极线门限 epipolar_gate_px：纯函数，默认行为不变 ----
+    # 本机自报极线 RMS 0.584 px；4×RMS ≈ 2.336，非回退值 2.5（证明真按 RMS 算）。
+    gate_0584 = epipolar_gate_px({"epipolar_rms": 0.584})
+    checks.append((f"0.584 px RMS -> 门限 {gate_0584:.4f}（≈4×RMS 且 != 2.5，"
+                   f"确非偷偷回退）",
+                   abs(gate_0584 - 2.336) < 0.01 and gate_0584 != 2.5))
+    checks.append(("0.30 px RMS -> 门限 1.2（比 2.5 更紧）",
+                   abs(epipolar_gate_px({"epipolar_rms": 0.30}) - 1.2) < 1e-9))
+    checks.append(("3.0 px RMS -> 门限被上限夹在 6.0",
+                   epipolar_gate_px({"epipolar_rms": 3.0}) == 6.0))
+    checks.append(("0.05 px RMS -> 门限被下限夹在 1.0",
+                   epipolar_gate_px({"epipolar_rms": 0.05}) == 1.0))
+    _fb_cases = [None, {}, {"epipolar_rms": float("nan")},
+                 {"epipolar_rms": float("inf")}, {"epipolar_rms": 0.0},
+                 {"epipolar_rms": "0.6"}]
+    _fb_vals = [epipolar_gate_px(c) for c in _fb_cases]
+    checks.append((f"回退分支全覆盖（None/空/NaN/inf/0.0/字符串）-> {_fb_vals}"
+                   f"（全部 = 2.5）", all(v == 2.5 for v in _fb_vals)))
+    _sweep = [epipolar_gate_px({"epipolar_rms": float(r)})
+              for r in np.arange(0.1, 2.0 + 1e-9, 0.05)]
+    _mono_ok = all(b >= a for a, b in zip(_sweep, _sweep[1:]))
+    _bnd_ok = all(1.0 <= v <= 6.0 for v in _sweep)
+    # 两端必须真的碰到夹子（0.1×4=0.4→下限 1.0；2.0×4=8→上限 6.0）：
+    # 少了这一条，"k 写错成永远回退"这类改动会给出恒定 2.5，仍满足单调+在界内，
+    # 判据就空转了。
+    _clip_ok = abs(_sweep[0] - 1.0) < 1e-9 and abs(_sweep[-1] - 6.0) < 1e-9
+    checks.append((f"单调性/边界：RMS 0.1→2.0 门限非降={_mono_ok}，"
+                   f"全程落在 [{min(_sweep):.1f}, {max(_sweep):.1f}] 内={_bnd_ok}，"
+                   f"两端触及夹子={_clip_ok}",
+                   _mono_ok and _bnd_ok and _clip_ok))
+    # 两路等价：自适应路径与显式同值路径必须给出完全相同的匹配
+    rig.quality = {"epipolar_rms": 0.584}
+    auto_px = epipolar_gate_px(rig.quality)
+    explicit_px = 4.0 * 0.584                      # 人手写死的同一个数
+    left_d = Detection(x=float(uv1[0, 0]), y=float(uv1[0, 1]), radius=20.0, score=1.0)
+
+    def _cands():
+        return [Detection(x=float(uv2[0, 0]), y=float(uv2[0, 1]), radius=20.0, score=0.9),
+                Detection(x=float(uv2[0, 0]) + 30.0, y=float(uv2[0, 1]) + 30.0,
+                          radius=20.0, score=0.6)]
+
+    b_auto, dy_auto = match_epipolar(rig, left_d, _cands(),
+                                     MatchConfig(max_epipolar_px=auto_px))
+    b_exp, dy_exp = match_epipolar(rig, left_d, _cands(),
+                                   MatchConfig(max_epipolar_px=explicit_px))
+    _same = (abs(auto_px - explicit_px) < 1e-9 and dy_auto == dy_exp
+             and b_auto is not None and b_exp is not None
+             and b_auto.x == b_exp.x and b_auto.y == b_exp.y)
+    checks.append((f"自适应 {auto_px:.4f} 与显式 {explicit_px:.4f} 同值 -> 匹配一致={_same}",
+                   _same))
+
     ok = True
     for name, passed in checks:
         print(f"  [{'通过' if passed else '不达标'}] {name}")

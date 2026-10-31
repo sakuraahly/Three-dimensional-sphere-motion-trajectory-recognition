@@ -33,6 +33,7 @@ fusion 的成员拼错（不在注册表里）           `fusion_members += ["co
 采纳 sidecar 的推荐阈值却不生效              删掉 `_adopt_recommended_conf` 的赋值   exit=1
 推荐阈值退回"升序取第一个"（永远 0.02）       `reversed(rows)` → `rows`              exit=1
 `--conf` 缺省又变回 0.25                     `default=0.25`                         exit=1
+框内细化继承全局 hough_max_radius（80）      `sub` 不按框尺寸定搜索窗口             exit=1
 ==========================================  ====================================  ========
 
 用法::
@@ -609,6 +610,96 @@ def _check_radius_evidence() -> list[tuple[str, bool]]:
     return checks
 
 
+def _check_refine_in_box_window() -> list[tuple[str, bool]]:
+    """``refine_circle_in_box`` 的搜索半径窗口：按**框尺寸**定，不继承全局 hough_max_radius。
+
+    现场（2026-10-31）：自训 ``models/ball_yolo.pt`` 的细化成功率只有 11.5%，
+    88.5% 的帧退回用 YOLO 框中心当圆心（框中心误差中位 4.29 px）。根因是子配置
+    **原样继承**了全局 ``hough_max_radius=80``（镜面球像素半径约 90 > 80，hough
+    必然找不到），而镜面球在 color 路径下又分割不出来 —— 细化必然失败。那个 80
+    是给**全图** hough 定的性能上限，在框内 ~180×180 的 ROI 里不适用。
+
+    不依赖 ultralytics：直接手造 ``Detection(extra={"box": ...})`` 再调细化函数。
+    """
+    import numpy as np
+    import cv2
+
+    from sphere_tracker.detectors.neural import refine_circle_in_box
+    from sphere_tracker.types import Detection
+
+    checks: list[tuple[str, bool]] = []
+
+    def scene(radius: float, box_half: float, highlight: tuple[float, float] | None = None):
+        """浅灰背景 + 深灰实心球（模拟金属/镜面球）；可选在偏移处加一个亮白高光斑。
+
+        边缘用 ``LINE_AA`` 画（真实相机的球边缘是抗锯齿的）：硬边渲染下
+        ``HoughCircles`` 在 ``param2=30`` 只会得到零星票数、检不出，那是**合成图的
+        假象**而非代码缺陷 —— 用抗锯齿边更贴近现场，也才能让本用例验证到真东西。
+        """
+        size = int(2 * box_half) + 120
+        frame = np.full((size, size, 3), 200, np.uint8)
+        cx = cy = size // 2
+        cv2.circle(frame, (cx, cy), int(radius), (90, 90, 90), -1, lineType=cv2.LINE_AA)
+        if highlight is not None:
+            off, hr = highlight
+            cv2.circle(frame, (int(cx + off), cy), int(hr), (255, 255, 255), -1,
+                       lineType=cv2.LINE_AA)
+        det = Detection(
+            x=float(cx), y=float(cy), radius=box_half, score=0.9, method="yolo",
+            extra={"box": (cx - box_half, cy - box_half, cx + box_half, cy + box_half)},
+        )
+        return frame, det, float(cx), float(cy)
+
+    cfg = DetectorConfig()
+
+    # 1) 主用例：球半径 90 > 旧硬顶 80 —— 这一条就是"改前必红"的锚点。
+    frame, det, cx, cy = scene(90.0, 90.0)
+    out = refine_circle_in_box(frame, det, cfg)
+    win = out.parts.get("refine_window") if out else None
+    checks.append((f"半径 90 的球：细化窗口上界 > 80（{win}；继承全局 hough_max_radius 时为 80）",
+                   win is not None and win[1] > 80.0))
+    checks.append(("半径 90 的球：细化成功（method 以 yolo+ 开头，没退回框中心）",
+                   out is not None and out.method.startswith("yolo+")))
+    # 4) 主用例的圆心精度（相对真球心）
+    if out is None:
+        checks.append(("半径 90 的球：圆心误差 < 2 px", False))
+    else:
+        err = float(np.hypot(out.x - cx, out.y - cy))
+        checks.append((f"半径 90 的球：圆心误差 {err:.2f} px < 2 px", err < 2.0))
+
+    # 2) 高光斑陷阱：偏离球心 40 px 处有个半径 20 px 的亮白斑。
+    #    下界若不收紧（沿用全局 min_radius=8），hough 会细化到高光斑上、圆心偏到球面一侧。
+    frame, det, cx, cy = scene(90.0, 90.0, highlight=(40.0, 20.0))
+    out = refine_circle_in_box(frame, det, cfg)
+    hx, hy = cx + 40.0, cy
+    if out is None:
+        checks.append(("高光斑陷阱：细化成功且圆心贴真球心（未跑偏到高光斑）", False))
+    else:
+        d_ball = float(np.hypot(out.x - cx, out.y - cy))
+        d_hi = float(np.hypot(out.x - hx, out.y - hy))
+        checks.append((f"高光斑陷阱：圆心到真球心 {d_ball:.2f} px 远小于到高光斑 {d_hi:.2f} px",
+                       d_ball < d_hi))
+        checks.append((f"高光斑陷阱：圆心贴真球心（{d_ball:.2f} px < 3 px）", d_ball < 3.0))
+
+    # 3) 不劣化：球半径 60 但框给半宽 200 的松框 —— 窗口 [100, 200] 框不住真球，
+    #    此时必须**安静地退回框中心**（不抛异常、method 仍是 yolo）。
+    frame, det, cx, cy = scene(60.0, 200.0)
+    try:
+        out = refine_circle_in_box(frame, det, cfg)
+    except Exception:                                   # noqa: BLE001
+        out = "raised"
+    if out == "raised":
+        checks.append(("松框：不抛异常", False))
+    else:
+        result = out or det                            # 复刻调用方 `or det` 的退回语义
+        bx = 0.5 * (det.extra["box"][0] + det.extra["box"][2])
+        by = 0.5 * (det.extra["box"][1] + det.extra["box"][3])
+        checks.append(("松框（半宽 200 / 球半径 60）：不抛异常，且退回框中心（method=yolo）",
+                       result.method == "yolo"
+                       and abs(result.x - bx) < 1e-6 and abs(result.y - by) < 1e-6))
+    return checks
+
+
 def main() -> int:
     print("=" * 70)
     print("插件注册表自测（清单唯一 / 未知名字报错 / 默认唯一 / 边界）")
@@ -630,6 +721,7 @@ def main() -> int:
          lambda: (_check_conf_calibration()
                   + _check_conf_recommend_rule()
                   + _check_run_video_conf_flags())),
+        ("9. 框内细化窗口（YOLO 框 → 圆）", _check_refine_in_box_window),
     ):
         print(f"----- {section} -----")
         got = fn()

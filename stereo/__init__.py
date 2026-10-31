@@ -64,9 +64,12 @@ from .predict3d import (
 )
 from .depth_fusion import fuse_depth, mono_depth, stereo_depth
 from .triangulate import (
+    GeometryVerdict,
     MatchConfig,
     StereoPoint,
     StereoReconstructor,
+    epipolar_dy,
+    geometry_verdict,
     match_epipolar,
     triangulate_one,
 )
@@ -121,7 +124,10 @@ __all__ = [
     "MatchConfig",
     "StereoPoint",
     "StereoReconstructor",
+    "GeometryVerdict",
     "match_epipolar",
+    "epipolar_dy",
+    "geometry_verdict",
     "triangulate_one",
     "AngledMatchConfig",
     "AngledPoint",

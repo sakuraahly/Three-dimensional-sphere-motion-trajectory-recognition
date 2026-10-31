@@ -349,6 +349,12 @@ class BallTracker:
                 # 半径一致性门控：同一个球，像素半径不会突然变化 35% 以上。
                 # 少了这一条，球被短暂遮挡后跟踪器很容易"跳"到画面里另一个
                 # 尺寸不同的物体上（镜面高光、另一个球、屏幕上的圆形图标…）。
+                #
+                # ⚠️ 这是**关联层**的门（判"这一帧的观测配给哪条轨迹"），与后面
+                # `RadiusGate` 那道**帧层**门（判"这一帧的半径能不能进 Z"）是
+                # **两件不同的事**，门限也各自独立（本处用 `radius_gate_ratio`，
+                # 那道用 `radius_seed_band_*` / `radius_max_jump` / `radius_band`）。
+                # **不要合并**：判不过的后果不一样（这里只丢关联、观测不丢）。
                 if tr.radius > 1.0:
                     ratio = abs(float(det.radius) - tr.radius) / tr.radius
                     if ratio > self.cfg.radius_gate_ratio and tr.hits >= self.cfg.init_hits:
@@ -427,6 +433,89 @@ class BallTracker:
             if tr.id == self.primary_id:
                 return tr
         return self.tracks[0] if self.tracks else None
+
+
+class RadiusGate:
+    """逐帧半径一致性门（**帧层**），同时负责统计。抽成类是为了能被测（判定与打印分开）。
+
+    ⚠️ **本类与 `BallTracker.update` 里的 `radius_gate_ratio` 是两道不同的门**，
+    管的是两件不同的事，**不要合并**：
+
+    - `radius_gate_ratio`：**关联层**门。判"这一帧的观测配给哪条轨迹"，
+      判不过只影响"检测配给谁"，观测本身不丢（轨迹照常 coasting）。
+    - 本类：**帧层**门。判"这一帧的半径能不能进三维深度 Z"，
+      判不过回退上一帧半径、或整帧不认（``accepted_r=None``）。
+
+    两者门限各自独立：本类读 `TrackerConfig` 的 `radius_seed_band_lo` /
+    `radius_seed_band_hi` / `radius_max_jump` / `radius_window` / `radius_band`，
+    **不含** `radius_gate_ratio`。
+
+    门有两级，管的是两件不同的事：
+
+    - **跳变护栏**（`radius_max_jump`，默认 8%）：这一帧的半径相对上一帧跳了 8% 以上，
+      说明细化射线抓到了别的东西。**只回退半径**（沿用上一帧），帧仍然算有效 ——
+      球心与轨迹是这一帧量到的，只有半径没量到。
+    - **半径带**：整帧不认。锚点分两种，**这是本轮最要紧的一处**：
+        * 给了 ``--seed``：锚 ``seed_r``，范围 ``[1-lo, 1+hi]×seed_r``
+          （默认 lo=0.25、hi=0.35）。种子是用户"就这个球"的声明，
+          也就是这一趟的**尺度基准**；拿它当锚，才不会像滚动中位那样自证
+          （见 `radius_seed_band_lo` 的注释）；
+        * 没给种子：只能锚最近 `radius_window` 帧的滚动中位（±`radius_band`）。
+          它**证明不了**"这就是那颗球"，所以报告里必须同时打 `[尺度]` 那条警告 ——
+          门的强度不许大于它实际能保证的东西。
+
+    分开的理由：跳变是"这一帧没量好"，带越界是"跟错目标了"，前者可以修补，
+    后者只能丢弃 —— 混成一个门就分不出该重测还是该重捕。
+    """
+
+    def __init__(self, seed_radius: float | None = None,
+                 cfg: TrackerConfig | None = None) -> None:
+        self.cfg = cfg if cfg is not None else TrackerConfig()
+        self.seed_radius = float(seed_radius) if seed_radius is not None else None
+        self.window: deque[float] = deque(maxlen=self.cfg.radius_window)
+        self.r_prev = self.seed_radius
+        if self.r_prev is not None:
+            # 种子半径就是"第一份已接受半径"：之后没给种子时才用的滚动中位
+            # 也以它为起点，免得第一帧细化失败把锚定在背景上。
+            self.window.append(self.r_prev)
+        self.jumps = 0
+        self.inconsistent = 0
+        self.jump_ratios: list[float] = []
+        self.radii: list[float] = []      # 全部已接受半径（统计用，不受窗口长度限制）
+
+    def band(self) -> tuple[float, float] | None:
+        """本门此刻的接受区间；没给种子且样本不足时返回 ``None``（只跳变护栏生效）。"""
+        if self.seed_radius is not None:
+            return (self.seed_radius * (1.0 - self.cfg.radius_seed_band_lo),
+                    self.seed_radius * (1.0 + self.cfg.radius_seed_band_hi))
+        if len(self.window) >= 3:
+            med = float(np.median(self.window))
+            return (med * (1.0 - self.cfg.radius_band), med * (1.0 + self.cfg.radius_band))
+        return None
+
+    def accept(self, r: float) -> tuple[float | None, str]:
+        """返回 ``(本帧采用的半径 或 None, 判定)``；判定 ∈ ok / jump / inconsistent。
+
+        **顺序要紧**：带必须先判、且判在**这一帧量到的** ``r`` 上。
+        如果先跑跳变护栏，它会先把 ``r`` 拉回上一帧（8% 以内），而带至少 25% ——
+        被拉回的值永远进不了带外，带就成了永不触发的死代码。
+        """
+        band = self.band()
+        if band is not None and not (band[0] <= r <= band[1]):
+            self.inconsistent += 1
+            return None, "inconsistent"
+        verdict = "ok"
+        if self.r_prev is not None and self.r_prev > 1e-6:
+            ratio = abs(r - self.r_prev) / self.r_prev
+            self.jump_ratios.append(ratio)
+            if ratio > self.cfg.radius_max_jump:
+                verdict = "jump"
+                self.jumps += 1
+                r = self.r_prev          # 沿用上一帧；见类 docstring
+        self.window.append(float(r))
+        self.radii.append(float(r))
+        self.r_prev = float(r)
+        return float(r), verdict
 
 
 # ---------------------------------------------------------------------------

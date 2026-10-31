@@ -4,13 +4,13 @@
 > 想知道"东西放哪"看 `文件结构.md`、"为什么这么设计、踩过哪些坑"看 `交接文档.md`；**入口文档是 `docs/项目总纲.md`**。
 > 签名逐个 `read` 源码后用 `inspect.signature` 复核（清单见 §15）；只写代码里**真的存在**的东西，没确认的一律标"未确认"。
 ## 0. 全局约定（先读这一节）
-| 约定     | 内容                                                                                     |
-| -------- | ---------------------------------------------------------------------------------------- |
-| 像素坐标 | `(x, y)` = `(列, 行)`，原点左上，OpenCV 口径                                               |
-| 单目三维 | **相机坐标系**：Z 向前、米（`CameraModel.depth_from_radius()` + `backproject()`）          |
-| 双目三维 | **校正后左相机系**、米（`T` 也是米）；要和原始左相机系的真值比，先乘 `rig.R1`               |
-| 时间 `t` | 秒。视频/图片源 = `帧号/fps`；实时相机 = `perf_counter()`（绝对值无意义，同进程内单调）     |
-| 失败约定 | 绝大多数"没结果"返回 `None`/`[]` **不抛**；只有校验类错误抛异常（各节标注）                 |
+| 约定     | 内容                                                                                          |
+| -------- | --------------------------------------------------------------------------------------------- |
+| 像素坐标 | `(x, y)` = `(列, 行)`，原点左上，OpenCV 口径                                                  |
+| 单目三维 | **相机坐标系**：Z 向前、米（`CameraModel.depth_from_radius()` + `backproject()`）             |
+| 双目三维 | **校正后左相机系**、米（`T` 也是米）；要和原始左相机系的真值比，先乘 `rig.R1`                 |
+| 时间 `t` | 秒。视频/图片源 = `帧号/fps`；实时相机 = `perf_counter()`（绝对值无意义，同进程内单调）       |
+| 失败约定 | 绝大多数"没结果"返回 `None`/`[]` **不抛**；只有校验类错误抛异常（各节标注）                   |
 | 取帧责任 | **`pipeline` 不取帧**：`sources`（单目）/`stereo.PairSource`（双目）由 app 驱动，再把帧喂进库 |
 
 **范围与前提**：本文只覆盖三个库包（`apps/`、`tests/`、启动器、PPT 工具链不在范围内）；文中"实测数字"引自源码注释或既有文档，我**没有**重跑那 6 个 selftest。
@@ -20,15 +20,15 @@
 一张全局表：`kind → name → 工厂`。检测器 / 预测器 / 视频源 / 标定方法 / 导出格式 / 跟踪器
 **全部**从这张表里选，不再有 if 链、也不许在别处手写名字清单。
 
-| 函数 | 签名 | 行为 |
-| ---- | ---- | ---- |
-| `plugin` | `plugin(kind, name, *, summary, default=False, needs=(), replace=False)` | 装饰器，登记工厂并**返回原对象** |
-| `register` | 同上（把 `factory` 作为位置参数传入） | 非装饰器写法 |
-| `resolve` | `resolve(kind, name)` | 返回工厂。**找不到抛 `UnknownPlugin`**（`LookupError` 子类），消息里带 kind、请求的名字、全部候选、以及候选的来源模块；**绝不 fallback 到默认** |
-| `names` | `names(kind) -> list[str]` | 注册顺序即展示顺序；GUI 下拉、`argparse choices`、`--help` 都用它 |
-| `default` | `default(kind) -> str` | 该 kind 的默认名。零个或多于一个 `default=True` 都抛错（**不许靠 import 顺序决定默认**） |
-| `describe` | `describe(kind) -> list[dict]` | `[{name, summary, needs, is_default}]`，给 GUI tooltip / CLI help 用 |
-| `clear` | `clear()` | **仅测试用**，清空全表 |
+| 函数       | 签名                                                                     | 行为                                                                                                                                            |
+| ---------- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `plugin`   | `plugin(kind, name, *, summary, default=False, needs=(), replace=False)` | 装饰器，登记工厂并**返回原对象**                                                                                                                |
+| `register` | 同上（把 `factory` 作为位置参数传入）                                    | 非装饰器写法                                                                                                                                    |
+| `resolve`  | `resolve(kind, name)`                                                    | 返回工厂。**找不到抛 `UnknownPlugin`**（`LookupError` 子类），消息里带 kind、请求的名字、全部候选、以及候选的来源模块；**绝不 fallback 到默认** |
+| `names`    | `names(kind) -> list[str]`                                               | 注册顺序即展示顺序；GUI 下拉、`argparse choices`、`--help` 都用它                                                                               |
+| `default`  | `default(kind) -> str`                                                   | 该 kind 的默认名。零个或多于一个 `default=True` 都抛错（**不许靠 import 顺序决定默认**）                                                        |
+| `describe` | `describe(kind) -> list[dict]`                                           | `[{name, summary, needs, is_default}]`，给 GUI tooltip / CLI help 用                                                                            |
+| `clear`    | `clear()`                                                                | **仅测试用**，清空全表                                                                                                                          |
 
 **调用方必须遵守的三条**（违反任一条都会被 `tests/selftest_plugins.py` 抓到）：
 
@@ -39,14 +39,14 @@
 
 **当前六类的实际内容**（2026-10-26；以 `python -c "from sphere_tracker.plugins import *; print(names('detector'))"` 为准）：
 
-| kind | 成员 | 默认 |
-| ---- | ---- | ---- |
-| `detector` | color / specular / hough / motion / fusion / yolo / yolo_sam | `color` |
-| `predictor` | kalman / quadratic | `quadratic` |
-| `source` | camera / file / images | `camera` |
-| `calib_method` | joint / chain | `joint` |
-| `exporter` | json / yaml / toml | `toml` |
-| `tracker` | ball | `ball` |
+| kind           | 成员                                                         | 默认        |
+| -------------- | ------------------------------------------------------------ | ----------- |
+| `detector`     | color / specular / hough / motion / fusion / yolo / yolo_sam | `color`     |
+| `predictor`    | kalman / quadratic                                           | `quadratic` |
+| `source`       | camera / file / images                                       | `camera`    |
+| `calib_method` | joint / chain                                                | `joint`     |
+| `exporter`     | json / yaml / toml                                           | `toml`      |
+| `tracker`      | ball                                                         | `ball`      |
 
 **新增一种实现的三步**（这就是插件化要买到的东西）：
 
@@ -74,13 +74,13 @@ class AppConfig:  detector / tracker / camera / predict / viz
 def load_config(path: str | Path | None = None) -> AppConfig      # None 或文件不存在 -> 全默认
 def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save(path)
 ```
-| 组               | 关键默认值                                                                                                                                                                                                                                                                                                        |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 组               | 关键默认值                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DetectorConfig` | `method="color"`、`fusion_members=["color","hough","motion"]`、`min_radius=8.0`、`max_radius=200.0`、`min_circularity=0.55`、`min_fill_ratio=0.72`、`min_radial_consistency=0.90`、`subpixel_refine=True`、`subpixel_rays=72`、`motion_compensation="auto"`、`camera_motion_threshold_px=0.8`、`motion_work_width=320`、`agree_px=6.0`、`agree_ratio=0.45`、`yolo_weights="models/yolo11n.pt"`、`sam_model="models/sam2.1_t.pt"`、`yolo_classes=[32]` |
-| `TrackerConfig`  | `order=2`、`process_noise=1.5e2`、`measurement_noise=2.0`、`gate_chi2=9.21`、`maneuver_min_px_s=250.0`、`maneuver_ratio=1.6`、`max_coast_frames=12`、`init_hits=2`、`trail_length=240`、`trail_source="measurement"`                                                                                                                                                                                                  |
-| `CameraConfig`   | `fx=fy=0.0`（未标定）、`cx=cy=-1.0`（用图像中心）、`hfov_deg=60.0`、`ball_diameter_m=0.04`、`enable_3d=True`                                                                                                                                                                                                       |
-| `PredictConfig`  | `method="quadratic"`、`horizon_s=0.6`、`steps=30`、`min_points=6`、`use_gravity=False`、`use_pixel_gravity=True`、`window_s=0.45`、`min_window_s=0.12`、`residual_tol=2.5`、`smooth_window=1`                                                                                                                          |
-| `VizConfig`      | `trail_enabled/show_circle/show_prediction/show_hud=True`、`show_mask/show_axes_3d=False`、`scale=1.0`                                                                                                                                                                                                            |
+| `TrackerConfig`  | `order=2`、`process_noise=1.5e2`、`measurement_noise=2.0`、`gate_chi2=9.21`、`maneuver_min_px_s=250.0`、`maneuver_ratio=1.6`、`max_coast_frames=12`、`init_hits=2`、`trail_length=240`、`trail_source="measurement"`                                                                                                                                                                                                                                  |
+| `CameraConfig`   | `fx=fy=0.0`（未标定）、`cx=cy=-1.0`（用图像中心）、`hfov_deg=60.0`、`ball_diameter_m=0.04`、`enable_3d=True`                                                                                                                                                                                                                                                                                                                                          |
+| `PredictConfig`  | `method="quadratic"`、`horizon_s=0.6`、`steps=30`、`min_points=6`、`use_gravity=False`、`use_pixel_gravity=True`、`window_s=0.45`、`min_window_s=0.12`、`residual_tol=2.5`、`smooth_window=1`                                                                                                                                                                                                                                                         |
+| `VizConfig`      | `trail_enabled/show_circle/show_prediction/show_hud=True`、`show_mask/show_axes_3d=False`、`scale=1.0`                                                                                                                                                                                                                                                                                                                                                |
 
 **坑**：① 默认颜色预设是**白色/高亮球**（`[0,0,175]`–`[179,80,255]`），**不是橙球** —— 拍橙球必须 `preset("orange_ball")` 或跑 `apps/tools/calibrate_color.py`，否则"检测不到"会被误判成算法问题。
 ② `DetectorConfig.min_score`（默认 `0.55`）与 `TrackerConfig.max_q_scale`（默认 `64.0`）**现在是活的** —— 接线位置：`detectors/fusion.py:75` 的孤证门限读 `cfg.min_score`、`KalmanFilter.__init__(..., max_q_scale=cfg.max_q_scale)`（`track.py:40` 用它算 `q_max`）。
@@ -93,11 +93,11 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 
 **`TrackState`**（跟踪器输出）：
 
-| 字段                         | 含义                                                             |
-| ---------------------------- | ---------------------------------------------------------------- |
-| `track_id, t`                | 轨迹号 / 时刻（秒）                                               |
+| 字段                         | 含义                                                               |
+| ---------------------------- | ------------------------------------------------------------------ |
+| `track_id, t`                | 轨迹号 / 时刻（秒）                                                |
 | `x, y, vx, vy, ax, ay`       | 位置(px)、速度(px/s)、加速度(px/s²)，**全部来自卡尔曼滤波**        |
-| `radius`                     | 半径（指数滑动平均，α=0.5 硬编码）                                |
+| `radius`                     | 半径（指数滑动平均，α=0.5 硬编码）                                 |
 | `z, vz`                      | 单目测深深度(米)、深度速度(m/s) —— **不是 track.py 填的**（见坑①） |
 | `confirmed / coasting`       | 命中 `init_hits` 次后 True / 本帧是外推出来的（没有观测）          |
 | `missed / age / hits`        | 连续丢失帧数 / 存活帧数 / 累计命中数                               |
@@ -105,10 +105,10 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 
 属性 `speed_px -> hypot(vx, vy)`。
 
-| 类型           | 字段                                                                                                                              |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `FrameContext` | `t=0.0, gray=None, motion=None, camera_moving=False`（`motion` 实际是 `MotionEstimate`，标注为 `Any`）                             |
-| `TrailPoint`   | `t, x, y, z=None, radius=0.0, score=0.0`                                                                                           |
+| 类型           | 字段                                                                                                                                           |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FrameContext` | `t=0.0, gray=None, motion=None, camera_moving=False`（`motion` 实际是 `MotionEstimate`，标注为 `Any`）                                         |
+| `TrailPoint`   | `t, x, y, z=None, radius=0.0, score=0.0`                                                                                                       |
 | `FrameResult`  | `t, frame_index, detection, track, trail, prediction, prediction_3d, position_3d, fps, detect_ms, camera_motion, camera_moving, camera_steady` |
 
 `FrameResult` 的三个三维字段不同：`prediction` = **(N,2) 像素**（3D 预测也会投影回像素）、`prediction_3d` = **(N,3) 米**、`position_3d` = **(3,) 米**；`trail` 坐标始终是像素。
@@ -120,6 +120,7 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 def fit_circle_taubin(points) -> tuple[float, float, float]         # 少于 3 点抛 ValueError
 def fit_circle_robust(points, iterations=3, trim_sigma=2.0) -> tuple[float, float, float]
 def refine_circle_subpixel(gray, cx, cy, radius, n_rays=72, search=2.5, step=0.25, min_gradient=15.0) -> tuple[float, float, float]
+def refine_circle_subpixel_checked(gray, cx, cy, radius, ...) -> tuple[float, float, float, bool]   # 末位多一个"是否真的细化成功"
 def contour_circularity(contour) -> float;  def radial_consistency(points, cx, cy, radius) -> float
 def circle_radial_gradient_stats(gray, cx, cy, radius, samples=96, min_magnitude=40.0, min_alignment=0.65) -> tuple[float, float]
 def circle_edge_support(edges, cx, cy, radius, samples=72) -> float
@@ -132,7 +133,7 @@ class CameraModel:
 ```
 **调用顺序**：`CameraModel` 要先有帧尺寸才能造（`width/height` 必填）⇒ `SpherePipeline` 是拿到**第一帧后**才建它；典型链路 `detect` →（color 内部）`refine_circle_subpixel` → `depth_from_radius`（Z）→ `backproject`（三维）。
 
-**坑**：① **`refine_circle_subpixel` 失败时不抛异常，而是原样返回输入**（`radius<3.0`、采样起点越界、有效射线 `< max(8, n_rays//3)`）—— "返回值和输入完全一样"是**细化失败**的信号；`fit_circle_robust` 点数 `<5` 时**退回** `fit_circle_taubin`。
+**坑**：① **`refine_circle_subpixel` 失败时不抛异常，而是原样返回输入**（`radius<3.0`、采样起点越界、有效射线 `< max(8, n_rays//3)`）；要判"到底细化成功没有"用 `refine_circle_subpixel_checked` 的末位布尔（**别去比浮点相等**），`sphere_tracker/detectors/specular.py::_refine_center()` 是它的调用方；`fit_circle_robust` 点数 `<5` 时**退回** `fit_circle_taubin`。
 ② `fx<=0` 用 `hfov_deg` 估；**`fy<=0` 直接令 `fy=fx`**（不按纵横比另算）；`cx/cy<0` 用图像中心；`calibrated` 只看 `fx`。`depth_from_radius` 用 `f=(fx+fy)/2`，单位米，依赖 `ball_diameter_m` 正确。
 ③ `circle_gradient_support()` **全仓库无调用者**（hough 用的是 `circle_radial_gradient_stats`），改它不影响 hough；旧文档里的 `PinholeModel.to_3d()/radius_from_depth()` **已删除**（`交接文档.md` §10.2-C），类名现在是 `CameraModel`，pipeline 只用 `depth_from_radius/backproject/project`，`estimate_focal_from_known_ball` 只有 `apps/tools/calibrate_focal.py` 在用。
 ## 4. `sphere_tracker/detectors/` —— 检测器
@@ -154,14 +155,14 @@ class YoloDetector / YoloSamDetector  # "yolo" / "yolo_sam"；def refine_circle_
 ```
 `_score_candidate` 的硬规则（所有检测器共用）：半径越界、`radial>0 且 <min_radial_consistency`、`fill>0 且 <min_fill_ratio` → **直接 0**；半径贴边（`<1.3*min` 或 `>0.8*max`）整分 ×0.8；只对"传进来 >0"的指标做加权平均。区分圆与方块主要靠 `radial`（方块顶点比边中点远 41%）。
 
-| 检测器 | 需要 `ctx` 的            | 返回 contour/mask | 额外前置                                                      |
-| ------ | ------------------------ | ----------------- | ------------------------------------------------------------- |
-| color  | `gray`                   | 有 / 有（整幅）    | 只对**前 3 个**候选做亚像素细化                                |
-| hough  | `gray`                   | 无 / 无           | 两道梯度门：`hough_min_support`、`hough_min_sign_consistency`   |
-| motion | `motion`+`camera_moving` | 有 / 有（`fg`）   | 需 `_prev_frame` 与 `motion.matrix` 才走补偿分支               |
-| specular | 不用（内部转灰度）    | 无 / 无           | **必须人工 seed**；CSRT 跑 BGR；丢失返回 `[]`，不 snap 背景    |
-| fusion | 透传                     | 取胜出者           | 子检测器由 `cfg.fusion_members` 决定                            |
-| neural | 不用                     | SAM 有 / YOLO 无   | 需 `ultralytics`；缺依赖时**抛 RuntimeError**                  |
+| 检测器   | 需要 `ctx` 的            | 返回 contour/mask | 额外前置                                                                                                                                                                                                                                                        |
+| -------- | ------------------------ | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| color    | `gray`                   | 有 / 有（整幅）   | 只对**前 3 个**候选做亚像素细化                                                                                                                                                                                                                                 |
+| hough    | `gray`                   | 无 / 无           | 两道梯度门：`hough_min_support`、`hough_min_sign_consistency`                                                                                                                                                                                                   |
+| motion   | `motion`+`camera_moving` | 有 / 有（`fg`）   | 需 `_prev_frame` 与 `motion.matrix` 才走补偿分支                                                                                                                                                                                                                |
+| specular | 不用（内部转灰度）       | 无 / 无           | **必须人工 seed**；CSRT 跑 BGR；丢失返回 `[]`，不 snap 背景；圆心在出口换成**轮廓圆心**（`cfg.specular.refine_center`），出处见 `det.extra["center_source"]`（`contour`/`box`）与 `parts["center_shift_px"]`；**半径仍取框**（`B-130`：镜面球半径不能从边缘量） |
+| fusion   | 透传                     | 取胜出者          | 子检测器由 `cfg.fusion_members` 决定                                                                                                                                                                                                                            |
+| neural   | 不用                     | SAM 有 / YOLO 无  | 需 `ultralytics`；缺依赖时**抛 RuntimeError**                                                                                                                                                                                                                   |
 
 **坑**：① `detect()` 返回**按 score 降序**，`pipeline` 只取 `[0]` 当"本帧检测"、整表交给 tracker —— 排序是接口契约。
 ② `build_single_detector` 只认三个名字：把 `"yolo"` 写进 `fusion_members` 会被**静默忽略**（不报错，少一路票）。
@@ -568,13 +569,13 @@ def cross_validate(fit_fn, n_items, *, k=4, seed=0) -> dict
 **`fit_fn` 的契约（2026-10-26 收紧，别漏）**：`fit_fn(train_idx, test_idx) -> dict`，至少含 `"train_rms"`、`"test_rms"`（都是 float，非有限即该折失败），且**必须报**两样东西：`"used_train_idx"`（真正拿去拟合的索引）与 `"train_rms_estimator"` / `"test_rms_estimator"`（两个估计量的名字）。
 
 **两道守卫**（都只防"从外面看不出来"的误用）：
-| 情况 | 结果 |
-| ---- | ---- |
-| 报了 `used_train_idx` 且与 `train_idx` 集合相等 | `leak_check="ok"`，正常判定 |
-| 报了但对不上（训练集与测试集重叠） | 该折抛 `ValueError` → 进 `failed_folds`，`verdict` 带「部分折失败」 |
-| **没报 `used_train_idx`** | `leak_check="unverified"`，`verdict` 整条降级为「未验证（…无法排除训练/测试泄漏）：按比值看是「…」，但不可采信」 |
-| 两个 `*_estimator` **不同名** | 该折抛 `ValueError`（"这种比值只能说明两把尺子不一样长"） |
-| 两个 `*_estimator` **没声明** | `estimator_declared=False`，`verdict` 追加「比值可能混了尺子，仅供参考」 |
+| 情况                                            | 结果                                                                                                             |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 报了 `used_train_idx` 且与 `train_idx` 集合相等 | `leak_check="ok"`，正常判定                                                                                      |
+| 报了但对不上（训练集与测试集重叠）              | 该折抛 `ValueError` → 进 `failed_folds`，`verdict` 带「部分折失败」                                              |
+| **没报 `used_train_idx`**                       | `leak_check="unverified"`，`verdict` 整条降级为「未验证（…无法排除训练/测试泄漏）：按比值看是「…」，但不可采信」 |
+| 两个 `*_estimator` **不同名**                   | 该折抛 `ValueError`（"这种比值只能说明两把尺子不一样长"）                                                        |
+| 两个 `*_estimator` **没声明**                   | `estimator_declared=False`，`verdict` 追加「比值可能混了尺子，仅供参考」                                         |
 
 **为什么泄漏守卫必须有**：这个工具最容易的误用是 `fit_fn` 忽略传入的 `train_idx`、每折都拿全量数据训练 —— 于是 `test_rms == train_rms`、`ratio` 恒 1.0、一路绿灯，**从外面完全看不出来**。
 
@@ -608,11 +609,11 @@ def extrinsic_sigma(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T,
 
 **最后一条是"这是量级估计、不是置信区间"的实测依据**（2026-10-26，30 次噪声实现）：
 
-| 场景 | σ_B 预测 / 实测散布 |
-| ---- | ---- |
-| 0.5 px 噪声、12 视图、54 点 | **0.74** |
-| 基线 60 / 200 mm、1 px、3 视图 | **0.54–0.62** |
-| 2 m 远场（板距 1.2–2.0 m） | **0.41** |
+| 场景                           | σ_B 预测 / 实测散布 |
+| ------------------------------ | ------------------- |
+| 0.5 px 噪声、12 视图、54 点    | **0.74**            |
+| 基线 60 / 200 mm、1 px、3 视图 | **0.54–0.62**       |
+| 2 m 远场（板距 1.2–2.0 m）     | **0.41**            |
 
 即**系统性偏低**（0.54–0.74，即偏低 **1.4–1.9 倍**），远场更糟：远处的板位姿与 `T` 强相关，而条件协方差（各视图位姿、内参固定）吃不到这部分。标定距离附近可信，拿去做验收会偏乐观。
 
@@ -684,14 +685,28 @@ CAMERA_WAIT_TIMEOUT = 5.0;  CAMERA_ALIGN_STEPS = 2;  CAMERA_POLL_INTERVAL = 0.00
 def rectify_point_left(rig, x, y) -> tuple[float, float];  def rectify_point_right(rig, x, y)
 def match_epipolar(rig, det_left: Detection, candidates_right: list[Detection], cfg: MatchConfig | None = None) -> tuple[Detection | None, float]    # 找不到 -> (None, inf)
 def triangulate_one(rig, det_left, det_right, t, epipolar_px=float("nan")) -> StereoPoint
+def epipolar_dy(rig, det_left: Detection | None, candidates_right: list[Detection]) -> float | None    # 校正后 v 差的最小值；缺一边 -> None
+@dataclass GeometryVerdict:
+    n: int;  med: float;  p95: float       # 逐帧样本数 / 校正后 y 差的中位 / p95
+    epipolar_rms=nan;  epipolar_max=nan    # 标定自报（取不到就是 nan，**不编数**）
+    suspect: bool                          # 判"录像几何与标定对不上"
+    @property has_ref -> bool;  @property ratio -> float    # 实测中位 / 标定自报；无自报值 -> nan
+def geometry_verdict(dy_samples, quality=None, min_samples=GEOM_MIN_SAMPLES) -> GeometryVerdict | None    # 样本 < 20 -> None
 @dataclass StereoReconstructor:
     rig: StereoRig;  cfg: MatchConfig = MatchConfig();  trajectory: list[StereoPoint] = []
     n_frames=0; n_matched=0; n_no_left=0; n_no_right=0; n_rejected=0
+    dy_samples: list[float] = []       # 两路都检出的帧才攒；几何判读的**唯一**输入
     def __post_init__(self) -> None    # 自动取 rig.disparity_sign()（仅当 cfg.disparity_sign == 0）
     def update(self, t, left: Detection | None, right_dets: list[Detection]) -> StereoPoint | None
     @property match_rate -> float      # n_matched / n_frames
     def as_array(self) -> np.ndarray   # (N,4) = [t, X, Y, Z]；无点时 (0,4) 零数组
     def summary(self) -> str
+    def geometry_lines(self) -> list[str]                       # 刚测出来的 [诊断] 几行（样本不足 -> []）
+    def low_match_diagnostic(self, low_rate=0.10) -> list[str]   # 配对率 >= low_rate 就返回 []
+    def geometry_failure_message(self, v=None, center_box_share=None) -> str
+        # "录像与标定对不上"的报错文案；v=None 时自己算。
+        # center_box_share>0.5 时**先**给"圆心没钉到轮廓上"这条更近的原因
+        # （B-132：左右高光错位本就 ≈6 px，与几何坏掉长得一样，但修法相反）
 ```
 **调用顺序**：
 ```python
@@ -705,6 +720,7 @@ pt = rec.update(t, left=det_left, right_dets=dets_right)    # left 是【单个�
 **坑**：① `update()` 的 `left` 是**单个 Detection 或 `None`**，`right_dets` 才是列表；返回 `None` 的三种原因分别计入 `n_no_left`/`n_no_right`/`n_rejected`（`summary()` 会报出来）。
 ② `match_epipolar` 选的是极线偏差 `dy` **最小**的候选（`cost = dy`），不是"最像球"的那个；`require_radius_ratio=False` 时不比较左右半径（同型号相机才该开）；`triangulate_one` 的 `epipolar_px` 默认 `nan`（想要值就传 `match_epipolar` 的第二个返回值）。
 ③ `as_array()` 无配对点时返回 `(0,4)` 零数组 —— 形状和内容都要判。
+④ **几何守卫**：`rec.dy_samples` 攒的是"两路都检出"那些帧的校正后 v 差最小值，也是 `geometry_verdict()` 的**唯一**输入；`apps/run_stereo_video.py --geometry-guard N`（默认 30，`0`=关）跑满 N 对就判一次，判 `suspect` 则打印 `geometry_failure_message()` 并**退出码 2、不产出任何文件**（拒绝出数；放宽 `--max-epipolar` 只会把错配变成"看起来正常"的数字）。判据只在 `geometry_verdict()` 写一份 —— `geometry_lines()` / `low_match_diagnostic()` / 入口守卫三处共用。守卫**跑满 N 对后一直等到样本够**（`dy_samples < 20` 时 `geometry_verdict()` 返回 `None` = "还没法判"，**不消耗**这次机会，下帧再判），跑完仍未判成会打印「没能判读（样本不足）」—— **没样本 ≠ 没问题**。
 ### 13.3b `stereo/angled.py` + `stereo/angled_geometry.py`（大角度）
 
 ```python

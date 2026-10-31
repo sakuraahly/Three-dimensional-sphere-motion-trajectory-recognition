@@ -51,7 +51,6 @@ import argparse
 import json
 import sys
 import time
-from collections import deque
 from pathlib import Path
 
 # --- 让脚本在任意目录深度都能找到项目根 ---
@@ -64,12 +63,15 @@ import csv
 import cv2
 import numpy as np
 
-from sphere_tracker.config import AppConfig, ColorConfig, load_config
+from sphere_tracker.config import AppConfig, ColorConfig, TrackerConfig, load_config
 from sphere_tracker.detectors import registry  # noqa: F401  （import 即注册：R1）
 from sphere_tracker.detectors.neural import mark_conf_explicit
 from sphere_tracker.geometry import refine_circle_subpixel
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import open_source
+# 帧层半径一致性门在**库层**（`sphere_tracker.track`），门限单点在 `TrackerConfig`。
+# 这里不再自带一份实现 —— 两份实现必然漂移。
+from sphere_tracker.track import RadiusGate
 from apps._common import add_mono_pipeline_args, apply_mono_calibration
 from apps._window import WindowManager
 
@@ -90,31 +92,10 @@ LOW_HIT_RATE = 0.10
 #: 与书架纹理只隔几个像素，窗口一宽，射线会先抓到背景边缘。
 REFINE_SEARCH_PX = 3.0
 
-#: 逐帧半径跳变容忍度。与 ``mono_vs_stereo._MAX_RADIUS_JUMP`` 同口径（8%）：
-#: 实测可测帧的半径逐帧变化中位 0.33%、p95 0.87%、最大 1.40%，8% 是近 6 倍余量；
-#: 超过它只可能是细化射线锁到了背景边缘，此时宁可沿用上一帧半径。
-MAX_RADIUS_JUMP = 0.08
-
-#: 半径带：与"最近 N 个已接受半径的中位"相差超过这一比例就整帧不认（**没给种子时**用）。
-#: 窗口 30 帧 ≈ 0.86 s @35 fps：比这短的波动（抖动）交给跳变护栏，
-#: 比这长的漂移（球真的靠近/远离）必须允许，所以窗口不能再短。
-#: ±25% 的依据：实测可测帧半径的 IQR 只有 ±2.6%（89.2~93.9 px），25% 是近 10 倍
-#: 余量 —— 它挡不住随机抖动（那是跳变护栏的事），只挡"锁到了另一个圆"这种量级错误。
-RADIUS_WINDOW = 30
-RADIUS_BAND = 0.25
-
-#: 给了 ``--seed`` 时，锚点换成**种子半径**，带是 ``seed_r × [1-下界, 1+上界]``。
-#:
-#: 为什么必须锚种子、不能锚滚动中位：中位是**自证**的。旧 `derived/traj.csv`
-#: （GUI 默认 hough）288 帧里 277 帧 detected=1、半径中位 11 px（真值 91），
-#: 全都≈11 ⟹ 中位就是 11 ⟹ 每一帧都"在 ±25% 内"，于是全过。滚动中位只能
-#: 说明"这几十帧是同一类圆"，不能说明"这就是用户点的那颗球"。
-#:
-#: 上界 35%（不是 25%）的依据：这段录像里半径从 89.2 变到 93.9（+5%），
-#: 球被甩近时还会再大一点，35% 留够余量又不会放过 2 倍大的背景圆；
-#: 下界 25% 用来挡"锁到小球"（旧结果的 11 px 相对 88 px 是 -87.5%）。
-SEED_BAND_LO = 0.25
-SEED_BAND_HI = 0.35
+#: 帧层半径门的五个门限（跳变护栏 / 半径带 / 窗口）现在**单点**在 `TrackerConfig`：
+#: `radius_max_jump` / `radius_band` / `radius_window` / `radius_seed_band_lo` /
+#: `radius_seed_band_hi`；门本身是 `sphere_tracker.track.RadiusGate`。
+#: （此前它们是散在这里的模块常量，2026-10-31 S1d′ 归位，值不变。）
 
 #: 0 有效帧时的换法建议：顺序 = 最可能有效的排在前面。
 #: 每条都带"什么情况下该用它"，因为用户此刻唯一的信息就是"球在画面里"。
@@ -146,74 +127,6 @@ def parse_seed(text: str) -> tuple[float, float, float]:
     if r <= 0:
         raise SystemExit(f"[错误] --seed 的半径必须 > 0，收到 r={r:g}")
     return x, y, r
-
-
-class RadiusGate:
-    """逐帧半径一致性门，同时负责统计。抽成类是为了能被测（判定与打印分开）。
-
-    门有两级，管的是两件不同的事：
-
-    - **跳变护栏**（``MAX_RADIUS_JUMP``）：这一帧的半径相对上一帧跳了 8% 以上，
-      说明细化射线抓到了别的东西。**只回退半径**（沿用上一帧），帧仍然算有效 ——
-      球心与轨迹是这一帧量到的，只有半径没量到。
-    - **半径带**：整帧不认。锚点分两种，**这是本轮最要紧的一处**：
-        * 给了 ``--seed``：锚 ``seed_r``，范围 ``[0.75, 1.35]×seed_r``。
-          种子是用户"就这个球"的声明，也就是这一趟的**尺度基准**；
-          拿它当锚，才不会像滚动中位那样自证（见 `SEED_BAND_LO` 的注释）；
-        * 没给种子：只能锚最近 30 帧的滚动中位（±25%）。它**证明不了**
-          "这就是那颗球"，所以报告里必须同时打 `[尺度]` 那条警告 ——
-          门的强度不许大于它实际能保证的东西。
-
-    分开的理由：跳变是"这一帧没量好"，带越界是"跟错目标了"，前者可以修补，
-    后者只能丢弃 —— 混成一个门就分不出该重测还是该重捕。
-    """
-
-    def __init__(self, seed_radius: float | None = None) -> None:
-        self.seed_radius = float(seed_radius) if seed_radius is not None else None
-        self.window: deque[float] = deque(maxlen=RADIUS_WINDOW)
-        self.r_prev = self.seed_radius
-        if self.r_prev is not None:
-            # 种子半径就是"第一份已接受半径"：之后没给种子时才用的滚动中位
-            # 也以它为起点，免得第一帧细化失败把锚定在背景上。
-            self.window.append(self.r_prev)
-        self.jumps = 0
-        self.inconsistent = 0
-        self.jump_ratios: list[float] = []
-        self.radii: list[float] = []      # 全部已接受半径（统计用，不受窗口长度限制）
-
-    def band(self) -> tuple[float, float] | None:
-        """本门此刻的接受区间；没给种子且样本不足时返回 ``None``（只跳变护栏生效）。"""
-        if self.seed_radius is not None:
-            return (self.seed_radius * (1.0 - SEED_BAND_LO),
-                    self.seed_radius * (1.0 + SEED_BAND_HI))
-        if len(self.window) >= 3:
-            med = float(np.median(self.window))
-            return (med * (1.0 - RADIUS_BAND), med * (1.0 + RADIUS_BAND))
-        return None
-
-    def accept(self, r: float) -> tuple[float | None, str]:
-        """返回 ``(本帧采用的半径 或 None, 判定)``；判定 ∈ ok / jump / inconsistent。
-
-        **顺序要紧**：带必须先判、且判在**这一帧量到的** ``r`` 上。
-        如果先跑跳变护栏，它会先把 ``r`` 拉回上一帧（8% 以内），而带至少 25% ——
-        被拉回的值永远进不了带外，带就成了永不触发的死代码。
-        """
-        band = self.band()
-        if band is not None and not (band[0] <= r <= band[1]):
-            self.inconsistent += 1
-            return None, "inconsistent"
-        verdict = "ok"
-        if self.r_prev is not None and self.r_prev > 1e-6:
-            ratio = abs(r - self.r_prev) / self.r_prev
-            self.jump_ratios.append(ratio)
-            if ratio > MAX_RADIUS_JUMP:
-                verdict = "jump"
-                self.jumps += 1
-                r = self.r_prev          # 沿用上一帧；见类 docstring
-        self.window.append(float(r))
-        self.radii.append(float(r))
-        self.r_prev = float(r)
-        return float(r), verdict
 
 
 def loss_segments(bad_frames: list[int]) -> list[tuple[int, int]]:
@@ -288,7 +201,8 @@ def consistency_lines(*, total: int, accepted: int, no_detection: int,
                       inconsistent: int, jumps: int, radii: list[float],
                       jump_ratios: list[float], bad_frames: list[int],
                       fps: float,
-                      seed: tuple[float, float, float] | None) -> list[str]:
+                      seed: tuple[float, float, float] | None,
+                      tracker: TrackerConfig | None = None) -> list[str]:
     """四段报告：有效帧 / 一致性 / 丢失 / 尺度。抽成纯函数是为了能被测。
 
     口径（本项目刻意不让"检出率"单独出现在屏幕上）：
@@ -349,10 +263,14 @@ def consistency_lines(*, total: int, accepted: int, no_detection: int,
         lines.append("[尺度] 无人工种子：半径未经确认，绝对深度不可信"
                      "（自动检测只能给出「有个圆」，不能证明是这个球）")
     else:
-        lo = seed[2] * (1.0 - SEED_BAND_LO)
-        hi = seed[2] * (1.0 + SEED_BAND_HI)
+        # 带的下/上界必须与 `RadiusGate` 实际用的**同一份**门限，否则这行报告
+        # 和门的行为会各说各话。门限单点在 `TrackerConfig`，两者都读它。
+        tcfg = tracker if tracker is not None else TrackerConfig()
+        lo = seed[2] * (1.0 - tcfg.radius_seed_band_lo)
+        hi = seed[2] * (1.0 + tcfg.radius_seed_band_hi)
         lines.append(f"[尺度] 人工种子 {seed[2]:g} px 锚定：接受半径 "
-                     f"{lo:.1f}~{hi:.1f} px（−{SEED_BAND_LO:.0%} / +{SEED_BAND_HI:.0%}）")
+                     f"{lo:.1f}~{hi:.1f} px（−{tcfg.radius_seed_band_lo:.0%} / "
+                     f"+{tcfg.radius_seed_band_hi:.0%}）")
     return lines
 
 
@@ -621,7 +539,8 @@ def main() -> int:
         frames_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict] = []
-    gate = RadiusGate(seed[2] if seed is not None else None)
+    # 门限单点在 cfg.tracker（`TrackerConfig` 的帧层五个字段），门本身在库层。
+    gate = RadiusGate(seed[2] if seed is not None else None, cfg=cfg.tracker)
     hits = 0          # 有效帧：过了半径一致性门的帧
     total = 0
     coast = 0
@@ -633,7 +552,11 @@ def main() -> int:
             ok, frame, t = src.read()
             if not ok or frame is None:
                 break
-            vis, result = pipe.process_and_render(frame, t)
+            # 先 `process`（检测 + 跟踪 + 默认按检测器半径算一次三维），等门判完、
+            # 深度定死之后再 `render` —— 这样视频 HUD 读到的 `position_3d` 就是
+            # 下面"唯一一处"按过门半径重算的那个值（否则 HUD 会报框半径的深度、
+            # CSV 报细化半径的深度，同一趟两个深度）。
+            result = pipe.process(frame, t)
             total += 1
             if result.track is not None and result.track.coasting:
                 coast += 1
@@ -671,10 +594,6 @@ def main() -> int:
                 if det is None:
                     no_detection += 1
 
-            if writer is not None:
-                writer.write(vis)
-            if frames_dir is not None:
-                cv2.imwrite(str(frames_dir / f"frame_{total:06d}.png"), vis)
             row = {
                 "frame": result.frame_index,
                 "t": round(result.t, 5),
@@ -692,24 +611,35 @@ def main() -> int:
                 "ay": round(result.track.ay, 3) if result.track else "",
                 "coasting": int(result.track.coasting) if result.track else "",
             }
-            # 没通过门的帧**不进轨迹**（也就没有 X_m/Y_m/Z_m，也不进可视化文件）：
-            # 一帧被拒，它的半径就是不可信的，而 Z=f·D/(2r) 会把这份不可信
-            # 1:1 地带进深度。留着它等于把被拒的那一帧又偷偷塞回结果里。
-            # 三维点必须用**过门的那个半径**重算。pipeline 的 position_3d 是用
-            # 检测器给的半径算的 —— specular 下那就是 CSRT 框的 max(w,h)/2，
-            # 它回答"框多大"，不是"球多大"。拿它算 Z 等于把深度锁成一个常数。
+            # ---- 三维点：一个产物里只允许有一个深度 ----
+            # 唯一的"哪个半径进 Z"的决定点就是这里：过门的细化半径 accepted_r。
+            # 它**同时**决定 CSV 行（X_m/Y_m/Z_m）与 `result.position_3d`
+            # （视频 HUD / 3D 面板读的就是它），两者必然是同一个数。
+            #
+            # 为什么过门的半径才是权威：帧层门（`RadiusGate`）的 accepted_r 是
+            # "这一帧真的从边缘量到、且过门"的半径；而 pipeline 默认用的
+            # `best.radius` 在 specular 下是 CSRT 框的 `max(w,h)/2`，回答"框多大"、
+            # 不是"球多大"（拿它算 Z 等于把深度锁成一个常数）。
             #
             # 为什么不能"打印用细化的、落盘用框半径的"（2026-10-30 实测）：
-            # 同一趟跑出两个深度 —— 报告说 91.2 px / Z 0.164 m，
-            # 可视化文件里是 70.8 px / Z 0.212 m（差 29%）。一个产物里只允许
-            # 有一个深度，否则下一个人会拿错的那个去做结论。
+            # 同一趟跑出两个深度 —— 报告 91.2 px / Z 0.164 m，可视化文件里是
+            # 70.8 px / Z 0.212 m（差 29%）。一个产物里只允许有一个深度，
+            # 否则下一个人会拿错的那个去做结论。
+            #
+            # "半径 → 深度"的算法只此一处（`pipe.apply_depth`），不在 app 里另写。
+            # 没过门的帧**没有可信深度**：连 `position_3d` 一起清掉 —— 别让深度
+            # 只从 CSV 里消失、却还挂在视频画面上（那正是"两个深度"的来源）。
             if accepted_r is not None and pipe.camera is not None and result.track is not None:
-                z = pipe.camera.depth_from_radius(
-                    float(accepted_r), float(result.track.x), float(result.track.y))
-                if np.isfinite(z) and 0.01 < z < 100.0:
-                    p = pipe.camera.backproject(float(result.track.x), float(result.track.y), z)
-                    row.update({"X_m": round(float(p[0]), 5), "Y_m": round(float(p[1]), 5),
-                                "Z_m": round(float(p[2]), 5)})
+                if not pipe.apply_depth(result, float(accepted_r),
+                                        float(result.track.x), float(result.track.y)):
+                    result.position_3d = None
+            else:
+                result.position_3d = None
+            if result.position_3d is not None:
+                # 行与 HUD 取**同一个**三元组（CSV 的 5 位精度就是画面上显示的数）
+                p = np.round(np.asarray(result.position_3d, dtype=np.float64), 5)
+                row.update({"X_m": float(p[0]), "Y_m": float(p[1]), "Z_m": float(p[2])})
+                result.position_3d = p
             if result.prediction is not None and len(result.prediction):
                 n = len(result.prediction) - 1
                 row.update({
@@ -717,6 +647,13 @@ def main() -> int:
                     "pred_y_end": round(float(result.prediction[n][1]), 3),
                 })
             rows.append(row)
+
+            # 深度已定死，现在才渲染（HUD 与 CSV 用同一个 depth）。
+            vis = pipe.render(frame, result)
+            if writer is not None:
+                writer.write(vis)
+            if frames_dir is not None:
+                cv2.imwrite(str(frames_dir / f"frame_{total:06d}.png"), vis)
             if not args.no_show:
                 wins.show(WINDOW, vis)
                 key = cv2.waitKey(1) & 0xFF
@@ -742,7 +679,7 @@ def main() -> int:
             total=total, accepted=hits, no_detection=no_detection,
             inconsistent=gate.inconsistent, jumps=gate.jumps,
             radii=gate.radii, jump_ratios=gate.jump_ratios, bad_frames=bad_frames,
-            fps=src_fps, seed=seed):
+            fps=src_fps, seed=seed, tracker=cfg.tracker):
         print(line)
     code, lines = hit_report(hits, total, method,
                              detector_error=getattr(pipe.detector, "last_error", ""))

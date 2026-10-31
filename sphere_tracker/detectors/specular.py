@@ -14,6 +14,19 @@
 所以本检测器**要求人工 seed**（`--seed x,y,r`，右路另给 `--seed-right`）。
 自动初始化不可靠（Hough top-1 可偏 528 px），不假装全自动。
 丢失时返回空列表，**绝不** snap 到远处的 Hough 圆。
+
+圆心与半径**出处不同**（`B-130` / `B-132`）
+--------------------------------------------
+- **半径**只能来自人工 seed / CSRT 框：镜面球整圈只有 25%~35% 有梯度，且球内
+  强反射的半径明显更小，边缘法**量不出**真半径；
+- **圆心**不能来自高光斑：球面反射是视角相关的，高光斑在左右视图落在球面不同
+  位置，于是"追高光的框中心"在左右图天然错位（实测约 6 px），**双目三角化要的是
+  轮廓圆心**。
+
+因此跟踪出框后，默认再用亚像素射线拟合把圆心钉到球轮廓上（`refine_center`），
+半径仍取框；拟合不出足够梯度时原样保留框中心。产出的 `Detection.extra`
+里记 `center_source`（`"contour"` / `"box"`）与 `center_shift_px`，让"这个圆心
+是怎么来的"可自证，而不是靠下游猜。
 """
 
 from __future__ import annotations
@@ -24,6 +37,7 @@ import cv2
 import numpy as np
 
 from ..config import DetectorConfig
+from ..geometry import refine_circle_subpixel_checked
 from ..types import Detection
 from .base import BaseDetector
 
@@ -121,6 +135,33 @@ class SpecularBallDetector(BaseDetector):
             return cv2.legacy.TrackerCSRT_create()
         return None
 
+    def _refine_center(self, gray: np.ndarray, cx: float, cy: float,
+                       radius: float) -> tuple[float, float, str, float]:
+        """把跟踪框中心钉到球**轮廓**上，返回 ``(cx, cy, 来源, 位移 px)``。
+
+        为什么只取圆心、不用它拟合出的半径：镜面球的**半径**无法从边缘量
+        （`B-130`：整圈只有 25%~35% 有梯度，球内强反射的半径又明显更小），
+        所以半径仍以人工 seed / CSRT 框为准；而**圆心**必须来自轮廓、不能来自
+        高光斑（`B-132`：高光斑随视角落在球面不同位置，左右视图中心天然错位
+        约 6 px，直接拿它配对会三角化出一个"看起来正常"的错点）。
+
+        拟合不出足够梯度、或拟合结果离原中心太远（多半吸到了背景边缘/内部反射）
+        时，**原样保留框中心**（来源记 ``"box"``）—— 只改善，不劣化。
+        """
+        c = self.cfg.specular
+        if not c.refine_center:
+            return cx, cy, "box", 0.0
+        search = float(c.refine_center_search_px) or float(np.clip(
+            0.25 * radius, c.refine_center_min_search_px, c.refine_center_max_search_px))
+        nx, ny, _nr, ok = refine_circle_subpixel_checked(gray, cx, cy, radius,
+                                                         search=search)
+        if not ok:
+            return cx, cy, "box", 0.0
+        shift = float(np.hypot(nx - cx, ny - cy))
+        if shift > 0.5 * radius:
+            return cx, cy, "box", shift
+        return float(nx), float(ny), "contour", shift
+
     # ------------------------------------------------------------------
     def detect(self, frame: np.ndarray, ctx=None) -> list[Detection]:
         c = self.cfg.specular
@@ -169,8 +210,11 @@ class SpecularBallDetector(BaseDetector):
                 self._recent.clear()
                 self._recent.append((x, y))
                 self.last_error = ""
-                return [Detection(x=x, y=y, radius=r, score=1.0, method=self.name,
-                                  extra={"state": "seed", "bbox": bbox})]
+                rx, ry, csrc, cshift = self._refine_center(gray, x, y, r)
+                return [Detection(x=rx, y=ry, radius=r, score=1.0, method=self.name,
+                                  parts={"center_shift_px": cshift},
+                                  extra={"state": "seed", "bbox": bbox,
+                                         "center_source": csrc})]
             return []
 
         ok, bbox = self._tracker.update(track_frame)
@@ -233,19 +277,26 @@ class SpecularBallDetector(BaseDetector):
                                    "判为丢了（不再报静止背景）")
                 self._tracker = None
                 return []
+        # ⚠️ 所有门控（跳变 / 模板 / 静止）都用**框中心**：它们是"CSRT 有没有跟丢"
+        # 的判据，混进口径不同的轮廓圆心只会让门限变得无法解释。轮廓圆心只在
+        # 出口处替换，供三角化用。
+        rx, ry, csrc, cshift = self._refine_center(gray, cx, cy, radius)
         self._snapshot = {
             "center": (round(cx, 1), round(cy, 1)), "radius": round(radius, 1),
             "ncc": round(ncc, 3), "motion": round(motion, 2), "jump": round(jump, 2),
             "bbox": (x, y, w, h), "frame": self._frames_since_seed,
+            "center_source": csrc, "center_shift_px": round(cshift, 2),
         }
         self.last_error = ""
         return [Detection(
-            x=cx, y=cy, radius=radius,
+            x=rx, y=ry, radius=radius,
             score=float(max(0.0, min(1.0, 0.6 * max(0.0, ncc) + 0.4 * min(1.0, motion / 30.0)))),
             method=self.name,
-            parts={"ncc": float(ncc), "motion": float(motion), "jump": float(jump)},
+            parts={"ncc": float(ncc), "motion": float(motion), "jump": float(jump),
+                   "center_shift_px": cshift},
             extra={"state": "track", "bbox": (x, y, w, h),
-                   "frames_since_seed": self._frames_since_seed},
+                   "frames_since_seed": self._frames_since_seed,
+                   "center_source": csrc},
         )]
 
     def debug_snapshot(self) -> dict:

@@ -222,32 +222,21 @@ class SpherePipeline:
         self._frame_index += 1
 
         # ---- 三维：像素 + 由球半径反推的深度 -------------------------
+        # `apply_depth` 是"半径 → 深度"的**唯一**出口（见该方法的文档）：这里先按
+        # 检测器给的半径算一次；若调用方（如 `run_video`）另有"过帧层门"的细化半径，
+        # 它会再调一次覆盖 —— 最终进产物的深度只有一个。
+        #
+        # 用"原始观测"的圆心与半径做三维重建：半径直接决定深度，用滤波后的半径
+        # 会引入滞后，深度就会跟着飘。**必须带上圆心坐标**：有畸变模型时要按该位置
+        # 的局部缩放校正半径，否则同一个球在画面边缘会比中心"看起来更大"，深度随之
+        # 偏近（2026-10-28 接 P1a 时发现只传半径等于校正没生效）。
         if (
             self.cfg.camera.enable_3d
             and self.camera is not None
             and state is not None
             and best is not None
-            and best.radius > 1e-3
         ):
-            # 用"原始观测"的圆心与半径做三维重建：半径直接决定深度，
-            # 用滤波后的半径会引入滞后，深度就会跟着飘。
-            # **必须带上圆心坐标**：有畸变模型时要按该位置的局部缩放校正半径，
-            # 否则同一个球在画面边缘会比中心"看起来更大"，深度随之偏近
-            # （2026-10-28 接 P1a 时发现只传半径等于校正没生效）。
-            z = self.camera.depth_from_radius(best.radius, best.x, best.y)
-            if np.isfinite(z) and 0.01 < z < 100.0:
-                pos = self.camera.backproject(best.x, best.y, z)
-                state.z = float(z)
-                if self.history3d:
-                    prev = self.history3d[-1]
-                    dt = state.t - prev.t
-                    if dt > 1e-6 and prev.z is not None:
-                        state.vz = float((z - prev.z) / dt)
-                result.position_3d = pos
-                self.history3d.append(
-                    TrailPoint(t=state.t, x=float(pos[0]), y=float(pos[1]), z=float(pos[2]),
-                               radius=float(best.radius), score=1.0)
-                )
+            self.apply_depth(result, best.radius, best.x, best.y)
 
         # ---- 轨迹拖尾（画图用） -------------------------------------
         result.trail = list(track.trail) if track is not None else []
@@ -289,6 +278,56 @@ class SpherePipeline:
                 )
 
         return result
+
+    # ------------------------------------------------------------------
+    def apply_depth(self, result: FrameResult, radius: float,
+                    x: float | None = None, y: float | None = None) -> bool:
+        """用**给定的像素半径**重建这一帧的三维，写入 ``state.z`` / ``history3d`` / ``position_3d``。
+
+        ## 为什么单独抽出来（S1c，2026-10-31）
+
+        单目深度 ``Z = f·D/(2r)`` 完全由半径决定，而半径有两个来源：
+
+        - `process()` 默认用**检测器给的**半径（``best.radius``）。在 specular 下
+          它就是 CSRT 框的 ``max(w,h)/2`` —— 回答"框多大"，不是"球多大"；
+        - `run_video` 用**过帧层门**（`RadiusGate.accept`）的细化半径 —— 回答
+          "这一帧真的从边缘量到、且过门"的半径。
+
+        两个来源若各自算一次，**同一趟就会有两个深度**（2026-10-30 实测差 29%：
+        视频 HUD 报框半径的 Z、CSV/可视化文件报细化半径的 Z）。所以这里把
+        "半径 → 深度"收敛成**只有一处实现**：谁决定半径，谁就调这里一次。
+
+        重复调用同一帧时**替换**那一点（而不是追加），``history3d`` 不会多出
+        一个点，``vz`` 仍基于真正的上一帧。
+
+        返回是否真的写入了三维（半径非法 / 相机缺失 / 深度越界时为 ``False``）。
+        """
+        state = result.track
+        if state is None or self.camera is None or radius is None or radius <= 1e-3:
+            return False
+        if x is None or y is None:
+            x, y = state.x, state.y
+        z = self.camera.depth_from_radius(radius, x, y)
+        if not (np.isfinite(z) and 0.01 < z < 100.0):
+            result.position_3d = None
+            return False
+        pos = self.camera.backproject(x, y, z)
+        state.z = float(z)
+        # 同一帧被重算（先框半径、后过门半径）时，先撤掉该帧上一个历史点 ——
+        # 保证 history3d 一帧只有一个点。
+        if self.history3d and abs(self.history3d[-1].t - state.t) < 1e-9:
+            self.history3d.pop()
+        if self.history3d:
+            prev = self.history3d[-1]
+            dt = state.t - prev.t
+            if dt > 1e-6 and prev.z is not None:
+                state.vz = float((z - prev.z) / dt)
+        result.position_3d = pos
+        self.history3d.append(
+            TrailPoint(t=state.t, x=float(pos[0]), y=float(pos[1]), z=float(pos[2]),
+                       radius=float(radius), score=1.0)
+        )
+        return True
 
     # ------------------------------------------------------------------
     def render(self, frame: np.ndarray, result: FrameResult,

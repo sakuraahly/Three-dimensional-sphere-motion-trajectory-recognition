@@ -51,6 +51,42 @@ GEOM_SUSPECT_RATIO = 4.0
 # 没有标定自报值时的绝对判据：中位偏差超过 3 px 就算可疑（默认门限 2.5 px 的量级）。
 GEOM_SUSPECT_PX = 3.0
 
+# 配对门限 = k × 标定自报极线 RMS。加了这三个常量，是为了把"门限该多大"
+# 这件以前写死的事**显式化**：门限随标定质量走，而不是永远钉在 2.5 px。
+EPI_GATE_K = 4.0          # 门限 = k × 标定自报极线 RMS
+EPI_GATE_MIN_PX = 1.0     # 下限
+EPI_GATE_MAX_PX = 6.0     # 上限
+
+
+def epipolar_gate_px(quality: dict | None, k: float = EPI_GATE_K,
+                     fallback: float = 2.5) -> float:
+    """按标定质量给出配对门限（像素）。``quality`` 取 ``rig.quality`` 那份字典。
+
+    语义：只有 ``quality["epipolar_rms"]`` 是**有限的、正的实数**时才按它算，
+    否则一律回退到 ``fallback``（默认 2.5 px，与历史硬编码门限一致）。
+
+    为什么这么定：
+
+    ① **k = 4.0**：与 :data:`GEOM_SUSPECT_RATIO` 同源 —— 那里判"录像与标定
+       不一致"用的就是"实测偏差 ≥ 标定自报的 4 倍"。配对门限取同一个倍数，
+       含义统一为"偏差到自报值的 4 倍就算可疑"。本机自报极线 RMS 是 0.584 px，
+       0.584 × 4 ≈ 2.34，已经很接近今天的硬编码 2.5 px —— 所以这次**不是放宽
+       门限**，只是把"2.5 ≈ 4.3×RMS"这层隐式关系写成显式的 4×RMS。
+
+    ② **要上限**：极线 RMS 大的标定（例如 3 px）若照搬 4 倍会得到 12 px 门限，
+       那等于把极线约束关掉了（校正后左右点的 y 差本来只该是亚像素~像素级），
+       任何右图候选都能配上，配对率虚高而三维结果不可信。上限 6 px 托底。
+
+    ③ **0.0 要当无效**：若把 RMS = 0 当成合法值，门限会算成 0，于是**每一个**
+       候选都因 ``dy > 0`` 被拒，配对率恒为 0；而这不会抛错，只会静默地
+       "什么都配不上" —— 典型的静默失效。同理 NaN / inf / 非数 / 键缺失
+       也必须回退，绝不能拿它们去乘。
+    """
+    rms = quality.get("epipolar_rms") if isinstance(quality, dict) else None
+    if isinstance(rms, (int, float)) and math.isfinite(rms) and rms > 0.0:
+        return min(max(k * rms, EPI_GATE_MIN_PX), EPI_GATE_MAX_PX)
+    return fallback
+
 
 @dataclass
 class MatchConfig:
@@ -153,6 +189,22 @@ def match_epipolar(
     return best, (best_dy if best is not None else float("inf"))
 
 
+def epipolar_dy(rig: StereoRig, det_left: Detection | None,
+                candidates_right: list[Detection]) -> float | None:
+    """两路都检出时，**校正后** v 差的最小值（px）；缺一边返回 ``None``。
+
+    这是"最像对应点"的那个偏差，也是几何诊断唯一采样的量：只测量、不配对、
+    不改任何门限。取最小而不是取"配对成功的那个"，是为了最不容易冤枉几何。
+
+    为什么单列一个函数：这一段以前在 :meth:`StereoReconstructor._match_frame`
+    与录前几何守卫里各写一遍，改口径时最怕两边不同步；现在只留这一处。
+    """
+    if det_left is None or not candidates_right:
+        return None
+    y1 = rectify_point_left(rig, det_left.x, det_left.y)[1]
+    return min(abs(y1 - rectify_point_right(rig, c.x, c.y)[1]) for c in candidates_right)
+
+
 def triangulate_one(
     rig: StereoRig,
     det_left: Detection,
@@ -188,6 +240,67 @@ def _project(P: np.ndarray, xyz: np.ndarray) -> np.ndarray:
     """用 3x4 投影矩阵把（校正后左相机系下的）三维点投影到像素。"""
     h = np.asarray(P, np.float64) @ np.append(np.asarray(xyz, np.float64), 1.0)
     return h[:2] / h[2]
+
+
+@dataclass
+class GeometryVerdict:
+    """一段录像的极线几何判读结果（**唯一**判据实现，见 :func:`geometry_verdict`）。
+
+    为什么单独做一个类型：这套判据以前只在 `geometry_lines()` 里、而且只在
+    **整段跑完之后**才用得上；`B-131` 的教训是"跑了半天才知道录像与标定对不上"。
+    现在提前判读与最后出报告共用同一个函数，避免两处各写一套门限（本项目
+    2026-10-30 就因为两处判据打架而互相矛盾过）。
+    """
+
+    n: int
+    med: float
+    p95: float
+    epipolar_rms: float = float("nan")   # 标定自报值；取不到就是 nan（**不编数**）
+    epipolar_max: float = float("nan")
+    suspect: bool = False                # 判"录像与标定不一致"
+
+    @property
+    def has_ref(self) -> bool:
+        """标定有没有给出可用的自报极线误差。"""
+        return math.isfinite(self.epipolar_rms) and self.epipolar_rms > 0
+
+    @property
+    def ratio(self) -> float:
+        """实测中位 / 标定自报；没有自报值时是 nan。"""
+        return self.med / self.epipolar_rms if self.has_ref else float("nan")
+
+
+def geometry_verdict(dy_samples, quality=None,
+                     min_samples: int = GEOM_MIN_SAMPLES) -> GeometryVerdict | None:
+    """把逐帧的"校正后左右圆心 y 差"读成判读结果；样本不足返回 ``None``。
+
+    `dy_samples` 是**校正后**的 v 差（原始像素里混着畸变与校正旋转，不能拿去
+    跟标定的 `epipolar_rms` 比）。`quality` 是标定的质量块（取 `epipolar_rms` /
+    `epipolar_max`）。
+
+    判据两条，缺一不可：
+      - 有标定自报值：``中位 / rms >= GEOM_SUSPECT_RATIO`` **且** ``中位 >= GEOM_SUSPECT_PX``；
+        （两个都要：只看比值会把"rms 极小 + 中位 1 px"也判成可疑，只看绝对值
+        又浪费了标定自报这个可比基准）
+      - 没有自报值：只看 ``中位 >= GEOM_SUSPECT_PX`` —— 别拿"不知道"当"没问题"。
+    """
+    a = np.asarray(list(dy_samples), np.float64)
+    a = a[np.isfinite(a)]
+    if a.size < min_samples:
+        return None
+    med = float(np.median(a))
+    p95 = float(np.percentile(a, 95))
+    q = quality or {}
+    try:
+        rms = float(q.get("epipolar_rms", float("nan")))
+        worst = float(q.get("epipolar_max", float("nan")))
+    except (TypeError, ValueError):
+        rms = worst = float("nan")
+    has_ref = math.isfinite(rms) and rms > 0
+    suspect = ((med / rms >= GEOM_SUSPECT_RATIO and med >= GEOM_SUSPECT_PX)
+               if has_ref else (med >= GEOM_SUSPECT_PX))
+    return GeometryVerdict(n=int(a.size), med=med, p95=p95, epipolar_rms=rms,
+                           epipolar_max=worst, suspect=bool(suspect))
 
 
 @dataclass
@@ -265,9 +378,9 @@ class StereoReconstructor:
         # 几何诊断的样本：两路都有检出的帧才量，量的是**校正后**的 v 差
         # （原始像素的 y 差里混着畸变与校正旋转，不能拿去跟标定的 epipolar_rms 比）。
         # 取候选里最小的那个 —— 那才是"最像对应点"的偏差，最不容易冤枉几何。
-        y1 = rectify_point_left(self.rig, left.x, left.y)[1]
-        self.dy_samples.append(min(
-            abs(y1 - rectify_point_right(self.rig, c.x, c.y)[1]) for c in right_dets))
+        dy = epipolar_dy(self.rig, left, right_dets)
+        if dy is not None:
+            self.dy_samples.append(dy)
         matched, dy = match_epipolar(self.rig, left, right_dets, self.cfg)
         if matched is None:
             self.n_rejected += 1
@@ -445,6 +558,53 @@ class StereoReconstructor:
         lines = self.geometry_lines()
         return "" if not lines else "\n" + "\n".join(lines)
 
+    def geometry_failure_message(self, v: GeometryVerdict | None = None,
+                                 center_box_share: float | None = None) -> str:
+        """"录像与标定对不上"的报错文案（**判据不在这里**，判在 :func:`geometry_verdict`）。
+
+        为什么要单独有这句话：`B-131`（2026-10-30 实测）那段会话 dy 中位
+        11.3~12.4 px、匹配率 1/30，而用户唯一的反馈是"整段跑完之后的 [诊断]"。
+        把它提前说，省下的不只是时间 —— 更重要的是**不给"再调调 --max-epipolar"
+        留时间**：把门限放大只会把错配变成看起来正常的数字。
+
+        `center_box_share` 是**召回前**先排除的近因：圆心没能钉到轮廓上的帧占比
+        （`center_source == "box"`，由调用方从检测器统计）。`B-132` 已量过：左右高光
+        在球面上落在不同位置，圆心退回框中心时 y 差本就错开 ≈6 px —— 与"几何坏掉"
+        长得一样，但修法相反。不说出来，程序会把人引去重标定（冤枉且费时）。
+
+        调用方负责决定"要不要因此停下"（`run_stereo_video` 的录前守卫就是停下来）；
+        这里只负责把"差在哪、下一步做什么"写清楚。
+        """
+        v = v or geometry_verdict(self.dy_samples, getattr(self.rig, "quality", None))
+        if v is None:                                        # 样本不足：不编结论
+            return ""
+        ref = (f"标定自报 极线误差 {v.epipolar_rms:.2f} px，相差 {v.ratio:.0f} 倍"
+               if v.has_ref else "标定没给自报极线误差，按绝对值判（中位 ≥ 3 px 即可疑）")
+        # 只有"多数帧都没钉到轮廓"才提这条：少数帧失败不足以解释整段的中位偏差。
+        caveat = ""
+        if center_box_share is not None and center_box_share > 0.5:
+            # 措辞是"检出"不是"帧"：调用方按**左右两侧的检出**计数，与逐帧的中位
+            # 偏差分母不同（少数帧只有一路检出）。说"帧"会比实际略偏。
+            caveat = (
+                f"⚠ 但先排除一个更近的原因：这段录像的左右检出里有 {center_box_share:.0%} "
+                "的球心**没钉到轮廓上**（center_source=box，轮廓梯度不足、亚像素细化失败）。\n"
+                "  左右高光在球面上落在不同位置，圆心退回框中心时 y 差本就错开 ≈6 px，"
+                "**与几何坏掉长得一样**。\n"
+                "  先让轮廓出得来（曝光/对焦/补光）再重跑：y 差回落即说明是圆心口径问题，"
+                "不是标定问题。\n")
+        return (
+            f"parallel 模式：判出**录像的几何与标定对不上** —— 左右圆心（校正后）y 差"
+            f"实测中位 {v.med:.1f} px（p95 {v.p95:.1f}，n={v.n}），{ref}；"
+            f"当前配对 {self.n_matched}/{self.n_frames}。\n"
+            "这不是『门限太紧』，是**这段录像不能用来重建**：放宽 --max-epipolar 只会"
+            "把错配变成看起来正常的数字（残差与交会角会同时变差）。\n"
+            + caveat
+            + "  第 1 步 确认装置没被碰动：相机是否挪过、改过对焦、左/右是否接反"
+            "（接反时画面完全正常、标定也能过）。\n"
+            "  第 2 步 重新标定（启动程序.bat calibrate）后再重录这一段。\n"
+            "  第 3 步 只想看几何差多少、不要它拦：加 --geometry-guard 0。"
+            + self._geometry_suffix())
+
     def geometry_lines(self) -> list[str]:
         """量出"这段录像的极线几何对不对"，只测量、不改任何门限。
 
@@ -456,38 +616,27 @@ class StereoReconstructor:
 
         样本不足（两路都检出的帧 < `GEOM_MIN_SAMPLES`）时返回空：20 帧以下
         的中位数会误导人，宁可不说。标定自报值取不到时省略那半句，**不编数**。
-        """
-        n = len(self.dy_samples)
-        if n < GEOM_MIN_SAMPLES:
-            return []
-        a = np.asarray(self.dy_samples, np.float64)
-        med = float(np.median(a))
-        p95 = float(np.percentile(a, 95))
-        lines = [f"[诊断] 左右圆心的 y 差实测：中位 {med:.1f} px（p95 {p95:.1f}，n={n}）"]
 
-        quality = getattr(self.rig, "quality", None) or {}
-        try:
-            rms = float(quality.get("epipolar_rms", float("nan")))
-            worst = float(quality.get("epipolar_max", float("nan")))
-        except (TypeError, ValueError):
-            rms = worst = float("nan")
-        has_ref = math.isfinite(rms) and rms > 0
-        if has_ref:
-            tail = f"（max {worst:.2f}）" if math.isfinite(worst) else ""
-            lines.append(f"       这段录像的标定自报 极线误差 {rms:.2f} px{tail}")
-            suspect = med / rms >= GEOM_SUSPECT_RATIO and med >= GEOM_SUSPECT_PX
-            lead = f"相差 {med / rms:.0f} 倍："
+        判据本身在 :func:`geometry_verdict` 里（运行期提前判读走的是同一个）。
+        """
+        v = geometry_verdict(self.dy_samples, getattr(self.rig, "quality", None))
+        if v is None:
+            return []
+        lines = [f"[诊断] 左右圆心的 y 差实测：中位 {v.med:.1f} px"
+                 f"（p95 {v.p95:.1f}，n={v.n}）"]
+        if v.has_ref:
+            tail = f"（max {v.epipolar_max:.2f}）" if math.isfinite(v.epipolar_max) else ""
+            lines.append(f"       这段录像的标定自报 极线误差 {v.epipolar_rms:.2f} px{tail}")
+            lead = f"相差 {v.ratio:.0f} 倍："
         else:
-            # 没有自报值就只比绝对值，别拿"不知道"当"没问题"，也别编一个比值。
-            suspect = med >= GEOM_SUSPECT_PX
             lead = ""
-        if suspect:
+        if v.suspect:
             lines.append(f"       → {lead}录制时的实际几何与标定不一致"
                          "（相机被碰动 / 改过对焦 / 换过装置）")
             lines.append("       → 继续放宽 max_epipolar 只会把错误配对变成数字，"
                          "建议**重新标定**")
-        elif has_ref:
-            lines.append(f"       → 与标定相符（{med / rms:.1f} 倍）：极线几何没问题，"
+        elif v.has_ref:
+            lines.append(f"       → 与标定相符（{v.ratio:.1f} 倍）：极线几何没问题，"
                          "低配对率另有原因（检测丢失 / 遮挡 / 配对策略）")
         else:
             lines.append("       → 实测值本身也不大：极线几何看起来没问题，"

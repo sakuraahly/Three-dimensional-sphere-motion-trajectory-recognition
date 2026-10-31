@@ -98,6 +98,18 @@ class SpecularConfig:
     motion_grace_frames: int = 5
     max_static_frames: int = 20  # 连续这么多帧中心/局部都不动 -> 判为丢了，别继续报背景
     static_motion_eps: float = 1.0
+    # 轮廓圆心：CSRT 锁的是**高光斑**（最显眼的特征），而高光斑在不同视角落在
+    # 球面不同位置，所以左右视图的"框中心"天然错位（实测约 6 px，见 B-132）。
+    # 三角化要的是**轮廓圆心**，因此跟踪得到框中心后，再用亚像素射线拟合把圆心
+    # 钉到球轮廓上（半径仍取框，因为镜面球的半径无法从边缘量，见 B-130）。
+    # 拟合不出足够梯度时原样保留框中心 —— 只改善、不劣化。
+    refine_center: bool = True
+    # 搜索半径（px）：0 = 自动（框半径的 25%，夹在下面两个界之间）。窗口跟着框半径
+    # 走而不是写死 ±2.5：左右视图框半径本就不一样（17.5 vs 24.7），窗口太窄会够不到
+    # 真轮廓；又不能太宽，否则会把球内部的强反射（半径明显更小）吸进来。
+    refine_center_search_px: float = 0.0
+    refine_center_min_search_px: float = 2.5
+    refine_center_max_search_px: float = 8.0
 
 
 @dataclass
@@ -265,6 +277,32 @@ class TrackerConfig:
     # 滞后/超调，这些结构化误差会被拟合放大成"速度误差"。
     # 亚像素检测下，原始观测本身就很干净，所以默认直接用观测值。
     trail_source: str = "measurement"  # "measurement" | "filtered"
+
+    # ---- 帧层半径一致性门（RadiusGate）的五个门限（2026-10-31，S1d′）----
+    # ⚠️ 与上面的 `radius_gate_ratio` 是**两道不同的门**，管的是两件事，不要合并：
+    #   * `radius_gate_ratio`（**关联层**，`BallTracker.update` 里用）：判"这一帧
+    #     的观测配给哪条轨迹"，判不过只影响"检测配给谁"，观测本身不丢；
+    #   * 下面这组（**帧层**，`RadiusGate` 里用）：判"这一帧的半径能不能进 Z"，
+    #     判不过回退上一帧半径、或整帧不认（`accepted_r=None`）。
+    # 拆成五个字段是为了让门限**单点可调**；唯一消费方是 `sphere_tracker.track.RadiusGate`。
+    #
+    # radius_max_jump（跳变护栏）：实测可测帧的半径逐帧变化中位 0.33%、p95 0.87%、
+    # 最大 1.40%，8% 是近 6 倍余量；超过它只可能是细化射线锁到了背景边缘，
+    # 此时**只回退上一帧半径**，帧仍算有效（球心与轨迹是这一帧量到的，只有半径没量到）。
+    radius_max_jump: float = 0.08
+    # radius_window（滚动中位窗口）：30 帧 ≈ 0.86 s @35 fps —— 比这短的波动（抖动）
+    # 交给跳变护栏，比这长的漂移（球真的靠近/远离）必须允许，所以窗口不能再短。
+    radius_window: int = 30
+    # radius_band（无种子时的半径带）：实测可测帧半径的 IQR 只有 ±2.6%（89.2~93.9 px），
+    # 25% 是近 10 倍余量 —— 它挡不住随机抖动（那是跳变护栏的事），只挡"锁到了另一个圆"。
+    radius_band: float = 0.25
+    # radius_seed_band_lo / hi（给了 ``--seed`` 时的半径带）：锚点换成**种子半径**，
+    # 带是 ``seed_r × [1-lo, 1+hi]``。为什么必须锚种子、不能锚滚动中位：中位是**自证**的
+    # ——旧 traj.csv 里 277 帧半径全是 11 px（真值 91），中位就是 11，每帧都"在带内"，
+    # 于是全过。上界给到 35%（不是 25%）是因为球被甩近时半径会变大（实测 +5%）；
+    # 下界 25% 用来挡"锁到小球"（11 px 相对 88 px 是 -87.5%）。
+    radius_seed_band_lo: float = 0.25
+    radius_seed_band_hi: float = 0.35
 
 
 @dataclass

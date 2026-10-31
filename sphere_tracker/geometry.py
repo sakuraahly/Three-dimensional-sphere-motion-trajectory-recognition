@@ -109,16 +109,44 @@ def refine_circle_subpixel(
 
     做法：从粗略圆心向 72 个方向发射射线，在半径附近采样梯度幅值，
     取峰值并用抛物线插值求亚像素位置，得到 72 个精确边缘点，最后做稳健圆拟合。
+
+    ⚠️ **失败时不抛异常，原样返回输入**（`radius < 3.0`、采样起点越界、
+    有效射线不足）。要区分"真的拟合出来了"与"原样退回"，用
+    :func:`refine_circle_subpixel_checked`。
+    """
+    x, y, r, _ = refine_circle_subpixel_checked(
+        gray, cx, cy, radius, n_rays=n_rays, search=search, step=step,
+        min_gradient=min_gradient)
+    return x, y, r
+
+
+def refine_circle_subpixel_checked(
+    gray: np.ndarray,
+    cx: float,
+    cy: float,
+    radius: float,
+    n_rays: int = 72,
+    search: float = 2.5,
+    step: float = 0.25,
+    min_gradient: float = 15.0,
+) -> tuple[float, float, float, bool]:
+    """:func:`refine_circle_subpixel` 的实现，末位多一个 **是否真的细化成功**。
+
+    为什么要这个布尔量：原函数的约定是"失败就把输入原样返回"（`docs/API.md`）。
+    调用方若想**只取圆心、不要它估的半径**（典型用途：双目要跨视图对应的
+    *轮廓圆心*，而半径另有出处），就必须能分辨"真的拟合出了一个圆"与
+    "压根没找到足够梯度"。靠比对"输出是否与输入逐位相同"来分辨，是把语义
+    压在浮点相等上；这里直接给出判据。
     """
     if radius < 3.0 or gray.size == 0:
-        return cx, cy, radius
+        return cx, cy, radius, False
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(gx, gy)
     n_samples = int(2 * search / step) + 1
     offsets = radius - search + step * np.arange(n_samples)
     if offsets[0] <= 1.0:
-        return cx, cy, radius
+        return cx, cy, radius, False
     angles = np.linspace(0.0, 2.0 * math.pi, n_rays, endpoint=False)
     cos_a = np.cos(angles)
     sin_a = np.sin(angles)
@@ -130,7 +158,7 @@ def refine_circle_subpixel(
     rows = np.arange(n_rays)
     valid = (peaks > 0) & (peaks < n_samples - 1) & (prof[rows, peaks] >= min_gradient)
     if int(valid.sum()) < max(8, n_rays // 3):
-        return cx, cy, radius
+        return cx, cy, radius, False
     rows_v = rows[valid]
     k_v = peaks[valid]
     y0 = prof[rows_v, k_v - 1]
@@ -141,7 +169,8 @@ def refine_circle_subpixel(
     delta = np.clip(delta, -1.0, 1.0)
     s = offsets[k_v] + delta * step
     edge = np.stack([cx + s * cos_a[valid], cy + s * sin_a[valid]], axis=1)
-    return fit_circle_robust(edge)
+    fx, fy, fr = fit_circle_robust(edge)
+    return fx, fy, fr, True
 
 
 def contour_circularity(contour: np.ndarray) -> float:

@@ -843,10 +843,17 @@ def test_valid_frame_gate_contract() -> bool:
     import json
     import tempfile
 
-    from apps.run_video import (MAX_RADIUS_JUMP, RADIUS_BAND, RADIUS_WINDOW,
-                                SEED_BAND_HI, SEED_BAND_LO, RadiusGate,
-                                build_vis, consistency_lines, hit_report,
-                                loss_segments, parse_seed)
+    from apps.run_video import (RadiusGate, build_vis, consistency_lines,
+                                hit_report, loss_segments, parse_seed)
+    from sphere_tracker.config import TrackerConfig
+    # 帧层半径门的五个门限现在**单点**在 `TrackerConfig`（2026-10-31 S1d′）：
+    # 本节既验证"越界默认值与改前逐字一致"，也验证"门限真的从配置读"（见 3c）。
+    _tcfg = TrackerConfig()
+    MAX_RADIUS_JUMP = _tcfg.radius_max_jump
+    RADIUS_BAND = _tcfg.radius_band
+    RADIUS_WINDOW = _tcfg.radius_window
+    SEED_BAND_HI = _tcfg.radius_seed_band_hi
+    SEED_BAND_LO = _tcfg.radius_seed_band_lo
 
     checks: list[tuple[str, bool]] = []
 
@@ -898,6 +905,24 @@ def test_valid_frame_gate_contract() -> bool:
     ck("带内但跳 16% → jump、沿用上一帧半径（帧仍算有效）",
        verdict4 == "jump" and abs(r_used4 - 90.4) < 1e-6 and g4.jumps == 1,
        f"verdict={verdict4} r={r_used4:.2f}")
+
+    # ---- 3c. 门限真的从 TrackerConfig 读（2026-10-31 S1d′：门限单点化）----
+    # 把 `radius_max_jump` 调到极端值，同一份输入（都在种子带内）的 jump 判定
+    # 必须跟着变 —— 这是"门限不再写死、真读配置"的功能证据（比 grep 硬）。
+    loose = TrackerConfig()
+    loose.radius_max_jump = 10.0            # 放到极大：任何带内跳变都不过护栏
+    g5 = RadiusGate(seed_radius=90.0, cfg=loose)
+    g5.accept(90.0)
+    _r5, v5 = g5.accept(90.0 * 1.3)         # 跳 30%，仍在带 [67.5,121.5] 内
+    ck("调大 TrackerConfig.radius_max_jump=10 -> 带内跳 30% 不再判 jump",
+       v5 == "ok" and g5.jumps == 0, f"verdict={v5}")
+    tight = TrackerConfig()
+    tight.radius_max_jump = 0.01            # 放到极小：稍有抖动就 jump
+    g6 = RadiusGate(seed_radius=90.0, cfg=tight)
+    g6.accept(90.0)
+    r6, v6 = g6.accept(90.0 * 1.02)         # 跳 2% > 1%
+    ck("调小 TrackerConfig.radius_max_jump=0.01 -> 跳 2% 即判 jump（沿用上一帧半径）",
+       v6 == "jump" and abs(r6 - 90.0) < 1e-6 and g6.jumps == 1, f"verdict={v6} r={r6}")
 
     # ---- 4. 四段报告：拆项加得起来，尺度必须交代 ----
     lines = consistency_lines(
@@ -973,6 +998,34 @@ def test_valid_frame_gate_contract() -> bool:
         f.write_text(json.dumps(vis, ensure_ascii=False), encoding="utf-8")
         ck("落盘后仍是合法 JSON（种子是元组，不转 list 会写不出来）",
            json.loads(f.read_text(encoding="utf-8"))["seed"] == [895.0, 718.0, 88.0])
+
+    # ---- 11. 半径 → 深度只有一个出口：`SpherePipeline.apply_depth`（S1c）----
+    # 单目深度 Z=f·D/(2r)：视频 HUD 读 `result.position_3d`，CSV/可视化文件读
+    # 过门半径算出的三元组。两者必须是**同一个数**，且"半径→深度"只有一处实现
+    # （`apply_depth`），否则同一趟会跑出两个深度（2026-10-30 实测差 29%）。
+    _cfg = AppConfig()
+    _cfg.camera.ball_diameter_m = 0.0216
+    _pipe = SpherePipeline(_cfg)
+    _frame = np.full((480, 640, 3), 60, np.uint8)
+    cv2.circle(_frame, (320, 240), 70, (235, 235, 235), -1)
+    _res = None
+    for _i in range(6):
+        _res = _pipe.process(_frame.copy(), _i * 0.03)
+    ck("pipeline 在 process 里就调了 apply_depth（默认口径 = 检测器半径）",
+       _res is not None and _res.track is not None and _res.position_3d is not None)
+    if _res is not None and _res.track is not None and _res.position_3d is not None:
+        _z_a = float(_res.position_3d[2])
+        _r_b = float(_res.track.radius) * 1.6
+        _ok = _pipe.apply_depth(_res, _r_b, float(_res.track.x), float(_res.track.y))
+        _z_b = float(_pipe.camera.depth_from_radius(
+            _r_b, float(_res.track.x), float(_res.track.y)))
+        ck("apply_depth 用**给定半径**重算（不吃检测器半径）：position_3d 随之变",
+           _ok and abs(float(_res.position_3d[2]) - _z_b) < 1e-9 and abs(_z_b - _z_a) > 1e-6,
+           f"框半径 Z={_z_a:.4f} → 细化半径 Z={_res.position_3d[2]:.4f}")
+        ck("同一帧重算不会在 history3d 里多出一个点（替换而非追加）",
+           sum(1 for p in _pipe.history3d if abs(p.t - _res.track.t) < 1e-9) == 1)
+    ck("半径非法（≤1e-3）→ 不写三维、返回 False",
+       _res is not None and _pipe.apply_depth(_res, 0.0) is False)
 
     ck(f"窗口长度 {RADIUS_WINDOW} 帧 ≈ 0.86 s @35 fps（覆盖不了更长的目标切换）",
        RADIUS_WINDOW == 30)

@@ -25,7 +25,8 @@
   3. 会话里有 `derived/seeds.json` 且没显式给 `--method` -> 自动用 specular；
   4. `parallel` 0 配对的报错要**按分项**给建议（"没检出"不能引向 angled）；
   5. 配对率低时要把"极线偏差 vs 标定自报"量出来——几何对不上时说"重新标定"，
-     而不是让人继续调 `--max-epipolar`。
+     而不是让人继续调 `--max-epipolar`；
+  6. 双目圆心取**轮廓**（不是高光斑）、跑满 N 对先判一次几何（`B-132` / `B-131`）。
 
     python tests/selftest_stereo_branch.py
     python tests/selftest_stereo_branch.py --scenario clean
@@ -53,10 +54,11 @@ import numpy as np
 from calib import StereoRig
 from selftest_synthetic import Scene, make_background, render_frame
 from sphere_tracker.config import AppConfig, ColorConfig
-from sphere_tracker.geometry import CameraModel
+from sphere_tracker.geometry import CameraModel, refine_circle_subpixel, \
+    refine_circle_subpixel_checked
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.types import Detection
-from stereo import MatchConfig, StereoReconstructor
+from stereo import MatchConfig, StereoReconstructor, epipolar_dy, geometry_verdict
 from stereo.triangulate import rectify_point_left, rectify_point_right
 
 # --------------------------------------------------------------------------
@@ -766,6 +768,198 @@ def test_low_rate_advice() -> bool:
     return ok
 
 
+# --------------------------------------------------------------------------
+def test_refine_center_and_geometry_guard() -> bool:
+    """S2a/S2c：双目圆心取**轮廓**（不是高光斑），且几何对不上要早停。
+
+    三组都带真值、都不依赖 CSRT，所以是确定性的（可反复跑出同一结果）。
+
+    ① **证伪"用高光斑当跨视图对应点"**（`B-132`）：同一颗球，左高光偏 12 px、
+       右高光偏 6 px（实测左右高光错位约 6 px、半径差 40%）。用**轮廓圆心**
+       配对，三角测量误差 0.000 mm；用**高光**配对，误差 487 mm —— 数字"算得
+       出来、看着正常"，实际整条轨迹整体歪掉。这就是 S2a 必须存在的原因。
+       （`B-130` 已单独证伪"从边缘量镜面球半径"：整圈只有 25%~35% 有梯度。）
+    ② **证伪"门限放宽就能救"**（`B-131`）：判读必须随 dy 单调分档，且
+       "比值够大"与"绝对值够大"**两个条件都要**——只满足一个不算可疑。
+       否则把 `--max-epipolar` 调大就能把一条错轨迹跑成"看起来正常"。
+    ③ **证伪"CSRT 框中心就是球心"**：合成球图（球 200 / 背景 50 / 偏心高光 255），
+       框中心被高光带偏 3.6 px。细化必须把它拉回真圆心（< 1 px），且**不许**
+       被吸到高光上。反向自证：把 `refine_center` 关掉，那 3.6 px 就留在出口。
+    ④ **守卫的归因**：圆心没钉到轮廓上（`center_source=box`）时的 y 差 ≈6 px 与
+       "几何坏掉"长得一样，但修法相反。得到这个占比就**必须先说圆心口径**；
+       占比 0 / 未报告 / 恰好 50% 都不能出现这条提示（不误伤真几何问题）。
+    """
+    print("----- 圆心的出处（轮廓 vs 高光）+ 几何判读的判据 -----")
+    from sphere_tracker.config import DetectorConfig
+    from sphere_tracker.detectors.specular import SpecularBallDetector
+
+    checks: list[tuple[str, bool]] = []
+
+    # ---- ① 高光当对应点 -> 好看但无意义的三角测量 ----
+    rig = build_rig()
+    P = np.array([0.05, -0.02, 3.0])
+    rv, _ = cv2.Rodrigues(R_REL)
+    ul, vl = cv2.projectPoints(P.reshape(1, 3), np.zeros((3, 1)), np.zeros(3),
+                               K1, D1)[0].reshape(-1, 2)[0]
+    ur, vr = cv2.projectPoints(P.reshape(1, 3), rv, T_REL, K2, D2)[0].reshape(-1, 2)[0]
+    xyz_c = rig.triangulate(np.array([[ul, vl]]), np.array([[ur, vr]]))[0]
+    err_contour_mm = float(np.linalg.norm(xyz_c - rig.R1 @ P)) * 1000
+    xyz_h = rig.triangulate(np.array([[ul + 12.0, vl + 2.0]]),
+                            np.array([[ur + 6.0, vr + 1.0]]))[0]
+    err_hl_mm = float(np.linalg.norm(xyz_h - rig.R1 @ P)) * 1000
+    checks += [
+        (f"① 轮廓圆心配对 -> 误差 {err_contour_mm:.4f} mm（< 1 mm）",
+         err_contour_mm < 1.0),
+        (f"① 高光配对 -> 误差 {err_hl_mm:.0f} mm（> 100 mm，是『1 m 处 ≤10 mm』"
+         "验收线的 10 倍以上，却照样算得出数）", err_hl_mm > 100.0),
+        (f"① 同一装置上：轮廓 {err_contour_mm:.4f} mm vs 高光 {err_hl_mm:.0f} mm ——"
+         "圆心出处错了，几何再准也没用", err_hl_mm > 100.0 * err_contour_mm),
+    ]
+
+    # ---- ② 几何判读：单调分档 + 两个条件都要 ----
+    q = {"epipolar_rms": 0.56, "epipolar_max": 1.53}   # 该会话标定自报（B-131）
+    v = {d: geometry_verdict([d] * 60, q) for d in (1.0, 2.9, 3.0, 5.0, 12.4)}
+    checks += [
+        ("② dy 1.0 px（比标定自报 1.8 倍）-> 不可疑", not v[1.0].suspect),
+        ("② dy 2.9 px：比值 5.2 已超 4，但中位 < 3 px -> **仍不可疑**（两个都要）",
+         not v[2.9].suspect),
+        ("② dy 3.0 px：两个条件同时满足 -> 可疑", v[3.0].suspect),
+        ("② dy 5.0 / 12.4 px -> 可疑（分档单调）", v[5.0].suspect and v[12.4].suspect),
+        ("② 判读值随 dy 单调不减",
+         v[1.0].med <= v[2.9].med <= v[3.0].med <= v[5.0].med <= v[12.4].med),
+        ("② 样本 10 帧（< 20）-> 返回 None，宁可不说话",
+         geometry_verdict([12.4] * 10, q) is None),
+        ("② 标定没自报值（q={}）时按绝对值判：dy 4 px 可疑 / 2 px 不可疑",
+         geometry_verdict([4.0] * 60, {}).suspect
+         and not geometry_verdict([2.0] * 60, {}).suspect),
+    ]
+    dl = Detection(x=float(ul), y=float(vl), radius=10)
+    near = Detection(x=float(ur), y=float(vr), radius=10)
+    far = Detection(x=float(ur), y=float(vr) + 40.0, radius=10)
+    checks += [
+        ("② epipolar_dy 取候选里**最小**的 v 差（不是『配对成功那个』）",
+         epipolar_dy(rig, dl, [far, near]) < 1.0 < epipolar_dy(rig, dl, [far])),
+        ("② epipolar_dy 缺一边 -> None（不编数）",
+         epipolar_dy(rig, None, [near]) is None and epipolar_dy(rig, dl, []) is None),
+    ]
+
+    # ---- ③ 框中心被高光带偏：细化必须拉回轮廓 ----
+    def sphere_gray(cx, cy, r, hl_dx, hl_dy, hl_r=7, size=400):
+        """合成球图：球 200 / 背景 50 / 偏心高光 255（硬边 + 一点离焦）。"""
+        img = np.full((size, size), 50, np.uint8)
+        cv2.circle(img, (cx, cy), r, 200, -1)
+        cv2.circle(img, (cx + hl_dx, cy + hl_dy), hl_r, 255, -1)
+        return cv2.GaussianBlur(img, (3, 3), 0.8)
+
+    gray = sphere_gray(200, 200, 25, 10, 8)
+    det = SpecularBallDetector(DetectorConfig())
+    bx, by = 203.0, 202.0                      # 框中心被高光带偏，半径还是对的
+    err_box = math.hypot(bx - 200.0, by - 200.0)
+    nx, ny, src, shift = det._refine_center(gray, bx, by, 25.0)      # noqa: SLF001
+    err_ref = math.hypot(nx - 200.0, ny - 200.0)
+    to_hl = math.hypot(nx - 210.0, ny - 208.0)
+    checks += [
+        (f"③ 细化后圆心误差 {err_ref:.3f} px < 1 px（框中心本身差 {err_box:.2f} px）",
+         err_ref < 1.0),
+        (f"③ 来源记为 contour、位移 {shift:.2f} px ≈ 框的偏差",
+         src == "contour" and abs(shift - err_box) < 0.5),
+        (f"③ 没被高光吸走：到高光中心 {to_hl:.1f} px 远大于到真圆心 {err_ref:.3f} px",
+         to_hl > 5.0 * max(err_ref, 1e-9)),
+    ]
+    # 反向自证：关掉细化 -> 框中心那 3.6 px 偏差原样留在出口
+    det.cfg.specular.refine_center = False
+    ex, ey, esrc, eshift = det._refine_center(gray, bx, by, 25.0)    # noqa: SLF001
+    checks.append(("③ 关掉 refine_center -> 原样返回框中心、来源 box（偏差留在出口）",
+                   esrc == "box" and eshift == 0.0 and (ex, ey) == (bx, by)))
+    # 只有高光斑、没有球轮廓：搜索窗围绕给定半径(25)，够不到 7 px 的高光边
+    # -> 找不到弧、原样退回（不会把高光本身当成球）
+    hl_only = np.full((400, 400), 50, np.uint8)
+    cv2.circle(hl_only, (200, 200), 7, 255, -1)
+    ox, oy, _r_o, ook = refine_circle_subpixel_checked(hl_only, 203.0, 202.0, 25.0, search=8.0)
+    checks.append(("③ 只有高光斑（半径 7）时不许把高光当球：ok=False、原样返回",
+                   ook is False and (ox, oy) == (203.0, 202.0)))
+    flat = np.full((100, 100), 128, np.uint8)
+    fok = refine_circle_subpixel_checked(flat, 50.0, 50.0, 20.0, search=5.0)
+    checks.append(("③ 全平图 -> ok=False；且非 _checked 版的『原样返回』约定成立",
+                   fok == (50.0, 50.0, 20.0, False)
+                   and refine_circle_subpixel(flat, 50.0, 50.0, 20.0, search=5.0)
+                   == (50.0, 50.0, 20.0)))
+
+    # ---- ④ 守卫的**归因**：圆心没钉到轮廓上时，不许把锅甩给"标定" ----
+    # `B-132`：左右高光在球面上落在不同位置，圆心退回框中心时 y 差本就错开 ≈6 px，
+    # **与"几何坏掉"长得一样**，但修法相反。程序得自己分清，别把用户引去重标定。
+    rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=2.5))
+    rec.dy_samples = [12.4] * 60              # 与 `B-131` 实测同量级
+    m_box = rec.geometry_failure_message(center_box_share=1.0)
+    m_ok = rec.geometry_failure_message(center_box_share=0.0)
+    m_mid = rec.geometry_failure_message(center_box_share=0.5)
+    m_none = rec.geometry_failure_message()
+    checks += [
+        ("④ 多数帧没钉到轮廓（box）-> 文案先指向**圆心口径**，不是重标定",
+         "没钉到轮廓上" in m_box and "center_source=box" in m_box),
+        ("④ 但『第 1/2/3 步』仍在（加了提示不等于少了指导）",
+         all(f"第 {i} 步" in m_box for i in (1, 2, 3))),
+        ("④ 圆心正常（box 占比 0）-> **不出现**这条提示（不误伤真几何问题）",
+         "没钉到轮廓上" not in m_ok),
+        ("④ 边界：恰好 50% 不提（门槛是『多数帧』，> 0.5）",
+         "没钉到轮廓上" not in m_mid),
+        ("④ 调用方没报占比（None）-> 保持原样，不瞎猜",
+         "没钉到轮廓上" not in m_none and "第 1 步" in m_none),
+    ]
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_guard_step() -> bool:
+    """几何守卫的一步判定抽成纯函数后，语义不许变（`B-131` 的验收缺口②）。
+
+    原来这段判定内联在 `run_stereo_video.main()` 的循环里，只有真跑一段坏录像
+    （跑到 `--geometry-guard N` 对）才能碰到，所以它一直不被任何测试覆盖 ——
+    这正是独立 Critic 指出的验收缺口。抽成 `_guard_step` 后可以只喂输入、看输出。
+
+    这里钉的是**状态机语义**，尤其是那个最容易被写错、又最难在真机上发现的点：
+    "跑够了 N 对，但两路同时检出的样本还不够 `GEOM_MIN_SAMPLES`" 时，必须返回
+    `(True, None)` —— **继续等、不消耗这次机会**。若写成 `(False, None)`（原来的
+    `n_pairs == guard_at` 只判一次就是这个效果），丢帧多的录像会**一次也判不成、
+    然后永久放弃**：几何明明坏掉，守卫却静默跳过，用户以为"守过了"。
+    """
+    print("----- 几何守卫的一步判定（纯函数 _guard_step）-----")
+    from apps.run_stereo_video import _guard_step
+    from stereo.triangulate import GEOM_MIN_SAMPLES
+
+    q = {"epipolar_rms": 0.56, "epipolar_max": 1.53}   # 该会话标定自报（B-131）
+
+    checks: list[tuple[str, bool]] = []
+    # ① 没武装 -> 保持原状、不判读
+    checks.append(("① armed=False -> (False, None)",
+                   _guard_step(False, 30, 100, [12.0] * 30, q) == (False, None)))
+    # ② 还没跑够 N 对 -> 继续等，不消耗机会
+    armed, v = _guard_step(True, 30, 10, None, q)
+    checks.append(("② n_pairs < guard_at -> (True, None)", armed and v is None))
+    # ③ 跑够了，但样本不足 -> (True, None)：不消耗这次机会（关键判据）
+    armed, v = _guard_step(True, 30, 30, [0.3] * 5, q)
+    checks.append((f"③ 样本只有 5 个（< GEOM_MIN_SAMPLES={GEOM_MIN_SAMPLES}）"
+                   "-> (True, None)，下次接着看", armed and v is None))
+    # ④ 样本够且一致（与标定自报相符）-> (False, v) 且不可疑
+    armed, v = _guard_step(True, 30, 40, [0.3] * 30, q)
+    checks.append(("④ 30 个 ≈0.3 px（与标定 0.56 相符）-> (False, 不可疑)",
+                   (not armed) and v is not None and not v.suspect))
+    # ⑤ 样本够但明显不一致 -> (False, v) 且可疑
+    armed, v = _guard_step(True, 30, 40, [12.0] * 30, q)
+    checks.append(("⑤ 30 个 ≈12 px（远超标定自报）-> (False, 可疑)",
+                   (not armed) and v is not None and v.suspect))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目链路端到端自测（合成真值）")
     ap.add_argument("--scenario", default="all", choices=["clean", "realistic", "all"])
@@ -795,6 +989,12 @@ def main() -> int:
     print()
 
     advice_ok = test_low_rate_advice()
+    print()
+
+    center_ok = test_refine_center_and_geometry_guard()
+    print()
+
+    guard_ok = test_guard_step()
     print()
 
     scenarios = ["clean", "realistic"] if args.scenario == "all" else [args.scenario]
@@ -856,7 +1056,7 @@ def main() -> int:
         print()
 
     all_ok = (ok and sign_ok and angled_ok and seed_ok and msg_ok
-              and geom_ok and advice_ok)
+              and geom_ok and advice_ok and center_ok and guard_ok)
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1
 

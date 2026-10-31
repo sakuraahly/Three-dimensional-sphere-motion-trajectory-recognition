@@ -23,6 +23,21 @@ COCO_CLASS_COUNT = 80
 #: 自训单类球检测器的默认落点（``apps/tools/train_ball_detector.py --out``）。
 SELF_TRAINED_WEIGHTS = "models/ball_yolo.pt"
 
+#: ``refine_circle_in_box`` 里"框内细化"的搜索半径，相对**框半宽**的比例下/上限。
+#:
+#: 几何依据：YOLO 的框是球的**外接范围**（框总比球大一圈），所以真球半径必然落在
+#: "约框半宽的 0.5〜1.15 倍"内。用**框尺寸**定窗口，而不是继承全局
+#: ``hough_max_radius=80`` —— 那个 80 是给**全图** hough 定的性能上限
+#: （``HoughCircles`` 代价随搜索区间线性上涨，见 config.py 注释），在框内
+#: ~180×180 的小 ROI 里根本不适用：镜面球像素半径约 90 px > 80，
+#: 沿用全局值 hough 必然找不到，细化就退回用框中心当圆心。
+#:
+#: **下界必须收紧**是这一条的关键：镜面球内部有个高光斑（实测半径约 20 px），
+#: 若沿用全局下界 ``min_radius=8``，hough 会"高高兴兴地细化到高光斑上"，
+#: 圆心就偏到球面一侧去了（这个失败模式本项目吃过一次，代号 B-132）。
+REFINE_BOX_RADIUS_LO = 0.5
+REFINE_BOX_RADIUS_HI = 1.15
+
 #: 建议置信度阈值 sidecar 的后缀。训练结束时写在**权重旁边**（``ball_yolo.pt`` →
 #: ``ball_yolo.conf.json``）。
 #:
@@ -186,7 +201,16 @@ def refine_circle_in_box(
     if x2 - x1 < 5 or y2 - y1 < 5:
         return None
     roi = frame[y1:y2, x1:x2]
-    sub = DetectorConfig(**{**cfg.__dict__, "method": "color"})
+    # 搜索半径按**框尺寸**定，不继承全局的 hough_max_radius（见 REFINE_BOX_RADIUS_LO
+    # 的注释）：框是球的外接范围，所以真球半径落在"约框半宽的 0.5〜1.15 倍"内。
+    half = 0.5 * max(box[2] - box[0], box[3] - box[1])
+    lo = max(cfg.min_radius, REFINE_BOX_RADIUS_LO * half)
+    hi = min(cfg.max_radius, REFINE_BOX_RADIUS_HI * half)
+    if hi < lo:
+        hi = lo
+    sub = DetectorConfig(**{**cfg.__dict__, "method": "color",
+                            "min_radius": lo, "max_radius": hi,
+                            "hough_max_radius": hi})
     best: Detection | None = None
     for name in ("color", "hough"):
         detector = build_single_detector(name, sub)
@@ -199,7 +223,7 @@ def refine_circle_in_box(
                 x=cand.x + x1, y=cand.y + y1, radius=cand.radius,
                 score=min(1.0, 0.5 * det.score + 0.5 * cand.score),
                 method=f"yolo+{name}", contour=None,
-                parts={**cand.parts, "refine": name},
+                parts={**cand.parts, "refine": name, "refine_window": (lo, hi)},
             )
             if best is None or cand.score > best.score:
                 best = cand
