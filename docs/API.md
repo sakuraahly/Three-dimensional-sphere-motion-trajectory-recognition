@@ -782,7 +782,7 @@ def load_session(path) -> tuple[Path, Session]              # 目录或 session.
 def validate_session(path) -> tuple[list[str], list[str]]   # (errors, warnings)，不抛
 def list_sessions(root) -> list[Path];  def sha256_file(path) -> str
 ```
-**契约**：一次采集 = `data/sessions/<id>/`（`session.json` + 两路视频 + `calib/` 快照 + `derived/`）。
+**契约**：一次采集 = `data/stereo/<id>/`（`session.json` + 两路视频 + `calib/` 快照 + `derived/`）。
 `validate_session` 检查视频可打开 / 分辨率 / 帧数 / 标定 sha256 / 基线偏差
 （物理 vs 算法 >10% 警告、>20% 错误），**不抛异常**，坏会话一次列全。
 **基线**：`baseline_mm` 是算法结果（几何用它），`baseline_measured_mm` 只作交叉核对，不覆盖算法值。

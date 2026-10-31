@@ -100,7 +100,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
    也不要放 `assets/`（那是入库的静态素材）。`data/` 默认不入库，
    **必须单独备份**；一次采集 = 一个目录 + `session.json`。
 
-### `apps/tools/` 里其实是六组东西
+### `apps/tools/` 里其实是七组东西
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -119,7 +119,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：15 个可执行脚本 + 14 个私有模块
+### `apps/` 顶层：15 个可执行脚本 + 15 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -127,11 +127,11 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | 标定与录制（5） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（13） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台**） |
+| 私有模块（15） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
-> 这里照着加粗，那 13 个 `apps/` 脚本会被当成"工具分组"，然后因为磁盘上
+> 这里照着加粗，那 15 个 `apps/` 脚本会被当成"工具分组"，然后因为磁盘上
 > `apps/tools/` 里没有它们而报"列了但不存在"。要改格式，先改那个解析器。
 
 ---
@@ -317,7 +317,7 @@ apps / tests                        （只调用，不被调用）
   - 新相机开发 = `dev/hd-camera`（当前分支）；
   - 功能/修复从 dev 切 `feature/*` / `fix/*`，合回 dev；
   - 发布候选走 `release/*`，验收通过后**必须征询用户批准**，才能合并 `main` 并打 `vX.Y.Z-lts`。
-- 合并前门禁：全量测试 23/23、`check_standards`、独立 Critic、真机证据、交接/决策文档。
+- 合并前门禁：全量测试 26/26、`check_standards`、独立 Critic、真机证据、交接/决策文档。
 - **`git push` 只在用户明确要求时执行**（仅用于跨设备同步）。
 - 提交前必须：跑验证 → 工作区干净 → 无密钥。
 - 详细规则：`docs/Git分支与发布规范.md`。
@@ -327,13 +327,13 @@ apps / tests                        （只调用，不被调用）
 ## 9. 明确不做 / 已知边界（避免重复讨论）
 
 - **不改模块划分**：分层已审计通过，只做清理不做重排。
-- **`apps/` 私有模块已 13 个，暂仍不建包**（2026-10-28）：原定"超过 12 个再议"，
+- **`apps/` 私有模块已 15 个，暂仍不建包**（2026-10-28）：原定"超过 12 个再议"，
   现在到了这个点，**议的结论是先不动**。判据：建 `apps/gui/` 要同步改
   `from apps._gui_xxx import ...` 的调用点、以及 `selftest_entrypoints` 里
   "扫 `apps/_gui_*.py` 全体"的 glob 假设 —— 换来的是目录齐整，代价是一次
   必然的引用漂移。真正的边界是**每个文件只做一件事**（现在满足：控件层 / 任务层 /
   外壳 / 控制台 / 单目窗 / 双目窗各自独立），不是"文件放在哪个目录"。
-  何时再议：新增第 15 个私有模块时。
+  何时再议：新增第 16 个私有模块时。
 - **不把 `docs/` 再分目录**：会打断几十处交叉引用，收益只是"好看"。
 - **不做大范围样板统一**（ROOT 引导 25 处、`make_scratch_dir` 3 份）：
   纯样式，动 20+ 文件换整洁，风险大于收益。**记录在案，不假装不存在。**
