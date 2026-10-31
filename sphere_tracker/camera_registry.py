@@ -95,6 +95,9 @@ DEFAULT_SETTINGS: dict = {
     "min_height": 720,
     "min_fps": 15.0,
     "max_index": 6,
+    # phantom 索引（未被 PnP 枚举到的编号）试开一次最坏 ~40s；连续失败这么多台
+    # 就视为"这段编号根本不存在"，提前停止扫描。max_index 仍作上界安全网。
+    "max_consecutive_miss": 2,
 }
 
 
@@ -904,22 +907,31 @@ def select_cameras(
     `_errors_out`：传一个 list 进来，试开失败的原因会写进去。
     **刻意用私有名** —— 它是给 `select_cameras_detailed` 用的通道，
     公开 API 请走那个版本。
+
+    phantom 索引（未被 PnP 枚举到的编号）试开一次最坏 ~40s；同型号 phantom 段
+    **连续失败 `max_consecutive_miss` 次即停**，避免"6 个不存在的编号 ≈ 好几分钟"。
+    早停只跳过 phantom、绝不 break —— 排在 phantom 之后的真设备（含被标「无关」的）
+    仍会照旧被试。且**只在 `devices` 非空（拿得到 PnP 枚举）时启用**：枚举拿不到
+    时"不在清单里"不等于"不存在"（见下面那段注释）。
     """
     merged = {**DEFAULT_SETTINGS, **((reg.settings if reg else {}) or {})}
     merged.update(settings or {})
     if devices is None:
         devices = list_devices()
 
+    phantom_ids: set[int] = set()
     if indices is not None:
         cands = [DeviceEntry(order=int(i)) for i in indices]
     else:
         ranked = rank_candidates(devices, reg=reg, settings=merged)
         known = {d.order for d in ranked}
-        cands = list(ranked) + [
+        phantom_entries = [
             DeviceEntry(order=i)
             for i in range(int(merged["max_index"]) + 1)
             if i not in known
         ]
+        phantom_ids = {id(e) for e in phantom_entries}
+        cands = list(ranked) + phantom_entries
 
     # 标了「无关」的排到最后：只有"其它相机都不够用"时才轮到它们，
     # 并且要显式告警 —— 用户明确说过不要的相机，静默用上比报错更糟。
@@ -940,7 +952,33 @@ def select_cameras(
     probe_errors: list[str] = []
     if _errors_out is not None:
         _errors_out.clear()
+    # phantom 段自适应早停：只作用于 phantom（未被 PnP 枚举到的编号），
+    # 真设备条目的探测逻辑一字不改。连续失败即视为"这段编号未被枚举到"。
+    #
+    # ⚠️ 前提是**拿得到 PnP 枚举**（`devices` 非空）。非 Windows / 枚举失败时
+    # `list_devices()` 返回 `[]`，系统本就退化为"按索引使用"，此刻"编号不在
+    # 清单里"**不能**推出"编号不存在"。独立 Critic 的反例：`devices=[]` 而 `#2`
+    # 实际可开 → 早停会让它永远选不到。故只在 devices 非空时才启用早停。
+    max_miss = int(merged["max_consecutive_miss"]) if devices else 0
+    phantom_misses = 0
+    phantom_exhausted = False
+
+    def _note_phantom_miss() -> None:
+        nonlocal phantom_misses, phantom_exhausted
+        if max_miss <= 0:              # 拿不到 PnP 枚举 -> 退化模式，不做早停
+            return
+        phantom_misses += 1
+        if phantom_misses >= max_miss:
+            phantom_exhausted = True
+            print(f"已连续 {phantom_misses} 个编号**未被枚举到**，不再往下探"
+                  f"（max_index 仍作上界）")
+
     for entry in cands:
+        is_phantom = id(entry) in phantom_ids
+        # phantom 已判定不存在 -> 跳过它，但**绝不 break**，
+        # 排在它之后的真设备（含被标「无关」的）仍会照旧被试。
+        if is_phantom and phantom_exhausted:
+            continue
         # ⚠️ 试开必须**自己接住异常**：`probe_index` 会去开真实设备，
         # 驱动抽风 / 设备被热拔 / USB 控制器报错都可能抛出来。
         # 改之前这里不接，一个索引抛异常会让**整次挑选崩掉** ——
@@ -955,6 +993,8 @@ def select_cameras(
             # `ProbeResult` 也算数）—— `usable_count` 报 1、`Selection.ok` 报 True。
             # 失败信息只进 `probe_errors`，供报错文本使用。
             probe_errors.append(f"#{entry.order} 试开异常：{type(exc).__name__}: {exc}")
+            if is_phantom:
+                _note_phantom_miss()
             continue
         if not isinstance(res, ProbeResult):
             continue
@@ -962,11 +1002,17 @@ def select_cameras(
                           res.std, res.error, entry)
         if not res.ok:
             probe_errors.append(f"#{entry.order} {res.error or '打不开'}")
+            if is_phantom:
+                _note_phantom_miss()
             continue
         if res.width and res.height and (res.width < min_w or res.height < min_h):
             probe_errors.append(f"#{entry.order} 分辨率 {res.width}x{res.height} "
                                 f"低于要求 {min_w}x{min_h}")
+            if is_phantom:
+                _note_phantom_miss()
             continue
+        if is_phantom:
+            phantom_misses = 0
         picked.append(res)
         if len(picked) >= limit:
             break
