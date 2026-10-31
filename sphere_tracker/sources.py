@@ -41,6 +41,40 @@ WINDOWS_BACKENDS = [
 # 改一处忘一处不会有任何提示，而它决定了"这帧算不算数"。
 BLACK_FRAME_STD = 1.0
 
+#: MSMF 在「采集会话失效」时给出的错误码。
+#:
+#: `-2147483638` = `MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED`：
+#: Media Foundation 认为这个采集会话已经失效（设备被**独占**，或驱动/USB 链路掉了），
+#: 于是每次 `grab` 都失败。**设备本身仍在系统里**（`cameras.py list` 看得见），
+#: 所以它的表现是「能打开、却没画面」——最容易被人当成"相机坏了"的那一种。
+MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED = -2147483638
+
+
+def explain_grab_error(
+    code: int = MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED,
+) -> str:
+    """把一个抓帧错误码翻译成「含义 + 一条下一步」（纯函数，不碰设备）。
+
+    为什么需要它：这些码只会以 WARN 的形式出现在 OpenCV 日志里，而
+    `quiet_repeated_grab_warnings()` 为了不被每 10 秒一条的刷屏**又把它静音了**
+    —— 于是用户在**两处**都看不到。只把数字丢给用户等于没说：数字本身没有含义。
+
+    「一条下一步」是刻意的：以前这里罗列 4 条可能原因，读者无法判断是哪一条，
+    等于把排查工作又推回给用户。真要再往下试，报错正文里另有顺序。
+    """
+    if code == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED:
+        return (
+            f"{code} = MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED\n"
+            "含义：这台相机的采集会话已经失效（设备被**独占**，或驱动/USB 链路掉了），\n"
+            "      所以每次抓帧都失败；设备仍在系统里，看起来像「能打开却没画面」。\n"
+            "下一步（只做这一条）：关掉所有可能占用它的窗口/程序 —— **包括你自己\n"
+            "      刚开的第二个本程序窗口**（识别/诊断/标定各开一个就会这样），再重跑。"
+        )
+    return (f"错误码 {code}（本程序只翻译 "
+            f"{MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED} = "
+            f"MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED，其余请查 OpenCV/MF 文档）")
+
+
 # ---------------------------------------------------------------------------
 # 「用编号开相机」必须配哪个后端 —— 全项目唯一的答案在这里
 # ---------------------------------------------------------------------------
@@ -99,6 +133,34 @@ def quiet_repeated_grab_warnings() -> None:
         os.environ.setdefault(f"OPENCV_LOG_LEVEL_{mod}", "ERROR")
 
 
+#: 抓帧错误已经对用户说过一次没有 —— 只为了「静音了，但至少说一次」。
+_grab_error_announced = False
+
+
+def _report_silent_grab_error() -> None:
+    """把被静音的抓帧 WARN **至少说一次**。
+
+    ## 为什么非说不可
+
+    `quiet_repeated_grab_warnings()` 把 `videoio` 的 WARN 压掉了（理由充分：
+    每 10 秒一条、无限刷）。但那条 WARN 里唯一的实质信息是错误码 ——
+    压掉之后，用户看到的现象只剩「相机打不开、日志里什么都没有」。
+    **静音是为了不被刷屏，不是为了让人看不见判据**，所以这里补一次可见的说明。
+
+    只打印一次：真正需要它的是"为什么没画面"那一刻，重复打印又变成噪音。
+    """
+    global _grab_error_announced
+    if _grab_error_announced:
+        return
+    _grab_error_announced = True
+    detail = "\n".join("       " + line
+                       for line in explain_grab_error().splitlines())
+    print("[提示] OpenCV 的抓帧 WARN 被本程序静音了（它每 10 秒刷一条，"
+          "会把有用信息淹掉）。\n"
+          "       它真正想说的是：\n"
+          f"{detail}", flush=True)
+
+
 @dataclass
 class SourceInfo:
     kind: str
@@ -134,6 +196,14 @@ class VideoSource:
 CANDIDATE_MODES: tuple[tuple[int, int], ...] = (
     (1920, 1080), (1280, 720), (1024, 768), (960, 540), (800, 600), (640, 480),
 )
+
+#: 「一帧都没拿到时**再试一次**」的那一档分辨率。
+#:
+#: 为什么是 640x480：USB 带宽不足恰恰是「降一档就好」——1920x1080 走 YUY2 只有
+#: 4.3 fps 就是这个原因，而"一帧都读不到"也可能只是模式协商失败。旧逻辑把它
+#: 一律当成"设备层面不给帧"、跳过所有分辨率，于是**把本来能用的相机判死**。
+#: 640x480 是候选里带宽需求最低的一档，用它能区分"带宽/协商不足"与"设备真不给帧"。
+LOWRES_RETRY_MODE: tuple[int, int] = (640, 480)
 _MODE_CACHE = Path(__file__).resolve().parents[1] / "config" / "camera_modes.json"
 
 
@@ -459,16 +529,27 @@ class CameraSource(VideoSource):
         # 每个后端一份均分预算（下限 12 s，免得后端多时每份太短试不出东西）
         per_backend_s = max(12.0, search_budget_s / max(1, len(candidates)))
         budget_hit = False
-        # 第一档就**一帧都没有** -> 剩下的分辨率不必试。
-        # 分辨率不对的表现是"能出帧但全黑"，而"一帧都读不到"是**设备层面**的问题
-        # （掉线/被独占/后端不工作），换个分辨率救不回来。
-        # 实测证据：MSMF 对这台相机每个分辨率都要 10 秒才失败，4 档 = 40 秒纯浪费。
+        # 一帧都没有 -> **先补试一次 640x480**，仍然没有才认定是设备层面。
+        #
+        # 旧判断（"一帧都没有 = 设备层面，换分辨率救不回来"）只在**有一种**原因时成立：
+        # 设备掉线 / 被独占 / 后端不工作。而 USB 带宽不足、模式协商失败也会表现为
+        # "能打开但读不到帧"，那种情况**降一档就能好** —— 一律跳过分辨率等于把
+        # 本来能用的相机判死。所以这里给最低带宽的那一档一次机会（只一次：
+        # 每档失败实测要 10~30 秒，多试几档就又变成"卡死"）。
+        lowres_retried = False
         no_frame_at_all = False
+        # 用可追加的队列而不是 `for res_candidates`：补试那一档要**插到队首**，
+        # 而不是等其余分辨率试完才轮到它（那就白等了）。
         for name, api in ([] if self.cap is not None else candidates):
             t_backend = time.perf_counter()
-            for rw, rh in res_candidates:
+            res_queue: list[tuple[int, int]] = list(res_candidates)
+            pos = 0
+            while pos < len(res_queue):
+                rw, rh = res_queue[pos]
+                pos += 1
                 if no_frame_at_all:
-                    errors.append(f"{name}: 第一档就一帧都读不到，跳过其余分辨率")
+                    errors.append(f"{name}: 一帧都读不到（{LOWRES_RETRY_MODE[0]}x"
+                                  f"{LOWRES_RETRY_MODE[1]} 也试过），跳过其余分辨率")
                     _log(f"⏭ {name} 一帧都读不到（设备层面问题），"
                          f"不再试其它分辨率")
                     break
@@ -529,7 +610,8 @@ class CameraSource(VideoSource):
                          f"（实际 {got_w}x{got_h}）")
                     if self.resolution_fallback:
                         print(
-                            f"[提示] 摄像头 {index} 不支持 {width}x{height}（该分辨率下输出全黑），"
+                            f"[提示] 摄像头 {index} 不支持 {width}x{height}"
+                            f"（该分辨率下拿不到可用画面），"
                             f"已自动降到 {got_w}x{got_h}。"
                         )
                     break
@@ -538,9 +620,21 @@ class CameraSource(VideoSource):
                 errors.append(f"{name} @ {rw or '默认'}x{rh or ''}: {why}")
                 _log(f"✘ {name} @ {rw or '原始'}x{rh or '原始'}：{why}")
                 if frame is None:
-                    # 12 次读里**一次都没拿到帧**（不是"拿到但全黑"）——
-                    # 这是设备层面不给帧，换分辨率没用。见上面 `no_frame_at_all`。
-                    no_frame_at_all = True
+                    # 12 次读里**一次都没拿到帧**（不是"拿到但全黑"）。
+                    #
+                    # 以前这里直接判"设备层面不给帧，换分辨率没用" —— 但那是把
+                    # **两种原因当成一种**：USB 带宽不足 / 模式协商失败同样会
+                    # "能打开、读不到帧"，而那种情况**降一档就好**。
+                    # 所以先补试一次最低带宽的 640x480；它也不行，才认定是设备层面
+                    # （掉线/被独占/后端不工作）并跳过其余分辨率。
+                    if not lowres_retried and (rw, rh) != LOWRES_RETRY_MODE:
+                        lowres_retried = True
+                        _log(f"↓ 一帧都没有，补试最低带宽的一档 "
+                             f"{LOWRES_RETRY_MODE[0]}x{LOWRES_RETRY_MODE[1]}"
+                             f"（带宽/协商不足时降档就好）")
+                        res_queue.insert(pos, LOWRES_RETRY_MODE)
+                    else:
+                        no_frame_at_all = True
             if self.cap is not None:
                 break
             # ⚠️ **这里刻意不做"自动换后端"**（2026-10-14 实测后撤回）。
@@ -559,25 +653,33 @@ class CameraSource(VideoSource):
             # 而"自动换完偷偷降分辨率"他完全看不见。
             if no_frame_at_all and backend is not None:
                 others = "、".join(n for n, a in WINDOWS_BACKENDS if a != backend)
+                # 静音的 WARN 里唯一有信息量的就是那个错误码，这里**至少说一次**。
+                _report_silent_grab_error()
+                detail = "\n".join("  " + ln
+                                   for ln in explain_grab_error().splitlines())
                 raise RuntimeError(
                     f"摄像头 {index} 用 {backend_name(backend)} 能打开，"
-                    f"但**一帧都拿不到**（读 12 次全空）。\n"
+                    f"但**一帧都拿不到**（读 12 次全空，含 "
+                    f"{LOWRES_RETRY_MODE[0]}x{LOWRES_RETRY_MODE[1]} 这一档）。\n"
+                    f"{detail}\n"
                     f"  ⚠ 本程序**不会自动换后端** —— 同一进程里混用 DSHOW + MSMF\n"
                     f"     会让 MSMF 那路「打开成功但抓不到帧」（本项目已实测过），\n"
                     f"     所以自动切换会把好的一路也弄坏。\n"
-                    f"  怎么办（按顺序试）：\n"
+                    f"  上面那一步做完还不行，才依次：\n"
                     f"    ① **拔掉相机再插回** —— 报 -2147483638 时这一步最有效；\n"
-                    f"    ② 确认没有别的程序占着它（会议软件 / 浏览器 / Windows Hello）；\n"
-                    f"    ③ 换一个直接插在机身上的 USB 口；\n"
-                    f"    ④ 仍不行就换后端 —— **两路必须同后端**"
+                    f"    ② 换一个直接插在机身上的 USB 口（别经 HUB / 扩展坞）；\n"
+                    f"    ③ 仍不行就换后端 —— **两路必须同后端**"
                     f"（只换一路，双目直接取不到帧）：\n"
                     f"       `--backend {others.split('、')[0].lower()}`"
                 )
         if self.cap is None:
+            if no_frame_at_all:
+                _report_silent_grab_error()
             raise RuntimeError(
                 f"无法打开摄像头 {index}，已尝试全部后端与分辨率。\n  " + "\n  ".join(errors) +
                 "\n可能原因：\n"
-                "  1) 被别的程序占用（QQ / 微信 / 腾讯会议 / 浏览器 / Windows Hello）；\n"
+                "  1) 被别的程序占用（QQ / 微信 / 腾讯会议 / 浏览器 / Windows Hello）"
+                "—— **也包括你自己开的第二个本程序窗口**；\n"
                 "  2) 是红外摄像头（IR，无彩色输出）；\n"
                 "  3) 镜头上有物理遮挡（隐私滑块 / 盖子合上）；\n"
                 "  4) USB 供电或带宽不足（换一个直接插在机身上的 USB 口试试）。"

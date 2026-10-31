@@ -74,6 +74,8 @@ import numpy as np
 
 from sphere_tracker.camera_registry import (
     AUTO_TOKEN,
+    RoleSpec,
+    load_registry,
     resolve_camera_arg,
     select_cameras,
 )
@@ -98,7 +100,38 @@ CAMERA_POLL_INTERVAL = 0.005     # 轮询间隔，比 30 fps 的帧间隔（33 m
 # （这是减小时间差，不是消除 —— 真正的同步要靠硬件触发。）
 CAMERA_ALIGN_STEPS = 2
 
+#: 并行打开两路相机的**整体**等待上限（秒）。它是"驱动层挂死"的兜底，
+#: 不是"正常慢相机"的上限 —— 取足够宽，宁晚判、不误杀。
+#: `CameraSource.search_budget_s` 默认 60；而 `_open` 在打不开时会**再试一次**
+#: `backup_camera`（见下面 `_open` 里那次回退），故正常路径最坏 ≈ 2×60。
+#: 取 150 = 2×60 + 30 余量（首帧等待 + 分辨率回退）。低于它会把一台
+#: "正常但慢 + 走了备用相机"的相机误判成超时。
+OPEN_JOIN_TIMEOUT_S = 150.0
+
 _BACKEND_BY_CLI = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
+
+
+def _join_all(threads: list[threading.Thread],
+              timeout_s: float) -> list[threading.Thread]:
+    """逐个 join；返回**超时后仍存活**的线程列表。**不抛异常。**
+
+    用**整体预算（deadline）**而不是"每线程各等 `timeout_s`"：
+    `deadline = perf_counter() + timeout_s`，对每个线程
+    `th.join(timeout=max(0.0, deadline - perf_counter()))`。
+
+    为什么是整体而不是每线程各自的上限：两路是并行打开的，
+    用户感知的等待上限取决于**整体**耗时，不是每路各自的上限 ——
+    否则"每路各等 90s"在最坏情况下会变成 180s。
+
+    调用方据此把"主线程被卡死"变成"可控失败"（见 `CameraPairReader.__init__`）。
+    """
+    deadline = time.perf_counter() + timeout_s
+    stuck: list[threading.Thread] = []
+    for th in threads:
+        th.join(timeout=max(0.0, deadline - time.perf_counter()))
+        if th.is_alive():
+            stuck.append(th)
+    return stuck
 
 
 def resolve_backend(value: str | None) -> int | None:
@@ -358,15 +391,37 @@ class CameraPairReader(FrameReader):
             t_open = time.perf_counter()
             for th in threads:
                 th.start()
-            for th in threads:
-                th.join()
+            # ⚠️ 原来是裸 `th.join()`，**没有 timeout**（2026-10-31 修）：
+            # 内部 `CameraSource.search_budget_s` 只保证"正常情况下会返回"，
+            # **不保证线程一定结束** —— `cv2.VideoCapture` 可能在驱动层挂住，
+            # 于是主线程会**永久等待**。`daemon=True` 只保证进程能退出，
+            # 不保证主线程不被卡。
+            stuck = _join_all(threads, OPEN_JOIN_TIMEOUT_S)
             opened = [c for c in results if c is not None]
+            if stuck:
+                # 不许写成静默跳过 —— 那等于把"死等"换成"悄悄丢相机"。
+                # 释放已开出来的那一路，并把这台后端**当场**报出来：
+                # `errors` 只在"所有后端都失败"时才被打印，若只是这一个后端超时、
+                # 下一个后端成功，只 append 就等于**静默**（独立 Critic 的 Q2b
+                # 实测：DSHOW 超时 + MSMF 成功 → 终端一个字都没提超时）。
+                for c in opened:
+                    c.stop()
+                msg = (f"{name}: 并行打开相机超时 {OPEN_JOIN_TIMEOUT_S:.0f}s 仍未返回"
+                       f"（{'/'.join(t.name for t in stuck)}），放弃这个后端")
+                errors.append(msg)
+                print(f"[警告] {msg}", flush=True)
+                continue
             if failures:
                 for c in opened:
                     c.stop()
                 exc = failures[0]
                 first_line = (str(exc).splitlines() or ["打开失败"])[0]
-                errors.append(f"{name}: {first_line}")
+                msg = f"{name}: {first_line}"
+                errors.append(msg)
+                # 同上：`errors` 只在"所有后端都失败"时才被打印。若这一路抛异常、
+                # 下一个后端却成功了，只 append 就等于**静默** —— 用户不会知道
+                # 有一台相机在这个后端下没开出来。当场报出来（2026-10-31）。
+                print(f"[警告] {msg}", flush=True)
                 continue
             print(f"[{name}] 两路都已打开，用时 {time.perf_counter() - t_open:.1f}s",
                   flush=True)
@@ -670,6 +725,142 @@ class PairSource:
             r.release()
 
 
+def _resolve_arg_noninteractive(raw, side: str) -> int | None:
+    """解析 `--left/--right` 的取值，**绝不弹交互选择**。
+
+    ## 为什么必须禁止交互（2026-10-31 在 `apps/_task_runner.py` 里查到根因）
+
+    `resolve_camera_arg(..., interactive=True)` 在某角色"按身份/端口/名字都找不到"
+    且 `verified=True` 时会走 `input()`。而任务运行器起的是**子进程**，并且
+    **没有重定向 stdin** —— 子进程仍挂在那台控制台上，于是 `input()` 会一直等
+    一个**永远不会有人敲**的回车。
+
+    用户看到的现象是：点了"开始标定"，一直显示"正在标定"；日志里只有一句
+    "请选择…"，取景窗永远不出现，进程也永远不退出。全项目**唯一**能无限期挂住
+    的地方就在这里，所以这两处必须显式 `interactive=False`。
+
+    解析不了就**当场报错**，并把"下一步"说全（配置错 vs 设备不在线），
+    让错误出现在日志里 —— 而不是等一个不存在的按键。
+    """
+    try:
+        return resolve_camera_arg(raw, interactive=False)
+    except RuntimeError as exc:
+        first = (str(exc).splitlines() or [type(exc).__name__])[0]
+        raise RuntimeError(
+            f"{side} 相机（--{side} {raw}）解析失败。\n"
+            f"  ⚠ 这里**不会**弹出「请选择哪个编号」——命令跑在后台/GUI 子进程里，"
+            f"没有人能敲那个回车，等它等于永远挂住。\n"
+            f"  原因：{first}\n"
+            f"  怎么办（都不用开相机）：\n"
+            f"    - 看当前设备与端口：python apps/tools/cameras.py list\n"
+            f"    - 按端口重绑角色：  python apps/tools/cameras.py pin {side} port:<端口>\n"
+            f"    - 或显式给编号：    --{side} <编号>"
+            f"（编号必须是**同一后端**的编号）"
+        ) from exc
+
+
+def _pin_value_for(spec: RoleSpec | None) -> str:
+    """给 `pin` 用的取值：优先 port（每台唯一），其次 id，最后 name。"""
+    if spec is None:
+        return ""
+    if spec.port:
+        return f"port:{spec.port}"
+    if spec.identity:
+        return f"id:{spec.identity}"
+    if spec.name:
+        return f'name:"{spec.name}"'
+    return ""
+
+
+def _spec_of_role(raw) -> RoleSpec | None:
+    """`--left right` 这种**角色名** -> 配置里的 RoleSpec；其它取值返回 None。
+
+    为什么要区分：这里只有"角色名"能查到两个角色各自记的是哪台设备；
+    数字编号 / `port:xxx` / `auto` 都是用户当场指定的，没有配置可比。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.isdigit() or text == AUTO_TOKEN or ":" in text:
+        return None
+    try:
+        return load_registry().roles.get(text)
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def explain_same_camera(left_i: int, right_i: int, *,
+                        left_spec: RoleSpec | None = None,
+                        right_spec: RoleSpec | None = None) -> str:
+    """左右两路落到**同一台相机**时的报错正文（**纯函数**：不读配置、不开相机）。
+
+    ## 为什么要分成两种说法（2026-10-31 用户实测）
+
+    以前这里一律说"角色绑定的那台相机不在线（换过 USB 口 / 重插过）"，
+    并把用户引向 `--left 0 --right 1 --backend dshow`。在本机这两条**都是错的**：
+
+      · 两台相机**都在线**（`cameras.py list` 两台都枚举得到，一台 1.2 s 出图）；
+      · DSHOW 的 `#1` 是**笔记本内置**、`#2` 才是外接 aoni —— 照它给的两个编号会
+        **开到另一台相机**，而且两路照样报同样的分辨率，界面上完全看不出异常。
+        静默错位比"打不开"危险得多，所以那句话必须删掉。
+
+    真相是 `config/cameras.json` 里 left 与 right 记的是**同一台**
+    （identity / port / name / index 逐字相同）—— 这是**配置错**，
+    改法也**不用开相机**（pin 按端口/身份绑），所以先说这一种。
+
+    只有两个角色记得的**不是同一台**时，才轮到"解析退化 / 索引漂移"
+    ——那时换过口、重插过、退化到同一个兜底索引才是合理解释。
+    """
+    head = (f"左右两路解析到了**同一个相机**（索引 #{left_i}）—— 标定无法进行。\n")
+    same_identity = bool(
+        left_spec is not None and right_spec is not None
+        and left_spec.identity and right_spec.identity
+        and left_spec.identity.upper() == right_spec.identity.upper()
+    )
+    if same_identity:
+        lv, rv = _pin_value_for(left_spec), _pin_value_for(right_spec)
+        if lv == rv:
+            # 两个角色记的端口/身份**逐字相同** = 它们描述的就是同一台，
+            # 照抄这个值 pin 两次只会又绑回同一台。必须从"另一台"取。
+            lv, rv = "<这一台的 port，见 list>", "<另一台的 port，见 list>"
+        return (
+            head
+            + "  ⚠ 这是**配置错**，**不是相机掉线**：\n"
+            + f"    config/cameras.json 里 left 与 right 记的是**同一台**"
+              f"（identity 都是 {left_spec.identity}）。\n"
+            + "    两台相机是双目的前提。改法**不用开相机**（按端口绑，不碰编号）：\n"
+            + f"      python apps/tools/cameras.py pin left  {lv}\n"
+            + f"      python apps/tools/cameras.py pin right {rv}\n"
+            + "    ⚠ 两个值**不能填同一个**；名字（name:）也区分不了两台 —— "
+              "本机同型号，\n"
+              + "      现有配置里连名字都一模一样，而按名字匹配的是「命中的第一台」。\n"
+            + "    端口用 python apps/tools/cameras.py list 看（不开相机，毫秒级）；\n"
+            + "    哪台是左、哪台是右只能你目视决定。改完复核：\n"
+            + "      python apps/tools/cameras.py check"
+              "   ← 它现在会直接报「左右撞车」并返回非零退出码。"
+        )
+    return (
+        head
+        + "  两个角色记的**不是同一台**（identity 不同或拿不到），"
+          "所以更像是**解析退化 / 索引漂移**：\n"
+        + "    1) 角色绑定的那台相机当前解析不到（换过 USB 口 / 重插过 / 被占用），\n"
+        + "       两个角色于是退化到同一个索引；\n"
+        + "    2) 显式给了同一个索引（如 --left 0 --right 0）；\n"
+        + "    3) **后端枚举错位**：`list_devices()` 的 order 来自 Windows PnP 枚举，\n"
+        + "       而 `cv2.VideoCapture(index, backend)` 用的是各后端自己的枚举，"
+          "两者不保证一致。\n"
+        + "  怎么办：\n"
+        + "    - python apps/tools/cameras.py check    看角色有没有漂移"
+          "（会直接报「左右撞车」）\n"
+        + "    - python apps/tools/cameras.py list     看当前设备、编号与端口\n"
+        + "    - 要显式给编号，就给**同一后端**下的两个**不同**编号，"
+          "并且只用该后端\n"
+          + "      自己的编号（别把 `list` 的 PnP 编号当后端编号用；"
+          "本机 DSHOW 的 #1 是内置相机）\n"
+        + "    - 开跑后先目视确认：两路必须是**同一场景的左右两个视角**。"
+    )
+
+
 def from_args(args) -> PairSource:
     """按命令行参数造一个 `PairSource`（`calibrate_stereo` / `verify_stereo` 共用）。
 
@@ -699,29 +890,22 @@ def from_args(args) -> PairSource:
             left_i, right_i = picks[0].index, picks[1].index
             print(f"[自动选择] 左 #{left_i}｜右 #{right_i}")
         else:
-            left_i = resolve_camera_arg(left_raw)
-            right_i = resolve_camera_arg(right_raw)
+            left_i = _resolve_arg_noninteractive(left_raw, "left")
+            right_i = _resolve_arg_noninteractive(right_raw, "right")
+
 
         # 左右必须落在**两台不同的相机**上。此前没有这道检查，于是
         # "两个角色解析到同一个索引"会静默继续：标定窗口里两路其实是同一台相机，
         # 用户要到一对有效图像都收不到时才发现，白白浪费一轮。
+        #
+        # 报错正文由纯函数 `explain_same_camera()` 生成：它按"两个角色记的是不是
+        # 同一台"分成**配置错**与**解析退化**两种说法 —— 这两种的下一步完全不同，
+        # 混成一句就会把用户引向"去查 USB 口"（本次用户遇到的是配置错，两台都在线）。
         if left_i == right_i:
-            raise RuntimeError(
-                f"左右两路解析到了**同一个相机**（索引 #{left_i}）—— 标定无法进行。\n"
-                f"  常见原因：\n"
-                f"    1) 角色绑定的那台相机不在线（换过 USB 口 / 重插过），"
-                f"解析退化到了同一个索引；\n"
-                f"    2) 显式给了同一个索引（如 --left 0 --right 0）；\n"
-                f"    3) **后端枚举错位**：list_devices() 的 order 来自 PnP 枚举，"
-                f"而 cv2.VideoCapture(index) 用的是 OpenCV 各后端自己的枚举，"
-                f"两者不保证一致；DSHOW 与 MSMF 之间还会整体错位。\n"
-                f"  怎么办：\n"
-                f"    - python apps/tools/cameras.py check    看角色有没有漂移\n"
-                f"    - python apps/tools/cameras.py list     看当前设备与索引\n"
-                f"    - 明确给索引 + 固定同一个后端："
-                f"--left 0 --right 1 --backend dshow\n"
-                f"    - 开跑后先目视确认：两路必须是**同一场景的左右两个视角**。"
-            )
+            raise RuntimeError(explain_same_camera(
+                left_i, right_i,
+                left_spec=_spec_of_role(left_raw),
+                right_spec=_spec_of_role(right_raw)))
 
         # 相机源默认固定 **MSMF**。
         #

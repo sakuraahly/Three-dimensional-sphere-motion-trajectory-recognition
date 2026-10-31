@@ -9,7 +9,7 @@
 做法：把每一帧的**帧号编进画面**（左下、右下两个色块分别存帧号的低字节和高字节），
 于是"取到的是第几帧"可以直接从像素里读回来比对，不依赖任何相机或标定。
 
-验证七件事：
+验证八件事：
   1. `sync_offset=0`：左第 i 帧 配 右第 i 帧；
   2. `sync_offset=+k`：左第 i 帧 配 右第 i+k 帧；
   3. `sync_offset=-k`：左第 i 帧 配 右第 i-k 帧；
@@ -19,6 +19,8 @@
   5. 参数校验与"短的那路读完了"能干净结束；
   6. `from_args` 的命令行参数映射（重构最易漏的是调用点，不是库）；
   7. **采集会话**（`session.json`）：写→读→校验；坏会话必须逐条报错。
+  8. **并行打开的整体超时**（`_join_all`）：改前裸 `th.join()` 会永久挂住主线程；
+     改后"永不返回"的线程能在 0.2s 内被判定为"仍存活"并返回（不依赖真相机）。
 
 图片文件夹与视频两条路径都测（两者的取帧实现完全不同：
 文件夹是随机访问，视频要按帧号定位）。
@@ -462,7 +464,11 @@ def test_from_args(base: Path) -> bool:
         def __init__(self, *args, **kwargs) -> None:
             built.append((args, kwargs))
 
-    def _fake_resolve(value):
+    def _fake_resolve(value, **_kw):
+        # `**_kw` 不是偷懒：真函数是 `resolve_camera_arg(value, *, interactive=True)`，
+        # 而 `pair_source` 现在显式传 `interactive=False`（后台/GUI 子进程没有 tty 输入，
+        # 交互 `input()` 会永远挂住）。替身签名必须与真函数一致，否则这道守卫
+        # **根本走不到**，红色会被误读成"守卫坏了"（替身陷阱，坑 24）。
         resolved.append(str(value))
         return {"left": 0, "right": 1}.get(str(value), 0)
 
@@ -792,6 +798,50 @@ def write_times(path: Path, times: list[float]) -> None:
 
 
 # --------------------------------------------------------------------------
+def test_open_join_timeout() -> bool:
+    """并行打开相机的**整体超时**：改前裸 `th.join()` 会永久挂住主线程。
+
+    ⚠️ **这就是 Q3 的证伪**（对照数值）：改前 `CameraPairReader.__init__` 里是
+    裸 `th.join()`（无 timeout），本判据会**永久挂住** —— 进程永不返回，
+    这正是"相机管理卡死"的机制。改成 `_join_all(threads, timeout_s)` 之后，
+    同一个"永不返回"的线程会在 ~0.2s 内被判定为"仍存活"并返回。
+
+    判据不依赖任何真相机：被 join 的是纯 `time.sleep` 线程。
+    实测耗时（改后）见下面打印出来的 `dt`。
+    """
+    print("----- 并行打开：整体超时（不依赖真相机） -----")
+    import threading
+    import time
+
+    from stereo.pair_source import _join_all
+
+    checks: list[tuple[str, bool]] = []
+
+    # 负向（关键）：一个 30s 不返回的线程，超时 0.2s 必须**很快**返回，
+    # 且它必须出现在"仍存活"名单里（= 是"可控失败"，不是"静默丢相机"）。
+    th = threading.Thread(target=lambda: time.sleep(30), daemon=True, name="never")
+    th.start()
+    t0 = time.perf_counter()
+    got = _join_all([th], 0.2)
+    dt = time.perf_counter() - t0
+    checks.append((f"永不返回的线程：{dt:.3f}s 内返回（应 < 1.0s）", dt < 1.0))
+    checks.append(("永不返回的线程出现在「仍存活」名单里", th in got))
+    print(f"  改后实测 dt = {dt:.3f}s（改前这里是裸 join()，会永久挂住，进程不返回）")
+
+    # 正向：很快结束的线程必须**不在**存活名单里（返回空列表）。
+    th2 = threading.Thread(target=lambda: time.sleep(0.05), daemon=True, name="quick")
+    th2.start()
+    got2 = _join_all([th2], 0.5)
+    checks.append(("正常结束的线程：不在「仍存活」名单里（返回空列表）", got2 == []))
+
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
+# --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="成对帧源自测")
     ap.add_argument("--keep", action="store_true",
@@ -814,6 +864,7 @@ def main() -> int:
             test_sessions(base),
             test_short_side(base),
             test_timestamp_pairing(base),
+            test_open_join_timeout(),
         ]
         print()
         results.append(test_live_camera_skipped())

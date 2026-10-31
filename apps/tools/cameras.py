@@ -71,6 +71,25 @@ def parse_indices(text: str | None, devices: list[cr.DeviceEntry],
     return list(range(max_index + 1))
 
 
+def positive_seconds(text: str) -> float:
+    """argparse 的 `type=`：接受有限正数，其余一律报错。
+
+    为什么不能让 argparse 直接 `type=float`：`float("nan")` / `float("inf")`
+    都能过，而它们进到预算计算里会得到"永远等"或"立刻超时"两种极端 ——
+    前者看着就是"卡死"（正是本次要修的病症），后者把好相机判死。
+    0 / 负数同理：`budget = timeout + 10` 会退化成极小值。
+    这里**报错退出**而不是静默回退默认值：用户明确传了数，就该知道自己传错了。
+    """
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"不是数字：{text!r}") from None
+    if not (0.0 < value < 1e6):
+        raise argparse.ArgumentTypeError(
+            f"必须是 (0, 1000000) 秒内的有限正数，收到 {text!r}")
+    return value
+
+
 # --------------------------------------------------------------------------- #
 # list
 # --------------------------------------------------------------------------- #
@@ -140,8 +159,13 @@ _KEY_HINT = "l=左相机  r=右相机  n=无关(这台不要用)  m=单目主相
 _backend_used: dict[int, str] = {}
 
 
-def _open_preview(index: int, backend: int, *, enumerated: bool = False):
+def _open_preview(index: int, backend: int, *, enumerated: bool = False,
+                  timeout_s: float | None = None):
     """按**给定的那一个后端**打开预览；返回 (src, 后端名)，打不开返回 (None, None)。
+
+    `timeout_s=None` → 用模块默认 `PREVIEW_FIRST_FRAME_S`（首帧），整台上限
+    派生为 `timeout_s + 10`（保持现 30→40 的关系）；给了值就按值走（P6：
+    默认值**不变**，只有显式传入才会改）。
 
     ## 为什么**绝不**在这里换后端（2026-10-18 第三次修正，用户实测反馈）
 
@@ -176,17 +200,21 @@ def _open_preview(index: int, backend: int, *, enumerated: bool = False):
     from sphere_tracker.sources import backend_name
 
     used_name = backend_name(backend)
+    # `timeout_s` 为 None 时用模块默认（现值不变）；给了值就按值派生整台上限。
+    first_timeout = timeout_s if timeout_s else PREVIEW_FIRST_FRAME_S
+    budget = (timeout_s + 10.0) if timeout_s else PREVIEW_BUDGET_S
     # 为什么把"整台上限"也写出来：首帧 30 秒只是**一个分辨率**的上限，
-    # 出不了图时会再降分辨率试一次，整台最多 `PREVIEW_BUDGET_S` 秒。
+    # 出不了图时会再降分辨率试一次，整台最多 `budget` 秒。
     # 只说 30 秒，用户在第 35 秒会以为"说好的 30 秒呢、是不是又卡死了"。
     print(f"  正在打开 #{index}（{used_name}）…最多等 "
-          f"{PREVIEW_FIRST_FRAME_S:.0f} 秒（首帧；整台上限 "
-          f"{PREVIEW_BUDGET_S:.0f} 秒）", flush=True)
-    tick = _WaitTicker(index, used_name)
+          f"{first_timeout:.0f} 秒（首帧；整台上限 "
+          f"{budget:.0f} 秒）", flush=True)
+    tick = _WaitTicker(index, used_name, budget_s=budget)
     tick.start()
     t0 = time.perf_counter()
     try:
-        src = _try_open(index, backend)
+        src = _try_open(index, backend, first_frame_timeout=first_timeout,
+                        budget=budget)
     except RuntimeError as exc:
         took = time.perf_counter() - t0
         tick.stop()
@@ -207,7 +235,8 @@ def _open_preview(index: int, backend: int, *, enumerated: bool = False):
     return src, used_name
 
 
-def _try_open(index: int, api: int):
+def _try_open(index: int, api: int, *, first_frame_timeout: float | None = None,
+              budget: float | None = None):
     """按给定后端开一路预览；失败**抛 RuntimeError**，由调用方决定是否回退。
 
     optimize=False + 短预算（2026-10-18，用户反馈"卡顿明显"）：
@@ -215,6 +244,9 @@ def _try_open(index: int, api: int):
     之前用默认参数时：optimize=True 会跑模式搜索（冷缓存最坏 10~40 s），
     search_budget_s 默认 60 s —— 遇到打不开的相机会干等一分钟。两者叠加
     就是用户看到的"卡顿"。
+
+    `first_frame_timeout` / `budget` 为 None 时用模块默认
+    （`PREVIEW_FIRST_FRAME_S` / `PREVIEW_BUDGET_S`，**现值不变**）。
     """
     # ⚠️ **请求 1920x1080（兼容档）而不是 640x480**。
     #
@@ -223,8 +255,107 @@ def _try_open(index: int, api: int):
     # 2026-10-24 复测：两台外接相机**都无视 1920/1280 请求、恒给 2560x1440**，
     # 所以这里请求 1920 只是兼容旧机型；实际分辨率以 `src.info` 为准，不假设。
     return CameraSource(index=index, width=1920, height=1080, backend=api,
-                        optimize=False, search_budget_s=PREVIEW_BUDGET_S,
-                        first_frame_timeout_s=PREVIEW_FIRST_FRAME_S)
+                        optimize=False,
+                        search_budget_s=(budget if budget is not None
+                                         else PREVIEW_BUDGET_S),
+                        first_frame_timeout_s=(first_frame_timeout
+                                               if first_frame_timeout is not None
+                                               else PREVIEW_FIRST_FRAME_S))
+
+
+def _open_preview_interruptible(index: int, backend: int, *, enumerated: bool = False,
+                                timeout_s: float | None = None, key_poll=None,
+                                skipped_out: list[int] | None = None):
+    """在后台线程里开预览；主线程轮询键盘，Esc/s 立即放弃（不阻塞等待）。
+
+    返回 `(src, 后端名)`；被跳过 / 打不开 → `(None, None)`。
+
+    `timeout_s=None` → 用模块默认（`PREVIEW_FIRST_FRAME_S`，派生
+    budget = timeout+10）。`key_poll=None` → 用 `_console_key`。
+
+    `skipped_out`：传一个 list 进来，**用户主动跳过**的索引会写进去。
+    返回值把"跳过"和"打不开"合并成 `(None, None)`（形状不变，第 21 节守着），
+    所以调用方要区分两者就只能靠这个出口 —— 它决定收尾文案该不该说"打不开"。
+
+    ## 为什么必须另起线程（P4，2026-10-31）
+
+    `CameraSource(...)` 是**在构造函数里开相机 + 等首帧**的，整段发生在主线程、
+    没有任何钩子能插进去（最多能等 `PREVIEW_FIRST_FRAME_S`=30 秒）。旧代码里
+    按键循环在 `_preview_and_assign` 的**首帧之后**才跑，所以这 30 秒内按 Esc
+    完全无效 —— 用户看到的就是"卡死"。这里把"开相机"搬进后台线程，
+    主线程只做"轮询键盘 + 等一小步"，于是等待期也能按键放弃。
+
+    ## 不留悬空相机（资源安全）
+
+    若用户跳过，**后台线程可能仍在尝试打开**。一旦它最终把 `src` 开出来，
+    由 worker 的 `finally` 负责 `release()`（见 `box["skipped"]` 分支），
+    所以**不会留一台没人管的相机**。若线程永不返回，它只是 `daemon` 线程，
+    不影响进程退出（放弃即返回，主线程不再等它）。
+
+    ## 无控制台时退化为"不可中断"（P5）
+
+    `key_poll` 恒返回 None（如 `_console_key` 在没有真控制台时）→ 本函数就只是
+    "在后台开、主线程等它结束"，行为等价于旧的阻塞版，但**绝不崩**。
+    """
+    key_poll = key_poll or _console_key
+    box = {"src": None, "bname": None, "done": False, "skipped": False}
+    lock = threading.Lock()
+
+    def _store_or_drop(src, bname) -> None:
+        """收尾：已被跳过就**就地释放**（不留悬空相机），否则把结果交给主线程。
+
+        为什么读 `skipped` 与写 `src` 必须在**同一把锁**里：主线程可能在 worker
+        赋值的**同一瞬间**按下 Esc。旧写法（先置 `done`、再查 `skipped`）会留下
+        一个窗口 —— 主线程已判定"跳过"并返回 `(None, None)`，worker 稍后才把
+        相机开出来，于是**没人 release**（独立 Critic 实测到过，窗口长度 = 一次
+        `key_poll()`）。现在两侧共用这一把锁：任一侧先到都能正确收尾，且
+        `box["src"]` 只会被置空一次，不会重复 `release()`。
+        """
+        with lock:
+            if box["skipped"]:
+                drop, box["src"] = src, None
+            else:
+                box["src"], box["bname"] = src, bname
+                drop = None
+            box["done"] = True
+        if drop is not None:
+            try:
+                drop.release()
+            except Exception:                            # noqa: BLE001
+                pass
+
+    def _worker() -> None:
+        src = bname = None
+        try:
+            src, bname = _open_preview(index, backend, enumerated=enumerated,
+                                       timeout_s=timeout_s)
+        except BaseException as exc:                     # noqa: BLE001
+            # 后台线程里抛异常若不接住，`box["done"]` 会永远为 False、主线程
+            # 空转 —— 比"打印一行"糟得多。原因照旧打出来，不静默。
+            print(f"  ✘ #{index} 后台打开时异常：{type(exc).__name__}: "
+                  f"{_first_line(exc)}", flush=True)
+        _store_or_drop(src, bname)
+
+    th = threading.Thread(target=_worker, daemon=True)
+    th.start()
+    while not box["done"]:
+        k = key_poll()
+        if k in (27, ord("s"), ord("S")):
+            with lock:
+                box["skipped"] = True
+                drop, box["src"] = box["src"], None
+            if drop is not None:
+                try:
+                    drop.release()
+                except Exception:                        # noqa: BLE001
+                    pass
+            if skipped_out is not None and index not in skipped_out:
+                skipped_out.append(index)
+            print(f"  ⏭ 已跳过 #{index}（后台仍在尝试打开；一旦打开会自动释放）",
+                  flush=True)
+            return None, None
+        th.join(timeout=0.05)
+    return box["src"], box["bname"]
 
 
 # 预览里"等第一帧"的上限（秒）。**慢相机实测要 ~24 秒**才给第一帧
@@ -291,6 +422,43 @@ class _WaitTicker:
                   f"（慢相机实测 ~24 秒才有画面，别关窗口）", flush=True)
 
 
+def _console_keys_available() -> bool:
+    """当前进程能否读控制台按键（Windows msvcrt）。无控制台 → False。
+
+    ## 为什么必须**兜底成不可用**（P5）
+
+    GUI 用 `tasks.start([...cameras.py...])` 起的是**子进程**，它的 stdin
+    不一定是真控制台（可能被重定向 / 根本没有）。此时 `msvcrt.kbhit()` 会抛
+    （`OSError` / `ValueError`）或恒假。**这条判据只用于决定是否提示"可按 Esc"**，
+    绝不能因为读不到键盘而崩掉整个 identify。
+
+    所以整体 try/except `(ImportError, OSError, ValueError)` → False，**绝不抛**。
+    """
+    try:
+        import msvcrt
+        msvcrt.kbhit()          # 真探一次：有控制台才会正常返回 bool
+        return True
+    except (ImportError, OSError, ValueError):
+        return False
+
+
+def _console_key() -> int | None:
+    """非阻塞读一个按键（返回码位；无键 / 不可用 → None）。**绝不抛**。
+
+    `msvcrt.getwch()` 返回 str（普通键是单个字符，特殊键是 `'\\x00'` / `'\\xe0'`
+    前缀 + 一个字节），统一用 `ord(ch)` 取码位。扩展键原样返回其前缀码位即可，
+    调用方只关心 Esc(27) / s / S —— 不需要为特殊键做特殊解析。
+    """
+    try:
+        import msvcrt
+        if not msvcrt.kbhit():
+            return None
+        ch = msvcrt.getwch()
+        return ord(ch) if ch else None
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
     """预览窗口上的标签。**必须写明"推测"** —— 这不是事实，是我们猜的。
 
@@ -325,8 +493,15 @@ def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
 
 
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
-                        *, backend: int) -> str | None:
+                        *, backend: int, first_frame_timeout: float | None = None,
+                        key_poll=None,
+                        failed_out: list[int] | None = None) -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
+
+    `failed_out`：传一个 list 进来，**"这个后端打不开这台"**的索引会写进去。
+    它把"**用户主动跳过**（Esc/s）"与"**后端开不出来**"分开 —— 两者都返回
+    `None`，但收尾时说的是两件事：主动跳过不该被报成"没能打开、去换个后端试试"。
+    （独立 Critic 指出的误导：用户按 Esc 跳过 #2 后，收尾却提示去 `probe` 查后端。）
 
     ⚠️ `_open_preview` **必须**返回 `(src, 后端名)` 两元组 —— 两个分支形状一致。
     这里崩过一次（2026-10-15）：早退分支写成 `return None`，解包时抛
@@ -337,17 +512,27 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
     里的长注释与那张实测表）。`keyword-only` 是为了让每个调用点都必须显式交代它。
     """
     label = _preview_label(index, entry)
+    skipped: list[int] = []
     try:
         # `enumerated` 决定失败文案：编号在 PnP 清单里 = "在线却开不出图"，
         # 不在清单里 = "枚举不到这个编号"。没有名字的一律按"没枚举到"算
         # （`cmd_identify` 对查不到的索引塞的是一个空白 DeviceEntry）。
-        src, backend_used = _open_preview(index, backend,
-                                          enumerated=bool(entry.name))
+        src, backend_used = _open_preview_interruptible(
+            index, backend, enumerated=bool(entry.name),
+            timeout_s=first_frame_timeout, key_poll=key_poll,
+            skipped_out=skipped)
     except RuntimeError as exc:
         print(f"  #{index} 打不开：{_first_line(exc)}")
+        if failed_out is not None and index not in failed_out:
+            failed_out.append(index)
         return None
     if src is None:
-        return None                     # 这个后端出不了图 -> 跳过这台（**不崩、也不换后端**）
+        # 这个后端出不了图 -> 跳过这台（**不崩、也不换后端**）。
+        # ⚠️ 只有**不是**用户主动跳过时才算"打不开"：两者返回值都是 `None`，
+        # 靠 `skipped` 区分（`_open_preview_interruptible` 的 `skipped_out`）。
+        if not skipped and failed_out is not None and index not in failed_out:
+            failed_out.append(index)
+        return None
     _backend_used[index] = backend_used
 
     win = "相机识别（l=左 r=右 n=无关 m=主 s=跳过 q=退出 / f 全屏）"
@@ -726,10 +911,22 @@ def cmd_identify(args) -> int:
     # 逐台开、每台最坏 `PREVIEW_FIRST_FRAME_S` 秒（慢相机实测 ~24 秒/台），
     # 而这段时间**一句话都不打**。所以：先报总预算，再报"还能只挑几台"，
     # 最后给出**不用开相机**的快路（pin）。
+
+    # ---- 等待期能不能按键跳过，先在开头说一声（2026-10-31，P4/P5）--------
+    #
+    # 旧版等待期**按什么键都无效**（按键循环在首帧之后）。现在等待期可中断，
+    # 但前提是**能读到控制台键盘** —— 从 GUI 子进程启动时读不到，必须如实告知
+    # "跳不了，要中止请 Ctrl+C"，而不是让用户以为按了没反应。
+    if _console_keys_available():
+        print("等待期间可按 Esc 或 s 跳过当前这台（不留悬空相机）")
+    else:
+        print("（从非控制台启动，无法按键跳过；要中止请 Ctrl+C）")
+
     n = len(indices)
-    worst = n * PREVIEW_FIRST_FRAME_S
+    timeout = args.first_frame_timeout
+    worst = n * timeout
     extra = f"（约 {worst / 60:.0f} 分钟）" if worst >= 60 else ""
-    print(f"共 {n} 台待识别，最坏约 {n}×{PREVIEW_FIRST_FRAME_S:.0f} 秒{extra}"
+    print(f"共 {n} 台待识别，最坏约 {n}×{timeout:.0f} 秒{extra}"
           f"；慢相机实测 ~24 秒/台。")
     if not args.indices:
         # 只在**用户没指定**时提示：已经写了 --indices 还提示一次，读起来像没生效。
@@ -803,16 +1000,19 @@ def cmd_identify(args) -> int:
     print("\n逐个索引显示画面，请按提示确认哪台是左、哪台是右、哪台「无关」：")
     print(f"（按键：{_KEY_HINT}）\n")
 
+    # `_unopened` 只收"这个后端打不开"的编号（由 `_preview_and_assign` 的
+    # `failed_out` 写进来）；**用户主动按 Esc/s 跳过的不算** —— 收尾文案说的是
+    # "没能打开、去换个后端试试"，把主动跳过混进去会误导用户（2026-10-31 修）。
     _unopened: list[int] = []
     for idx in indices:
         entry = by_order.get(idx) or cr.DeviceEntry(order=idx)
         status = _describe_status(reg, idx, entry)
-        role = _preview_and_assign(idx, entry, status, backend=backend)
-        if role is None and idx not in _unopened:
-            _unopened.append(idx)
+        role = _preview_and_assign(idx, entry, status, backend=backend,
+                                   first_frame_timeout=timeout,
+                                   failed_out=_unopened)
         if role == "":                                   # 退出
             break
-        if not role:                                     # 跳过：不改配置
+        if not role:                                     # 跳过/打不开：不改配置
             continue
 
         verified = bool(entry.identity)
@@ -862,8 +1062,12 @@ def cmd_identify(args) -> int:
         for key, roles in clash.items():
             print(f"    {' / '.join(roles)}  ->  {key}")
         print("    双目要求左右是**两台不同的相机**，现在这份配置没法用来标定。")
-        print("    原因通常是**有一台没打开**（换后端试试：`--backend dshow`），")
-        print("    于是你只能给另一台按键。请重跑 identify，确保两台各按一次。")
+        print("    原因通常是**有一台没能打开**，于是你只能给另一台按键 ——")
+        print("    于是两个角色记到了同一台上。改法有两种：")
+        print("      · 重跑 identify，确保两台各按一次（要目视确认画面）；")
+        print("      · 或者**不开相机**直接改绑（推荐：不受后端/编号影响）：")
+        print("          python apps/tools/cameras.py pin left  port:<左路那台的端口>")
+        print("          python apps/tools/cameras.py pin right port:<另一台的端口>")
     if _backend_used:
         used = "、".join(f"#{i}->{b}" for i, b in sorted(_backend_used.items()))
         print(f"预览实际用的后端：{used}")
@@ -1039,6 +1243,126 @@ def cmd_ignored(args) -> int:
 # --------------------------------------------------------------------------- #
 # check
 # --------------------------------------------------------------------------- #
+def _pin_value_of(entry: cr.DeviceEntry | None, spec: cr.RoleSpec) -> str:
+    """给 `pin` 命令用的取值：优先 port（每台唯一），其次 id，最后 name。
+
+    为什么不首选 `name:`：本机两台同型号，`identify` 记下的名字可能**完全一样**
+    （2026-10-31 的现状就是 left 与 right 都记成 "aoni webcam A25 left"），
+    而 `pin name:` 的匹配是"子串命中的第一台" —— 拿同一个名字 pin 两个角色，
+    只会**又绑回同一台**。port 才是每台唯一的那个。
+    """
+    if entry is not None:
+        if entry.port:
+            return f"port:{entry.port}"
+        if entry.identity:
+            return f"id:{entry.identity}"
+    if spec.port:
+        return f"port:{spec.port}"
+    if spec.identity:
+        return f"id:{spec.identity}"
+    if spec.name:
+        return f'name:"{spec.name}"'
+    return "<这台的 port，见 list>"
+
+
+def _role_collision_lines(
+    reg: cr.Registry, devices: list[cr.DeviceEntry]
+) -> tuple[bool, list[str]]:
+    """「两个角色解析到同一台相机」的判定与说明。返回 (是否危险, 输出行)。
+
+    ## 判据只调一次 `camera_registry.resolve_roles()`
+
+    它才是"两个角色不许落到同一台相机"的**唯一实现**（按角色依次解析，把已认领的
+    索引排除掉，撞车就抛 RuntimeError）。这里刻意**不**自己比 identity/index ——
+    那是第二份判据，迟早与它漂移。
+
+    而漂移的代价已经发生过一次（2026-10-31，用户被卡在死循环里）：
+
+        `pair_source.py` 报「左右解析到同一个相机」→ 用户照报错跑 `check`
+        → `check` **逐角色**比对，两个角色各自都"一致" →
+        输出「未发现危险项」、**退出码 0** → 用户被弹回原点，且被告知"没事"。
+
+    ## 危险由 resolve_roles 发起，是否"撞车"按**索引事实**复核
+
+    撞车后逐个角色**单独**解析一次（单个角色之间不存在撞车），拿到"谁落在哪台、
+    另一台是哪一个"。这不是第二份判据，而是**唯一一处**把异常翻译成结论的地方：
+    只要有两个角色落在同一个索引，就是撞车。
+
+    ⚠ 判据**不许看异常文案**。上一版写的是 `if "冲突" not in str(exc): return False`
+    —— 那么 `camera_registry` 里那句话改一个字，`check` 就静默退回
+    「未发现危险项 / EXIT 0」，**今天这个 bug 原样复发，而且没有测试会红**。
+    所以这里按事实复核；也不碰任何相机。
+    """
+    roles = [r for r in ("left", "right", "main") if r in reg.roles]
+    if len(roles) < 2:
+        return False, []
+    try:
+        cr.resolve_roles(roles, reg=reg, devices=devices, interactive=False)
+    except RuntimeError:
+        # 可能撞车，也可能只是某一路解析失败 —— 下面按索引事实区分，
+        # 不看异常文本（文案一改就静默变绿，那正是要防的）。
+        pass
+    else:
+        return False, []
+
+    landed: dict[int, list[str]] = {}
+    entries: dict[int, cr.DeviceEntry | None] = {}
+    for role in roles:
+        try:
+            res = cr.resolve_role(role, reg=reg, devices=devices, interactive=False)
+        except RuntimeError:
+            continue
+        if res.index is None:
+            continue
+        landed.setdefault(int(res.index), []).append(role)
+        entries.setdefault(int(res.index), res.entry)
+
+    ignored = cr.ignored_orders(reg, devices)
+    lines: list[str] = []
+    for index, group in landed.items():
+        if len(group) < 2:
+            continue
+        entry = entries.get(index)
+        who = f"#{index} {entry.name}" if entry is not None and entry.name else f"#{index}"
+        lines.append(f"[危险] {' 与 '.join(group)} 解析到同一台相机（{who}）")
+        lines.append("       两台相机是双目的前提；请分别 pin（**不用开相机**）：")
+        # 另一半的候选：在线、不是「无关」、不是撞车的这一台；内置/红外排后面
+        others = [d for d in devices
+                  if d.present and d.order not in ignored
+                  and (entry is None or d.identity.upper() != entry.identity.upper())]
+        others.sort(key=lambda d: cr.is_avoided(d.name))
+        if len(group) == 2:
+            a, b = group
+            lines.append(f"         python apps/tools/cameras.py pin {a:<5} "
+                         f"{_pin_value_of(entry, reg.roles[a])}")
+            lines.append(f"         python apps/tools/cameras.py pin {b:<5} "
+                         + (_pin_value_of(others[0], reg.roles[b]) if others
+                            else "<另一台的 port，见 list>"))
+        else:
+            for role in group:
+                lines.append(f"         python apps/tools/cameras.py pin {role:<5} "
+                             f"{_pin_value_of(entry, reg.roles[role])}")
+        if others:
+            cand = others[0]
+            lines.append(f"       另一台现在在线：#{cand.order} {cand.name or '(无名字)'}"
+                         f"（端口 {cand.port or '-'}）")
+            lines.append("       ⚠ 名字区分不了两台（本机同型号、可能连名字都一样），"
+                         "所以用 port；")
+            lines.append("         哪台是左、哪台是右只能你**目视**决定 —— "
+                         "反了就把两条 pin 的取值对调。")
+        elif not devices:
+            lines.append("       （当前枚举不到任何相机设备，给不出候选 —— 先跑 list 看看）")
+        else:
+            lines.append("       除这一台外**没有别的在线相机**（没插好/没上电/被标成「无关」），")
+            lines.append("       所以现在无论怎么 pin 都凑不出两台 —— 先把另一台插好。")
+    if not lines:
+        # 没有两个角色落在同一个索引 -> **不是撞车**（例如某一路只是解析失败，
+        # 那条由下面的逐角色循环报成 [危险]）。这里必须返回"不危险"，
+        # 否则每个解析失败都会被当成撞车，判据就失去意义。
+        return False, []
+    return True, lines
+
+
 def cmd_check(args) -> int:
     reg = cr.load_registry()
     if not reg.roles and not reg.ignored:
@@ -1052,6 +1376,21 @@ def cmd_check(args) -> int:
         print("（当前枚举不到任何相机设备；非 Windows 或系统枚举不可用 —— 只能按索引用）")
 
     danger = False
+
+    # ---- 先判「左右撞车」：它比任何单台问题都根本 ----
+    #
+    # 放在逐角色循环**之前**，因为逐角色看每台都"一致"（它们各自确实解析成功），
+    # 而问题恰恰是"两台角色指向同一台" —— 不说在前面，用户读完一堆「[一致]」
+    # 只会以为没事。
+    collide, collision_lines = _role_collision_lines(reg, devices)
+    if collision_lines:
+        for line in collision_lines:
+            print(line)
+        print("       （下面每个角色**单看**都是「一致」—— 问题不在某一台，"
+              "而在这两个角色指向同一台。）")
+        print()
+        danger = True
+
     for role in sorted(reg.roles):
         spec = reg.roles[role]
         tag = "已确认" if spec.verified else "未确认"
@@ -1116,7 +1455,11 @@ def cmd_check(args) -> int:
                 print(f"[无关] 「{who}」不在线（没插 / 换过口）—— 记录保留，插回来仍然生效")
 
     if danger:
-        print("\n存在 [危险] 项：请重跑 python apps/tools/cameras.py identify 重新确认。")
+        if collide:
+            print("\n存在 [危险] 项：按上面的 pin 命令把左右分开（不用开相机）；"
+                  "或重跑 python apps/tools/cameras.py identify 逐台目视确认。")
+        else:
+            print("\n存在 [危险] 项：请重跑 python apps/tools/cameras.py identify 重新确认。")
         return 2
     print("\n未发现危险项。若要每次开机都安心，可把这条命令放进启动脚本。")
     return 0
@@ -1281,6 +1624,10 @@ def build_parser() -> argparse.ArgumentParser:
     pi = sub.add_parser("identify", help="逐个索引显示画面，确认哪个是左/右/无关")
     pi.add_argument("--indices", default=None, help="只识别这些索引，如 0,2")
     pi.add_argument("--max-index", type=int, default=6, help="没给 --indices 时补探到第几个索引")
+    pi.add_argument(
+        "--first-frame-timeout", type=positive_seconds, default=PREVIEW_FIRST_FRAME_S,
+        help="每台相机等第一帧的上限（秒，默认 30）。"
+             "**实测慢相机 ~24s 才有画面，调小会让它在界面上消失**")
     pi.add_argument(
         "--backend", choices=("msmf", "dshow"), default=None,
         help="整场用哪个后端。**默认 msmf** —— 只有它与系统设备列表的顺序一致；"

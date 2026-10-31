@@ -522,6 +522,72 @@ def test_select_cameras() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# 9b. select_cameras：phantom 索引自适应早停（连续失败即停，不误伤真设备）
+# --------------------------------------------------------------------------- #
+def test_select_cameras_adaptive_phantom() -> bool:
+    print("----- 9b. phantom 索引自适应早停（连续失败即停，真设备不误伤） -----")
+    checks: list[tuple[str, bool]] = []
+    settings = {"min_width": 1280, "min_height": 720}       # max_index 走默认 6
+
+    def make_probe(mapping, seen):
+        def probe(index, **kw):
+            seen.append(index)          # 记下被真实探测的编号（entry.order，int）
+            return mapping.get(index, ProbeResult(index=index, ok=False, error="打不开"))
+        return probe
+
+    # 场景①：有真设备(0号)但打不开 + 其后 phantom 全打不开
+    # -> 真设备的失败**不计 miss**，phantom 连续失败 2 次即停（只试 [0, 1, 2]）
+    # ⚠️ 必须给一台真设备：`devices` 非空才启用早停（见场景④的反面）。
+    seen: list[int] = []
+    dev0 = DeviceEntry(order=0, name="real cam", identity="USB\\VID_ZZZZ")
+    picks = select_cameras(need=1, devices=[dev0], probe=make_probe({}, seen),
+                           reg=Registry(), settings=settings)
+    checks.append(("① 真设备失败不计 miss；phantom 连续失败 2 次即停（试 [0, 1, 2]）",
+                   seen == [0, 1, 2]))
+    checks.append(("① 全失败：无可用返回空 list 不抛", picks == []))
+
+    # 场景②：真设备在 3 号位且可用 -> 一定被试到（不被 phantom 早停跳过）
+    seen2: list[int] = []
+    dev3 = DeviceEntry(order=3, name="real cam", identity="USB\\VID_XXXX")
+    ok3 = {3: ProbeResult(3, True, 1920, 1080, 30.0, std=20.0)}
+    picks2 = select_cameras(need=1, devices=[dev3], probe=make_probe(ok3, seen2),
+                            reg=Registry(), settings=settings)
+    checks.append(("② 真设备(3号)一定被试到", 3 in seen2))
+    checks.append(("② 真设备(3号)被挑中", len(picks2) == 1 and picks2[0].index == 3))
+
+    # 场景③：真设备全失败 + 一台被标「无关」的真设备在 5 号 -> 5 号仍被试到
+    # （它在 keep/drop 重排后被排到 phantom 之后，正是"早停会不会跳过真设备"的关键）
+    seen3: list[int] = []
+    dev5 = DeviceEntry(order=5, name="ignored cam", identity="USB\\VID_YYYY")
+    reg3 = Registry()
+    mark_ignored(reg3, entry=dev5, index=5, verified=True)
+    picks3 = select_cameras(need=1, devices=[dev5], probe=make_probe({}, seen3),
+                            reg=reg3, settings=settings)
+    checks.append(("③ 被标「无关」的真设备(5号)仍被试到（早停不跳过真设备）",
+                   5 in seen3))
+    checks.append(("③ 全失败无可用时返回空 list", picks3 == []))
+
+    # 场景④：**拿不到 PnP 枚举**（devices=[]）时早停必须**禁用** ——
+    # 此刻"编号不在清单里"不等于"编号不存在"（非 Windows / 枚举失败会退化成
+    # "按索引使用"）。反例：devices=[] 而 #2 实际可开；若早停生效则 seen==[0,1]，
+    # 永远选不到 2 号。这条判据就是 Critic 抓到的真回归的守护。
+    seen4: list[int] = []
+    ok2 = {2: ProbeResult(2, True, 1920, 1080, 30.0, std=20.0)}
+    picks4 = select_cameras(need=1, devices=[], probe=make_probe(ok2, seen4),
+                            reg=Registry(), settings=settings)
+    checks.append(("④ devices=[] 时早停被禁用：#2 仍被试到（seen 含 2）",
+                   2 in seen4))
+    checks.append(("④ devices=[] 时 #2 被挑中（picks == [2]，不是空）",
+                   len(picks4) == 1 and picks4[0].index == 2))
+
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # 10. from_args 兼容性（守护硬约束：全空必须抛 RuntimeError）
 # --------------------------------------------------------------------------- #
 def test_from_args_compat() -> bool:
@@ -1383,6 +1449,595 @@ def test_avoid_rules_are_configurable() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_identify_open_interruptible() -> bool:
+    """第 21 节：`_open_preview_interruptible` 在**等待首帧期间**就能被 Esc/s 打断。
+
+    ## 守的是用户 2026-10-31 报的"相机管理依然卡死"（P4）
+
+    旧代码里 `CameraSource(...)` 在**构造函数里**开相机 + 等首帧（上限 30 秒），
+    而按键循环在 `_preview_and_assign` 里、位于**首帧到达之后**才跑 ——
+    所以那 30 秒内按 Esc 完全无效，用户只能理解成"卡死"。
+
+    本判据注入：① 一个"睡眠 1.5 秒才返回"的假 `_open_preview`；
+    ② 一个"第 3 次调用返回 27(Esc)"的假 `key_poll`。改后应在 ~0.1 秒内返回
+    `(None, None)`（远早于 1.5 秒）。
+
+    ⚠️ **改前对照（Q3）**：改前没有这条可中断通道，这个调用会**等满 1.5 秒**
+    才返回（因为它就是直接 `_open_preview(...)` 阻塞），`< 0.8s` 的断言会红。
+    """
+    print("----- 21. identify 开预览可中断（等待期按键即可放弃）-----")
+    try:
+        from apps.tools import cameras as _cm
+    except Exception as exc:                              # noqa: BLE001
+        print(f"  [跳过] 无法导入 apps/tools/cameras.py：{exc}")
+        return True
+
+    import time as _time
+
+    class _FakeSrc:
+        def __init__(self) -> None:
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+
+    checks: list[tuple[str, bool]] = []
+    real_open = _cm._open_preview
+    fake = _FakeSrc()
+
+    def _slow_open(index, backend, *, enumerated=False, timeout_s=None):  # noqa: ANN001
+        _time.sleep(1.5)
+        return fake, "MSMF"
+
+    try:
+        # ---- 场景①：第 3 次轮询按 Esc -> 立即返回 (None, None) ----
+        _cm._open_preview = _slow_open                  # type: ignore[assignment]
+        calls = {"n": 0}
+
+        def _poll():
+            calls["n"] += 1
+            return 27 if calls["n"] == 3 else None
+
+        t0 = _time.perf_counter()
+        got = _cm._open_preview_interruptible(0, 0, enumerated=True,
+                                              timeout_s=5.0, key_poll=_poll)
+        elapsed = _time.perf_counter() - t0
+        ok1 = (got == (None, None)) and elapsed < 0.8
+        print(f"  ① 按 Esc -> 返回 {got!r}，用时 {elapsed:.3f}s（假实现要 1.5s）")
+        checks.append(("等待期按 Esc < 0.8s 返回 (None, None)", ok1))
+
+        # ---- 场景②：后台稍后把相机会开出来 -> 必须被 release()（不留悬空）----
+        released, waited = False, 0.0
+        while waited < 3.0:
+            if fake.released:
+                released = True
+                break
+            _time.sleep(0.1)
+            waited += 0.1
+        print(f"  ② 后台线程结束后 fake.released = {fake.released}（等了 {waited:.1f}s）")
+        checks.append(("用户跳过 -> 后台开出图后自动 release()（不留悬空相机）", released))
+
+        # ---- 场景③：不按任何键 + 立即返回 -> 正常拿到 src，且不被误 release ----
+        fake2 = _FakeSrc()
+
+        def _fast_open(index, backend, *, enumerated=False, timeout_s=None):  # noqa: ANN001
+            return fake2, "MSMF"
+
+        _cm._open_preview = _fast_open                  # type: ignore[assignment]
+        got3 = _cm._open_preview_interruptible(0, 0, enumerated=True,
+                                               timeout_s=5.0,
+                                               key_poll=lambda: None)
+        ok3 = (got3 == (fake2, "MSMF")) and (fake2.released is False)
+        print(f"  ③ 不按键 -> 拿到 fake={got3[0] is fake2}，"
+              f"fake2.released = {fake2.released}")
+        checks.append(("不按键 -> 正常拿到 src，且不被误 release", ok3))
+
+        # ---- 场景④：**用户主动跳过**必须记进 `skipped_out`（收尾据此不说
+        #      "没能打开、去换个后端试试"）----
+        skip_list: list[int] = []
+        calls2 = {"n": 0}
+
+        def _poll2():
+            calls2["n"] += 1
+            return 27 if calls2["n"] == 3 else None
+
+        _cm._open_preview = _slow_open                  # type: ignore[assignment]
+        got4 = _cm._open_preview_interruptible(7, 0, enumerated=True,
+                                               timeout_s=5.0, key_poll=_poll2,
+                                               skipped_out=skip_list)
+        checks.append(("④ 用户跳过 -> 记进 skipped_out（供收尾区分「跳过」与「打不开」）",
+                       got4 == (None, None) and skip_list == [7]))
+
+        # ---- 场景⑤：**打不开**（非用户跳过）不得进 `skipped_out`，且
+        #      `_preview_and_assign` 要把它记进 `failed_out` ----
+        skip_list2: list[int] = []
+
+        def _fail_open(index, backend, *, enumerated=False, timeout_s=None):  # noqa: ANN001
+            return None, None
+
+        _cm._open_preview = _fail_open                  # type: ignore[assignment]
+        _cm._open_preview_interruptible(3, 0, enumerated=True, timeout_s=5.0,
+                                        key_poll=lambda: None,
+                                        skipped_out=skip_list2)
+        checks.append(("⑤ 打不开（非跳过）-> skipped_out 为空", skip_list2 == []))
+
+        failed: list[int] = []
+        entry5 = DeviceEntry(order=3, name="real cam", identity="USB\\VID_FAIL")
+        role5 = _cm._preview_and_assign(3, entry5, "", backend=0,
+                                        first_frame_timeout=5.0,
+                                        key_poll=lambda: None,
+                                        failed_out=failed)
+        checks.append(("⑤ 打不开 -> `_preview_and_assign` 记进 failed_out"
+                       "（收尾才对它说「没能打开」）",
+                       role5 is None and failed == [3]))
+
+        # ---- 场景⑥：**用户主动跳过**不得进 `failed_out`（本次修复的语义本体：
+        #      跳过 ≠ 打不开；回退这条判据，收尾又会把跳过说成"没能打开"）----
+        failed2: list[int] = []
+        calls3 = {"n": 0}
+
+        def _poll3():
+            calls3["n"] += 1
+            return 27 if calls3["n"] == 3 else None
+
+        _cm._open_preview = _slow_open                  # type: ignore[assignment]
+        entry6 = DeviceEntry(order=9, name="real cam", identity="USB\\VID_SKIP")
+        role6 = _cm._preview_and_assign(9, entry6, "", backend=0,
+                                        first_frame_timeout=5.0,
+                                        key_poll=_poll3, failed_out=failed2)
+        checks.append(("⑥ 用户跳过 -> failed_out 保持空（不误报「打不开」）",
+                       role6 is None and failed2 == []))
+    finally:
+        _cm._open_preview = real_open                   # type: ignore[assignment]
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_check_detects_both_roles_on_same_camera() -> bool:
+    """第 22 节：`cameras.py check` **必须自己发现「左右撞车」**。
+
+    ## 守的是用户 2026-10-31 被卡住的死循环
+
+        `pair_source.py` 报「左右两路解析到同一个相机」→ 报错让用户跑 check
+        → check **逐角色**比对，两个角色各自都"一致"
+        → 输出「未发现危险项」+ **退出码 0** → 用户被弹回原点，还被告知"没事"。
+
+    所以这里钉两件事：
+
+    1. **退出码**：撞车时必须非 0（`check --help` 承诺过"有 [危险] 项时退出码 2"）；
+    2. **顺序**：危险的结论必须出现在逐个角色的「[一致]」**之前** —— 否则用户读完
+       一屏"一致"就关窗口了，根本看不到后面。
+
+    判据不许自己比 identity/index：那会变成第二份"撞车判据"。这里只断言
+    `check` 的输出与退出码，实现上它必须交给 `camera_registry.resolve_roles()`。
+
+    ## 不碰相机
+
+    `cmd_check` 本来就不开相机（只做枚举 + 配置比对），所以这里替换掉
+    `list_devices` / `load_registry` 两个入口即可，整段只读假数据。
+    """
+    print("----- 22. check 必须发现「左右撞车」 -----")
+    import importlib.util
+
+    import sphere_tracker.camera_registry as _cr
+
+    cam_path = ROOT / "apps" / "tools" / "cameras.py"
+    spec = importlib.util.spec_from_file_location("cam_tool_collide", cam_path)
+    cam = importlib.util.module_from_spec(spec)
+    sys.modules["cam_tool_collide"] = cam
+    assert spec.loader is not None
+    spec.loader.exec_module(cam)
+
+    left_dev = dev(0, "aoni webcam A25 left", "USB\\A\\p0", "6&31324e2c&0&0000")
+    right_dev = dev(1, "aoni webcam A25 right", "USB\\B\\p1", "6&4489382&0&0000")
+    builtin = dev(2, "Integrated Camera", "USB\\INT\\p2", "6&3a5c8ec3&1&0000")
+    devs = [left_dev, right_dev, builtin]
+
+    # 撞车：left 与 right 记的**同一台**（就是用户现在的 config/cameras.json）
+    collide = Registry()
+    set_role(collide, "left", entry=left_dev, index=0, verified=True)
+    set_role(collide, "right", entry=left_dev, index=0, verified=True)
+    # 对照：两台不同
+    healthy = Registry()
+    set_role(healthy, "left", entry=left_dev, index=0, verified=True)
+    set_role(healthy, "right", entry=right_dev, index=1, verified=True)
+
+    checks: list[tuple[str, bool]] = []
+    real_list, real_load = _cr.list_devices, _cr.load_registry
+    real_roles = _cr.resolve_roles
+
+    def _fake_roles_raise(*_a, **_k):
+        # 判据不许看异常文案：这里把 `resolve_roles` 的报错改成任意无关文本。
+        # 若 `check` 靠 `"冲突" in str(exc)` 判断，这一轮就会静默退回 EXIT=0
+        # —— 那正是今天这个 bug 的复发方式（改一句文案就重犯，而且没人会发现）。
+        raise RuntimeError("duplicate")
+
+    try:
+        _cr.list_devices = lambda: list(devs)                  # type: ignore[assignment]
+
+        _cr.load_registry = lambda *a, **k: collide            # type: ignore[assignment]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code_bad = cam.cmd_check(SimpleNamespace())
+        out_bad = buf.getvalue()
+
+        _cr.load_registry = lambda *a, **k: healthy            # type: ignore[assignment]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code_ok = cam.cmd_check(SimpleNamespace())
+        out_ok = buf.getvalue()
+
+        # 第三/四轮：异常文案改成 "duplicate"（判据必须仍按事实成立）
+        _cr.resolve_roles = _fake_roles_raise                   # type: ignore[assignment]
+        _cr.load_registry = lambda *a, **k: collide            # type: ignore[assignment]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code_msg = cam.cmd_check(SimpleNamespace())
+        out_msg = buf.getvalue()
+
+        _cr.load_registry = lambda *a, **k: healthy            # type: ignore[assignment]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code_msg_ok = cam.cmd_check(SimpleNamespace())
+        out_msg_ok = buf.getvalue()
+    finally:
+        _cr.list_devices, _cr.load_registry = real_list, real_load
+        _cr.resolve_roles = real_roles
+
+    print("  撞车时 check 的输出（前 9 行）：")
+    for line in out_bad.splitlines()[:9]:
+        print(f"      {line[:96]}")
+    print(f"  撞车退出码 = {code_bad}；不撞车退出码 = {code_ok}")
+    print(f"  把异常文案换成「duplicate」后：撞车退出码 = {code_msg}；"
+          f"不撞车退出码 = {code_msg_ok}")
+
+    headline = "[危险] left 与 right 解析到同一台相机（#0 aoni webcam A25 left）"
+    # 用 find（找不到返回 -1）而不是 index（找不到直接抛）：判据自己要能**报红**，
+    # 不许在"守卫被删掉"的情况下先崩成 ValueError —— 那就看不出是哪条判据红的。
+    pos_danger = out_bad.find("[危险] left 与 right")
+    pos_agree = out_bad.find("[一致]")
+    checks += [
+        ("撞车 -> 退出码非 0（`check` 承诺过有 [危险] 项时为 2）", code_bad == 2),
+        ("撞车 -> 明确报出「left 与 right 解析到同一台相机」并点名那台",
+         headline in out_bad),
+        ("撞车 -> 说明这两台是双目的前提，并给出两份 pin（不用开相机）",
+         "两台相机是双目的前提" in out_bad
+         and "pin left" in out_bad and "pin right" in out_bad
+         and "不用开相机" in out_bad),
+        ("撞车 -> 给出的两个 pin 取值**指向两台不同的相机**（port 各取各的）",
+         "port:6&31324e2c&0&0000" in out_bad and "port:6&4489382&0&0000" in out_bad),
+        ("撞车 -> 危险结论出现在逐个角色的「[一致]」**之前**（否则用户只看得到一致）",
+         pos_danger >= 0 and pos_agree >= 0 and pos_danger < pos_agree),
+        ("不撞车 -> 退出码 0 且「未发现危险项」（对照，防止判据永远为红）",
+         code_ok == 0 and "未发现危险项" in out_ok and "[危险]" not in out_ok),
+        # 下面两条钉死"**不许看异常文案**"：判据一旦退回 `"冲突" in str(exc)`，
+        # 第一条立刻红（撞车被漏判），而第二条守住另一头（不许把任何异常都当撞车）。
+        ("异常文案改成「duplicate」-> 仍判撞车、退出码 2（判据不看字串）",
+         code_msg == 2 and "[危险] left 与 right 解析到同一台相机" in out_msg),
+        ("异常文案改了也**不许误报**：不撞车时仍 EXIT 0",
+         code_msg_ok == 0 and "未发现危险项" in out_msg_ok),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_no_frame_retries_lowres_and_translates_error() -> bool:
+    """第 23 节：「一帧都没有」先补试 640x480；-2147483638 必须翻译成人话。
+
+    ## 守的两个真缺陷（2026-10-31）
+
+    **① 判据被自己吞掉**：`quiet_repeated_grab_warnings()` 为了不被每 10 秒一条
+    的 WARN 刷屏，把 `videoio` 的 WARN 压成 ERROR —— 而那条 WARN 里唯一的实质
+    信息就是错误码。于是"用户永远看不到判据"。现在报错正文必须把
+    `MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED` 的含义与**一条**下一步说出来，
+    并且提示"也可能是你自己开了第二个窗口"。
+
+    **② 把"带宽不够"当成"设备死了"**：USB 带宽不足恰恰是"降一档就好"，
+    旧代码在一个分辨率上读不到帧就 `break` 掉所有分辨率，于是本来能用的相机
+    被判死。现在必须**再试一次 640x480**，且只补这一档（不是全部重试一遍）。
+
+    ## 判据怎么做到"不依赖真机"
+
+    把 `sources.cv2.VideoCapture` 换成替身：一个"永远读不到帧"、一个"只在
+    640x480 下给帧"。于是既能断言"补试的是哪一档"，也能断言"补试成功后相机
+    真的被救回来了"。全程不打开任何真实设备。
+    """
+    print("----- 23. 一帧都没有时补试 640x480；错误码翻译 -----")
+    import cv2 as _cv2
+
+    from sphere_tracker import sources as _src
+
+    checks: list[tuple[str, bool]] = []
+
+    class _NoFrameCap:
+        """能打开、`read()` 永远返回 (False, None)，并记下被请求的分辨率。"""
+
+        def __init__(self, args) -> None:                  # noqa: ANN001
+            self._w = 0
+            self._h = 0
+            self.seen: list[tuple[int, int]] = []
+
+        def isOpened(self) -> bool:
+            return True
+
+        def set(self, prop, val=None):                      # noqa: ANN001
+            if prop == _cv2.CAP_PROP_FRAME_WIDTH:
+                self._w = int(val)
+            elif prop == _cv2.CAP_PROP_FRAME_HEIGHT:
+                self._h = int(val)
+                self.seen.append((self._w, self._h))
+            return True
+
+        def get(self, prop):                               # noqa: ANN001
+            if prop == _cv2.CAP_PROP_FRAME_WIDTH:
+                return self._w or 640
+            if prop == _cv2.CAP_PROP_FRAME_HEIGHT:
+                return self._h or 480
+            return 30.0
+
+        def read(self):
+            return False, None
+
+        def release(self) -> None:
+            pass
+
+    class _LowresOnlyCap(_NoFrameCap):
+        """1920x1080 下读不到帧，640x480 下正常 —— 这就是"带宽不够"的样子。"""
+
+        def read(self):
+            import numpy as _np
+            if (self._w, self._h) == (640, 480):
+                frame = _np.zeros((480, 640, 3), _np.uint8)
+                frame[::2] = 255                             # 有噪声，不是全黑
+                return True, frame
+            return False, None
+
+    made: list[_NoFrameCap] = []
+
+    def factory(kind):
+        def _make(*_a, **_k):
+            cap = kind(_a)
+            made.append(cap)
+            return cap
+        return _make
+
+    def run(kind):
+        made.clear()
+        real_vc = _src.cv2.VideoCapture
+        _src.cv2.VideoCapture = factory(kind)                # type: ignore[assignment]
+        try:
+            try:
+                return _src.CameraSource(index=993, width=1920, height=1080, fps=30,
+                                         backend=_cv2.CAP_MSMF, optimize=False,
+                                         search_budget_s=5.0,
+                                         first_frame_timeout_s=1.0), ""
+            except RuntimeError as exc:
+                return None, str(exc)
+        finally:
+            _src.cv2.VideoCapture = real_vc                   # type: ignore[assignment]
+
+    # ---- ① 永远读不到帧：补试 640x480，只补一档 ----
+    _src_unused, msg = run(_NoFrameCap)
+    tries = [wh for cap in made for wh in cap.seen]
+    print(f"  ① 实际尝试的分辨率序列：{tries}")
+    print("  ① 报错前 8 行：")
+    for line in msg.splitlines()[:8]:
+        print(f"      {line[:96]}")
+    checks += [
+        ("一帧都没有 -> 紧接着补试的就是 640x480（不是试完所有档才轮到它）",
+         tries[:2] == [(1920, 1080), (640, 480)]),
+        ("补试**只有一档**（1280x720 没被试，否则又变成「卡死」）",
+         (1280, 720) not in tries),
+        ("报错写明错误码的含义（MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED）",
+         "MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED" in msg),
+        ("报错给出**一条**下一步：先关占用它的窗口/程序",
+         "下一步（只做这一条）" in msg),
+        ("报错提示「也可能是你自己开了第二个窗口」（P2-7）",
+         "第二个本程序窗口" in msg),
+        ("报错说明已试过 640x480 这一档（结论有依据）", "640x480" in msg),
+    ]
+
+    # ---- ② 只认 640x480：必须被救回来（补试的全部意义） ----
+    src2, msg2 = run(_LowresOnlyCap)
+    tries2 = [wh for cap in made for wh in cap.seen]
+    print(f"  ② 实际尝试的分辨率序列：{tries2}")
+    ok2 = src2 is not None
+    if src2 is not None:
+        print(f"  ② 救回来了：{src2.info.width}x{src2.info.height}，"
+              f"resolution_fallback={src2.resolution_fallback}")
+        src2.release()
+    checks += [
+        ("一帧都没有时，若 640x480 能出帧 -> 相机**被救回来**（旧逻辑会直接判死）",
+         ok2),
+        ("救回来时用的是 640x480 那一档", ok2 and tries2[:2] == [(1920, 1080), (640, 480)]),
+        ("救回来时标记 resolution_fallback（上层能说出「降了一档」）",
+         ok2 and src2.resolution_fallback is True),
+    ]
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_same_camera_message_blames_config_not_cable() -> bool:
+    """第 24 节：左右撞车的报错必须说「配置错」，不许再推荐 `--backend dshow`。
+
+    ## 守的是用户 2026-10-31 的真实处境
+
+    报错原文让用户"确认角色绑定的相机在不在线（换过 USB 口）"，
+    并推荐 `--left 0 --right 1 --backend dshow`。这两条在本机**都错**：
+
+      · 两台 aoni **都在线**（`list` 里都枚举得到，一台 1.2 s 出图）；
+      · DSHOW 的 `#1` 是**笔记本内置**、`#2` 才是外接 aoni —— 照它给的两个
+        编号会**开到另一台相机**，两路照样报同样的分辨率，界面上看不出异常。
+
+    真相是配置里 left/right 记的是同一台，改法**不用开相机**（pin 按端口绑）。
+    只有两个角色记的**不是**同一台时，才轮到"解析退化/索引漂移"的说法。
+
+    ## 判据为什么喂纯函数
+
+    `explain_same_camera()` 是纯函数（不读配置、不开相机），所以两种输入
+    （同 identity / 不同 identity）都能直接断言文案，不需要任何设备。
+    """
+    print("----- 24. 左右撞车的报错：配置错 vs 解析退化 -----")
+    from stereo.pair_source import explain_same_camera
+
+    same_a = role(identity="USB\\X\\p0", port="6&31324e2c&0&0000",
+                  name="aoni webcam A25 left", index=0, verified=True)
+    same_b = role(identity="USB\\X\\p0", port="6&31324e2c&0&0000",
+                  name="aoni webcam A25 left", index=0, verified=True)
+    diff_b = role(identity="USB\\Y\\p1", port="6&4489382&0&0000",
+                  name="aoni webcam A25 right", index=1, verified=True)
+
+    msg_same = explain_same_camera(0, 0, left_spec=same_a, right_spec=same_b)
+    msg_diff = explain_same_camera(0, 0, left_spec=same_a, right_spec=diff_b)
+    msg_bare = explain_same_camera(0, 0)          # 显式给了同一个数字编号
+
+    for label, msg in (("同 identity", msg_same), ("不同 identity", msg_diff),
+                       ("显式同编号", msg_bare)):
+        print(f"  {label}：")
+        for line in msg.splitlines()[:6]:
+            print(f"      {line[:96]}")
+
+    checks = [
+        ("同 identity -> 说「配置错」（不是相机掉线）",
+         "配置错" in msg_same and "不是相机掉线" in msg_same),
+        ("同 identity -> 给两份 pin（不开相机就能做）",
+         "pin left" in msg_same and "pin right" in msg_same and "不用开相机" in msg_same),
+        ("同 identity -> 两个角色记的值一样时**明确警告不能填同一个**",
+         "不能填同一个" in msg_same),
+        ("同 identity -> 不再出现假线索「换过 USB 口」", "换过 USB 口" not in msg_same),
+        ("不同 identity -> 才说「解析退化 / 索引漂移」并保留换口线索",
+         ("解析退化" in msg_diff or "索引漂移" in msg_diff)
+         and "换过 USB 口" in msg_diff),
+        ("不同 identity -> 不冒充「配置错」（那是另一种原因）",
+         "配置错" not in msg_diff),
+        ("两条路径都**删掉了**会开错相机的 `--left 0 --right 1 --backend dshow`",
+         "--backend dshow" not in msg_same and "--backend dshow" not in msg_diff
+         and "--left 0 --right 1" not in msg_same
+         and "--left 0 --right 1" not in msg_diff),
+        ("拿不到角色配置（显式同编号）-> 走「解析退化」那条，不硬说是配置错",
+         "解析退化" in msg_bare and "配置错" not in msg_bare),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_resolve_camera_arg_never_prompts() -> bool:
+    """第 25 节：`--left/--right` 的解析**永不弹交互**（否则后台子进程永远挂住）。
+
+    ## 守的是"点了开始标定，一直显示正在标定"
+
+    `resolve_camera_arg(..., interactive=True)` 在某角色"按身份/端口/名字都找不到"
+    且 `verified=True` 时会走 `input()`。而 `apps/_task_runner.py` 起子进程时
+    **没有重定向 stdin** —— 子进程仍挂在控制台上，于是 `input()` 一直在等一个
+    **永远不会有人敲**的回车：进程活着、日志里只有一句"请选择"、取景窗永不出现。
+    这是全项目**唯一**能无限期挂住的地方。
+
+    ## 判据是行为断言，不是读源码里的字符串
+
+      · 让 `input()` 只记账（不阻塞），跑一次**正常**解析 -> 必须一次都没被调用；
+      · 让解析失败 -> 必须当场抛出**非交互**错误（说明"不会弹选择"并给出 pin 命令），
+        而不是返回"等你自己选"。
+
+    两个替身都**记录 kwargs**，所以"有没有传 `interactive=False`"是被观测到的事实，
+    不是"源码里有这串字符"。
+    """
+    print("----- 25. --left/--right 解析永不弹交互 -----")
+    import builtins
+
+    from stereo import pair_source as ps
+
+    prompts: list[str] = []
+    seen: list[dict] = []
+
+    def _fake_input(*a, **_k):
+        # 真 `input()` 在没有 tty 输入的子进程里会永远等；这里只记账、立刻返回。
+        prompts.append(str(a[0]) if a else "")
+        return ""
+
+    class _StubPairSource:
+        """守卫/解析没拦住时才会构造 —— 只记录参数，绝不碰相机。"""
+
+        def __init__(self, *a, **k) -> None:
+            self.kw = k
+
+    real_resolve = ps.resolve_camera_arg
+    real_pair = ps.PairSource
+    real_input = builtins.input
+
+    def _resolve_ok(value, **kw):
+        seen.append(kw)
+        # 复现真函数的交互分支：**只要 interactive 还是 True，就会弹选择**。
+        # 这样"少传一个参数"立刻表现为 input() 被调用，而不是悄悄通过。
+        if kw.get("interactive", True):
+            _fake_input(f"「{value}」用哪个编号？")
+        return {"left": 0, "right": 1}.get(str(value), 0)
+
+    def _resolve_fail(value, **kw):
+        seen.append(kw)
+        if kw.get("interactive", True):
+            _fake_input(f"「{value}」用哪个编号？")
+        raise RuntimeError(f"「{value}」指定的相机当前不在线")
+
+    args = SimpleNamespace(left="left", right="right", backend=None,
+                           width=1280, height=720, fps=30, backup_camera=None)
+    checks: list[tuple[str, bool]] = []
+    builtins.input = _fake_input                    # type: ignore[assignment]
+    try:
+        ps.PairSource = _StubPairSource             # type: ignore[assignment]
+
+        ps.resolve_camera_arg = _resolve_ok         # type: ignore[assignment]
+        seen.clear()
+        ok_call = True
+        try:
+            with redirect_stdout(io.StringIO()):
+                ps.from_args(args)
+        except Exception as exc:                    # noqa: BLE001
+            ok_call = False
+            print(f"  正常解析抛了异常：{type(exc).__name__}: {exc}")
+        seen_ok = list(seen)                        # 这一轮的两个 kwargs（失败轮会再追加）
+
+        ps.resolve_camera_arg = _resolve_fail       # type: ignore[assignment]
+        msg = ""
+        try:
+            with redirect_stdout(io.StringIO()):
+                ps.from_args(args)
+        except RuntimeError as exc:
+            msg = str(exc)
+        except Exception as exc:                    # noqa: BLE001
+            msg = f"<{type(exc).__name__}> {exc}"
+    finally:
+        builtins.input = real_input                  # type: ignore[assignment]
+        ps.resolve_camera_arg = real_resolve         # type: ignore[assignment]
+        ps.PairSource = real_pair                    # type: ignore[assignment]
+
+    print(f"  正常解析：input() 被调用 {len(prompts)} 次；"
+          f"两处 kwargs = {[kw.get('interactive') for kw in seen_ok]}")
+    first = msg.splitlines()[0] if msg else "(没有抛错)"
+    print(f"  解析失败时的首行：{first[:88]}")
+    checks += [
+        ("两处解析都显式传了 interactive=False",
+         len(seen_ok) == 2 and all(kw.get("interactive") is False for kw in seen_ok)),
+        ("整个解析过程**一次都没调 input()**（真子进程里那会永远挂住）",
+         prompts == [] and ok_call),
+        ("解析失败 -> 当场抛错，而不是返回 None 让人去等输入",
+         bool(msg) and not msg.startswith("<")),
+        ("失败报错说明「不会弹出选择」（后台/GUI 子进程没有键盘输入）",
+         "**不会**弹出" in msg and "子进程" in msg),
+        ("失败报错给出可复制的下一步（pin 该角色 / 显式给编号）",
+         "pin left port:" in msg and "--left" in msg),
+        ("失败报错带上原始原因（哪台不在线），不吞掉它", "不在线" in msg),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def make_scratch_dir() -> Path:
     """可写的临时目录（沙箱里 %TEMP% 可能不可写，退回项目内 outputs/）。"""
     import tempfile
@@ -1423,6 +2078,7 @@ def main() -> int:
             test_resolve_camera_arg(),
             test_config_roundtrip(tmp),
             test_select_cameras(),
+            test_select_cameras_adaptive_phantom(),
             test_from_args_compat(),
             test_ignored(tmp),
             test_probe_fallback_and_cache_invalidation(),
@@ -1432,6 +2088,11 @@ def main() -> int:
             test_identify_never_switches_backend(),
             test_preview_label_admits_it_is_a_guess(),
             test_avoid_rules_are_configurable(),
+            test_identify_open_interruptible(),
+            test_check_detects_both_roles_on_same_camera(),
+            test_no_frame_retries_lowres_and_translates_error(),
+            test_same_camera_message_blames_config_not_cable(),
+            test_resolve_camera_arg_never_prompts(),
         ]
         print()
         if args.probe:
