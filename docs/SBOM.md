@@ -1,6 +1,6 @@
 # SBOM — 软件物料清单
 
-> 生成时间：2026-10-19 10:58:21 +0800　生成时 HEAD：`c8fef88`（仅参考）
+> 生成时间：2026-10-31 13:42:20 +0800　生成时 HEAD：`ba0e2f3`（仅参考）
 > 环境：`myenv`（Python 3.14.7，Windows-11-10.0.26300-SP0）
 > 范围：本机运行环境里 **59 个 Python 发行版** + **7 个原生运行时组件**。
 > 机器可读版本：[`docs/sbom.cdx.json`](sbom.cdx.json)（CycloneDX 1.5）。
@@ -93,7 +93,7 @@
 | FFmpeg (OpenCV wheel bundled) | prebuilt-unknown | LGPL-2.1-or-later OR GPL-2.0-or-later | required | OpenCV 的 FFMPEG 后端；许可证取决于 wheel 构建，分发前复核 |
 | NVIDIA CUDA Runtime | 12.8 | NVIDIA proprietary (EULA) | optional | torch 2.11.0+cu128；AI 后端才需要 |
 | NVIDIA cuDNN | 9.19.0 | NVIDIA proprietary (EULA) | optional | torch.backends.cudnn 报 91900 |
-| NVIDIA Display Driver | 577.05 | NVIDIA proprietary (EULA) | required | NVIDIA GeForce RTX 5060 Laptop GPU；CUDA 的最低驱动 |
+| NVIDIA Display Driver | 616.56 | NVIDIA proprietary (EULA) | required | NVIDIA GeForce RTX 5060 Laptop GPU；CUDA 的最低驱动 |
 | Intel MKL | 2026.1.0 | Intel Simplified Software License | required | conda 环境里的 BLAS/LAPACK；numpy 使用 |
 | Windows | 10.0.26300 | Proprietary | required | 操作系统 |
 
