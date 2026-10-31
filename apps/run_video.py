@@ -66,6 +66,7 @@ import numpy as np
 
 from sphere_tracker.config import AppConfig, ColorConfig, load_config
 from sphere_tracker.detectors import registry  # noqa: F401  （import 即注册：R1）
+from sphere_tracker.detectors.neural import mark_conf_explicit
 from sphere_tracker.geometry import refine_circle_subpixel
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.sources import open_source
@@ -443,7 +444,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--conf", type=float, default=None, metavar="0.25",
         help="YOLO 置信度门（覆盖配置里的 yolo_conf，只对 --method yolo / yolo_sam 生效）。"
-             "自训模型刚训完分数可能偏低，可临时调到 0.05~0.1 看是不是这个门把框全滤掉了")
+             "**不传就按自训权重旁的建议阈值走**（models/ball_yolo.conf.json，训练时在 val 上标定）；"
+             "显式给了就一律不动")
+    p.add_argument(
+        "--imgsz", type=int, default=None, metavar="960",
+        help="YOLO 推理分辨率（覆盖配置里的 yolo_imgsz，默认 640）。"
+             "球在画面里很小（几十像素）时才需要调大，代价是逐帧推理变慢")
     p.add_argument("--max-frames", type=int, default=0, help=">0 时只处理前 N 帧")
     p.add_argument("--no-show", action="store_true", help="不弹窗（批处理用）")
     return p.parse_args()
@@ -551,6 +557,15 @@ def main() -> int:
         # 0.04，而默认 yolo_conf=0.25 会让整段录像 0 检出 —— 现象和"权重没接上"
         # 一模一样。没有这个旋钮，用户只能去改配置文件才能判断到底是哪一种。
         cfg.detector.yolo_conf = args.conf
+        # 同时声明"这是人给的"：YoloDetector 会按权重旁的 sidecar 校准阈值，
+        # 但那只在用户没表态时做。不标记的话 `--conf 0.25`（恰好等于配置默认值）
+        # 会被悄悄换成 0.05 —— 用户的显式选择被藏起来，事后无从解释。
+        mark_conf_explicit(cfg.detector)
+    if args.imgsz is not None:
+        if args.imgsz < 64:
+            # 太小不是"更快"，是"球只有几个像素"，只会得到 0 检出。
+            raise SystemExit(f"[错误] --imgsz 至少 64，收到 {args.imgsz}")
+        cfg.detector.yolo_imgsz = args.imgsz
     # 给了种子就等于说"我指的就是这颗球，跟住它"。而 color/hough 不接受种子，
     # 会继续在整幅画面里找自己那一票 —— 本仓库那段录像上它锁定的是书架上的小圆
     # （r≈11~13 px，而球约 91 px）。所以自动切到唯一吃种子的 specular，并说明原因：
