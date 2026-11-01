@@ -40,6 +40,8 @@ import argparse
 import csv
 import json
 import math
+import re
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -94,6 +96,137 @@ def _as_detection(res) -> Detection | None:
         r = res.detection.radius if res.detection is not None else state.radius
         return Detection(x=state.x, y=state.y, radius=r, score=1.0, method="track")
     return res.detection
+
+
+def _gray(frame: np.ndarray) -> np.ndarray:
+    """取单通道灰度。**每帧每路只该调一次**（联合细化要吃灰度图）。"""
+    # 单通道输入直接返回：`cvtColor(..., BGR2GRAY)` 对 1 通道图会抛，而视频源
+    # 理论上可能是灰度（录制端只存 BGR，但入口不该假定上游一定守约）。
+    if frame.ndim == 2:
+        return frame
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+def _joint_detection(det: Detection, xy, applied: bool) -> Detection:
+    """用联合细化给出的圆心重建 `Detection`，其余字段原样保留。
+
+    为什么只换 ``x/y``：半径、``score``、``method`` 描述的是"目标多大、它是被
+    哪条路找到的"，联合细化只回答"圆心该落在哪"，它没有能力也不该改这些量。
+    ``contour`` / ``mask`` 同样保留 —— 那是候选轮廓，圆心挪几个像素并不会让它
+    失效，丢掉反而让下游少一份可用信息。
+    ``extra["joint_refine"]`` 记下本帧**是否真的被采纳**：排查时最常见的疑问是
+    "这帧圆心为什么和检测器输出的不一样"，没有这个标记只能靠比对数值去猜。
+    """
+    extra = dict(det.extra or {})
+    extra["joint_refine"] = bool(applied)
+    return Detection(x=float(xy[0]), y=float(xy[1]), radius=det.radius,
+                     score=det.score, method=det.method, parts=dict(det.parts or {}),
+                     contour=det.contour, mask=det.mask, extra=extra)
+
+
+#: reason 里随帧变化的数字（"v 差 44px"、"12px"）在归类前要压平，否则每一对
+#: 都是一个独立的键，"其它 35（多为…）"永远只数到 1。
+_JUNK_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _support_retention(res) -> float | None:
+    """支撑保留率 = **每侧各自**的 `共享处 / 独立最优` 里较差的那个。
+
+    ## 为什么必须用"保留率"而不是 `dv_after` 来汇报
+
+    共享 v 的定义就是"把两侧的校正后 v 压成同一个数"，所以 `dv_after` 恒接近 0
+    —— 那是**同义反复，不是成绩**。把它印成"27.9 → 0.8 px"会让人以为测量精度
+    提高了，而实际上它只是"我按定义让两个数相等了"。真正付了代价的是轮廓：
+    把两侧拉到同一个 v，会离开各自独立最优点，支撑率必然下降。保留率（1.00 =
+    与独立最优持平）才是这个方法的**成本**，也是唯一能拿来判断"值不值"的独立量。
+
+    ## 口径：逐侧比值取最小，不是"最小的当前 ÷ 最大的参照"
+
+    两种算法在最坏情况下能差一倍以上。逐侧算 `sup/own` 再取 min，语义是
+    "**哪一侧掉得最多**"，与模块内部的采纳判据（`keep_l`、`keep_r` 都要过线）
+    完全同口径 —— 汇报的数和把关的数必须是同一个，否则日志会和行为打起来。
+
+    ``own`` 侧支撑缺失时返回 None（老版本模块只有 ``support_left/right``，
+    没有参照系就无从算比值）—— 宁可这行不打，也不要拿两个不可比的数硬除。
+    """
+    own_l = getattr(res, "support_left_own", None)
+    own_r = getattr(res, "support_right_own", None)
+    if own_l is None or own_r is None:
+        return None
+    try:
+        keep_l = float(res.support_left) / float(own_l) if float(own_l) > 1e-6 else 0.0
+        keep_r = float(res.support_right) / float(own_r) if float(own_r) > 1e-6 else 0.0
+        # 截到 [0,1]：`own` 是在"环相关打分表"的 argmax 处量的支撑，而分子是
+        # 共享 v 处那一点的支撑 —— 两个打分器不同（一个是幅值卷积，一个是射线
+        # 径向+符号一致性），所以比值**可能 >1**。>1 不代表"比最优还好"，只代表
+        # "参照点不是同一个打分器的最优"，按 1.00 记（= 没掉）才不会误导。
+        val = min(1.0, max(0.0, min(keep_l, keep_r)))
+    except (TypeError, ValueError):
+        return None
+    return val if math.isfinite(val) else None
+
+
+def _joint_refine_summary(stats: dict, keep_floor: float | None = None) -> str:
+    """联合细化的摘要（**纯函数**，只拼字符串，便于自测）。
+
+    `stats` 的键：`applied` / `skipped` / `support_short` / `no_gain` / `other`
+    是计数，`dv_before` / `retention` 是样本列表（调用处已滤掉 NaN）。
+    `keep_floor` 是模块判"代价能不能接受"的保留率下限（`DEFAULT_MIN_SUPPORT_KEEP`）；
+    取不到就只解释这个比值怎么读，不编一个门限。
+
+    ## 刻意**不打印** `dv_after`
+
+    见 :func:`_support_retention`：共享 v 让 `dv_after` 恒≈0，"校正后 v 差中位
+    0.8 px"这种句子读起来像精度提升，实际什么都没证明。`dv_before` 反倒值得
+    打 —— 它说明"现状有多差、有多少可修的量"，那是输入属性，不是自证。
+
+    ## 保留率 >1 不算好消息
+
+    共享 v 处的支撑高于该侧独立最优，说明"环上梯度最强处"和"打分表最认可处"
+    在这一帧上互相不同意（球内反射纹理比轮廓还强时就长这样），采纳可能把圆心
+    从对的挪到错的。所以中位数超过 1.05 时要把这层意思放在同一行里，不能让
+    "1.24 > 1.00"读成"比独立最优还好"。
+    """
+    total = stats["applied"] + stats["skipped"]
+    if not total:
+        return "[联合细化] 没有可用的成对检测"
+
+    reject = [f"支撑不足 {stats['support_short']}", f"无改善 {stats['no_gain']}"]
+    if stats["other"]:
+        # 第三类只在真的出现时才占版面：`半径太小 / 未做极线校正 / 贴边` 归进
+        # "无改善"会把"根本没法算"说成"算了但没变好"，那是另一句假话。
+        label = f"其它 {stats['other']}"
+        if stats.get("other_reasons"):
+            # 顺手把这一类里最常见的那句原样带出来（截断到第一层括号前）。
+            # 模块以后新增拒绝理由（例如 v 超出搜索范围）时，这条会自动变成
+            # 可读的文字，而不是埋在"其它 7"里没人知道那 7 对是怎么被拒的。
+            top = max(stats["other_reasons"].items(), key=lambda kv: kv[1])[0]
+            label += f"（多为「{top}」）"
+        reject.append(label)
+    head = (f"[联合细化] 应用 {stats['applied']}/{total} 对"
+            f"（拒 {stats['skipped']}：{' / '.join(reject)}）")
+
+    tail = []
+    if stats["retention"]:
+        med = statistics.median(stats["retention"])
+        if keep_floor is not None and math.isfinite(keep_floor):
+            # 口径一致：模块的 0.85 是逐侧 support/own 的门限，这行报的也是逐侧比值
+            # 取最小 —— 汇报的数和把关的数必须是同一个，否则用户会以为模块自相矛盾。
+            note = f"逐侧 min(sup/own)，与采纳门限 {keep_floor:.2f} 同口径"
+        else:
+            note = "1.00=与独立最优持平"
+        tail.append(f"共享 v 处支撑保留率 中位 {med:.2f}（{note}）")
+        # 阈值取 1.05 而不是 1.00：1.01~1.05 属于打分噪声，喊狼来了会把真正
+        # "支撑与打分表指向两个地方"的帧（实测见过 1.24）淹掉。
+        if med > 1.05:
+            tail.append("保留率>1：该帧支撑与打分表互相不同意，采纳可能是改错")
+    elif stats["applied"]:
+        tail.append("支撑保留率无法统计（模块未提供 support_*_own）")
+    if stats["dv_before"]:
+        tail.append(f"校正前 v 差中位 {statistics.median(stats['dv_before']):.1f} px")
+    if not tail:
+        return head
+    return head + "\n[联合细化] " + "；".join(tail)
 
 
 def _make_pipeline(cfg: AppConfig, rig: StereoRig, side: str) -> SpherePipeline:
@@ -580,6 +713,12 @@ def main() -> int:
                     help="跑满 N 对后先判一次『录像几何 vs 标定』：对不上就早停"
                          "（不白跑整段，也不产出看似正常的错数字）；0=关。默认 30。"
                          "判据见 stereo.triangulate.geometry_verdict")
+    ap.add_argument("--joint-refine", choices=("off", "on"), default="off",
+                    help="跨视图联合细化：两路共享极线 v、各自解 u，用来修"
+                         "『两路独立细化出的圆心各偏一边』的问题"
+                         "（实测 v 差中位 -28.1px，导致极线门 0%% 通过）。"
+                         "默认 off：这条路径还没有 A/B 实测数据支撑，"
+                         "开了会改变圆心，先按 opt-in 放出来")
     ap.add_argument("--trail", type=int, default=300, help="轨迹线保留多少个匹配点（0=不画）")
     ap.add_argument("--smooth", action="store_true",
                     help="开启三维平滑：另存 traj3d_smoothed.csv，并把平滑结果与抖动指标"
@@ -598,6 +737,26 @@ def main() -> int:
     ap.add_argument("--no-plot", action="store_true", help="不生成 traj3d.png")
     ap.add_argument("--no-video", action="store_true")
     args = ap.parse_args()
+
+    # ---- 跨视图联合细化（B-166）：只解析开关，模块按需导入 ----
+    # 为什么要延迟 import：off 是默认路径，那条路上不该新增一次模块加载，而且模块
+    # 缺失时 off 必须照旧能跑 —— 一个没打开的功能不该让整段录像跑不起来。
+    joint_refine_on = args.joint_refine == "on"
+    jr_keep_floor = None
+    if joint_refine_on:
+        try:
+            from stereo.joint_refine import describe_result, refine_pair
+            import stereo.joint_refine as _jr_mod
+        except ImportError as exc:
+            print(f"[联合细化][错误] 模块不可用（{exc}）；需要 stereo/joint_refine.py")
+            return 2
+        # 摘要里要报"保留率达到多少才算划算"，这个门限属于模块的判据而不是我的
+        # 判断，所以从模块读，取不到就如实不打（不在这里复制一个会漂的常数）。
+        _keep = getattr(_jr_mod, "DEFAULT_MIN_SUPPORT_KEEP", None)
+        jr_keep_floor = float(_keep) if _keep is not None else None
+        # 开就明说"它会改写圆心"，否则拿 on/off 两份 CSV 比深度的人不会知道
+        # 差异从哪来，只会以为是标定或检测器不稳定。
+        print("[联合细化] 已开启：共享极线 v、各解 u 的联合细化（会改写左右圆心）")
 
     session_dir, s = load_session(args.session)
     # ---- 检测方法：用户显式给了就照做，否则有种子就自动接管 ----
@@ -944,6 +1103,16 @@ def main() -> int:
     trail_r: list[tuple[float, float]] = []
     n_pairs = 0
     center_src = {"contour": 0, "box": 0}   # 只看这两种；其它（非 specular）不计数
+    # 联合细化的计数与样本（off 时是一个没人读的空容器，不产生任何输出）。
+    # 计数和样本分开：dv / 保留率会被 NaN 或"算不出来"过滤掉，计数不能因此少报。
+    jr_stats = {
+        "applied": 0, "skipped": 0,
+        "support_short": 0, "no_gain": 0, "other": 0,
+        "other_reasons": {},  # "其它"桶里各句 reason 的首段原文计数（便于看清那几对为何被拒）
+        "dv_before": [],     # 校正前 v 差 —— "现状有多差"，是输入属性
+        "retention": [],     # 共享 v 处的支撑保留率 —— 这个方法的成本
+    }
+    jr_first_result = None
     t0 = time.perf_counter()
     try:
         while True:
@@ -957,6 +1126,47 @@ def main() -> int:
             res_r = pipe_r.process(right_frame, t)
             det_l = _as_detection(res_l)
             det_r = _as_detection(res_r)
+            # 跨视图联合细化（B-166，默认 off）：只有两路都有检测时才成对做，
+            # 单边缺检测没有任何"跨视图"可对齐。灰度**每帧每路只转一次**：cvtColor
+            # 是这段里最容易被忘掉的重复开销（一帧转两遍等于白烧一遍）。
+            if joint_refine_on and det_l is not None and det_r is not None:
+                jr = refine_pair(_gray(left_frame), _gray(right_frame),
+                                 det_l, det_r, rig, search_px=None)
+                if jr_first_result is None:
+                    jr_first_result = jr
+                if jr.applied:
+                    jr_stats["applied"] += 1
+                else:
+                    jr_stats["skipped"] += 1
+                    # 只按 reason 的字面分桶（含"支撑"→支撑不足，含"改善"→无改善，
+                    # 其余→其它）。不去读模块的私有常量：reason 是它对外的契约，
+                    # 加个新判据时这里最多分错桶，不会跟着崩。
+                    why = str(jr.reason)
+                    if "支撑" in why:
+                        jr_stats["support_short"] += 1
+                    elif "改善" in why:
+                        jr_stats["no_gain"] += 1
+                    else:
+                        jr_stats["other"] += 1
+                        # 归一化后再聚：reason 里带每次的数值（"v 差 44px"、"12px"），
+                        # 原样当键会让每一对各自成一类，"多为"永远只数到 1 —— 那就
+                        # 失去了"这一类到底以什么原因为主"的意义。数字一律压成 #。
+                        key = _JUNK_NUMBER.sub("#", why.split("（")[0])[:24]
+                        jr_stats["other_reasons"][key] = (
+                            jr_stats["other_reasons"].get(key, 0) + 1)
+                # 模块在"半径太小 / 未校正 / 尺寸不一致"这几条**早退**路径上会把
+                # dv 填成 NaN。NaN 混进中位数会把整行变成 nan，所以只收有限样本。
+                if math.isfinite(jr.dv_before):
+                    jr_stats["dv_before"].append(float(jr.dv_before))
+                # 保留率只统计**被采纳**的那些：共享 v 只有被采纳时才真正作用于
+                # 输出；被拒的对拿来算"在共享 v 上还剩多少支撑"没有对象。
+                ret = _support_retention(jr)
+                if ret is not None and jr.applied:
+                    jr_stats["retention"].append(ret)
+                # 不采纳时 res.left/res.right 就是输入原值，所以这里无条件重建：
+                # extra 里的 joint_refine 标记要覆盖每一对，而不只是成功的那批。
+                det_l = _joint_detection(det_l, jr.left, jr.applied)
+                det_r = _joint_detection(det_r, jr.right, jr.applied)
             pt = rec.update(t, det_l, [det_r] if det_r is not None else [])
             n_pairs += 1
 
@@ -1056,6 +1266,15 @@ def main() -> int:
     print(f"匹配：{rec.n_matched}/{n_pairs}（{rec.match_rate*100:.1f}%）  "
           f"无左={rec.n_no_left} 无右={rec.n_no_right} "
           f"拒绝={rec.n_rejected}（{reject_why}）")
+    # 联合细化只在 on 时打这一行：off 的 stdout 必须与改动前逐字一致，否则
+    # "同一段输入、只有开关不同"的对照实验就没法直接 diff 了。
+    if joint_refine_on:
+        print(_joint_refine_summary(jr_stats, jr_keep_floor))
+        if jr_stats["applied"] == 0 and jr_first_result is not None:
+            # 一对都没采纳时把**第一对的原文**打出来：这是"为什么没采纳"的唯一
+            # 证据。绝不去调阈值凑采纳数 —— 采纳数为 0 本身就是有价值的结论
+            # （轮廓支撑太弱），把它抹平只会让人以为这个方法不可行/可行都无从判断。
+            print(f"[联合细化] 一对都没采纳；首对：{describe_result(jr_first_result)}")
     # 配对率低时把"几何对不对"量出来：用户看到的 3.3% 背后常常是"这段录像和
     # 它的标定对不上"，不说出来，下一个人还会去调 --max-epipolar（而那不是原因）。
     # 0 配对的情形走的是异常那条路，诊断已经拼在报错里。

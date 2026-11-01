@@ -46,11 +46,14 @@ from stereo import (
     timestamp_offset,
 )
 from stereo.fov_align import FovAlignment, estimate_fov_alignment
+from stereo.joint_refine import describe_result, refine_pair
 from stereo.triangulate import (anchor_accepts, anchor_problem,
-                                build_radius_anchor, epipolar_gate_px)
+                                build_radius_anchor, epipolar_gate_px,
+                                rectify_point_left, rectify_point_right)
 from stereo.visualization import (
     build_trajectory_payload, export_session_visualization, load_seeds, write_seeds,
 )
+from sphere_tracker.geometry import refine_circle_subpixel_checked
 from sphere_tracker.types import Detection
 
 
@@ -948,6 +951,182 @@ def test_warmup_no_false_alarm() -> bool:
     return ok
 
 
+def _joint_rig(size=(640, 480)) -> StereoRig:
+    """给跨视图联合细化用的平行装置（R=I、T=(-0.1,0,0)）。
+
+    特意让 R=I：`stereoRectify` 出来的校正映射就是恒等映射，于是"校正后的 v"
+    与原图 y 是同一个数，测试可以直接拿真值比，不必再换算一层。
+    T 的符号按 OpenCV 约定（T 是"左→右"的平移），右相机在 x 的**负**方向 ——
+    写反了三角化会给出 Z<0（`test_radius_anchor` 里踩过这个坑）。
+    焦距按画幅的 0.8 倍取，640/1080p 两档都落在"正常镜头"的视场里。
+    """
+    fx = 0.8 * float(size[0])
+    K = _K(fx, fx, size[0] / 2.0, size[1] / 2.0)
+    D = np.zeros(5)
+    R = np.eye(3)
+    T = np.array([[-0.1], [0.0], [0.0]], np.float64)
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        K, D, K, D, size, R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.0)
+    return StereoRig(K1=K, D1=D, K2=K, D2=D, R=R, T=T, image_size=size,
+                     R1=R1, R2=R2, P1=P1, P2=P2, Q=Q)
+
+
+def _draw_arc_ball(size, center, radius, a0, a1, highlight_dy, seed, noise=4.0):
+    """画一颗"只有 (a1-a0) 这段圆周上有轮廓"的镜面球，外加一个偏离球心的亮斑。
+
+    为什么用**填充扇形**而不是粗弧线：粗线会造出第二条圆边（内沿），环核会把它
+    当成半径更小的假轮廓，圆心被拉走 6 px（第一版就踩了）。扇形只有一条阶跃边，
+    正好落在 radius 上；两条辐条是径向边，梯度是切向的，既不计入轮廓支撑
+    （支撑只看径向分量），也不随圆心平移变化，构不成竞争峰。
+
+    高光用实心小圆（偏离球心 8 px）：镜面球的高光在左右视图落在球面不同位置，
+    这正是检测框中心会往两边各偏一点的来由。
+    """
+    img = np.full((size[1], size[0]), 30, np.uint8)
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    r = int(round(radius))
+    cv2.ellipse(img, (cx, cy), (r, r), 0, a0, a1, 200, -1, cv2.LINE_AA)
+    cv2.circle(img, (cx, cy + int(round(highlight_dy))), 5, 255, -1, cv2.LINE_AA)
+    rng = np.random.default_rng(seed)
+    out = img.astype(np.float32) + rng.normal(0.0, noise, img.shape)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def test_joint_refine() -> bool:
+    """跨视图联合细化：共享极线 v，把两路圆心**一起**解出来（B-166）。
+
+    必须证明三件事，缺一不算：
+      ① **问题真实存在**：两路各自独立细化出的圆心，校正后 v 差是像素级起步的；
+      ② **联合细化解得对**：v 差落进 1 px，且两路圆心各自离真值 < 6 px
+         （说明解出来的是**球心**，不是被高光拉偏的框中心）；
+      ③ **诚实降级**：没轮廓时不采纳、坐标原样返回；也不许动半径。
+    """
+    print("----- 跨视图联合细化（共享极线 v） -----")
+    import dataclasses
+    import time
+
+    size = (640, 480)
+    rig = _joint_rig(size)
+    truth_l, truth_r, rad = (300.0, 240.0), (280.0, 240.0), 40.0
+    # 可见弧各 108 度 = 整圈 30%（`B-130` 实测 25%~35%）。
+    # 左弧在 3 点钟（切线竖直：v 病态、u 清楚），右弧在 12 点钟（反过来）。
+    # 故意的：任意一路单独都定不死圆心，只能靠对面那一路补信息。
+    gray_l = _draw_arc_ball(size, truth_l, rad, -54, 54, -8.0, seed=3)
+    gray_r = _draw_arc_ball(size, truth_r, rad, -144, -36, 8.0, seed=4)
+
+    # 检测框中心被高光拉偏（CSRT 框就是这么偏的）：左偏上、右偏下各 6 px
+    det_l = Detection(x=truth_l[0], y=truth_l[1] - 6.0, radius=rad)
+    det_r = Detection(x=truth_r[0], y=truth_r[1] + 6.0, radius=rad)
+
+    # ① 现有做法：两路各解各的（`refine_circle_subpixel_checked`，检测器用的就是它）
+    ind = []
+    for gray, det in ((gray_l, det_l), (gray_r, det_r)):
+        x, y, _r, ok = refine_circle_subpixel_checked(gray, det.x, det.y, det.radius)
+        ind.append((x, y, ok))
+        print(f"  独立细化 {'左' if gray is gray_l else '右'}路：ok={ok} "
+              f"({x:.2f}, {y:.2f})，相对检测框 dy={y - det.y:+.2f} px")
+    vl = rectify_point_left(rig, ind[0][0], ind[0][1])
+    vr = rectify_point_right(rig, ind[1][0], ind[1][1])
+    dv_ind = abs(vl[1] - vr[1])
+    print(f"  独立细化后两路 v 差 {dv_ind:.2f} px（真值应该差 0：同一行的同名点）")
+
+    # ② 联合细化：输入就是上一步的结果（真实接线：检测 -> 独立细化 -> 配对）
+    det_l2 = Detection(x=ind[0][0], y=ind[0][1], radius=rad)
+    det_r2 = Detection(x=ind[1][0], y=ind[1][1], radius=rad)
+    res = refine_pair(gray_l, gray_r, det_l2, det_r2, rig)
+    print("  " + describe_result(res))
+    err_l = float(np.hypot(res.left[0] - truth_l[0], res.left[1] - truth_l[1]))
+    err_r = float(np.hypot(res.right[0] - truth_r[0], res.right[1] - truth_r[1]))
+    print(f"  圆心误差：左 {err_l:.2f} px，右 {err_r:.2f} px；"
+          f"轮廓支撑 {res.support_left:.2f} / {res.support_right:.2f}")
+
+    # ③-1 没有任何轮廓（纯噪声）时必须拒绝，而且坐标逐位不变
+    rng = np.random.default_rng(9)
+    noise_l = np.clip(rng.normal(120, 8, (size[1], size[0])), 0, 255).astype(np.uint8)
+    noise_r = np.clip(rng.normal(120, 8, (size[1], size[0])), 0, 255).astype(np.uint8)
+    res_noise = refine_pair(noise_l, noise_r, det_l2, det_r2, rig)
+    print("  " + describe_result(res_noise))
+    noise_same = (res_noise.left == (det_l2.x, det_l2.y)
+                  and res_noise.right == (det_r2.x, det_r2.y))
+
+    # ③-2 v 差本来就在门限内（同一行基本对上了）-> 不值得动，也别白动
+    gray_lf = _draw_arc_ball(size, truth_l, rad, 0, 360, -8.0, seed=13)
+    gray_rf = _draw_arc_ball(size, truth_r, rad, 0, 360, 8.0, seed=14)
+    det_lf = Detection(x=truth_l[0], y=truth_l[1], radius=rad)
+    det_rf = Detection(x=truth_r[0], y=truth_r[1], radius=rad)
+    res_full = refine_pair(gray_lf, gray_rf, det_lf, det_rf, rig)
+    print("  " + describe_result(res_full))
+    full_same = (res_full.left == (det_lf.x, det_lf.y)
+                 and res_full.right == (det_rf.x, det_rf.y))
+
+    # ③-3 未做极线校正的标定：没有"同一行"可言，必须直接说清
+    rig_raw = dataclasses.replace(rig, meta={"rectification": "none_raw"})
+    res_raw = refine_pair(gray_l, gray_r, det_l2, det_r2, rig_raw)
+    print("  " + describe_result(res_raw))
+
+    # ③-4 两路 v 差远超搜索窗：必须**拒绝**，不能"取个平均"把左边一路拽走。
+    #
+    # 这条是线上实测倒逼出来的：右路跟丢时两路 v 差能到 200+ px，而候选 v 的窗口
+    # 若只围绕两路均值展开，就会跟着错误一起平移 —— 实测把左路圆心从球上拽到了
+    # 130 px 外的背景墙上，然后"成功采纳"。所以夹逼必须同时用两侧原始 v。
+    far = dataclasses.replace(det_l2, y=det_l2.y + 120.0)
+    res_far = refine_pair(gray_l, gray_r, far, det_r2, rig)
+    print("  " + describe_result(res_far))
+
+    # ④ 耗时：1080p、r=70（真机量级），20 次取均值
+    big = (1920, 1080)
+    rig_big = _joint_rig(big)
+    gl_b = _draw_arc_ball(big, (1000.0, 540.0), 70.0, -54, 54, -10.0, seed=5)
+    gr_b = _draw_arc_ball(big, (925.0, 540.0), 70.0, -144, -36, 10.0, seed=6)
+    dl_b = Detection(x=1000.0, y=530.0, radius=70.0)
+    dr_b = Detection(x=925.0, y=550.0, radius=70.0)
+    refine_pair(gl_b, gr_b, dl_b, dr_b, rig_big)          # 预热（建映射/环核）
+    t0 = time.perf_counter()
+    for _ in range(20):
+        res_big = refine_pair(gl_b, gr_b, dl_b, dr_b, rig_big)
+    ms_pair = (time.perf_counter() - t0) / 20.0 * 1000.0
+    print(f"  1080p（r=70）单帧耗时 {ms_pair:.2f} ms/对；"
+          f"|v 差| {res_big.dv_before:.2f} -> {res_big.dv_after:.2f} px")
+
+    checks = [
+        (f"独立细化后两路 v 差 {dv_ind:.2f} px（> 2：两路各偏一边，问题真实存在）",
+         dv_ind > 2.0),
+        (f"联合细化：已采纳且 |v 差| {res.dv_after:.2f} px（< 1.0，落得进极线门）",
+         res.applied and res.dv_after < 1.0),
+        (f"共享 v 的契约：两路校正后 y 相等，残差 {res.dv_after:.4f} px（< 0.05，"
+         f"只剩数值往返误差）", res.dv_after < 0.05),
+        (f"支撑保留率可查：own {res.support_left_own:.2f} / {res.support_right_own:.2f}"
+         f" -> 共享 {res.support_left:.2f} / {res.support_right:.2f}（都不掉，"
+         f"证明这两处是同一条轮廓）",
+         res.support_left_own > 0.0 and res.support_right_own > 0.0
+         and res.support_left >= 0.85 * res.support_left_own
+         and res.support_right >= 0.85 * res.support_right_own),
+        (f"联合细化的两路圆心离真值 {err_l:.2f} / {err_r:.2f} px（各 < 6：解的是球心）",
+         err_l < 6.0 and err_r < 6.0),
+        ("reason 非空且摘要带 [已采纳]（用户能看懂为什么动）",
+         bool(res.reason.strip()) and "[已采纳]" in describe_result(res)),
+        (f"纯噪声：不采纳且坐标原样（支撑 {res_noise.support_left:.2f} / "
+         f"{res_noise.support_right:.2f}）", (not res_noise.applied) and noise_same),
+        ("v 差本来就在 0.5 px 内：不采纳且坐标原样（不值得动就不动）",
+         (not res_full.applied) and full_same),
+        ("未做极线校正：不采纳并说明原因（不假装能算）",
+         (not res_raw.applied) and "极线校正" in res_raw.reason
+         and res_raw.left == (det_l2.x, det_l2.y)),
+        (f"两路 v 差 {res_far.dv_before:.0f}px 远超搜索窗：必须拒绝（不许取平均把"
+         f"圆心拽走），且原样返回",
+         (not res_far.applied) and "同一颗球" in res_far.reason
+         and res_far.left == (far.x, far.y)),
+        ("半径不被改（镜面球半径量不准，只解圆心）",
+         det_l2.radius == rad and det_r2.radius == rad),
+        (f"1080p 一对 {ms_pair:.2f} ms（< 20，防退化成逐点采样）", ms_pair < 20.0),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     print("=" * 62)
     print("双目链路自测（合成真值）")
@@ -972,7 +1151,12 @@ def main() -> int:
     print()
     w = test_warmup_no_false_alarm()
     print()
-    allok = a and b and c and d and e and f and p3 and g and h and w
+    j = test_joint_refine()
+    print()
+    results = [a, b, c, d, e, f, p3, g, h, w, j]
+    allok = all(results)
+    print(f"合计 {len(results)} 项：通过 {sum(1 for r in results if r)}，"
+          f"不达标 {sum(1 for r in results if not r)}")
     print("判定结果：" + ("全部通过" if allok else "有不达标项"))
     return 0 if allok else 1
 
