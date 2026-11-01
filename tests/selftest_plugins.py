@@ -700,6 +700,33 @@ def _check_refine_in_box_window() -> list[tuple[str, bool]]:
     return checks
 
 
+
+def _check_deterministic_rng() -> list[tuple[str, bool]]:
+    """检测结果必须可复现：CSRT 用 OpenCV 的**进程级全局 RNG**，不固定种子时
+    同一段视频每次启动进程给出的检出帧数都不一样（实测 222 / 198 / 283）。
+    对一个用来比精度的工具，这层噪声会盖住真实差异。
+    """
+    from sphere_tracker.detectors import base
+
+    calls: list[int] = []
+    orig = base.cv2.setRNGSeed
+    base.cv2.setRNGSeed = lambda v: calls.append(v)      # type: ignore[assignment]
+    try:
+        base._rng_seeded = False
+        base.ensure_deterministic_rng()
+        base.ensure_deterministic_rng()                  # 第二次必须什么都不做
+    finally:
+        base.cv2.setRNGSeed = orig                       # type: ignore[assignment]
+        base._rng_seeded = True
+
+    from sphere_tracker.config import DetectorConfig
+    return [
+        ("RNG 只固定一次，且用固定常量（不是时间/随机）",
+         calls == [base.DETERMINISTIC_RNG_SEED]),
+        ("回捕默认关闭（会锁到日光灯管，见待办 B-163）",
+         DetectorConfig().specular.reacquire is False),
+    ]
+
 def main() -> int:
     print("=" * 70)
     print("插件注册表自测（清单唯一 / 未知名字报错 / 默认唯一 / 边界）")
@@ -722,6 +749,7 @@ def main() -> int:
                   + _check_conf_recommend_rule()
                   + _check_run_video_conf_flags())),
         ("9. 框内细化窗口（YOLO 框 → 圆）", _check_refine_in_box_window),
+        ("10. 可复现性（固定 RNG）与回捕默认值", _check_deterministic_rng),
     ):
         print(f"----- {section} -----")
         got = fn()

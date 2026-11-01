@@ -2,10 +2,33 @@
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from ..config import DetectorConfig
 from ..types import Detection
 from pathlib import Path
+
+# CSRT 内部用 OpenCV 的**进程级全局 RNG** 做采样。不固定它，同一段视频每次启动
+# 进程的结果都不一样 —— 2026-11-01 实测同一段 302 帧：222 / 198 / 283 帧检出。
+# 对一个"要拿数字比精度"的工具，这是致命的：A/B 的差异会被这层噪声盖住
+# （我因此误判过一次：把"左路第 100 帧跟丢"当成真实现象，其实是当次的随机结果）。
+DETERMINISTIC_RNG_SEED = 20261031
+_rng_seeded = False
+
+
+def ensure_deterministic_rng() -> None:
+    """把 OpenCV 全局 RNG 固定下来；**进程内只做一次**。
+
+    为什么是"一次"而不是每个检测器各来一次：这是全局状态，运行中途重置会让
+    先建好的检测器与后建好的走不同序列，"同一段视频两次跑不一样"会换个形式回来。
+    """
+    global _rng_seeded
+    if _rng_seeded:
+        return
+    setter = getattr(cv2, "setRNGSeed", None)
+    if setter is not None:
+        setter(DETERMINISTIC_RNG_SEED)
+    _rng_seeded = True
 
 
 def resolve_weights(weights: str) -> str:
@@ -40,6 +63,8 @@ class BaseDetector:
 
     def __init__(self, cfg: DetectorConfig) -> None:
         self.cfg = cfg
+        # 所有检测器共用一个确定性入口：谁先被构造谁把 RNG 钉住。
+        ensure_deterministic_rng()
 
     # ctx 是可选的共享上下文（灰度图 / 相机自运动），由 pipeline 每帧构造一次。
     # 不需要它的后端直接忽略即可。
