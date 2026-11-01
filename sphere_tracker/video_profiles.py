@@ -163,6 +163,49 @@ def get(width: int, height: int) -> VideoProfile:
     return VideoProfile(w, h)
 
 
+#: 「原生档」哨兵：``(0, 0)`` 表示"不指定宽高、用相机的原生档"。
+#:
+#: ⚠️ **语义未验证**：MSMF 下 ``cap.set(CAP_PROP_FRAME_WIDTH, 0)`` 到底怎么解释，
+#: 本项目从未证实（planbook ``2026-10-31_双目标定取帧失败与分辨率档.md`` §3 的 P5）。
+#: 所以它只作**最后兜底**，且**不进**模式搜索（``sources.CANDIDATE_MODES`` 会剔除它）。
+NATIVE: tuple[int, int] = (0, 0)
+
+
+def probe_order(start: VideoProfile | None = None) -> list[tuple[int, int]]:
+    """自适应候选分辨率，**按像素降序**，末尾恒为原生档 ``NATIVE``。
+
+    - ``start=None``：不设上限，从 ``PROFILES`` 最高档（4K）一路降到原生档 ——
+      "不被一个写死的默认档限制死"；
+    - ``start=某档``：**从该档开始往下**（显式档**不越级往上**，保持可控），
+      末尾同样跟 ``NATIVE``。``start`` **不在** ``PROFILES`` 里也照样含它自身
+      （如 ``1024x768``），再跟 ``PROFILES`` 中像素更小的档。
+
+    这是"分辨率降档梯子"的**唯一来源**：``sources.CameraSource`` 的
+    ``res_candidates`` 与 ``CANDIDATE_MODES`` 都从这里取，不再各写一份手写清单。
+    此前 ``sources.py`` 里那份硬编码梯子 ``[(申请),(1280,720),(640,480),(原生)]``
+    **漏了 1920x1080** —— 本机唯一稳定可用的档 —— 却一步跳到了已知无效的 640x480
+    （planbook 2026-10-31 §2 / §8.1）。
+
+    保证：无重复项；``start`` 恰好是 ``PROFILES`` 某档时区间**含** ``start`` 自身。
+    """
+    order: list[tuple[int, int]] = []
+
+    def _add(w: int, h: int) -> None:
+        if (w, h) not in order:
+            order.append((w, h))
+
+    if start is None:
+        for profile in PROFILES:
+            _add(profile.width, profile.height)
+    else:
+        _add(start.width, start.height)
+        for profile in PROFILES:
+            if profile.pixels < start.pixels:
+                _add(profile.width, profile.height)
+    _add(NATIVE[0], NATIVE[1])
+    return order
+
+
 def resolve(requested: VideoProfile, actual_w: int, actual_h: int,
             ) -> tuple[VideoProfile, bool]:
     """把"请求的档"与"相机实际给的宽高"对齐，返回 ``(实际档, 是否回退)``。
@@ -294,6 +337,30 @@ def _selftest() -> int:
     _expect_value_error(lambda: detection_width(3840, target=0), "target=0")
     _expect_value_error(lambda: detection_width(3840, target=-1), "target=-1")
     print("PASS detection_width: 只缩不放，target<=0 抛 ValueError")
+
+    # ---- probe_order：自适应降档梯子（唯一来源；本机修复点是必须含 1080） ----
+    assert NATIVE == (0, 0)
+    assert probe_order(None) == [
+        (3840, 2160), (2560, 1440), (1920, 1080),
+        (1280, 720), (960, 540), (640, 480), NATIVE,
+    ]
+    assert probe_order(p1080) == [
+        (1920, 1080), (1280, 720), (960, 540), (640, 480), NATIVE,
+    ]
+    assert (1920, 1080) in probe_order(None)      # 修复点：旧梯子缺这一档
+    assert (1920, 1080) in probe_order(p1080)
+    # 显式档**不越级往上**：p1080 的结果里不含 1440 / 4K
+    assert (2560, 1440) not in probe_order(p1080)
+    assert (3840, 2160) not in probe_order(p1080)
+    # 非标准显式档：含自身，再跟 PROFILES 中像素更小的档
+    assert probe_order(parse("1024x768")) == [
+        (1024, 768), (960, 540), (640, 480), NATIVE,
+    ]
+    # 无重复项 + 末尾恒为原生档
+    for order in (probe_order(None), probe_order(p1080), probe_order(parse("1024x768"))):
+        assert len(order) == len(set(order)), order
+        assert order[-1] == NATIVE
+    print("PASS probe_order: 降档梯子按像素降序、含 1920x1080、显式档不越级往上、末尾原生档")
 
     print("PASS 全部自测通过（video_profiles）")
     return 0

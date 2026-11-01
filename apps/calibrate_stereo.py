@@ -1015,10 +1015,12 @@ def main() -> int:
     log = logging.getLogger("calibrate")
     print(f"本次日志：{log_path}")
     log.info("=== 双目标定开始 ===")
-    log.info("参数：left=%s right=%s backend=%s %dx%d@%d 目标 %d 对（最少 %d）",
+    _size_note = ("自适应（逐档协商）" if (args.width <= 0 or args.height <= 0)
+                  else f"{args.width}x{args.height}")
+    log.info("参数：left=%s right=%s backend=%s 采集档=%s@%d 目标 %d 对（最少 %d）",
              args.left or args.left_video or args.left_dir,
              args.right or args.right_video or args.right_dir,
-             args.backend, args.width, args.height, args.fps,
+             args.backend, _size_note, args.fps,
              args.target, args.min_pairs)
     log_environment(log)
     if args.relaxed:
@@ -1125,9 +1127,26 @@ def main() -> int:
     if first_pair is None:
         print("\n[错误] 启动后读不到可用的成对画面，无法开始采集。")
         if src.is_live:
-            print("       请先确认两路相机都能出图："
-                  "python apps/tools/cameras.py doctor")
-            print("       然后重试；本次不会在没有画面的情况下继续标定。")
+            # ⚠️ 这里**不许**再写"先确认两路相机都能出图 → 跑 doctor"：旧 doctor
+            # 是**逐台串行**检查（同一时刻只开一台），两台分开都正常、**同时**取帧
+            # 却失败时它会说"两台都好" —— 用户照它重试就永远走不出来（死循环）。
+            # 现在指向真问题：doctor 的**「双路同时取帧」**那段（与双目同工况），
+            # 以及设备级失效只能物理拔插。
+            print("       这是**取帧失败**（相机没给出成对画面），与**标定算法拒收**"
+                  "是两回事：")
+            print("       拒收发生在画面正常、只是棋盘没停稳/没完整出现在两路里的时候。")
+            print("       取帧失败按代价从小到大排查：")
+            print("         ① 跑 `python apps/tools/cameras.py doctor`，看**「双路同时取帧」**"
+                  "那段结论")
+            print("            —— 它是与双目同工况地同时开两路；逐台检查会说'两台都好'，"
+                  "不作数。")
+            print("         ② 把那路失败的相机**物理拔插**一次，并换一个**直插机身**的 "
+                  "USB 口")
+            print("            （别走 HUB / 扩展坞）；设备级失效（-2147483638）软件重开"
+                  "救不回来。")
+            print("         ③ 两路分辨率必须一致：若某台相机只支持某个档，用 "
+                  "`--width/--height` 指定**两台都支持**的档。")
+            print("       本次不会在没有画面的情况下继续标定。")
         else:
             print("       两路视频/图片序列没有同时有效的帧：检查左右文件是否成对、"
                   "长度是否一致。")
@@ -1525,12 +1544,35 @@ def main() -> int:
         return 1
     if mode == "angled" and measured_angle < 15.0:
         print(f"[警告] 标为 angled，但实测夹角只有 {measured_angle:.1f}°，更像平行双目。")
+    # ---- 采集档：录制 / 复检 / 前置检查要复现**同一档**才能对齐 ----------------
+    # `capture_size` 是相机的**实际采集分辨率**（FOV 裁剪**之前**），不是标定
+    # `image_size`（裁剪**之后**）。录制端读它来按同一档开相机（见
+    # `apps/_common.py` 的 `calib_capture_size`）；`capture` 子 dict 记录本次
+    # 自适应协商的完整过程（请求了什么 / 定案成什么 / 两路实际值 / 成对帧率），
+    # 供"标定 1080p、录制却换了档"这类问题回查。video/dir 源没有协商，置 None。
+    if src.kind == "camera":
+        _req = src.requested_size
+        capture_meta = {
+            "requested": list(_req) if isinstance(_req, tuple) else _req,
+            "resolved": list(src.resolved_size) if src.resolved_size else None,
+            "actual_left": list(src.actual_sizes[0]) if src.actual_sizes else None,
+            "actual_right": (list(src.actual_sizes[1])
+                             if len(src.actual_sizes) > 1 else None),
+            "pair_fps": (round(src.pair_fps, 2)
+                         if src.pair_fps is not None else None),
+        }
+        capture_size = list(src.image_size)
+    else:
+        capture_meta = None
+        capture_size = None
     rig = StereoRig.from_result(res, meta={
         "board": spec.describe(),
         "source": src.kind,
         "left": args.left if args.left is not None else (args.left_video or args.left_dir),
         "right": args.right if args.right is not None else (args.right_video or args.right_dir),
         "image_size": list(img_size),
+        "capture_size": capture_size,
+        "capture": capture_meta,
         "fov": fov.to_dict() if fov is not None else None,
         "stereo_mode": mode,
         "angle_deg": measured_angle,

@@ -37,7 +37,11 @@ for _parent in Path(__file__).resolve().parents:
 import cv2
 import numpy as np
 
-from apps._common import add_stereo_source_args, open_pair_source
+from apps._common import (
+    add_stereo_source_args,
+    calib_capture_size,
+    open_pair_source,
+)
 from apps._window import WindowManager
 from calib import BoardSpec, detect_board
 from stereo import profiles as rig_profiles
@@ -247,6 +251,19 @@ def main() -> int:
         _warnings, errors = _print_profile_section()
         print("=" * 62)
         return 1 if errors else 0
+
+    # ---- 采集档：未显式给 --width/--height 时，**优先用标定记下的采集档** ----
+    # 前置检查若在已有标定的机器上跑，应按**标定同一档**取帧（这样查出来的
+    # "两路是否一致 / 都看到棋盘"才对外呼的标定有意义）。没有标定记录就交给
+    # 相机自适应（首次标定前的正常情况）。
+    if args.width <= 0 or args.height <= 0:
+        _cs = calib_capture_size(CALIBRATION_PATH)
+        if _cs is not None:
+            args.width, args.height = _cs
+            print(f"[采集档] 采用标定记录的采集档 {_cs[0]}x{_cs[1]}"
+                  f"（{CALIBRATION_PATH.name} 的 capture_size）")
+        else:
+            print("[采集档] 没有标定采集档记录，按相机自适应逐档探测")
 
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
     print(f"标定板：{spec.describe()}")

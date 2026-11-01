@@ -29,7 +29,11 @@ for _parent in Path(__file__).resolve().parents:
 import cv2
 import numpy as np
 
-from apps._common import add_stereo_source_args, open_pair_source
+from apps._common import (
+    add_stereo_source_args,
+    calib_capture_size,
+    open_pair_source,
+)
 from calib import BoardSpec, StereoRig
 from calib.board import detect_board
 from calib.capture import CaptureConfig, focus_gate
@@ -102,6 +106,19 @@ def main() -> int:
                     help="视频/图片输入已按标定 FOV 归一化：跳过首对帧校验。"
                          "默认会验证；低纹理等无法验证时若确认输入已归一化再加此开关")
     args = ap.parse_args()
+
+    # ---- 采集档：未显式给 --width/--height 时，**优先用标定记下的采集档** ----
+    # 复检要套用标定的 FOV 裁剪，而裁剪区是相对**标定采集帧**定义的；采集帧
+    # 比裁剪区小就会越界。所以这里优先按标定记录的采集档打开，与标定同档。
+    if args.width <= 0 or args.height <= 0:
+        _cs = calib_capture_size(args.calib)
+        if _cs is not None:
+            args.width, args.height = _cs
+            print(f"[采集档] 未显式给 --width/--height，采用标定记录的采集档 "
+                  f"{_cs[0]}x{_cs[1]}（与标定同一档才能正确套用 FOV 裁剪）")
+        else:
+            print("[采集档] 标定里没有采集档记录（旧标定），按相机自适应；"
+                  "若复检异常请显式给 --width/--height")
 
     rig = StereoRig.load(args.calib)
 

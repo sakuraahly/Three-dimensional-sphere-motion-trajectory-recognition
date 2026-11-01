@@ -633,6 +633,74 @@ def test_baseline_in_profile_is_reference_only() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_resolution_ladder_comes_from_video_profiles() -> bool:
+    """分辨率降档梯子必须是**单一来源**（`video_profiles`），且**含 1920x1080**。
+
+    ## 守的是什么（2026-10-31，planbook §2 / §8）
+
+    "分辨率档位"曾在**四处**各写一遍（GUI 的档位表、`sources.py` 的降档梯子、
+    `CANDIDATE_MODES`、`LOWRES_RETRY_MODE`）。其中 `sources.py` 那份手写梯子
+    ``[(申请),(1280,720),(640,480),(原生)]`` **不含 1920x1080** —— 而 1920x1080
+    恰是本机 aoni 在 MSMF 下**唯一稳定可用**的档；梯子里另外两个备选档
+    （720p/480p）反而是本机已知打不开的。于是"一帧读不到"时程序跳到已知无效档，
+    把"能用的相机"诊断成"坏的"。
+
+    ## 判据
+
+    1. `video_profiles.probe_order(None)` 从最高档到原生档，按像素降序、无重复；
+    2. `probe_order(start)` 从该档往下、**不越级往上**，且**含 start 自身**（区间闭）；
+    3. 梯子**含 1920x1080**（修复点）；
+    4. `sources.CANDIDATE_MODES` 从 `probe_order` 派生（原生档剔除）；
+    5. `video_profiles` 仍**不** import cv2（可在无相机、无显示器环境自测）。
+
+    这是静态/纯逻辑检查，不开相机、不需要硬件，所以能进无人值守的回归。
+    """
+    print("----- 分辨率降档梯子：单一来源 + 必须含 1920x1080 -----")
+    from sphere_tracker import sources
+    from sphere_tracker import video_profiles as vp
+
+    auto = vp.probe_order(None)
+    explicit = vp.probe_order(vp.parse("1920x1080"))
+    custom = vp.probe_order(vp.parse("1024x768"))
+    print(f"  probe_order(None)      = {auto}")
+    print(f"  probe_order(1920x1080) = {explicit}")
+    print(f"  probe_order(1024x768)  = {custom}")
+
+    vp_src = (ROOT / "sphere_tracker" / "video_profiles.py").read_text(encoding="utf-8")
+    # 只看真正的 import 语句（模块 docstring 里"不 import cv2"那句话不算）
+    vp_imports_cv2 = any(
+        ln.strip().startswith(("import cv2", "from cv2"))
+        for ln in vp_src.splitlines()
+    )
+    checks: list[tuple[str, bool]] = [
+        ("probe_order(None)：最高档 -> 原生档，按像素降序",
+         auto == [(3840, 2160), (2560, 1440), (1920, 1080),
+                  (1280, 720), (960, 540), (640, 480), vp.NATIVE]),
+        ("probe_order(1920x1080)：从该档往下、不越级往上",
+         explicit == [(1920, 1080), (1280, 720), (960, 540), (640, 480), vp.NATIVE]),
+        ("降档梯子**含 1920x1080**（本机唯一稳定档；旧梯子缺它）",
+         (1920, 1080) in auto and (1920, 1080) in explicit),
+        ("显式档本身在结果里（区间是闭的）",
+         explicit[0] == (1920, 1080) and custom[0] == (1024, 768)),
+        ("非标准显式档也含自身，再跟更小的档 + 原生",
+         custom == [(1024, 768), (960, 540), (640, 480), vp.NATIVE]),
+        ("无重复项、末尾恒为原生档 NATIVE=(0,0)",
+         all(len(o) == len(set(o)) and o[-1] == vp.NATIVE
+             for o in (auto, explicit, custom))),
+        ("sources.CANDIDATE_MODES 从 probe_order 派生（原生档不进模式搜索）",
+         sources.CANDIDATE_MODES
+         == tuple(p for p in auto if p != vp.NATIVE)
+         and vp.NATIVE not in sources.CANDIDATE_MODES),
+        ("sources.LOWRES_RETRY_MODE 仍是 (640,480)（补试最低带宽档语义不变）",
+         sources.LOWRES_RETRY_MODE == (640, 480)),
+        ("video_profiles 仍不 import cv2（无相机环境可自测）",
+         not vp_imports_cv2),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -653,7 +721,9 @@ def main() -> int:
     print()
     h = test_baseline_in_profile_is_reference_only()
     print()
-    ok = a and b and c and d and e and f and g and h
+    i = test_resolution_ladder_comes_from_video_profiles()
+    print()
+    ok = a and b and c and d and e and f and g and h and i
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 

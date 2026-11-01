@@ -530,12 +530,25 @@ def main() -> int:
     app._refresh_res_note()
     mod_src = (ROOT / "启动程序.py").read_text(encoding="utf-8")
     checks_res = [
-        ("默认分辨率 = 2560x1440（真机恒给 1440，1080 请求必失败）",
+        ("默认分辨率 = 2560x1440（video_profiles.DEFAULT；不随某台相机实际能力变）",
          res_default == mod.DEFAULT_RESOLUTION == "2560x1440"),
-        ("录制默认档来自 video_profiles.RECORD_DEFAULT（不写死 1080）",
+        # ⚠️ **2026-10-31 改了这条断言的前提（不是删判据）**：录制侧的
+        # `--width/--height` 默认从 `RECORD_DEFAULT` 改成了 `None`（未显式给时
+        # 优先读标定 meta 的 `capture_size`，与标定同一档；没有才退回
+        # `RECORD_DEFAULT`）。判据**守的真实意图没变** —— "录制档不写死 1080、
+        # 且真的会去读标定采集档、兜底数值仍来自 `RECORD_DEFAULT`"。
+        # 断言**具体那两行**默认值（而不是宽泛的 `'default=None'`，`record_stereo.py`
+        # 里还有别的 `default=None`）以及**真的调用了** `calib_capture_size(`。
+        # 依据：`apps/record_stereo.py` 的采集档分支；planbook
+        # `2026-10-31_双目标定取帧失败与分辨率档.md` §8.3 S2。
+        ("录制档不写死：--width/--height 默认 None，且真的读标定 capture_size"
+         "（兜底数值仍来自 video_profiles.RECORD_DEFAULT）",
          RECORD_DEFAULT.label == "2560x1440"
-         and "default=RECORD_DEFAULT.width" in record_src
-         and "default=RECORD_DEFAULT.height" in record_src),
+         and '"--width", type=int, default=None' in record_src
+         and '"--height", type=int, default=None' in record_src
+         and "calib_capture_size(" in record_src
+         and "RECORD_DEFAULT.width" in record_src
+         and "RECORD_DEFAULT.height" in record_src),
         ("录制前校验标定分辨率：旧 1080 标定 + 1080 录制仍放行（旧会话可读）",
          record_same_ok),
         ("录制前校验标定分辨率：1080 标定 + 1440 录制报错（不静默混用）",

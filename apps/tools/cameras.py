@@ -1479,6 +1479,139 @@ def cmd_check(args) -> int:
 #   `check`  = 配置 vs 设备（**不开相机**，秒级）—— 查"配置还对不对"
 #   `doctor` = **真开相机**，查"现在到底能不能出图、能不能凑成一对"
 # 两者都**只报告不改配置**。
+
+
+# 「双路**同时**取帧」检查（S5，2026-10-31）的默认值。
+#
+# 为什么单列一组常量：双目是**两台同时**开的工况，与 `identify` 的**逐台串行**
+# 不是一回事 —— 这里要同时持有两台相机句柄、各自读若干帧，耗时可以与单台预览叠加。
+PAIR_FIRST_FRAME_S = 25.0    # 每台等首帧的上限（慢相机实测 ~24 s 才给第一帧）
+PAIR_FRAMES = 15             # 每台读多少帧（够判断"有没有画面"+估帧率，不无限等）
+PAIR_READ_BUDGET_S = 8.0     # 每台读帧的**总**预算，到点即收（把十几分钟级卡顿截断）
+PAIR_SEARCH_BUDGET_S = 25.0  # 打开时的搜索总预算（坏相机到这里就如实收场）
+
+
+def _simultaneous_grab_check(
+    left_index: int, right_index: int, backend: int, *,
+    width: int, height: int,
+    frames: int = PAIR_FRAMES,
+    first_frame_timeout: float = PAIR_FIRST_FRAME_S,
+) -> bool:
+    """两台**同时**打开、各自读若干帧 —— 与双目同工况（同一后端 + 同一分辨率）。
+
+    返回 True = 双路同时取帧**失败或分辨率不一致**（调用方据此判 fail）；
+    False = 两台能同时出图且实际分辨率一致。全程打印进度与可判定结论。
+
+    ## 为什么必须与 `identify` 分开做（这是本段存在的唯一理由）
+    `identify` 是**逐台串行**的：开一台、读完就在 `finally` 里 `release()`，
+    同一时刻只有一台相机活着。而双目要的是两台**同时**开着。
+    设备级失效（`MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED`）在串行下测不出来，
+    只有"两台同时"才复现 —— 这就是 2026-10-31「identify 说两台都好、标定却说
+    取不到成对帧」那个"自相矛盾"的来源。详见
+    docs/planbooks/2026-10-31_双目标定取帧失败与分辨率档.md §2 / §4.1。
+    """
+    from sphere_tracker.sources import backend_name, explain_grab_error
+
+    frames = max(1, int(frames))
+    bname = backend_name(backend)
+    print("\n双路**同时**取帧（双目同工况：同一后端 + 同一分辨率）：")
+
+    if left_index == right_index:
+        print(f"    ✘ 左右解析到**同一台**（都是 #{left_index}）—— 配置自相矛盾，"
+              f"双目标定必然失败。")
+        print("      改法：重跑 `python apps/tools/cameras.py identify`（两台各按一次），"
+              "或用 `pin` 按名字绑。")
+        return True
+
+    print(f"    正在同时打开 left(#{left_index}) 与 right(#{right_index})…")
+    print(f"    （后端 {bname}，请求 {width}x{height}；每台最坏等 ~{first_frame_timeout:.0f}s "
+          f"首帧，再各读 {frames} 帧 / {PAIR_READ_BUDGET_S:.0f}s 超时）")
+
+    srcs: dict[str, object] = {}
+    stats: dict[str, dict] = {}
+    # 两台**同时存活**：先把左开出来（构造里含"等首帧"）并**不释放**，
+    # 右紧接着打开 —— 于是右打开期间左仍占着设备句柄，与双目启动一致。
+    for role, idx in (("left", left_index), ("right", right_index)):
+        t0 = time.perf_counter()
+        try:
+            srcs[role] = CameraSource(
+                index=idx, width=width, height=height, backend=backend,
+                optimize=False, search_budget_s=PAIR_SEARCH_BUDGET_S,
+                first_frame_timeout_s=first_frame_timeout)
+            print(f"      ✔ {role}(#{idx}) 已打开（{time.perf_counter() - t0:.1f}s）")
+        except Exception as exc:                          # noqa: BLE001
+            stats[role] = {"opened": False, "frames": 0, "w": 0, "h": 0, "fps": 0.0}
+            print(f"      ✘ {role}(#{idx}) **打不开**（{time.perf_counter() - t0:.1f}s）："
+                  f"{_first_line(exc)}")
+
+    # 各自读帧（**两路都还开着**的时候读）。
+    for role in ("left", "right"):
+        src = srcs.get(role)
+        if src is None:
+            continue
+        n_ok = 0
+        t0 = time.perf_counter()
+        for _ in range(frames):
+            try:
+                ok, frame, _t = src.read()
+            except Exception:                             # noqa: BLE001
+                ok, frame = False, None
+            if ok and frame is not None:
+                n_ok += 1
+            if time.perf_counter() - t0 > PAIR_READ_BUDGET_S:
+                break
+        took = time.perf_counter() - t0
+        info = getattr(src, "info", None)
+        info_fps = float(getattr(info, "fps", 0.0) or 0.0)
+        fps = (n_ok / took) if (n_ok and took > 0) else info_fps
+        stats[role] = {
+            "opened": True, "frames": n_ok,
+            "w": int(getattr(info, "width", 0) or 0),
+            "h": int(getattr(info, "height", 0) or 0), "fps": fps,
+        }
+
+    # 收尾：两台一起释放（无论成败都不留悬空相机）。
+    for src in srcs.values():
+        try:
+            src.release()
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    lstat, rstat = stats["left"], stats["right"]
+    print(f"    实读：left(#{left_index}) {lstat['frames']}/{frames} 帧，"
+          f"right(#{right_index}) {rstat['frames']}/{frames} 帧")
+
+    if lstat["frames"] > 0 and rstat["frames"] > 0:
+        same = (lstat["w"], lstat["h"]) == (rstat["w"], rstat["h"])
+        note = (f"左 {lstat['w']}x{lstat['h']} @ {lstat['fps']:.1f} fps，"
+                f"右 {rstat['w']}x{rstat['h']} @ {rstat['fps']:.1f} fps")
+        if same:
+            print(f"    ✅ 两台可同时取帧（{note}，后端 {bname}）")
+            return False
+        print(f"    ⚠ 两台分辨率不一致（{note}）→ 双目标定会失败，需同一档")
+        return True
+
+    # 至少一路 0 帧或打不开 → 失败。
+    print("    ❌ 双路同时取帧失败：")
+    for role, idx in (("left", left_index), ("right", right_index)):
+        st = stats[role]
+        if st["frames"] > 0:
+            continue
+        if not st["opened"]:
+            print(f"       · {role}(#{idx}) 在 {bname}@请求{width}x{height} 下**打不开**"
+                  f"（构造即失败，内部已逐档试过）")
+        else:
+            print(f"       · {role}(#{idx}) 在 {bname}@请求{width}x{height} 下 **0 帧**"
+                  f"（实读 {st['frames']}/{frames}，实际 {st['w']}x{st['h']}）")
+    print("       （两路同时取帧失败最常见的错误码及含义：）")
+    for ln in explain_grab_error().splitlines():
+        print(f"       {ln}")
+    print("       → 建议：**物理拔插**上面这路相机（设备级失效软件救不回来）；"
+          "仍不行，换一个")
+    print("         **直接插在机身上**的 USB 口（别经 HUB / 扩展坞）。")
+    return True
+
+
 def cmd_doctor(args) -> int:
     """打开每台相机实测一遍，回答"现在能不能跑双目"。"""
     import tempfile
@@ -1595,6 +1728,23 @@ def cmd_doctor(args) -> int:
                   f"本机实测：两台外接相机都无视请求、恒给 2560x1440"
                   f"（请求 1920/1280 也一样）；不一致先查是不是混进了内置/红外。")
 
+    # ---- 双路**同时**取帧（双目同工况；S5，2026-10-31）----
+    #
+    # 与上面 ③/④ 的区别：③/④ 走 `probe_index`，是**逐台**试开（开一台、读一帧、
+    # 立刻 release），同一时刻只有一台相机活着；而双目要的是**两台同时**开着、
+    # 同一后端同一分辨率同时取帧。设备级失效（-2147483638 / DEVICE_INVALIDATED）
+    # **逐台串行测不出来**，只有"两台同时"才暴露 —— 这就是「identify 说两台都好、
+    # 标定却取不到成对帧」那个"自相矛盾"的来源（planbook §2/§4.1）。故补这一段。
+    if resolved.get("left") is None or resolved.get("right") is None:
+        print("\n双路**同时**取帧（双目同工况）：")
+        print("    未配置 left/right 角色（缺一个或没解析出来）→ **跳过**双路同时检查。")
+        print("    先跑 `python apps/tools/cameras.py identify` 把左右固定下来。")
+    elif _simultaneous_grab_check(
+            resolved["left"], resolved["right"], probe_backend,
+            width=want_w, height=want_h,
+            frames=args.pair_frames, first_frame_timeout=args.pair_timeout):
+        fail = True
+
     # ---- ⑤ 结论 ----
     print("\n" + "=" * 68)
     if fail:
@@ -1667,6 +1817,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"目标宽度（默认档 {video_profiles.DEFAULT.label}）")
     pd.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
                     help=f"目标高度（默认档 {video_profiles.DEFAULT.label}）")
+    pd.add_argument(
+        "--pair-timeout", type=positive_seconds, default=PAIR_FIRST_FRAME_S,
+        help=f"双路同时取帧检查里每台等首帧的上限（秒，默认 {PAIR_FIRST_FRAME_S:.0f}）")
+    pd.add_argument(
+        "--pair-frames", type=int, default=PAIR_FRAMES,
+        help=f"双路同时取帧检查里每台读多少帧（默认 {PAIR_FRAMES}）")
     pd.set_defaults(func=cmd_doctor)
     return p
 

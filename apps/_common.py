@@ -24,6 +24,7 @@ from __future__ import annotations
 from sphere_tracker.video_profiles import DEFAULT_FPS
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime
@@ -32,8 +33,6 @@ from pathlib import Path
 # apps/_common.py 的上一级就是项目根（apps/ 在根目录下）。
 ROOT = Path(__file__).resolve().parent.parent
 LOG_DIR = ROOT / "outputs" / "logs"
-
-from sphere_tracker import video_profiles  # noqa: E402  (ROOT 已就绪)
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _LOG_DATEFMT = "%H:%M:%S"
@@ -118,14 +117,22 @@ def log_environment(log: logging.Logger) -> None:
 def add_stereo_source_args(
     ap: argparse.ArgumentParser,
     *,
-    width: int = video_profiles.DEFAULT.width,
-    height: int = video_profiles.DEFAULT.height,
+    width: int = 0,
+    height: int = 0,
     fps: int = DEFAULT_FPS,
 ) -> argparse.ArgumentParser:
     """补上双目取帧参数 —— 字段名与 ``stereo.from_args()`` 读的一一对应。
 
     参数名/默认值集中在这里，三个双目 app 就永远同步，不会出现
     "这个脚本能用、那个不能"。
+
+    ⚠️ **2026-10-31：``--width/--height`` 默认由 ``video_profiles.DEFAULT``
+    改为 ``0``（= 自适应）。** 原因（planbook
+    ``2026-10-31_双目标定取帧失败与分辨率档.md`` §8.3 S2）：本机 aoni
+    **不支持 2560x1440**，请求它被**静默降级** 1920x1080 —— 写死一个"名义
+    默认档"既拿不到、又掩盖了相机实际能力。改成 ``0`` 后由
+    ``stereo.CameraPairReader`` **逐档协商**（清晰度优先 + 帧率下限 + 两路一致），
+    不再被一个固定值限制死。**显式给数则跳过协商，行为与以前一致。**
 
     默认帧率 **24**（2026-10-24 真机实测）：**1440p 全尺寸写盘**时
     ``record_stereo`` 主循环约 24.07fps，请求 30 会丢帧；
@@ -147,13 +154,42 @@ def add_stereo_source_args(
     ap.add_argument("--left-dir", default=None, help="左路图片文件夹")
     ap.add_argument("--right-dir", default=None, help="右路图片文件夹")
     ap.add_argument("--width", type=int, default=width,
-                    help=f"相机采集宽度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
+                    help="相机采集宽度（两路一致）。**默认 0 = 自适应**"
+                         "（逐档探测，清晰度优先 + 帧率下限）；给具体值则按该档打开")
     ap.add_argument("--height", type=int, default=height,
-                    help=f"相机采集高度（两路一致；默认档 {video_profiles.DEFAULT.label}）")
+                    help="相机采集高度（两路一致）。**默认 0 = 自适应**（说明见 --width）")
     ap.add_argument("--fps", type=int, default=fps,
                     help=f"相机采集帧率（默认 {fps}）。1440p 全尺寸写盘约 24fps；"
                          "FOV 对齐后写盘 1718x972 时 30fps 实测稳定")
     return ap
+
+
+def calib_capture_size(calib_base) -> tuple[int, int] | None:
+    """读标定 JSON 里记的**采集档**（``capture_size``，形如 ``[宽, 高]``）。
+
+    为什么要它：标定是在某个**采集分辨率**下做的（FOV 裁剪之前）。录制 / 复检 /
+    前置检查要复现**同一档**，否则写盘尺寸与标定 ``image_size`` 对不上
+    （``record_stereo`` 的「实际 == 请求」校验会直接失败），FOV 裁剪也可能越界。
+
+    返回 ``None`` 表示**没有这条记录**（旧标定）—— 调用方必须**明确说清**、
+    退回默认档，不许静默假定。文件缺失 / 损坏 / 字段非法同样返回 ``None``。
+    """
+    p = Path(calib_base)
+    if p.suffix != ".json":
+        p = p.with_suffix(".json")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    cs = data.get("capture_size") if isinstance(data, dict) else None
+    if isinstance(cs, (list, tuple)) and len(cs) == 2:
+        try:
+            w, h = int(cs[0]), int(cs[1])
+        except (TypeError, ValueError):
+            return None
+        if w > 0 and h > 0:
+            return (w, h)
+    return None
 
 
 def apply_mono_calibration(cfg, args) -> str:
@@ -298,6 +334,7 @@ __all__ = [
     "LOG_DIR",
     "add_mono_pipeline_args",
     "add_stereo_source_args",
+    "calib_capture_size",
     "open_pair_source",
     "setup_logging",
     "log_environment",

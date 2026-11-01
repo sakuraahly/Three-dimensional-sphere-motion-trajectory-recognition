@@ -23,6 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import video_profiles
 from .plugins import register, resolve
 
 WINDOWS_BACKENDS = [
@@ -193,8 +194,13 @@ class VideoSource:
 # 1280x720@30fps（DSHOW 在不同请求下选了不同的内部模式）；
 # 1920x1080 更是只有 4.3 fps（YUY2 未压缩，USB 带宽不够）。
 # 不探测就只能靠猜。
-CANDIDATE_MODES: tuple[tuple[int, int], ...] = (
-    (1920, 1080), (1280, 720), (1024, 768), (960, 540), (800, 600), (640, 480),
+#
+# ⚠️ 2026-10-31：清单改为从 `video_profiles.probe_order(None)` **派生**
+# （此前是第三份手写清单，与降档梯子、与 GUI 档位表各写一遍 —— planbook §8.1）。
+# **原生档 NATIVE (0,0) 排除在外**：`optimize_mode` 靠具体宽高重开，
+# 而原生档语义未验证（planbook §3 的 P5），不该进模式搜索。
+CANDIDATE_MODES: tuple[tuple[int, int], ...] = tuple(
+    p for p in video_profiles.probe_order(None) if p != video_profiles.NATIVE
 )
 
 #: 「一帧都没拿到时**再试一次**」的那一档分辨率。
@@ -393,10 +399,19 @@ class CameraSource(VideoSource):
         # 分辨率候选：先试用户要的，失败再降级。
         # 为什么必须降级：不少 USB 摄像头对不支持的分辨率不会报错，
         # 而是"打开成功但每帧都返回全黑"，代码不检查就会一直拿到黑屏。
-        res_candidates: list[tuple[int, int]] = []
-        for cand in ((width, height), (1280, 720), (640, 480), (0, 0)):
-            if cand not in res_candidates:
-                res_candidates.append(cand)
+        #
+        # ⚠️ 2026-10-31 改为**自适应**（planbook §8.3 的 S3），列表统一来自
+        # `video_profiles.probe_order(...)`（不再手写一份可能漏档的梯子）：
+        #   · auto（width<=0 或 height<=0）→ `probe_order(None)`：从最高档（4K）
+        #     一路降到原生档，**不被一个写死的默认档限制死**；
+        #   · 显式档 → `probe_order(get(width, height))`：**先试用户要的那一档**，
+        #     再逐级降档（含 1920x1080；旧梯子恰好漏了它，见 planbook §2）。
+        # 原意保留："先试用户要的、失败再降级"。
+        if width <= 0 or height <= 0:
+            res_candidates: list[tuple[int, int]] = video_profiles.probe_order(None)
+        else:
+            res_candidates = video_profiles.probe_order(
+                video_profiles.get(width, height))
 
         self._cached_hit = False
         # 先看缓存：上次探测出的"后端 + 分辨率"直接拿来打开，
@@ -603,7 +618,13 @@ class CameraSource(VideoSource):
                 if frame is not None and float(frame.std()) > BLACK_FRAME_STD:
                     self.cap = cap
                     self.backend_name = name
-                    self.resolution_fallback = bool(rw and (rw, rh) != (width, height))
+                    # ⚠️ auto（width<=0 或 height<=0）时**不许谎报回退**：
+                    # 此时用户没要任何具体档，`(rw,rh) != (width,height)` 恒为真，
+                    # 于是每次都打一句"[提示] 摄像头 N 不支持 0x0"——纯噪音，
+                    # 且会让人以为相机不支持某个分辨率。只有**显式档**被静默
+                    # 降级才算真回退（那时提示才有用）。
+                    self.resolution_fallback = bool(
+                        width > 0 and height > 0 and (rw, rh) != (width, height))
                     got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     _log(f"✔ {name} @ {rw or '原始'}x{rh or '原始'} 打开成功"

@@ -18,14 +18,19 @@
 - 两侧默认值语义也不同：共用侧 `--left=None`（= 交给 `auto` 推断），
   录制侧 `--left="left"`（= 缺省就按角色名开工，双击 bat 直接能录）。
 
-数值层面**已经没有第二个来源**：宽高来自 `video_profiles.RECORD_DEFAULT`、
-帧率来自 `video_profiles.DEFAULT_FPS`（两者都注明"全项目只此一处"）。
+数值层面**已经没有第二个来源**：帧率来自 `video_profiles.DEFAULT_FPS`，
+而采集档的**兜底默认**来自 `video_profiles.RECORD_DEFAULT`（都注明"全项目只此一处"）。
 真正的单一是**数值单一**，不是硬把两份 argparse 揉成一份 —— 揉完就得往共用函数里
 塞"录制专用"的帮助文案，耦合方向反而错了。
 
+采集档（2026-10-31）：`--width/--height` **默认 None**。未显式给时，先读标定
+meta 记的 `capture_size`（= 标定时的**实际采集分辨率**），与标定**同一档**才能
+保证 FOV 裁剪区与 `validate_capture_size` 对得上；标定没记（旧标定）则明确说清、
+退回 `RECORD_DEFAULT`。给了显式值就按显式值（不改）。
+
 FOV 生效时（标定 meta 带 `fov`）写盘 / 预览用的是标定的 `fov.target_size`
-（两路共同、**不放大**，当前一对约 1684x978），**不是** `--width/--height`：
-相机仍按 `--width/--height`（2560x1440）打开，再在采集线程里逐帧归一化。
+（两路共同、**不放大**，当前一对约 1684x978），**不是**上面的采集档：
+相机仍按采集档打开，再在采集线程里逐帧归一化。
 `session.json` 的 `left/right.width/height`、`calibration.image_size` 都记
 写盘尺寸；无损 MKV 只接受偶数宽高，奇数 target 会在录制前退出 2。
 
@@ -68,7 +73,7 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from apps._common import setup_logging                      # noqa: E402
+from apps._common import calib_capture_size, setup_logging      # noqa: E402
 from calib.params import StereoRig                           # noqa: E402
 from stereo.fov_align import (                              # noqa: E402
     MIN_FOV_INLIERS,
@@ -432,13 +437,13 @@ def main() -> int:
     ap.add_argument("--left", default="left", help="左路：角色名 / 编号 / name:...")
     ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
-    ap.add_argument("--width", type=int, default=RECORD_DEFAULT.width,
-                    help=f"录制宽度（默认 {RECORD_DEFAULT.label}）。真机实测：两台外接"
-                         "相机无视 1920/1280 请求、恒给 2560x1440。2026-10-24 复测："
-                         "写盘 1718x972（FOV 对齐后）时 30fps 稳定（301 帧/10s）；"
-                         "1440p 全尺寸未复测")
-    ap.add_argument("--height", type=int, default=RECORD_DEFAULT.height,
-                    help=f"录制高度（默认 {RECORD_DEFAULT.label}；说明见 --width）")
+    ap.add_argument("--width", type=int, default=None,
+                    help=f"录制采集宽度。**默认不填 = 采用标定记录的采集档 "
+                         f"(capture_size)**；标定没记（旧标定）则退回 {RECORD_DEFAULT.label}。"
+                         "录制必须与标定同一档，否则写盘尺寸与标定 image_size 对不上")
+    ap.add_argument("--height", type=int, default=None,
+                    help=f"录制采集高度。默认不填 = 采用标定记录的采集档；"
+                         f"标定没记则退回 {RECORD_DEFAULT.label}（说明见 --width）")
     ap.add_argument("--fps", type=int, default=DEFAULT_FPS,
                     help="请求相机的帧率（提示值），**不是**容器标称帧率；容器帧率"
                          "取相机协商值（取不到才退回本值）。默认 24")
@@ -461,6 +466,26 @@ def main() -> int:
     ap.add_argument("--self-check-only", action="store_true",
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
     args = ap.parse_args()
+
+    # ---- 采集档：未显式给 --width/--height 时，**优先用标定记下的采集档** ----
+    #
+    # 为什么必须这样（2026-10-31）：录制必须与标定**同一档** —— 写盘尺寸、
+    # FOV 裁剪区、`validate_capture_size` 都建立在"采集帧 == 标定采集档"上。
+    # 而标定档现在可能是 1920x1080（相机实际能力），不再是名义默认 2560x1440。
+    # 若还按名义默认请求 1440，`_open_pair` 的「实际 == 请求」校验会直接失败。
+    # 标定没记该字段（旧标定）时**明确说清**、退回 RECORD_DEFAULT，不静默假定。
+    if args.width is None or args.height is None:
+        _cs = calib_capture_size(args.calib)
+        if _cs is not None:
+            args.width, args.height = _cs
+            print(f"[采集档] 采用标定记录的采集档 {_cs[0]}x{_cs[1]}"
+                  f"（{Path(args.calib).with_suffix('.json').name} 的 capture_size）")
+        else:
+            args.width, args.height = RECORD_DEFAULT.width, RECORD_DEFAULT.height
+            print(f"[采集档] 标定里没有采集档记录（旧标定或读不到），"
+                  f"退回默认 {RECORD_DEFAULT.label}。")
+            print("         若与本机实际采集档不符，请显式给 --width/--height，"
+                  "或先重标（新标定会记下采集档）。")
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")

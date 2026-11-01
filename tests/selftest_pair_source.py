@@ -9,7 +9,7 @@
 做法：把每一帧的**帧号编进画面**（左下、右下两个色块分别存帧号的低字节和高字节），
 于是"取到的是第几帧"可以直接从像素里读回来比对，不依赖任何相机或标定。
 
-验证八件事：
+验证十件事：
   1. `sync_offset=0`：左第 i 帧 配 右第 i 帧；
   2. `sync_offset=+k`：左第 i 帧 配 右第 i+k 帧；
   3. `sync_offset=-k`：左第 i 帧 配 右第 i-k 帧；
@@ -21,6 +21,11 @@
   7. **采集会话**（`session.json`）：写→读→校验；坏会话必须逐条报错。
   8. **并行打开的整体超时**（`_join_all`）：改前裸 `th.join()` 会永久挂住主线程；
      改后"永不返回"的线程能在 0.2s 内被判定为"仍存活"并返回（不依赖真相机）。
+  9. **自适应成对协商的纯逻辑**：档位标签、成对帧率取"两路较小者"、
+     刚打开测不到时先等首帧再测（A5）、帧率下限与 `DEFAULT_FPS` 的换算关系。
+  10. **A3 真帧守卫**（驱动真实的 `_negotiate`）：两路**上报一致但真帧不一致**
+      必须被**拒绝**（不能静默接受一对尺寸不一致的相机），任一路取不到真帧
+      也必须被拒绝；对照"都一致"要被接受。
 
 图片文件夹与视频两条路径都测（两者的取帧实现完全不同：
 文件夹是随机访问，视频要按帧号定位）。
@@ -842,6 +847,180 @@ def test_open_join_timeout() -> bool:
 
 
 # --------------------------------------------------------------------------
+def test_auto_negotiate_helpers() -> bool:
+    """自适应成对协商的**纯逻辑**部分（不依赖真相机）。
+
+    覆盖 S4 协商里最容易写错、又最容易被"合成真值漂亮"掩盖的几点：
+    档位标签、成对帧率必须取**两路较小者**（不是某一台）、刚打开测不到帧时
+    要**先等首帧再测**（A5）、帧率下限与 `DEFAULT_FPS` 的换算。判据不依赖相机：
+    被测量的是纯 `time` 驱动的假相机。
+    """
+    print("----- 自适应成对协商：纯逻辑（不依赖相机） -----")
+    import time
+
+    from sphere_tracker.video_profiles import DEFAULT_FPS, probe_order
+    from stereo.pair_source import (
+        AUTO_MIN_PAIR_FPS,
+        _measure_pair_fps,
+        _pair_fps_sample,
+        _profile_label,
+    )
+
+    checks: list[tuple[str, bool]] = []
+
+    # 档位标签：原生档 (0,0) 必须说成"原生"，不能打印成会误导的 "0x0"
+    checks.append(("原生档标签", _profile_label(0, 0) == "原生"))
+    checks.append(("普通档标签", _profile_label(1920, 1080) == "1920x1080"))
+
+    # 帧率下限 = DEFAULT_FPS * 0.6
+    checks.append((f"帧率下限 = DEFAULT_FPS({DEFAULT_FPS}) * 0.6",
+                   abs(AUTO_MIN_PAIR_FPS - DEFAULT_FPS * 0.6) < 1e-9))
+
+    # 协商的档序来源：probe_order(None) 从最高档到原生档
+    order = probe_order(None)
+    checks.append(("档序首个是最高档", order[0] == (3840, 2160)))
+    checks.append(("档序末尾是原生档", order[-1] == (0, 0)))
+
+    class _FakeCam:
+        """够用的假相机：`seq` 按 `rate` 匀速增长；`first_delay` 内不出帧。"""
+
+        def __init__(self, rate: float, first_delay: float = 0.0) -> None:
+            self._rate = float(rate)
+            self._t0 = time.perf_counter()
+            self._delay = float(first_delay)
+
+        def _seq(self) -> int:
+            dt = time.perf_counter() - self._t0 - self._delay
+            return max(0, int(dt * self._rate))
+
+        def latest(self, last_seq: int = -1):
+            return self._seq(), None, 0.0
+
+        def wait_first(self, timeout: float = 10.0):
+            if self._delay <= 0:
+                return object()
+            time.sleep(min(self._delay, timeout))
+            return object()
+
+    # 成对帧率 = **两路较小者**：快的 100、慢的 20 -> 结果 ≈20，而不是 ≈60。
+    rate = _pair_fps_sample([_FakeCam(100.0), _FakeCam(20.0)], budget=0.4)
+    checks.append((f"成对帧率取两路较小者（测得 {rate:.0f}，应 ≈20 而非 ≈60）",
+                   10.0 <= rate <= 30.0))
+
+    # A5：刚打开（首个 0.8s 不出帧）短测会得到 0 -> 必须先等首帧再测。
+    rate2 = _measure_pair_fps([_FakeCam(25.0, first_delay=0.8)],
+                              budget=0.2, settle_max=2.0)
+    checks.append((f"刚打开测不到时先等首帧再测（测得 {rate2:.0f}，应 > 0）",
+                   rate2 > 1.0))
+
+    ok_all = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok_all = ok_all and passed
+    return ok_all
+
+
+# --------------------------------------------------------------------------
+def test_auto_negotiate_guards() -> bool:
+    """A3 **真帧**守卫：**上报一致但真帧不一致**必须被拒（不静默接受）。
+
+    这是本次修复（独立 Critic 判出的高）的**证伪点**：老代码只比
+    `cap.get()` 的**上报值**，两台上报同为 1920x1080、真帧一个 1280x1080
+    一个 1920x1080 时会被**静默接受**一对尺寸不一致的相机。
+
+    这里**驱动真实的 `_negotiate`**（不复制逻辑）：只把"打开两路"替身掉，
+    A3/A2/A5 守卫本身照走产品代码。
+    """
+    print("----- 自适应成对协商：A3 真帧守卫（驱动真实 _negotiate） -----")
+    import time
+    from types import SimpleNamespace
+
+    from stereo.pair_source import CameraPairReader
+
+    class _FakeCam:
+        """假相机：`info` 是**上报值**，`wait_first` 给的是**真帧**。"""
+
+        def __init__(self, reported, frame, seq_rate: float = 30.0) -> None:
+            self.info = SimpleNamespace(width=reported[0], height=reported[1])
+            self._frame = frame
+            self._t0 = time.perf_counter()
+            self._rate = float(seq_rate)
+            self.stopped = False
+
+        def latest(self, last_seq: int = -1):
+            return max(0, int((time.perf_counter() - self._t0) * self._rate)), \
+                self._frame, 0.0
+
+        def wait_first(self, timeout: float = 10.0):
+            return self._frame
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    def _frame(w: int, h: int):
+        return np.zeros((h, w, 3), np.uint8)
+
+    class _StubReader(CameraPairReader):
+        """跳过真开相机：只替身 `_try_open_pair`，`_negotiate` 照走产品代码。"""
+
+        def __init__(self, factory) -> None:
+            # 不调 super().__init__（那会真开相机）；只补 `_negotiate` 需要的属性。
+            self._left_index, self._right_index = 0, 1
+            self._auto = True
+            self.requested_size = "auto"
+            self.resolved_size = None
+            self.actual_sizes = []
+            self.pair_fps = None
+            self._fps = 30
+            self._backup_camera = None
+            self.cams = []
+            self._factory = factory
+
+        def _try_open_pair(self, name, api, rw, rh, errors, deadline=None):
+            return self._factory(rw, rh)
+
+    checks: list[tuple[str, bool]] = []
+
+    # ① 上报一致（都报 1920x1080）但**真帧不一致**（左 1920x1080 / 右 1280x1080）
+    #    -> 每一档都必须被拒；全档走完 -> cams 空 + attempts 写明真帧尺寸不一致。
+    r1 = _StubReader(lambda rw, rh: [_FakeCam((1920, 1080), _frame(1920, 1080)),
+                                     _FakeCam((1920, 1080), _frame(1280, 1080))])
+    errs1: list[str] = []
+    r1._negotiate([("指定", None)], errs1)
+    joined1 = "\n".join(errs1)
+    checks.append(("上报一致、真帧不一致 -> **拒绝**（cams 为空，未静默接受）",
+                   r1.cams == []))
+    checks.append(("拒绝原因写明「实际帧尺寸不一致」且带两路尺寸",
+                   "实际帧尺寸" in joined1
+                   and "1920x1080" in joined1 and "1280x1080" in joined1))
+
+    # ② 任一路拿不到真帧（右路 `wait_first` 永远 None）-> 拒绝、降档。
+    r2 = _StubReader(lambda rw, rh: [_FakeCam((1920, 1080), _frame(1920, 1080)),
+                                     _FakeCam((1920, 1080), None)])
+    errs2: list[str] = []
+    r2._negotiate([("指定", None)], errs2)
+    joined2 = "\n".join(errs2)
+    checks.append(("任一路取不到真帧 -> **拒绝**（cams 为空）", r2.cams == []))
+    checks.append(("拒绝原因写明「取不到真帧」", "取不到真帧" in joined2))
+
+    # ③ 对照：上报一致、真帧也一致、帧率够快 -> **接受**（证明①②不是恒拒绝）。
+    r3 = _StubReader(lambda rw, rh: [_FakeCam((1920, 1080), _frame(1920, 1080)),
+                                     _FakeCam((1920, 1080), _frame(1920, 1080))])
+    errs3: list[str] = []
+    r3._negotiate([("指定", None)], errs3)
+    checks.append(("对照：上报/真帧都一致、帧率够 -> **接受**", len(r3.cams) == 2))
+    checks.append(("接受时 resolved_size / actual_sizes 记的是**真帧**尺寸",
+                   r3.resolved_size == (1920, 1080)
+                   and r3.actual_sizes == [(1920, 1080), (1920, 1080)]))
+
+    ok_all = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok_all = ok_all and passed
+    return ok_all
+
+
+# --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser(description="成对帧源自测")
     ap.add_argument("--keep", action="store_true",
@@ -865,6 +1044,8 @@ def main() -> int:
             test_short_side(base),
             test_timestamp_pairing(base),
             test_open_join_timeout(),
+            test_auto_negotiate_helpers(),
+            test_auto_negotiate_guards(),
         ]
         print()
         results.append(test_live_camera_skipped())

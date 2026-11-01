@@ -85,6 +85,7 @@ from sphere_tracker.sources import (
     LatestFrameCamera,
     infer_source_kind,
 )
+from sphere_tracker.video_profiles import DEFAULT_FPS, probe_order
 
 from .timestamp_pair import (
     canary_safe,
@@ -108,7 +109,104 @@ CAMERA_ALIGN_STEPS = 2
 #: "正常但慢 + 走了备用相机"的相机误判成超时。
 OPEN_JOIN_TIMEOUT_S = 150.0
 
+#: auto（`width<=0` 或 `height<=0`）= 自适应协商的**总**预算（秒）。
+#: 逐档探测每档要开两路 + 短测帧率，最坏走完 `probe_order(None)` 的 6 个档
+#: （+ 原生档）。取 90 与 `OPEN_JOIN_TIMEOUT_S` 同量级：到点就带着"试过哪些、
+#: 为什么都不行"收场，而不是无限期地一档一档等下去。
+AUTO_PAIR_DEADLINE_S = 90.0
+#: 成对帧率的**下限**：低于它就降档。= `DEFAULT_FPS * 0.6`（当前 14.4）。
+#: 为什么必须有（范式审计 A2）：4K 也能"出帧"，只是每秒 2 帧 —— 只判"能不能出图"
+#: 会把一个"清晰但卡成幻灯片"的档当成好档。
+AUTO_MIN_PAIR_FPS = DEFAULT_FPS * 0.6
+#: 刚打开时测不到帧率（<0.1 fps）的"等首帧再测"上限（秒）。
+#: 对齐 `sources.optimize_mode` 的做法：刚打开测成 0 是**测量时机**问题，不是设备慢。
+AUTO_FIRST_FRAME_WAIT_S = 6.0
+#: 短测成对帧率的采样窗口（秒）。
+#:
+#: 为什么是 **0.6** 而不是更短的 0.3（2026-10-31 独立 Critic 的中等项）：
+#: 帧率 = (窗口内帧数) / 时长，帧数是整数 —— 0.3s 窗口在 13~20 fps 附近的量化
+#: 误差约 ±1.7 fps（12 与 20 fps 只差 3 帧）。而帧率下限 `AUTO_MIN_PAIR_FPS`
+#: 恰是 14.4，于是"贴线"档的判决会**跨次运行翻转**（真机实测：同一个档一次测成
+#: 13.1 被拒、另一次 19.7 被接受）。窗口加倍到 0.6s，量化误差压到约 ±0.8 fps。
+#: 代价：每档多 0.3s；最坏走完 7 个档 ≈ 多 2s，相对 `AUTO_PAIR_DEADLINE_S=90` 可忽略。
+AUTO_PAIR_FPS_BUDGET = 0.6
+#: 从两路各取**一帧真帧**（`wait_first`）的等待上限（秒），用于 A3 的"真帧尺寸"复核。
+#: 为什么短：`CameraSource` 在**打开时**就已经成功读到过帧（否则会 raise），
+#: 所以后台采集线程的首帧应在一帧间隔内到达；3s 足够，且不啃协商总预算。
+AUTO_FRAME_PROBE_TIMEOUT_S = 3.0
+
 _BACKEND_BY_CLI = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
+
+
+def _profile_label(rw: int, rh: int) -> str:
+    """候选档的显示名（原生档 ``(0, 0)`` 说成"原生"）。"""
+    return "原生" if (rw <= 0 or rh <= 0) else f"{rw}x{rh}"
+
+
+def _wh(size: tuple[int, int]) -> str:
+    return f"{size[0]}x{size[1]}"
+
+
+def _pair_fps_sample(cams: list["LatestFrameCamera"], budget: float) -> float:
+    """采样 `budget` 秒，返回**成对**帧率 = min(两路 seq 增量) / 时长。
+
+    为什么取 min：双目要的是"两路都能跟上"的节奏，某台快、另一台慢时，
+    成对取帧的实际上限是**慢的那台**（`read()` 会等两路都出新帧）。
+    `seq` 是采集线程每存一帧 +1，停止出帧就不再增长 —— 所以这个数如实反映"真在出帧"。
+    """
+    base = [c.latest()[0] for c in cams]
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < budget:
+        time.sleep(0.02)
+    dt = max(time.perf_counter() - t0, 1e-6)
+    now = [c.latest()[0] for c in cams]
+    return min(n - b for n, b in zip(now, base)) / dt
+
+
+def _measure_pair_fps(
+    cams: list["LatestFrameCamera"],
+    budget: float = AUTO_PAIR_FPS_BUDGET,
+    settle_max: float = AUTO_FIRST_FRAME_WAIT_S,
+) -> float:
+    """测成对帧率；刚打开测成 0 时**先等首帧再测**（A5），最多 `settle_max` 秒。
+
+    "测不准"不能当成"设备不行"—— 刚打开的相机还没开始出帧时测出来必然是 0，
+    那是测量时机的问题（与 `sources.optimize_mode` 同一处理）。
+    """
+    rate = _pair_fps_sample(cams, budget)
+    if rate >= 0.1:
+        return rate
+    t_wait = time.perf_counter()
+    while time.perf_counter() - t_wait < settle_max:
+        for c in cams:
+            c.wait_first(timeout=0.25)
+        rate = _pair_fps_sample(cams, budget)
+        if rate >= 0.1:
+            return rate
+    return rate
+
+
+def _probe_real_frames(cams: list["LatestFrameCamera"],
+                       timeout: float = AUTO_FRAME_PROBE_TIMEOUT_S,
+                       ) -> tuple[list[np.ndarray] | None, str]:
+    """从两路各取**一帧真帧**，返回 `(帧列表, "")` 或 `(None, 失败原因)`。
+
+    为什么要拿真帧（范式审计 A3，2026-10-31 独立 Critic 定出的高）：
+    `cam.info.width/height` 是 `cap.get(CAP_PROP_FRAME_WIDTH/HEIGHT)` 的**上报值**，
+    驱动可能上报一套、实际给另一套 —— 本文件 `read()` 里就写着实测
+    （内置相机上报 1920x1080、实际给 1280x1080）。A3 的契约是"两路**实际**
+    分辨率必须一致"，只比上报值 = 拿**弱证据**下**强结论**：两台上报同为
+    1920x1080、真帧一个 1280x1080、一个 1920x1080 时会被**静默接受**一对待
+    不一致的相机 —— 而喂给标定器的正是真帧尺寸。
+    """
+    out: list[np.ndarray] = []
+    for i, c in enumerate(cams):
+        f = c.wait_first(timeout=timeout)
+        if f is None:
+            side = ("左", "右")[i] if i < 2 else str(i)
+            return None, f"{side}路 {timeout:.0f}s 内取不到真帧"
+        out.append(f)
+    return out, ""
 
 
 def _join_all(threads: list[threading.Thread],
@@ -301,6 +399,13 @@ class CameraPairReader(FrameReader):
     这里**不支持偏移**：两个采集线程各跑各的，帧号之间没有共同的 0 点，
     想"让右路退回去 8 帧"是做不到的（帧早没了）。所以只做一件事 ——
     等两路都出新帧，把时间差压到一帧以内。
+
+    ## 分辨率：显式档 vs 自适应（auto）
+
+    - **显式**给 `width/height`（>0）：按该档成对打开，行为与以前完全一致；
+    - **自适应**（`width<=0` 或 `height<=0`）：逐档协商（见 `_negotiate`），
+      定案后把 `requested_size="auto"` / `resolved_size` / `actual_sizes` /
+      `pair_fps` 暴露给上层（标定脚本要写进 meta）。
     """
 
     kind = "camera"
@@ -318,37 +423,16 @@ class CameraPairReader(FrameReader):
         if left_index == right_index:
             raise RuntimeError(f"左右相机不能是同一个索引（都是 {left_index}）")
         self.label = f"camera {left_index} / {right_index}"
-
-        def _open(role: str, idx: int, api: int) -> LatestFrameCamera:
-            # ⚠️ **`optimize=False` 是必须的，不是省事**（2026-10-14 修）：
-            #
-            # `CameraSource` 默认 `optimize=True`，它会**为这一台相机**搜索
-            # "最适合自己"的后端 + 分辨率。但双目要求**两路分辨率完全一致**
-            # （`image_size`、标定、三角测量全都建立在这个前提上），
-            # 于是各自优化必然把两路拉开。受控实测（连续两轮，结果完全一致）：
-            #
-            #     请求 1920x1080  optimize=False -> idx1=1920x1080 idx0=1920x1080  一致
-            #     请求 1920x1080  optimize=True  -> idx1=1280x720  idx0=1920x1080  不一致
-            #
-            # 不一致的表现是标定**直接失败**（"两路分辨率不一致…标定要求两路
-            # 完全一致"），而用户看到的是"我明明设了 1920x1080"。
-            #
-            # 关掉优化 ≠ "不管分辨率"：`CameraSource` 拿到明确的 `width/height`
-            # 就按它打开，给不出帧时仍会回退到候选分辨率 —— 那时两路是否一致
-            # 由上层**报出来**，是可见的，而不是被静默优化掉。
-            try:
-                return LatestFrameCamera(CameraSource(
-                    index=idx, width=width, height=height, fps=fps, backend=api,
-                    optimize=False))
-            except RuntimeError:
-                if backup_camera is None or backup_camera == idx:
-                    raise
-                print(f"[警告] {role}相机 {idx} 打不开，改用备用相机 {backup_camera}")
-                print("       注意：备用相机与被替换的那台型号/视野都不同，"
-                      "标定结果只对当前这个组合有效")
-                return LatestFrameCamera(CameraSource(
-                    index=backup_camera, width=width, height=height, fps=fps,
-                    backend=api, optimize=False))
+        self._left_index, self._right_index = int(left_index), int(right_index)
+        self._fps = int(fps)
+        self._backup_camera = backup_camera
+        # auto（含 0）：宽或高任一边 <= 0 就进自适应协商；否则按该显式档打开。
+        self._auto = (width <= 0 or height <= 0)
+        self.requested_size: str | tuple[int, int] = (
+            "auto" if self._auto else (int(width), int(height)))
+        self.resolved_size: tuple[int, int] | None = None
+        self.actual_sizes: list[tuple[int, int]] = []
+        self.pair_fps: float | None = None
 
         # 两路必须用同一个后端，且要**成对地**挑：一个后端能同时打开两路才算数。
         # 原因（2026-10 实测）：同一进程里混用 DSHOW + MSMF 时，MSMF 那路会
@@ -358,102 +442,262 @@ class CameraPairReader(FrameReader):
                     else [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF)])
         errors: list[str] = []
         self.cams: list[LatestFrameCamera] = []
-        for name, api in backends:
-            opened: list[LatestFrameCamera] = []
-            # ---- 两路**并行**打开（2026-10-14 改）----
-            #
-            # ⚠️ 原来是**串行**：先开左、开好再开右。而实测本机的一台相机
-            # 在 MSMF 下要 **29.8 ~ 51.4 秒**（同型号的另一台只要 0.9 秒；
-            # 且单独开也这么慢 —— 已排除带宽竞争）。串行意味着总等待是
-            # **两者之和**（1.0 + 37.4 = 38.4s），并行则只有**较慢那个**。
-            #
-            # 这个差别对用户是直接的：点「标定前置检查」后到看见画面
-            # 从 38s 降到 37s 看着不多，但两路都慢时就是**减半**。
-            # 而且并行不改变任何语义 —— 两路本来就要用同一个后端，
-            # 失败判定与错误信息都保持不变。
-            results: list[object] = [None] * 2
-            failures: list[BaseException] = []
 
-            def _open_slot(slot: int, role: str, idx: int) -> None:
-                try:
-                    results[slot] = _open(role, idx, api)
-                except BaseException as exc:            # noqa: BLE001
-                    failures.append(exc)                # 交给主线程重新抛
+        if self._auto:
+            self._negotiate(backends, errors)
+        else:
+            for name, api in backends:
+                opened = self._try_open_pair(name, api, int(width), int(height),
+                                             errors)
+                if opened is not None:
+                    self.cams = opened
+                    break
 
-            threads = [
-                threading.Thread(target=_open_slot, args=(0, "左", left_index),
-                                 daemon=True, name="open-left"),
-                threading.Thread(target=_open_slot, args=(1, "右", right_index),
-                                 daemon=True, name="open-right"),
-            ]
-            print(f"[{name}] 并行打开两路相机（左 #{left_index} / 右 #{right_index}）…",
-                  flush=True)
-            t_open = time.perf_counter()
-            for th in threads:
-                th.start()
-            # ⚠️ 原来是裸 `th.join()`，**没有 timeout**（2026-10-31 修）：
-            # 内部 `CameraSource.search_budget_s` 只保证"正常情况下会返回"，
-            # **不保证线程一定结束** —— `cv2.VideoCapture` 可能在驱动层挂住，
-            # 于是主线程会**永久等待**。`daemon=True` 只保证进程能退出，
-            # 不保证主线程不被卡。
-            stuck = _join_all(threads, OPEN_JOIN_TIMEOUT_S)
-            opened = [c for c in results if c is not None]
-            if stuck:
-                # 不许写成静默跳过 —— 那等于把"死等"换成"悄悄丢相机"。
-                # 释放已开出来的那一路，并把这台后端**当场**报出来：
-                # `errors` 只在"所有后端都失败"时才被打印，若只是这一个后端超时、
-                # 下一个后端成功，只 append 就等于**静默**（独立 Critic 的 Q2b
-                # 实测：DSHOW 超时 + MSMF 成功 → 终端一个字都没提超时）。
-                for c in opened:
-                    c.stop()
-                msg = (f"{name}: 并行打开相机超时 {OPEN_JOIN_TIMEOUT_S:.0f}s 仍未返回"
-                       f"（{'/'.join(t.name for t in stuck)}），放弃这个后端")
-                errors.append(msg)
-                print(f"[警告] {msg}", flush=True)
-                continue
-            if failures:
-                for c in opened:
-                    c.stop()
-                exc = failures[0]
-                first_line = (str(exc).splitlines() or ["打开失败"])[0]
-                msg = f"{name}: {first_line}"
-                errors.append(msg)
-                # 同上：`errors` 只在"所有后端都失败"时才被打印。若这一路抛异常、
-                # 下一个后端却成功了，只 append 就等于**静默** —— 用户不会知道
-                # 有一台相机在这个后端下没开出来。当场报出来（2026-10-31）。
-                print(f"[警告] {msg}", flush=True)
-                continue
-            print(f"[{name}] 两路都已打开，用时 {time.perf_counter() - t_open:.1f}s",
-                  flush=True)
-            # 每路一个后台采集线程：主循环不再被"等下一帧"拖住，
-            # 处理得慢就自动丢帧，永远处理最新画面
-            self.cams = opened                          # type: ignore[assignment]
-            break
         if not self.cams:
-            # ⚠️ 2026-10-14 重写：原来的文案把**所有**失败都归给"USB 带宽/集线器"，
-            # 于是给出"换 USB 口"的建议。而真实原因常常完全不是那个 ——
-            # 用户那次实测：相机 0 用 MSMF 1.2 秒就开好了，相机 1 用 MSMF
-            # **读 12 帧全空**（`-2147483638`），换到 DSHOW 两路都正常。
-            # 那是**后端**问题，换 USB 口一点用都没有。
-            hint = (
-                "\n怎么定位（按代价从小到大）：\n"
-                "  ① **换一个后端**：加 `--backend dshow`（或 `--backend msmf`）再跑一次。\n"
-                "     本机实测就是这一条解决了问题：MSMF 对其中一台读不到帧，DSHOW 正常。\n"
-                "  ② 看上面每一路的报错：**两台都失败**多半是后端/驱动；\n"
-                "     **只有一台失败**先怀疑那一台（换线、换口、单独打开试试）。\n"
-                "  ③ 排除了后端再怀疑链路：把两台插到机身上**不同的 USB 口**\n"
-                "     （不要走同一个集线器/扩展坞）。\n"
-                "  ④ 都试过还不行：跑 `apps/tools/camera_quality.py` 做画质会诊（它能区分"
-                "「带宽/链路」与「光学/曝光」两类问题）。")
-            raise RuntimeError(
-                f"左右相机（{left_index} / {right_index}）无法用同一个后端同时打开：\n  "
-                + "\n  ".join(errors) + hint)
+            raise RuntimeError(self._no_camera_message(errors))
 
         self._primed = False
-        self.width = self.cams[0].info.width
-        self.height = self.cams[0].info.height
-        for i, idx in enumerate((left_index, right_index)):
-            print(f"相机 {idx}: {describe_info(self.cams[i].info)}")
+        # ---- 定案尺寸一律取**真帧**（上报值可能不准）----
+        # auto 已在 `_negotiate` 里按真帧尺寸定案；显式档在这里补取一次真帧。
+        # `width/height`（= `image_size`）要喂给标定器，必须是真帧尺寸，否则
+        # 标定 image_size / 录制 capture_size 会与真实帧不符。上报值只在
+        # **取不到真帧时**兜底，且明确告警（不静默）。
+        if not self._auto:
+            frames, why = _probe_real_frames(self.cams)
+            if frames is None:
+                print(f"[警告] 显式档 {int(width)}x{int(height)} 取不到真帧（{why}）；"
+                      f"按上报值继续，标定尺寸可能不准", flush=True)
+                self.actual_sizes = [(c.info.width, c.info.height) for c in self.cams]
+            else:
+                self.actual_sizes = [(f.shape[1], f.shape[0]) for f in frames]
+                for i, f in enumerate(frames):
+                    rep = (self.cams[i].info.width, self.cams[i].info.height)
+                    if self.actual_sizes[i] != rep:
+                        print(f"[警告] 相机 {i} 上报 {_wh(rep)}、实际给帧 "
+                              f"{_wh(self.actual_sizes[i])}；按**实际帧尺寸**继续",
+                              flush=True)
+            self.resolved_size = self.actual_sizes[0]
+        self.width = self.actual_sizes[0][0]
+        self.height = self.actual_sizes[0][1]
+        if not self._auto:                # auto 的定案行已在 _negotiate 里打过
+            for i, idx in enumerate((left_index, right_index)):
+                print(f"相机 {idx}: {describe_info(self.cams[i].info)}")
+
+    # ------------------------------------------------------------------
+    def _open_one(self, role: str, idx: int, api: int, rw: int, rh: int,
+                  ) -> LatestFrameCamera:
+        """打开一台相机（`optimize=False`）；打不开且配了备用相机时顶上。
+
+        ⚠️ **`optimize=False` 是必须的，不是省事**（2026-10-14 修）：
+        `CameraSource` 默认 `optimize=True`，它会**为这一台相机**搜索
+        "最适合自己"的后端 + 分辨率。但双目要求**两路分辨率完全一致**
+        （`image_size`、标定、三角测量全都建立在这个前提上），
+        于是各自优化必然把两路拉开。受控实测（连续两轮，结果完全一致）：
+
+            请求 1920x1080  optimize=False -> idx1=1920x1080 idx0=1920x1080  一致
+            请求 1920x1080  optimize=True  -> idx1=1280x720  idx0=1920x1080  不一致
+
+        不一致的表现是标定**直接失败**，而用户看到的是"我明明设了 1920x1080"。
+        关掉优化 ≠ "不管分辨率"：给不出帧时 `CameraSource` 仍会回退到候选分辨率，
+        那时两路是否一致由上层**报出来**（A3），是可见的，而不是被静默优化掉。
+        """
+        try:
+            return LatestFrameCamera(CameraSource(
+                index=idx, width=rw, height=rh, fps=self._fps, backend=api,
+                optimize=False))
+        except RuntimeError:
+            backup = self._backup_camera
+            if backup is None or backup == idx:
+                raise
+            print(f"[警告] {role}相机 {idx} 打不开，改用备用相机 {backup}")
+            print("       注意：备用相机与被替换的那台型号/视野都不同，"
+                  "标定结果只对当前这个组合有效")
+            return LatestFrameCamera(CameraSource(
+                index=backup, width=rw, height=rh, fps=self._fps,
+                backend=api, optimize=False))
+
+    def _try_open_pair(self, name: str, api: int, rw: int, rh: int,
+                       errors: list[str], deadline: float | None = None,
+                       ) -> list[LatestFrameCamera] | None:
+        """按 (name, api, rw, rh) **并行**打开两路；成功返回 [左, 右]，失败返回 None。
+
+        失败时把原因写进 `errors` 并**当场打印** —— `errors` 只在"所有组合都
+        失败"时才被收进最终报错，若只 append 就等于**静默**（独立 Critic 的 Q2b
+        实测：DSHOW 超时 + MSMF 成功 → 终端一个字都没提超时）。
+        """
+        # ---- 两路**并行**打开（2026-10-14 改）----
+        # 原来是**串行**：实测本机一台相机在 MSMF 下要 29.8 ~ 51.4 秒
+        # （同型号另一台只要 0.9 秒）。串行意味着总等待是**两者之和**，并行只有较慢那个。
+        results: list[object] = [None] * 2
+        failures: list[BaseException] = []
+
+        def _open_slot(slot: int, role: str, idx: int) -> None:
+            try:
+                results[slot] = self._open_one(role, idx, api, rw, rh)
+            except BaseException as exc:            # noqa: BLE001
+                failures.append(exc)                # 交给主线程重新抛
+
+        threads = [
+            threading.Thread(target=_open_slot, args=(0, "左", self._left_index),
+                             daemon=True, name="open-left"),
+            threading.Thread(target=_open_slot, args=(1, "右", self._right_index),
+                             daemon=True, name="open-right"),
+        ]
+        print(f"[{name}] 并行打开两路相机（左 #{self._left_index} / "
+              f"右 #{self._right_index}）请求 {_profile_label(rw, rh)}…", flush=True)
+        t_open = time.perf_counter()
+        for th in threads:
+            th.start()
+        # ⚠️ 原来是裸 `th.join()`，**没有 timeout**（2026-10-31 修）：
+        # `cv2.VideoCapture` 可能在驱动层挂住，主线程会**永久等待**；
+        # `daemon=True` 只保证进程能退出，不保证主线程不被卡。
+        # auto 还要服从协商总预算：把本次等待压到"预算之内"。
+        budget = OPEN_JOIN_TIMEOUT_S
+        if deadline is not None:
+            budget = max(1.0, min(OPEN_JOIN_TIMEOUT_S,
+                                  deadline - time.perf_counter()))
+        stuck = _join_all(threads, budget)
+        opened = [c for c in results if c is not None]
+        if stuck:
+            for c in opened:
+                c.stop()
+            msg = (f"{name} 请求 {_profile_label(rw, rh)}：并行打开相机超时 "
+                   f"{budget:.0f}s 仍未返回（{'/'.join(t.name for t in stuck)}）")
+            errors.append(msg)
+            print(f"[警告] {msg}", flush=True)
+            return None
+        if failures:
+            for c in opened:
+                c.stop()
+            first_line = (str(failures[0]).splitlines() or ["打开失败"])[0]
+            msg = f"{name} 请求 {_profile_label(rw, rh)}：{first_line}"
+            errors.append(msg)
+            print(f"[警告] {msg}", flush=True)
+            return None
+        if len(opened) != 2:
+            for c in opened:
+                c.stop()
+            errors.append(f"{name} 请求 {_profile_label(rw, rh)}："
+                          f"只打开了 {len(opened)}/2 路")
+            return None
+        print(f"[{name}] 两路都已打开，用时 {time.perf_counter() - t_open:.1f}s",
+              flush=True)
+        return opened                          # type: ignore[return-value]
+
+    def _negotiate(self, backends: list[tuple[str, int]],
+                   errors: list[str]) -> None:
+        """auto：逐档协商，第一个满足「两路一致 + 帧率下限」的档即定案。
+
+        控制流一句话：外层**成对挑后端**（同一后端同时开两路），内层按
+        `video_profiles.probe_order(None)` **从高到低**逐档试，每档两道守卫
+        —— A3 比对两路分辨率（**先**比 `cap.get()` 上报值、**再**比真帧尺寸，
+        任一不等就降档；只比上报值会让"上报一致、真帧不一致"被静默接受）、
+        A2 短测**成对**帧率（低于 `AUTO_MIN_PAIR_FPS` 就降档；刚打开测不到
+        先等首帧再测，A5）。定案尺寸记**真帧**尺寸（喂给标定器的就是它）。
+        全档都不满足就带着**逐档记录**收场。
+        """
+        deadline = time.perf_counter() + AUTO_PAIR_DEADLINE_S
+        attempts: list[str] = []
+        detail: list[str] = []
+        for name, api in backends:
+            for (rw, rh) in probe_order(None):
+                if time.perf_counter() >= deadline:
+                    attempts.append(f"总预算 {AUTO_PAIR_DEADLINE_S:.0f}s 用尽")
+                    self._finish_negotiate_failure(errors, attempts, detail)
+                    return
+                label = _profile_label(rw, rh)
+                print(f"[成对自适应] 试 {label}（后端 {name}）…", flush=True)
+                opened = self._try_open_pair(name, api, rw, rh, detail,
+                                             deadline=deadline)
+                if opened is None:
+                    attempts.append(f"{label}✘ 打不开（见上面警告）")
+                    continue
+                # ---- A3(1)：两路**上报**分辨率必须一致（cap.get()）----
+                reported = [(c.info.width, c.info.height) for c in opened]
+                if reported[0] != reported[1]:
+                    attempts.append(f"{label}✘ 两路上报不一致"
+                                    f"（左 {_wh(reported[0])} / 右 {_wh(reported[1])}）")
+                    for c in opened:
+                        c.stop()
+                    continue
+                # ---- A3(2)：上报值不可信，必须拿**真帧**尺寸再比一次 ----
+                # `cap.get()` 是上报值、可能与实际给帧不符（见 `read()` 里的实测：
+                # 内置相机上报 1920x1080、实际 1280x1080）。只比上报值 = 拿弱证据
+                # 下强结论：两台上报 1920x1080、真帧 1280x1080 + 1920x1080 会被
+                # **静默接受**，而标定吃的是真帧尺寸。
+                timeout = AUTO_FRAME_PROBE_TIMEOUT_S
+                if deadline is not None:
+                    timeout = max(0.5, min(timeout, deadline - time.perf_counter()))
+                frames, why = _probe_real_frames(opened, timeout)
+                if frames is None:
+                    attempts.append(f"{label}✘ {why}")
+                    for c in opened:
+                        c.stop()
+                    continue
+                real = [(f.shape[1], f.shape[0]) for f in frames]
+                if real[0] != real[1]:
+                    attempts.append(f"{label}✘ 两路**实际帧尺寸**不一致"
+                                    f"（左 {_wh(real[0])} / 右 {_wh(real[1])}）")
+                    for c in opened:
+                        c.stop()
+                    continue
+                if real[0] != reported[0]:
+                    print(f"[成对自适应] 注意：{label} 上报 {_wh(reported[0])}、"
+                          f"实际给帧 {_wh(real[0])}；按**实际帧尺寸**继续", flush=True)
+                # ---- A5 + A2：短测**成对**帧率（刚打开测不到先等首帧再测）----
+                rate = _measure_pair_fps(opened)
+                if rate < AUTO_MIN_PAIR_FPS:
+                    attempts.append(
+                        f"{label}✘ 成对 {rate:.1f} fps < 下限 "
+                        f"{AUTO_MIN_PAIR_FPS:.1f}（实际 {_wh(real[0])}）")
+                    for c in opened:
+                        c.stop()
+                    continue
+                # ---- 定案（记**真帧**尺寸，那才是喂给标定器的尺寸）----
+                self.cams = opened
+                self.resolved_size = real[0]
+                self.actual_sizes = real
+                self.pair_fps = rate
+                history = " / ".join(attempts) if attempts else "首档即成"
+                print(f"[成对自适应] 定案 {_wh(real[0])}"
+                      f"（后端 {name}，左 {_wh(real[0])}，右 {_wh(real[1])}，"
+                      f"成对 {rate:.1f} fps；试过 {history}）")
+                return
+        self._finish_negotiate_failure(errors, attempts, detail)
+
+    @staticmethod
+    def _finish_negotiate_failure(errors: list[str], attempts: list[str],
+                                  detail: list[str]) -> None:
+        errors.append(
+            "自适应协商失败：候选分辨率档没有一个同时满足「两路实际一致」"
+            f"与「成对帧率 ≥ {AUTO_MIN_PAIR_FPS:.1f}」。逐档记录：\n    "
+            + "\n    ".join(attempts or ["（没有走完任何一档）"]))
+        if detail:
+            errors.append("逐组合明细：\n    " + "\n    ".join(detail))
+
+    def _no_camera_message(self, errors: list[str]) -> str:
+        """相机没凑成一对时的报错正文（含"按代价从小到大"的定位步骤）。"""
+        # ⚠️ 原文案把**所有**失败都归给"USB 带宽/集线器"并建议"换一个后端"，
+        # 而真实原因常常完全不是那个（用户实测：MSMF 读 12 帧全空、DSHOW 正常）。
+        # 这里是**诚实**的定位步骤：先物理拔插（设备级失效软件救不回），再看逐路报错。
+        hint = (
+            "\n怎么定位（按代价从小到大）：\n"
+            "  ① **物理拔插**那台失败的相机：设备被系统置为无效"
+            "（MSMF 报 -2147483638 / DEVICE_INVALIDATED）时软件重开会一直失败 —— "
+            "只有拔下来重插（或换一个**直插机身**的 USB 口，别走集线器/扩展坞）才恢复。\n"
+            "  ② 看上面每一路的报错：**两台都失败**多半是后端/驱动；"
+            "**只有一台失败**先怀疑那一台（换线、换口、单独打开试试）。\n"
+            "  ③ 两路分辨率不一致：自适应会在**同一个后端**下逐档重试；"
+            "若某台相机只支持某个档，请用 `--width/--height` 指定**两台都支持**的档。\n"
+            "  ④ 跑 `python apps/tools/cameras.py doctor` 看**「双路同时取帧」**那段"
+            "（它真开两路、与双目同工况，能区分「逐台都好」与「同时取帧失败」）。")
+        if self._auto:
+            head = (f"左右相机（{self._left_index} / {self._right_index}）"
+                    f"自适应协商失败：\n  ")
+        else:
+            head = (f"左右相机（{self._left_index} / {self._right_index}）"
+                    f"无法用同一个后端同时打开：\n  ")
+        return head + "\n  ".join(errors) + hint
 
     @property
     def info(self):
@@ -564,6 +808,12 @@ class PairSource:
         self.kind = ""
         self.n = 0                    # 已经返回了多少对
         self.warnings: list[str] = []
+        # 相机协商结果（只有 camera 分支会填；其余帧源保持 None）——
+        # 标定脚本据此把"请求了什么 / 实际定案成什么"写进标定 meta。
+        self.requested_size: str | tuple[int, int] | None = None
+        self.resolved_size: tuple[int, int] | None = None
+        self.actual_sizes: list[tuple[int, int]] = []
+        self.pair_fps: float | None = None
         self.pairing_policy = pairing
         self._pair_plan = None
         self._pair_pos = 0
@@ -583,6 +833,11 @@ class PairSource:
                 int(camera[0]), int(camera[1]), width=width, height=height, fps=fps,
                 backup_camera=backup_camera, backend=backend)
             self.kind = "camera"
+            # 把协商结果暴露出来（显式档也有：resolved == 实际值）。
+            self.requested_size = self._left.requested_size
+            self.resolved_size = self._left.resolved_size
+            self.actual_sizes = list(self._left.actual_sizes)
+            self.pair_fps = self._left.pair_fps
         elif video is not None:
             self._left = _make_reader(video[0], "左路")
             self._right = _make_reader(video[1], "右路")
