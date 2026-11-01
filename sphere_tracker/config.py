@@ -129,7 +129,11 @@ class SpecularConfig:
     # 真轮廓；又不能太宽，否则会把球内部的强反射（半径明显更小）吸进来。
     refine_center_search_px: float = 0.0
     refine_center_min_search_px: float = 2.5
-    refine_center_max_search_px: float = 8.0
+    # 上限从 8 提到 24（2026-11-01）：搜索窗按 0.25×半径 走，8px 的帽子是**按小球**
+    # （r≈35）设的；r≈70 的球本应给 17.5px，被砍到 8 之后细化够不到真轮廓，
+    # 圆心就留在 CSRT 框中心上（实测跨视图 dy −28px、落进极线门 0%）。
+    # 提到 24 后同一段录像：dy 中位 −23px、落门 13%；再大（40/60）反而变差（开始吸别的）。
+    refine_center_max_search_px: float = 24.0
 
 
 @dataclass
