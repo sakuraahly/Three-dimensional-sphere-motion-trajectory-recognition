@@ -334,6 +334,28 @@ def _write_times(path: Path, times: list[tuple[int, float, float]]) -> None:
             w.writerow([idx, f"{perf:.6f}", f"{unix:.6f}"])
 
 
+_PREVIEW_WIN = "record left | right"
+
+
+def _grab_preview_canvas(left_src, right_src, fov) -> np.ndarray | None:
+    """读一对帧、按 fov 归一化、拼成 1280x360 的预览画布；拿不到返回 ``None``。
+
+    抽出来是为了让"等待按键 / 倒计时 / 录制中"三处**共用同一套**归一化逻辑：
+    以前只有倒计时那一处做了 fov，录制中直接拿原始帧缩略 —— 一旦 FOV 对齐生效，
+    同一场录制里前后两个阶段看到的画面就不一致（一个有裁切一个没有）。
+    """
+    ok_l, lf, _ = left_src.read()
+    ok_r, rf, _ = right_src.read()
+    if not (ok_l and ok_r and lf is not None and rf is not None):
+        return None
+    if fov is not None:
+        lf = fov.apply_side(lf, "left")
+        rf = fov.apply_side(rf, "right")
+    return np.hstack([
+        cv2.resize(lf, (640, 360), interpolation=cv2.INTER_AREA),
+        cv2.resize(rf, (640, 360), interpolation=cv2.INTER_AREA)])
+
+
 def _hud(img: np.ndarray, lines: list[tuple[str, tuple[int, int, int]]]) -> np.ndarray:
     """在预览画面上叠 HUD；只影响预览，不写进录制的原始视频。"""
     if not lines:
@@ -463,9 +485,23 @@ def main() -> int:
                     default="auto",
                     help="写入会话的双目模式；auto=按标定 meta 推断，缺省 parallel")
     ap.add_argument("--preview", action="store_true", help="显示两路预览（会略增负载）")
+    ap.add_argument("--wait-key", choices=("none", "space"), default="none",
+                    help="按【空格】才开始倒计时（默认 none = 立刻倒计时）。"
+                         "需要 --preview：没有预览窗口就收不到按键。"
+                         "为什么要有它：倒计时一开始就只剩几秒，而程序刚启动时"
+                         "相机可能还没出画面、窗口也可能还没抢到焦点 —— "
+                         "先让人看清两路都有图、球在视野里，再按键开始")
     ap.add_argument("--self-check-only", action="store_true",
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
     args = ap.parse_args()
+
+    # `--wait-key space` 没有预览窗口就收不到按键 —— 这是**参数层的矛盾**，
+    # 必须在开相机之前判死：等两台相机都打开、两个 writer 都建好再说"没法等按键"，
+    # 用户白等一轮，而且日志里那句错误离"我按了开始录制"隔了好几屏。
+    if args.wait_key == "space" and not args.preview:
+        print("[错误] --wait-key space 需要 --preview：没有预览窗口就收不到按键。"
+              "去掉 --wait-key，或同时开 --preview。")
+        return 2
 
     # ---- 采集档：未显式给 --width/--height 时，**优先用标定记下的采集档** ----
     #
@@ -741,34 +777,74 @@ def main() -> int:
         print("准备好后看倒计时。录制开始后 **1 秒内闪一次光**（或拍一次手），")
         print("结束前再闪一次；球保持在两路视野内。")
         print(f"本次录 {args.duration:.0f} 秒；按 q / Esc 可提前结束。")
+
+        # ---- 先等【空格】，再进倒计时 ----
+        #
+        # 为什么要有这一步：倒计时一共只有 `--countdown` 秒，而程序刚起来时
+        # 相机常常还没出第一帧、窗口也未必抢到焦点。用户按下「开始录制」后
+        # 看到的是一个黑窗 + 已经开始的倒计时，等于把"准备"这段最重要的时间
+        # 从人手里抢走了。这一步把控制权交回给人：画面先跑起来，确认两路都有图、
+        # 球在视野里，再按空格。
+        if args.wait_key == "space":
+            print()
+            print("预览已开：按【空格】开始倒计时（按 Esc / q 取消）。")
+            while True:
+                try:
+                    canvas = _grab_preview_canvas(left_src, right_src, fov)
+                except ValueError as exc:
+                    print(f"[错误] 预览 FOV 归一化失败：{exc}")
+                    LOG.error("预览 FOV 归一化失败：%s", exc)
+                    left_writer.release()
+                    right_writer.release()
+                    return 2
+                if canvas is None:
+                    canvas = np.zeros((360, 1280, 3), np.uint8)
+                canvas = _hud(canvas, [
+                    ("READY - press SPACE to start", (0, 255, 255)),
+                    (f"then {max(0, args.countdown):g}s countdown, "
+                     f"{args.duration:.0f}s recording", (200, 200, 200)),
+                    ("FLASH once within 1s after REC starts", (200, 200, 200)),
+                ])
+                cv2.imshow(_PREVIEW_WIN, canvas)
+                key = cv2.waitKey(30) & 0xFF
+                if key == 32:            # 空格
+                    break
+                if key in (27, ord("q")):
+                    print("[取消] 没有开始录制。")
+                    left_writer.release()
+                    right_writer.release()
+                    cv2.destroyWindow(_PREVIEW_WIN)
+                    return 0
+                # 点了窗口右上角的叉：不处理的话会在这儿空转，且没有任何提示
+                try:
+                    if cv2.getWindowProperty(_PREVIEW_WIN, cv2.WND_PROP_VISIBLE) < 1:
+                        print("[取消] 预览窗口被关掉，没有开始录制。")
+                        left_writer.release()
+                        right_writer.release()
+                        return 0
+                except cv2.error:
+                    pass
+
         for i in range(int(max(0, args.countdown)), 0, -1):
             print(f"  {i}…", end="", flush=True)
             t_end = time.perf_counter() + 1.0
             while time.perf_counter() < t_end:
                 if args.preview:
-                    ok_l, lf, _ = left_src.read()
-                    ok_r, rf, _ = right_src.read()
-                    if ok_l and ok_r and lf is not None and rf is not None:
-                        if fov is not None:
-                            try:
-                                lf = fov.apply_side(lf, "left")
-                                rf = fov.apply_side(rf, "right")
-                            except ValueError as exc:
-                                print(f"[错误] 倒计时预览 FOV 归一化失败：{exc}")
-                                LOG.error("倒计时预览 FOV 归一化失败：%s", exc)
-                                left_writer.release()
-                                right_writer.release()
-                                return 2
-                        canvas = np.hstack([
-                            cv2.resize(lf, (640, 360), interpolation=cv2.INTER_AREA),
-                            cv2.resize(rf, (640, 360), interpolation=cv2.INTER_AREA)])
-                    else:
+                    try:
+                        canvas = _grab_preview_canvas(left_src, right_src, fov)
+                    except ValueError as exc:
+                        print(f"[错误] 倒计时预览 FOV 归一化失败：{exc}")
+                        LOG.error("倒计时预览 FOV 归一化失败：%s", exc)
+                        left_writer.release()
+                        right_writer.release()
+                        return 2
+                    if canvas is None:
                         canvas = np.zeros((360, 1280, 3), np.uint8)
                     canvas = _hud(canvas, [
                         (f"READY  {max(0.0, t_end - time.perf_counter()):.1f}s", (0, 255, 255)),
                         ("FLASH NOW after the beep; flash again before the end", (200, 200, 200)),
                     ])
-                    cv2.imshow("record left | right", canvas)
+                    cv2.imshow(_PREVIEW_WIN, canvas)
                     cv2.waitKey(1)
                 else:
                     time.sleep(0.02)

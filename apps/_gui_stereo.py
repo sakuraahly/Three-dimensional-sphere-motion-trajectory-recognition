@@ -206,12 +206,20 @@ def record_args(*, left: str = "left", right: str = "right", duration: str = "10
     分辨率/帧率/后端也**不传**：录制程序会按标定校验尺寸（`validate_capture_size`），
     界面再写一份数字只会多一处漂移。要改这些，先给它们加控件 —— 那时再把
     对应的关键字参数接上。
+
+    ``--preview --wait-key space`` 是**必传**的（2026-11-01 修）：
+    老界面一直传 ``--preview``，而新界面从重做那天起就没传过 —— 于是"录制时
+    看不到实时画面"成了新界面的独有现象，且**不报错**（`--preview` 是
+    `store_true`，不传就是没有窗口）。用户报"标定完实时画面没了"，根因就是这一行。
+    同时把起录方式改成"先出画面，按空格才开始倒计时"：程序刚起来时相机常常
+    还没出第一帧，倒计时一共才 3 秒，等于把准备时间从人手里抢走。
     """
     cmd = [sys.executable, str(ROOT / "apps" / "record_stereo.py"),
            "--left", str(left or "").strip() or "left",
            "--right", str(right or "").strip() or "right",
            "--duration", str(duration or "").strip() or "10",
-           "--out", str(out)]
+           "--out", str(out),
+           "--preview", "--wait-key", "space"]
     # 空白标签不传：`--label ""` 与不传是同一件事，传空串只会让命令行更长
     if str(label or "").strip():
         cmd += ["--label", str(label).strip()]
@@ -890,8 +898,9 @@ class StereoWindow(tk.Toplevel):
         # 这里不猜具体时间，但必须说清"录完在第 ④ 步能选到它" —— 上一版落进
         # `data/stereo_session`，不在扫描范围，用户录完在列表里找不到。
         self.status.set_status(
-            f"正在录制 {self.var_seconds.get() or '10'} 秒 → data/stereo/ 下的新会话目录"
-            f"（标签「{label or '空'}」）；录完在第 ④ 步「选择…」里就能选它", "info")
+            f"预览窗口已开：确认两路都有画面后按【空格】开始（再倒计时进行录制）；"
+            f"录 {self.var_seconds.get() or '10'} 秒 → data/stereo/ 下的新会话目录"
+            f"（标签「{label or '空'}」）", "info")
 
     def _pick_session(self) -> None:
         """打开会话选择器（按本窗模式三态过滤）。"""

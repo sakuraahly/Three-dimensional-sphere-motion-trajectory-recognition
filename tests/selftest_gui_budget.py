@@ -198,6 +198,17 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
               or _has_seq(v, ["--stereo-mode", "angled"])
               for v in branches.values()))
 
+    # ---- 录制：预览开关必须传下去（"标定完实时画面没了"的根因）----
+    #
+    # 老界面一直传 `--preview`，新界面重做后**从没传过** —— 而它是 store_true，
+    # 不传就是没有窗口，且一声不响。这类"界面上少一个参数"的缺陷截图看不出来，
+    # 只能靠比对命令行。
+    rec = record_args(out="data/stereo", duration="10")
+    check("录制必须带 --preview（否则录制时没有任何实时画面，且不报错）",
+          "--preview" in rec, " ".join(rec))
+    check("录制必须带「--wait-key space」：先出画面，按空格才进倒计时",
+          _has_seq(rec, ["--wait-key", "space"]), " ".join(rec))
+
     # ---- 半径锚点：勾选框 → 命令行，必须真的传下去 ----
     #
     # 这条判据存在的理由：本项目已经在"界面上有、命令行没收到"上栽过三次
