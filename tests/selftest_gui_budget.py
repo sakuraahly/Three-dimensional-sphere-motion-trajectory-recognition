@@ -523,6 +523,58 @@ def _mono_session_checks() -> list[tuple[str, bool]]:
     return out
 
 
+
+def _argv_single_source_checks() -> list[tuple[str, bool]]:
+    """argv 只能有一个产地（`apps/_actions.py`）—— 用 AST 扫，不看人。
+
+    判据故意是"**零字面量**"而不是"有没有调 `_actions`"：后者可以一边调
+    一边又内联一份（那正是从前那种漂移）。只要界面文件里再出现 ``"xxx.py"``，
+    就说明有人在手工拼命令行，紧接着就是"同一个动作两份参数清单"。
+
+    经典界面（``启动程序.py``）是**已知豁免**：它有 22 处内联，一次改完风险大。
+    但豁免是**棘轮**——只许减少、不许增加，否则它会悄悄长出新的内联 argv。
+    """
+    import ast
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parent.parent
+    legacy_budget = 22
+
+    def py_literals(path):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        return [n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value.endswith(".py")]
+
+    out: list[tuple[str, bool]] = []
+    print("\n----- argv 只有一个产地（apps/_actions.py）-----")
+    for f in sorted((root / "apps").glob("_gui_*.py")):
+        hits = py_literals(f)
+        ok = not hits
+        print(f"  [{'通过' if ok else '不达标'}] {f.name}: 脚本字面量 {len(hits)} 处"
+              + ("" if ok else f"（行 {hits[:6]}）"))
+        out.append((f"{f.name} 不许手写脚本路径", ok))
+
+    legacy = py_literals(root / "启动程序.py")
+    ok = len(legacy) <= legacy_budget
+    print(f"  [{'通过' if ok else '不达标'}] 经典界面内联数 {len(legacy)} ≤ {legacy_budget}"
+          "（棘轮：只许减）")
+    out.append(("经典界面内联 argv 只减不增", ok))
+
+    # 动作模块本身必须真的承载这些脚本（否则"零字面量"可以靠删功能达成）
+    acts = (root / "apps" / "_actions.py").read_text(encoding="utf-8")
+    need = ["record_stereo.py", "calibrate_stereo.py", "run_stereo_video.py",
+            "check_stereo_setup.py", "record_mono.py", "run_video.py",
+            "run_realtime.py", "view_3d.py", "cameras.py", "capture_board.py",
+            "check_dataset.py", "export_visualization.py", "data_manager.py",
+            "calibrate_mono.py", "calibrate_focal.py"]
+    missing = [n for n in need if n not in acts]
+    print(f"  [{'通过' if not missing else '不达标'}] 动作模块覆盖 {len(need) - len(missing)}/{len(need)} 个脚本"
+          + ("" if not missing else f"（缺 {missing}）"))
+    out.append(("_actions 覆盖全部界面动作", not missing))
+    return out
+
+
 def main() -> int:
     print("=" * 74)
     print("GUI 预算自测：分窗后的每一步都必须留在一屏之内")
@@ -531,6 +583,7 @@ def main() -> int:
     # 参数拼装判据先跑：它直接调纯函数、不需要 Tk，所以**没有显示器也要跑**。
     # 结构判据可以跳过，参数拼装不行 —— 跳过的那部分一律不算验证过。
     results: list[tuple[str, bool]] = _stereo_param_checks()
+    results += _argv_single_source_checks()
     results += _mono_session_checks()
     results += _mono_seed_checks()
 

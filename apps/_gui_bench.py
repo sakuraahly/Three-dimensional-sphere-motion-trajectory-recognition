@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import tkinter as tk
 from collections import namedtuple
 from pathlib import Path
@@ -39,7 +38,7 @@ from tkinter import ttk
 from apps._gui_stereo import SessionPicker, pick_seeds
 from apps._gui_widgets import BG, ScrollPage, StatusBar, Surface, fit_to_content
 from apps._collapsible import CollapsibleSection
-from apps._task_runner import ROOT
+from apps import _actions
 from apps._workbench import SessionSummary, scan_sessions, summarize_session
 from sphere_tracker.paths import stereo_roots
 
@@ -162,7 +161,7 @@ def offline_cmd(s: SessionSummary) -> list[str]:
     不传 ``--stereo-mode``：默认 auto 会读 session/标定，而 ``SessionSummary``
     把"未记录模式"折成了 parallel，照它传会把老会话按错的几何解算。
     """
-    cmd = [sys.executable, str(ROOT / "apps" / "run_stereo_video.py"), str(s.path)]
+    cmd = _actions.offline_stereo(s.path)
     seed = s.path / "derived" / "seeds.json"
     if s.has_seeds and seed.is_file():
         cmd += ["--method", "specular", "--seed-json", str(seed)]
@@ -404,8 +403,7 @@ class BenchWindow(tk.Toplevel):
         if s is None:
             return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "tools" / "check_dataset.py"),
-             str(s.path), "--strict"],
+            _actions.check_dataset(s.path),
             f"校验数据 {s.id}",
             on_done=self._on_done("校验", "这段会话通过了数据校验（--strict），可以进第 ③ 步",
                                   "数据校验没通过：看运行日志里它列的每一项问题"))
@@ -469,7 +467,7 @@ class BenchWindow(tk.Toplevel):
                                    "warn")
             return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
+            _actions.view_3d(src),
             f"3D 查看器 {s.id}")
         self.status.set_status(f"正在打开 3D 查看器：{s.id}", "info")
 
@@ -494,8 +492,7 @@ class BenchWindow(tk.Toplevel):
         if s is None:
             return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "export_visualization.py"),
-             str(s.path), "--plot"],
+            _actions.export_visualization(s.path),
             f"导出标准数据 {s.id}",
             on_done=self._on_done("导出", "导出完成：visualization.json / CSV / 示意图都写好了",
                                   "导出失败：看运行日志里它的报错"))

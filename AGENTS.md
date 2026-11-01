@@ -113,6 +113,13 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | **球检测器**（2） | `export_ball_dataset.py` `train_ball_detector.py` | 把"点选 + 跟踪"的结果自举成 YOLO 数据集（**按会话切分**，正/负样本都收），再微调 `yolo11n` 并用**圆心误差**（不是 mAP）验收；训完 `models/ball_yolo.pt` 会被 `YoloDetector` 自动优选 |
 | **界面走查**（1） | `gui_walkthrough.py` | 按真实用户流程走一遍新 GUI：逐步截图、量裁切、**每点一个按钮都留状态条前后对照 + 任务日志尾 + 退出码 + 产物是否出现**（截图只作证据、不作通过依据）；只走不需要硬件的路径，录制/标定/清理只检查不点击 |
 
+> **argv 只能有一个产地**：界面（`apps/_gui_*.py`）里**不许出现 `"xxx.py"` 字面量**，
+> 一律调 `apps/_actions.py`。理由不是整洁 —— 同一个动作在两套界面各拼一遍 argv，
+> 已经连着出过三次"界面说做了、命令行没收到"的静默缺陷（录制少了 `--preview`、
+> 球径按 mm 传给按米收的参数、「检查装置」一个参数都不传）。
+> 判据：`selftest_gui_budget` 用 AST 扫，出现即红；经典界面（`启动程序.py`）是
+> **棘轮式豁免**（只减不增）。
+
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。
 
@@ -120,7 +127,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：15 个可执行脚本 + 15 个私有模块
+### `apps/` 顶层：15 个可执行脚本 + 16 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -128,7 +135,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 | 标定与录制（5） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（15） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话**） |
+| 私有模块（15） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。

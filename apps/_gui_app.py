@@ -45,6 +45,7 @@ from apps._gui_widgets import (ACCENT, BG, FONT_FAMILY, INK, MUTED, OK, WARN,
                                ScrollPage, StatusBar, Surface, fit_to_content,
                                init_style)
 from apps._task_runner import ROOT, TaskRunner
+from apps import _actions
 
 __all__ = ["GuiPrefs", "AppState", "App", "HubWindow", "run"]
 
@@ -607,8 +608,7 @@ class HubWindow(tk.Toplevel):
         ``identify`` 是交互式的，会自己开 cv2 窗口让人逐个确认。
         """
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
-             "identify"],
+            _actions.cameras(),
             "相机设备管理")
         # 文案必须提"要等多久"：`identify` 逐台开相机，`PREVIEW_FIRST_FRAME_S=30`
         # 是**实测**值（慢相机 ~24 秒才给首帧，调小会让它在界面上彻底消失）。
@@ -628,7 +628,7 @@ class HubWindow(tk.Toplevel):
         # 只说"看哪里"，**不去读任务对象**：状态条是给用户看的，
         # 不该因为拿不到 `task.log_path` 就整条不写。
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "data_manager.py")],
+            _actions.data_manager(),
             "数据管理")
         self.status.set_status(
             "已启动数据管理（它是独立窗口，首次启动要几秒）。"
@@ -646,7 +646,7 @@ class HubWindow(tk.Toplevel):
                 "它会写出 visualization.json，然后这里就能打开", "warn")
             return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
+            _actions.view_3d(src),
             "3D 查看器")
         # 会话名，不是 `src.parent.name` —— 离线结果在 `<会话>/derived/` 里，
         # `parent.name` 永远是 derived（与双目窗同一处口径，见 `session_name_of`）。
@@ -664,7 +664,7 @@ class HubWindow(tk.Toplevel):
             "补齐之前可以用它做完整流程。它会在分窗完成后删除。",
             parent=self)
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "启动程序.py"), "--legacy"],
+            _actions.legacy_gui(),
             "经典界面")
 
     # ---------- 刷新就绪度 ----------

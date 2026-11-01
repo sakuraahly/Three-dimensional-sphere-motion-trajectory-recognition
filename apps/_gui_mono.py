@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import queue
-import sys
 import threading
 import time
 import tkinter as tk
@@ -38,14 +37,17 @@ from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
                                  MonoSession, create_mono_session,
                                  delete_mono_session, find_clip,
                                  scan_mono_sessions, sync_from_take)
-from apps._task_runner import ROOT, Task
+from apps._task_runner import ROOT
+from apps import _actions
+from apps._actions import CALIBRATE_MONO as MONO_CALIB_APP
+from apps._task_runner import Task
 from sphere_tracker.plugins import names as plugin_names      # noqa: E402
 
 __all__ = ["MonoWindow", "MonoSessionPicker"]
 
-MONO_CALIB_APP = ROOT / "apps" / "calibrate_mono.py"
+
 MONO_CALIB_JSON = ROOT / "config" / "mono_calibration.json"
-FOCAL_ESTIMATOR = ROOT / "apps" / "tools" / "calibrate_focal.py"
+
 CALIB_FRAME_DIR = ROOT / "outputs" / "mono_calib_frames"
 
 # 误差预算的假设（写在界面上，不许藏起来）
@@ -906,10 +908,7 @@ class MonoWindow(tk.Toplevel):
                 f"建不了会话目录（{self._short(self._session_root)}）：{exc}", "warn")
             return
         out = sess_dir / "clip.mkv"
-        cmd = [sys.executable, str(ROOT / "apps" / "record_mono.py"),
-               "--camera", self._camera_arg(cam_label) or "0",
-               "--duration", secs,
-               "--out", str(out)]
+        cmd = _actions.record_mono(self._camera_arg(cam_label) or "0", secs, out)
         self._start(cmd, f"单目录制 {secs}s",
                     on_done=lambda task: self._on_recorded(sess_dir, task))
         self._select_session(sess_dir)
@@ -1181,7 +1180,7 @@ class MonoWindow(tk.Toplevel):
                 "它会把 derived/visualization.json 写出来", "warn")
             return
         self._start(
-            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(vis)],
+            _actions.view_3d(vis),
             f"3D 查看：{self._session.id if self._session is not None else vis.parent.name}")
         self.status.set_status(
             f"已打开 3D 查看器：{self._short(vis)}（单目深度由球径先验得到，"
@@ -1236,8 +1235,7 @@ class MonoWindow(tk.Toplevel):
         才给第一帧，不说这句用户会以为卡死、把窗口关掉。
         """
         self._start(
-            [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
-             "identify"], "相机设备管理")
+            _actions.cameras(), "相机设备管理")
         self.status.set_status(
             "已打开相机设备管理：每台最多等 30 秒（慢相机实测 ~24 秒），"
             "日志里会逐台报进度，别关窗口。只想绑左右可直接用 pin"
@@ -1552,13 +1550,13 @@ class MonoWindow(tk.Toplevel):
 
     def _start_capture(self) -> None:
         CALIB_FRAME_DIR.mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, str(ROOT / "apps" / "tools" / "capture_board.py"),
-               "--out", str(CALIB_FRAME_DIR),
-               "--cols", self.var_cols.get().strip() or "8",
-               "--rows", self.var_rows.get().strip() or "5",
-               "--square", self.var_square.get().strip() or "25",
-               "--target", self.var_target.get().strip() or "15",
-               "--auto"] + self._common_camera_args()
+        cmd = _actions.capture_board(
+            out=CALIB_FRAME_DIR,
+            cols=self.var_cols.get().strip() or "8",
+            rows=self.var_rows.get().strip() or "5",
+            square=self.var_square.get().strip() or "25",
+            target=self.var_target.get().strip() or "15",
+            extra=self._common_camera_args())
         self._start(cmd, "拍单目标定图")
         self.status.set_status(
             f"已开始拍图：板在每个姿态停稳约 1 秒就会自动存；"
@@ -1568,14 +1566,14 @@ class MonoWindow(tk.Toplevel):
     def _start_calibrate(self) -> None:
         if not MONO_CALIB_APP.exists():
             self.status.set_status(
-                "标定入口还没落地：现在可以用「替代：单点焦距估计」，"
+                "标定脚本还没落地：现在可以用「替代：单点焦距估计」，"
                 "但它假设主点在画面中心、不产生畸变系数，球径误差会并入 fx", "warn")
             return
-        cmd = [sys.executable, str(MONO_CALIB_APP),
-               "--dir", str(CALIB_FRAME_DIR),
-               "--cols", self.var_cols.get().strip() or "8",
-               "--rows", self.var_rows.get().strip() or "5",
-               "--square", self.var_square.get().strip() or "25"]
+        cmd = _actions.calibrate_mono(
+            frames_dir=CALIB_FRAME_DIR,
+            cols=self.var_cols.get().strip() or "8",
+            rows=self.var_rows.get().strip() or "5",
+            square=self.var_square.get().strip() or "25")
         self._start(cmd, "单目内参标定", on_done=self._on_calibrated)
         self.status.set_status("正在标定内参…", "info")
 
@@ -1606,9 +1604,8 @@ class MonoWindow(tk.Toplevel):
         直接错一个比例（换球后 30 / 21.6 = 1.39 倍）—— 那不是误差项叠加，
         是拿错了输入。
         """
-        cmd = ([sys.executable, str(FOCAL_ESTIMATOR),
-                "--ball-diameter", self._diameter_arg()]
-               + self._common_camera_args())
+        cmd = _actions.calibrate_focal(diameter_m=self._diameter_arg(),
+                                       extra=self._common_camera_args())
         self._start(cmd, "单点焦距估计")
         note = diameter_problem(self.var_diameter.get())
         self.status.set_status(
@@ -1674,11 +1671,10 @@ class MonoWindow(tk.Toplevel):
         return "color" if name == SMART else name
 
     def _start_realtime(self) -> None:
-        cmd = [sys.executable, str(ROOT / "apps" / "run_realtime.py"),
-               "--ball-diameter", self._diameter_arg(),
-               # 检测器必须显式传：界面选了却不传，等于"显示 hough、实际跑 color"，
-               # 与"显示 21.6 却传 40"是同一类静默失效。
-               "--method", self._method_arg()]
+        # 检测器必须显式传：界面选了却不传，等于"显示 hough、实际跑 color"，
+        # 与"显示 21.6 却传 40"是同一类静默失效。
+        cmd = _actions.run_realtime(diameter_m=self._diameter_arg(),
+                                    method=self._method_arg())
         cmd += self._common_camera_args()
         fx, fx_note = self._focal_arg()
         if fx is not None:
@@ -1723,12 +1719,10 @@ class MonoWindow(tk.Toplevel):
         fx, fx_note = self._focal_arg()
         if clip is not None:
             derived = clip.parent / "derived"
-            cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), str(clip),
-                   "--ball-diameter", self._diameter_arg(),
-                   "--method", method,
-                   "--out", str(derived / "annotated.mp4"),
-                   "--csv", str(derived / "traj.csv"),
-                   "--vis-json", str(derived / "visualization.json")]
+            cmd = _actions.run_video(
+                clip, diameter_m=self._diameter_arg(), method=method,
+                out=derived / "annotated.mp4", csv=derived / "traj.csv",
+                vis_json=derived / "visualization.json")
             if seed_value:
                 cmd += ["--seed", seed_value]
             if fx is not None:
@@ -1760,9 +1754,8 @@ class MonoWindow(tk.Toplevel):
         if not path:
             self.status.set_status("没有选视频，已取消", "info")
             return
-        cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"), path,
-               "--ball-diameter", self._diameter_arg(),
-               "--method", method]
+        cmd = _actions.run_video(path, diameter_m=self._diameter_arg(),
+                                 method=method)
         if fx is not None:
             cmd += ["--focal", str(fx)]
         # 不在会话里的文件也给 --vis-json，落在它旁边（用户明确选了文件，

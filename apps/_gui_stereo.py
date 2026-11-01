@@ -26,7 +26,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -34,14 +33,18 @@ from tkinter import ttk
 from apps._gui_widgets import (BG, INK, MUTED, WARN, ScrollPage, StatusBar,
                                Surface, fit_to_content)
 from apps._collapsible import CollapsibleSection
-from apps._task_runner import ROOT
+# argv 的唯一产地在 `_actions`（见该模块 docstring）：这里只 import 名字，
+# 不再自己拼命令行 —— 否则同一个动作会有两份参数清单，已经因此出过三次缺陷。
+from apps._actions import (CHAIN_ROOT, board_args, calibrate_args,
+                           chain_dirs, check_setup_args, offline_args,
+                           record_args)
+from apps import _actions
 from sphere_tracker.paths import STEREO_ROOT, stereo_roots
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
            "record_out_dir", "check_setup_args", "session_name_of"]
 
-CHAIN_ROOT = ROOT / "outputs" / "chain_frames"
 
 #: 两条方法在界面上的说法。键与 `calibrate_stereo.py --method` 一致。
 METHODS = {
@@ -68,164 +71,14 @@ METHODS = {
 # 7 节判据守着，新窗口却是空的 —— 这才是必须补的缺口。
 # 抽出来的函数不碰 Tk、不读控件，判据才能直接调它；**行为与抽之前逐字等价**，
 # 抽的时候没有顺手"修正"任何默认值。
-BOARD_DEFAULTS = {"cols": "8", "rows": "5", "square": "25", "target": "40"}
-_BOARD_FLAGS = (("cols", "--cols"), ("rows", "--rows"),
-                ("square", "--square"), ("target", "--target"))
 
 
-def board_args(board: dict | None) -> list[str]:
-    """棋盘参数四项（内角点列/行、方格边长、目标对数）。
-
-    留空 = 用脚本自己的默认档（8×5 / 25mm / 40 对），**不是**非法输入：
-    这几个框在界面上本来就带着默认值，用户清空只是"这一次用默认"。
-    真正的坑在另一头 —— "留空也传一个空串"：`--cols ""` 会在标定程序里
-    被 `int()` 直接咬死，而报错的地方离用户的操作十万八千里。
-    """
-    out: list[str] = []
-    for key, flag in _BOARD_FLAGS:
-        raw = str((board or {}).get(key) or "").strip()
-        out += [flag, raw or BOARD_DEFAULTS[key]]
-    return out
 
 
-def chain_dirs(root: Path | None = None) -> dict[str, Path]:
-    """链式标定的四个目录（左右各一组 + 参考段的双路同拍图）。"""
-    base = root if root is not None else CHAIN_ROOT
-    return {"left": base / "left", "right": base / "right",
-            "ref_left": base / "ref_left", "ref_right": base / "ref_right"}
 
 
-def calibrate_args(method: str, board: dict | None = None,
-                   left: str = "left", right: str = "right",
-                   mode: str = "parallel", *,
-                   stationary: str = "", sharpness: str = "",
-                   relaxed: bool = False, backend: str = "",
-                   dirs: dict | None = None) -> list[str]:
-    """双目标定的完整 argv。
-
-    三条分支的差别**只在参数**，不在文案：
-
-    - ``chain``：``--method chain --same-board --left-dir/--right-dir``；
-      参考段真有图时才加 ``--pair-frame``（指向不存在的目录等于给后端一个
-      必然失败的证据，不如不提）。
-    - ``joint_skip_fov``：仍是共同求解，但**模式写死 angled** —— 按重叠视场
-      裁剪正是大角度装置要跳过的那一步。
-    - ``joint``：带**本窗口**的模式（平行窗 parallel / 大角度窗 angled）。
-
-    ``--skip-fov`` 不属于这里任何一条：它只属于旧界面那个"90° 装置"专用入口。
-    新窗口的等效做法是选 `joint_skip_fov`（它走 ``--stereo-mode angled``，
-    后端据此不再做 FOV 对齐），把这个 flag 混进普通 joint 会同时改变裁剪与
-    内参口径，属于静默改行为。
-
-    ``backend`` 只在调用方给出**具体**后端（dshow/msmf）时才下传：
-    ``auto`` 是脚本自己的默认值，替用户写死一遍等于把"没选"伪装成"选了"。
-    **两台相机共用这一个参数** —— 出现两次意味着有人给左右各拼了一份，
-    那会拼出"左 dshow / 右 msmf"这种直接把一路弄挂的组合。
-    """
-    cmd = [sys.executable, str(ROOT / "apps" / "calibrate_stereo.py")]
-    if method == "chain":
-        d = dirs if dirs is not None else chain_dirs()
-        cmd += ["--method", "chain", "--same-board",
-                "--left-dir", str(d["left"]),
-                "--right-dir", str(d["right"])] + board_args(board)
-        # 参考段的双路同拍图作为"同一块板"的证据
-        if Path(d["ref_left"]).exists():
-            cmd += ["--pair-frame", str(d["ref_left"]), "--pair-camera", "left"]
-    else:
-        cmd += ["--method", "joint"] + board_args(board)
-        if method == "joint_skip_fov":
-            cmd += ["--stereo-mode", "angled"]
-        else:
-            cmd += ["--stereo-mode", mode]
-        cmd += ["--left", str(left or "").strip() or "left",
-                "--right", str(right or "").strip() or "right"]
-    # 高级项：只有用户真的填了才下传（空 = 让后端用自己的默认值）
-    if str(stationary or "").strip():
-        cmd += ["--stationary-px", str(stationary).strip()]
-    if str(sharpness or "").strip():
-        cmd += ["--min-sharpness", str(sharpness).strip()]
-    if relaxed:
-        cmd += ["--relaxed"]
-    if str(backend or "").strip() and str(backend).strip() != "auto":
-        cmd += ["--backend", str(backend).strip()]
-
-    # `--min-pairs` **必须传**，否则"试标定档"必然失败（2026-10-29 查出的功能缺口）。
-    #
-    # 链条：`calibrate_stereo` 的 `--min-pairs` 默认 20；而收图一旦达到
-    # 「目标对数」就停（`calib/capture.py:274` `full = count >= cfg.target_pairs`）。
-    # 于是把目标改成 8 的人会看到：收 8 对 → 停 → 8 < 20 → `:278 enough` 判假
-    # → 标定失败。他只想快速验证通路，却被判"对数不足"。
-    #
-    # 旧界面把这个值放在「高级」里可填；新窗口没有这个框，所以在这里兜住：
-    # 取 `min(20, target)` —— target ≥ 20 时与脚本默认**完全一致**（不改变语义），
-    # 只有试标定档才下调到 target 本身（够 target 就能过）。
-    _target = str((board or {}).get("target") or "").strip() or BOARD_DEFAULTS["target"]
-    try:
-        _pairs = int(_target)
-    except ValueError:
-        _pairs = 0
-    if _pairs > 0:
-        cmd += ["--min-pairs", str(min(20, _pairs))]
-    return cmd
 
 
-def offline_args(session: str, mode: str, *, anchor: bool = False) -> list[str]:
-    """离线重建（`run_stereo_video.py`）的 argv。
-
-    抽成纯函数是为了**能被判据抓到**：界面上的勾选框到命令行之间断链，
-    在本项目已经发生过不止一次（"检查装置"没传参、球径按 mm 传给了按米收的参数）。
-    有了它，`selftest_gui_budget` 可以直接断言"勾了就必须出现 --anchor-gate on"，
-    而不是靠人去点一遍。
-
-    ``--stereo-mode`` **只出现一次**：这个窗口存在的意义就是"按本窗口的装置解算"，
-    重复传会让 argparse 取最后一个，读起来却像有两处来源。
-    """
-    cmd = [sys.executable, str(ROOT / "apps" / "run_stereo_video.py"),
-           session, "--stereo-mode", mode]
-    if anchor:
-        cmd += ["--anchor-gate", "on"]
-    return cmd
-
-
-def record_args(*, left: str = "left", right: str = "right", duration: str = "10",
-                out: str, mode: str | None = None,
-                label: str = "") -> list[str]:
-    """双目录制的 argv。
-
-    **故意不传 ``--stereo-mode``**（B-107 的教训）：录制要按标定走 ``auto``，
-    模式由 `stereo.record_plan.plan_record` 从标定里读。传平行/大角度都可能
-    与当前标定不符 —— 后果是相机先白开、会话目录先建好，然后在检查里才报
-    "模式冲突"，白等一轮；传 ``auto`` 又只是把脚本默认值写死一遍。
-    所以 ``mode`` 只在调用方给出**非 auto** 的显式值时才下传，其余一律不提。
-
-    ``--label`` 是**界面上的「标签」框**的唯一去处（2026-10-31 修）：
-    它写进 ``session.json`` 的 ``label`` 字段，会话列表「标签」列读的就是它。
-    上一版只拿标签去拼目录名（还拼错了根），于是录出来的每一段在列表里
-    都显示"（无标签）"—— 用户分不清哪个是哪次实验。
-
-    分辨率/帧率/后端也**不传**：录制程序会按标定校验尺寸（`validate_capture_size`），
-    界面再写一份数字只会多一处漂移。要改这些，先给它们加控件 —— 那时再把
-    对应的关键字参数接上。
-
-    ``--preview --wait-key space`` 是**必传**的（2026-11-01 修）：
-    老界面一直传 ``--preview``，而新界面从重做那天起就没传过 —— 于是"录制时
-    看不到实时画面"成了新界面的独有现象，且**不报错**（`--preview` 是
-    `store_true`，不传就是没有窗口）。用户报"标定完实时画面没了"，根因就是这一行。
-    同时把起录方式改成"先出画面，按空格才开始倒计时"：程序刚起来时相机常常
-    还没出第一帧，倒计时一共才 3 秒，等于把准备时间从人手里抢走。
-    """
-    cmd = [sys.executable, str(ROOT / "apps" / "record_stereo.py"),
-           "--left", str(left or "").strip() or "left",
-           "--right", str(right or "").strip() or "right",
-           "--duration", str(duration or "").strip() or "10",
-           "--out", str(out),
-           "--preview", "--wait-key", "space"]
-    # 空白标签不传：`--label ""` 与不传是同一件事，传空串只会让命令行更长
-    if str(label or "").strip():
-        cmd += ["--label", str(label).strip()]
-    if mode and str(mode).strip() and str(mode).strip() != "auto":
-        cmd += ["--stereo-mode", str(mode).strip()]
-    return cmd
 
 
 def record_out_dir(root: Path | None = None) -> Path:
@@ -262,30 +115,6 @@ def session_name_of(visualization: Path | str) -> str:
     return p.parent.name if p.name == "derived" else p.name
 
 
-def check_setup_args(*, left: str = "left", right: str = "right",
-                     board: dict | None = None) -> list[str]:
-    """「检查装置」的 argv（2026-10-31 修，缺陷 #4）。
-
-    为什么必须带参数：``check_stereo_setup.py`` 的两路画面来自
-    ``apps._common.add_stereo_source_args``，**不传 ``--left/--right`` 就等于
-    让它自己去猜**；它的 docstring 第一行给的就是 ``--left 0 --right 2`` 这种
-    显式用法。上一版一个参数都没传，检查程序只能按 ``auto`` 自己挑相机 ——
-    与第 ② 步标定用的两台不是同一对时，用户会按一个**别的装置**的结论去调
-    相机，而且界面还不回写结果（状态条永远停在"正在检查装置…"）。
-
-    相机取值可以是角色名（``left``/``right``，查 ``config/cameras.json``）
-    或索引，与 ``calibrate_stereo`` 同一套解析 —— 界面里那两个框就原样下传。
-    """
-    cmd = [sys.executable, str(ROOT / "apps" / "tools" / "check_stereo_setup.py"),
-           "--left", str(left or "").strip() or "left",
-           "--right", str(right or "").strip() or "right"]
-    b = board or {}
-    # 棋盘参数只下传用户真填了的：留空 = 脚本默认 8×5 / 25mm（同 `board_args` 的口径）
-    for key, flag in (("cols", "--cols"), ("rows", "--rows"), ("square", "--square")):
-        raw = str(b.get(key) or "").strip()
-        if raw:
-            cmd += [flag, raw]
-    return cmd
 
 
 # --------------------------------------------------------------------------- #
@@ -795,9 +624,7 @@ class StereoWindow(tk.Toplevel):
     # ------------------------------------------------------------------ #
     def _open_cameras(self) -> None:
         """打开相机设备管理（复用 apps/tools/cameras.py，不新写第二个界面）。"""
-        self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "tools" / "cameras.py"),
-             "identify"], "相机设备管理")
+        self.app.tasks.start(_actions.cameras(), "相机设备管理")
         self.status.set_status(
             "已打开相机设备管理：每台最多等 30 秒（慢相机实测 ~24 秒），"
             "日志里会逐台报进度，别关窗口。只想绑左右可直接用 pin（不开相机，秒级）",
@@ -960,8 +787,8 @@ class StereoWindow(tk.Toplevel):
                         if (cand / rel).is_file()), None)
             if src is None:
                 self.status.set_status(
-                    f"这个会话还没有 visualization.json：先在上面的"
-                    f"「跑离线三维」跑一次，再来查看", "warn")
+                    "这个会话还没有 visualization.json：先在上面的"
+                    "「跑离线三维」跑一次，再来查看", "warn")
                 return
         else:
             src = self.app.recent_visualization()
@@ -970,7 +797,7 @@ class StereoWindow(tk.Toplevel):
                     "先选一个会话并跑一次「跑离线三维」，才有三维结果可看", "warn")
                 return
         self.app.tasks.start(
-            [sys.executable, str(ROOT / "apps" / "view_3d.py"), str(src)],
+            _actions.view_3d(src),
             "3D 查看器")
         # 说**会话名**而不是 `src.parent.name`（那永远是 derived）
         self.status.set_status(
