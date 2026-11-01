@@ -169,6 +169,24 @@ def calibrate_args(method: str, board: dict | None = None,
     return cmd
 
 
+def offline_args(session: str, mode: str, *, anchor: bool = False) -> list[str]:
+    """离线重建（`run_stereo_video.py`）的 argv。
+
+    抽成纯函数是为了**能被判据抓到**：界面上的勾选框到命令行之间断链，
+    在本项目已经发生过不止一次（"检查装置"没传参、球径按 mm 传给了按米收的参数）。
+    有了它，`selftest_gui_budget` 可以直接断言"勾了就必须出现 --anchor-gate on"，
+    而不是靠人去点一遍。
+
+    ``--stereo-mode`` **只出现一次**：这个窗口存在的意义就是"按本窗口的装置解算"，
+    重复传会让 argparse 取最后一个，读起来却像有两处来源。
+    """
+    cmd = [sys.executable, str(ROOT / "apps" / "run_stereo_video.py"),
+           session, "--stereo-mode", mode]
+    if anchor:
+        cmd += ["--anchor-gate", "on"]
+    return cmd
+
+
 def record_args(*, left: str = "left", right: str = "right", duration: str = "10",
                 out: str, mode: str | None = None,
                 label: str = "") -> list[str]:
@@ -507,6 +525,10 @@ class StereoWindow(tk.Toplevel):
         self.var_left = tk.StringVar(value="left")
         self.var_right = tk.StringVar(value="right")
         self.var_session = tk.StringVar(value="")
+        # 可信半径锚点（默认关）：用一次「点选球心」的左右两点定出"两路半径该差多少"，
+        # 据此拒掉半径离谱的假配对。开关放在这里而不是"永远开"：它要求会话里
+        # **有人点过**球心，没点过就开只会得到一条报错；默认关才符合"点了才有"。
+        self.var_anchor = tk.BooleanVar(value=False)
         self.var_label = tk.StringVar(value="")
         self.var_seconds = tk.StringVar(value="10")
 
@@ -663,18 +685,25 @@ class StereoWindow(tk.Toplevel):
     def _build_step4(self, parent) -> None:
         box = self.surface.card(
             parent, "④ 分析（对一段已录好的会话跑三维）",
-            "这里跑的是离线重建：读会话里的两路视频，按标定解出三维轨迹。"
-            "会话自己记录了它是哪种装置；本窗口会强制按 "
-            + ("平行" if self.mode == "parallel" else "大角度") +
-            " 解算 —— 这正是这个窗口存在的意义。")
+            "离线重建：读会话的两路视频，按标定解出三维轨迹。本窗口强制按 "
+            + ("平行" if self.mode == "parallel" else "大角度") + " 解算。")
         line = ttk.Frame(box)
         line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                   sticky="w", pady=(4, 0))
         ttk.Label(line, text="会话目录").pack(side="left")
-        ttk.Entry(line, textvariable=self.var_session, width=46).pack(
+        # 输入框宽度 46 → 38：给同一行的锚点勾选框腾地方（不新增行，见下）。
+        ttk.Entry(line, textvariable=self.var_session, width=38).pack(
             side="left", padx=(8, 8))
         ttk.Button(line, text="选择…", command=self._pick_session).pack(
             side="left")
+        # 半径锚点开关（默认关）：勾了才传 --anchor-gate on。
+        #
+        # 为什么跟会话输入框**同一行**：本窗口高度按"一屏看全"定，单起一行实测会把
+        # 「大角度」顶出 5 px（内容 874 > 窗口 869）；再加一行说明则是 53 px。
+        # 宁可把输入框收窄，也不裁按钮、不动控件预算。
+        ttk.Checkbutton(
+            line, text="半径锚点（先「点选球心」左右各一次）",
+            variable=self.var_anchor).pack(side="left", padx=(10, 0))
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "跑离线三维", self._start_offline)
         self.surface.secondary(actions, "点选球心", self._start_seed)
@@ -883,11 +912,15 @@ class StereoWindow(tk.Toplevel):
         if not session:
             self.status.set_status("先选一个会话（点「选择…」）", "warn")
             return
-        cmd = [sys.executable, str(ROOT / "apps" / "run_stereo_video.py"),
-               session, "--stereo-mode", self.mode]
+        cmd = offline_args(session, self.mode, anchor=self.var_anchor.get())
+        if self.var_anchor.get():
+            self.status.set_status(
+                f"正在按 {self.mode} 解算 {Path(session).name}"
+                "（半径锚点门已开：先读会话里的点选中心）…", "info")
+        else:
+            self.status.set_status(f"正在按 {self.mode} 解算 {Path(session).name}…",
+                                   "info")
         self.app.tasks.start(cmd, "离线三维重建")
-        self.status.set_status(f"正在按 {self.mode} 解算 {Path(session).name}…",
-                               "info")
 
     def _start_seed(self) -> None:
         session = self.var_session.get().strip()

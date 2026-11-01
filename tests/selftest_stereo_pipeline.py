@@ -46,7 +46,8 @@ from stereo import (
     timestamp_offset,
 )
 from stereo.fov_align import FovAlignment, estimate_fov_alignment
-from stereo.triangulate import epipolar_gate_px
+from stereo.triangulate import (anchor_accepts, anchor_problem,
+                                build_radius_anchor, epipolar_gate_px)
 from stereo.visualization import (
     build_trajectory_payload, export_session_visualization, load_seeds, write_seeds,
 )
@@ -838,6 +839,78 @@ def test_pipeline_blocks() -> bool:
     return ok
 
 
+def test_radius_anchor() -> bool:
+    """人工锚点：一次左右点选 → 期望半径比 → 用它拒掉假目标。
+
+    必须证明两件事，缺一不算：
+      ① **数学对**（Z、两路各自的期望半径、比值 = f_L/f_R）；
+      ② **这道门真的改变了配对结果** —— 所以故意让"错的那个候选"极线偏差更小：
+         不开门它会被选中，开门它被拒。只断言"过滤掉了一个坏候选"是不够的，
+         因为那可能只是一次本来就不会发生的选择。
+    """
+    print("----- 人工锚点（左右半径比）-----")
+    size = (1920, 1080)
+    # 两路焦距差 40%：镜面球那种"左右一样粗"的假设不成立的极端情形。
+    K1 = _K(1000.0, 1000.0, 960.0, 540.0)
+    K2 = _K(1400.0, 1400.0, 960.0, 540.0)
+    D1, D2 = np.zeros(5), np.zeros(5)
+    R = np.eye(3)
+    T = np.array([[-0.1], [0.0], [0.0]], np.float64)
+    R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+        K1, D1, K2, D2, size, R, T, flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.0)
+    rig = StereoRig(K1=K1, D1=D1, K2=K2, D2=D2, R=R, T=T, image_size=size,
+                    R1=R1, R2=R2, P1=P1, P2=P2, Q=Q)
+
+    # 真值：球在 Z=1.0 m、直径 40 mm。T=(-0.1,0,0) 的约定下，右光心在 x 的**负**方向
+    # （OpenCV：T 是"左→右"的平移），所以右图横坐标 = 960 − f2·0.1/1.0 = 820。
+    # 这个符号写反会让三角化给出 Z=−1（我第一版就写反了，测试当场抓住）。
+    dia = 0.04
+    anchor = build_radius_anchor(rig, (960.0, 540.0), (820.0, 540.0), dia)
+    r_l_expect, r_r_expect = 1000.0 * dia / 2.0, 1400.0 * dia / 2.0   # 20 / 28 px
+
+    # 候选：对的（半径 28、y 偏 2px）与错的（半径 40、y 恰好对上）。
+    det_l = Detection(x=960.0, y=540.0, radius=r_l_expect)
+    good = Detection(x=820.0, y=543.0, radius=r_r_expect)
+    bad = Detection(x=820.0, y=540.0, radius=r_r_expect * 1.6)
+
+    cfg_off = MatchConfig(max_epipolar_px=4.0)
+    cfg_on = MatchConfig(max_epipolar_px=4.0,
+                         radius_ratio_expected=anchor.radius_ratio,
+                         radius_ratio_band=anchor.band)
+    pick_off, _ = match_epipolar(rig, det_l, [good, bad], cfg_off)
+    pick_on, _ = match_epipolar(rig, det_l, [good, bad], cfg_on)
+
+    ok_pair = anchor_accepts(anchor, r_l_expect, r_r_expect)[0]
+    bad_pair = anchor_accepts(anchor, r_l_expect, r_r_expect * 1.6)[0]
+    no_r = anchor_accepts(anchor, r_l_expect, 0.0)[0]
+    # 锚点自身的几何判据：y 差超限必须给理由（用 dataclasses.replace 造一个坏锚点）
+    import dataclasses
+    bad_anchor = dataclasses.replace(anchor, dy_px=5.0)
+    bad_why = anchor_problem(bad_anchor)
+
+    checks = [
+        (f"锚点三角化 Z={anchor.z_m:.4f} m（真值 1.0）", abs(anchor.z_m - 1.0) < 1e-6),
+        (f"左右期望半径 {anchor.r_left_px:.2f} / {anchor.r_right_px:.2f} px"
+         f"（真值 {r_l_expect:.0f} / {r_r_expect:.0f}）",
+         abs(anchor.r_left_px - r_l_expect) < 0.05
+         and abs(anchor.r_right_px - r_r_expect) < 0.05),
+        (f"期望比值 {anchor.radius_ratio:.3f} = f_L/f_R（不是 1）",
+         abs(anchor.radius_ratio - 1000.0 / 1400.0) < 1e-6),
+        ("不开门：被『半径离谱但极线更准』的候选骗走（这就是要修的那个错）",
+         pick_off is bad),
+        ("开门：选中半径比正确的那个", pick_on is good),
+        ("半径比符合 → 接受；离谱 → 拒绝；缺半径 → 拒绝（不静默放行）",
+         ok_pair and not bad_pair and not no_r),
+        ("锚点自身 y 差超限 → 给得出原因（不是只返回 False）",
+         bool(bad_why) and "y 差" in str(bad_why)),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     print("=" * 62)
     print("双目链路自测（合成真值）")
@@ -858,7 +931,9 @@ def main() -> int:
     print()
     g = test_pipeline_blocks()
     print()
-    allok = a and b and c and d and e and f and p3 and g
+    h = test_radius_anchor()
+    print()
+    allok = a and b and c and d and e and f and p3 and g and h
     print("判定结果：" + ("全部通过" if allok else "有不达标项"))
     return 0 if allok else 1
 

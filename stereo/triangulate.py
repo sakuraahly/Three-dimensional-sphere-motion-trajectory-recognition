@@ -57,6 +57,20 @@ EPI_GATE_K = 4.0          # 门限 = k × 标定自报极线 RMS
 EPI_GATE_MIN_PX = 1.0     # 下限
 EPI_GATE_MAX_PX = 6.0     # 上限
 
+# 人工锚点：默认容差与"锚点自身可信吗"的判据。
+#
+# 0.25 的来源不是拍脑袋：镜面球的半径本身量不准（`B-130`：整圈只有 25%~35%
+# 有梯度），实测同一颗球在**同一帧**里两次估计的半径相对偏差就在 10% 量级；
+# 再给运动模糊/曝光留一点余量，25% 是"能拒掉两倍大的假目标、又不误杀真球"的档。
+# 调窄到 0.1 会把真对应点也拒掉（左右框半径实测差 40%，锚点只能把**期望比值**
+# 定准，定不准每一帧的半径抖动），调宽到 0.5 就等于没门。
+RADIUS_ANCHOR_BAND = 0.25
+# 锚点自身的几何判据：人工点的是**真对应点**，它的校正后 y 差就是"这套标定在
+# 这一点上到底准不准"的直接测量。超过 GEOM_SUSPECT_PX 说明连人眼确认过的对应点
+# 都对不上，那时再用它的比值当门限只会把后面每一帧都带偏 —— 必须拒绝，不是警告。
+ANCHOR_MAX_DY_PX = GEOM_SUSPECT_PX
+
+
 
 def epipolar_gate_px(quality: dict | None, k: float = EPI_GATE_K,
                      fallback: float = 2.5) -> float:
@@ -95,6 +109,14 @@ class MatchConfig:
     max_disparity_px: float = 600.0
     require_radius_ratio: bool = False  # 是否要求左右半径接近（同型号相机才合理）
     radius_ratio_tol: float = 0.35
+    # 人工锚点给的「左右半径比期望值」（见 `RadiusAnchor`）。0 = 不做这道门。
+    #
+    # 为什么它和上一行不是同一件事，不能合并：
+    # `require_radius_ratio` 假设两路半径**接近**（比值 ≈1），只对同型号同焦距成立；
+    # 镜面球实测左右差 40%（两台相机焦距不同），照它做会把**真对应点也拒掉**。
+    # 锚点先把"该差多少"量出来（`f_L/f_R`），门就变成"按各自的期望比"，与距离无关。
+    radius_ratio_expected: float = 0.0
+    radius_ratio_band: float = RADIUS_ANCHOR_BAND
     # 视差符号。0 = 不检查（按 |视差| 判范围，两边都接受）；
     # 一般不用手填 —— StereoReconstructor 会用 rig.disparity_sign() 自动定，
     # 见下面 match_epipolar 的说明。
@@ -182,6 +204,15 @@ def match_epipolar(
         if cfg.require_radius_ratio and det_left.radius > 0 and cand.radius > 0:
             ratio = abs(cand.radius - det_left.radius) / det_left.radius
             if ratio > cfg.radius_ratio_tol:
+                continue
+        if cfg.radius_ratio_expected > 0 and det_left.radius > 0 and cand.radius > 0:
+            # 人工锚点给的是"两路该差多少"（f_L/f_R），不是"应该一样粗"。
+            # 镜面球左右实测差 40%，用上面那种"比值≈1"的判法会把真对应点也拒掉
+            # —— 那正是 `require_radius_ratio` 一直默认关着的原因。这里比的是
+            # **相对期望值的偏差**，与球的距离无关（详见 :class:`RadiusAnchor`）。
+            ratio = det_left.radius / cand.radius
+            exp = cfg.radius_ratio_expected
+            if abs(ratio - exp) / exp > cfg.radius_ratio_band:
                 continue
         cost = dy
         if cost < best_cost:
@@ -301,6 +332,130 @@ def geometry_verdict(dy_samples, quality=None,
                if has_ref else (med >= GEOM_SUSPECT_PX))
     return GeometryVerdict(n=int(a.size), med=med, p95=p95, epipolar_rms=rms,
                            epipolar_max=worst, suspect=bool(suspect))
+
+
+@dataclass(frozen=True)
+class RadiusAnchor:
+    """一次人工点选（左右各点一次球心）定出的「可信半径比」。
+
+    它只回答**一个数**：同一颗球在左右两路里的像素半径**该差多少**。
+
+    为什么是比值而不是绝对半径：``r = f·D/(2Z)``，左右两路的 Z 相同，
+    所以 ``r_L/r_R = f_L/f_R`` —— **与距离无关**。一次锚点就能管整段，
+    球飞近飞远都不会失真。反过来，拿绝对半径去卡整段，球一靠近就会被
+    判成"半径不对"而整帧丢掉。
+
+    `z_m` 与 `r_left_px` / `r_right_px` 只是"这一次点选落在多远处、两路各多粗"
+    的现场记录，用于让人核对量级（也用于确认锚点没把球点到背景上）。
+    """
+
+    z_m: float
+    radius_ratio: float          # 期望的 r_left/r_right = f_left/f_right
+    r_left_px: float             # 在 z_m 处应有的像素半径（仅作量级核对）
+    r_right_px: float
+    dy_px: float                 # 锚点自身的校正后 y 差（几何可信度）
+    band: float = RADIUS_ANCHOR_BAND
+    diameter_m: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        """锚点自身能不能用（几何对得上、比值是个正实数）。"""
+        return (math.isfinite(self.radius_ratio) and self.radius_ratio > 0
+                and math.isfinite(self.dy_px) and self.dy_px <= ANCHOR_MAX_DY_PX)
+
+
+def _focal_of(rig: StereoRig, which: str) -> float:
+    """取某一路的焦距（像素），**用原始内参 K，不用校正后的 P**。
+
+    为什么必须是 K：这个比值要跟**检测器给的半径**比，而检测器的半径是在
+    **原始图**上量的（`Detection.radius` 没有经过极线校正）。用 `P1/P2` 会犯一个
+    很隐蔽的错 —— 立体校正把两路重投影到同一个虚拟相机，``P1[0,0] == P2[0,0]``
+    **恒成立**（本机实测：K 比 1.015，P 比恰好 1.000），于是"左右半径该差多少"
+    这个本来要量的东西，会被校正**抹成 1**，门就退化成"左右应该一样粗"。
+
+    这个坑差点写进去：第一版注释还振振有词地写了"要与三角化同源所以用 P"，
+    而三角化用的是坐标、不是半径 —— 两者不在一个空间里。
+    """
+    K = rig.K1 if which == "left" else rig.K2
+    f = float(np.asarray(K, np.float64)[0, 0])
+    if not (math.isfinite(f) and f > 0):
+        raise ValueError(f"{which} 路的焦距取不到正数（{f!r}），这套标定不能做锚点")
+    return f
+
+
+def build_radius_anchor(rig: StereoRig, left_xy, right_xy, diameter_m: float,
+                        band: float = RADIUS_ANCHOR_BAND) -> RadiusAnchor:
+    """从一次人工点选（左右各一个球心）算出 :class:`RadiusAnchor`。
+
+    ``left_xy`` / ``right_xy`` 是**原始像素**坐标（与 seeds.json 里存的一致），
+    内部做去畸变 + 极线校正，跟三角测量走同一条路。
+
+    会抛 ``ValueError`` 的三种情况（**不静默**）：
+      - 直径不是正数（拿不到球径就没法换算像素半径）；
+      - 三角化得到的深度非有限/非正（点到了无穷远、或左右点的是不同物体）；
+      - 焦距取不到（标定文件残缺）。
+    """
+    d = float(diameter_m)
+    if not (math.isfinite(d) and d > 0):
+        raise ValueError(f"球直径必须是正数（收到 {diameter_m!r} 米）")
+
+    x1, y1 = rectify_point_left(rig, float(left_xy[0]), float(left_xy[1]))
+    x2, y2 = rectify_point_right(rig, float(right_xy[0]), float(right_xy[1]))
+    dy = abs(float(y1) - float(y2))
+
+    pts_l = np.array([[float(left_xy[0]), float(left_xy[1])]], np.float64)
+    pts_r = np.array([[float(right_xy[0]), float(right_xy[1])]], np.float64)
+    xyz = np.asarray(rig.triangulate(pts_l, pts_r), np.float64)[0]
+    z = float(xyz[2])
+    if not (math.isfinite(z) and z > 0):
+        raise ValueError(
+            f"锚点三角化得到的深度无效（Z={z!r} 米）—— "
+            "多半是左右点到了不同物体，或这两点根本不在同一对成对帧上")
+
+    f_l, f_r = _focal_of(rig, "left"), _focal_of(rig, "right")
+    r_l = f_l * d / (2.0 * z)
+    r_r = f_r * d / (2.0 * z)
+    return RadiusAnchor(z_m=z, radius_ratio=r_l / r_r, r_left_px=r_l,
+                        r_right_px=r_r, dy_px=dy, band=float(band), diameter_m=d)
+
+
+def anchor_problem(anchor: RadiusAnchor, max_dy_px: float = ANCHOR_MAX_DY_PX) -> str | None:
+    """锚点自身可信吗？可信返回 ``None``，否则返回一句能直接给人看的原因。"""
+    if not (math.isfinite(anchor.radius_ratio) and anchor.radius_ratio > 0):
+        return f"锚点的半径比无效（{anchor.radius_ratio!r}）"
+    if math.isfinite(anchor.dy_px) and anchor.dy_px > max_dy_px:
+        return (
+            f"锚点这一对点（人眼确认过是同一颗球）的校正后 y 差是 "
+            f"{anchor.dy_px:.1f}px，超过 {max_dy_px:g}px —— "
+            "连人点出来的真对应点都对不上，说明**录像几何与标定不一致**"
+            "（相机被碰动过 / 换过 USB 口），此时用它的比值当门限只会把整段带偏。"
+            "下一步：重跑 `verify_stereo`，或重新标定；确认几何没问题再开锚点门。")
+    return None
+
+
+def anchor_accepts(anchor: RadiusAnchor, r_left: float, r_right: float) -> tuple[bool, str]:
+    """这一对检测的半径**比例**符合锚点吗？返回 ``(是否接受, 一句话说明)``。
+
+    只比比值、不比绝对大小 —— 理由见 :class:`RadiusAnchor`。
+    任何一路半径缺失（<=0）时**不接受**：那时没法判，而"判不了就放行"
+    正是本项目反复踩的静默失效（会让假目标混进来，且一声不响）。
+    """
+    if not (r_left > 0 and r_right > 0):
+        return False, f"半径缺失（左 {r_left:.1f} / 右 {r_right:.1f} px），无法按锚点判"
+    obs = float(r_left) / float(r_right)
+    exp = float(anchor.radius_ratio)
+    dev = abs(obs - exp) / exp
+    note = (f"左右半径比 {obs:.2f}，锚点期望 {exp:.2f}（±{anchor.band:.0%}）")
+    return dev <= anchor.band, note
+
+
+def describe_anchor(anchor: RadiusAnchor) -> str:
+    """给人看的一行：锚点定在哪、两路各该多粗、比值多少。"""
+    return (
+        f"锚点：人工点选一对 → Z={anchor.z_m:.3f} m，"
+        f"期望半径 左 {anchor.r_left_px:.1f}px / 右 {anchor.r_right_px:.1f}px，"
+        f"左右比 {anchor.radius_ratio:.3f}（容差 ±{anchor.band:.0%}），"
+        f"锚点 y 差 {anchor.dy_px:.2f}px")
 
 
 @dataclass

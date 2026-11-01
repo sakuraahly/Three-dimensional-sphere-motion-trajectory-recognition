@@ -144,7 +144,8 @@ def _has_seq(argv: list[str], seq: list[str]) -> bool:
 
 def _stereo_param_checks() -> list[tuple[str, bool]]:
     """新窗口的命令行拼装判据。返回 (判据名, 是否通过) 列表。"""
-    from apps._gui_stereo import calibrate_args, record_args, record_out_dir
+    from apps._gui_stereo import (calibrate_args, offline_args, record_args,
+                                  record_out_dir)
 
     out: list[tuple[str, bool]] = []
 
@@ -196,6 +197,20 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
           all(("--skip-fov" not in v)
               or _has_seq(v, ["--stereo-mode", "angled"])
               for v in branches.values()))
+
+    # ---- 半径锚点：勾选框 → 命令行，必须真的传下去 ----
+    #
+    # 这条判据存在的理由：本项目已经在"界面上有、命令行没收到"上栽过三次
+    # （球径按 mm 传给按米收的参数、「检查装置」一个参数都不传、后端与编号打架）。
+    # 所以这里不比"有没有这个控件"，只比"勾了以后命令行长什么样"。
+    offl_off = offline_args("data/stereo/20261024-173619", "parallel")
+    offl_on = offline_args("data/stereo/20261024-173619", "parallel", anchor=True)
+    check("半径锚点默认关：不勾就不传 --anchor-gate", "--anchor-gate" not in offl_off,
+          " ".join(offl_off))
+    check("半径锚点勾上：命令行必须出现「--anchor-gate on」",
+          _has_seq(offl_on, ["--anchor-gate", "on"]), " ".join(offl_on))
+    check("--stereo-mode 只出现一次（这个窗口存在的意义就是按本装置解算）",
+          offl_on.count("--stereo-mode") == 1, " ".join(offl_on))
 
     # ---- 对标老窗口 §2.5：--backend 是**一个**参数、两台相机共用 ----
     # 出现两次 = 有人给左右各拼了一份（"左 dshow / 右 msmf"会把一路弄挂）；

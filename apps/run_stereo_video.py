@@ -72,6 +72,9 @@ from stereo.triangulate import (  # noqa: E402
     EPI_GATE_MAX_PX,
     EPI_GATE_MIN_PX,
     GEOM_MIN_SAMPLES,       # 几何守卫的样本下限
+    anchor_problem,         # 人工锚点自身可信吗
+    build_radius_anchor,    # 一次人工点选 → 左右半径比期望值
+    describe_anchor,
     epipolar_gate_px,       # `--max-epipolar auto`：按标定自报极线 RMS 定门限
 )
 from stereo.visualization import (  # noqa: E402
@@ -157,6 +160,56 @@ def _resolve_max_epipolar(text, rig, mode: str) -> tuple[float, str]:
         return float(text), ""
     except (TypeError, ValueError):
         return default, f"[警告] --max-epipolar 读不懂：{text!r} → 用默认 {default:g}px"
+
+
+def _radius_anchor_from_session(args, seeds_path, rig):
+    """读会话里那一对**人工点选**，算出 ``RadiusAnchor``。返回 ``(anchor, 原因)``。
+
+    失败一律返回 ``None`` + 一句人话，由调用处决定退出码 —— 这里不抛异常，
+    是因为"没点选过"是最常见的情况，用 traceback 告诉用户等于没说。
+
+    三种拒绝都必须是硬拒绝（不是警告）：锚点一旦用了错的数据，它给的比值会
+    **静默地**把后面每一帧的配对都筛一遍，结果"看着能跑、其实一直在丢真目标"，
+    这正是本项目最怕的失效形态。
+    """
+    path = Path(seeds_path)
+    if not path.is_file():
+        return None, (
+            f"没有种子文件：{path}\n"
+            "  锚点要用**人工点选**的那一对球心。做法：GUI 双目窗 →「点选球心」"
+            "（左右各点一次）→ 再回来跑。\n"
+            "  不想点选就别开这个门：去掉 --anchor-gate on（默认就是 off）。")
+    try:
+        seeds = load_seeds(path)
+    except (FileNotFoundError, ValueError) as exc:
+        return None, f"读不了种子文件：{exc}"
+
+    src = str(seeds.get("source") or "")
+    if src == "auto-yolo":
+        return None, (
+            "这份 seeds.json 是 --auto-seed 自动定位的（source=auto-yolo），"
+            "它的半径来自 YOLO 框、**不可信**（见待办 B-130）。\n"
+            "  锚点只能用人点的那一份：GUI「点选球心」。")
+
+    d_mm = float(args.anchor_diameter_mm)
+    d_note = "命令行 --anchor-diameter-mm"
+    if not (d_mm > 0):
+        d_mm = 21.6
+        d_note = "内置默认 21.6mm（没给 --anchor-diameter-mm）"
+    try:
+        anchor = build_radius_anchor(
+            rig,
+            (seeds["left"]["x"], seeds["left"]["y"]),
+            (seeds["right"]["x"], seeds["right"]["y"]),
+            d_mm / 1000.0)
+    except ValueError as exc:
+        return None, f"锚点算不出来：{exc}"
+
+    prob = anchor_problem(anchor)
+    if prob:
+        return None, prob
+    print(f"[锚点] 球径用 {d_mm:g}mm（{d_note}）；种子来源 {src or '未知'}")
+    return anchor, ""
 
 
 def _guard_step(armed: bool, guard_at: int, n_pairs: int, dy_samples, quality):
@@ -490,6 +543,14 @@ def main() -> int:
                          "定位球心当种子（写进 <session>/derived/seeds.json）。"
                          "只在没显式给 --method / --detect-width 时生效；"
                          "半径仍来自 YOLO 框，不可信")
+    ap.add_argument("--anchor-gate", choices=("off", "on"), default="off",
+                    help="用**一次人工点选**（左右各点一次球心，存在会话的 "
+                         "derived/seeds.json）定出「左右半径该差多少」，配对时据此"
+                         "拒掉假目标。默认 off；开之前必须先点选过（--auto-seed 的"
+                         "种子不算，它的半径来自 YOLO 框）")
+    ap.add_argument("--anchor-diameter-mm", type=float, default=0.0,
+                    help="锚点换算要用的真实球径（毫米）。0 = 用内置默认值（21.6），"
+                         "并在输出里写明用的是它 —— 换算错了整段的半径都在同一档上偏")
     ap.add_argument("--out", default=None, metavar="DIR",
                     help="把产物写到这个目录（traj3d.csv / annotated.mp4 / 预测 / 世界系）。"
                          "不给就写回 <session>/derived —— 做对照实验时用它，"
@@ -804,6 +865,20 @@ def main() -> int:
     epi, epi_note = _resolve_max_epipolar(args.max_epipolar, rig, mode)
     if epi_note:
         print(epi_note)
+    # 人工锚点门（默认关，见 --anchor-gate 的 help）。放在**建重建器之前**：
+    # 它要注入 MatchConfig，而不是等跑完再解释结果。
+    anchor = None
+    if args.anchor_gate == "on":
+        if mode == "angled":
+            print("[锚点] 只对 parallel（已极线校正）有意义；angled 下不启用")
+        else:
+            anchor, why = _radius_anchor_from_session(args, seeds_path, rig)
+            if anchor is None:
+                print(f"[锚点][错误] {why}")
+                return 2
+            print(f"[锚点] {describe_anchor(anchor)}")
+            print("[锚点] 半径门已开：配对时按「左右半径比」拒掉假目标"
+                  "（--anchor-gate off 可关）")
     if mode == "angled":
         from stereo.angled import AngledMatchConfig, AngledReconstructor
         if args.max_epipolar is None:
@@ -813,8 +888,12 @@ def main() -> int:
         # `source_hint` 只进"0 配对"的报错文案：那句话要能直接告诉用户
         # `--seed-json <会话>/derived/seeds.json` 长什么样，重建器自己不知道会话在哪。
         # 用 as_posix()：文案里再拼 "/derived/seeds.json"，混着反斜杠会像坏路径。
-        rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=epi),
-                                  source_hint=session_dir.as_posix())
+        rec = StereoReconstructor(
+            rig,
+            MatchConfig(max_epipolar_px=epi,
+                        radius_ratio_expected=(anchor.radius_ratio if anchor else 0.0),
+                        radius_ratio_band=(anchor.band if anchor else 0.25)),
+            source_hint=session_dir.as_posix())
     # 录前几何守卫（`B-131`）：跑满 N 对就先判一次"录像几何 vs 标定"，对不上就早停。
     # 放在这里而不是库层默认：`mono_vs_stereo` / `profile_stages` 会在同一批坏会话上
     # 跑，默认拦下来会让它们从"出数"变成"崩"；那是入口层的决定，不该由库替它做。
