@@ -203,6 +203,18 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     # 老界面一直传 `--preview`，新界面重做后**从没传过** —— 而它是 store_true，
     # 不传就是没有窗口，且一声不响。这类"界面上少一个参数"的缺陷截图看不出来，
     # 只能靠比对命令行。
+    # ---- 勾了锚点但没点选球心：界面必须先说清，而不是让人等一次进程启动 ----
+    import tempfile
+    from apps._actions import has_seeds
+    with tempfile.TemporaryDirectory() as td:
+        sess = Path(td)
+        no_seed = not has_seeds(sess)
+        (sess / "derived").mkdir()
+        (sess / "derived" / "seeds.json").write_text("{}", encoding="utf-8")
+        with_seed = has_seeds(sess)
+    check("has_seeds：没有 derived/seeds.json → False；有 → True",
+          no_seed and with_seed)
+
     rec = record_args(out="data/stereo", duration="10")
     check("录制必须带 --preview（否则录制时没有任何实时画面，且不报错）",
           "--preview" in rec, " ".join(rec))

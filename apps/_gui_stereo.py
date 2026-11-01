@@ -539,7 +539,7 @@ class StereoWindow(tk.Toplevel):
         # 「大角度」顶出 5 px（内容 874 > 窗口 869）；再加一行说明则是 53 px。
         # 宁可把输入框收窄，也不裁按钮、不动控件预算。
         ttk.Checkbutton(
-            line, text="半径锚点（先「点选球心」左右各一次）",
+            line, text="半径锚点门（勾了才生效）",
             variable=self.var_anchor).pack(side="left", padx=(10, 0))
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "跑离线三维", self._start_offline)
@@ -748,6 +748,14 @@ class StereoWindow(tk.Toplevel):
         if not session:
             self.status.set_status("先选一个会话（点「选择…」）", "warn")
             return
+        # 勾了锚点却没点选过球心：命令行会拒绝（退出码 2），但那时用户已经等了
+        # 一次进程启动。能在这里说清就不要让人等 —— 这也是"按钮看起来什么都做了"
+        # 那类抱怨的来源。
+        if self.var_anchor.get() and not _actions.has_seeds(session):
+            self.status.set_status(
+                "这个会话还没有「点选球心」，半径锚点门用不了：先点「点选球心」"
+                "（左右各一次），再回来勾它；不想点就把勾去掉", "warn")
+            return
         cmd = offline_args(session, self.mode, anchor=self.var_anchor.get())
         if self.var_anchor.get():
             self.status.set_status(
@@ -768,7 +776,8 @@ class StereoWindow(tk.Toplevel):
             self.status.set_status("没有保存球心（窗口被关掉或左右没点完）", "warn")
             return
         self.status.set_status(
-            f"球心已保存：{Path(saved).name}；现在跑第 ④ 步会用 specular 解算", "ok")
+            f"球心已保存：{Path(saved).name}；现在跑第 ④ 步会用 specular 解算。"
+            "想同时用「半径锚点门」，把它勾上再跑（不勾就只是普通点选）", "ok")
 
     def _open_bench(self) -> None:
         """打开会话工作台。带上当前会话，用户接着做 ①–⑤ 而不是再选一遍。"""

@@ -66,9 +66,15 @@ EPI_GATE_MAX_PX = 6.0     # 上限
 # 定准，定不准每一帧的半径抖动），调宽到 0.5 就等于没门。
 RADIUS_ANCHOR_BAND = 0.25
 # 锚点自身的几何判据：人工点的是**真对应点**，它的校正后 y 差就是"这套标定在
-# 这一点上到底准不准"的直接测量。超过 GEOM_SUSPECT_PX 说明连人眼确认过的对应点
-# 都对不上，那时再用它的比值当门限只会把后面每一帧都带偏 —— 必须拒绝，不是警告。
-ANCHOR_MAX_DY_PX = GEOM_SUSPECT_PX
+# 这一点上到底准不准"的直接测量。
+#
+# ⚠ 门限不能直接沿用 GEOM_SUSPECT_PX(3px)：那个 3px 是**检测器口径**（检测器给的
+# 是轮廓圆心）。而人在镜面球上点的是**高光斑**，高光斑在左右视图里落在球面不同
+# 位置，天然就差 ~6px（B-132 实测 6px）—— 拿 3px 去卡，等于把"点选口径不同"判成
+# "标定坏了"。2026-11-01 用真实会话验过：同一颗球、同一帧，人点出来的 dy 是 6.4px，
+# 而那段标定的极线 RMS 只有 0.58px，几何本身是好的。
+ANCHOR_CLICK_TOLERANCE_PX = 6.0     # 高光斑 vs 轮廓圆心 的系统偏移（实测）
+ANCHOR_MAX_DY_PX = GEOM_SUSPECT_PX + ANCHOR_CLICK_TOLERANCE_PX
 
 
 
@@ -455,16 +461,25 @@ def describe_anchor(anchor: RadiusAnchor) -> str:
         f"锚点：人工点选一对 → Z={anchor.z_m:.3f} m，"
         f"期望半径 左 {anchor.r_left_px:.1f}px / 右 {anchor.r_right_px:.1f}px，"
         f"左右比 {anchor.radius_ratio:.3f}（容差 ±{anchor.band:.0%}），"
-        f"锚点 y 差 {anchor.dy_px:.2f}px")
+        f"锚点 y 差 {anchor.dy_px:.2f}px（人工点高光斑，天然 ±{ANCHOR_CLICK_TOLERANCE_PX:g}px；"
+        f"门限 {ANCHOR_MAX_DY_PX:g}px）")
 
 
 @dataclass
 class StereoReconstructor:
-    """把逐帧的左右检测配成一条三维轨迹。"""
+    """把逐帧的左右检测配成一条三维轨迹。
+
+    ``warmup_frames``：**已知前 N 帧不会有检测**（种子落在第 N 帧）。
+    零配对门禁必须让路 —— 否则"在第 80 帧点选球心"这种完全合法的用法，
+    会在第 20 帧就被判成"检测器坏了"并抛错（2026-11-01 真实踩到）。
+    """
 
     rig: StereoRig
     cfg: MatchConfig = field(default_factory=MatchConfig)
     trajectory: list[StereoPoint] = field(default_factory=list)
+
+    #: 前 N 帧**已知不会**有检测（种子落在第 N 帧）。见类 docstring。
+    warmup_frames: int = 0
 
     # 统计
     n_frames: int = 0
@@ -557,11 +572,14 @@ class StereoReconstructor:
         """
         if not self._is_parallel():
             return
-        if self.n_frames < SILENT_FAILURE_MIN_FRAMES:
+        # 预热期（种子还没生效的那些帧）不计入判据：那几帧的 0 检出是**设计如此**，
+        # 不是"检测器没给出圆心"。分母也跟着扣掉，否则配对率会被预热期稀释。
+        effective = self.n_frames - max(0, int(self.warmup_frames))
+        if effective < SILENT_FAILURE_MIN_FRAMES:
             return
         if self.n_matched == 0:
             raise RuntimeError(self._zero_match_message())
-        rate = self.match_rate
+        rate = self.n_matched / effective
         if rate < LOW_MATCH_RATE and not self._low_rate_warned:
             self._low_rate_warned = True
             msg = (f"截至第 {self.n_frames} 帧：parallel 模式配对率极低，"
@@ -823,7 +841,9 @@ class StereoReconstructor:
 
     @property
     def match_rate(self) -> float:
-        return self.n_matched / self.n_frames if self.n_frames else 0.0
+        """配对率。分母扣掉预热期（那几帧按设计不会有检测）。"""
+        effective = self.n_frames - max(0, int(self.warmup_frames))
+        return self.n_matched / effective if effective > 0 else 0.0
 
     def as_array(self) -> np.ndarray:
         """(N,4) 的 [t, X, Y, Z]，方便直接喂给平滑/预测。"""

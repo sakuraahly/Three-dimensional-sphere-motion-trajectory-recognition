@@ -767,6 +767,7 @@ def main() -> int:
         cfg.detector.color = ColorConfig.preset(args.preset)
     pipe_l = _make_pipeline(cfg, rig, "left")
     pipe_r = _make_pipeline(cfg, rig, "right")
+    seed_frame = 0        # 种子落在第几帧；后面要拿它给重建器设"预热期"
     if method == "specular":
         def _seed_arg(text: str, what: str):
             try:
@@ -856,6 +857,7 @@ def main() -> int:
         if seed_frame > 0:
             print(f"[提示] seed_frame={seed_frame}：前 {seed_frame} 对按设计不会初始化检测；"
                   "除非第 0 帧看不清球，否则建议改成 0")
+
     elif args.seed or args.seed_right:
         print("[警告] 只有 --method specular 使用 --seed/--seed-right；已忽略。")
     if args.detect_width:
@@ -894,6 +896,13 @@ def main() -> int:
                         radius_ratio_expected=(anchor.radius_ratio if anchor else 0.0),
                         radius_ratio_band=(anchor.band if anchor else 0.25)),
             source_hint=session_dir.as_posix())
+    # 种子落在第 N 帧时，前 N 帧**按设计**不会有检测。不告诉重建器的话，它的
+    # 零配对门禁会在第 20 帧判"检测器坏了"并抛错 —— 2026-11-01 真实踩到：
+    # 用户在 GUI 第 80 帧点选球心，跑离线三维直接报错，看起来像"点选没用"。
+    if seed_frame > 0 and hasattr(rec, "warmup_frames"):
+        rec.warmup_frames = int(seed_frame)
+        print(f"[提示] 前 {seed_frame} 帧记为预热期：零配对判据从第 "
+              f"{seed_frame + 20} 帧之后才生效，配对率分母也扣掉这段")
     # 录前几何守卫（`B-131`）：跑满 N 对就先判一次"录像几何 vs 标定"，对不上就早停。
     # 放在这里而不是库层默认：`mono_vs_stereo` / `profile_stages` 会在同一批坏会话上
     # 跑，默认拦下来会让它们从"出数"变成"崩"；那是入口层的决定，不该由库替它做。

@@ -216,6 +216,16 @@ def record_args(*, left: str = "left", right: str = "right", duration: str = "10
 # 打开类动作（不起任务、只看/管理）：相机设备、数据管理、3D 查看器、经典界面
 # --------------------------------------------------------------------------- #
 
+def has_seeds(session: str | Path) -> bool:
+    """这个会话里有没有**人点过**的球心（`derived/seeds.json`）。
+
+    界面拿它做前置检查：勾了「半径锚点门」却没点选过，命令行那边会拒绝并退出码 2，
+    但那时用户已经点了按钮、等了一次进程启动 —— 能在界面上先说清楚就不要让人等。
+    """
+    p = Path(session) / "derived" / "seeds.json"
+    return p.is_file()
+
+
 def cameras(sub: str = "identify") -> list[str]:
     """相机设备管理。``identify`` 是交互式的（自己开 cv2 窗口逐台确认）。
 

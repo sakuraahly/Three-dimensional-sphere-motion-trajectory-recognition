@@ -885,7 +885,8 @@ def test_radius_anchor() -> bool:
     no_r = anchor_accepts(anchor, r_l_expect, 0.0)[0]
     # 锚点自身的几何判据：y 差超限必须给理由（用 dataclasses.replace 造一个坏锚点）
     import dataclasses
-    bad_anchor = dataclasses.replace(anchor, dy_px=5.0)
+    # 12px：远超"人工点高光斑"的 6px 系统偏移，说明这次点选真的对不上
+    bad_anchor = dataclasses.replace(anchor, dy_px=12.0)
     bad_why = anchor_problem(bad_anchor)
 
     checks = [
@@ -903,6 +904,42 @@ def test_radius_anchor() -> bool:
          ok_pair and not bad_pair and not no_r),
         ("锚点自身 y 差超限 → 给得出原因（不是只返回 False）",
          bool(bad_why) and "y 差" in str(bad_why)),
+        # 真实会话（20261101-205709）人点出来是 6.4px：那是高光斑偏移，不是几何坏。
+        # 门限若沿用检测器口径的 3px，会把合法点选判成"标定坏了"。
+        ("6.4px（人工点高光斑）→ 放行；12px（真的对不上）→ 拒绝",
+         anchor_problem(dataclasses.replace(anchor, dy_px=6.43)) is None
+         and anchor_problem(dataclasses.replace(anchor, dy_px=12.0)) is not None),
+    ]
+    ok = True
+    for name, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {name}")
+        ok = ok and passed
+    return ok
+
+
+def test_warmup_no_false_alarm() -> bool:
+    """种子落在第 N 帧时，前 N 帧的 0 检出是**设计如此**，不能判成检测器坏了。
+
+    真实踩到过：用户在 GUI 第 80 帧点选球心，跑离线三维时 `seed_frame=80` 被正确读入，
+    但零配对门禁在第 20 帧就抛错，界面看起来像"点选没用"。
+    """
+    print("----- 预热期不误杀（seed_frame>0）-----")
+    rec = StereoReconstructor(rig=None, warmup_frames=20)
+    for _ in range(25):
+        rec.update(0.0, None, [])          # 左路一直没检测 = 预热期的样子
+    warm_ok = rec.n_frames == 25 and rec.match_rate == 0.0
+
+    control_raised = False
+    rec2 = StereoReconstructor(rig=None)     # 没有预热期：同样 25 帧应该判死
+    try:
+        for _ in range(25):
+            rec2.update(0.0, None, [])
+    except RuntimeError as exc:
+        control_raised = "0 个配对" in str(exc)
+
+    checks = [
+        ("有 warmup=20：25 帧全空不抛错（预热期不参与判据）", warm_ok),
+        ("对照：没有 warmup 时同样 25 帧必须抛『0 个配对』", control_raised),
     ]
     ok = True
     for name, passed in checks:
@@ -933,7 +970,9 @@ def main() -> int:
     print()
     h = test_radius_anchor()
     print()
-    allok = a and b and c and d and e and f and p3 and g and h
+    w = test_warmup_no_false_alarm()
+    print()
+    allok = a and b and c and d and e and f and p3 and g and h and w
     print("判定结果：" + ("全部通过" if allok else "有不达标项"))
     return 0 if allok else 1
 
