@@ -282,6 +282,151 @@ def circle_edge_support(edges: np.ndarray, cx: float, cy: float, radius: float, 
     return hit / samples
 
 
+def estimate_radius_px(
+    gray: np.ndarray,
+    cx: float,
+    cy: float,
+    r0: float,
+    *,
+    r_min_ratio: float = 0.5,
+    r_max_ratio: float = 1.6,
+    n_radii: int = 24,
+    n_angles: int = 96,
+) -> tuple[float, float]:
+    """在 ``[r_min_ratio*r0, r_max_ratio*r0]`` 里找"最像球轮廓"的半径。
+
+    返回 ``(best_r, score)``；``score`` 在 0-1，供调用方判断这次估计靠不靠得住
+    （实测：真实帧 0.14~0.45，纯噪声 < 0.05）。
+
+    ## 为什么不是"取全区间最大值"（0.78r 的坑，必须先说清）
+
+    镜面球的**内部反射会比外轮廓更强**。`data/stereo/20261101-205709` 第 104 帧
+    左路实测：沿射线最强的径向峰落在 0.75~0.80 r0 处（高光/反射面），真正的
+    轮廓峰反而更弱。所以"取 score 最大的半径"会稳定地锁到内部反射上，估出的
+    半径比真实轮廓小 20% 左右 —— 那是"把半径量到反射面上"，不是球的外缘。
+
+    这里的做法：先在 ρ 序列上找**局部极大**，再丢掉比最大分低 10% 以上的峰，
+    最后取其中**半径最大**的那个。也就是"只要和最可信的峰差不多可信，就选更靠
+    外的那个"——球的外轮廓一定是这块区域最外面的一圈闭合边缘，内部反射不会。
+
+    ## 打分口径
+
+    对每个候选 ρ：96 条射线各在 ρ ± max(2, 0.05ρ) 里取 |径向梯度| 最大
+    （不是死卡环上那一点：真机边缘被散焦摊成 5~8 px 的过渡带，峰值不在 ρ 上）。
+    超过 3×ROI 中位的射线算"看到边"，并要求符号与多数派一致（真轮廓在一段弧里
+    同向）。得到 ``support``。
+
+    但**光有 support 在真实画面上会随半径单调上升**：球外面是书架/墙/手机，
+    背景纹理对任何一个圆都能凑出几十条射线（实测同一帧 support 从 0.14 一路
+    涨到 0.30，没有峰）。所以再乘一个"这圈是不是边界"的门槛：
+
+        1 - 外圈平均 |径向梯度| / 本圈平均 |径向梯度|
+
+    轮廓的特征是"里面毛糙、外面平滑"（球面有反射纹理，背景相对干净）；内部
+    反射的两侧都毛糙，这一项接近 0。乘上去之后，同一帧的分数在 93~97 px 处
+    出现唯一的峰，内部反射和背景都被压掉。
+
+    ## 失败姿态
+
+    找不到任何局部极大（全零分）时**原样返回 (r0, 0.0)**，不猜。调用方拿到
+    ``score`` 很低就该保留用户/Hough 的原值，而不是悄悄换掉。
+    """
+    img = np.asarray(gray)
+    if img.size == 0:
+        return float(r0), 0.0
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    r0f = float(r0)
+    if not np.isfinite(r0f) or r0f <= 2.0:
+        return r0f, 0.0
+
+    h, w = img.shape[:2]
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+
+    r_min = max(3.0, float(r_min_ratio) * r0f)
+    r_max = min(min(h, w) * 0.5 - 2.0, float(r_max_ratio) * r0f)
+    if r_max <= r_min + 1.0:
+        return r0f, 0.0
+
+    # 底噪：点击点周围这块 ROI 的 Sobel 幅值中位数（与 joint_refine._ray_support
+    # 同一口径）。不用全图：全图含大片暗背景，会把门槛压到纹理以下。
+    half = int(round(r_max * 1.1)) + 1
+    x0, x1 = max(0, int(cx) - half), min(w, int(cx) + half + 1)
+    y0, y1 = max(0, int(cy) - half), min(h, int(cy) + half + 1)
+    floor = float(np.median(mag[y0:y1, x0:x1]))
+    thr = max(3.0 * floor, 8.0)
+
+    ang = np.linspace(0.0, 2.0 * math.pi, int(n_angles), endpoint=False)
+    cos_a = np.cos(ang)
+    sin_a = np.sin(ang)
+    rows = np.arange(int(n_angles))
+
+    def _radial_mean(radius: float) -> float:
+        xs = float(cx) + radius * cos_a
+        ys = float(cy) + radius * sin_a
+        gr = _bilinear(gx, xs, ys) * cos_a + _bilinear(gy, xs, ys) * sin_a
+        return float(np.mean(np.abs(gr)))
+
+    radii = np.linspace(r_min, r_max, int(n_radii))
+    support = np.zeros(radii.size)
+    boundary = np.zeros(radii.size)
+    peak_pos = np.full(radii.size, np.nan)
+
+    for i, rho in enumerate(radii):
+        band = max(2.0, 0.05 * rho)
+        offs = np.arange(-band, band + 1e-6, 0.5)
+        rr = rho + offs
+        xs = float(cx) + np.outer(rr, cos_a)
+        ys = float(cy) + np.outer(rr, sin_a)
+        gr = (_bilinear(gx, xs, ys) * cos_a[None, :]
+              + _bilinear(gy, xs, ys) * sin_a[None, :])
+        best_i = np.argmax(np.abs(gr), axis=0)
+        best = gr[best_i, rows]
+        strong = np.abs(best) >= thr
+        if int(strong.sum()) >= 3:
+            sign = 1.0 if float(np.median(best[strong])) >= 0.0 else -1.0
+            ok = strong & (best * sign > 0.0)
+            support[i] = float(ok.sum()) / len(ang)
+            if ok.any():
+                peak_pos[i] = float(np.median(rho + offs[best_i][ok]))
+
+        # "这圈是不是边界"：外面要比里面平滑。内侧取本圈，外侧取 1.10~1.30ρ
+        # 的平均值 —— 只跨一个梯度过渡带，不能跨到球外的第二层结构上。
+        inside = _radial_mean(float(rho))
+        outside = float(np.mean([_radial_mean(float(rho) * (1.0 + d))
+                                 for d in np.linspace(0.10, 0.30, 8)]))
+        if inside > 1e-6:
+            boundary[i] = float(np.clip(1.0 - outside / inside, 0.0, 1.0))
+
+    score = support * boundary
+
+    # 局部极大（端点也算）：score 是离散序列，相邻点共用一个 ±5% 的采样带，
+    # 真峰通常是一个 2~4 点的平台，所以用 >= 而不是 >，平台上的点都算候选。
+    peaks = [
+        i for i in range(len(radii))
+        if score[i] > 0.0
+        and score[i] >= (score[i - 1] if i > 0 else -1.0)
+        and score[i] >= (score[i + 1] if i + 1 < len(radii) else -1.0)
+    ]
+    if not peaks:
+        return r0f, 0.0
+
+    best_score = max(float(score[i]) for i in peaks)
+    # 10% 容差 + 取最大 ρ：这是对"内部反射更强"那件事的唯一对冲手段。
+    outer = [i for i in peaks if score[i] >= 0.9 * best_score]
+    i_best = max(outer, key=lambda j: radii[j])
+
+    # 选中的是"候选点"，最终半径取**支持射线峰位置的中位数**：
+    # 候选网格步长约 0.05r0（r0=92 时 4.6 px），直接用网格值会带上半格偏差；
+    # 而 96 条射线落在同一条边上的位置中位数是连续的，且能抵消平台偏外的那半格。
+    r_est = (float(peak_pos[i_best]) if np.isfinite(peak_pos[i_best])
+             else float(radii[i_best]))
+    r_est = float(np.clip(r_est, r_min, r_max))
+    return r_est, float(score[i_best])
+
+
 # --------------------------------------------------------------------------
 # 极线几何（parallel / angled 两种模式共用）
 # --------------------------------------------------------------------------

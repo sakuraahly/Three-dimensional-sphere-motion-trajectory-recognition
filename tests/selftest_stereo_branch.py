@@ -55,7 +55,7 @@ from calib import StereoRig
 from selftest_synthetic import Scene, make_background, render_frame
 from sphere_tracker.config import AppConfig, ColorConfig
 from sphere_tracker.geometry import CameraModel, refine_circle_subpixel, \
-    refine_circle_subpixel_checked
+    refine_circle_subpixel_checked, estimate_radius_px
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.types import Detection
 from stereo import MatchConfig, StereoReconstructor, epipolar_dy, geometry_verdict
@@ -914,6 +914,85 @@ def test_refine_center_and_geometry_guard() -> bool:
     return ok
 
 
+def test_estimate_radius() -> bool:
+    """B-171：半径从图上估，但**不许**被更强的内部反射带跑。
+
+    为什么这组判据必须存在
+    ----------------------
+    半径是 `Z = f·D/(2r)` 的分母，偏 10% 就是整条轨迹系统偏 10%。可是镜面球
+    有一个反直觉的性质：**内部反射的径向梯度比外轮廓还强**（实测真球处最强峰
+    落在 0.75~0.80 r0）。任何"取全区间最大梯度/最大分"的实现都会锁到反射上，
+    估出的半径系统性偏小 20%。
+
+    所以这里钉两条：
+      ① 30% 弧 + 偏心高光的球，已知半径 40 -> 40±3；
+      ② 再画一圈**比轮廓亮一倍**、覆盖 38% 的内部反射环 -> 结果**仍然** 40±3。
+         这一条是"取更靠外的局部峰"的唯一证据：把选择规则改回"直接取最大分"，
+         它必须变红（实测会掉到 33）。
+      ③ 纯噪声 -> score < 0.2（调用方据此不采信）。
+      ④ r0 故意给偏（50 vs 真值 40）也要能拉回来 —— 证明不是贴着输入走。
+    """
+    print("----- 半径从图上估（内部反射更强时也不许偏）-----")
+
+    def sphere(r: float = 40.0, size: int = 200, arc_frac: float = 0.30,
+               ring: float = 0.0, ring_frac: float = 0.38,
+               ring_value: int = 255, ball_value: int = 120
+               ) -> tuple[np.ndarray, int, int]:
+        """合成一颗"只有 30% 弧可见"的球；``ring>0`` 时再加一圈内部反射。"""
+        img = np.full((size, size), 30, np.float32)
+        cx = cy = size // 2
+        disk = np.zeros((size, size), np.uint8)
+        cv2.circle(disk, (cx, cy), int(r), 255, -1)
+        sector = np.zeros((size, size), np.uint8)
+        cv2.ellipse(sector, (cx, cy), (int(r) + 2, int(r) + 2), 0,
+                    200, 200 + 360 * arc_frac, 255, -1)
+        img[(disk > 0) & (sector > 0)] = ball_value
+        cv2.circle(img, (cx + 9, cy - 7), 5, 255, -1)      # 偏离球心的高光
+        if ring > 0:
+            # 内部反射：0.80r，亮度 255（轮廓只有 120，**梯度确实更强**），
+            # 覆盖 38% 的角 —— 做得比轮廓的 30% 略宽，正是"按分数会赢"的形态。
+            ring_mask = np.zeros((size, size), np.uint8)
+            cv2.ellipse(ring_mask, (cx, cy), (int(ring * r), int(ring * r)),
+                        0, 10, 10 + 360 * ring_frac, 255, 1)
+            img[ring_mask > 0] = ring_value
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        return cv2.GaussianBlur(img, (3, 3), 0.8), cx, cy
+
+    checks: list[tuple[str, bool]] = []
+
+    gray, cx, cy = sphere()
+    r_plain, s_plain = estimate_radius_px(gray, cx, cy, 40.0)
+    checks.append((f"① 30% 弧 + 偏心高光：r={r_plain:.2f} px（真值 40±3），"
+                   f"score={s_plain:.2f}", abs(r_plain - 40.0) <= 3.0 and s_plain >= 0.2))
+
+    gray_ring, cx, cy = sphere(ring=0.75)
+    r_ring, s_ring = estimate_radius_px(gray_ring, cx, cy, 40.0)
+    checks.append((f"② 内部反射环（0.80r、亮度 2 倍、38% 弧）仍在 "
+                   f"r={r_ring:.2f} px（真值 40±3）",
+                   abs(r_ring - 40.0) <= 3.0))
+    checks.append((f"② 同图 score={s_ring:.2f}（≥0.2，调用方敢用）", s_ring >= 0.2))
+
+    r_far, s_far = estimate_radius_px(gray_ring, cx, cy, 50.0)
+    checks.append((f"④ 输入 r0=50（故意偏 25%）仍估到 {r_far:.2f} px —— "
+                   "不是贴着输入走", abs(r_far - 40.0) <= 3.0))
+
+    rng = np.random.default_rng(3)
+    noise_img = np.clip(rng.normal(120.0, 30.0, (200, 200)), 0, 255).astype(np.uint8)
+    r_noise, s_noise = estimate_radius_px(noise_img, 100, 100, 40.0)
+    checks.append((f"③ 纯噪声：score={s_noise:.3f} < 0.2，原样返回 r0="
+                   f"{r_noise:.1f}（不猜）", s_noise < 0.2 and r_noise == 40.0))
+
+    flat = np.full((120, 120), 128, np.uint8)
+    _, s_flat = estimate_radius_px(flat, 60, 60, 20.0)
+    checks.append((f"③ 全平图：score={s_flat:.3f}（没有边就没有分）", s_flat == 0.0))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
 def test_guard_step() -> bool:
     """几何守卫的一步判定抽成纯函数后，语义不许变（`B-131` 的验收缺口②）。
 
@@ -994,6 +1073,9 @@ def main() -> int:
     center_ok = test_refine_center_and_geometry_guard()
     print()
 
+    radius_ok = test_estimate_radius()
+    print()
+
     guard_ok = test_guard_step()
     print()
 
@@ -1056,7 +1138,7 @@ def main() -> int:
         print()
 
     all_ok = (ok and sign_ok and angled_ok and seed_ok and msg_ok
-              and geom_ok and advice_ok and center_ok and guard_ok)
+              and geom_ok and advice_ok and center_ok and radius_ok and guard_ok)
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1
 

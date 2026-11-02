@@ -40,8 +40,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from stereo.visualization import write_seeds  # noqa: E402
+from sphere_tracker.geometry import estimate_radius_px  # noqa: E402
 
 PREVIEW_W, PREVIEW_H = 760, 428
+
+#: 图上估半径的"可信"门槛。低于它说明这一帧没有足够长的可见轮廓（镜面球只有
+#: 25%~35% 的弧有梯度），此时**保留点选原值**，只在界面上把估计值标成"不实"。
+RADIUS_SCORE_MIN = 0.20
 
 #: 单目预览固定 760 宽（与双目同宽，用户不用适应两套尺度），高度按原图比例算。
 MONO_PREVIEW_W = 760
@@ -108,6 +113,10 @@ class SeedPicker(tk.Toplevel):
         self.right_click: tuple[float, float] | None = None
         self.left_radius = 0.0
         self.right_radius = 0.0
+        # 点选时 Hough 给的原始半径 —— 只用于在界面上和"图上估"并排显示，
+        # 不参与后续计算（绝不静默丢掉用户/原算法的值，见 `_on_click`）。
+        self.left_drawn = 0.0
+        self.right_drawn = 0.0
         self.left_frame: np.ndarray | None = None
         self.right_frame: np.ndarray | None = None
         self._left_photo = None
@@ -163,6 +172,16 @@ class SeedPicker(tk.Toplevel):
         for spin in (lspin, rspin):
             spin.bind("<Return>", lambda _e: self._apply_radius_vars())
             spin.bind("<FocusOut>", lambda _e: self._apply_radius_vars())
+
+        # 为什么单独一行写两个数：点选半径（Hough）和图上估的半径**可能差 10% 以上**
+        # （实测 92.5 的点击值、估出来 96；右路 79→79.5）。只显示一个数，用户就
+        # 看不出这里被换过；这一行的存在就是为了"换之前先给你看"。
+        self.notes = ttk.Frame(self, padding=(10, 0, 10, 4))
+        self.notes.pack(fill="x")
+        self.left_note = ttk.Label(self.notes, text="左：还没点", style="Hint.TLabel")
+        self.left_note.pack(side="left")
+        self.right_note = ttk.Label(self.notes, text="", style="Hint.TLabel")
+        self.right_note.pack(side="left", padx=(18, 0))
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
@@ -241,6 +260,22 @@ class SeedPicker(tk.Toplevel):
                 return gx, gy, float(max(8.0, min(110.0, cr)))
         return None
 
+    def _auto_radius(self, label: str, frame: np.ndarray, x: float, y: float,
+                     r0: float) -> tuple[float, str]:
+        """从图上复核半径，返回 ``(建议初值, 给用户看的说明)``。
+
+        **不静默替换**：返回的说明里同时写"图上估多少"和"点选原值多少"，
+        调用方把它显示在输入框下面。信度不够（镜面球只有一段弧）时保留原值，
+        并把"估不准"这件事说出来 —— 用户至少知道这里被检查过。
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        est, score = estimate_radius_px(gray, float(x), float(y), float(r0))
+        if score >= RADIUS_SCORE_MIN:
+            return est, (f"{label}：图上估 {est:.0f} px（点选原值 {r0:.0f}，"
+                         f"信度 {score:.2f}）")
+        return float(r0), (f"{label}：图上估不实（{est:.0f} px，信度 {score:.2f}），"
+                           f"保留点选原值 {r0:.0f}")
+
     def _on_wheel(self, side: str, event) -> None:
         """滚轮粗调半径；精确值用上面的输入框。"""
         delta = 1.02 if event.delta > 0 else 0.98
@@ -283,12 +318,19 @@ class SeedPicker(tk.Toplevel):
             if circle is None:
                 continue
             cx, cy, radius = circle
+            drawn = float(radius)
+            radius, note = self._auto_radius(
+                "左" if side == "left" else "右", frame, cx, cy, drawn)
             if side == "left":
                 self.left_click, self.left_radius = (cx, cy), radius
+                self.left_drawn = drawn
                 self.left_r_var.set(f"{radius:.0f}")
+                self.left_note.configure(text=note)
             else:
                 self.right_click, self.right_radius = (cx, cy), radius
+                self.right_drawn = drawn
                 self.right_r_var.set(f"{radius:.0f}")
+                self.right_note.configure(text=note)
             changed += 1
         self._redraw()
         if changed:
@@ -306,22 +348,30 @@ class SeedPicker(tk.Toplevel):
         circle = self._estimate_circle(frame, x, y)
         if circle is not None:
             # 圆心必须严格等于用户点击位置，不自动吸附 Hough 圆心；
-            # Hough 只用来估半径（用户明确要求“我点哪就是哪”）。
-            radius = float(circle[2])
+            # Hough 只用来给半径一个**起点**，再由图上轮廓复核（见 _auto_radius）。
+            drawn = float(circle[2])
         else:
-            radius = float(max(12, min(300, round(w / 32.0))))
+            drawn = float(max(12, min(300, round(w / 32.0))))
+        radius, note = self._auto_radius(
+            "左" if side == "left" else "右", frame, x, y, drawn)
         if side == "left":
             self.left_click, self.left_radius = (x, y), radius
+            self.left_drawn = drawn
             self.left_r_var.set(f"{radius:.0f}")
+            self.left_note.configure(text=note)
         else:
             self.right_click, self.right_radius = (x, y), radius
+            self.right_drawn = drawn
             self.right_r_var.set(f"{radius:.0f}")
+            self.right_note.configure(text=note)
         self._redraw()
 
     def _redraw(self) -> None:
-        for canvas, photo, click, radius, side in (
-            (self.left_canvas, self._left_photo, self.left_click, self.left_radius, "左"),
-            (self.right_canvas, self._right_photo, self.right_click, self.right_radius, "右"),
+        for canvas, photo, click, radius, drawn, side in (
+            (self.left_canvas, self._left_photo, self.left_click, self.left_radius,
+             self.left_drawn, "左"),
+            (self.right_canvas, self._right_photo, self.right_click, self.right_radius,
+             self.right_drawn, "右"),
         ):
             canvas.delete("all")
             if photo is not None:
@@ -337,12 +387,20 @@ class SeedPicker(tk.Toplevel):
                                    outline="#ef4444", width=3)
                 canvas.create_line(sx - 12, sy, sx + 12, sy, fill="#22c55e", width=2)
                 canvas.create_line(sx, sy - 12, sx, sy + 12, fill="#22c55e", width=2)
-                canvas.create_text(sx + 8, sy - 8, text=f"{side} ({click[0]:.0f},{click[1]:.0f}) r={radius:.0f}",
+                # 画布上也写"原值"：图上估的值被换成初值后，原来那个数不能消失。
+                tail = (f"（原值 {drawn:.0f}）"
+                        if drawn > 0 and abs(drawn - radius) >= 1 else "")
+                canvas.create_text(sx + 8, sy - 8,
+                                   text=(f"{side} ({click[0]:.0f},{click[1]:.0f}) "
+                                         f"r={radius:.0f}{tail}"),
                                    fill="#22c55e", anchor="sw", font=("Consolas", 9))
         if self.left_click and self.right_click:
             warn = ""
-            if max(self.left_radius, self.right_radius) > 90:
-                warn = "  ⚠ 半径偏大：向下滚轮或直接输入更小值"
+            # 原来这里写的是 `> 90 就警告半径偏大`。实测该会话第 104 帧左路真实
+            # 轮廓约 93 px（横竖扫描线量到 1669/1857、627），90 的"上限"是错的：
+            # 球离得近时 90+ 才是对的。只有明显圈进了背景才值得提醒。
+            if max(self.left_radius, self.right_radius) > 150:
+                warn = "  ⚠ 半径 >150：确认圈住的是整颗球，不是背景"
             self.status.configure(
                 text=f"左 ({self.left_click[0]:.0f},{self.left_click[1]:.0f}) "
                      f"r={self.left_radius:.0f}  |  右 "
@@ -356,8 +414,11 @@ class SeedPicker(tk.Toplevel):
     def _reset(self) -> None:
         self.left_click = self.right_click = None
         self.left_radius = self.right_radius = 0.0
+        self.left_drawn = self.right_drawn = 0.0
         self.left_r_var.set("0")
         self.right_r_var.set("0")
+        self.left_note.configure(text="左：还没点")
+        self.right_note.configure(text="")
         self._redraw()
 
     def _save(self) -> None:
@@ -373,7 +434,7 @@ class SeedPicker(tk.Toplevel):
                 seed_frame=self.frame_index,
                 image_size=(self.left_frame.shape[1], self.left_frame.shape[0]),
                 source="gui_click",
-                note="GUI 点选球心；圆心=点击位置，半径由 Hough 估计、可微调",
+                note="GUI 点选球心；圆心=点击位置，半径由 Hough 起点 + 图上轮廓复核、可微调",
             )
         except Exception as exc:                            # noqa: BLE001
             messagebox.showerror("保存 seed", f"保存失败：{exc}", parent=self)
