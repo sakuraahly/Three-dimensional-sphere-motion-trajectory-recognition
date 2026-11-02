@@ -219,7 +219,7 @@ class DataManager(tk.Tk):
         self._build()
         self.refresh()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(100, self._poll_ui)
+        self._poll_after_id = self.after(100, self._poll_ui)
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
@@ -752,6 +752,10 @@ class DataManager(tk.Tk):
                 pass
 
     def _on_close(self) -> None:
+        # 先停轮询再决定关不关：`_poll_ui` 每 100 ms 自己续一次，窗口一旦 destroy，
+        # 那条已经排进队列的回调就会 TclError（`invalid command name "..._poll_ui"`），
+        # 而 Tk 把它打到 stderr —— `selftest_launcher_params` 会因此偶发判红。
+        self._stop_polling()
         if not self._running:
             self.destroy()
             return
@@ -772,8 +776,22 @@ class DataManager(tk.Tk):
         self._cleanup_partial()
         self.destroy()
 
+    def _stop_polling(self) -> None:
+        """取消尚未触发的 `_poll_ui`（幂等：重复调用无副作用）。"""
+        poll_id = getattr(self, "_poll_after_id", None)
+        if poll_id is None:
+            return
+        try:
+            self.after_cancel(poll_id)
+        except tk.TclError:
+            pass                      # 已经执行过/窗口已销毁
+        self._poll_after_id = None
+
     def _poll_ui(self) -> None:
         """后台线程不能碰 Tk；只把消息放进队列，这里在主线程消费。"""
+        # 窗口已在关闭流程里：不再消费、也不再续（续了就是那条 TclError 的来源）。
+        if self._closing or not self.winfo_exists():
+            return
         while True:
             try:
                 msg = self._ui_queue.get_nowait()
@@ -787,7 +805,7 @@ class DataManager(tk.Tk):
             elif kind == "done":
                 self._on_done(msg[1])
         try:
-            self.after(100, self._poll_ui)
+            self._poll_after_id = self.after(100, self._poll_ui)
         except tk.TclError:
             pass
 

@@ -17,10 +17,13 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import io
 import json
+import os
 import shutil
 import sys
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,6 +62,18 @@ from sphere_tracker.camera_registry import (  # noqa: E402
 
 # 三台典型设备：外接 A（USB\A）、外接 B（USB\B）、笔记本内置（USB\INT）
 MODULE_GUID = "{e5323777-f976-4f5b-9b55-b94699c46e44}"
+
+# 第 12/13 节要**改写模式缓存**来验证"坏缓存自己作废"与"缓存不许盖过显式请求"。
+# 这两节原先直接改写真实的 `config/camera_modes.json` 再还原 —— 在 `-j 6` 下
+# `selftest_sources` 会同时走 `_drop_mode_cache()` 写同一个文件，Windows 直接
+# 抛 PermissionError（2026-11-02 08:11 全量因此红了一次，单独跑却绿）。
+# 缓存本身只是"上次探测的备忘录"，指到进程私有临时文件即可：
+# 既不碰用户配置，也没有任何跨进程竞争。
+from sphere_tracker import sources as _sources_mod  # noqa: E402
+
+_TMP_MODE_CACHE = Path(tempfile.gettempdir()) / f"camera_modes_selftest_{os.getpid()}.json"
+_sources_mod._MODE_CACHE = _TMP_MODE_CACHE
+atexit.register(lambda: _TMP_MODE_CACHE.unlink(missing_ok=True))
 
 
 def dev(order, name="", identity="", port="", present=True, source="powershell"):
