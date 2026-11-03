@@ -1426,6 +1426,24 @@ def main() -> int:
             filter_ok = False
         checks_extra.append(("GUI 筛选/搜索：只改显示不动勾选、全选只看可见", filter_ok))
 
+        # 日期下拉有值 + 导出 README 含数据变量说明（2026-11-03）
+        try:
+            dm3 = DataManager(sroot); dm3.withdraw(); dm3.update(); dm3.refresh()
+            date_ok = len(dm3.from_box.cget("values")) > 0
+            dm3.destroy()
+        except Exception as exc:                            # noqa: BLE001
+            date_ok = False
+        from apps._data_export import (
+            ExportOptions, SessionItem, _readme as _dm_readme)
+        _probe_it = SessionItem(path=sd, id="x", created="2026-01-02 12:00:00",
+                                frames_left=1, frames_right=1, n_matched=0,
+                                status="traj", size_bytes=1)
+        readme_txt = _dm_readme([_probe_it], ExportOptions())
+        readme_ok = ("数据变量说明" in readme_txt and "traj3d.csv" in readme_txt
+                     and "segment" in readme_txt and "左相机系" in readme_txt)
+        checks_extra.append(("日期下拉有值 + 导出 README 含数据变量说明",
+                             date_ok and readme_ok))
+
         for name, passed in checks_extra:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))

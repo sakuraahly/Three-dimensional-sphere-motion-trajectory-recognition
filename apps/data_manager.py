@@ -264,16 +264,18 @@ class DataManager(tk.Tk):
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Label(toolbar, text="从").pack(side="left")
         self.from_var = tk.StringVar()
-        ttk.Entry(toolbar, textvariable=self.from_var, width=17).pack(side="left", padx=(2, 4))
+        self.from_box = ttk.Combobox(toolbar, textvariable=self.from_var, width=16)
+        self.from_box.pack(side="left", padx=(2, 4))
         ttk.Label(toolbar, text="到").pack(side="left")
         self.to_var = tk.StringVar()
-        ttk.Entry(toolbar, textvariable=self.to_var, width=17).pack(side="left", padx=(2, 4))
+        self.to_box = ttk.Combobox(toolbar, textvariable=self.to_var, width=16)
+        self.to_box.pack(side="left", padx=(2, 4))
         ttk.Button(toolbar, text="按时间选择", command=self.select_time).pack(side="left")
         ttk.Button(toolbar, text="清除时间", command=self.clear_time).pack(side="left", padx=4)
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=10)
         ttk.Button(toolbar, text="编辑名称/备注…", command=self._edit_selected).pack(
             side="left")
-        ttk.Label(toolbar, text="格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS",
+        ttk.Label(toolbar, text="日期可下拉选，或手填 YYYY-MM-DD",
                   foreground=MUTED).pack(side="left", padx=8)
 
         body = ttk.PanedWindow(self, orient="horizontal")
@@ -422,7 +424,19 @@ class DataManager(tk.Tk):
             return
         valid = {it.key for it in self.items}
         self.selected &= valid
+        self._fill_date_options()
         self._apply_filters()
+
+    def _fill_date_options(self) -> None:
+        """把会话里实际出现的日期填进「从/到」下拉（去重、升序），方便点选。"""
+        dates: set[str] = set()
+        for it in self.items:
+            c = (it.created or "").strip()
+            if len(c) >= 10:
+                dates.add(c[:10])          # YYYY-MM-DD 部分
+        ordered = sorted(dates)
+        self.from_box.configure(values=ordered)
+        self.to_box.configure(values=ordered)
 
     @staticmethod
     def _session_name(it: SessionItem) -> str:

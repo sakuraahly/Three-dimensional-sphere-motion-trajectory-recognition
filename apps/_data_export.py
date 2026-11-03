@@ -302,6 +302,46 @@ manifest.json    会话清单、类别、文件大小
 
 > **视频画面没有做自动打码。** 勾选 `annotated` 或 `raw` 时，
 > 画面里的房间、人物、屏幕内容会一起交付；请自行确认授权。
+
+## 数据变量说明（简明）
+
+### 坐标与单位
+- 三维点坐标单位**米**，坐标系**左相机系**：X 右、Y 下、Z 前（未标定时）；
+- 时间单位**秒**，`t=0` 为该段起始；速度 `m/s`，加速度 `m/s²`；
+- 像素坐标单位为**像素**，图像尺寸以各自文件头/标定为准。
+
+### `derived/traj3d.csv`（三维轨迹，核心）
+| 列 | 含义 |
+| --- | --- |
+| `frame` | 帧号（左路） |
+| `t` | 时间（秒） |
+| `matched` | 1=该帧左右配对成功，0=失败（0 的行 X/Y/Z 为空） |
+| `X, Y, Z` | 球心三维坐标（米，左相机系） |
+| `u_left, v_left, u_right, v_right` | 左右图像的像素坐标 |
+| `epipolar_px` | 极线误差（像素），越小越好 |
+| `residual_px` | 交会残差（像素） |
+| `confident` | 该帧是否高置信 |
+| `method_left, method_right` | 左右各自用的检测/跟踪方法 |
+
+### `derived/motion.csv`（速度/加速度，可选产物）
+| 列 | 含义 |
+| --- | --- |
+| `x, y, z` | 平滑后的位置（米） |
+| `vx, vy, vz, speed` | 速度分量与模（m/s） |
+| `ax, ay, az, accel` | 加速度分量与模（m/s²），**需先平滑位置再求导，原始二阶差分噪声很大** |
+| `segment` | 段号；数据有丢帧，**跨段不能连续差分/滤波，滤波器按段重置** |
+| `smoothed` | true=该点参与了平滑 |
+
+### `derived/traj3d.json` / `visualization.json`
+- `trajectory[]`：`{{frame, t, xyz, confident}}`，`xyz` 为 `[X, Y, Z]`（米）；
+- `visualization.json` 另有 `style.axes` 说明轴向、`bounds` 说明范围。
+
+### `metadata/session.json`
+- `stereo_mode`：`parallel`（平行）/ `angled`（大角度）；
+- `left/right.frame_count`、`fps`、`sync`（同步方法/偏移/置信度）；
+- `rig`（标定基线、内外参，若存在）。
+
+> 详细口径见仓库 `docs/数据标准.md` 与 `docs/运动数据交付说明.md`。
 """
 
 
