@@ -1,4 +1,4 @@
-"""装置档案管理：列出、切换当前装置（含它配的标定）。
+"""装置档案管理：列出、切换、新建当前装置（含它配的标定）。
 
 为什么需要它
 ------------
@@ -6,12 +6,9 @@
 ``config/stereo_calibration.json`` 时，换装置重新标定就会**覆盖**另一套的数据
 ——于是"90 度装置读到了平行装置的标定"。
 
-底层 ``stereo/profiles.py`` 早就支持"一套装置 = 一份档案 + 一份标定路径"
-（``RigProfile.calibration_path``），但 GUI 一直没有切换入口。这个对话框补上：
-列出所有档案、高亮当前 active、点一下切换，切换后门厅三张卡会按新装置重判就绪。
-
-只做「列表 + 切换」，不在这里建/改档案（新建走 ``apps/tools/rig_profile.py``，
-那一步人很少做，且要校验的字段多，塞进对话框反而让"切换"这个高频动作变重）。
+底层 ``stereo/profiles.py`` 支持"一套装置 = 一份档案 + 一份标定路径"
+（``RigProfile.calibration_path``）。这个对话框补上整套入口：列出、切换、
+**新建**档案（此前只有列表+切换，但档案列表初始为空，等于功能没闭环）。
 """
 
 from __future__ import annotations
@@ -32,13 +29,13 @@ from stereo import profiles  # noqa: E402
 
 
 class ProfileDialog(tk.Toplevel):
-    """装置档案切换对话框（模态）。选一个档案点「设为当前」，或「清除当前」。"""
+    """装置档案管理对话框（模态）：列出 / 切换 / 新建。"""
 
     def __init__(self, app, on_changed=None) -> None:
         super().__init__(app)
         self.app = app
         self.on_changed = on_changed
-        self.title("装置档案 · 切换当前装置")
+        self.title("装置档案 · 管理当前装置")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.transient(app)
@@ -52,7 +49,7 @@ class ProfileDialog(tk.Toplevel):
         cols = ("name", "mode", "baseline", "distance", "calib")
         heads = ("装置", "模式", "期望基线", "工作距离", "标定")
         self.tree = ttk.Treeview(body, columns=cols, show="headings", height=8)
-        for c, h, w in zip(cols, heads, (140, 80, 80, 80, 200)):
+        for c, h, w in zip(cols, heads, (140, 70, 70, 70, 210)):
             self.tree.heading(c, text=h)
             self.tree.column(c, width=w, anchor="w", stretch=(c == "calib"))
         self.tree.pack(fill="both", expand=True, pady=(0, 8))
@@ -63,9 +60,9 @@ class ProfileDialog(tk.Toplevel):
 
         bar = ttk.Frame(body)
         bar.pack(fill="x")
+        ttk.Button(bar, text="新建装置…", command=self._new_profile).pack(side="left")
         ttk.Button(bar, text="设为当前", command=self._apply).pack(side="right")
         ttk.Button(bar, text="清除当前", command=self._clear).pack(side="right", padx=(0, 6))
-        ttk.Button(bar, text="刷新", command=self._load).pack(side="left")
 
         self._load()
 
@@ -78,16 +75,16 @@ class ProfileDialog(tk.Toplevel):
             base = f"{p.expected_baseline_mm:.0f}" if p.expected_baseline_mm else "—"
             dist = f"{p.working_distance_m:.2f}" if p.working_distance_m else "—"
             calib = p.calibration_path or "（默认 config/stereo_calibration）"
-            tag = "active"
             self.tree.insert("", "end", iid=p.name,
                              values=(p.name, mode, base, dist, calib),
-                             tags=(tag,) if p.name == active else ())
+                             tags=("active",) if p.name == active else ())
         self.tree.tag_configure("active", background="#dbeafe")
         if active:
             self.tree.selection_set(active)
             self.status.configure(text=f"当前装置：{active}")
         else:
-            self.status.configure(text="未设置当前装置（用默认标定路径）")
+            self.status.configure(text="还没有装置档案 —— 点「新建装置…」建一条"
+                                       "（如「平行装置」「90度装置」），各配一份标定")
 
     def _selected(self) -> str | None:
         sel = self.tree.selection()
@@ -115,16 +112,71 @@ class ProfileDialog(tk.Toplevel):
         if self.on_changed:
             self.on_changed()
 
+    def _new_profile(self) -> None:
+        """弹一个新建档案的小表单：名称 + 模式 + 期望基线 + 工作距离。
 
-def main() -> int:
-    """独立运行（不经过门厅）时也能打开，方便排查档案问题。"""
-    from apps._gui_app import App
-    app = App()
-    app.withdraw()
-    dlg = ProfileDialog(app)
-    app.wait_window(dlg)
-    return 0
+        标定路径**自动**按装置名生成（`config/calib/<name>`），不让用户手填
+        绝对路径（`_check_calibration_path` 拒绝绝对路径与 `..`）。
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title("新建装置档案")
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill="both", expand=True)
 
+        name_var = tk.StringVar()
+        mode_var = tk.StringVar(value="parallel")
+        base_var = tk.StringVar()
+        dist_var = tk.StringVar()
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+        ttk.Label(body, text="名称（如「平行装置」「90度装置」）").pack(anchor="w")
+        ttk.Entry(body, textvariable=name_var, width=32).pack(fill="x", pady=(2, 8))
+        ttk.Label(body, text="模式").pack(anchor="w")
+        ttk.Combobox(body, textvariable=mode_var, state="readonly", width=20,
+                     values=("parallel（平行）", "angled（大角度）")).pack(anchor="w", pady=(2, 8))
+        ttk.Label(body, text="期望基线 mm（可留空，参考值）").pack(anchor="w")
+        ttk.Entry(body, textvariable=base_var, width=32).pack(fill="x", pady=(2, 8))
+        ttk.Label(body, text="工作距离 m（可留空，参考值）").pack(anchor="w")
+        ttk.Entry(body, textvariable=dist_var, width=32).pack(fill="x", pady=(2, 8))
+        ttk.Label(body, text="标定路径自动设为 config/calib/<名称>（标定时自动写入）",
+                  foreground=MUTED, wraplength=400).pack(anchor="w", pady=(0, 8))
+
+        err = ttk.Label(body, text="", foreground="#b45309", wraplength=400)
+        err.pack(anchor="w", pady=(0, 8))
+
+        def save() -> None:
+            name = name_var.get().strip()
+            mode_label = mode_var.get()
+            mode = "angled" if "angled" in mode_label else "parallel"
+            if not name:
+                err.configure(text="名称不能为空")
+                return
+            try:
+                base = float(base_var.get()) if base_var.get().strip() else None
+                dist = float(dist_var.get()) if dist_var.get().strip() else None
+            except ValueError:
+                err.configure(text="基线/工作距离要填数字（或留空）")
+                return
+            # 标定路径：仓库内相对路径，按装置名生成
+            calib_path = f"config/calib/{name}"
+            prof = profiles.RigProfile(
+                name=name, stereo_mode=mode,
+                expected_baseline_mm=base, working_distance_m=dist,
+                calibration_path=calib_path)
+            try:
+                profiles.upsert(prof)
+            except profiles.ProfileError as exc:
+                err.configure(text=str(exc))
+                return
+            dlg.destroy()
+            self._load()
+            self.status.configure(text=f"已新建装置：{name}（标定路径 {calib_path}）")
+
+        bar = ttk.Frame(body)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="确定", command=save).pack(side="right")
+        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=(0, 6))
+
+        dlg.grab_set()
