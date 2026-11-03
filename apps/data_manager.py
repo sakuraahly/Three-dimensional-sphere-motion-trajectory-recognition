@@ -34,6 +34,7 @@ from apps._data_export import (  # noqa: E402
     ExportResult,
     SessionItem,
     estimate_bytes,
+    export_motion_pair,
     export_zip,
     normalize_output,
     scan_items,
@@ -317,6 +318,12 @@ class DataManager(tk.Tk):
 
         self.export_btn = ttk.Button(right, text="开始导出", command=self.start_export)
         self.export_btn.pack(fill="x", pady=(2, 4))
+        # 「处理前 + 处理后」一次导出（2026-11-03）：对每个**已跑过三维**的选中会话，
+        # 在输出目录下成对写出 `<会话>_raw.csv`（原始轨迹，逐字节复制）与
+        # `<会话>_motion.csv`（平滑 + 速度/加速度）。不依赖 zip 与类别勾选。
+        self.export_pair_btn = ttk.Button(
+            right, text="导出 处理前+处理后 (轨迹)", command=self._export_motion_pair)
+        self.export_pair_btn.pack(fill="x", pady=(0, 4))
         ttk.Button(right, text="查看 3D + 视频", command=self._open_viewer).pack(
             fill="x", pady=(0, 4))
         clean_bar = ttk.Frame(right)
@@ -679,6 +686,39 @@ class DataManager(tk.Tk):
     def _log_line(self, text: str) -> None:
         self.log.insert("end", text + "\n")
         self.log.see("end")
+
+    def _export_motion_pair(self) -> None:
+        """「处理前 + 处理后」一次导出：成对写出 raw/motion，同步进行、不等后台线程。"""
+        if self._running:
+            self.status.configure(text="正在导出，请先等上一个任务结束")
+            return
+        chosen = [it for it in self.items if it.key in self.selected]
+        if not chosen:
+            messagebox.showinfo("导出轨迹", "先勾选至少一个会话。", parent=self)
+            return
+        out_dir = Path(self.out_var.get().strip() or self._default_output())
+        # 用户给的是 `.zip` 路径时，轨迹成对导出不该写进 zip；换成同名目录。
+        if out_dir.suffix.lower() == ".zip":
+            out_dir = out_dir.with_suffix("")
+        done, skipped = [], []
+        for it in chosen:
+            try:
+                pair = export_motion_pair(it.path, out_dir)
+            except Exception as exc:                     # noqa: BLE001
+                self._log_line(f"[跳过] {it.id}：{exc}")
+                skipped.append(it.id)
+                continue
+            if pair is None:
+                self._log_line(f"[跳过] {it.id}：还没跑过三维（没有 traj3d.csv）")
+                skipped.append(it.id)
+                continue
+            self._log_line(f"[导出] {it.id} → {pair[0].name} / {pair[1].name}")
+            done.append(it.id)
+        self.status.configure(
+            text=f"已导出 {len(done)} 个会话的处理前+处理后轨迹到 {out_dir}"
+                 + (f"；跳过 {len(skipped)} 个（未跑三维）" if skipped else ""))
+        if done:
+            self._log_line(f"共 {len(done)} 个会话，输出目录：{out_dir}")
 
     def start_export(self) -> None:
         if self._running:

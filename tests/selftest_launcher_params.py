@@ -1077,7 +1077,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="dsh_wb_") as tmp:
         base = Path(tmp)
         good = summarize_session(_make_session(base, 302, 303, True, True))
-        bad = summarize_session(_make_session(base, 302, 304, False, False))
+        # 2026-11-03 改：小差异（302/304、364/362）**不再算坏** —— 管线只是"取到短的那路结束"。
+        # 只有比例上明显掉帧（302/380 ≈ 26%）才判死。
+        small = summarize_session(_make_session(base, 364, 362, False, False))
+        bad = summarize_session(_make_session(base, 302, 380, False, False))
         rec = summarize_session(_make_session(base, 302, 303, False, False))
         # 目录 mtime 不能决定默认会话：处理旧会话会刷新 mtime。
         from apps._workbench import scan_sessions
@@ -1092,14 +1095,18 @@ def main() -> int:
         checks_wb = [
             ("好会话 -> traj，n_matched=1，Z=0.25",
              good.status == "traj" and good.n_matched == 1 and abs((good.z_min or 0) - 0.25) < 1e-9),
-            ("帧数 302/304 -> bad，并给出原因",
-             bad.status == "bad" and any("帧数不一致" in p for p in bad.problems)),
+            ("帧数 302/380（差 26%）-> bad，并给出原因",
+             bad.status == "bad" and any("明显掉帧" in p for p in bad.problems)),
+            ("帧数 364/362（差 2 帧）-> **不算坏**，只提醒可继续",
+             small.status != "bad" and any("可继续" in p for p in small.problems)),
             ("未点选 -> recorded，按钮层能据此禁用三维",
              rec.status == "recorded" and not rec.can_view),
             ("坏会话在 specular 下禁用 seed/run/view",
              not button_states(bad, True)["seed"]
              and not button_states(bad, True)["run"]
              and not button_states(bad, True)["view"]),
+            ("成对导出：有轨迹会话产出 raw+motion、raw 逐字节等于源",
+             _pair_check(base)),
             ("好会话在 specular 下启用 seed/run/view",
              button_states(good, True)["seed"]
              and button_states(good, True)["run"]
@@ -1694,6 +1701,30 @@ def main() -> int:
             print(f"  · {n}")
     print("\n判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
+
+
+def _pair_check(base) -> bool:
+    """`export_motion_pair` 端到端：造一个 traj3d.csv，导出后 raw 与源逐字节一致。"""
+    import tempfile as _tf
+    from apps._data_export import export_motion_pair
+    d = base / "pair_src"
+    (d / "derived").mkdir(parents=True)
+    (d / "session.json").write_text(
+        '{"schema":"sphere-stereo-session","version":1,"id":"pair_src"}', encoding="utf-8")
+    rows = ["frame,t,matched,X,Y,Z",
+            "0,0.000,1,0.0,0.0,0.60",
+            "1,0.033,1,0.0,0.0,0.60",
+            "2,0.066,1,0.0,0.0,0.60"]
+    src = d / "derived" / "traj3d.csv"
+    src.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with _tf.TemporaryDirectory() as td:
+        got = export_motion_pair(d, td)
+        if got is None:
+            return False
+        raw, motion = got
+        # 校验必须在 TemporaryDirectory 仍存活时做（read_bytes 此时才读得到）。
+        return (raw.name.endswith("_raw.csv") and motion.name.endswith("_motion.csv")
+                and raw.read_bytes() == src.read_bytes() and motion.stat().st_size > 0)
 
 
 if __name__ == "__main__":

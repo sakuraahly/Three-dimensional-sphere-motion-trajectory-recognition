@@ -163,9 +163,22 @@ def summarize_session(path: str | Path) -> SessionSummary:
     if s.frames_left <= 0 or s.frames_right <= 0:
         s.problems.append("缺视频帧数")
         s.status = "bad"
-    elif abs(s.frames_left - s.frames_right) > 1:
-        s.problems.append(f"左右帧数不一致 {s.frames_left}/{s.frames_right}")
-        s.status = "bad"
+    else:
+        # 帧数差多少才算"坏"：**按管线能不能跑**定，不按"差 1 帧就不行"定。
+        # 管线遇到帧数不一致只是警告「取到短的那路结束」，照常出轨迹；
+        # 实测（2026-11-03）：364/362（0.5%）→ 匹配 317/335，完全可用；
+        # 450/378（19%）→ 右路掉到 25 fps，那才是真的废。
+        # 所以阈值取 max(5 帧, 5%)：小数差只记"提醒"，大比例差才判死。
+        diff = abs(s.frames_left - s.frames_right)
+        longer = max(s.frames_left, s.frames_right)
+        tol = max(5, int(round(0.05 * longer)))
+        if diff > tol:
+            s.problems.append(
+                f"左右帧数差 {diff}（超过 {tol}）：有一路明显掉帧，三维会断续")
+            s.status = "bad"
+        elif diff > 1:
+            s.problems.append(
+                f"左右帧数差 {diff} 帧（管线按短的那路跑，可继续）")
     if s.sync_method == "none":
         s.problems.append("未同步（sync=none）")
     if any("几乎全黑" in c for c in checks):

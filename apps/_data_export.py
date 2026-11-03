@@ -441,3 +441,41 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
     archive_size = out.stat().st_size if out.exists() else total
     return ExportResult(output=out, n_sessions=len(items), n_files=file_count,
                         bytes_written=archive_size, sessions=[s.id for s in items])
+
+
+# --------------------------------------------------------------------------- #
+# "处理前 + 处理后" 一次导出（2026-11-03）
+# --------------------------------------------------------------------------- #
+def export_motion_pair(session: str | Path, out_dir: str | Path) -> tuple[Path, Path] | None:
+    """把一个会话的**原始轨迹**与**平滑/求导后轨迹**一起导出，返回两个文件路径。
+
+    为什么要成对导出：用户要在同一次操作里拿到"管线直接产出的"与"给滤波/分析用的"，
+    否则两个文件分别导出、命名还各写各的，很容易把平滑过的当成原始数据（或者反过来）。
+    命名固定为 ``<会话>_raw.csv`` / ``<会话>_motion.csv``，一眼能分。
+
+    `*_raw.csv` 是**逐字节复制** `derived/traj3d.csv`（不做任何重排/改列）：
+    原始数据一旦被"顺手规整"，就没法和旧结果对账了。
+
+    会话没有 `derived/traj3d.csv` 时返回 ``None``（调用方据此告诉用户"这段还没跑过"）。
+    """
+    import shutil
+
+    from apps.tools.export_motion import read_csv_traj, write_motion_csv
+    from stereo.motion import kinematics
+
+    sess = Path(session)
+    src = sess / "derived" / "traj3d.csv"
+    if not src.exists():
+        return None
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    raw = out / f"{sess.name}_raw.csv"
+    motion = out / f"{sess.name}_motion.csv"
+    shutil.copy2(src, raw)
+
+    frame, t, P = read_csv_traj(src)          # 注意返回顺序是 (frame, t, P)
+    if t.size == 0:
+        return None
+    kin = kinematics(t, P)
+    write_motion_csv(motion, frame, kin)
+    return raw, motion
