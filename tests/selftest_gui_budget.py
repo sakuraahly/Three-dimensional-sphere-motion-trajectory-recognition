@@ -48,6 +48,10 @@ MODE_WORDS = {"auto", "parallel", "angled"}
 L1_INPUTS_MAX = 8
 L1_BUTTONS_MAX = 5
 L2_CLICKABLE_MAX = 12
+# 大角度（angled）第②步：链式标定比 joint 多「标定方法下拉 + 采集标定板图 +
+# 检查链式输入」三个控件，是**真实且必要**的内容差异，不是"长回一个窗口装全部"。
+# 单独给它放宽 L2 上限，其余窗口仍守 12。
+ANGLED_L2_CLICKABLE_MAX = 14
 
 
 def walk(widget):
@@ -276,13 +280,20 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
               _has_seq(c, ["--method", "chain", "--same-board",
                            "--left-dir", str(dirs["left"]),
                            "--right-dir", str(dirs["right"])]), " ".join(c))
-        check("chain：参考段不存在时不带 --pair-frame（别指向空目录）",
+        # 2026-11-03 修正：单板模式（--same-board）的参考段参数是 **--ref-left/--ref-right**，
+        # 不是 --pair-frame（那是「双板」模式 --board-b-dir 才用的；calibrate_stereo 的
+        # _chain_input_error 明确说单板模式不许给 pair-frame）。旧判据把 pair-frame 写死了，
+        # 导致这个错误参数名一直没被发现——chain 标定在真机上拿不到参考段图。
+        check("chain：参考段不存在时也不带 --pair-frame（单板模式不认这个参数）",
               "--pair-frame" not in c, " ".join(c))
         dirs["ref_left"].mkdir(parents=True)
+        dirs["ref_right"].mkdir(parents=True)
         c2 = calibrate_args("chain", {}, "", "", "angled", dirs=dirs)
-        check("chain：参考段存在时带 --pair-frame <ref_left> --pair-camera left",
-              _has_seq(c2, ["--pair-frame", str(dirs["ref_left"]),
-                            "--pair-camera", "left"]), " ".join(c2))
+        check("chain：参考段存在时带 --ref-left <ref_left> --ref-right <ref_right>",
+              _has_seq(c2, ["--ref-left", str(dirs["ref_left"]),
+                            "--ref-right", str(dirs["ref_right"])]), " ".join(c2))
+        check("chain：绝不带 --pair-frame / --pair-camera（那是双板模式的参数）",
+              "--pair-frame" not in c2 and "--pair-camera" not in c2, " ".join(c2))
         check("chain：板参数仍然进命令（不是只有 joint 才带）",
               _has_seq(c2, ["--cols", "8", "--rows", "5", "--square", "25",
                             "--target", "40"]), " ".join(c2))
@@ -808,11 +819,13 @@ def main() -> int:
                 m = measure(card)
                 ok_l1 = (m["l1_inputs"] <= L1_INPUTS_MAX
                          and m["l1_buttons"] <= L1_BUTTONS_MAX)
-                ok_l2 = m["l2_clickable"] <= L2_CLICKABLE_MAX
+                l2_max = (ANGLED_L2_CLICKABLE_MAX
+                          if name == "stereo(angled)" else L2_CLICKABLE_MAX)
+                ok_l2 = m["l2_clickable"] <= l2_max
                 ok_primary = m["primary"] <= 1
                 print(f"  {title[:26]:28s} L1 输入 {m['l1_inputs']}/{L1_INPUTS_MAX}"
                       f"  按钮 {m['l1_buttons']}/{L1_BUTTONS_MAX}"
-                      f"  L2 可点 {m['l2_clickable']}/{L2_CLICKABLE_MAX}"
+                      f"  L2 可点 {m['l2_clickable']}/{l2_max}"
                       f"  主操作 {m['primary']}")
                 results.append((f"{name}「{title}」L1 预算", ok_l1))
                 results.append((f"{name}「{title}」L2 预算", ok_l2))

@@ -37,8 +37,8 @@ from apps._collapsible import CollapsibleSection
 # argv 的唯一产地在 `_actions`（见该模块 docstring）：这里只 import 名字，
 # 不再自己拼命令行 —— 否则同一个动作会有两份参数清单，已经因此出过三次缺陷。
 from apps._actions import (CHAIN_ROOT, board_args, calibrate_args,
-                           chain_dirs, check_setup_args, offline_args,
-                           record_args)
+                           chain_dirs, check_chain_inputs, check_setup_args,
+                           capture_chain_frames, offline_args, record_args)
 from apps import _actions
 from sphere_tracker.config import ColorConfig
 from sphere_tracker.paths import STEREO_ROOT, stereo_roots
@@ -385,6 +385,7 @@ class StereoWindow(tk.Toplevel):
         self.var_left = tk.StringVar(value="left")
         self.var_right = tk.StringVar(value="right")
         self.var_session = tk.StringVar(value="")
+        self._chain_step = 0     # 「采集标定板图」三段流程的游标（内参左→右→参考段）
         # 可信半径锚点（默认关）：用一次「点选球心」的左右两点定出"两路半径该差多少"，
         # 据此拒掉半径离谱的假配对。开关放在这里而不是"永远开"：它要求会话里
         # **有人点过**球心，没点过就开只会得到一条报错；默认关才符合"点了才有"。
@@ -526,6 +527,12 @@ class StereoWindow(tk.Toplevel):
 
         actions = self.surface.action_row(box)
         self.surface.primary(actions, "开始标定", self._start_calibrate)
+        if self.mode == "angled":
+            # 链式标定（chain）的前置步骤：90° 装置缺的就是这两个入口 ——
+            # 以前选 chain 只有「开始标定」，但后端要 `outputs/chain_frames/`
+            # 下的四段图，GUI 没地方采，点了标定只能看"缺图"报错。
+            self.surface.secondary(actions, "采集标定板图…", self._capture_chain_frames)
+            self.surface.secondary(actions, "检查链式输入", self._check_chain_inputs)
 
     # ------------------------------------------------------------------ #
     # ③ 采集
@@ -736,13 +743,73 @@ class StereoWindow(tk.Toplevel):
             sharpness=self.var_sharpness.get(),
             relaxed=bool(self.var_relaxed.get()))
         if method == "chain":
-            self.status.set_status(
-                f"链式标定要四个目录的图：{CHAIN_ROOT.name}\\left、right、"
-                f"ref_left、ref_right。缺图会报缺哪一段", "info")
+            # 先查四段图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
+            d = chain_dirs()
+            missing = [k for k, p in d.items() if not p.is_dir()
+                       or not any(p.iterdir())]
+            if missing:
+                self.status.set_status(
+                    "链式标定缺图：" + "、".join(missing)
+                    + "。先点「采集标定板图…」拍齐四段，再「检查链式输入」",
+                    "warn")
+                return
+            self.status.set_status("正在链式标定（读 chain_frames 四段图）…", "info")
         else:
             self.status.set_status("正在标定：会打开两个取景窗，板停稳自动存图",
                                    "info")
         self.app.tasks.start(cmd, "双目标定", on_done=self._on_calibrated)
+
+    def _capture_chain_frames(self) -> None:
+        """采集链式标定的四段图：内参左 → 内参右 → 参考段（板不动，左右成对）。
+
+        分三段依次起 `capture_board.py`，每段拍完回到界面继续下一段。
+        用 on_done 串起来：一段结束才起下一段，避免三个取景窗同时抢相机。
+        """
+        board_base = {"cols": self.var_cols.get(), "rows": self.var_rows.get(),
+                      "square": self.var_square.get()}
+        left, right = self.var_left.get(), self.var_right.get()
+        d = chain_dirs()
+        for p in d.values():
+            p.mkdir(parents=True, exist_ok=True)
+
+        # 张数与旧界面 CHAIN_STAGES 对齐：内参段 15、参考段 3（板固定，够用即可）。
+        # 别都拿 var_target（40）拍参考段——那会让"板一动不动"的前提更难守住。
+        steps = [
+            ("内参段·左（板可移动，多姿态）",
+             capture_chain_frames(stage="left", left=left, right=right,
+                                  target="15", **board_base)),
+            ("内参段·右（板可移动，多姿态）",
+             capture_chain_frames(stage="right", left=left, right=right,
+                                  target="15", **board_base)),
+            ("参考段（板**固定不动**，左右成对拍）",
+             capture_chain_frames(stage="ref", left=left, right=right,
+                                  target="3", **board_base)),
+        ]
+        self._chain_step = 0
+
+        def run_next(_task=None):
+            if self._chain_step >= len(steps):
+                self.status.set_status(
+                    "四段图拍完。点「检查链式输入」确认没问题，再点「开始标定」",
+                    "info")
+                return
+            label, cmd = steps[self._chain_step]
+            self._chain_step += 1
+            self.status.set_status(f"[{self._chain_step}/{len(steps)}] {label}。"
+                                   "取景窗里板停稳会自动存图；拍完关窗回到这里", "info")
+            self.app.tasks.start(cmd, label, on_done=run_next)
+
+        run_next()
+
+    def _check_chain_inputs(self) -> None:
+        """拍完先自检（姿态覆盖 / 参考段板是否移动），别等标定跑完才发现图不行。"""
+        cmd = check_chain_inputs(
+            cols=self.var_cols.get(), rows=self.var_rows.get(),
+            square=self.var_square.get())
+        self.status.set_status(
+            "检查链式输入（读 chain_frames 四段图，报姿态覆盖与参考段板是否移动）…",
+            "info")
+        self.app.tasks.start(cmd, "链式输入自检")
 
     def _on_calibrated(self, _task) -> None:
         self.app.state.reload()

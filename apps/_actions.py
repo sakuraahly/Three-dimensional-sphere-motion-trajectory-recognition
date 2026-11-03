@@ -120,9 +120,16 @@ def calibrate_args(method: str, board: dict | None = None,
         cmd += ["--method", "chain", "--same-board",
                 "--left-dir", str(d["left"]),
                 "--right-dir", str(d["right"])] + board_args(board)
-        # 参考段的双路同拍图作为"同一块板"的证据
+        # 单板模式（--same-board）的参考段是 **--ref-left / --ref-right**，
+        # 不是 --pair-frame（那是「双板」模式 --board-b-dir 才用的参数，
+        # calibrate_stereo.py 的 _chain_input_error 明确说单板模式不许给 pair-frame）。
+        # 这里曾误传 --pair-frame —— 后端直接把它当双板模式处理，参考段参数对不上，
+        # 90° 单板链式标定于是跑不通。参考段真有图才传（指向不存在的目录等于给
+        # 后端一个必然失败的证据，不如不提）。
         if Path(d["ref_left"]).exists():
-            cmd += ["--pair-frame", str(d["ref_left"]), "--pair-camera", "left"]
+            cmd += ["--ref-left", str(d["ref_left"])]
+        if Path(d["ref_right"]).exists():
+            cmd += ["--ref-right", str(d["ref_right"])]
     else:
         cmd += ["--method", "joint"] + board_args(board)
         if method == "joint_skip_fov":
@@ -357,6 +364,49 @@ def capture_board(*, out: str | Path, cols: str, rows: str, square: str,
     args = [str(out), "--cols", str(cols), "--rows", str(rows),
             "--square", str(square), "--target", str(target), "--auto"]
     return _argv(_TOOLS / "capture_board.py", *args, *(extra or []))
+
+
+def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
+                         target: str, left: str = "left", right: str = "right",
+                         dirs: dict | None = None) -> list[str]:
+    """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
+
+    ``stage`` ∈ {``left``, ``right``, ``ref``}，与旧界面 `启动程序.py` 的
+    ``CHAIN_STAGES`` 同构：
+    - ``left``/``right``：内参段，单路（板可移动，多姿态）；
+    - ``ref``：参考段，``--both`` 双路同拍（板**固定不动**，这是 T_AB=I 的前提）。
+
+    90° 单板链式标定缺的就是这一环：新界面以前只给「开始标定」按钮，chain 后端
+    需要 `outputs/chain_frames/{left,right,ref_left,ref_right}` 四段图，但 GUI
+    没有任何采集入口，用户点了标定只能看到"缺图"报错。这段动作把它补上。
+
+    参考段**不传** ``--camera-left/--camera-right``：与旧界面一致，让
+    `capture_board.py` 自己按 left/right 角色取相机（角色绑定更稳，索引会漂移）。
+    """
+    d = dirs if dirs is not None else chain_dirs()
+    if stage == "ref":
+        return _argv(
+            _TOOLS / "capture_board.py", "--both",
+            "--out-left", str(d["ref_left"]),
+            "--out-right", str(d["ref_right"]),
+            "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+            "--target", str(target), "--auto")
+    side = "left" if stage == "left" else "right"
+    out = d["left"] if stage == "left" else d["right"]
+    return _argv(
+        _TOOLS / "capture_board.py", "--out", str(out), "--side", side,
+        "--camera", str(left if stage == "left" else right or "").strip() or side,
+        "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+        "--target", str(target), "--auto")
+
+
+def check_chain_inputs(*, cols: str, rows: str, square: str,
+                       dirs: dict | None = None) -> list[str]:
+    """链式标定输入自检（`check_chain_inputs.py`），拍完先跑这个。"""
+    d = dirs if dirs is not None else chain_dirs()
+    return _argv(
+        _TOOLS / "check_chain_inputs.py", "--root", str(Path(d["left"]).parent),
+        "--cols", str(cols), "--rows", str(rows), "--square", str(square))
 
 def check_setup_args(*, left: str = "left", right: str = "right",
                      board: dict | None = None) -> list[str]:
