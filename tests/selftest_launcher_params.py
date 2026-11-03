@@ -1444,6 +1444,18 @@ def main() -> int:
         checks_extra.append(("日期下拉有值 + 导出 README 含数据变量说明",
                              date_ok and readme_ok))
 
+        # 按钮文字（2026-11-03）：开始导出标注 zip、轨迹导出标注 csv、右上角合并成一个刷新按钮
+        try:
+            dm4 = DataManager(sroot); dm4.withdraw(); dm4.update()
+            btn_ok = (dm4.export_btn.cget("text") == "开始导出 (zip)"
+                      and dm4.export_pair_btn.cget("text") == "导出轨迹数据 (csv)"
+                      and dm4.head_refresh.cget("text") == "刷新数据目录")
+            dm4.destroy()
+        except Exception as exc:                            # noqa: BLE001
+            btn_ok = False
+        checks_extra.append(("按钮文字：开始导出(zip)/导出轨迹数据(csv)/刷新数据目录",
+                             btn_ok))
+
         for name, passed in checks_extra:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))

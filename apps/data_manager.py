@@ -235,10 +235,14 @@ class DataManager(tk.Tk):
         tk.Label(head, text="勾选会话 → 选类别 → 自动去标识 → 打成有目录的 zip",
                  bg=ACCENT, fg="#dbeafe",
                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 8), pady=(10, 2))
-        ttk.Button(head, text="数据目录…", command=self.choose_root).pack(
-            side="right", padx=(4, 12), pady=8)
-        ttk.Button(head, text="刷新", command=self.refresh).pack(side="right", pady=8)
-        # 搜索框（实时匹配会话 id / 名称 label），放头部右侧，和刷新/数据目录并列
+        # 一个按钮同时做两件事：单击=刷新当前目录，右键=换数据目录。
+        # 之前「刷新」「数据目录…」两个按钮语义重叠（换目录后本来就自动刷新），
+        # 合并成一个，减少"到底点哪个"的困惑。
+        self.head_refresh = ttk.Button(head, text="刷新数据目录",
+                                       command=self.refresh)
+        self.head_refresh.pack(side="right", padx=(4, 12), pady=8)
+        self.head_refresh.bind("<Button-3>", lambda _e: self.choose_root())
+        # 搜索框（实时匹配会话 id / 名称 label），放头部右侧，和刷新数据目录并列
         ttk.Label(head, text="搜索", background=ACCENT, foreground="white").pack(
             side="right", padx=(4, 2), pady=8)
         self.search_var = tk.StringVar()
@@ -336,13 +340,13 @@ class DataManager(tk.Tk):
         ttk.Entry(out_box, textvariable=self.out_var).pack(fill="x", pady=(0, 4))
         ttk.Button(out_box, text="选择 zip 路径…", command=self.browse_output).pack(anchor="w")
 
-        self.export_btn = ttk.Button(right, text="开始导出", command=self.start_export)
+        self.export_btn = ttk.Button(right, text="开始导出 (zip)", command=self.start_export)
         self.export_btn.pack(fill="x", pady=(2, 4))
         # 「处理前 + 处理后」一次导出（2026-11-03）：对每个**已跑过三维**的选中会话，
         # 在输出目录下成对写出 `<会话>_raw.csv`（原始轨迹，逐字节复制）与
-        # `<会话>_motion.csv`（平滑 + 速度/加速度）。不依赖 zip 与类别勾选。
+        # `<会话>_motion.csv`（平滑 + 速度/加速度）及 `数据说明.md`。不依赖 zip 与类别勾选。
         self.export_pair_btn = ttk.Button(
-            right, text="导出 处理前+处理后 (轨迹)", command=self._export_motion_pair)
+            right, text="导出轨迹数据 (csv)", command=self._export_motion_pair)
         self.export_pair_btn.pack(fill="x", pady=(0, 4))
         ttk.Button(right, text="查看 3D + 视频", command=self._open_viewer).pack(
             fill="x", pady=(0, 4))
