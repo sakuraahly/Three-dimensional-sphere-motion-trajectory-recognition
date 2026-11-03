@@ -456,7 +456,7 @@ class BallSettings:
                  methods, presets=(), method_var: tk.StringVar | None = None,
                  preset_var: tk.StringVar | None = None, kind: str = "",
                  diameter_var: tk.StringVar | None = None,
-                 diameter_label: str = "球直径（有效值）", diameter_width: int = 8,
+                 diameter_label: str = "球直径（mm）", diameter_width: int = 8,
                  on_diameter_key=None, radius_vars: tuple | None = None,
                  on_change=None) -> None:
         self.surface = surface

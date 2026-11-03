@@ -519,14 +519,18 @@ def _mono_session_checks() -> list[tuple[str, bool]]:
     # （``sphere_tracker/config.py`` = 0.0216）。原样传 21.6 等于"球有 21.6 米大"，
     # 实测 ``data/mono/20261029-205522`` 上 40 帧**一个三维点都没有**。
     # 所以这里的期望值全部是米，并多看一条"永远 < 1"。
-    from apps._gui_mono import EFFECTIVE_DIAMETER_MM, diameter_arg
+    from apps._gui_mono import diameter_arg, diameter_problem
 
-    want = f"{EFFECTIVE_DIAMETER_MM / 1000.0:g}"
-    ck("球径留空 → 命令行用有效直径（米，不是旧默认 40）",
-       diameter_arg("") == want and diameter_arg("40") == "0.04",
+    # 2026-11-03 改：球径**没有默认值**了。留空 = 不传参数（而不是兜底成 21.6），
+    # 由 `run_video` 在启动前拒跑、界面在这里先拦住。原因见 config.py 那段注释：
+    # 测试球尺寸跨度大，猜一个数会让 Z 按 1:1 比例错。
+    ck("球径留空 → 不传 --ball-diameter（不再兜底成有效直径）",
+       diameter_arg("") == "" and diameter_arg("40") == "0.04",
        f"空→{diameter_arg('')!r}，填 40→{diameter_arg('40')!r}")
-    ck("球径只有空白 → 也退回有效直径",
-       diameter_arg("   ") == want, repr(diameter_arg("   ")))
+    ck("球径只有空白 → 同样不传",
+       diameter_arg("   ") == "", repr(diameter_arg("   ")))
+    ck("留空必须能说清后果（不是静默）",
+       bool(diameter_problem("")) and "Z" in diameter_problem(""), repr(diameter_problem("")))
     ck("球径填了就用填的，且换算成米（mm ÷ 1000）",
        diameter_arg(" 30 ") == "0.03", repr(diameter_arg(" 30 ")))
     ck("反向：界面填 21.6（mm）→ 命令行 0.0216（米），不许出现 21.6",
@@ -880,24 +884,18 @@ def main() -> int:
         real_tasks = mono.app.tasks
         mono.app.tasks = _StubTasks()
         try:
-            mono.var_diameter.set("")           # 用户把输入框清空
+            # 2026-11-03：球径**没有默认值**了。留空必须**拦住**，
+            # 而不是拿 21.6 mm 顶上 —— 测试球尺寸跨度大，猜一个数会让 Z 按比例错。
+            captured.clear()
+            mono.var_diameter.set("")
             mono._start_realtime()
+            note = mono.status._label.cget("text")
+            ok_diam = (not captured) and ("球径" in note) and ("Z" in note)
+            print(f"  [{'通过' if ok_diam else '不达标'}] 单目窗球径留空 → 不起任务且说清为什么"
+                  f"（命令 {len(captured)} 条，状态条尾部：…{note[-34:]}）")
+            results.append(("球径留空先拦住", ok_diam))
         finally:
             mono.app.tasks = real_tasks
-        got = ""
-        if captured and "--ball-diameter" in captured[0]:
-            cmd = captured[0]
-            got = cmd[cmd.index("--ball-diameter") + 1]
-        try:
-            ok_diam = (got != LEGACY_DIAMETER
-                       and abs(float(got) - want_m) < 1e-9)
-        except ValueError:
-            ok_diam = False
-        print(f"  [{'通过' if ok_diam else '不达标'}] 单目窗球径留空 → "
-              f"命令行 --ball-diameter {got or '(缺失)'}"
-              f"（应为 {want_m:g} 米 = {EFFECTIVE_DIAMETER_MM:g} mm，"
-              f"不是旧默认 {LEGACY_DIAMETER}，也不是 {EFFECTIVE_DIAMETER_MM:g}）")
-        results.append(("单目窗球径留空传有效直径", ok_diam))
 
         # ---------- 单目窗：离线视频传不传 fx、焦距估计传不传球径 ----------
         # 与上面同源的失效方式：界面里填了、命令行里没有（或反过来）。
@@ -915,7 +913,7 @@ def main() -> int:
             mono._session = _FakeSess()
 
             captured.clear()
-            mono.var_diameter.set("")
+            mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
             mono.var_focal.set("1500")
             mono._start_video()
             cmd = captured[0] if captured else []
@@ -993,7 +991,7 @@ def main() -> int:
             mono_mod.find_clip = real_find
             mono._session = real_sess
             mono.var_focal.set("")
-            mono.var_diameter.set("")
+            mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
             mono.app.tasks = real_tasks
 
         # ---------- 单目窗：检测器下拉 / --vis-json / 「看 3D」（2026-10-29 增）----------
@@ -1010,7 +1008,7 @@ def main() -> int:
         try:
             mono_mod.find_clip = lambda _p: Path("outputs/_fake_mono_session/clip.mkv")
             mono._session = _FakeSess()
-            mono.var_diameter.set("")
+            mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
             mono.var_focal.set("")
 
             mono.var_detector.set("hough")
@@ -1136,7 +1134,7 @@ def main() -> int:
                 mono.app.tasks = _StubTasks()
                 mono.var_source.set(SOURCE_OFFLINE)
                 mono.var_focal.set("")
-                mono.var_diameter.set("")
+                mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
 
                 captured.clear()
                 mono.var_detector.set("color")      # 用户没动检测器：默认 color
@@ -1252,7 +1250,7 @@ def main() -> int:
                 print(f"  [{'通过' if ok_reg else '不达标'}] 双目窗「检测方法」下拉项 == "
                       f"注册表（{len(shown)} 项：{list(shown)}）")
                 results.append(("自定义档的下拉项等于注册表", ok_reg))
-                mono.var_diameter.set("")
+                mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
                 mono.var_preset.set("不使用")
                 mono.ball.set_kind(BALL_PLASTIC)
 
@@ -1262,7 +1260,7 @@ def main() -> int:
             mono_mod.find_clip = real_find
             mono._session = real_sess
             mono.var_focal.set("")
-            mono.var_diameter.set("")
+            mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
             mono.var_detector.set("color")
             mono.var_source.set(SOURCE_OFFLINE)
             mono._auto_retry_pending = False

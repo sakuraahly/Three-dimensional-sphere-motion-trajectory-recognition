@@ -497,6 +497,15 @@ def main() -> int:
         cfg.detector.color = ColorConfig.preset(args.preset)
     if args.ball_diameter:
         cfg.camera.ball_diameter_m = args.ball_diameter
+    # 球径**没有默认值**：课题的测试球从几毫米到几十毫米都有，而单目测深
+    # `Z = f·D/(2r)` 对 D 是 1:1 的 —— 替你猜一个数，就是把"我不知道球多大"
+    # 悄悄变成"深度偏了 N%"（`CameraModel` 的注释里记着历史上三份默认值打架的事）。
+    # 所以这里**停在启动前**，并把"怎么给"和"会给成什么单位"一次说清。
+    if cfg.camera.ball_diameter_m is None:
+        print("[错误] 没有球径，单目无法估深：Z = f·D/(2r)，D 错 10% 深度就错 10%。\n"
+              "       用 --ball-diameter 给**米**（如 25 mm 的球写 0.025），\n"
+              "       或先量好再跑；本项目不再提供任何默认球径。", flush=True)
+        return 2
     # 内参：标定文件（含畸变）优先，--focal 再覆盖；**来源每次都打印**
     print(f"[{apply_mono_calibration(cfg, args)}]")
     if args.predict:

@@ -252,44 +252,43 @@ def diameter_mm_or_none(text: str) -> float | None:
 
 
 def diameter_arg(text: str) -> str:
-    """把框里的球径（**mm**）变成命令行要用的值（**米**）：空 / 非法 → 有效直径。
+    """把框里的球径（**mm**）变成命令行要用的值（**米**）：空 / 非法 → ``""``（不传）。
 
     ⚠️ 这条 ``/1000`` 是 2026-10-31 实测出来的断链，别删：
-    界面按 mm 收（标签「球直径（有效值）」，默认 21.6），而 ``--ball-diameter``
-    和 ``AppConfig.ball_diameter_m``（``sphere_tracker/config.py`` = 0.0216）
-    按 **米** 收。原样传 21.6 等于告诉程序"球有 21.6 米大"，
-    ``run_video`` 于是**一帧有效三维点都没有**（``data/mono/20261029-205522``
-    实测 40 帧全丢），而日志只写"没有三维点"，界面还显示"已完成"。
+    界面按 mm 收（人量卡尺用的是 mm），而 ``--ball-diameter`` 与
+    ``AppConfig.ball_diameter_m`` 按 **米** 收。原样传 21.6 等于告诉程序
+    "球有 21.6 米大"，``run_video`` 于是**一帧有效三维点都没有**。
 
-    为什么留空要有兜底而不是"不传"：``run_video`` / ``run_realtime`` 的
-    ``--ball-diameter`` 默认是 ``None``，再落到 ``AppConfig.camera`` —— 不传就
-    会拿库默认值算，而界面上显示的又是另一个数（实测踩过：显示 21.6、传 40）。
-    清空输入框是常见动作（改到一半、想重填），所以这里不能让它变成"用别的数"。
-
-    抽成模块级纯函数是为了能被测：界面上"点什么按钮传什么参"只有抓 argv 才看得见。
+    **2026-11-03 改：留空不再兜底成 21.6 mm。** 原因是课题的测试球会从几毫米
+    到几十毫米大范围变化，"有效直径 21.6"（镜面球高光半径偏小 13.6% 的产物）
+    对别的球毫无意义；而单目 ``Z = f·D/(2r)`` 对 D 是 1:1 的 —— 兜底一个数，
+    就是把"我不知道"变成"深度按比例错"。现在留空 = **不传**，由 ``run_video``
+    在启动前明确拒绝，界面这一层也会先拦住并说明要填什么。
     """
-    mm = diameter_mm_or_none(text) or DEFAULT_DIAMETER_MM
-    return f"{mm / 1000.0:g}"
+    mm = diameter_mm_or_none(text)
+    return "" if mm is None else f"{mm / 1000.0:g}"
 
 
 def diameter_text_mm(text: str) -> str:
     """给**界面文案**用的球径（mm）。与 ``diameter_arg`` 分开是为了不混单位。
 
-    状态条里写 ``D=21.6 mm`` 是对的（人量的是 mm）；写 ``D=0.0216`` 会让人
+    状态条里写 ``D=25 mm`` 是对的（人量的是 mm）；写 ``D=0.025`` 会让人
     以为填错了单位。所以"进命令行用米、给人看用 mm"这两件事各有一个入口。
+    留空时返回空串 —— 不再编一个 21.6 出来。
     """
-    mm = diameter_mm_or_none(text) or DEFAULT_DIAMETER_MM
-    return f"{mm:g}"
+    mm = diameter_mm_or_none(text)
+    return "" if mm is None else f"{mm:g}"
 
 
 def diameter_problem(text: str) -> str:
-    """这个输入会不会被"默默换个数"？会的话返回要写进状态条的一句，否则空串。"""
+    """这个输入会不会让单目拿不到三维？会的话返回要写进状态条的一句，否则空串。"""
     raw = (text or "").strip()
     if not raw:
-        return f"球径留空，按有效直径 {DEFAULT_DIAMETER_MM:g} mm 算"
+        return ("球径没填：单目估深 Z = f·D/(2r) 需要它，留空就不会出三维"
+                "（填毫米，比如 25 mm 的球写 25）")
     if diameter_mm_or_none(raw) is None:
-        return (f"球径那一栏「{raw}」不是有效的毫米数，已按 {DEFAULT_DIAMETER_MM:g} mm "
-                f"算 —— 这里要填毫米（例如 21.6），不是 0.0216")
+        return (f"球径那一栏「{raw}」不是有效的毫米数 —— 这里填毫米（例如 25），"
+                f"不是 0.025")
     return ""
 
 
@@ -312,12 +311,13 @@ def migrate_legacy_diameter(prefs) -> str:
     if prefs.get_str("mono.diameter_mm", "").strip() != LEGACY_DIAMETER:
         prefs.save()
         return ""
-    new = f"{EFFECTIVE_DIAMETER_MM:g}"
-    prefs.set("mono.diameter_mm", new)
+    # 2026-11-03：不再"40 → 21.6"。21.6 mm 是那颗 25 mm **镜面球**的有效直径
+    # （高光半径偏小 13.6% 反推出来的），对别的球毫无意义；而球径现在没有默认值，
+    # 留着 21.6 等于又造了一个隐式预设。改为**清空**，让用户按手里的球重填。
+    prefs.set("mono.diameter_mm", "")
     prefs.save()
-    return (f"球直径已从旧默认 {LEGACY_DIAMETER} 改为有效直径 {new}"
-            f"（名义 {NOMINAL_DIAMETER_MM:g} mm，高光半径偏小 "
-            f"{MEASURED_RADIUS_SHRINK * 100:.1f}%）；若你确实想用别的值，直接改这一栏")
+    return (f"旧默认球直径 {LEGACY_DIAMETER} mm 已清空 —— 球径现在没有默认值，"
+            f"请按实际球的直径（毫米）重填；单目测深 Z 对它是 1:1 的")
 
 
 def error_budget(fx: float, diameter_mm: float,
@@ -589,13 +589,13 @@ class MonoWindow(tk.Toplevel):
         self.var_rows = tk.StringVar(value=prefs.get_str("board.rows", "5"))
         self.var_square = tk.StringVar(value=prefs.get_str("board.square_mm", "25"))
         self.var_target = tk.StringVar(value=prefs.get_str("mono.target", "15"))
-        # 兜底值是**有效**直径（21.6），不是卡尺量的 25：标签写的是"有效值"，
-        # 而 ``Z = f·D/(2r)`` 里的 r 来自检测器（系统性偏小 13.6%），
-        # 填名义值会让 Z 全帧偏大 15.7%。旧默认 40 由 migrate 一次性改掉。
+        # **没有默认值（2026-11-03 改）**：测试球会从几毫米到几十毫米变化，
+        # "有效直径 21.6" 只对那颗 25 mm 镜面球成立（它还把高光半径偏小 13.6%
+        # 折进去了）。留空时界面会拦住并说明要填什么，而不是替用户猜一个数 ——
+        # 猜错的话 Z 会按 1:1 比例错，而且看起来完全"正常"。
         self._diameter_note = migrate_legacy_diameter(prefs)
         self.var_diameter = tk.StringVar(
-            value=prefs.get_str("mono.diameter_mm",
-                                f"{EFFECTIVE_DIAMETER_MM:g}"))
+            value=prefs.get_str("mono.diameter_mm", ""))
         self.var_focal = tk.StringVar(
             value=prefs.get_str("mono.focal_override", ""))   # 空 = 用标定值
         self.var_record_secs = tk.StringVar(
@@ -1720,6 +1720,12 @@ class MonoWindow(tk.Toplevel):
         return "color" if name == SMART else name
 
     def _start_realtime(self) -> None:
+        # 没有球径就不启动：`run_video` 会直接拒跑（Z = f·D/(2r) 对 D 1:1），
+        # 让它跑到一半再报错，用户只会看到"进程退出、没结果"。
+        problem = diameter_problem(self.var_diameter.get())
+        if problem:
+            self.status.set_status(problem + " —— 已取消启动", "error")
+            return
         # 检测器必须显式传：界面选了却不传，等于"显示 hough、实际跑 color"，
         # 与"显示 21.6 却传 40"是同一类静默失效。
         cmd = _actions.run_realtime(diameter_m=self._diameter_arg(),
@@ -1759,6 +1765,11 @@ class MonoWindow(tk.Toplevel):
         用户点了球还让它自己找，等于白点。
         """
         clip = find_clip(self._session.path) if self._session is not None else None
+        # 与实时同理：没有球径就先把话说清，不要起一个注定要退出的进程。
+        problem = diameter_problem(self.var_diameter.get())
+        if problem:
+            self.status.set_status(problem + " —— 已取消启动", "error")
+            return
         # 种子在**产生命令行之前**定：因为它会改写检测器（specular），
         # 而 --method 跟着检测器走。放在后面拼，就是"带了种子却跑了别的检测器"。
         seed_value, seed_note = self._seed_for_command(clip)

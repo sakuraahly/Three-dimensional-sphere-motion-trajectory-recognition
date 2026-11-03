@@ -123,6 +123,12 @@ class SpherePipeline:
             return
         h, w = frame.shape[:2]
         c = self.cfg.camera
+        if c.ball_diameter_m is None:
+            # 没有球径 = 不估深。`Z = f·D/(2r)` 对 D 是 1:1 的，猜一个数只会得到
+            # "看起来对、其实按比例错"的深度；而这一层也可能只被用来出**像素轨迹**
+            # （检测/跟踪根本不需要球径），拒跑会把它一起废掉。所以这里静默跳过，
+            # 由 `run_video` 在启动前明确拦一次（那里才知道用户要不要三维）。
+            return
         self.camera = CameraModel(
             width=w, height=h, fx=c.fx, fy=c.fy, cx=c.cx, cy=c.cy,
             hfov_deg=c.hfov_deg, ball_diameter_m=c.ball_diameter_m,
