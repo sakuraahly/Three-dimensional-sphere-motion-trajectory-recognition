@@ -587,6 +587,7 @@ class HubWindow(tk.Toplevel):
         # 工作台在这里出现，是因为它的对象是"任意一段历史会话"，
         # 不属于某一种装置；当前会话的 ①–⑤ 在双目窗第 ④ 步就地做。
         self.surface.secondary(row, "会话工作台", self.app.open_bench)
+        self.surface.secondary(row, "装置档案", self._open_profiles)
         self.surface.secondary(row, "重新读取标定", self._reload_state)
         # 过渡入口：旧界面还没删完，明确标注并给出它将消失的时间点，
         # 而不是让用户自己猜"两个入口哪个是真的"。
@@ -598,6 +599,22 @@ class HubWindow(tk.Toplevel):
         self._refresh()
         ok, msg = True, "已重新读取装置与标定状态"
         self.status.set_status(msg, "ok" if ok else "warn")
+
+    def _open_profiles(self) -> None:
+        """打开装置档案管理（列出 + 切换当前装置）。
+
+        切换装置后要**重读状态**：门厅三张卡的就绪判定、每个模式窗顶部的
+        "装置档案：xxx"都依赖 active profile，不重读就还是旧装置的结论。
+        """
+        from apps.profile_dialog import ProfileDialog
+
+        def changed() -> None:
+            self.app.state.reload()
+            self._refresh()
+            self.status.set_status(
+                "已切换装置档案，三张卡与各窗口的标定判定已按新装置重读", "ok")
+
+        ProfileDialog(self.app, on_changed=changed)
 
     def _open_cameras(self) -> None:
         """打开相机设备管理（识别 / 固定 / 标无关）。

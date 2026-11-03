@@ -269,6 +269,21 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
           and _has_seq(filled, ["--min-sharpness", "1200"])
           and "--relaxed" in filled, " ".join(filled))
 
+    # ---- 装置档案：标定落盘按 active profile 走（2026-11-03）----
+    # 标定要写进"当前装置专属"的 calibration_path，而不是总覆盖 config/stereo_calibration
+    # —— 否则换 90° 装置重新标定就把平行装置的标定冲掉了。
+    no_out = calibrate_args("joint", {}, "", "", "parallel")
+    check("不传 out 时不带 --out（走脚本默认 config/stereo_calibration）",
+          "--out" not in no_out, " ".join(no_out))
+    with_out = calibrate_args("joint", {}, "", "", "parallel",
+                              out="config/calib/parallel_rig")
+    check("传 out=config/calib/parallel_rig 时带 --out 该路径",
+          _has_seq(with_out, ["--out", "config/calib/parallel_rig"]),
+          " ".join(with_out))
+    blank_out = calibrate_args("joint", {}, "", "", "parallel", out="  ")
+    check("out 只填空格也算空（不传 --out 空串）",
+          "--out" not in blank_out, " ".join(blank_out))
+
     # ---- 对标老窗口 §5/§7：chain 分支与参考段 ----
     import tempfile
     with tempfile.TemporaryDirectory(prefix="stereo_args_") as tmp:

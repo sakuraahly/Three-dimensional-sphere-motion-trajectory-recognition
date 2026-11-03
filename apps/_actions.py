@@ -92,7 +92,8 @@ def calibrate_args(method: str, board: dict | None = None,
                    mode: str = "parallel", *,
                    stationary: str = "", sharpness: str = "",
                    relaxed: bool = False, backend: str = "",
-                   dirs: dict | None = None) -> list[str]:
+                   dirs: dict | None = None,
+                   out: str = "") -> list[str]:
     """双目标定的完整 argv。
 
     三条分支的差别**只在参数**，不在文案：
@@ -165,6 +166,12 @@ def calibrate_args(method: str, board: dict | None = None,
         _pairs = 0
     if _pairs > 0:
         cmd += ["--min-pairs", str(min(20, _pairs))]
+    # `--out` 只在调用方给出**具体**路径时才传：空 = 让脚本用默认
+    # ``config/stereo_calibration``。GUI 会传当前装置档案的 `calibration_path`，
+    # 让标定写进"这套装置专属"的路径，而不是总覆盖默认文件（否则换 90° 装置
+    # 重新标定就把平行装置的标定冲掉了）。
+    if str(out or "").strip():
+        cmd += ["--out", str(out).strip()]
     return cmd
 def offline_stereo(session: str | Path, *, mode: str = "",
                    anchor: bool = False, method: str = "", seed_json: str = "",

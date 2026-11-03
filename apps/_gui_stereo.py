@@ -734,6 +734,10 @@ class StereoWindow(tk.Toplevel):
 
     def _start_calibrate(self) -> None:
         method = self._method_key()
+        # 标定写进「当前装置档案」的 calibration_path（若有），否则走默认
+        # config/stereo_calibration。这样平行装置和 90° 装置各存各的标定，
+        # 换装置重新标定不会覆盖另一套的数据。
+        prof = getattr(self.app.state.profile, "calibration_path", None)
         cmd = calibrate_args(
             method,
             {"cols": self.var_cols.get(), "rows": self.var_rows.get(),
@@ -741,7 +745,8 @@ class StereoWindow(tk.Toplevel):
             self.var_left.get(), self.var_right.get(), self.mode,
             stationary=self.var_stationary.get(),
             sharpness=self.var_sharpness.get(),
-            relaxed=bool(self.var_relaxed.get()))
+            relaxed=bool(self.var_relaxed.get()),
+            out=(prof or ""))
         if method == "chain":
             # 先查四段图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
             d = chain_dirs()
