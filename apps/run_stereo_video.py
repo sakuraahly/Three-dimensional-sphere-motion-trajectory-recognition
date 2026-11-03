@@ -40,6 +40,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -1092,9 +1093,18 @@ def main() -> int:
               "不会覆盖正式文件。")
 
     writer = None
+    video_tmp: Path | None = None
     if not args.no_video:
+        # 写临时文件，收尾成功再原子改名成正式名：mp4v 的 moov atom 只在 release()
+        # 落盘，进程被强杀会留下"存在但打不开"的 annotated.mp4（moov atom not
+        # found），查看器 .exists() 判它存在、cv2 却打不开 → 视频黑屏。写 .tmp
+        # 后中断只留垃圾，正式名永远是"完整"或"不存在"。
+        # 临时名**结尾必须仍是 .mp4**：cv2.VideoWriter 靠后缀认容器，否则
+        # writer.isOpened() 返回 False。
+        video_tmp = video_path.with_name(
+            video_path.stem + ".tmp" + video_path.suffix)
         writer = cv2.VideoWriter(
-            str(video_path),
+            str(video_tmp),
             cv2.VideoWriter_fourcc(*"mp4v"), fps, (1920, 540))
         if not writer.isOpened():
             print("[警告] 打不开标注视频 writer，继续只写 CSV")
@@ -1257,6 +1267,12 @@ def main() -> int:
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(rows)
+
+    # release 已把 moov atom 写进 .partial，现在原子改名成正式名。只有跑到这里
+    # （读完整段 + 写完 CSV）才会发生，所以 annotated.mp4 要么完整、要么不存在，
+    # 不再有"存在但 moov 缺失"的坏文件骗过 .exists()。
+    if video_tmp is not None and video_tmp.exists():
+        os.replace(video_tmp, video_path)
 
     elapsed = time.perf_counter() - t0
     print()

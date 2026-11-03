@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -532,14 +533,25 @@ def main() -> int:
     wins = WindowManager()
 
     writer = None
+    out_partial: Path | None = None
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter.fourcc(*"mp4v")
         # fps 可能是 -1（某些摄像头/异常文件），必须是正数才能写出可播放的视频
         out_fps = src.info.fps if (src.info.fps and src.info.fps > 1.0) else 30.0
-        writer = cv2.VideoWriter(args.out, fourcc, out_fps, (src.info.width, src.info.height))
+        # 写临时文件，收尾成功后再原子改名成正式名：mp4v 的 moov atom 只在
+        # release() 时落盘，进程被强杀（任务管理器 3 秒优雅不退就 taskkill /F）
+        # 会留下一个"存在但打不开"的 annotated.mp4（moov atom not found），
+        # 查看器用 .exists() 判它存在、cv2 却打不开，表现为"视频黑屏/不显示"。
+        # 写 .tmp 后，中断只留 .tmp 垃圾，正式名永远是"完整"或"不存在"。
+        # 注意临时名**结尾必须仍是 .mp4**：cv2.VideoWriter 靠后缀认容器格式，
+        # 后缀改成 .partial 会让 writer.isOpened() 返回 False（打不开）。
+        out_partial = Path(args.out).with_name(
+            Path(args.out).stem + ".tmp" + Path(args.out).suffix)
+        writer = cv2.VideoWriter(str(out_partial), fourcc, out_fps,
+                                 (src.info.width, src.info.height))
         if not writer.isOpened():
-            print(f"[警告] 无法创建输出视频 {args.out}")
+            print(f"[警告] 无法创建输出视频 {out_partial}")
             writer = None
 
     frames_dir = None
@@ -705,13 +717,15 @@ def main() -> int:
         if args.vis_json:
             print(f"[跳过] 没有一帧通过一致性门，不写三维可视化：{args.vis_json}"
                   "（没有三维点，写了也打不开）")
-        if args.out and writer is not None and Path(args.out).exists():
+        # 没通过门：清掉临时文件（正式名不该被这次的坏结果覆盖，更不能留一个
+        # "存在但打不开"的 .partial 当正式视频用）。
+        if out_partial is not None and out_partial.exists():
             try:
-                Path(args.out).unlink()
-                print(f"[跳过] 标注视频已删除：{args.out}"
-                      "（一帧有效帧都没有，它就是原视频的拷贝，留着等于包装了一个假结果）")
+                out_partial.unlink()
+                print(f"[跳过] 标注视频临时文件已删：{out_partial}"
+                      "（一帧有效帧都没有，留着等于包装了一个假结果）")
             except OSError as exc:
-                print(f"[警告] 标注视频没删掉（{exc}），但它是没有标注的：{args.out}")
+                print(f"[警告] 临时视频没删掉（{exc}），但它是没有标注的：{out_partial}")
         return code
 
     if args.csv and rows:
@@ -729,6 +743,11 @@ def main() -> int:
             w.writerows(rows)
         print(f"轨迹已导出：{args.csv}")
     if args.out:
+        # release 已把 moov atom 写进 .partial，现在原子改名成正式名。这一步
+        # 只会在"跑完 + 有有效帧"后发生，所以 annotated.mp4 要么完整、要么不存在，
+        # 不会再出现"存在但 moov 缺失"的坏文件。
+        if out_partial is not None and out_partial.exists():
+            os.replace(out_partial, args.out)
         print(f"标注视频已保存：{args.out}")
 
     if args.vis_json:

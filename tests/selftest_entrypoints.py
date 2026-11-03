@@ -447,6 +447,43 @@ def _flag_literals(path: Path, candidates: set[str],
     return hits
 
 
+def test_annotated_video_atomic_write() -> bool:
+    """标注视频必须「写临时文件 + 原子改名」，不能直接写正式名。
+
+    ## 这条守的是什么（真实事故，2026-11-03）
+
+    单目的 `annotated.mp4` 用 mp4v 编码，它的 moov atom **只在 `writer.release()`
+    时落盘**。任务管理器「优雅退出」只给 3 秒，跑不完就 `taskkill /F` 强杀——
+    强杀时 `release()` 没执行，留下一个「存在但打不开」的 annotated.mp4
+    （`moov atom not found`）。查看器 `_resolve_video` 用 `.exists()` 判它存在、
+    `cv2.VideoCapture` 却打不开，表现是「3D 有轨迹、视频黑屏/不显示」，且不报错。
+
+    根因不是路径（`data/mono/...` 相对路径是对的），是**视频文件本身损坏**。
+    修法：`run_video.py` 与 `run_stereo_video.py` 把标注视频写到 `*.tmp.mp4`，
+    release 成功后 `os.replace` 原子改名成正式名。这样中断只留 .tmp 垃圾，
+    正式名永远是「完整」或「不存在」，`.exists()` 的判断就重新可靠了。
+
+    ## 断言防什么
+
+    1. `run_video.py` 里必须有「`.tmp` + 后缀」的临时名 + `os.replace`；
+    2. `run_stereo_video.py` 同理（双目也有同样的隐患，只是没被中断踩中过）。
+    反向自证：删掉 `os.replace` 或把临时名改回直接写正式名 → 断言红。
+    """
+    from pathlib import Path as _P
+
+    checks: list[tuple[str, bool]] = []
+    for name in ("apps/run_video.py", "apps/run_stereo_video.py"):
+        src = _P(name).read_text(encoding="utf-8", errors="replace")
+        has_tmp = '".tmp" + ' in src or "'.tmp' + " in src
+        has_replace = "os.replace(" in src
+        checks.append((f"{name} 写 .tmp 临时名", has_tmp))
+        checks.append((f"{name} 有 os.replace 原子改名", has_replace))
+
+    for label, good in checks:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+    return all(good for _label, good in checks)
+
+
 def test_shared_arg_blocks() -> bool:
     """单目两个入口的公共参数必须**出自同一个函数**，预设名单不许再手抄。
 
@@ -1273,6 +1310,7 @@ def main() -> int:
                test_path_bootstrap_is_marker_based,
                test_data_layout_single_source,
                test_shared_arg_blocks,
+               test_annotated_video_atomic_write,
                test_run_all_orchestrator,
                test_export_ball_dataset):
         results.append(fn())
