@@ -28,17 +28,43 @@ from apps._gui_widgets import BG, MUTED, ACCENT  # noqa: E402
 from stereo import profiles  # noqa: E402
 
 
+#: 预置的两条默认装置档案（用户第一次打开时自动建，避免空列表"没用"）。
+DEFAULT_PROFILES = (
+    ("平行装置", "parallel", 124.0, 0.3),
+    ("90度装置", "angled", None, 0.3),
+)
+
+
+def ensure_default_profiles() -> int:
+    """若档案列表为空，预置「平行装置」「90度装置」两条；返回新建条数。
+
+    只建**不存在的**名字（幂等）：用户已经自己建过的同名档案不会被覆盖。
+    标定路径按装置名生成 `config/calib/<名称>`。
+    """
+    created = 0
+    existing = {p.name for p in profiles.list_profiles()}
+    for name, mode, base, dist in DEFAULT_PROFILES:
+        if name in existing:
+            continue
+        profiles.upsert(profiles.RigProfile(
+            name=name, stereo_mode=mode,
+            expected_baseline_mm=base, working_distance_m=dist,
+            calibration_path=f"config/calib/{name}"))
+        created += 1
+    return created
+
+
 class ProfileDialog(tk.Toplevel):
     """装置档案管理对话框（模态）：列出 / 切换 / 新建。"""
 
     def __init__(self, app, on_changed=None) -> None:
         super().__init__(app)
-        self.app = app
         self.on_changed = on_changed
         self.title("装置档案 · 管理当前装置")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.transient(app)
+        self.grab_set()
 
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
@@ -67,6 +93,9 @@ class ProfileDialog(tk.Toplevel):
         self._load()
 
     def _load(self) -> None:
+        # 首次打开时预置默认档案（平行/90度各一条），否则空列表看起来"没用"。
+        if ensure_default_profiles():
+            self.status.configure(text="已预置默认档案：平行装置、90度装置")
         self.tree.delete(*self.tree.get_children())
         active = profiles.active_name()
         items = profiles.list_profiles()

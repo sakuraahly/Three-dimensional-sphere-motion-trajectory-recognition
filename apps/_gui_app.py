@@ -614,7 +614,9 @@ class HubWindow(tk.Toplevel):
             self.status.set_status(
                 "已切换装置档案，三张卡与各窗口的标定判定已按新装置重读", "ok")
 
-        ProfileDialog(self.app, on_changed=changed)
+        # parent 传 **self（门厅，显示中的 Toplevel）**，不是 withdraw 的 self.app：
+        # Toplevel 以 withdraw 的根为 parent 会继承 withdraw 状态，弹窗不出来。
+        ProfileDialog(self, on_changed=changed)
 
     def _open_cameras(self) -> None:
         """打开相机设备管理（识别 / 固定 / 标无关）。
