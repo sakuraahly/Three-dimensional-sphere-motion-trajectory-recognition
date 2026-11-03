@@ -372,13 +372,14 @@ class DataManager(tk.Tk):
 
     def _default_output(self) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        # zip 导出统一进固定文件夹 exports/detailed data/，文件名带时间戳
-        return str(ROOT / "outputs" / "exports" / "detailed data"
-                   / f"sphere-stereo-export-{stamp}.zip")
+        # zip 导出：exports/detailed/<时间戳文件夹>/xxx.zip —— 每次导出自己成一层
+        return str(ROOT / "outputs" / "exports" / "detailed"
+                   / f"export-{stamp}" / f"sphere-stereo-export-{stamp}.zip")
 
     def _default_traj_output(self) -> str:
-        """「导出轨迹数据 (csv)」的固定目录 exports/trajectory data/。"""
-        return str(ROOT / "outputs" / "exports" / "trajectory data")
+        """「导出轨迹数据 (csv)」：exports/trajectory/<时间戳文件夹>/，每次导出一层。"""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return str(ROOT / "outputs" / "exports" / "trajectory" / f"trajectory-{stamp}")
 
     # ------------------------------------------------------------------
     def _status_symbol(self, it: SessionItem) -> str:
@@ -754,8 +755,8 @@ class DataManager(tk.Tk):
 
     # ------------------------------------------------------------------
     def browse_output(self) -> None:
-        # initialdir 用固定的 detailed data 目录（先建好，避免被静默降级）。
-        exports_dir = ROOT / "outputs" / "exports" / "detailed data"
+        # initialdir 用固定的 detailed 目录（先建好，避免被静默降级）。
+        exports_dir = ROOT / "outputs" / "exports" / "detailed"
         exports_dir.mkdir(parents=True, exist_ok=True)
         path = filedialog.asksaveasfilename(
             parent=self, title="导出 zip", defaultextension=".zip",
@@ -778,14 +779,16 @@ class DataManager(tk.Tk):
         if not chosen:
             messagebox.showinfo("导出轨迹", "先勾选至少一个会话。", parent=self)
             return
-        # 默认目录（固定 exports/trajectory data/），弹窗取消/异常时兜底用它。
+        # 默认目录（exports/trajectory/<时间戳>/），弹窗取消/异常时兜底用它。
         default_dir = Path(self._default_traj_output())
-        default_dir.mkdir(parents=True, exist_ok=True)
+        # 弹窗 initialdir 指到固定的 trajectory 目录（父级），让用户在里面选/建文件夹
+        traj_root = ROOT / "outputs" / "exports" / "trajectory"
+        traj_root.mkdir(parents=True, exist_ok=True)
         out_dir = default_dir
         try:
             picked = filedialog.askdirectory(
                 parent=self, title="选择轨迹数据导出目录（取消则用默认目录）",
-                initialdir=str(default_dir), mustexist=False)
+                initialdir=str(traj_root), mustexist=False)
         except Exception:                                   # noqa: BLE001
             picked = ""          # 弹窗交互失败（无显示/后端异常）→ 走默认
         if picked:
