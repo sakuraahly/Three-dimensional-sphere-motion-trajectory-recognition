@@ -31,8 +31,9 @@ from pathlib import Path
 from tkinter import ttk
 
 from apps._collapsible import CollapsibleSection
-from apps._gui_widgets import (BG, INK, MUTED, OK, PARAM_HINT_WRAP, WARN,
-                               ScrollPage, StatusBar, Surface)
+from apps._gui_widgets import (BALL_METAL, PRESET_NONE, BG, INK, MUTED, OK,
+                               PARAM_HINT_WRAP, WARN, BallSettings, ScrollPage,
+                               StatusBar, Surface)
 from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
                                  MonoSession, create_mono_session,
                                  delete_mono_session, find_clip,
@@ -41,9 +42,10 @@ from apps._task_runner import ROOT
 from apps import _actions
 from apps._actions import CALIBRATE_MONO as MONO_CALIB_APP
 from apps._task_runner import Task
+from sphere_tracker.config import ColorConfig
 from sphere_tracker.plugins import names as plugin_names      # noqa: E402
 
-__all__ = ["MonoWindow", "MonoSessionPicker"]
+__all__ = ["MonoWindow", "MonoSessionPicker", "preset_choices"]
 
 
 MONO_CALIB_JSON = ROOT / "config" / "mono_calibration.json"
@@ -159,6 +161,17 @@ def detector_choices() -> tuple[str, ...]:
     自己登记的，算早了就会漏掉后登记的检测器 —— 那种漏法在界面上看不出来。
     """
     return tuple(plugin_names("detector")) + (SMART,)
+
+
+def preset_choices() -> tuple[str, ...]:
+    """颜色预设候选：**唯一来源**是 ``ColorConfig.preset_names()``。
+
+    为什么不在界面里手抄"红/绿/蓝/黄/白"：那份清单在预设表里已经有一份，
+    抄一份的下场和检测器清单一样 —— 加一种球色要改三处，漏一处就表现为
+    "下拉里根本没有这个颜色"。判据（``tests/selftest_gui_budget.py``）
+    断言的就是"下拉项 == 预设表"，不是"有没有这五个字"。
+    """
+    return tuple(ColorConfig.preset_names())
 
 #: 界面文案（不许只写在注释里）：用户是在"要不要换检测器"的那一刻需要它。
 DETECTOR_HINT = ("球颜色不突出时 color 会 0 检出（本机实测 0/40 帧），改 hough（95%）"
@@ -532,7 +545,11 @@ class MonoWindow(tk.Toplevel):
         # 三步加起来约 712 px 高（实测 ① 10–338、② 348–512、③ 522–712），
         # 700 的窗口会把第③步的下半截切掉——用户看到的是"方框被遮挡"。
         # 给到 820 一次看全三步；屏幕逻辑高 1000，放得下。
-        self.geometry("880x820")
+        # 2026-11-03：第②步多了「球种类 / 检测方法 / 颜色预设」一行（+31 px），
+        # 内容实测 806 > 820 窗口的 785 视口 —— 于是抬到 860（视口 825）。
+        # 不改成 `fit_to_content`：本窗三步的高度是稳定的，按内容算只会让
+        # 每次开窗先跳一下；而 860 仍小于工作区 960。
+        self.geometry("880x860")
         self.minsize(780, 560)
         self.surface = Surface(self)
 
@@ -589,6 +606,11 @@ class MonoWindow(tk.Toplevel):
         _saved_det = prefs.get_str("mono.detector", "")
         self.var_detector = tk.StringVar(
             value=_saved_det if _saved_det in detector_choices() else "color")
+        # 颜色预设（2026-11-03）：只在"纯色塑料球/自定义"下才下传。
+        # 存过的值可能已经不在预设表里（改过名/删掉了）：交给 BallSettings 折成
+        # 「不使用」—— `--preset` 有 choices，带一个不存在的名字会直接 argparse 退出。
+        self.var_preset = tk.StringVar(
+            value=prefs.get_str("mono.preset", PRESET_NONE) or PRESET_NONE)
         self.var_source = tk.StringVar(
             value=(prefs.get_str("mono.source", "") or SOURCE_OFFLINE)
             if prefs.get_str("mono.source", "") in SOURCE_CHOICES else SOURCE_OFFLINE)
@@ -753,15 +775,24 @@ class MonoWindow(tk.Toplevel):
         # ⚠ 走游标：写死 row=1 时游标也停在 1（card() 的说明占了 row=0），
         # 后面那句 hint 就拿到同一个 row=1 —— 说明文字直接压在参数行上，
         # 两个输入框看起来"被遮挡"（2026-10-28 用户截图）。
+        #
+        # 球种类 / 检测方法 / 颜色预设 / 球直径合成**一行**（2026-11-03）：
+        # 它们回答的是同一件事——"这是什么球、按它的哪条线索去找"。原来的
+        # 「检测器」下拉在第③步、预设根本没有，于是"录完才发现检测器不对"。
+        # 这里挂了球种类之后，第③步只留「识别来源」，选项不再分成两处。
+        self.ball = BallSettings(
+            self.surface, box,
+            methods=detector_choices(), presets=preset_choices(),
+            method_var=self.var_detector, preset_var=self.var_preset,
+            diameter_var=self.var_diameter,
+            on_diameter_key=self._refresh_budget,
+            on_change=self._ball_changed)
+        # 标签仍是「球直径（有效值）」（BallSettings 的默认标签）：这个数不是
+        # 卡尺量出来的名义直径，而是"填进去能让 Z 对上"的那个数。写成"球直径"
+        # 会让人直接填 25，然后整体偏大 15.7%。
         row = ttk.Frame(box)
         row.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                  sticky="w", pady=(4, 0))
-        # 「有效值」三个字必须进标签：这个数不是卡尺量的名义直径，而是"填进去能
-        # 让 Z 对上"的那个数。写成"球直径"会让人直接填 25，然后整体偏大 15.7%。
-        ttk.Label(row, text="球直径（有效值）").pack(side="left")
-        ent = ttk.Entry(row, textvariable=self.var_diameter, width=8)
-        ent.pack(side="left", padx=(8, 16))
-        ent.bind("<KeyRelease>", lambda _e: self._refresh_budget())
         ttk.Label(row, text="焦距 fx（留空用标定值；手填会覆盖它）").pack(side="left")
         ent2 = ttk.Entry(row, textvariable=self.var_focal, width=8)
         ent2.pack(side="left", padx=(8, 0))
@@ -799,14 +830,13 @@ class MonoWindow(tk.Toplevel):
             "没有内参时焦距按 60° 视场估算，那种结果只能看趋势。")
         # 检测器与识别来源合成一行：它们一起回答"用什么、跑在哪"，
         # 拆成两行只会把第③步撑长（首屏装不下三步是 2026-10-28 的问题）。
+        #
+        # 2026-11-03：检测器下拉搬去了第②步「球种类与检测参数」——它属于
+        # "这是什么球"，不属于"录制与识别"；而两块地方各有一个下拉就是
+        # 同一个值的两份控件（键一样、约束两套，迟早对不上）。这里只剩来源。
         pick = ttk.Frame(box)
         pick.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                   sticky="w", pady=(4, 0))
-        ttk.Label(pick, text="检测器").pack(side="left")
-        # 只读下拉，不给手打：名字必须与注册表一致（打错 run_video 直接退出）
-        ttk.Combobox(pick, values=list(detector_choices()), width=9,
-                     state="readonly",
-                     textvariable=self.var_detector).pack(side="left", padx=(8, 16))
         ttk.Label(pick, text="识别来源").pack(side="left")
         ttk.Combobox(pick, values=list(SOURCE_CHOICES), width=16,
                      state="readonly",
@@ -846,6 +876,14 @@ class MonoWindow(tk.Toplevel):
             side="left", padx=(8, 12))
         ttk.Label(line, text="（0 = 按 q 停止）", style="Hint.TLabel").pack(side="left")
         self._hint_pack(adv.content, DETECTOR_HINT)
+        # 球种类那三档各自要注意什么（2026-11-03）：放在这里而不是第②步的
+        # 首屏，是因为首屏高度已经顶到视口；而它是"换球时才需要读一遍"的内容，
+        # 折叠着不影响日常使用（切档那一刻状态条还会再说一句）。
+        self._hint_pack(
+            adv.content,
+            "球种类决定检测方法：镜面金属球 = specular，必须先在「点选球心」里"
+            "人工点一次球心（没有种子多半 0 检出）；纯色塑料球 = color + 颜色预设，"
+            "球色要和背景分得开；自定义 = 直接用注册表里的某个方法。")
         self._hint_pack(
             adv.content,
             "「离线」处理当前会话的录像：结果写进 derived/，跑完「看 3D」才会亮；"
@@ -863,6 +901,17 @@ class MonoWindow(tk.Toplevel):
             "再点「点选球心」——第一点球心、第二点球边（半径不靠自动估），"
             "之后「开始识别」用它跟踪，检测器会自动切成 specular。"
             "换会话存放目录的入口在「历史会话…」里。")
+
+    def _ball_changed(self) -> None:
+        """切了球种类 / 改了方法之后，把"这一档要注意什么"写进状态条。
+
+        为什么不另起一行常驻显示：第②步的首屏高度已经顶到视口（再加一行就把
+        第③步整块挤出屏幕）。说明的**常驻**部分在卡片说明里（三种球各一句），
+        这里补的是"刚选完那一刻该做什么"的那一句。
+        """
+        text = self.ball.hint()
+        if text:
+            self.status.set_status(text, "warn")
 
     def _sync_record_summary(self, section) -> None:
         """折叠区标题里带上"现在录多久"：收起时也得看得见这个数。
@@ -1674,7 +1723,8 @@ class MonoWindow(tk.Toplevel):
         # 检测器必须显式传：界面选了却不传，等于"显示 hough、实际跑 color"，
         # 与"显示 21.6 却传 40"是同一类静默失效。
         cmd = _actions.run_realtime(diameter_m=self._diameter_arg(),
-                                    method=self._method_arg())
+                                    method=self._method_arg(),
+                                    preset=self.ball.preset())
         cmd += self._common_camera_args()
         fx, fx_note = self._focal_arg()
         if fx is not None:
@@ -1713,16 +1763,20 @@ class MonoWindow(tk.Toplevel):
         # 而 --method 跟着检测器走。放在后面拼，就是"带了种子却跑了别的检测器"。
         seed_value, seed_note = self._seed_for_command(clip)
         if seed_value:
+            # 有种子 = 这颗球是镜面球（只有 specular 认 --seed）：球种类跟着走，
+            # 否则"球种类"那一栏还显示纯色球，与命令行矛盾。
+            self.ball.set_kind(BALL_METAL)
             self.var_detector.set(SEED_DETECTOR)     # 下拉框同步显示，不留两套口径
         method = self._method_arg()
         auto = self.var_detector.get() == SMART
         fx, fx_note = self._focal_arg()
+        preset = self.ball.preset()
         if clip is not None:
             derived = clip.parent / "derived"
             cmd = _actions.run_video(
                 clip, diameter_m=self._diameter_arg(), method=method,
                 out=derived / "annotated.mp4", csv=derived / "traj.csv",
-                vis_json=derived / "visualization.json")
+                vis_json=derived / "visualization.json", preset=preset)
             if seed_value:
                 cmd += ["--seed", seed_value]
             if fx is not None:
@@ -1732,6 +1786,12 @@ class MonoWindow(tk.Toplevel):
             self._start(cmd, f"离线单目：{clip.parent.name}（{method}）",
                         on_done=self._on_detected)
             d_note = diameter_problem(self.var_diameter.get())
+            # 选了镜面球却还没点过球心：specular 没有种子 = 很可能 0 检出。
+            # 提示放在"已经启动"的同一句话里，而不是拦着不让跑（用户可能是
+            # 想先用 specular 试一段，或种子文件在别处）。
+            metal_note = ("选了镜面金属球但这段还没有「点选球心」："
+                          "specular 只在高光附近找，没有种子多半 0 检出"
+                          if (self.ball.kind() == BALL_METAL and not seed_value) else "")
             self.status.set_status(
                 f"已启动离线单目：{self._short(clip)}（检测器 {method}）；结果写进 "
                 f"{self._short(derived)}/（跑完摘要会变成「已检测」，"
@@ -1740,8 +1800,9 @@ class MonoWindow(tk.Toplevel):
                 + (f"。用你点的种子跟踪（{seed_value}），不再自动检测" if seed_value else "")
                 + (f"。注意：{fx_note}" if fx_note else "")
                 + (f"。注意：{d_note}" if d_note else "")
-                + (f"。注意：{seed_note}" if seed_note else ""),
-                "warn" if (fx_note or seed_note or d_note) else "info")
+                + (f"。注意：{seed_note}" if seed_note else "")
+                + (f"。注意：{metal_note}" if metal_note else ""),
+                "warn" if (fx_note or seed_note or d_note or metal_note) else "info")
             return
 
         # 兜底走文件选择框：run_video.py 的 path 是必填位置参数，它自己不会弹
@@ -1755,7 +1816,7 @@ class MonoWindow(tk.Toplevel):
             self.status.set_status("没有选视频，已取消", "info")
             return
         cmd = _actions.run_video(path, diameter_m=self._diameter_arg(),
-                                 method=method)
+                                 method=method, preset=preset)
         if fx is not None:
             cmd += ["--focal", str(fx)]
         # 不在会话里的文件也给 --vis-json，落在它旁边（用户明确选了文件，
@@ -1836,6 +1897,7 @@ class MonoWindow(tk.Toplevel):
         # 检测器与来源是**输入**（用户的选择），要记住：这颗球 color 看不见，
         # 每次开窗都回到 color 等于每次都让他再撞一遍墙。
         p.set("mono.detector", self.var_detector.get().strip())
+        p.set("mono.preset", self.var_preset.get().strip() or PRESET_NONE)
         p.set("mono.source", self.var_source.get().strip())
         # 只存"用户换过的根目录"这个输入；当前选中的会话属于磁盘现状，不存
         p.set("mono.session_root", str(self._session_root))

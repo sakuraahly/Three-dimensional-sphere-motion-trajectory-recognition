@@ -35,8 +35,11 @@ from collections import namedtuple
 from pathlib import Path
 from tkinter import ttk
 
-from apps._gui_stereo import SessionPicker, pick_seeds
-from apps._gui_widgets import BG, ScrollPage, StatusBar, Surface, fit_to_content
+from apps._gui_stereo import (SessionPicker, detector_methods, pick_seeds,
+                              preset_choices)
+from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, METHOD_METAL, BG,
+                               BallSettings, ScrollPage, StatusBar, Surface,
+                               fit_to_content)
 from apps._collapsible import CollapsibleSection
 from apps import _actions
 from apps._workbench import SessionSummary, scan_sessions, summarize_session
@@ -122,6 +125,8 @@ STEP_SPECS: tuple[_Step, ...] = (
           (_Button("seed", "点选球心", "_run_seed", "primary", _st_seed),)),
     _Step("run", "③ 跑离线三维",
           "读两路视频，按标定解出三维轨迹，写出 traj3d.json 与 visualization.json。"
+          "「球种类」决定检测方法：镜面金属球 = specular，必须先做第 ② 步点选球心；"
+          "纯色塑料球 = color + 颜色预设，球色要和背景分得开。"
           "有点选球心时自动用 specular 解算。",
           (_Button("run", "跑离线三维", "_run_offline", "primary", _st_run),)),
     _Step("view", "④ 看三维",
@@ -151,21 +156,28 @@ def visualization_path(session: Path) -> Path | None:
     return None
 
 
-def offline_cmd(s: SessionSummary) -> list[str]:
+def offline_cmd(s: SessionSummary, *, method: str = "", preset: str = "",
+                min_radius: str = "", max_radius: str = "") -> list[str]:
     """第 ③ 步的命令行。
 
-    有 ``seeds.json`` 就必须用 specular（点选的球心只对那个检测器有意义），
-    没有就用 ``run_stereo_video`` 自己的默认检测器 —— 与经典界面
-    ``_offline_stereo_args`` 同一条规则，只是不带那些面板参数。
+    2026-11-03 改：``--method`` **不再写死在函数里**。以前这里是一句
+    ``cmd += ["--method", "specular", "--seed-json", …]``，于是"球种类"
+    在工作台上根本改不动 —— 同一段命令行有两个产地（这里 + `_actions`）。
+    现在方法/预设/半径都由「球种类与检测参数」那一块给，本函数只做一件
+    判断：**有 seeds.json 就必须 specular**（``--seed-json`` 只有它读，
+    换个方法等于把用户点的球心静默丢掉）。
+
+    不传参数 = 老行为（有 seeds → specular+seed-json；没有 → 脚本默认 color）。
 
     不传 ``--stereo-mode``：默认 auto 会读 session/标定，而 ``SessionSummary``
     把"未记录模式"折成了 parallel，照它传会把老会话按错的几何解算。
     """
-    cmd = _actions.offline_stereo(s.path)
     seed = s.path / "derived" / "seeds.json"
-    if s.has_seeds and seed.is_file():
-        cmd += ["--method", "specular", "--seed-json", str(seed)]
-    return cmd
+    use_seed = bool(s.has_seeds and seed.is_file())
+    used = METHOD_METAL if use_seed else str(method or "").strip()
+    return _actions.offline_stereo(
+        s.path, method=used, seed_json=(seed if use_seed else ""),
+        preset=preset, min_radius=min_radius, max_radius=max_radius)
 
 
 def step_states(s: SessionSummary | None) -> dict[str, tuple[bool, str]]:
@@ -308,6 +320,18 @@ class BenchWindow(tk.Toplevel):
         """
         for step in STEP_SPECS:
             box = self.surface.card(parent, step.title)
+            if step.key == "run":
+                # 「球种类与检测参数」（2026-11-03）只对第③步有意义：标定/校验/
+                # 点选都不看它，导出也不看它。摆在按钮**上面**是因为顺序——
+                # 先说清"这是什么球"，再点"跑离线三维"。
+                self.ball = BallSettings(
+                    self.surface, box,
+                    methods=detector_methods(), presets=preset_choices(),
+                    kind=(BALL_METAL
+                          if (self._path is not None
+                              and _actions.has_seeds(self._path))
+                          else BALL_PLASTIC),
+                    on_change=self._refresh_ball_note)
             row = self.surface.action_row(box)
             for btn in step.buttons:
                 make = (self.surface.primary if btn.kind == "primary"
@@ -443,17 +467,44 @@ class BenchWindow(tk.Toplevel):
         self.status.set_status(f"球心已保存：{Path(saved).name}；现在可以跑第 ③ 步",
                                "ok")
 
+    def _refresh_ball_note(self) -> None:
+        """球种/半径改了的回写：填错先说错，否则说这一档的前提（都走状态条）。"""
+        problem = self.ball.problem()
+        if problem:
+            self.status.set_status(problem, "warn")
+            return
+        hint = self.ball.hint()
+        if hint:
+            self.status.set_status(hint, "warn")
+
     def _run_offline(self) -> None:
         s = self._summary
         if s is None:
             return
-        self.app.tasks.start(offline_cmd(s), f"离线三维 {s.id}",
-                             on_done=self._on_done(
-                                 "离线三维",
-                                 f"{s.id} 解算完了；④ 的两个按钮现在可用了",
-                                 "离线三维没跑成：看运行日志里它的报错"))
+        problem = self.ball.problem()
+        if problem:
+            self.status.set_status(problem, "warn")
+            return
+        # 镜面球没有点选球心 = 必然 0 配对。在这里拦住并指到第②步，
+        # 比让人等一次进程启动、再看到"匹配 0/300"有用。
+        if self.ball.kind() == BALL_METAL and not _actions.has_seeds(s.path):
+            self.status.set_status(
+                "镜面金属球要先做第 ② 步「点选球心」：specular 靠那些点跟踪，"
+                "没有它们这一段会是 0 对匹配（想不用种子，就把球种类改回纯色球）",
+                "warn")
+            return
+        self.app.tasks.start(
+            offline_cmd(s, method=self.ball.method(), preset=self.ball.preset(),
+                        min_radius=self.ball.min_radius(),
+                        max_radius=self.ball.max_radius()),
+            f"离线三维 {s.id}",
+            on_done=self._on_done(
+                "离线三维",
+                f"{s.id} 解算完了；④ 的两个按钮现在可用了",
+                "离线三维没跑成：看运行日志里它的报错"))
         self.status.set_status(
-            f"正在解算 {s.id}；跑完 ④ 的按钮会自动亮起", "info")
+            f"正在解算 {s.id}（检测方法 {self.ball.method()}）；"
+            f"跑完 ④ 的按钮会自动亮起", "info")
 
     def _open_viewer(self) -> None:
         s = self._summary

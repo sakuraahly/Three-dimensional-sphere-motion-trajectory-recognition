@@ -36,6 +36,10 @@ __all__ = [
     "BG", "ACCENT", "INK", "MUTED", "WARN", "OK", "FONT_FAMILY",
     "CARD_HINT_WRAP", "PARAM_HINT_WRAP", "INLINE_NOTE_WRAP",
     "init_style", "Surface", "ScrollPage", "StatusBar", "fit_to_content",
+    "BALL_METAL", "BALL_PLASTIC", "BALL_CUSTOM", "BALL_KINDS", "BALL_HINTS",
+    "METHOD_METAL", "METHOD_PLASTIC", "PRESET_NONE",
+    "method_for_kind", "kind_for_method", "kind_default_for", "BallSettings",
+    "preset_label", "preset_options", "detector_needs_note",
 ]
 
 # 配色沿用旧界面（不换皮：换肤会把 199 个控件的视觉经验全部作废，见计划书 §8）
@@ -123,9 +127,14 @@ class Surface:
 
     # ---------- 卡片 ----------
     def card(self, parent: tk.Misc, title: str, hint: str = "", *,
-             pady: tuple[int, int] = (10, 0), fill: str = "x",
+             pady: tuple[int, int] = (8, 0), fill: str = "x",
              expand: bool = False) -> ttk.Frame:
         """一张卡片。返回的 Frame 是内部 grid 的父容器。
+
+        卡片间距默认 (8, 0)（2026-11-03 由 10 调到 8）：四步叠起来时，每张卡
+        多 2 px 就是最后一步多 8 px —— 双目「大角度」第④步原本恰好在视口下沿，
+        加一行控件后全靠这 8 px 回到预算内（`tests/selftest_window_mode.py`
+        逐卡量下沿）。同时保留一点留白：贴死会让相邻步骤读成一整块。
 
         ``fill``/``expand`` 默认 ``"x"``/``False`` —— 参数卡按内容定高，这没问题。
         但**日志那种要吃掉剩余高度的卡片必须传 ``fill="both", expand=True``**，
@@ -266,6 +275,410 @@ class Surface:
         btn = ttk.Button(parent, text=text, command=command)
         btn.pack(side="left", padx=(0, 8))
         return btn
+
+
+# --------------------------------------------------------------------------- #
+# 球种类与检测参数（2026-11-03 增）：三个窗口共用的一份词表 + 一块控件
+# --------------------------------------------------------------------------- #
+# 为什么是"球种类"而不是"检测方法"摆前面
+# --------------------------------------
+# 用户知道自己拿的是什么球（镀铬的／红色的），不知道 `specular` 与 `color`
+# 对他那颗球意味着什么。检测方法是他这句话的**翻译结果**，所以只能跟在后面
+# 显示、不能让他先做一次术语题。
+#
+# 这份词表是**界面语言**，不是检测器清单：方法名一律由调用方从
+# `sphere_tracker/detectors/registry.py` 取（R7，界面不许手写名字），
+# 这里只写"金属球对应注册表里的哪个名字"这层映射。
+BALL_METAL = "镜面金属球"
+BALL_PLASTIC = "纯色塑料球"
+BALL_CUSTOM = "自定义"
+BALL_KINDS = (BALL_METAL, BALL_PLASTIC, BALL_CUSTOM)
+
+#: 球种类 → 检测方法（注册表里的名字）。「自定义」不在表里 = 由下拉自己决定。
+METHOD_METAL = "specular"
+METHOD_PLASTIC = "color"
+_BALL_KIND_METHOD = {BALL_METAL: METHOD_METAL, BALL_PLASTIC: METHOD_PLASTIC}
+
+#: 预设下拉里的「不用」哨兵。沿用经典界面的同一个词 —— 换一个说法等于
+#: 让两套界面在同一个概念上各讲一套话。
+PRESET_NONE = "不使用"
+
+#: 选完球种类**当场**要说的话。它不是装饰：选「镜面金属球」却直接点「开始识别」
+#: 会得到 0 配对（本机实测这颗球 288 帧里 color 落在球上 0 帧），
+#: 而那看起来就像"程序跑完了"。
+BALL_HINTS = {
+    BALL_METAL: "镜面金属球只有高光能定位：先「点选球心」人工点一次球心再识别，"
+                "否则自动检测找不到球（实测 288 帧里 color 落在球上 0 帧）。",
+    BALL_PLASTIC: "纯色塑料球靠颜色分割：球的颜色要和背景分得开（同色背景会把"
+                  "整片区域当成球），并选一个贴合的「颜色预设」。",
+    BALL_CUSTOM: "自定义：检测方法直接取注册表里的实现；换一种球就换一个方法。",
+}
+
+
+def method_for_kind(kind: str) -> str:
+    """球种类 → 检测方法；「自定义」（或认不出的值）返回空串 = 不指定。"""
+    return _BALL_KIND_METHOD.get(str(kind or "").strip(), "")
+
+
+def kind_for_method(method: str, current: str = "") -> str:
+    """检测方法 → 界面该显示的球种类。
+
+    只有"当前这一档本来就对应这个方法"时才保留它，其余一律显示「自定义」——
+    这就是"手动改方法 → 球种类变成自定义"那条规则的**全部实现**：
+    它只决定显示，不反过来改方法。
+    """
+    m = str(method or "").strip()
+    cur = str(current or "").strip()
+    if m and _BALL_KIND_METHOD.get(cur) == m:
+        return cur
+    return BALL_CUSTOM
+
+
+def kind_default_for(method: str) -> str:
+    """初始那一档（只在建控件时用一次）：specular→金属、color→纯色、其余→自定义。
+
+    与 :func:`kind_for_method` 分开是因为语义不同：这里**允许**从方法反推种类
+    （开窗时没有"用户当前那一档"可言），而联动发生时不许这样做。
+    """
+    m = str(method or "").strip()
+    for kind, name in _BALL_KIND_METHOD.items():
+        if name == m:
+            return kind
+    return BALL_CUSTOM
+
+
+#: 预设名的**首字母 → 中文颜色字**。键是单个字母，**不是** `red_ball` 这样的
+#: 完整名字 —— 所以它不是预设表的副本：`COLOR_PRESETS` 加一种球色时这里不用动
+#: （加 `purple_ball` 自动得到"紫球"；字母不认识就原样显示，绝不把注册表里
+#: 真实存在的预设从下拉里藏掉）。
+_PRESET_INITIAL = {"r": "红", "o": "橙", "g": "绿", "b": "蓝",
+                   "y": "黄", "w": "白", "k": "黑", "p": "紫", "c": "青"}
+
+#: 预设名统一的后缀（`red_ball` → `red`）。
+_PRESET_SUFFIX = "_ball"
+
+
+def preset_label(name: str) -> str:
+    """``red_ball`` → ``红球``；不认识的名字退回**去掉后缀的原名**。
+
+    为什么允许退回英文：能退不能藏。让一个新预设显示成 ``purple`` 只是不好看，
+    而把它从下拉里悄悄丢掉，用户会以为"程序不支持这个颜色"。
+    """
+    text = str(name or "").strip()
+    if not text or text == PRESET_NONE:
+        return PRESET_NONE
+    stem = text[:-len(_PRESET_SUFFIX)] if text.endswith(_PRESET_SUFFIX) else text
+    cn = _PRESET_INITIAL.get(stem[:1].lower())
+    return f"{cn}球" if cn else (stem or text)
+
+
+def preset_options(presets) -> dict[str, str]:
+    """``{下拉显示: 真正要下传的 --preset 值}``，从预设表推出来，不手写。
+
+    重名（例如将来同时有 ``red_ball`` 与 ``rose_ball``，都映射到"红球"）时
+    **退回内部名**而不是合并：合并会让其中一项永远选不到，而界面又看不出来
+    —— 与"检测器清单手抄漏一项"是同一种静默失效。
+    """
+    names = [str(p) for p in presets]
+    labels = [preset_label(p) for p in names]
+    clash = {lab for lab in labels if labels.count(lab) > 1}
+    out: dict[str, str] = {}
+    for name, lab in zip(names, labels):
+        out[name if lab in clash else lab] = name
+    return out
+
+
+def _module_missing(pkg: str) -> bool:
+    """这个 import 名是否**没装**（只查文件，不 import —— 不能因为界面建控件
+    就把 torch 拉起来）。包名与 import 名允许不同（``segment-anything`` →
+    ``segment_anything``）。"""
+    import importlib.util
+
+    for cand in (pkg, str(pkg).replace("-", "_")):
+        try:
+            if importlib.util.find_spec(cand) is not None:
+                return False
+        except (ImportError, ValueError, AttributeError):
+            continue
+    return True
+
+
+def detector_needs_note(method: str) -> str:
+    """这个检测方法缺哪个可选依赖；不缺 / 不适用 → 空串。
+
+    为什么要有它：``yolo`` / ``yolo_sam`` 在注册表里声明了 ``needs``，而它们的
+    import 发生在**首次推理**（``neural.py`` 的 ``_ensure_model``）—— 也就是说
+    界面选得动、录完点下去才炸，炸在离用户这次操作很远的地方。这里提前查一次，
+    把"装什么"写在状态条上。
+
+    唯一一处函数内 import（不是模块级）：本模块的约定是"不依赖业务模块"，
+    而注册表是``needs`` 的唯一来源。放在函数里，模块仍可在无依赖环境下被
+    单独 import/实例化（判据就是这么跑的）。
+    """
+    m = str(method or "").strip()
+    if not m:
+        return ""
+    try:
+        from sphere_tracker.plugins import describe
+    except Exception:                                   # noqa: BLE001
+        return ""
+    entry = next((d for d in describe("detector") if d.get("name") == m), None)
+    if not entry:
+        return ""
+    missing = [pkg for pkg in entry.get("needs") or [] if _module_missing(pkg)]
+    if not missing:
+        return ""
+    return (f"「{m}」依赖 {'、'.join(missing)}，当前没装："
+            f"pip install {' '.join(missing)}；装上之前它每帧都会失败")
+
+
+class BallSettings:
+    """球种类 + 检测方法 + 颜色预设（+ 可选的球径 / 半径）一行控件。
+
+    三个窗口都挂它（单目第②步、双目第④步、工作台第③步）—— 为什么必须共用
+    一块而不是各摆三个下拉：球种类到检测方法是一条**联动**，写三遍就会漂三遍，
+    而"界面选了 A、命令行跑的是 B"在本项目已经出过三次（球径 mm/m、
+    「检查装置」一个参数都不传、录制不传 ``--preview``）。
+
+    三条刻意的不作为
+    ----------------
+    1. **联动只改显示**：切换球种类只写"检测方法"这一个值（它本来就是该档的
+       定义），球直径、焦距、会话路径一个字都不碰；
+    2. **不猜默认值**：球直径的输入变量由调用方传进来 —— 每个窗口只有一处
+       球径真相，这里再放一个默认值就是第二处；
+    3. **不 import 业务模块**：方法清单由调用方从注册表取，控件只照着画。
+
+    ``methods`` / ``presets`` 必须是调用方从唯一来源取来的（注册表 /
+    ``ColorConfig.preset_names()``），控件不提供任何内置清单。
+    """
+
+    def __init__(self, surface: Surface, parent: tk.Misc, *,
+                 methods, presets=(), method_var: tk.StringVar | None = None,
+                 preset_var: tk.StringVar | None = None, kind: str = "",
+                 diameter_var: tk.StringVar | None = None,
+                 diameter_label: str = "球直径（有效值）", diameter_width: int = 8,
+                 on_diameter_key=None, radius_vars: tuple | None = None,
+                 on_change=None) -> None:
+        self.surface = surface
+        self.methods = [str(m) for m in methods]
+        self.presets = [str(p) for p in presets]
+        #: 下拉显示 ↔ 真正下传的预设名。**从预设表推**（`preset_options`），
+        #: 不手写"红=red_ball"这类字典 —— 那会是预设表的第四份副本。
+        self._preset_by_label = preset_options(self.presets)
+        self._label_by_preset = {v: k for k, v in self._preset_by_label.items()}
+        self.var_method = method_var if method_var is not None else tk.StringVar()
+        self.var_preset = (preset_var if preset_var is not None
+                           else tk.StringVar(value=PRESET_NONE))
+        #: 下拉里显示的那一串（中文）。外部变量 `var_preset` 始终存**内部名**，
+        #: 因为它是写进 `gui_state.json` 的东西：标签的推导规则一改，
+        #: 存标签就等于存了一份会过期的值。
+        self._var_preset_label = tk.StringVar()
+        self.var_kind = tk.StringVar()
+        self.var_diameter = diameter_var
+        self.radius_vars = radius_vars
+        self._on_change = on_change
+        self._busy = False                  # 防止"改值 → 回调 → 再改值"打转
+        self._kind = (kind if kind in BALL_KINDS
+                      else kind_default_for(self.var_method.get()))
+        # 只给了球种类、没给方法（工作台/双目那种"从零开始"的用法）：
+        # 把方法补成这一档的定义值。否则 `kind()` 会反推成「自定义」——
+        # 界面显示"纯色塑料球"、实际没有任何方法，两边打架。
+        picked = method_for_kind(self._kind)
+        if picked and not str(self.var_method.get() or "").strip():
+            self.var_method.set(picked)
+        # 预设值可能来自旧配置文件：认不出的名字当"不用"（别把不存在的预设
+        # 带进命令行 —— --preset 有 choices，会直接 argparse 退出）
+        if str(self.var_preset.get() or "").strip() not in [PRESET_NONE, *self.presets]:
+            self.var_preset.set(PRESET_NONE)
+
+        row = ttk.Frame(parent)
+        row.grid(row=surface._next_row(parent), column=0, columnspan=9,
+                 sticky="w", pady=(0, 0))
+        ttk.Label(row, text="球种类").pack(side="left")
+        self.cb_kind = ttk.Combobox(row, values=list(BALL_KINDS), width=10,
+                                    state="readonly", textvariable=self.var_kind)
+        self.cb_kind.pack(side="left", padx=(6, 12))
+        self.cb_kind.bind("<<ComboboxSelected>>", self._on_kind_selected)
+        ttk.Label(row, text="检测方法").pack(side="left")
+        self.cb_method = ttk.Combobox(row, values=self.methods, width=9,
+                                      state="readonly",
+                                      textvariable=self.var_method)
+        self.cb_method.pack(side="left", padx=(6, 12))
+        ttk.Label(row, text="颜色预设").pack(side="left")
+        self.cb_preset = ttk.Combobox(
+            row, values=[PRESET_NONE, *self._preset_by_label],
+            width=11, state="readonly", textvariable=self._var_preset_label)
+        self.cb_preset.pack(side="left", padx=(6, 0))
+        self.cb_preset.bind("<<ComboboxSelected>>", self._on_preset_selected)
+        if self.var_diameter is not None:
+            ttk.Label(row, text=diameter_label).pack(side="left", padx=(14, 0))
+            ent = ttk.Entry(row, textvariable=self.var_diameter,
+                            width=diameter_width)
+            ent.pack(side="left", padx=(6, 0))
+            if callable(on_diameter_key):
+                # 与旧控件同一条绑定：改数字时误差预算要跟着重算
+                ent.bind("<KeyRelease>", lambda _e: on_diameter_key())
+        if self.radius_vars is not None:
+            lo, hi = self.radius_vars
+            ttk.Label(row, text="半径 px").pack(side="left", padx=(14, 0))
+            ttk.Entry(row, textvariable=lo, width=5).pack(side="left", padx=(6, 2))
+            ttk.Label(row, text="–").pack(side="left")
+            ttk.Entry(row, textvariable=hi, width=5).pack(side="left", padx=(2, 0))
+        # ⚠ **不再单起一行放说明**（2026-11-03 实测）：三个窗口的首屏高度都已
+        # 顶到预算边缘（双目第④步装下时恰好 869 px），多加一行说明就整段出屏 ——
+        # 而"控件被裁到窗口下沿"在本项目是比"少一句解释"严重得多的故障
+        # （`tests/selftest_window_mode.py` 直接盯着每步的下沿）。
+        # 说明走两条路：每档该注意什么写进卡片的说明文字（常驻），
+        # 切档那一刻的提醒由调用方通过 ``on_change`` 写进状态条（见 ``hint()``）。
+
+        # 方法被程序改掉（例如单目有了种子强制 specular）时，显示要跟着走
+        self.var_method.trace_add("write", self._sync)
+        # 预设：内部名 ↔ 下拉标签双向同步。外部仍只认 `var_preset`（内部名），
+        # 所以旧配置文件里的 `red_ball` 照样能认；界面上一行中文。
+        self._var_preset_label.set(self._label_by_preset.get(
+            str(self.var_preset.get() or "").strip(), PRESET_NONE))
+        self.var_preset.trace_add("write", self._sync_preset_label)
+        self._sync(first=True)
+
+    # ---------- 取值 ----------
+    @staticmethod
+    def resolve(kind: str, method: str = "",
+                preset: str = PRESET_NONE) -> tuple[str, str]:
+        """界面上的三个值 → 真要下传的 (``--method``, ``--preset``)。
+
+        空串 = **这项不传**。纯函数，所以判据可以在没有显示器的机器上断言
+        "选纯色球 + 红色 → 命令行是 color + red_ball"。
+
+        两条规则写在**这一处**，三个窗口不用各写一遍：
+
+        - 镜面球不传 ``--preset``：那个参数是颜色分割的 HSV 预设，
+          对高光定位没有意义，传了只是让命令行看起来像"选了颜色"；
+        - 纯色球**强制** ``color``：这一档的定义就是颜色分割，
+          留着别的检测方法等于让用户选的档位不生效。
+        """
+        k = str(kind or "").strip()
+        if k == BALL_METAL:
+            return METHOD_METAL, ""
+        if k == BALL_PLASTIC:
+            return METHOD_PLASTIC, _preset_value(preset)
+        m = str(method or "").strip()
+        # 自定义档也可能落到 specular 上（它在注册表里是可选项）：一样不传预设。
+        return m, ("" if m == METHOD_METAL else _preset_value(preset))
+
+    def kind(self) -> str:
+        """当前显示的球种类 —— **由方法反推**，因此永远与实际下传的一致。"""
+        return kind_for_method(self.var_method.get(), self._kind)
+
+    def method(self) -> str:
+        return str(self.var_method.get() or "").strip()
+
+    def preset(self) -> str:
+        return BallSettings.resolve(self.kind(), self.method(),
+                                    self.var_preset.get())[1]
+
+    def min_radius(self) -> str:
+        return str(self.radius_vars[0].get() or "").strip() if self.radius_vars else ""
+
+    def max_radius(self) -> str:
+        return str(self.radius_vars[1].get() or "").strip() if self.radius_vars else ""
+
+    def problem(self) -> str:
+        """这个区块里"填错了"的地方，一句话；空串 = 没问题。
+
+        只说**会被怎么处理**，不静默：留空是合法的（用脚本默认），
+        填了负数/乱码则说明"这一项不会被采用" —— 两者在界面上必须看得出区别。
+        """
+        if self.radius_vars is None:
+            return ""
+        lo, hi = self.min_radius(), self.max_radius()
+        bad: list[str] = []
+        values: dict[str, float] = {}
+        for label, text in (("最小半径", lo), ("最大半径", hi)):
+            if not text:
+                continue
+            try:
+                num = float(text)
+            except ValueError:
+                bad.append(f"{label}「{text}」不是数字，这一项不传给命令行")
+                continue
+            if num <= 0:
+                bad.append(f"{label}要填正数，{text} 不会被采用")
+                continue
+            values[label] = num
+        if len(values) == 2 and values["最小半径"] > values["最大半径"]:
+            bad.append(f"最小半径 {lo} 大于最大半径 {hi}，这个范围什么都选不出来")
+        return "；".join(bad)
+
+    def hint(self) -> str:
+        """这一档该注意什么 —— 调用方拿它写状态条（切档那一刻要说出来）。
+
+        两段拼起来：球种类的前提（``BALL_HINTS``）+ 方法缺可选依赖的提醒
+        （``yolo`` / ``yolo_sam`` 没装时，界面选得动、跑起来才炸）。
+        """
+        parts = [BALL_HINTS.get(self.kind(), ""), detector_needs_note(self.method())]
+        return "；".join(p for p in parts if p)
+
+    # ---------- 联动 ----------
+    def set_kind(self, kind: str) -> None:
+        """程序化地改这一档（例如单目发现会话里有 seed.json → 就是镜面球）。"""
+        if kind not in BALL_KINDS:
+            return
+        self._kind = kind
+        self.var_kind.set(kind)
+        picked = method_for_kind(kind)
+        if picked and self.var_method.get() != picked:
+            self.var_method.set(picked)     # 只动"方法"，别的输入一律不碰
+        self._sync()
+
+    def _on_kind_selected(self, _evt=None) -> None:
+        # ``_sync`` 里会回调 ``on_change``（窗口拿去刷状态条），这里不重复调
+        self.set_kind(self.var_kind.get())
+
+    def _on_preset_selected(self, _evt=None) -> None:
+        """下拉里选的是**标签**，写回变量的是**内部名**（argv 只认内部名）。"""
+        label = self._var_preset_label.get()
+        self.var_preset.set(self._preset_by_label.get(label, PRESET_NONE))
+        if callable(self._on_change):
+            self._on_change()
+
+    def _sync_preset_label(self, *_a) -> None:
+        """内部名变了（程序改的 / 读配置读出来的）→ 下拉跟着显示对应中文。"""
+        if self._busy:
+            return
+        name = str(self.var_preset.get() or "").strip()
+        label = self._label_by_preset.get(name, PRESET_NONE)
+        if label != self._var_preset_label.get():
+            self._busy = True
+            try:
+                self._var_preset_label.set(label)
+            finally:
+                self._busy = False
+
+    def _sync(self, *_a, first: bool = False) -> None:
+        """把"已选的那一档"回写到控件上（**只改显示**）。"""
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            kind = self.kind()
+            self.var_kind.set(kind)
+            # 金属/纯色这两档的方法是被定义的（specular / color），下拉置灰：
+            # 能改的地方只有「自定义」——否则"档位"与"方法"可以互相矛盾，
+            # 而命令行只认方法，用户以为选的是档位。
+            self.cb_method.configure(
+                state="disabled" if kind in (BALL_METAL, BALL_PLASTIC) else "readonly")
+            self.cb_preset.configure(
+                state="disabled" if kind == BALL_METAL else "readonly")
+        finally:
+            self._busy = False
+        if not first and callable(self._on_change):
+            self._on_change()
+
+
+def _preset_value(preset) -> str:
+    """界面上的预设值 → 命令行值（``不使用`` 与空白都变成空串）。"""
+    text = str(preset or "").strip()
+    return "" if text in ("", PRESET_NONE) else text
 
 
 class ScrollPage(ttk.Frame):

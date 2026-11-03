@@ -43,6 +43,23 @@ def _flag(name: str, value) -> list[str]:
     return [name, text] if text else []
 
 
+def _positive(name: str, value) -> list[str]:
+    """正数才追加该参数；空 / 非数字 / ≤0 **一律不传**。
+
+    为什么不在界面里"取个大概"再传：``--min-radius`` 是像素门限，传 0 或负数
+    等于把所有候选都放行（或全拒），而界面上那一栏看起来只是"填了个数"。
+    界面负责说清"这一项没被采用"，这里负责绝不把它混进命令行。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        num = float(text)
+    except ValueError:
+        return []
+    return [name, text] if num > 0 else []
+
+
 # --------------------------------------------------------------------------- #
 # 双目：标定 / 录制 / 分析（原在 `_gui_stereo.py`，2026-11-01 搬到这里）
 # --------------------------------------------------------------------------- #
@@ -143,7 +160,9 @@ def calibrate_args(method: str, board: dict | None = None,
         cmd += ["--min-pairs", str(min(20, _pairs))]
     return cmd
 def offline_stereo(session: str | Path, *, mode: str = "",
-                   anchor: bool = False) -> list[str]:
+                   anchor: bool = False, method: str = "", seed_json: str = "",
+                   preset: str = "", min_radius: str = "",
+                   max_radius: str = "") -> list[str]:
     """离线重建（`run_stereo_video.py`）的 argv。
 
     抽成纯函数是为了**能被判据抓到**：界面上的勾选框到命令行之间断链，
@@ -153,6 +172,15 @@ def offline_stereo(session: str | Path, *, mode: str = "",
 
     ``--stereo-mode`` **只出现一次**：这个窗口存在的意义就是"按本窗口的装置解算"，
     重复传会让 argparse 取最后一个，读起来却像有两处来源。
+
+    ``method`` / ``preset`` / 半径范围来自「球种类与检测参数」那一块控件
+    （2026-11-03 增）：纯色球用 ``color`` + 颜色预设、镜面球用 ``specular``。
+    空串 = 这项不传（脚本按注册表默认 color 走），**不在这里替用户写死** ——
+    写死一处就等于界面上的下拉白摆。
+
+    ``seed_json`` 单独一个参数而不是让调用方 ``cmd += ["--seed-json", …]``：
+    「跑离线三维」原来在工作台里手工拼了 ``["--method", "specular",
+    "--seed-json", …]`` 三行，于是"球种类"改不动它 —— 同一段命令行有两个产地。
     """
     # mode 为空 = **不传** `--stereo-mode`：会话工作台那边要让脚本自己读
     # session/标定（老会话的 `stereo_mode` 常被折成 parallel，照它传会按错几何解算）。
@@ -160,6 +188,11 @@ def offline_stereo(session: str | Path, *, mode: str = "",
     cmd += _flag("--stereo-mode", mode)
     if anchor:
         cmd += ["--anchor-gate", "on"]
+    cmd += _flag("--method", method)
+    cmd += _flag("--preset", preset)
+    cmd += _positive("--min-radius", min_radius)
+    cmd += _positive("--max-radius", max_radius)
+    cmd += _flag("--seed-json", seed_json)
     return cmd
 
 
@@ -294,22 +327,29 @@ def record_mono(camera: str, duration: str, out: str | Path) -> list[str]:
 
 def run_video(clip: str | Path, *, diameter_m: str, method: str,
               out: str | Path | None = None, csv: str | Path | None = None,
-              vis_json: str | Path | None = None) -> list[str]:
+              vis_json: str | Path | None = None, preset: str = "") -> list[str]:
     """离线单目。
 
     ``diameter_m`` 一律是**米**（界面显示 mm，换算在界面那一层做完再传进来）——
     这条口径以前断过：界面按 mm 传 21.6，命令行按米收，结果一个三维点都不出。
+
+    ``preset`` 是**颜色预设**（``--preset``，值取自
+    ``ColorConfig.preset_names()``）：只有颜色分割才看它，镜面球选的那一档
+    在「球种类」里已经被折成空串（见 ``apps/_gui_widgets.BallSettings.resolve``），
+    所以这里只管"有就传、没有不提"。
     """
     args = [str(clip), "--ball-diameter", str(diameter_m), "--method", str(method)]
+    args += _flag("--preset", preset)
     args += _flag("--out", out)
     args += _flag("--csv", csv)
     args += _flag("--vis-json", vis_json)
     return _argv(_APPS / "run_video.py", *args)
 
 
-def run_realtime(*, diameter_m: str, method: str) -> list[str]:
+def run_realtime(*, diameter_m: str, method: str, preset: str = "") -> list[str]:
     return _argv(_APPS / "run_realtime.py",
-                 "--ball-diameter", str(diameter_m), "--method", str(method))
+                 "--ball-diameter", str(diameter_m), "--method", str(method),
+                 *_flag("--preset", preset))
 
 
 def capture_board(*, out: str | Path, cols: str, rows: str, square: str,

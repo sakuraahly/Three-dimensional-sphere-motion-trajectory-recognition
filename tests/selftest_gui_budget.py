@@ -536,6 +536,179 @@ def _mono_session_checks() -> list[tuple[str, bool]]:
 
 
 
+def _ball_settings_checks() -> list[tuple[str, bool]]:
+    """球种类与检测参数（2026-11-03 增）：**不需要 Tk** 的那一半。
+
+    为什么必须有这一节
+    ------------------
+    "球种类"不是一个装饰性的下拉 —— 它到 ``--method`` / ``--preset`` 之间
+    是一条**联动**，而联动的失效方式全是静默的：选「纯色塑料球 + 红」而命令行
+    只有 ``--method color``（预设丢了 → 默认按白球分割 → 红球 0 检出）、
+    选「镜面金属球」却还带着 ``--preset red_ball``（把高光定位换成颜色门限）。
+    这些在界面上一个字都看不出来，只能比对命令行。
+
+    判据全部打在**产出 argv 的那一层**（``BallSettings.resolve`` +
+    ``_actions``），而不是"源码里有没有某个字面量" —— 后者一改写法就失效。
+    """
+    from apps._actions import offline_stereo, run_realtime, run_video
+    from apps._gui_stereo import detector_methods, preset_choices
+    from apps._gui_widgets import (BALL_CUSTOM, BALL_METAL, BALL_PLASTIC,
+                                   BallSettings, detector_needs_note,
+                                   method_for_kind, preset_label, preset_options)
+    from sphere_tracker.config import ColorConfig
+    from sphere_tracker.plugins import names as plugin_names
+
+    out: list[tuple[str, bool]] = []
+
+    def ck(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
+        out.append((label, ok))
+
+    print("\n----- 球种类 → 检测参数（BallSettings → argv）-----")
+
+    # ---- 三档的定义值 ----
+    ck("球种类的三档：镜面金属球 / 纯色塑料球 / 自定义",
+       (method_for_kind(BALL_METAL), method_for_kind(BALL_PLASTIC),
+        method_for_kind(BALL_CUSTOM)) == ("specular", "color", ""),
+       f"{method_for_kind(BALL_METAL)} / {method_for_kind(BALL_PLASTIC)} / "
+       f"{method_for_kind(BALL_CUSTOM)!r}")
+
+    # ---- ① 纯色塑料球 + 红：--method color 且带对应 --preset ----
+    # 预设名取自注册表（`ColorConfig.preset_names()`），不是测试里手写的"red"
+    presets = list(preset_choices())
+    red = next((p for p in presets if p.startswith("red")), "")
+    m, p = BallSettings.resolve(BALL_PLASTIC, "", red)
+    argv = run_video("clip.mkv", diameter_m="0.0216", method=m, preset=p)
+    ck("纯色塑料球 + 红 → --method color --preset red_ball",
+       red == "red_ball" and _has_seq(argv, ["--method", "color"])
+       and _has_seq(argv, ["--preset", "red_ball"]), " ".join(argv))
+    rt = run_realtime(diameter_m="0.0216", method=m, preset=p)
+    ck("同一档在实时入口也带 --preset（两个入口同一套规则）",
+       _has_seq(rt, ["--method", "color", "--preset", "red_ball"]), " ".join(rt))
+
+    # ---- ② 镜面金属球：--method specular，且**不许**带 --preset ----
+    m, p = BallSettings.resolve(BALL_METAL, "hough", red)
+    argv = run_video("clip.mkv", diameter_m="0.0216", method=m, preset=p)
+    ck("镜面金属球 → --method specular（即便别处填了别的方法）",
+       m == "specular" and _has_seq(argv, ["--method", "specular"]), " ".join(argv))
+    ck("镜面金属球不传 --preset（那是颜色分割的参数，传了等于换了个检测器）",
+       p == "" and "--preset" not in argv, " ".join(argv))
+    ck("自定义 + 真选了颜色 → --preset 仍然传（只有金属球才禁用它）",
+       _has_seq(run_video("c.mkv", diameter_m="0.0216", method="hough",
+                          preset=red), ["--preset", "red_ball"]))
+    ck("自定义档里手动落到 specular → 同样不传 --preset（这条跟方法走，不跟档位走）",
+       BallSettings.resolve("自定义", "specular", red)[1] == "")
+    ck("预设选「不使用」= 不传 --preset（与经典界面同一个哨兵词）",
+       BallSettings.resolve(BALL_PLASTIC, "", "不使用")[1] == "")
+
+    # ---- ③ 自定义：下拉项 == 注册表（不是界面里手抄的清单）----
+    methods = detector_methods()
+    ck("自定义档的方法候选 == 注册表里的全部检测器（R7：不许手写名字）",
+       bool(methods) and set(methods) == set(plugin_names("detector")),
+       f"{list(methods)}")
+    ck("颜色预设候选 == ColorConfig.preset_names()（同理：不许手抄颜色清单）",
+       list(preset_choices()) == ColorConfig.preset_names(),
+       f"{list(preset_choices())}")
+
+    # ---- 预设**显示**：中文标签从预设表推，不是手写的"红=red_ball"字典 ----
+    # 判据认的是"能不能从内部名推出来"，不是某几个字长什么样：
+    # 表里加一种球色，这里自动跟着多一行；而写死字典会立刻露馅。
+    labels = preset_options(preset_choices())
+    ck("预设下拉显示中文（red_ball → 红球），且与预设表一一对应",
+       labels.get("红球") == "red_ball" and labels.get("绿球") == "green_ball"
+       and set(labels.values()) == set(preset_choices()),
+       f"{labels}")
+    ck("没见过的预设名照样显示（退回英文词干，不把它从下拉里藏掉）",
+       preset_label("magenta_ball") == "magenta"
+       and preset_label("不使用") == "不使用")
+    # 首字母撞名：合并会让其中一项永远选不到，而界面看不出来
+    clash = preset_options(["red_ball", "rose_ball"])
+    ck("首字母撞名的预设不许互相覆盖（退回内部名，两项都还在）",
+       len(clash) == 2 and set(clash.values()) == {"red_ball", "rose_ball"},
+       f"{clash}")
+
+    # ---- 可选依赖：注册表声明的 needs 要提前说，别跑到一半炸在 import ----
+    note = detector_needs_note("yolo")
+    ck("yolo 的依赖提示：没装就点名 ultralytics（装了则为空）",
+       note == "" or ("ultralytics" in note and "pip install" in note),
+       note or "（本机已装 ultralytics，提示为空）")
+    ck("没有 needs 的方法不产生提示（color / specular 不该被这份提示污染）",
+       detector_needs_note("color") == "" and detector_needs_note("specular") == "")
+
+    # ---- 参数按窗口裁剪：脚本没有的开关，界面的 argv 里就不许出现 ----
+    # run_video 的 argparse 里**没有** --min-radius/--max-radius；
+    # run_stereo_video 的 argparse 里**没有** --ball-diameter。
+    ck("单目 argv 不含半径参数（run_video 没这两个开关，传了必被 argparse 拒）",
+       not any(x in run_video("c.mkv", diameter_m="0.0216", method="color")
+               for x in ("--min-radius", "--max-radius")))
+    ck("双目 argv 不含 --ball-diameter（run_stereo_video 没这个开关）",
+       "--ball-diameter" not in offline_stereo("s", method="color"))
+
+    # ---- 半径：非法值**不许**混进命令行 ----
+    ok_r = _has_seq(offline_stereo("s", min_radius="12", max_radius="90"),
+                    ["--min-radius", "12", "--max-radius", "90"])
+    bad_r = any(x in offline_stereo("s", min_radius="-3", max_radius="abc")
+                for x in ("--min-radius", "--max-radius"))
+    ck("半径范围：正数照传；负数/乱码一项都不传（不静默变成 0）", ok_r and not bad_r,
+       " ".join(offline_stereo("s", min_radius="12", max_radius="90")))
+
+    # ---- 工作台：第③步的 argv 真的跟着球种类走（不是写死 specular） ----
+    import tempfile
+    from types import SimpleNamespace
+
+    from apps import _actions
+    from apps._gui_bench import offline_cmd
+
+    with tempfile.TemporaryDirectory(prefix="bench_ball_") as tmp:
+        sess = Path(tmp) / "20260104-000000"
+        (sess / "derived").mkdir(parents=True)
+
+        plain = SimpleNamespace(path=sess, has_seeds=False)
+        argv = offline_cmd(plain, method="color", preset=red)
+        ck("工作台：选纯色球+红 → 命令行 --method color --preset red_ball",
+           _has_seq(argv, ["--method", "color", "--preset", "red_ball"])
+           and "--stereo-mode" not in argv, " ".join(argv))
+
+        # 有 seeds.json 时必须 specular：--seed-json 只有它读
+        (sess / "derived" / "seeds.json").write_text("{}", encoding="utf-8")
+        seeded = SimpleNamespace(path=sess, has_seeds=True)
+        argv = offline_cmd(seeded, method="color")
+        ck("工作台：会话里有点选球心 → 强制 specular + --seed-json（种子不被静默丢掉）",
+           _has_seq(argv, ["--method", "specular"])
+           and _has_seq(argv, ["--seed-json", str(sess / "derived" / "seeds.json")]),
+           " ".join(argv))
+
+        # 行为没变的证据（搬迁不是顺手改命令）：老写法是
+        # `offline_stereo(path)` 之后在 GUI 里手工追加 `--method/--seed-json`；
+        # 新写法把这两段交给 `_actions`。两条 argv 必须**逐字相等**（连顺序）。
+        old_seeded = _actions.offline_stereo(sess) + [
+            "--method", "specular",
+            "--seed-json", str(sess / "derived" / "seeds.json")]
+        old_plain = _actions.offline_stereo(sess)
+        ck("工作台：有 seeds 时 argv 与改动前逐字相同（顺序也一样）",
+           old_seeded == offline_cmd(seeded), " ".join(old_seeded[-4:]))
+        ck("工作台：无 seeds 且不传参数时，argv 与改动前逐字相同",
+           old_plain == offline_cmd(plain), " ".join(old_plain))
+
+    # ---- 工作台：--method 不许再写死在函数里 ----
+    # 这一条守的是"第 167 行写死 specular"那个具体缺陷：写死之后球种类那一栏
+    # 怎么改都改不动命令行，而界面看起来一切正常。
+    #
+    # 用 AST 找**完整的字符串常量**，不做全文子串匹配：docstring 里解释这个缺陷
+    # 时会写到 `--method`，子串匹配会把"解释"当成"又拼了一遍"（假红会让下一个人
+    # 删掉注释保绿，那才是真损失）。
+    import ast
+
+    bench_tree = ast.parse((ROOT / "apps" / "_gui_bench.py").read_text(encoding="utf-8"))
+    inline = sorted({n.value for n in ast.walk(bench_tree)
+                     if isinstance(n, ast.Constant)
+                     and n.value in ("--method", "--seed-json", "--preset")})
+    ck("工作台不再自己拼 --method / --seed-json（跟随球种类，而不是写死）",
+       not inline, f"仍在字面量里：{inline}" if inline else "")
+    return out
+
+
 def _argv_single_source_checks() -> list[tuple[str, bool]]:
     """argv 只能有一个产地（`apps/_actions.py`）—— 用 AST 扫，不看人。
 
@@ -595,6 +768,7 @@ def main() -> int:
     # 参数拼装判据先跑：它直接调纯函数、不需要 Tk，所以**没有显示器也要跑**。
     # 结构判据可以跳过，参数拼装不行 —— 跳过的那部分一律不算验证过。
     results: list[tuple[str, bool]] = _stereo_param_checks()
+    results += _ball_settings_checks()
     results += _argv_single_source_checks()
     results += _mono_session_checks()
     results += _mono_seed_checks()
@@ -1005,6 +1179,83 @@ def main() -> int:
                       f"--seed 且状态条说明（尾部：…{note[-34:]}）")
                 results.append(("种子分辨率不符时退回自动检测", ok_bad))
 
+                # ---------- 球种类与检测参数（2026-11-03 增）----------
+                # 这一段守的是"界面选了什么、命令行就是什么"：
+                #   ① 纯色塑料球 + 红 → --method color --preset red_ball
+                #   ② 镜面金属球     → --method specular，且**不带** --preset
+                #   ③ 自定义档的下拉项 == 注册表（不是界面里手抄的清单）
+                #   ④ 切球种类**不动**用户填的球直径
+                # ①② 抓的是 argv（界面看不错、命令行错的那种静默失效）；
+                # ④ 抓的是"联动越界"——改显示不成就顺手改了参数，那比不做联动更糟。
+                from apps._gui_widgets import BALL_METAL, BALL_PLASTIC
+                from apps._gui_stereo import detector_methods
+
+                def _argv_of() -> list[str]:
+                    captured.clear()
+                    mono._start_video()
+                    got = captured[0] if captured else []
+                    print(f"      实际 argv：{' '.join(got) or '(无命令)'}")
+                    return got
+
+                def _val(cmd: list[str], flag: str) -> str:
+                    return cmd[cmd.index(flag) + 1] if flag in cmd else ""
+
+                mono.var_diameter.set("30")         # 用户填的球径（mm）
+                mono.var_focal.set("")
+                mono.var_preset.set("red_ball")
+                mono.ball.set_kind(BALL_PLASTIC)
+                cmd = _argv_of()
+                ok_plastic = (_val(cmd, "--method") == "color"
+                              and _val(cmd, "--preset") == "red_ball"
+                              and _val(cmd, "--ball-diameter") == "0.03")
+                print(f"  [{'通过' if ok_plastic else '不达标'}] 界面选「纯色塑料球 + 红」"
+                      f"→ --method {_val(cmd, '--method') or '(缺失)'} "
+                      f"--preset {_val(cmd, '--preset') or '(缺失)'} "
+                      f"--ball-diameter {_val(cmd, '--ball-diameter') or '(缺失)'}")
+                results.append(("球种类：纯色球+红 → color + red_ball", ok_plastic))
+
+                mono.ball.set_kind(BALL_METAL)
+                cmd = _argv_of()
+                ok_metal = (_val(cmd, "--method") == "specular"
+                            and "--preset" not in cmd)
+                ok_keep = (mono.var_diameter.get().strip() == "30"
+                           and _val(cmd, "--ball-diameter") == "0.03")
+                print(f"  [{'通过' if ok_metal else '不达标'}] 界面选「镜面金属球」"
+                      f"→ --method {_val(cmd, '--method') or '(缺失)'}，"
+                      f"--preset {'仍在（错）' if '--preset' in cmd else '不传（对）'}")
+                print(f"  [{'通过' if ok_keep else '不达标'}] 切球种类不动球直径："
+                      f"框里仍是 {mono.var_diameter.get()!r}，命令行 "
+                      f"{_val(cmd, '--ball-diameter') or '(缺失)'}（mm→m 换算是 0.03）")
+                results.append(("球种类：镜面球 → specular 且不带 preset", ok_metal))
+                results.append(("切球种类不改动球直径", ok_keep))
+
+                # 预设：下拉显示中文、变量里仍是内部名（argv 只认 red_ball）
+                mono.ball._var_preset_label.set("红球")
+                mono.ball._on_preset_selected()
+                ok_lab = (mono.var_preset.get() == "red_ball"
+                          and "红球" in tuple(mono.ball.cb_preset.cget("values")))
+                print(f"  [{'通过' if ok_lab else '不达标'}] 预设下拉显示「红球」，"
+                      f"写回变量的是 {mono.var_preset.get()!r}（argv 只认内部名）")
+                results.append(("预设显示中文但下传内部名", ok_lab))
+
+                # 参数按窗口裁剪：单目没有半径控件（run_video 没这两个开关）
+                ok_scope_m = mono.ball.radius_vars is None
+                print(f"  [{'通过' if ok_scope_m else '不达标'}] 单目窗不放半径"
+                      f"（run_video 的 argparse 里没有 --min/max-radius）")
+                results.append(("单目窗不含半径控件", ok_scope_m))
+
+                # ③ 下拉项 == 注册表：把界面上的候选与注册表逐个比，
+                # 而不是"看看有没有 color 这一项"（少一个也是错，多一个更是）。
+                stereo_win = dict(windows)["stereo(parallel)"]
+                shown = tuple(stereo_win.ball.cb_method.cget("values"))
+                ok_reg = shown == detector_methods()
+                print(f"  [{'通过' if ok_reg else '不达标'}] 双目窗「检测方法」下拉项 == "
+                      f"注册表（{len(shown)} 项：{list(shown)}）")
+                results.append(("自定义档的下拉项等于注册表", ok_reg))
+                mono.var_diameter.set("")
+                mono.var_preset.set("不使用")
+                mono.ball.set_kind(BALL_PLASTIC)
+
             print(f"  检测器候选 = {list(detector_choices())}"
                   f"（默认 {mono.var_detector.get()!r}）")
         finally:
@@ -1017,6 +1268,64 @@ def main() -> int:
             mono._auto_retry_pending = False
             mono.app.tasks = real_tasks
             mono._refresh_session()
+
+        # ---------- 双目窗：第④步的 argv 真的来自「球种类」（2026-11-03 增）----------
+        # 与单目那三条同一件事的另一半：第④步原来一个检测参数都不传，
+        # 于是"这颗是红球"在界面上无处可说；现在说在哪、就必须传到位。
+        import tempfile
+
+        from apps._gui_widgets import BALL_METAL, BALL_PLASTIC
+
+        stereo_win = dict(windows)["stereo(parallel)"]
+        captured.clear()
+        stereo_win.app.tasks = _StubTasks()
+        try:
+            with tempfile.TemporaryDirectory(prefix="stereo_ball_") as tmp:
+                sess = Path(tmp) / "20260105-000000"
+                sess.mkdir()
+                stereo_win.var_session.set(str(sess))
+                stereo_win.ball.set_kind(BALL_PLASTIC)
+                stereo_win.var_preset.set("red_ball")
+                stereo_win.var_min_radius.set("12")
+                stereo_win.var_max_radius.set("90")
+                stereo_win._start_offline()
+                cmd = captured[0] if captured else []
+                ok_st = (_has_seq(cmd, ["--method", "color", "--preset", "red_ball"])
+                         and _has_seq(cmd, ["--min-radius", "12", "--max-radius", "90"])
+                         and _has_seq(cmd, ["--stereo-mode", "parallel"]))
+                print(f"  [{'通过' if ok_st else '不达标'}] 双目第④步（纯色球+红）→ "
+                      f"{' '.join(cmd[1:]) or '(无命令)'}")
+                results.append(("双目窗球种类进命令行", ok_st))
+
+                # 切球种类**只许改方法**：半径范围是用户填的，不许跟着动
+                stereo_win.ball.set_kind(BALL_METAL)
+                ok_keep_r = (stereo_win.var_min_radius.get() == "12"
+                             and stereo_win.var_max_radius.get() == "90")
+                print(f"  [{'通过' if ok_keep_r else '不达标'}] 切球种类不动半径范围："
+                      f"仍是 {stereo_win.var_min_radius.get()!r}–"
+                      f"{stereo_win.var_max_radius.get()!r}")
+                results.append(("切球种类不改动半径范围", ok_keep_r))
+                # 双目没有球直径控件（run_stereo_video 的 argparse 里没有这个开关）
+                ok_scope_s = stereo_win.ball.var_diameter is None
+                print(f"  [{'通过' if ok_scope_s else '不达标'}] 双目窗不放球直径"
+                      f"（run_stereo_video 没有 --ball-diameter）")
+                results.append(("双目窗不含球直径控件", ok_scope_s))
+
+                # 镜面球没有点选球心：拦住并说清，别让人等一次进程启动再看 0 配对
+                captured.clear()
+                stereo_win._start_offline()
+                note = stereo_win.status._label.cget("text")
+                ok_blk = not captured and "点选球心" in note
+                print(f"  [{'通过' if ok_blk else '不达标'}] 双目镜面球没点选球心 → "
+                      f"不起进程，状态条说明（尾部：…{note[-26:]}）")
+                results.append(("双目镜面球缺种子时先拦住", ok_blk))
+        finally:
+            stereo_win.app.tasks = real_tasks
+            stereo_win.var_session.set("")
+            stereo_win.var_preset.set("不使用")
+            stereo_win.var_min_radius.set("")
+            stereo_win.var_max_radius.set("")
+            stereo_win.ball.set_kind(BALL_PLASTIC)
 
         try:
             from apps._gui_stereo import SessionPicker, scan_sessions

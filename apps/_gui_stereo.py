@@ -30,8 +30,9 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
-from apps._gui_widgets import (BG, INK, MUTED, WARN, ScrollPage, StatusBar,
-                               Surface, fit_to_content)
+from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, METHOD_METAL,
+                               PRESET_NONE, BG, INK, MUTED, WARN, BallSettings,
+                               ScrollPage, StatusBar, Surface, fit_to_content)
 from apps._collapsible import CollapsibleSection
 # argv 的唯一产地在 `_actions`（见该模块 docstring）：这里只 import 名字，
 # 不再自己拼命令行 —— 否则同一个动作会有两份参数清单，已经因此出过三次缺陷。
@@ -39,11 +40,33 @@ from apps._actions import (CHAIN_ROOT, board_args, calibrate_args,
                            chain_dirs, check_setup_args, offline_args,
                            record_args)
 from apps import _actions
+from sphere_tracker.config import ColorConfig
 from sphere_tracker.paths import STEREO_ROOT, stereo_roots
+from sphere_tracker.plugins import names as plugin_names
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
-           "record_out_dir", "check_setup_args", "session_name_of"]
+           "record_out_dir", "check_setup_args", "session_name_of",
+           "detector_methods", "preset_choices"]
+
+
+def detector_methods() -> tuple[str, ...]:
+    """双目/工作台的检测方法候选：**注册表里的全部实现**，一个不多一个不少。
+
+    为什么不在界面里写一份名字清单（R7）：这份清单以前在手抄的四份里漂过
+    （GUI 7 项 / ``run_stereo_video`` 5 项 / ``run_all`` 4 项）。判据
+    （``tests/selftest_gui_budget.py``）断言的就是"下拉项 == 注册表"，
+    所以这里**只准**转发，不许过滤、不许补字面量。
+
+    不带单目那个 ``smart``：它是单目窗自己的"0 检出换 hough 重跑"行为，
+    ``run_stereo_video --method`` 的 choices 里没有它。
+    """
+    return tuple(plugin_names("detector"))
+
+
+def preset_choices() -> tuple[str, ...]:
+    """颜色预设候选：唯一来源 ``ColorConfig.preset_names()``（同 ``detector_methods``）。"""
+    return tuple(ColorConfig.preset_names())
 
 
 #: 两条方法在界面上的说法。键与 `calibrate_stereo.py --method` 一致。
@@ -366,6 +389,14 @@ class StereoWindow(tk.Toplevel):
         # 据此拒掉半径离谱的假配对。开关放在这里而不是"永远开"：它要求会话里
         # **有人点过**球心，没点过就开只会得到一条报错；默认关才符合"点了才有"。
         self.var_anchor = tk.BooleanVar(value=False)
+        # 球种类与检测参数（2026-11-03）：控件摆在 ④，但值是**用户的选择**，
+        # 所以关窗时和板参数一起存（不存"当前会话"，那是磁盘现状）。
+        self.var_preset = tk.StringVar(
+            value=prefs.get_str("stereo.preset", PRESET_NONE) or PRESET_NONE)
+        self.var_min_radius = tk.StringVar(
+            value=prefs.get_str("stereo.min_radius", ""))
+        self.var_max_radius = tk.StringVar(
+            value=prefs.get_str("stereo.max_radius", ""))
         self.var_label = tk.StringVar(value="")
         self.var_seconds = tk.StringVar(value="10")
 
@@ -524,6 +555,19 @@ class StereoWindow(tk.Toplevel):
             parent, "④ 分析（对一段已录好的会话跑三维）",
             "离线重建：读会话的两路视频，按标定解出三维轨迹。本窗口强制按 "
             + ("平行" if self.mode == "parallel" else "大角度") + " 解算。")
+        # 球种类与检测参数（2026-11-03）：以前这一段只有一个会话输入框，
+        # 检测参数全靠 `run_stereo_video` 自己的默认值 —— 换了一颗纯色球的人
+        # 在界面上**没有任何地方**能说"这是红球"，只能去命令行加 `--preset`。
+        # 摆在第④步而不是第②③步：它只影响"解算"，不影响标定与录制。
+        self.ball = BallSettings(
+            self.surface, box,
+            methods=detector_methods(), presets=preset_choices(),
+            kind=(BALL_METAL
+                  if _actions.has_seeds(self.var_session.get().strip())
+                  else BALL_PLASTIC),
+            preset_var=self.var_preset,
+            radius_vars=(self.var_min_radius, self.var_max_radius),
+            on_change=self._refresh_ball_note)
         line = ttk.Frame(box)
         line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                   sticky="w", pady=(4, 0))
@@ -738,15 +782,47 @@ class StereoWindow(tk.Toplevel):
         """选中一个会话。``why`` 非空表示"它不属于本窗模式"，必须说出来。"""
         self.var_session.set(path)
         name = Path(path).name
+        notes: list[str] = []
         if why:
-            self.status.set_status(f"已选 {name} —— 注意：{why}", "warn")
+            notes.append(why)
+        # 会话里有人点过球心 = 这颗球是镜面球（只有 specular 认那些点）。
+        # 替他把球种类切过去并**说出来**：不切的话下拉显示"纯色球"、
+        # 命令行却因为没有种子解不出东西，用户会以为是标定坏了。
+        if self.ball.kind() != BALL_METAL and _actions.has_seeds(path):
+            self.ball.set_kind(BALL_METAL)
+            notes.append("这段会话里有点选球心，球种类已切到「镜面金属球」"
+                         "（specular 会读那些点）")
+        if notes:
+            self.status.set_status(f"已选 {name} —— 注意：" + "；".join(notes), "warn")
         else:
             self.status.set_status(f"已选会话：{name}", "ok")
+
+    def _refresh_ball_note(self) -> None:
+        """球种/半径改了之后的回写（只往状态条写，不新增任何行）。
+
+        为什么不下放成一行常驻说明：第④步的下沿已经贴着视口（869 px），
+        多一行就把「跑离线三维」挤出屏幕 —— 而"按钮看不见"比"少一句解释"严重。
+        所以：填错 → 说清哪一项不会被采用；切档 → 说清这一档的前提。
+        每档的长解释在卡片说明与 ``BallSettings`` 的 docstring 里。
+        """
+        problem = self.ball.problem()
+        if problem:
+            self.status.set_status(problem, "warn")
+            return
+        hint = self.ball.hint()
+        if hint:
+            self.status.set_status(hint, "warn")
 
     def _start_offline(self) -> None:
         session = self.var_session.get().strip()
         if not session:
             self.status.set_status("先选一个会话（点「选择…」）", "warn")
+            return
+        # 填坏了的半径范围不许静默变成"不传"：那会让用户以为限定了范围，
+        # 实际是全画面在找（`run_stereo_video` 的默认是 8–200 px）。
+        problem = self.ball.problem()
+        if problem:
+            self.status.set_status(problem, "warn")
             return
         # 勾了锚点却没点选过球心：命令行会拒绝（退出码 2），但那时用户已经等了
         # 一次进程启动。能在这里说清就不要让人等 —— 这也是"按钮看起来什么都做了"
@@ -756,14 +832,28 @@ class StereoWindow(tk.Toplevel):
                 "这个会话还没有「点选球心」，半径锚点门用不了：先点「点选球心」"
                 "（左右各一次），再回来勾它；不想点就把勾去掉", "warn")
             return
-        cmd = offline_args(session, self.mode, anchor=self.var_anchor.get())
-        if self.var_anchor.get():
+        seed = Path(session) / "derived" / "seeds.json"
+        method = self.ball.method()
+        # 镜面球没有种子 = 必然 0 配对（specular 只在高光附近找，不会自己初始化）。
+        # 与其让人等一次进程启动再看到"0 匹配"，不如在这里拦住并说清下一步。
+        if self.ball.kind() == BALL_METAL and not seed.is_file():
             self.status.set_status(
-                f"正在按 {self.mode} 解算 {Path(session).name}"
-                "（半径锚点门已开：先读会话里的点选中心）…", "info")
-        else:
-            self.status.set_status(f"正在按 {self.mode} 解算 {Path(session).name}…",
-                                   "info")
+                "镜面金属球要先「点选球心」（左右各点一次球心+球边）："
+                "specular 靠那些点跟踪，没有它们这一段会得到 0 对匹配", "warn")
+            return
+        use_seed = seed.is_file() and method == METHOD_METAL
+        cmd = _actions.offline_stereo(
+            session, mode=self.mode, anchor=self.var_anchor.get(),
+            method=method, seed_json=(seed if use_seed else ""),
+            preset=self.ball.preset(),
+            min_radius=self.ball.min_radius(),
+            max_radius=self.ball.max_radius())
+        tail = "（半径锚点门已开：先读会话里的点选中心）" if self.var_anchor.get() else ""
+        if use_seed:
+            tail += "（用会话里的点选球心跟踪）"
+        self.status.set_status(
+            f"正在按 {self.mode} 解算 {Path(session).name}（检测方法 {method}）{tail}…",
+            "info")
         self.app.tasks.start(cmd, "离线三维重建")
 
     def _start_seed(self) -> None:
@@ -825,6 +915,11 @@ class StereoWindow(tk.Toplevel):
         p.set("stereo.min_sharpness", self.var_sharpness.get().strip())
         p.set("stereo.relaxed", bool(self.var_relaxed.get()))
         p.set("stereo.seconds", self.var_seconds.get().strip())
+        # 球种类与检测参数是**输入**：换了一颗红球的人不该每次开窗重填一遍。
+        # （球种类本身不存：它由检测方法反推，存了就是同一件事的两份值。）
+        p.set("stereo.preset", self.var_preset.get().strip() or PRESET_NONE)
+        p.set("stereo.min_radius", self.var_min_radius.get().strip())
+        p.set("stereo.max_radius", self.var_max_radius.get().strip())
         p.save()
 
     def _stop_my_tasks(self) -> None:
