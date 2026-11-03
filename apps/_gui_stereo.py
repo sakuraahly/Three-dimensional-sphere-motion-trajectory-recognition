@@ -612,12 +612,6 @@ class StereoWindow(tk.Toplevel):
     # ------------------------------------------------------------------ #
     def _refresh_state(self) -> None:
         st = self.app.state
-        ready, text = (st.parallel_status() if self.mode == "parallel"
-                       else st.angled_status())
-        clean = text.replace("**", "")
-        self.lbl_calib.configure(
-            text=("标定：" if ready else "标定：") + clean,
-            style="Ok.TLabel" if ready else "Warn.TLabel")
         prof = getattr(st.profile, "name", None)
         mode = st.stereo_mode() or "未记录"
         base = st.baseline_mm()
@@ -629,6 +623,18 @@ class StereoWindow(tk.Toplevel):
         if angle is not None:
             bits.append(f"夹角 {angle:.1f}°")
         self.lbl_rig.configure(text="｜".join(bits))
+
+        # 第②步是**标定**（产出动作），不是消费现有标定。三种方法在本窗口都合法
+        # （joint/joint_skip_fov/chain 都会产出本窗口要的 stereo_mode），所以这里
+        # **不**再用 parallel_status/angled_status 的"现有标定不匹配"来拒绝 ——
+        # 那套判定是给第③步录制/第④步分析用的（它们消费现有标定）。以前把
+        # angled_status 用在这里，导致大角度窗在"现有标定还是上次的 parallel"时，
+        # 状态栏写"请用平行窗口"，用户想选 joint 重新标定却被误判成"不匹配"。
+        existing = "尚无标定" if st.rig is None else f"当前已有标定（{mode}）"
+        self.lbl_calib.configure(
+            text=f"标定：{existing}。选好方法点「开始标定」即可产出本窗口需要的标定",
+            style="Ok.TLabel")
+
         # 相机身份：只读 config/cameras.json，改它只能通过「换相机…」
         try:
             self._cam_text = ("相机：" + st.camera_role_text("left")
@@ -638,8 +644,8 @@ class StereoWindow(tk.Toplevel):
         self._sync_check_enabled()
         if self.lbl_method is not None:
             self._refresh_method_hint()
-        self.status.set_status("就绪" if ready else "第 2 步的标定还不匹配本窗口",
-                               "ok" if ready else "warn")
+        # 第②步本身不再有"就绪"门槛（标定随时可做）；就绪属于第③/④步。
+        self.status.set_status("就绪", "ok")
 
     def _sync_check_enabled(self) -> None:
         """「检查装置」能不能点：只看左右相机有没有填。

@@ -857,6 +857,23 @@ def main() -> int:
             print(f"  未渲染 Markdown = {len(stars)}（必须为 0）")
             results.append((f"{name} 无 Markdown 星号", not stars))
 
+            # 第②步（标定）状态栏不得用"现有标定模式"去拒绝"即将标定"（2026-11-03）。
+            # 标定是产出动作：大角度窗选 joint/chain 都是合法的，即使当前 active 标定
+            # 还是上次的 parallel，也不该写"请用平行窗口"（那套判定属于第③录制/第④分析）。
+            if name.startswith("stereo"):
+                lbl = getattr(win, "lbl_calib", None)
+                if lbl is not None:
+                    try:
+                        calib_txt = str(lbl.cget("text"))
+                    except Exception:                       # noqa: BLE001
+                        calib_txt = ""
+                    ok = ("请用" not in calib_txt
+                          and "请用平行" not in calib_txt
+                          and "请用「平行双目」窗口" not in calib_txt)
+                    print(f"  标定状态栏不误导 = {'通过' if ok else '不达标'}"
+                          f"（{calib_txt[:40]}）")
+                    results.append((f"{name} 第②步标定不误判模式", ok))
+
         # ---------- 界面契约（2026-10-28 增，防回退） ----------
         # 守的是本轮踩过的坑：分窗时把跨模式工具与装置身份弄丢/藏起来，
         # 用户找不到相机管理、也看不出左右相机是哪台（B-103/B-104/B-106）。
