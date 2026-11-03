@@ -303,14 +303,20 @@ manifest.json    会话清单、类别、文件大小
 > **视频画面没有做自动打码。** 勾选 `annotated` 或 `raw` 时，
 > 画面里的房间、人物、屏幕内容会一起交付；请自行确认授权。
 
-## 数据变量说明（简明）
+{VARIABLE_REFERENCE}
+"""
+
+
+#: 数据变量说明（简明）。`export_zip` 的 README 与「处理前+处理后」导出的
+#: `数据说明.md` **共用这一份**，不各写各的——口径改了只改这一处。
+VARIABLE_REFERENCE = """## 数据变量说明（简明）
 
 ### 坐标与单位
 - 三维点坐标单位**米**，坐标系**左相机系**：X 右、Y 下、Z 前（未标定时）；
 - 时间单位**秒**，`t=0` 为该段起始；速度 `m/s`，加速度 `m/s²`；
 - 像素坐标单位为**像素**，图像尺寸以各自文件头/标定为准。
 
-### `derived/traj3d.csv`（三维轨迹，核心）
+### `traj3d.csv` / `*_raw.csv`（三维轨迹，核心）
 | 列 | 含义 |
 | --- | --- |
 | `frame` | 帧号（左路） |
@@ -323,7 +329,7 @@ manifest.json    会话清单、类别、文件大小
 | `confident` | 该帧是否高置信 |
 | `method_left, method_right` | 左右各自用的检测/跟踪方法 |
 
-### `derived/motion.csv`（速度/加速度，可选产物）
+### `motion.csv` / `*_motion.csv`（速度/加速度，可选产物）
 | 列 | 含义 |
 | --- | --- |
 | `x, y, z` | 平滑后的位置（米） |
@@ -332,8 +338,8 @@ manifest.json    会话清单、类别、文件大小
 | `segment` | 段号；数据有丢帧，**跨段不能连续差分/滤波，滤波器按段重置** |
 | `smoothed` | true=该点参与了平滑 |
 
-### `derived/traj3d.json` / `visualization.json`
-- `trajectory[]`：`{{frame, t, xyz, confident}}`，`xyz` 为 `[X, Y, Z]`（米）；
+### `traj3d.json` / `visualization.json`
+- `trajectory[]`：`{frame, t, xyz, confident}`，`xyz` 为 `[X, Y, Z]`（米）；
 - `visualization.json` 另有 `style.axes` 说明轴向、`bounds` 说明范围。
 
 ### `metadata/session.json`
@@ -496,6 +502,9 @@ def export_motion_pair(session: str | Path, out_dir: str | Path) -> tuple[Path, 
     `*_raw.csv` 是**逐字节复制** `derived/traj3d.csv`（不做任何重排/改列）：
     原始数据一旦被"顺手规整"，就没法和旧结果对账了。
 
+    每次导出还会在**输出目录**写一份 ``数据说明.md``（`VARIABLE_REFERENCE`，与
+    `export_zip` 的 README 共用同一份口径），让接收方一眼看懂列含义/单位/坐标系。
+
     会话没有 `derived/traj3d.csv` 时返回 ``None``（调用方据此告诉用户"这段还没跑过"）。
     """
     import shutil
@@ -518,4 +527,15 @@ def export_motion_pair(session: str | Path, out_dir: str | Path) -> tuple[Path, 
         return None
     kin = kinematics(t, P)
     write_motion_csv(motion, frame, kin)
+
+    # 附一份说明（幂等覆盖：多次导出同一目录时保持最新口径）
+    note = out / "数据说明.md"
+    note.write_text(
+        f"# 双目运动数据说明\n\n导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"会话：{sess.name}\n\n"
+        f"本目录含该会话的两份轨迹：\n\n"
+        f"- `{raw.name}`：原始三维轨迹（逐字节复制 traj3d.csv）\n"
+        f"- `{motion.name}`：平滑后的位置 + 速度 + 加速度\n\n"
+        f"{VARIABLE_REFERENCE}",
+        encoding="utf-8")
     return raw, motion

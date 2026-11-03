@@ -1783,8 +1783,11 @@ def _pair_check(base) -> bool:
             return False
         raw, motion = got
         # 校验必须在 TemporaryDirectory 仍存活时做（read_bytes 此时才读得到）。
+        note = Path(td) / "数据说明.md"
         return (raw.name.endswith("_raw.csv") and motion.name.endswith("_motion.csv")
-                and raw.read_bytes() == src.read_bytes() and motion.stat().st_size > 0)
+                and raw.read_bytes() == src.read_bytes() and motion.stat().st_size > 0
+                and note.exists()
+                and "数据变量说明" in note.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
