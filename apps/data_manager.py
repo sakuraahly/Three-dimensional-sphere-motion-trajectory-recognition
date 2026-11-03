@@ -288,12 +288,9 @@ class DataManager(tk.Tk):
         outer.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
         body = ttk.PanedWindow(outer, orient="horizontal")
-        outer.add(body, weight=4)
 
         left = ttk.Frame(body)
-        right = ttk.Frame(body, width=330)
-        body.add(left, weight=4)
-        body.add(right, weight=1)
+        right = ttk.Frame(body)
 
         cols = ("sel", "id", "name", "created", "frames", "mode", "status", "size")
         heads = ("选", "会话", "名称", "时间", "帧", "模式", "状态", "大小")
@@ -368,14 +365,18 @@ class DataManager(tk.Tk):
         self.status.pack(anchor="w")
 
         log_box = ttk.LabelFrame(outer, text="导出日志", padding=4)
-        # 日志作为垂直 PanedWindow 的第二个 pane：默认给足高度（约 10 行），
-        # 用户还能拖上下分隔线随时调整。
-        outer.add(log_box, weight=1)
         self.log = tk.Text(log_box, height=10, wrap="none")
         self.log.pack(side="left", fill="both", expand=True)
         lsb = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         lsb.pack(side="right", fill="y")
         self.log.configure(yscrollcommand=lsb.set)
+
+        # 内容都建好之后再 add 到两个 PanedWindow（ttk 的 pane 只支持 weight，
+        # 不支持 minsize；拖动由内置 sash 手柄完成）。
+        body.add(left, weight=4)
+        body.add(right, weight=1)
+        outer.add(body, weight=4)
+        outer.add(log_box, weight=1)
 
     def _default_output(self) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")

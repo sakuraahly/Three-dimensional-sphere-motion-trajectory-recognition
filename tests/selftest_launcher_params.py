@@ -1456,6 +1456,37 @@ def main() -> int:
         checks_extra.append(("按钮文字：开始导出(zip)/导出轨迹数据(csv)/刷新数据目录",
                              btn_ok))
 
+        # 三区可拖（2026-11-03）：两个 PanedWindow（vertical + horizontal）各有 2 个 pane，
+        # 且 sash 位置可写（sashpos 设置后值变化 = 拖动机制在工作）。
+        try:
+            dm5 = DataManager(sroot)   # 不 withdraw：sashpos 依赖几何映射，withdraw 后恒为 0
+            for _ in range(3):
+                dm5.update_idletasks(); dm5.update()
+            from tkinter import ttk as _ttk
+            _panes = []
+            def _walk(w):
+                for _c in w.winfo_children():
+                    if isinstance(_c, _ttk.PanedWindow): _panes.append(_c)
+                    _walk(_c)
+            _walk(dm5)
+            _ok_struct = (len(_panes) == 2
+                          and all(len(_p.panes()) == 2 for _p in _panes))
+            _ok_drag = False
+            if _ok_struct:
+                _ok_drag = True
+                for _p in _panes:
+                    _b = _p.sashpos(0)
+                    try:
+                        _p.sashpos(0, max(_b + 30, 30))
+                        _ok_drag = _ok_drag and (_p.sashpos(0) != _b)
+                    except Exception:                        # noqa: BLE001
+                        _ok_drag = False
+            dm5.destroy()
+            pane_ok = _ok_struct and _ok_drag
+        except Exception as exc:                            # noqa: BLE001
+            pane_ok = False
+        checks_extra.append(("三区可拖：vertical+horizontal 各 2 pane，sash 可写", pane_ok))
+
         # 三层结构（2026-11-03）：exports/<detailed|trajectory>/<时间戳文件夹>/…
         from apps.data_manager import DataManager as _DM
         _stub = _DM.__new__(_DM)   # 不跑 __init__（不开 Tk），只测两个纯方法
