@@ -282,8 +282,13 @@ class DataManager(tk.Tk):
         ttk.Label(toolbar, text="日期可下拉选，或手填 YYYY-MM-DD",
                   foreground=MUTED).pack(side="left", padx=8)
 
-        body = ttk.PanedWindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        # 垂直 PanedWindow：上=主区（左列表+右面板），下=导出日志。
+        # 两条可拖分隔线（类似 VSCode）：主区内部那条拖左右，这条拖上下。
+        outer = ttk.PanedWindow(self, orient="vertical")
+        outer.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        body = ttk.PanedWindow(outer, orient="horizontal")
+        outer.add(body, weight=4)
 
         left = ttk.Frame(body)
         right = ttk.Frame(body, width=330)
@@ -362,9 +367,11 @@ class DataManager(tk.Tk):
                                 wraplength=310, justify="left")
         self.status.pack(anchor="w")
 
-        log_box = ttk.LabelFrame(self, text="导出日志", padding=4)
-        log_box.pack(fill="x", padx=12, pady=(0, 8))
-        self.log = tk.Text(log_box, height=6, wrap="none")
+        log_box = ttk.LabelFrame(outer, text="导出日志", padding=4)
+        # 日志作为垂直 PanedWindow 的第二个 pane：默认给足高度（约 10 行），
+        # 用户还能拖上下分隔线随时调整。
+        outer.add(log_box, weight=1)
+        self.log = tk.Text(log_box, height=10, wrap="none")
         self.log.pack(side="left", fill="both", expand=True)
         lsb = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         lsb.pack(side="right", fill="y")
