@@ -1384,6 +1384,48 @@ def main() -> int:
             gui_ok = False
         checks_extra.append(("GUI 起点→终点/全选/反选/查看3D", gui_ok))
 
+        # 筛选 + 搜索（2026-11-03）：筛选只改显示不动勾选；全选只作用于可见项；
+        # 搜索匹配会话 id 或名称 label。
+        try:
+            dm2 = DataManager(sroot)
+            dm2.withdraw(); dm2.update()
+            # 造一个带 label 的会话，验证搜索能按名称匹配
+            lbl_dir = sroot / "a_lbl_1"
+            (lbl_dir / "derived").mkdir(parents=True)
+            (lbl_dir / "session.json").write_text(json.dumps({
+                "schema": "sphere-stereo-session", "version": 1, "id": "lbl-1",
+                "label": "金属球-左路虚", "created": "2026-01-03 12:00:00",
+                "left": {"frame_count": 1}, "right": {"frame_count": 1},
+            }), encoding="utf-8")
+            dm2.refresh()
+            total = len(dm2.items)
+            # 先勾一个
+            dm2.selected = {dm2.items[0].key}
+            dm2._refresh_count()
+            kept = set(dm2.selected)
+            # 搜索按名称匹配
+            dm2.search_var.set("金属球")
+            dm2.update()
+            vis = dm2._visible_items()
+            search_ok = (len(vis) == 1 and vis[0].key == "a_lbl_1"
+                         and dm2.selected == kept)   # 搜索不动勾选
+            # 清空搜索，选状态下拉=○ 已录制
+            dm2.search_var.set("")
+            dm2.status_filter_var.set("○ 已录制")
+            dm2.update()
+            vis_rec = dm2._visible_items()
+            filt_ok = all(it.status == "recorded" for it in vis_rec) and dm2.selected == kept
+            # 全选只作用于可见项（此时可见=recorded 的那批），不把隐藏的也勾上
+            dm2.select_none()
+            dm2.select_all()
+            all_visible_ok = dm2.selected == {it.key for it in vis_rec}
+            dm2.destroy()
+            filter_ok = search_ok and filt_ok and all_visible_ok
+        except Exception as exc:                            # noqa: BLE001
+            print(f"    DataManager 筛选/搜索测试失败：{exc}")
+            filter_ok = False
+        checks_extra.append(("GUI 筛选/搜索：只改显示不动勾选、全选只看可见", filter_ok))
+
         for name, passed in checks_extra:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))

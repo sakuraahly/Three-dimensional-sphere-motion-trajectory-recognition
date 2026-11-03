@@ -217,6 +217,9 @@ class DataManager(tk.Tk):
         self._cat_vars: dict[str, tk.BooleanVar] = {}
         self._redact_vars: dict[str, tk.BooleanVar] = {}
         self._ui_queue: queue.Queue = queue.Queue()
+        # 列表筛选：状态下拉 + 搜索框（只改显示，不动勾选状态）
+        self._status_filter: str = "全部"
+        self._search_text: str = ""
         self._build()
         self.refresh()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -235,9 +238,24 @@ class DataManager(tk.Tk):
         ttk.Button(head, text="数据目录…", command=self.choose_root).pack(
             side="right", padx=(4, 12), pady=8)
         ttk.Button(head, text="刷新", command=self.refresh).pack(side="right", pady=8)
+        # 搜索框（实时匹配会话 id / 名称 label），放头部右侧，和刷新/数据目录并列
+        ttk.Label(head, text="搜索", background=ACCENT, foreground="white").pack(
+            side="right", padx=(4, 2), pady=8)
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_a: self._apply_filters())
+        ttk.Entry(head, textvariable=self.search_var, width=20).pack(
+            side="right", pady=8)
 
         toolbar = ttk.Frame(self, padding=(12, 8))
         toolbar.pack(fill="x")
+        # 状态筛选下拉（全部 / 各状态符号）
+        ttk.Label(toolbar, text="状态").pack(side="left")
+        self.status_filter_var = tk.StringVar(value="全部")
+        status_options = ["全部", "✓ 有3D", "◐ 已点选", "○ 已录制", "✗ 坏", "— 空"]
+        ttk.Combobox(toolbar, textvariable=self.status_filter_var,
+                     values=status_options, state="readonly", width=10).pack(
+            side="left", padx=(2, 10))
+        self.status_filter_var.trace_add("write", lambda *_a: self._apply_filters())
         ttk.Button(toolbar, text="全选", command=self.select_all).pack(side="left")
         ttk.Button(toolbar, text="全不选", command=self.select_none).pack(side="left", padx=4)
         ttk.Button(toolbar, text="反选", command=self.invert).pack(side="left", padx=4)
@@ -351,16 +369,40 @@ class DataManager(tk.Tk):
         return str(ROOT / "outputs" / "exports" / f"sphere-stereo-export-{stamp}.zip")
 
     # ------------------------------------------------------------------
-    def refresh(self) -> None:
-        try:
-            self.items = scan_items(self.root_dir)
-        except Exception as exc:                            # noqa: BLE001
-            messagebox.showerror("扫描失败", str(exc), parent=self)
-            return
-        valid = {it.key for it in self.items}
-        self.selected &= valid
+    def _status_symbol(self, it: SessionItem) -> str:
+        """把状态下拉的值映射回 STATUS_SYMBOLS 的键，用于过滤。"""
+        return {
+            "✓ 有3D": "traj",
+            "◐ 已点选": "seeded",
+            "○ 已录制": "recorded",
+            "✗ 坏": "bad",
+            "— 空": "empty",
+        }.get(self._status_filter)
+
+    def _visible_items(self) -> list[SessionItem]:
+        """当前筛选 + 搜索之后应该显示在列表里的项（顺序与 self.items 一致）。"""
+        want_symbol = self._status_symbol(self._status_filter)
+        q = self.search_var.get().strip().lower()
+        out: list[SessionItem] = []
+        for it in self.items:
+            if want_symbol is not None and it.symbol != want_symbol:
+                continue
+            if q:
+                name = self._session_name(it).lower()
+                if q not in it.id.lower() and q not in name:
+                    continue
+            out.append(it)
+        return out
+
+    def _apply_filters(self) -> None:
+        """按状态 + 搜索重画列表。只改显示，勾选状态原样保留。"""
+        self._status_filter = self.status_filter_var.get()
+        self._search_text = self.search_var.get()
+        visible = {it.key for it in self._visible_items()}
         self.tree.delete(*self.tree.get_children())
         for it in self.items:
+            if it.key not in visible:
+                continue
             size = _fmt_bytes(it.size_bytes)
             self.tree.insert("", "end", iid=it.key,
                              values=("☑" if it.key in self.selected else "☐",
@@ -370,6 +412,17 @@ class DataManager(tk.Tk):
                                      "大角度" if it.stereo_mode == "angled" else "平行",
                                      it.symbol, size))
         self._refresh_count()
+
+    # ------------------------------------------------------------------
+    def refresh(self) -> None:
+        try:
+            self.items = scan_items(self.root_dir)
+        except Exception as exc:                            # noqa: BLE001
+            messagebox.showerror("扫描失败", str(exc), parent=self)
+            return
+        valid = {it.key for it in self.items}
+        self.selected &= valid
+        self._apply_filters()
 
     @staticmethod
     def _session_name(it: SessionItem) -> str:
@@ -472,7 +525,8 @@ class DataManager(tk.Tk):
         self._refresh_count()
 
     def select_all(self) -> None:
-        self.selected = {it.key for it in self.items}
+        # 只作用于当前**可见**项：筛选/搜索后"全选"不该把被隐藏的也勾上
+        self.selected.update(it.key for it in self._visible_items())
         self._anchor_id = None
         self._refresh_count()
 
@@ -482,8 +536,9 @@ class DataManager(tk.Tk):
         self._refresh_count()
 
     def invert(self) -> None:
-        all_keys = {it.key for it in self.items}
-        self.selected = all_keys - self.selected
+        # 反选同样只针对可见项，避免"看不见的也被翻转"
+        visible = {it.key for it in self._visible_items()}
+        self.selected = (self.selected - visible) | (visible - self.selected)
         self._anchor_id = None
         self._refresh_count()
 
