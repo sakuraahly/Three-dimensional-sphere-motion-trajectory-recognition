@@ -623,6 +623,8 @@ class MonoWindow(tk.Toplevel):
         _root_txt = prefs.get_str("mono.session_root", "")
         self._session_root = Path(_root_txt) if _root_txt else MONO_SESSIONS_ROOT
         self._session: MonoSession | None = None
+        #: 第③步「会话目录」输入框里显示的文字（只读，回填自磁盘现状，不是输入）。
+        self.var_session_dir = tk.StringVar(value="")
         #: 当前会话里那份种子文件（有 = 「开始识别」走人工种子的跟踪）。
         #: **每次刷新都从磁盘重取**：它不是输入，是派生事实；缓存久了就会
         #: 与磁盘分叉（用户删了 seed.json，界面还在说"会用种子"）。
@@ -842,6 +844,19 @@ class MonoWindow(tk.Toplevel):
                      state="readonly",
                      textvariable=self.var_source).pack(side="left", padx=(8, 0))
 
+        # 会话目录行（对齐双目第④步）：只读输入框显示当前会话 + 「选择…」按钮。
+        # 之前只有「历史会话…」按钮（弹窗选），现在把"当前会话"摆到首屏一眼可见，
+        # 选择动作由「选择…」承担，「历史会话…」按钮撤掉（按钮预算 5 已满）。
+        sess_line = ttk.Frame(box)
+        sess_line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
+                       sticky="we", pady=(4, 0))
+        ttk.Label(sess_line, text="会话目录").pack(side="left")
+        ttk.Entry(sess_line, textvariable=self.var_session_dir, width=38,
+                  state="readonly").pack(side="left", padx=(8, 8), fill="x",
+                                         expand=True)
+        ttk.Button(sess_line, text="选择…", command=self._pick_session).pack(
+            side="left")
+
         # 会话摘要：录完 / 跑完检测后状态会变，必须一眼看出"录了但还没检测"。
         # 它在首屏（不在折叠里）—— 这是用户判断"下一步该点什么"的唯一依据。
         self.lbl_session = self.surface.hint(box, "")
@@ -852,10 +867,9 @@ class MonoWindow(tk.Toplevel):
         # 而"看 3D"是单目唯一的可视化入口，必须挤进来 —— 它比多一个并列按钮值。
         self.surface.secondary(actions, "开始识别", self._start_by_source)
         self.btn_view3d = self.surface.secondary(actions, "看 3D", self._open_3d)
-        self.surface.secondary(actions, "历史会话…", self._pick_session)
         # 镜面球没有可靠的自动初始化（实测 color 0/288 落在球上、hough 只有 1.4%，
         # 半径中位 69.5 px vs 真值 91 px），所以"点一下球"是这类录像的唯一正路。
-        # 按钮预算 5 已被占满，于是把「换目录…」挪进「历史会话…」（见该窗口的说明）。
+        # 「历史会话…」已并入上面的「会话目录 + 选择…」行，这里不再单独占一个按钮。
         self.btn_seed = self.surface.secondary(actions, "点选球心", self._pick_seed)
         self.btn_seed.state(["disabled"])       # 没会话/没视频时不可点，见 _sync_seed_button
 
@@ -900,7 +914,7 @@ class MonoWindow(tk.Toplevel):
             "球是镜面的（镀铬、反光）时，自动检测会把书架/衣服当球：先录一段，"
             "再点「点选球心」——第一点球心、第二点球边（半径不靠自动估），"
             "之后「开始识别」用它跟踪，检测器会自动切成 specular。"
-            "换会话存放目录的入口在「历史会话…」里。")
+            "换会话存放目录的入口在「选择…」弹窗里。")
 
     def _ball_changed(self) -> None:
         """切了球种类 / 改了方法之后，把"这一档要注意什么"写进状态条。
@@ -1080,12 +1094,14 @@ class MonoWindow(tk.Toplevel):
         self._seed_json = self._seed_path()
         if cur is None:
             self.lbl_session_dir.configure(text=self._preview_dir())
+            self.var_session_dir.set("")   # 会话目录输入框：空 = 尚无当前会话
             self.lbl_session.configure(
                 text="还没有当前会话：按「录制视频」会自动新建一个目录；"
-                     "要接着看以前录的，点「历史会话…」挑一段。",
+                     "要接着看以前录的，点「选择…」挑一段。",
                 style="Hint.TLabel")
             return
         self.lbl_session_dir.configure(text=self._short(cur.path) + "/")
+        self.var_session_dir.set(str(cur.path))   # 回填当前会话目录（只读展示）
         if cur.error:
             self.lbl_session.configure(
                 text=f"当前会话 {cur.id} 有问题：{cur.error}", style="Warn.TLabel")
@@ -1179,7 +1195,7 @@ class MonoWindow(tk.Toplevel):
         clip = self._clip_path()
         if clip is None:
             self.status.set_status(
-                "当前会话里没有视频：先「录制视频」，或从「历史会话…」挑一段已录好的",
+                "当前会话里没有视频：先「录制视频」，或点「选择…」挑一段已录好的",
                 "warn")
             return
         from apps.seed_picker import MonoSeedPicker
@@ -1251,7 +1267,7 @@ class MonoWindow(tk.Toplevel):
         cur = self._session
         if cur is None:
             self.status.set_status(
-                "选中的会话读不出来（目录可能刚被移走），点「历史会话…」刷新一下",
+                "选中的会话读不出来（目录可能刚被移走），点「选择…」刷新一下",
                 "warn")
         elif cur.error:
             self.status.set_status(f"当前会话有问题：{cur.error}", "warn")
@@ -1272,7 +1288,7 @@ class MonoWindow(tk.Toplevel):
         self._refresh_session()
         self.status.set_status(
             f"新的会话会建在 {self._short(self._session_root)}/<时间戳>/，"
-            f"以前录的还在原位置（点「历史会话…」只看这个目录下的）", "info")
+            f"以前录的还在原位置（点「选择…」只看这个目录下的）", "info")
 
     # ------------------------------------------------------------------ #
     # 状态
