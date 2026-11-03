@@ -372,12 +372,13 @@ class DataManager(tk.Tk):
 
     def _default_output(self) -> str:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        return str(ROOT / "outputs" / "exports" / f"sphere-stereo-export-{stamp}.zip")
+        # zip 导出统一进固定文件夹 exports/detailed data/，文件名带时间戳
+        return str(ROOT / "outputs" / "exports" / "detailed data"
+                   / f"sphere-stereo-export-{stamp}.zip")
 
     def _default_traj_output(self) -> str:
-        """「导出轨迹数据 (csv)」的默认目录，前缀与 zip 导出区分开。"""
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        return str(ROOT / "outputs" / "exports" / f"sphere-stereo-trajectory-{stamp}")
+        """「导出轨迹数据 (csv)」的固定目录 exports/trajectory data/。"""
+        return str(ROOT / "outputs" / "exports" / "trajectory data")
 
     # ------------------------------------------------------------------
     def _status_symbol(self, it: SessionItem) -> str:
@@ -753,10 +754,13 @@ class DataManager(tk.Tk):
 
     # ------------------------------------------------------------------
     def browse_output(self) -> None:
+        # initialdir 用固定的 detailed data 目录（先建好，避免被静默降级）。
+        exports_dir = ROOT / "outputs" / "exports" / "detailed data"
+        exports_dir.mkdir(parents=True, exist_ok=True)
         path = filedialog.asksaveasfilename(
             parent=self, title="导出 zip", defaultextension=".zip",
             filetypes=[("ZIP", "*.zip")],
-            initialdir=str(Path(self.out_var.get()).parent),
+            initialdir=str(exports_dir),
             initialfile=Path(self.out_var.get()).name)
         if path:
             self.out_var.set(path)
@@ -766,7 +770,7 @@ class DataManager(tk.Tk):
         self.log.see("end")
 
     def _export_motion_pair(self) -> None:
-        """「处理前 + 处理后」一次导出：成对写出 raw/motion，同步进行、不等后台线程。"""
+        """「导出轨迹数据 (csv)」：弹窗选目录，取消/失败则落默认目录。"""
         if self._running:
             self.status.configure(text="正在导出，请先等上一个任务结束")
             return
@@ -774,9 +778,20 @@ class DataManager(tk.Tk):
         if not chosen:
             messagebox.showinfo("导出轨迹", "先勾选至少一个会话。", parent=self)
             return
-        # 「导出轨迹数据」用**自己的**默认目录（sphere-stereo-trajectory-<时间>），
-        # 不复用 zip 导出的 out_var —— 否则两个导出的默认命名会撞在一起。
-        out_dir = Path(self._default_traj_output())
+        # 默认目录（固定 exports/trajectory data/），弹窗取消/异常时兜底用它。
+        default_dir = Path(self._default_traj_output())
+        default_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = default_dir
+        try:
+            picked = filedialog.askdirectory(
+                parent=self, title="选择轨迹数据导出目录（取消则用默认目录）",
+                initialdir=str(default_dir), mustexist=False)
+        except Exception:                                   # noqa: BLE001
+            picked = ""          # 弹窗交互失败（无显示/后端异常）→ 走默认
+        if picked:
+            out_dir = Path(picked)
+        else:
+            self._log_line(f"未选目录，落到默认目录：{out_dir}")
         done, skipped = [], []
         for it in chosen:
             try:

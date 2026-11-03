@@ -1456,13 +1456,16 @@ def main() -> int:
         checks_extra.append(("按钮文字：开始导出(zip)/导出轨迹数据(csv)/刷新数据目录",
                              btn_ok))
 
-        # 两个导出的默认命名要区分（2026-11-03）：zip=export、csv=trajectory
+        # 两个导出各有**固定**子文件夹（2026-11-03）：zip→exports/detailed data/，
+        # 轨迹→exports/trajectory data/，不再每次新建带时间戳的目录。
         from apps.data_manager import DataManager as _DM
         _stub = _DM.__new__(_DM)   # 不跑 __init__（不开 Tk），只测两个纯方法
-        _z = Path(_DM._default_output(_stub)).stem
-        _t = Path(_DM._default_traj_output(_stub)).stem
-        checks_extra.append(("两个导出默认命名区分：export vs trajectory",
-                             "export" in _z and "trajectory" in _t and _z != _t))
+        _z = Path(_DM._default_output(_stub))
+        _t = Path(_DM._default_traj_output(_stub))
+        checks_extra.append(
+            ("两个导出默认路径区分：zip 进 detailed data、csv 进 trajectory data",
+             _z.parent.name == "detailed data" and _z.suffix == ".zip"
+             and _t.name == "trajectory data"))
 
         for name, passed in checks_extra:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
