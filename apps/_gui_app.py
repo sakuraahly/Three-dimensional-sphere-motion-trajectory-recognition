@@ -584,9 +584,9 @@ class HubWindow(tk.Toplevel):
         self.surface.secondary(row, "任务管理器和运行日志", self.app.open_console)
         self.surface.secondary(row, "数据管理", self._open_data_manager)
         self.surface.secondary(row, "3D 查看器", self._open_viewer)
-        # 工作台在这里出现，是因为它的对象是"任意一段历史会话"，
-        # 不属于某一种装置；当前会话的 ①–⑤ 在双目窗第 ④ 步就地做。
-        self.surface.secondary(row, "会话工作台", self.app.open_bench)
+        # 「会话工作台」入口已隐藏（2026-11-03）：它和单目/双目窗各自的
+        # 「历史会话…」选择器功能重叠，属于旧架构遗留。BenchWindow 代码保留
+        # （双目/单目窗的「历史会话…」仍能用），只是不再从门厅暴露这个跨装置的入口。
         self.surface.secondary(row, "装置档案", self._open_profiles)
         self.surface.secondary(row, "重新读取标定", self._reload_state)
         # 过渡入口：旧界面还没删完，明确标注并给出它将消失的时间点，
