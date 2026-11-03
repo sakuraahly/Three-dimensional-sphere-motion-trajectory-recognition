@@ -616,6 +616,12 @@ class BallSettings:
         （``yolo`` / ``yolo_sam`` 没装时，界面选得动、跑起来才炸）。
         """
         parts = [BALL_HINTS.get(self.kind(), ""), detector_needs_note(self.method())]
+        if self.radius_vars is not None:
+            # 这两个框最容易被误读成"球有多大"。它不是：它是**画面里的像素半径门限**，
+            # 只负责把明显过大/过小的候选筛掉（噪点、远处反光、整块同色背景）。
+            # 同一颗球在近处可能 90 px、远处 30 px，所以它和球的毫米直径没有换算关系。
+            parts.append("「半径 px」是像素门限（筛掉过大/过小的候选，不是球的直径），"
+                         "留空 = 用检测器默认 8~200")
         return "；".join(p for p in parts if p)
 
     # ---------- 联动 ----------
