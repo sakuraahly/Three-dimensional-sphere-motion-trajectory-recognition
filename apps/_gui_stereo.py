@@ -69,7 +69,8 @@ def preset_choices() -> tuple[str, ...]:
     return tuple(ColorConfig.preset_names())
 
 
-#: 两条方法在界面上的说法。键与 `calibrate_stereo.py --method` 一致。
+#: 方法在界面上的说法。键与 `calibrate_stereo.py --method` 一致（chain_dual 是
+#: 界面专用键，底层仍是 chain，只是双板模式：--board-b-dir + --pair-frame）。
 METHODS = {
     "joint": ("两路共视（joint）",
               "两路在**每个姿态**都要同时看到同一块板。适合平行或充分共视的装置。"),
@@ -78,6 +79,9 @@ METHODS = {
     "chain": ("单板链式（chain）",
               "板不必被两路同时看到：各拍一组内参图，再用一块固定参考板把两路串起来。"
               "90 度这类几乎看不到同一区域的装置用它。产物就是本窗口要的 angled。"),
+    "chain_dual": ("双板链式（chain，两板各看一块）",
+                   "两块刚性固定的板（如垂直双板），左相机看 A、右相机看 B，"
+                   "再拍一张两板同框图求相对位姿。适合两路各看各的板的 90° 装置。"),
 }
 
 
@@ -753,28 +757,35 @@ class StereoWindow(tk.Toplevel):
             sharpness=self.var_sharpness.get(),
             relaxed=bool(self.var_relaxed.get()),
             out=(prof or ""))
-        if method == "chain":
-            # 先查四段图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
+        if method in ("chain", "chain_dual"):
+            # 先查图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
             d = chain_dirs()
-            missing = [k for k, p in d.items() if not p.is_dir()
-                       or not any(p.iterdir())]
+            if method == "chain_dual":
+                need = ("left", "board_b", "pair")   # 双板：左拍A、右拍B、同框图
+            else:
+                need = ("left", "right", "ref_left", "ref_right")  # 单板四段
+            missing = [k for k in need if not d[k].is_dir()
+                       or not any(d[k].iterdir())]
             if missing:
                 self.status.set_status(
-                    "链式标定缺图：" + "、".join(missing)
-                    + "。先点「采集标定板图…」拍齐四段，再「检查链式输入」",
+                    ("双板" if method == "chain_dual" else "链式") + "标定缺图："
+                    + "、".join(missing)
+                    + "。先点「采集标定板图…」拍齐，再「检查链式输入」",
                     "warn")
                 return
-            self.status.set_status("正在链式标定（读 chain_frames 四段图）…", "info")
+            self.status.set_status(
+                "正在链式标定（读 chain_frames 图）…", "info")
         else:
             self.status.set_status("正在标定：会打开两个取景窗，板停稳自动存图",
                                    "info")
         self.app.tasks.start(cmd, "双目标定", on_done=self._on_calibrated)
 
     def _capture_chain_frames(self) -> None:
-        """采集链式标定的四段图：内参左 → 内参右 → 参考段（板不动，左右成对）。
+        """采集链式标定的图（按当前方法分单板/双板两套流程）。
 
-        分三段依次起 `capture_board.py`，每段拍完回到界面继续下一段。
-        用 on_done 串起来：一段结束才起下一段，避免三个取景窗同时抢相机。
+        - 单板（chain）：内参左 → 内参右 → 参考段（板不动，左右成对）；
+        - 双板（chain_dual）：拍 A 板（左）→ 拍 B 板（右）→ 提示手动拍同框图。
+        每段拍完回到界面继续下一段（on_done 串起来，避免取景窗抢相机）。
         """
         board_base = {"cols": self.var_cols.get(), "rows": self.var_rows.get(),
                       "square": self.var_square.get()}
@@ -783,26 +794,41 @@ class StereoWindow(tk.Toplevel):
         for p in d.values():
             p.mkdir(parents=True, exist_ok=True)
 
-        # 张数与旧界面 CHAIN_STAGES 对齐：内参段 15、参考段 3（板固定，够用即可）。
-        # 别都拿 var_target（40）拍参考段——那会让"板一动不动"的前提更难守住。
-        steps = [
-            ("内参段·左（板可移动，多姿态）",
-             capture_chain_frames(stage="left", left=left, right=right,
-                                  target="15", **board_base)),
-            ("内参段·右（板可移动，多姿态）",
-             capture_chain_frames(stage="right", left=left, right=right,
-                                  target="15", **board_base)),
-            ("参考段（板**固定不动**，左右成对拍）",
-             capture_chain_frames(stage="ref", left=left, right=right,
-                                  target="3", **board_base)),
-        ]
+        if self._method_key() == "chain_dual":
+            # 双板：A/B 两块板各拍一组（可移动），同框图需**手动**拍（capture_board
+            # 只检单板，检不了同框两板）。
+            steps = [
+                ("双板·拍 A 板（左相机，板可移动）",
+                 capture_chain_frames(stage="left", left=left, right=right,
+                                      target="15", **board_base)),
+                ("双板·拍 B 板（右相机，板可移动）",
+                 capture_chain_frames(stage="dual_b", left=left, right=right,
+                                      target="15", **board_base)),
+            ]
+        else:
+            steps = [
+                ("内参段·左（板可移动，多姿态）",
+                 capture_chain_frames(stage="left", left=left, right=right,
+                                      target="15", **board_base)),
+                ("内参段·右（板可移动，多姿态）",
+                 capture_chain_frames(stage="right", left=left, right=right,
+                                      target="15", **board_base)),
+                ("参考段（板**固定不动**，左右成对拍）",
+                 capture_chain_frames(stage="ref", left=left, right=right,
+                                      target="3", **board_base)),
+            ]
         self._chain_step = 0
 
         def run_next(_task=None):
             if self._chain_step >= len(steps):
-                self.status.set_status(
-                    "四段图拍完。点「检查链式输入」确认没问题，再点「开始标定」",
-                    "info")
+                if self._method_key() == "chain_dual":
+                    self.status.set_status(
+                        "A/B 两板图拍完。同框图需**手动**拍一张（两板同时入画）放进 "
+                        f"{d['pair']}，再点「检查链式输入」「开始标定」", "info")
+                else:
+                    self.status.set_status(
+                        "四段图拍完。点「检查链式输入」确认没问题，再点「开始标定」",
+                        "info")
                 return
             label, cmd = steps[self._chain_step]
             self._chain_step += 1
@@ -814,6 +840,13 @@ class StereoWindow(tk.Toplevel):
 
     def _check_chain_inputs(self) -> None:
         """拍完先自检（姿态覆盖 / 参考段板是否移动），别等标定跑完才发现图不行。"""
+        if self._method_key() == "chain_dual":
+            # 双板没有对应的自检工具（check_chain_inputs 只认单板四段目录），
+            # 这里只提示要手动确认同框图两板都完整入画。
+            self.status.set_status(
+                "双板链式没有自动自检：确认 left(A板)/board_b(B板) 各有图、"
+                "pair 里有一张两板同框图，且 A/B 相对位置全程没变", "info")
+            return
         cmd = check_chain_inputs(
             cols=self.var_cols.get(), rows=self.var_rows.get(),
             square=self.var_square.get())

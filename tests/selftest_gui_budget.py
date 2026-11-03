@@ -289,7 +289,8 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     with tempfile.TemporaryDirectory(prefix="stereo_args_") as tmp:
         base = Path(tmp)
         dirs = {"left": base / "left", "right": base / "right",
-                "ref_left": base / "ref_left", "ref_right": base / "ref_right"}
+                "ref_left": base / "ref_left", "ref_right": base / "ref_right",
+                "board_b": base / "board_b", "pair": base / "pair"}
         c = calibrate_args("chain", {}, "", "", "angled", dirs=dirs)
         check("chain：走 --method chain --same-board --left-dir/--right-dir",
               _has_seq(c, ["--method", "chain", "--same-board",
@@ -312,6 +313,17 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
         check("chain：板参数仍然进命令（不是只有 joint 才带）",
               _has_seq(c2, ["--cols", "8", "--rows", "5", "--square", "25",
                             "--target", "40"]), " ".join(c2))
+
+        # 双板链式（chain_dual，2026-11-03）：两块刚性固定的板 A/B，各看一块。
+        # 用 --board-b-dir + --pair-frame + --pair-camera，**不加 --same-board**。
+        dirs["board_b"].mkdir(parents=True)
+        dirs["pair"].mkdir(parents=True)
+        c3 = calibrate_args("chain_dual", {}, "", "", "angled", dirs=dirs)
+        check("chain_dual：--board-b-dir + --pair-frame + --pair-camera，无 --same-board",
+              _has_seq(c3, ["--method", "chain"])
+              and _has_seq(c3, ["--board-b-dir", str(dirs["board_b"])])
+              and _has_seq(c3, ["--pair-frame", str(dirs["pair"]), "--pair-camera", "left"])
+              and "--same-board" not in c3 and "--ref-left" not in c3, " ".join(c3))
 
     # ---- 对标老窗口 §8：录制参数 ----
     out_dir = record_out_dir()

@@ -83,10 +83,17 @@ def board_args(board: dict | None) -> list[str]:
         out += [flag, raw or BOARD_DEFAULTS[key]]
     return out
 def chain_dirs(root: Path | None = None) -> dict[str, Path]:
-    """链式标定的四个目录（左右各一组 + 参考段的双路同拍图）。"""
+    """链式标定的目录（单板：left/right + ref 参考段；双板：left/right + pair 同框图）。
+
+    单板模式（`--same-board`）用 left/right/ref_left/ref_right；
+    双板模式（两块刚性固定的板 A/B，各看一块）用 left/right/board_b/pair。
+    两种模式共用 left/right（内参段，板可移动），区别在参考段：
+    单板是"同一块板不动"（ref_left/ref_right），双板是"同框拍两板"（pair）。
+    """
     base = root if root is not None else CHAIN_ROOT
     return {"left": base / "left", "right": base / "right",
-            "ref_left": base / "ref_left", "ref_right": base / "ref_right"}
+            "ref_left": base / "ref_left", "ref_right": base / "ref_right",
+            "board_b": base / "board_b", "pair": base / "pair"}
 def calibrate_args(method: str, board: dict | None = None,
                    left: str = "left", right: str = "right",
                    mode: str = "parallel", *,
@@ -116,21 +123,33 @@ def calibrate_args(method: str, board: dict | None = None,
     那会拼出"左 dshow / 右 msmf"这种直接把一路弄挂的组合。
     """
     cmd = [sys.executable, str(ROOT / "apps" / "calibrate_stereo.py")]
-    if method == "chain":
+    if method in ("chain", "chain_dual"):
         d = dirs if dirs is not None else chain_dirs()
-        cmd += ["--method", "chain", "--same-board",
-                "--left-dir", str(d["left"]),
-                "--right-dir", str(d["right"])] + board_args(board)
-        # 单板模式（--same-board）的参考段是 **--ref-left / --ref-right**，
-        # 不是 --pair-frame（那是「双板」模式 --board-b-dir 才用的参数，
-        # calibrate_stereo.py 的 _chain_input_error 明确说单板模式不许给 pair-frame）。
-        # 这里曾误传 --pair-frame —— 后端直接把它当双板模式处理，参考段参数对不上，
-        # 90° 单板链式标定于是跑不通。参考段真有图才传（指向不存在的目录等于给
-        # 后端一个必然失败的证据，不如不提）。
-        if Path(d["ref_left"]).exists():
-            cmd += ["--ref-left", str(d["ref_left"])]
-        if Path(d["ref_right"]).exists():
-            cmd += ["--ref-right", str(d["ref_right"])]
+        if method == "chain_dual":
+            # 双板模式：两块刚性固定的板 A/B（如"垂直双板"装置），左看 A、右看 B，
+            # 用一张「同框拍到 A、B 两板」的图求 T_AB。**不加 --same-board**，
+            # 用 --board-b-dir + --pair-frame + --pair-camera（单板模式才用
+            # --ref-left/--ref-right，两者互斥）。
+            cmd += ["--method", "chain",
+                    "--left-dir", str(d["left"]),
+                    "--board-b-dir", str(d["board_b"])] + board_args(board)
+            if Path(d["pair"]).exists():
+                # 同框图是哪一路相机拍的（默认左），后端据此区分 A/B 板。
+                cmd += ["--pair-frame", str(d["pair"]), "--pair-camera", "left"]
+        else:
+            cmd += ["--method", "chain", "--same-board",
+                    "--left-dir", str(d["left"]),
+                    "--right-dir", str(d["right"])] + board_args(board)
+            # 单板模式（--same-board）的参考段是 **--ref-left / --ref-right**，
+            # 不是 --pair-frame（那是「双板」模式 --board-b-dir 才用的参数，
+            # calibrate_stereo.py 的 _chain_input_error 明确说单板模式不许给 pair-frame）。
+            # 这里曾误传 --pair-frame —— 后端直接把它当双板模式处理，参考段参数对不上，
+            # 90° 单板链式标定于是跑不通。参考段真有图才传（指向不存在的目录等于给
+            # 后端一个必然失败的证据，不如不提）。
+            if Path(d["ref_left"]).exists():
+                cmd += ["--ref-left", str(d["ref_left"])]
+            if Path(d["ref_right"]).exists():
+                cmd += ["--ref-right", str(d["ref_right"])]
     else:
         cmd += ["--method", "joint"] + board_args(board)
         if method == "joint_skip_fov":
@@ -378,14 +397,12 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
                          dirs: dict | None = None) -> list[str]:
     """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
 
-    ``stage`` ∈ {``left``, ``right``, ``ref``}，与旧界面 `启动程序.py` 的
-    ``CHAIN_STAGES`` 同构：
-    - ``left``/``right``：内参段，单路（板可移动，多姿态）；
-    - ``ref``：参考段，``--both`` 双路同拍（板**固定不动**，这是 T_AB=I 的前提）。
-
-    90° 单板链式标定缺的就是这一环：新界面以前只给「开始标定」按钮，chain 后端
-    需要 `outputs/chain_frames/{left,right,ref_left,ref_right}` 四段图，但 GUI
-    没有任何采集入口，用户点了标定只能看到"缺图"报错。这段动作把它补上。
+    ``stage`` ∈ {``left``, ``right``, ``ref``, ``dual_b``}：
+    - ``left``/``right``：单板模式的内参段，单路（板可移动，多姿态）；
+    - ``ref``：单板模式的参考段，``--both`` 双路同拍（板**固定不动**，T_AB=I）；
+    - ``dual_b``：**双板模式**里右相机拍 B 板（落 `board_b` 目录），与 ``left``
+      （拍 A 板）配对。同框图（pair）不能走 `capture_board.py`（它只检单板），
+      需单独采集，所以这里没有 ``pair`` 段。
 
     参考段**不传** ``--camera-left/--camera-right``：与旧界面一致，让
     `capture_board.py` 自己按 left/right 角色取相机（角色绑定更稳，索引会漂移）。
@@ -396,6 +413,14 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
             _TOOLS / "capture_board.py", "--both",
             "--out-left", str(d["ref_left"]),
             "--out-right", str(d["ref_right"]),
+            "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+            "--target", str(target), "--auto")
+    if stage == "dual_b":
+        # 双板模式：右相机拍 B 板，落 board_b 目录。
+        return _argv(
+            _TOOLS / "capture_board.py", "--out", str(d["board_b"]),
+            "--side", "right",
+            "--camera", str(right or "").strip() or "right",
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
             "--target", str(target), "--auto")
     side = "left" if stage == "left" else "right"
