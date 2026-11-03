@@ -374,6 +374,11 @@ class DataManager(tk.Tk):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         return str(ROOT / "outputs" / "exports" / f"sphere-stereo-export-{stamp}.zip")
 
+    def _default_traj_output(self) -> str:
+        """「导出轨迹数据 (csv)」的默认目录，前缀与 zip 导出区分开。"""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return str(ROOT / "outputs" / "exports" / f"sphere-stereo-trajectory-{stamp}")
+
     # ------------------------------------------------------------------
     def _status_symbol(self, it: SessionItem) -> str:
         """把状态下拉的值映射回 STATUS_SYMBOLS 的键，用于过滤。"""
@@ -769,10 +774,9 @@ class DataManager(tk.Tk):
         if not chosen:
             messagebox.showinfo("导出轨迹", "先勾选至少一个会话。", parent=self)
             return
-        out_dir = Path(self.out_var.get().strip() or self._default_output())
-        # 用户给的是 `.zip` 路径时，轨迹成对导出不该写进 zip；换成同名目录。
-        if out_dir.suffix.lower() == ".zip":
-            out_dir = out_dir.with_suffix("")
+        # 「导出轨迹数据」用**自己的**默认目录（sphere-stereo-trajectory-<时间>），
+        # 不复用 zip 导出的 out_var —— 否则两个导出的默认命名会撞在一起。
+        out_dir = Path(self._default_traj_output())
         done, skipped = [], []
         for it in chosen:
             try:
@@ -788,7 +792,7 @@ class DataManager(tk.Tk):
             self._log_line(f"[导出] {it.id} → {pair[0].name} / {pair[1].name}")
             done.append(it.id)
         self.status.configure(
-            text=f"已导出 {len(done)} 个会话的处理前+处理后轨迹到 {out_dir}"
+            text=f"已导出 {len(done)} 个会话的轨迹数据（原始+平滑 csv + 数据说明）到 {out_dir}"
                  + (f"；跳过 {len(skipped)} 个（未跑三维）" if skipped else ""))
         if done:
             self._log_line(f"共 {len(done)} 个会话，输出目录：{out_dir}")
