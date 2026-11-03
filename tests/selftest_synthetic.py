@@ -43,6 +43,7 @@ from sphere_tracker.config import AppConfig, ColorConfig
 from sphere_tracker.geometry import CameraModel
 from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.plugins import names as method_names  # 预测器清单的唯一来源（R7）
+from stereo.motion import kinematics, smooth_positions, split_segments
 
 GRAVITY = 9.80665
 
@@ -522,6 +523,136 @@ def run_case(
     return out
 
 
+# --------------------------------------------------------------------------
+# 运动学判据（`stereo/motion.py`）：真值已知，所以误差可以直接量
+# --------------------------------------------------------------------------
+# 为什么放在这个文件里：上面那些用例检验"能不能看见球"，这一段检验"看见之后
+# 算出来的速度/加速度对不对"。两者是同一套思路 —— 用合成真值，而不是肉眼看图。
+#
+# 这四条判据各自钉死一件事（都对应下游真会踩的坑）：
+#
+#   1. 匀速直线      差分本身不能引入误差（误差 < 1e-9）—— 否则滤波的收益无法归因；
+#   2. 丢帧          缺口两侧不许"连着算"（差分和平滑都不许）—— 跨缺口一次就能
+#                    把 |a| 抬到几十 m/s²，卡尔曼会当成真观测吃进去；
+#   3. 噪声          平滑必须真的降抖动（≥20%）—— 不然"平滑"只是个空动作；
+#   4. 短段          凑不出窗口就必须标 `valid=False` —— 不许装成"已平滑"。
+MOTION_FPS = 30.0
+MOTION_SPEED = 0.5          # m/s，匀速直线的真值速度
+MOTION_GAP_S = 0.10         # 与 stereo.motion.DEFAULT_MAX_GAP_S 同口径
+
+
+def _straight(t: np.ndarray, speed: float = MOTION_SPEED) -> np.ndarray:
+    """沿 +X 匀速的直线，返回 (N,3) 米。"""
+    return np.column_stack([speed * t, np.zeros_like(t), np.zeros_like(t)])
+
+
+def _jitter(xyz: np.ndarray) -> float:
+    """抖动指标：二阶差分模长的**中位数**（稳态下只剩噪声，不含真实加速度）。"""
+    return float(np.median(np.linalg.norm(np.diff(xyz, n=2, axis=0), axis=1)))
+
+
+def test_motion_uniform_velocity() -> bool:
+    """匀速直线：速度必须逐点等于真值（中心/单边差分都要精确）。"""
+    t = np.arange(0.0, 3.0, 1.0 / MOTION_FPS)
+    kin = kinematics(t, _straight(t), smooth=False)
+    err = float(np.max(np.abs(kin["speed"] - MOTION_SPEED)))
+    ok = err < 1e-9
+    print(f"[{'通过' if ok else '不达标'}] 匀速直线 {MOTION_SPEED} m/s："
+          f"速度最大误差 {err:.1e} m/s（阈值 1e-9，{t.size} 点）")
+    return ok
+
+
+def test_motion_gap_does_not_leak_velocity() -> bool:
+    """丢帧：切成 2 段，且差分与平滑都不许跨过缺口。
+
+    **缺口处刻意放一个折角**（前段走 +X、后段走 +Y）。理由：如果数据本身是
+    一条直线，跨缺口插值出来的也还是那条直线 —— 错误**不可观测**。有了折角，
+    "整条当一段"就会把折角抹圆，位置偏差是毫米级、速度直接掉到 0.05 m/s。
+    """
+    t = np.arange(0.0, 3.0, 1.0 / MOTION_FPS)
+    keep = np.ones(t.size, dtype=bool)
+    keep[40:50] = False                     # 中间挖掉 10 帧（0.33 s 缺口）
+    t2 = t[keep]
+
+    x0 = MOTION_SPEED * t[39]               # 折角：缺口前走 +X，缺口后走 +Y
+    before = t2 <= t[39] + 1e-9
+    P2 = np.zeros((t2.size, 3))
+    P2[before, 0] = MOTION_SPEED * t2[before]
+    P2[~before, 0] = x0
+    P2[~before, 1] = MOTION_SPEED * (t2[~before] - t[50])
+
+    segs = split_segments(t2, MOTION_GAP_S)
+    n_seg = len(segs)
+
+    # (a) 原始差分：跨缺口算一步，速度会从 0.5 掉到 ~0.05（位置连续、时间跳 10 帧）
+    kin = kinematics(t2, P2, smooth=False)
+    speed_err = float(np.max(np.abs(kin["speed"] - MOTION_SPEED)))
+    seg_ids = sorted(set(kin["segment"].tolist()))
+
+    # (b) 平滑：每段都是精确直线，所以平滑结果必须仍在各自直线上
+    Ps, valid = smooth_positions(t2, P2, window_s=0.20, poly=2)
+    ref = np.zeros_like(P2)
+    ref[before, 0] = MOTION_SPEED * t2[before]
+    ref[~before, 0] = x0
+    ref[~before, 1] = MOTION_SPEED * (t2[~before] - t[50])
+    bend = float(np.max(np.linalg.norm(Ps - ref, axis=1)))
+
+    ok = (n_seg == 2 and speed_err < 1e-9 and bend < 1e-6
+          and seg_ids == [0, 1] and bool(valid.all()))
+    print(f"[{'通过' if ok else '不达标'}] 丢帧（挖掉 10 帧）：段数 {n_seg}（应为 2）、"
+          f"段号 {seg_ids}；原始速度误差 {speed_err:.1e} m/s（阈值 1e-9）；"
+          f"平滑后偏离本段直线 {bend * 1000:.3f} mm（阈值 1e-6 m）")
+    return ok
+
+
+def test_motion_smoothing_cuts_jitter() -> bool:
+    """噪声：σ=2 mm 高斯噪声下，平滑后的抖动必须比原始小 ≥20%。"""
+    rng = np.random.default_rng(7)
+    t = np.arange(0.0, 3.0, 1.0 / MOTION_FPS)
+    P = np.column_stack([0.5 * t, 0.2 * t, np.zeros_like(t)])
+    P = P + rng.normal(0.0, 0.002, P.shape)
+    Ps, valid = smooth_positions(t, P, window_s=0.20, poly=2)
+    raw, sm = _jitter(P), _jitter(Ps)
+    drop = 1.0 - sm / raw
+    ok = bool(valid.all()) and drop >= 0.20
+    print(f"[{'通过' if ok else '不达标'}] 噪声 σ=2 mm：抖动 {raw * 1000:.2f} → "
+          f"{sm * 1000:.2f} mm（降 {drop * 100:.0f}%，要求 ≥20%）；"
+          f"全部点参与平滑={bool(valid.all())}")
+    return ok
+
+
+def test_motion_short_segment_is_marked() -> bool:
+    """短段：2 点段必须 `valid=False`；单点段的速度必须是 nan（不是 0）。"""
+    t = np.array([0.0, 1.0 / MOTION_FPS, 1.5])
+    P = np.array([[0.0, 0.0, 0.0], [MOTION_SPEED / MOTION_FPS, 0.0, 0.0], [0.1, 0.0, 0.0]])
+
+    _Ps, valid = smooth_positions(t, P)
+    no_fake_smooth = not bool(valid.any())          # 2 点段 < poly+2，不许自称已平滑
+
+    kin = kinematics(t, P, smooth=False)
+    ok_seg = kin["segment"].tolist() == [0, 0, -1]
+    ok_nan = bool(np.isnan(kin["V"][2]).all() and np.isnan(kin["speed"][2]))
+    ok_acc = bool(np.isnan(kin["A"][:2]).all())     # 2 点凑不出加速度
+    ok = no_fake_smooth and ok_seg and ok_nan and ok_acc
+    print(f"[{'通过' if ok else '不达标'}] 短段：2 点段 valid={bool(valid.any())}"
+          f"（应为 False）、段号 {kin['segment'].tolist()}（单点段应为 -1）、"
+          f"单点段速度为 nan={ok_nan}、2 点段加速度为 nan={ok_acc}")
+    return ok
+
+
+def run_motion_checks() -> bool:
+    """跑完四条运动学判据；任一不达标 → False。"""
+    print("===== 运动学判据（stereo/motion.py：差分 / 丢帧 / 平滑 / 短段） =====")
+    results = []
+    for fn in (test_motion_uniform_velocity,
+               test_motion_gap_does_not_leak_velocity,
+               test_motion_smoothing_cuts_jitter,
+               test_motion_short_segment_is_marked):
+        results.append(fn())
+    print()
+    return all(results)
+
+
 def check_ai() -> None:
     print("\n=== AI 依赖检查 ===")
     for mod in ("torch", "ultralytics", "onnxruntime"):
@@ -552,12 +683,19 @@ def main() -> int:
                    choices=["clean", "realistic", "panning", "all"],
                    help="panning = 相机匀速横移（检验相机不固定时是否还成立）")
     p.add_argument("--gate", default="color,fusion", help="必须达标的方法（逗号分隔）")
+    p.add_argument("--motion", action="store_true",
+                   help="只跑运动学判据（stereo/motion.py），不跑合成视频流水线（秒级）")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
     if args.check_ai:
         check_ai()
         return 0
+
+    motion_ok = run_motion_checks()
+    if args.motion:
+        print("判定结果：" + ("全部通过" if motion_ok else "有不达标项"))
+        return 0 if motion_ok else 1
 
     scenarios = ["clean", "realistic", "panning"] if args.scenario == "all" else [args.scenario]
     # 平移场景额外加一个"不补偿"的对照组，直接看出补偿值不值
@@ -597,7 +735,7 @@ def main() -> int:
         "pred_0.1s_px": "稳定段0.1s", "pred_0.2s_px": "稳定段0.2s", "pred_0.3s_px": "稳定段0.3s",
     }
 
-    ok = True
+    ok = motion_ok
     for scenario in scenarios:
         print(f"===== 场景：{scenario} =====")
         print(f"{'方法':<9}{'检出率':>8}{'检测RMSE':>10}{'跟踪中位':>10}{'半径RMSE':>10}"

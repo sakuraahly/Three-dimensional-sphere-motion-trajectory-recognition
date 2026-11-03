@@ -191,6 +191,19 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                  root.title() != title0 and "20260202-000000" in root.title()
                  and int(float(v.slider.cget("to"))) == 8),
             ]
+            # 「平滑」开关（2026-11-03 加）：默认必须**开**（用户要的是去掉毛刺），
+            # 且取消勾选后主图与小图**同时**退回原始点 —— 两条路径共用一个
+            # `_smooth_active()`，这里量的是那个出口，不是按钮外观。
+            checks.append(("「平滑」勾选框默认是开，文字是「平滑」",
+                           bool(v.use_smooth.get())
+                           and v.smooth_chk.cget("text") == "平滑"
+                           and v._smooth_active() is True))
+            v.use_smooth.set(False)
+            v._on_toggle_smooth()
+            checks.append(("取消勾选后不再用平滑点（主图/小图同一条判据）",
+                           v._smooth_active() is False))
+            v.use_smooth.set(True)
+            v._on_toggle_smooth()
         finally:
             if v is not None:
                 v.close()       # 释放 cap，否则临时目录删不掉（WinError 32）

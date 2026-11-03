@@ -17,7 +17,11 @@
     python apps/view_3d.py data/mono/20261029-205522
     python apps/view_3d.py data/stereo/20261019-221550 --check
 
-只依赖 matplotlib + Tkinter（环境已有），不依赖网络、不依赖 stereo 包。
+只依赖 matplotlib + Tkinter + numpy（环境已有），不依赖网络。平滑用
+`stereo.motion.smooth_positions` —— **不在这里再写一份**（两处平滑 = 图与 CSV
+两个结果，这个项目已经因此返工过）。scipy 缺失时它返回 `valid` 全 False，
+查看器照常显示原始轨迹。
+
 坐标系由 `visualization.json` 的 `coordinate_system` 决定：**X 右 / Y 下 / Z 前**
 （单位米）；parallel 是校正后左相机系，angled 是原始左相机系，
 mono-camera 是单目相机系（主点在画面中心或标定主点）。
@@ -37,6 +41,8 @@ import cv2
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox
@@ -50,6 +56,9 @@ if str(ROOT) not in sys.path:
 # 数据根目录只有 `sphere_tracker/paths.py` 说了算：以前 `data/sessions` 这个
 # 字面量散在 8 处，于是"会话"在磁盘上指了两个东西（见该模块 docstring）。
 from sphere_tracker.paths import MONO_ROOT, STEREO_ROOT, stereo_roots  # noqa: E402
+# 平滑**只有这一处实现**（`stereo/motion.py` 定稿）：查看器要用，就 import，
+# 不许在这里再复制一份窗口/阶数的代码。默认 0.20 s 是实测扫出来的，别改。
+from stereo.motion import smooth_positions, split_segments  # noqa: E402
 
 VIS_SCHEMA = "sphere-stereo-visualization"
 TRAJ_SCHEMA = "sphere-stereo-trajectory"
@@ -105,6 +114,116 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
     ys = [float(p["xyz"][1]) for p in points]
     zs = [float(p["xyz"][2]) for p in points]
     return [min(xs), min(ys), min(zs)], [max(xs), max(ys), max(zs)]
+
+
+#: 右下角俯视小图的 axes 矩形（figure 坐标）。尺寸不能动主图：
+#: 主图是 `add_subplot(111)` 且 `subplots_adjust` 写死的，小图另叠一块
+#: `add_axes`，**不改主图布局**（主图尺寸有别的判据盯着）。
+#:
+#: 为什么不是 `[0.60, 0.07, 0.36, 0.30]`，也不是 `[0.635, 0.145, 0.315, 0.255]`：
+#: 3D 轴的 **Z 标签是竖着站在右侧的**（x≈0.76~0.79 / y≈0.29~0.55），
+#: 它的刻度数字（0.5/0.6/0.7）就在它左边一点。实测（把 figure 只画文字、
+#: 不画数据，逐像素求交）：`[0.635, 0.145, 0.315, 0.255]` 会压住
+#: `Z forward (m)` 的下半截 + 0.7 刻度，默认窗口 843 个文字像素，
+#: 放大窗口 986 / 1118 —— 所以不能往左放，只能落在它右边那条**空白右边距**里。
+#:
+#: 关键细节：小图自己的 Y 刻度数字会从 axes 左边界**再往左伸 ~16 px**，
+#: 所以 axes 的 x0 必须 ≥0.81 才算真不压（按 axes 矩形算会漏掉这 16 px）。
+#: 右边到 0.985、下边 y0=0.10（刻度数字下方留 29 px，> 25 px 的硬要求）。
+#:
+#: ⚠️ 已知边界：窗口拉到最小（900x700，3D 画布 ~1.3:1）时 3D 轴吃满宽度，
+#: Z 标签右移到 ≈0.85，小图会压到它。这是"不许改主图布局"的代价 ——
+#: 要根治得让主图让出右边距，那属于主图行为，不在本次范围。
+INSET_RECT = (0.815, 0.100, 0.170, 0.335)
+
+#: 曲线配色（与主图一致：灰=原始、橙=平滑/小球）。
+#: 原始线用中灰而不是浅灰：浅灰在图例里几乎看不见（图例继承线条的 alpha）。
+INSET_RAW_COLOR = "#64748b"
+INSET_SMOOTH_COLOR = "#f97316"
+
+#: 小图里的中文（matplotlib 默认字体没有汉字，会画成方框）。按顺序回退。
+INSET_FONTS = ("Microsoft YaHei", "SimHei", "DejaVu Sans")
+
+
+def track_arrays(points: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """点列 → ``(t, P, P_smooth, valid)``，**四个数组长度都等于 `len(points)`**。
+
+    缺口（丢帧 / 遮挡）**不补点**：平滑是按段做的，段之间的缺口原样留着 ——
+    补点就等于编造了从来没有测到的位置，而这正是这个项目最不该出的错。
+
+    平滑参数用 `stereo/motion.py` 的默认值（0.20 s / 2 阶，实测扫出来的），
+    这里不覆盖它：查看器与速度/加速度是**同一条曲线**，参数一分叉就没人信了。
+    """
+    t = np.array([float(p.get("t", i)) for i, p in enumerate(points)], dtype=float)
+    P = np.array([p["xyz"] for p in points], dtype=float).reshape(-1, 3)
+    P_smooth, valid = smooth_positions(t, P)
+    return t, P, P_smooth, valid
+
+
+def rough_positions(t: np.ndarray, P: np.ndarray,
+                    max_gap_s: float = 0.10) -> float:
+    """抖动指标：段内二阶差分的平均模长（米）。**只在段内算**，不跨缺口。
+
+    为什么不用逐点差分：一阶差分里包含真实速度，看不出"毛刺"；
+    二阶差分对真实匀加速也敏感，但短窗口的高频抖动远大于运动本身的加速度，
+    所以"平滑前后同一个数变小"足以说明毛刺被压掉了（判据见
+    `tests/selftest_viz_scale.py` 第 11 节）。
+    """
+    total, count = 0.0, 0
+    for seg in split_segments(t, max_gap_s):
+        if seg.size < 3:
+            continue
+        d2 = np.linalg.norm(np.diff(P[seg], n=2, axis=0), axis=1)
+        total += float(d2.sum())
+        count += d2.size
+    return total / count if count else 0.0
+
+
+def draw_xz_inset(ax, P_raw: np.ndarray, P_smooth: np.ndarray,
+                  smooth: bool) -> None:
+    """在 `ax` 上画 **X–Z 俯视投影**：原始=灰细线，平滑=橙线。
+
+    为什么是 X–Z 而不是 X–Y：坐标系是 **X 右 / Y 下 / Z 前**，
+    "从上方往下看"看到的平面就是 X–Z；X–Y 是相机正面的投影，
+    看起来像"贴着地面跑"，与真实轨道不是一回事。
+
+    `smooth=False` 时**只画原始**并在角落写"段太短，未平滑" ——
+    这时 `P_smooth == P_raw`（`smooth_positions` 对短段原样返回），
+    画两条重合的线等于假装平滑生效了。
+
+    放在模块级（而不是 `Viewer3D` 的方法里）是为了能**离屏验证**：
+    判据只要一张 Agg 画布就能画，不必开 Tk 窗口。
+    """
+    ax.clear()
+    # 原始线画在平滑线**下面**、略细、半透明：两条重合时橙线盖住灰线（说明平滑
+    # 没改形状）；一旦有毛刺，灰线会从橙线两侧"支棱"出来 —— 这正是用户要看的东西。
+    # 0.6/0.45 实测太淡（缩到查看器实际尺寸基本看不见），改成 1.4/0.30：
+    # 宽度给足、透明度再压一点，既能看到毛刺，又不会被误读成"两条轨迹"。
+    ax.plot(P_raw[:, 0], P_raw[:, 2], color=INSET_RAW_COLOR,
+            linewidth=1.4, alpha=0.30, label="原始")
+    if smooth:
+        ax.plot(P_smooth[:, 0], P_smooth[:, 2],
+                color=INSET_SMOOTH_COLOR, linewidth=1.4, label="平滑")
+    else:
+        ax.text(0.97, 0.04, "段太短，未平滑", transform=ax.transAxes,
+                ha="right", va="bottom", fontsize=6.5, color="#b45309",
+                fontfamily=INSET_FONTS)
+    ax.margins(0.08)
+    # 等比例：俯视图的作用是看"轨迹形状对不对"，把 X 与 Z 拉成不同比例
+    # 会让椭圆看起来像别的曲线。`datalim` 调范围、不动 axes 的矩形。
+    ax.set_aspect("equal", adjustable="datalim")
+    # 小图只有 ~1 英寸见方：刻度只留 3 个、一位小数，否则数字比曲线还宽。
+    for axis in (ax.xaxis, ax.yaxis):
+        axis.set_major_locator(mticker.MaxNLocator(3))
+        axis.set_major_formatter(mticker.FormatStrFormatter("%.1f"))
+    ax.tick_params(labelsize=6, length=1.8, pad=1)
+    ax.set_title("X–Z 俯视 (m)", fontsize=6.5, pad=1.5, fontfamily=INSET_FONTS)
+    if smooth:
+        ax.legend(loc="lower right", frameon=False, handlelength=1.1,
+                  borderaxespad=0.1,
+                  prop={"family": list(INSET_FONTS), "size": 6})
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
 
 
 #: 会话结果最多列几个（够选就行；下拉太长反而难找）
@@ -203,6 +322,12 @@ class Viewer3D:
         self._left_raw = None
         self._right_raw = None
         self._sources: list[Path] = []
+        # 「平滑」开关：**默认开**（用户要的就是去掉毛刺）。它是**用户的偏好**，
+        # 不是会话状态 —— 换会话不清零，所以放在 `_apply` 之外建。
+        # `master=root` 不能省：测试会在同一进程里连开几个 Tk 根，
+        # 不指定 master 的布尔变量会绑到"默认根"上，换到第二个窗口就抛
+        # `too many values to unpack` / 变量失效。
+        self.use_smooth = tk.BooleanVar(master=root, value=True)
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -233,6 +358,10 @@ class Viewer3D:
         self.n = len(self.points)
         self.idx = 0
         self.mono = is_mono(data)
+        # 平滑曲线**在装入会话时算一次**，不在每一帧重算：0.20 s 窗口的
+        # Savitzky-Golay 是 O(n)，播放时每秒要重画 30 次，重算纯属白烧 CPU。
+        # 注意「平滑」开关本身不在这里重置（那是用户偏好，见 `__init__`）。
+        _t, self.P_raw, self.P_smooth, self.smooth_valid = track_arrays(self.points)
         self.video_error = ""
         self.video_disabled = (video_path is None or video_path == "") and not auto_video
         self.lo, self.hi = bounds_of(self.points)
@@ -331,6 +460,10 @@ class Viewer3D:
         self.fig = plt.Figure(figsize=(5.5, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111, projection="3d")
         self.fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.90)
+        # 右下角俯视小图：**另叠一块 axes**，不碰主图的 subplot 布局
+        # （主图的范围/视角/色标有别的判据盯着）。zorder 抬高让它盖在 3D 轴之上。
+        self.ax_inset = self.fig.add_axes(INSET_RECT)
+        self.ax_inset.set_zorder(10)
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
@@ -355,6 +488,11 @@ class Viewer3D:
         self.speed_box.set("1x")
         self.speed_box.pack(side="left")
         self.speed_box.bind("<<ComboboxSelected>>", self._on_speed)
+        # 「平滑」：跟现有控件同一条 bar，不另起一行（另起一行会把 3D 图挤矮）。
+        # 默认开 —— 毛刺是跟踪噪声，不是运动。
+        self.smooth_chk = ttk.Checkbutton(bar, text="平滑", variable=self.use_smooth,
+                                          command=self._on_toggle_smooth)
+        self.smooth_chk.pack(side="left", padx=(10, 0))
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
         self.status.pack(side="bottom", fill="x")
@@ -457,7 +595,10 @@ class Viewer3D:
         self._grid.rowconfigure(0, minsize=max(90, int(round(pane_w * 9 / 16))))
 
     def _on_space(self, event) -> None:
-        if isinstance(event.widget, (ttk.Button, ttk.Entry, ttk.Combobox, ttk.Scale)):
+        # 勾选框聚焦时按空格 = 切「平滑」；不排除它，空格会**同时**切播放
+        # （两个状态一起变，用户看到的是一次乱跳）。
+        if isinstance(event.widget, (ttk.Button, ttk.Checkbutton, ttk.Entry,
+                                     ttk.Combobox, ttk.Scale)):
             return
         self._toggle_play()
 
@@ -508,12 +649,21 @@ class Viewer3D:
         self.ax.view_init(elev=22, azim=-62)
         self.canvas.draw_idle()
 
+    def _smooth_active(self) -> bool:
+        """当前是否真的在用平滑点：勾了**且**至少有一段被平滑处理过。
+
+        两个条件都要：段全太短时 `P_smooth == P_raw`，此时报"已平滑"是撒谎，
+        小图要如实写"段太短，未平滑"。
+        """
+        return bool(self.use_smooth.get()) and bool(self.smooth_valid.any())
+
     def _redraw(self) -> None:
         self.ax.clear()
         self._reset_view()
-        xs = [p["xyz"][0] for p in self.points]
-        ys = [p["xyz"][1] for p in self.points]
-        zs = [p["xyz"][2] for p in self.points]
+        # 勾了「平滑」就用平滑点画主图，否则用原始点。**范围/视角不变**：
+        # `_limits` 始终按原始点算（平滑不改变量级，改范围只会让两张图对不上）。
+        P = self.P_smooth if self._smooth_active() else self.P_raw
+        xs, ys, zs = P[:, 0], P[:, 1], P[:, 2]
         self.ax.plot(xs, ys, zs, color="#93c5fd", linewidth=1.2, alpha=0.8, label="trajectory")
         k = min(self.idx + 1, self.n)
         self.ax.plot(xs[:k], ys[:k], zs[:k], color="#2563eb", linewidth=2.0, label="trail")
@@ -526,9 +676,15 @@ class Viewer3D:
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
                           f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
+        self._redraw_inset()
         self.canvas.draw_idle()
         self._update_video()
         self._status()
+
+    def _redraw_inset(self) -> None:
+        """重画右下角俯视小图（画法在模块级 `draw_xz_inset`，见那里为什么）。"""
+        draw_xz_inset(self.ax_inset, self.P_raw, self.P_smooth,
+                      self._smooth_active())
 
     def _render_video(self) -> None:
         for raw, canvas, attr, empty in (
@@ -626,6 +782,14 @@ class Viewer3D:
     def _on_speed(self, _event=None) -> None:
         self.speed = {"0.25x": 0.25, "0.5x": 0.5, "1x": 1.0, "2x": 2.0}.get(
             self.speed_box.get(), 1.0)
+
+    def _on_toggle_smooth(self) -> None:
+        """勾选框变化：**复用 `_redraw`**（主图 + 小图 + 状态条同一条路径）。
+
+        新开一条"只重画小图"的分支，主图和小图就会有两条刷新时序 ——
+        播放中切开关时，一张图新、一张图旧，而没有任何报错。
+        """
+        self._redraw()
 
     def _toggle_play(self) -> None:
         self.playing = not self.playing

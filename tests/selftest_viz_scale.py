@@ -1035,6 +1035,101 @@ def test_valid_frame_gate_contract() -> bool:
     return all(k for _l, k in checks)
 
 
+def test_viewer_inset_smoothing() -> bool:
+    """第 11 节：3D 查看器右下角俯视小图的数据口径（2026-11-03 增）。
+
+    ## 为什么这一节存在
+
+    查看器要在主图上叠一张 X–Z 俯视小图，把**平滑后**的轨迹和**原始**轨迹画在
+    一起（用户要的是"去掉毛刺后再和真实轨道对照"）。三件事全是离线可判的，
+    不需要开 Tk 窗口：
+
+    1. **缺口不补点**：`track_arrays` 的四个数组长度都等于原始点数。
+       丢帧留下的缺口若被插值填平，图上就会出现一段**从来没有测到过**的轨迹 ——
+       这个项目最不该出的错就是"看起来成功了"。
+    2. **平滑真的压掉毛刺**：段内二阶差分平均模长（`rough_positions`）变小。
+       这是"勾了平滑之后图上确实少毛刺"的可计算形式（不是看截图说"好像顺了"）。
+    3. **段太短时不画平滑线**：`valid` 全 False 时 `draw_xz_inset` 只画一条线。
+       画两条重合的线等于假装平滑生效了。
+    4. **小图矩形在右下、且不出画布**：位置写死在 `INSET_RECT`，改飞了要有人知道。
+
+    ⚠️ **本节不声称**验证"小图没有压住主图的轴标签" —— 那要拿真实渲染的像素
+    去比（3D 轴的刻度数字在 `draw()` 之前 `get_window_extent()` 不更新，按 bbox
+    判会得到假的"没重叠"）。逐像素检查在 `outputs/_diag/check_inset_overlap.py`，
+    默认窗口与放大窗口都跑过；它不进测试套件是因为它依赖字体渲染，比这条脆。
+    """
+    print("----- 11. 查看器俯视小图：缺口不补点 / 平滑压毛刺 -----")
+    import numpy as np
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    from apps.view_3d import (INSET_RECT, draw_xz_inset, rough_positions,
+                              track_arrays)
+
+    checks: list[tuple[str, bool]] = []
+
+    def ck(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
+        checks.append((label, ok))
+
+    # 一段圆周运动 + 2 mm 噪声（实测抖动中位 3.6 mm，同量级），中间丢 12 帧。
+    rng = np.random.default_rng(3)
+    pts = []
+    for i in range(80):
+        if 30 <= i < 42:
+            continue                      # 0.4 s 的缺口，远大于 0.1 s 的断段阈值
+        t = i / 30.0
+        pts.append({"frame": i, "t": round(t, 5), "xyz": [
+            0.30 * np.sin(2 * np.pi * t / 3) + rng.normal(0, 0.002),
+            0.02 * np.cos(2 * np.pi * t / 3) + rng.normal(0, 0.002),
+            0.75 + 0.22 * np.cos(2 * np.pi * t / 3) + rng.normal(0, 0.002)]})
+
+    t, P, P_s, valid = track_arrays(pts)
+    ck("缺口不补点：t / P / P_smooth / valid 的长度都等于原始点数",
+       t.size == P.shape[0] == P_s.shape[0] == valid.size == len(pts),
+       f"{len(pts)} 点（含 12 帧缺口）")
+    ck("缺口两侧各自成段、段内都被平滑（不是整条跳过）",
+       int(valid.sum()) == len(pts),
+       f"valid {int(valid.sum())}/{len(pts)}")
+
+    r_raw, r_sm = rough_positions(t, P), rough_positions(t, P_s)
+    if r_raw <= 0:
+        print("  [跳过] 抖动量算不出来（合成数据有问题）")
+        return False
+    ck("平滑后段内抖动（二阶差分平均模长）至少降到 60% 以下",
+       r_sm < 0.6 * r_raw,
+       f"{r_raw * 1000:.2f} mm -> {r_sm * 1000:.2f} mm（{r_sm / r_raw:.0%}）")
+
+    # 段太短：3 个点 < poly+2，`smooth_positions` 原样返回并标 valid=False
+    short = [{"t": i / 30.0, "xyz": [0.1 * i, 0.0, 1.0]} for i in range(3)]
+    _t2, P2, P2_s, v2 = track_arrays(short)
+    ck("段太短（3 点）→ valid 全 False，且 P_smooth 与原始逐点相同",
+       not v2.any() and np.allclose(P2, P2_s))
+    fig = Figure(figsize=(2, 2), dpi=100)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes((0.1, 0.1, 0.8, 0.8))
+    draw_xz_inset(ax, P2, P2_s, smooth=False)
+    ck("段太短时小图只画原始一条线（不画一条重合的假「平滑」线）",
+       len(ax.lines) == 1, f"ax.lines={len(ax.lines)}")
+
+    fig2 = Figure(figsize=(2, 2), dpi=100)
+    FigureCanvasAgg(fig2)
+    ax2 = fig2.add_axes((0.1, 0.1, 0.8, 0.8))
+    draw_xz_inset(ax2, P, P_s, smooth=True)
+    ck("有平滑时小图画两条线（灰=原始、橙=平滑）", len(ax2.lines) == 2,
+       f"ax.lines={len(ax2.lines)}")
+
+    x0, y0, w, h = INSET_RECT
+    ck(f"小图矩形 {tuple(round(v, 3) for v in INSET_RECT)} 在画布内且落在右下象限",
+       x0 > 0.5 and y0 < 0.5 and x0 + w <= 1.0 and y0 + h <= 1.0,
+       "右下 = x>0.5, y<0.5")
+
+    print(f"  共 {len(checks)} 项：" + ("全部通过" if all(k for _l, k in checks)
+                                      else "有不达标项"))
+    return all(k for _l, k in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("叠加层缩放自测（viz.scale：整张图所有元素一起缩放）")
@@ -1052,7 +1147,8 @@ def main() -> int:
                test_detect_width_rescales_coordinates,
                test_hud_text_is_immune_to_display_width,
                test_mono_visualization_contract,
-               test_valid_frame_gate_contract):
+               test_valid_frame_gate_contract,
+               test_viewer_inset_smoothing):
         results.append(fn())
         print()
     ok = all(results)
