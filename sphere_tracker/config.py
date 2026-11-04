@@ -421,14 +421,29 @@ class AppConfig:
 
 
 def _merge_dataclass(instance: Any, data: dict[str, Any]) -> Any:
-    """把 dict 递归合并进 dataclass 实例（未知字段忽略，避免旧配置报错）。"""
+    """把 dict 递归合并进 dataclass 实例（未知字段忽略，避免旧配置报错）。
+
+    **对象字段只接受 dict，收到标量直接报错**。理由不是洁癖：把
+    ``CameraConfig`` 覆盖成一个字符串，后果不是"这个字段没生效"，而是
+    几十行之后某处 ``cfg.camera.ball_diameter_m`` 抛 AttributeError，
+    错误信息完全指不到真正的原因。
+
+    2026-11-04 现场：单目标定文件被当作 ``--config``（AppConfig）传进来，
+    文件里的 ``camera: "left"`` 把 ``cfg.camera`` 盖成了 ``str``，
+    ``run_realtime`` 在第 143 行崩在 ``'str' object has no attribute``。
+    """
     for key, value in data.items():
         if not hasattr(instance, key):
             continue
         current = getattr(instance, key)
-        if hasattr(current, "__dataclass_fields__") and isinstance(value, dict):
-            _merge_dataclass(current, value)
-        elif isinstance(current, ColorConfig) and isinstance(value, dict):
+        is_obj = (hasattr(current, "__dataclass_fields__")
+                  or isinstance(current, ColorConfig))
+        if is_obj:
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"配置字段 {key!r} 期望对象（{type(current).__name__}），"
+                    f"但收到 {type(value).__name__}：{value!r}。"
+                    f"——若你本意是传单目标定文件，请用 --mono-calib，不要用 --config。")
             _merge_dataclass(current, value)
         else:
             setattr(instance, key, value)

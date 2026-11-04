@@ -1752,7 +1752,13 @@ class MonoWindow(tk.Toplevel):
         if fx is not None:
             cmd += ["--focal", str(fx)]                 # 只有手动覆盖才传
         if MONO_CALIB_JSON.exists():
-            cmd += ["--config", str(MONO_CALIB_JSON)]
+            # ⚠ 必须是 `--mono-calib`，不是 `--config`：
+            # `--config` 的语义是 **AppConfig 配置文件**（检测器/跟踪/预测参数），
+            # 把单目标定文件传进去，`load_config` 会按字段名把 `camera` 这个
+            # 字符串盖到 `cfg.camera`（本该是 CameraConfig 对象）上，于是
+            # `cfg.camera.ball_diameter_m` 直接 AttributeError 崩掉
+            # （2026-11-04 实测）。今天新增的 `--mono-calib` 才是内参入口。
+            cmd += ["--mono-calib", str(MONO_CALIB_JSON)]
         self._start(cmd, "实时单目识别")
         auto_note = ("。auto 在实时里退化成 color（实时没有录像可以重跑）"
                      if self.var_detector.get() == SMART else "")
