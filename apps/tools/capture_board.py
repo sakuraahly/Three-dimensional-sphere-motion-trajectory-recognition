@@ -786,16 +786,20 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                         f"q 退出   {wins.fullscreen_hint()}"
                         if auto else
                         f"空格 保存   q 退出   {wins.fullscreen_hint()}")
-                # 覆盖进度进 footer：用户眼睛只扫底部，这里不写"还差几个角"，
-                # 覆盖信息就埋在 HUD 上半段，容易漏。
+                # 覆盖进度进 footer：用户眼睛只扫底部。**结束只看覆盖，不看张数**
+                # （2026-11-04 用户明确：拍 5 张就退出是错的，该看"集到几个绿色区域"）。
                 cover_txt = ""
                 if args.min_cover > 0 and stage == "intr":
                     missing = args.min_cover - len(covered)
-                    cover_txt = (f"  覆盖 {len(covered)}/{args.min_cover}"
+                    cover_txt = (f"  已拍 {len(saved)} 张   覆盖 {len(covered)}/{args.min_cover}"
                                  + (f"，还差 {max(missing, 0)} 个角" if missing > 0 else "，已达标"))
-                footer = (f"{len(saved)}/{args.target} 张{cover_txt}   "
-                          f"{'可保存' if can else (reason or '—')}   "
-                          f"{src.info.width}x{src.info.height}   {hint}")
+                    footer = (f"{cover_txt}   "
+                              f"{'可保存' if can else (reason or '—')}   "
+                              f"{src.info.width}x{src.info.height}   {hint}")
+                else:
+                    footer = (f"{len(saved)}/{args.target} 张   "
+                              f"{'可保存' if can else (reason or '—')}   "
+                              f"{src.info.width}x{src.info.height}   {hint}")
                 canvas = _compose(
                     [{"title": f"{args.side or '相机'}", "frame": frame,
                       "obs": obs, "ok": can, "reason": reason, "spec": spec,
@@ -861,29 +865,28 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                 if idx >= 0:
                     covered.add(idx)
             verb = "自动保存" if not manual else "已保存"
-            # 结束判据两段式（2026-11-04）：要么覆盖满 --min-cover 个区域**且**至少
-            # 拍了 min-cover 张（拍够各角就够了），要么拍到 --target 张硬性兜底。
-            # 光看张数会把"全挤在中间"也判成合格（就是今天那次 15 张全废的事故）。
+            # 结束判据：**只覆盖满 --min-cover 个区域就收工，不设张数上限**。
+            # 2026-11-04 用户明确纠正：限制结束的该是"集到几个绿色区域"，不是"拍了
+            # 几张"。拍 5 张就退出是错的——板摆不开时该继续拍，直到四个角都绿。
             cover_reached = (args.min_cover > 0
-                             and len(covered) >= args.min_cover
-                             and len(saved) >= args.min_cover)
-            print(f"{verb} {len(saved)}/{args.target}  {name}  "
-                  f"（focus {acc.focus:.0f}，原始清晰度 {acc.sharpness:.0f}，位移 {still:.1f} px）"
+                             and len(covered) >= args.min_cover)
+            print(f"{verb} {name}  （已拍 {len(saved)} 张，"
+                  f"focus {acc.focus:.0f}，原始清晰度 {acc.sharpness:.0f}，位移 {still:.1f} px）"
                   + (f"  覆盖 {len(covered)}/{REGIONS_TOTAL} 已达标，收工" if cover_reached else ""))
             log.info("保存 %s（focus %.0f，原始清晰度 %.0f，格子 %.1fpx，位移 %.1f px）",
                      path, acc.focus, acc.sharpness, acc.square_px, still)
             stable = 0
             last_save_ts = ts
-            if len(saved) >= args.target or cover_reached:
+            if cover_reached:
                 break
     finally:
         src.release()
         if show:
             cv2.destroyAllWindows()
 
-    print(f"共保存 {len(saved)} 张 → {out_dir}")
+    print(f"共保存 {len(saved)} 张 → {out_dir}（覆盖 {len(covered)}/{REGIONS_TOTAL} 个区域）")
     if 0 < len(saved) < 3:
-        print("至少需要 3 张才能标定，建议 15 张覆盖画面四角")
+        print("至少需要 3 张才能标定")
     # 边车最后写：count 必须是**实际落盘**的张数（含提前退出/没到 target 的情况）
     try:
         sidecar = write_capture_sidecar(
@@ -894,6 +897,9 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
         print(f"[错误] 元数据边车写不进：{out_dir / SIDECAR_NAME}（{exc}）")
         return 1
     log.info("元数据边车 %s（count=%d）", sidecar, len(saved))
+    # 退出码：--min-cover 启用时按覆盖达标判；否则按张数判（旧行为）
+    if args.min_cover > 0:
+        return 0 if len(covered) >= args.min_cover else 3
     return 0 if len(saved) >= args.target else 3
 
 
