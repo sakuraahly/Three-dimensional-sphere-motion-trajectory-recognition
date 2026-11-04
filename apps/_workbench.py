@@ -222,15 +222,25 @@ def scan_sessions(root: str | Path, limit: int = 12) -> list[SessionSummary]:
     跑一次离线双目会写 derived/，把旧会话的目录 mtime 刷新到今天，
     结果“昨天刚处理过的会话”会跳到第一条，默认选中就漂了。
     名字不是标准时间戳的目录，退回用 mtime。
+
+    枚举走 `apps/_stereo_layout.candidate_session_dirs`：会话按装置分区后
+    （``data/stereo/parallel/<时间戳>``）只扫一层会把分区目录本身当会话，
+    工作台里就会出现两条"坏会话"（名字叫 parallel / angled）。
     """
+    from apps._stereo_layout import candidate_session_dirs
+
     root = Path(root)
     if not root.exists():
         return []
-    dirs = [p for p in root.iterdir() if p.is_dir()]
+    dirs = candidate_session_dirs([root])
 
     def sort_key(p: Path) -> tuple[str, float]:
         m = re.match(r"(\d{8}-\d{6})", p.name)
-        return (m.group(1) if m else "", p.stat().st_mtime)
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (m.group(1) if m else "", mtime)
 
     dirs.sort(key=sort_key, reverse=True)
     return [summarize_session(p) for p in dirs[:max(1, limit)]]

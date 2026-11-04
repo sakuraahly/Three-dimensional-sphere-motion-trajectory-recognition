@@ -102,15 +102,26 @@ def _dir_size(path: Path) -> int:
 
 
 def scan_items(root: str | Path) -> list[SessionItem]:
-    """按会话时间倒序返回可导出的会话（坏会话也列出，但由 UI 提示）。"""
+    """按会话时间倒序返回可导出的会话（坏会话也列出，但由 UI 提示）。
+
+    用 `apps/_stereo_layout.candidate_session_dirs` 而不是 ``root.iterdir()``：
+    会话现在按装置分区（``data/stereo/parallel/<时间戳>``），只扫一层会把
+    分区目录本身当成会话（``summarize_session`` 报 bad、导出一堆空目录），
+    而真正的会话一个都看不到。
+    """
+    from apps._stereo_layout import candidate_session_dirs
+
     root = Path(root)
     if not root.is_dir():
         return []
-    dirs = [p for p in root.iterdir() if p.is_dir()]
+    dirs = candidate_session_dirs([root])
 
     def key(p: Path):
         m = re.match(r"(\d{8}-\d{6})", p.name)
-        return (m.group(1) if m else "", p.stat().st_mtime)
+        try:
+            return (m.group(1) if m else "", p.stat().st_mtime)
+        except OSError:
+            return (m.group(1) if m else "", 0.0)
 
     dirs.sort(key=key, reverse=True)
     items: list[SessionItem] = []

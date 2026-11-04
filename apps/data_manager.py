@@ -73,7 +73,8 @@ def _parse_dt(text: str, end: bool = False) -> datetime | None:
 # ----------------------------------------------------------------------
 # 会话元数据编辑（改名 / 改备注）
 #
-# 与 `apps/_cleanup.py` 同一套安全习惯：只认 sessions 根目录的**直接子目录**，
+# 与 `apps/_cleanup.py` 同一套安全习惯：只认 sessions 根下的**会话目录**
+# （直接子目录，或一层装置分区下的会话 —— 见 `_stereo_layout`），
 # 拒绝 `..`、绝对路径与符号链接逃逸；写之前**必须**留一份备份，
 # 再写同目录临时文件 `os.replace` 原子替换。**绝不**直接 `json.dump` 覆盖。
 # ----------------------------------------------------------------------
@@ -94,7 +95,17 @@ def _sessions_root(sessions_root: Path | str | None) -> Path:
 
 def _resolve_session_dir(session_dir: Path | str,
                          sessions_root: Path | str | None = None) -> tuple[Path, Path]:
-    """校验并返回 (会话目录, session.json)；越界/符号链接一律 ValueError。"""
+    """校验并返回 (会话目录, session.json)；越界/符号链接一律 ValueError。
+
+    允许两种层级（2026-11-04，会话按装置分区后）：
+
+    - ``<根>/<时间戳>``           旧扁平布局；
+    - ``<根>/<模式>/<时间戳>``    新布局（``data/stereo/parallel/<时间戳>``）。
+
+    两级都必须真的是"会话"（有 ``session.json``）。中间层用
+    ``_stereo_layout.layout_mode_of`` 判定，**不靠层数** —— 否则
+    ``<根>/a/b`` 这种任意嵌套也会被放进来。
+    """
     root = _sessions_root(sessions_root)
     raw = Path(session_dir)
     if raw.is_symlink():
@@ -103,7 +114,12 @@ def _resolve_session_dir(session_dir: Path | str,
     if p == root or not p.is_relative_to(root):
         raise ValueError(f"只能编辑 {root} 下的会话，收到：{p}")
     if p.parent != root:
-        raise ValueError(f"只支持 sessions 根目录的直接子目录（不许嵌套/`..`）：{p}")
+        from apps._stereo_layout import layout_mode_of
+
+        if p.parent.parent != root or layout_mode_of(p) is None:
+            raise ValueError(
+                f"只支持 {root} 的直接子目录，或一层装置分区"
+                f"（parallel/angled）下的会话：{p}")
     if not p.is_dir():
         raise ValueError(f"会话目录不存在：{p}")
     jf = p / "session.json"

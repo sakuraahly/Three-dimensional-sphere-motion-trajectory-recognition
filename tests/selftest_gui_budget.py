@@ -357,8 +357,16 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     r = record_args(left="left", right="right", duration="10", out=str(out_dir))
     check("录制：调用 apps/record_stereo.py",
           any("record_stereo.py" in x for x in r), " ".join(r))
-    # B-107 的教训：传错模式会先把两台相机开起来，再在体检里报"模式冲突"
-    check("录制：不传 --stereo-mode（走 auto = 按标定，B-107）",
+    # B-107 的教训是"别把错模式写死"；但 2026-11-04 起口径变了：
+    # `record_stereo.plan_record` 的体检已经**前移到开相机之前**（不符只读一个 npz
+    # 就返回 2），所以"传了会白开相机"不再成立；而"不传"的代价变成了
+    # 「在 90° 窗口用平行标定录 → 会话被标成 parallel」——元数据与装置不符，
+    # 隔离失效（用户实测 20261103-093820 就是这样）。
+    r_ang = record_args(left="left", right="right", duration="10",
+                        out=str(out_dir), mode="angled")
+    check("录制：显式传本窗装置几何（--stereo-mode angled）",
+          _has_seq(r_ang, ["--stereo-mode", "angled"]), " ".join(r_ang))
+    check("录制：没给模式就不许凭空写 auto（保持脚本默认）",
           "--stereo-mode" not in r, " ".join(r))
     check("录制：带 --left left --right right --duration 10 --out <目录>",
           _has_seq(r, ["--left", "left", "--right", "right"])
@@ -376,6 +384,15 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     check("录制：--out 落在会话扫描根里（否则录完第④步/工作台都列不出来）",
           any(Path(record_out_dir()).resolve() == Path(p).resolve()
               for p in stereo_roots()), str(record_out_dir()))
+    # 2026-11-04：新录的会话按装置分区（data/stereo/<mode>/）。这里守住
+    # "分区根只比会话根多一层" —— 扫描器（candidate_session_dirs）往里走一层
+    # 就能找到会话；多套几层它就不认了，录完在列表里看不到。
+    from sphere_tracker.paths import STEREO_ROOT
+
+    for _m in ("parallel", "angled"):
+        _d = Path(record_out_dir(_m))
+        check(f"录制：{_m} 落 data/stereo/{_m}（分区根，只多一层）",
+              _d.name == _m and _d.parent.resolve() == STEREO_ROOT.resolve(), str(_d))
     check("录制：标签 → --label（不拼路径；空白不传）",
           _has_seq(record_args(out=str(out_dir), label="ball01"),
                    ["--label", "ball01"])

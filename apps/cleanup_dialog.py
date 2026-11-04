@@ -96,9 +96,12 @@ class CleanupDialog(tk.Toplevel):
 
     def _preview(self) -> None:
         try:
+            # allow_nested：会话按装置分区后躺在 data/stereo/<mode>/<时间戳>，
+            # 不放宽的话数据管理里勾中分区里的会话会报"只能清理直接子目录"。
             self.plan = plan_cleanup(self.root_dir, self.targets,
                                      mode=self.mode_var.get(),
-                                     keep_latest=self._keep_latest())
+                                     keep_latest=self._keep_latest(),
+                                     allow_nested=True)
         except Exception as exc:                            # noqa: BLE001
             self.plan = None
             self.summary.configure(text=f"预览失败：{exc}")

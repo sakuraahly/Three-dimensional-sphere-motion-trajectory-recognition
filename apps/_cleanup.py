@@ -79,7 +79,19 @@ def trash_root(sessions_root: str | Path) -> Path:
     return root.parent / TRASH_NAME
 
 
-def _resolve_target(root: Path, target: str | Path) -> Path:
+def _resolve_target(root: Path, target: str | Path,
+                    allow_nested: bool = False) -> Path:
+    """校验目标目录并返回规范化路径。
+
+    ``allow_nested=True`` 时接受**两层**：``root/<分区>/<会话>``。
+
+    为什么需要它（2026-11-04）：双目会话改成了按装置分区
+    （``data/stereo/parallel/<时间戳>``），若仍只认"根的直接子目录"，
+    会话管理器就删不掉分区里的会话 —— 而且报错还是一句与事实无关的
+    "只能清理直接子目录"。**这里不判断分区名**（`parallel`/`angled` 是
+    双目的知识，不属于这个通用清理层）：只多允许一层，安全边界仍由
+    "必须是 root 的后代、不许符号链接、不许 .. 逃逸"守住。
+    """
     raw = Path(target)
     if not raw.is_absolute():
         raw = root / raw
@@ -87,8 +99,13 @@ def _resolve_target(root: Path, target: str | Path) -> Path:
         raise ValueError(f"拒绝清理符号链接：{raw}")
     p = raw.resolve()
     if p.parent != root:
-        raise ValueError(f"只能清理 sessions 根目录的直接子目录：{p}")
-    if p == root or p.name == TRASH_NAME:
+        nested = (p.parent.parent == root) if allow_nested else False
+        if not nested:
+            raise ValueError(
+                f"只能清理 sessions 根目录的直接子目录"
+                + ("（或一层装置分区下的会话）" if allow_nested else "")
+                + f"：{p}")
+    if p == root or p.name == TRASH_NAME or p.parent == p:
         raise ValueError(f"拒绝清理根目录/回收站：{p}")
     if p.is_symlink():
         raise ValueError(f"拒绝清理符号链接：{p}")
@@ -96,8 +113,13 @@ def _resolve_target(root: Path, target: str | Path) -> Path:
 
 
 def plan_cleanup(sessions_root: str | Path, targets: list[str | Path],
-                 mode: str = "session", keep_latest: int = 0) -> CleanupPlan:
-    """生成清理计划；不移动任何文件。"""
+                 mode: str = "session", keep_latest: int = 0,
+                 allow_nested: bool = False) -> CleanupPlan:
+    """生成清理计划；不移动任何文件。
+
+    ``allow_nested`` 透传给 :func:`_resolve_target`：双目会话按装置分区后
+    在 ``data/stereo/<mode>/`` 下，需要它才能删。
+    """
     root = Path(sessions_root).resolve()
     if not root.is_dir():
         raise ValueError(f"sessions 根目录不存在：{root}")
@@ -107,7 +129,7 @@ def plan_cleanup(sessions_root: str | Path, targets: list[str | Path],
     unique: list[Path] = []
     seen: set[Path] = set()
     for t in targets:
-        p = _resolve_target(root, t)
+        p = _resolve_target(root, t, allow_nested=allow_nested)
         if p not in seen:
             seen.add(p)
             unique.append(p)

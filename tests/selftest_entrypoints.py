@@ -484,6 +484,146 @@ def test_annotated_video_atomic_write() -> bool:
     return all(good for _label, good in checks)
 
 
+def test_stereo_session_layout() -> bool:
+    """双目会话必须**按装置分区**，且两种装置的列表不能互相看到。
+
+    ## 这条守的是什么（用户原话，2026-11-04）
+
+    「大角度双目和平行双目的会话没有完全隔离开」。查下来是真的：43 段会话
+    全在 ``data/stereo/<时间戳>`` 扁平层，隔离只靠 ``session.json`` 的
+    ``stereo_mode`` 在列表里过滤 —— 而 **29/43 段老会话根本没有这个字段**，
+    于是两个窗口都列得出来。更进一步：以前录制的 ``--stereo-mode`` 是
+    ``auto``（按标定），在 90° 装置上用平行标定录，会话就被标成 parallel，
+    元数据与装置不符，事后谁也分不出来。
+
+    ## 断言防什么
+
+    1. 新录的会话落 ``data/stereo/<mode>/``（分区目录就是"属于哪套装置"）；
+    2. 扫描能同时认**两种布局**：新的两层 + 旧扁平层（迁移没做也不能丢会话）；
+    3. 按模式过滤**只给本装置的**：未记录的不算"可能匹配"，它算"不知道"；
+    4. 「改装置模式」同时改字段**并**搬目录（只改字段 = 隔离继续失效）；
+    5. 「移到回收站」是软删：目录进 ``_trash``，不是 rmtree。
+
+    反向自证：把 ``record_out_dir`` 改回返回 ``STEREO_ROOT``、或让
+    ``scan_sessions`` 不再按 mode 过滤 → 断言红。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    from apps import _stereo_sessions, _stereo_layout
+    from apps._gui_stereo import record_out_dir, scan_sessions
+    from sphere_tracker.paths import STEREO_ROOT, stereo_mode_root
+
+    checks: list[tuple[str, bool]] = []
+
+    def make_session(parent: _P, name: str, mode: str | None) -> _P:
+        d = parent / name
+        d.mkdir(parents=True, exist_ok=True)
+        raw = {"schema": "sphere-stereo-session", "version": 1, "id": name,
+               "created": "2026-01-01 12:00:00", "left": {"frame_count": 10}}
+        if mode:
+            raw["stereo_mode"] = mode
+            raw["rig"] = {"stereo_mode": mode}
+        (d / "session.json").write_text(json.dumps(raw), encoding="utf-8")
+        return d
+
+    # ① 写入落点：按装置分区（不是扁平根）
+    checks.append(("record_out_dir('parallel') 落在 data/stereo/parallel",
+                   record_out_dir("parallel").name == "parallel"
+                   and record_out_dir("parallel").parent.resolve()
+                   == STEREO_ROOT.resolve()))
+    checks.append(("record_out_dir('angled') 落在 data/stereo/angled",
+                   record_out_dir("angled").name == "angled"))
+    checks.append(("record_out_dir() 兜底仍是扁平根（老调用方不炸）",
+                   record_out_dir().resolve() == STEREO_ROOT.resolve()))
+
+    with tempfile.TemporaryDirectory() as td:
+        data = _P(td) / "data"
+        stereo = data / "stereo"
+        stereo.mkdir(parents=True)
+
+        # ② 三种会话：扁平层的 parallel / 扁平层的 angled / 无字段的老会话
+        make_session(stereo, "20260101-000001", "parallel")
+        make_session(stereo, "20260101-000002", "angled")
+        make_session(stereo, "20260101-000003", None)
+        # 新布局：分区目录里的会话（故意不写字段，靠"摆在哪"认出来）
+        make_session(stereo / "angled", "20260101-000004", None)
+        # 专供"改模式"用的一段：字段与 rig 都齐全（正常录制产物的形状）。
+        # 不拿 000001 改，是为了让前面那几条"按 mode 过滤"的断言不被后续改动影响。
+        make_session(stereo, "20260101-000005", "parallel")
+        (stereo / "parallel").mkdir(exist_ok=True)
+
+        all_rows = scan_sessions((stereo,))
+        checks.append(("两种布局都枚举得到（5 段）", len(all_rows) == 5))
+        checks.append(("分区目录本身不被当成会话",
+                       all(r["id"] not in ("parallel", "angled") for r in all_rows)))
+
+        par = scan_sessions((stereo,), mode="parallel")
+        ang = scan_sessions((stereo,), mode="angled")
+        checks.append(("mode='parallel' 只给 parallel（2 段）",
+                       sorted(r["id"] for r in par)
+                       == ["20260101-000001", "20260101-000005"]))
+        checks.append(("mode='angled' 给 angled + 分区里那段（2 段）",
+                       sorted(r["id"] for r in ang)
+                       == ["20260101-000002", "20260101-000004"]))
+        checks.append(("未记录的会话不混进任何一种装置",
+                       all(r["id"] != "20260101-000003" for r in par + ang)))
+
+        # ③ 改装置模式：字段 + 目录一起动
+        orig = _stereo_sessions.stereo_mode_root
+        _stereo_sessions.stereo_mode_root = lambda m: stereo / m
+        try:
+            moved = _stereo_sessions.set_session_mode(
+                stereo / "20260101-000005", "angled")
+        finally:
+            _stereo_sessions.stereo_mode_root = orig
+        rec = json.loads((moved / "session.json").read_text(encoding="utf-8"))
+        checks.append(("改模式后字段与 rig 都更新",
+                       rec.get("stereo_mode") == "angled"
+                       and (rec.get("rig") or {}).get("stereo_mode") == "angled"))
+        checks.append(("改模式后目录搬进 angled/",
+                       moved.parent.name == "angled"
+                       and not (stereo / "20260101-000005").exists()))
+        checks.append(("改模式留了 session.json.bak-* 备份",
+                       bool(list(moved.glob("session.json.bak-*")))))
+
+        # ④ 移到回收站（软删）
+        batch = _stereo_sessions.delete_stereo_session(moved, root=stereo)
+        checks.append(("移到回收站：原目录消失", not moved.exists()))
+        checks.append(("移到回收站：批次里有这段会话",
+                       any(p.name == "session.json"
+                           for p in batch.rglob("session.json"))))
+        checks.append(("回收站在 data/_trash（不是 rmtree）",
+                       batch.parent == data / "_trash"))
+
+        # ⑤ 越界保护：不许删根 / 不许删分区目录本身
+        def rejects(fn) -> bool:
+            try:
+                fn()
+            except (OSError, ValueError):
+                return True
+            return False
+
+        checks.append(("拒绝删 sessions 根",
+                       rejects(lambda: _stereo_sessions.delete_stereo_session(
+                           stereo, root=stereo))))
+        checks.append(("拒绝删分区目录本身",
+                       rejects(lambda: _stereo_sessions.delete_stereo_session(
+                           stereo / "parallel", root=stereo))))
+
+        # ⑥ 布局推断：位置 vs 记录要能分开看
+        checks.append(("layout_mode_of 认得出分区",
+                       _stereo_layout.layout_mode_of(stereo / "angled" / "x") == "angled"))
+        checks.append(("扁平层的 layout 是 None（位置不表态）",
+                       _stereo_layout.layout_mode_of(
+                           stereo / "20260101-000001") is None))
+
+    for label, good in checks:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+    return all(good for _label, good in checks)
+
+
 def test_shared_arg_blocks() -> bool:
     """单目两个入口的公共参数必须**出自同一个函数**，预设名单不许再手抄。
 
@@ -1309,6 +1449,7 @@ def main() -> int:
                test_every_cli_parses,
                test_path_bootstrap_is_marker_based,
                test_data_layout_single_source,
+               test_stereo_session_layout,
                test_shared_arg_blocks,
                test_annotated_video_atomic_write,
                test_run_all_orchestrator,

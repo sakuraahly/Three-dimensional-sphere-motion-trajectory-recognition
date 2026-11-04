@@ -42,8 +42,18 @@ from apps._actions import (CHAIN_ROOT, board_args, calibrate_args,
                            chain_dirs, check_chain_inputs, check_setup_args,
                            capture_chain_frames, offline_args, record_args)
 from apps import _actions
+from apps._stereo_layout import (
+    MODE_LABELS,
+    candidate_session_dirs,
+    effective_mode,
+    is_legacy_flat,
+    layout_mode_of,
+    looks_like_session,
+    mode_label,
+    session_mode_of,
+)
 from sphere_tracker.config import ColorConfig
-from sphere_tracker.paths import STEREO_ROOT, stereo_roots
+from sphere_tracker.paths import STEREO_ROOT, stereo_mode_root, stereo_roots
 from sphere_tracker.plugins import names as plugin_names
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
@@ -132,26 +142,33 @@ PICKER_METHODS = ("joint", "chain", "chain_dual")
 
 
 
-def record_out_dir(root: Path | None = None) -> Path:
-    """录制的 ``--out``：会话**根目录** ``data/stereo``（时间戳子目录由录制程序建）。
+def record_out_dir(mode: str | None = None, root: Path | None = None) -> Path:
+    """录制的 ``--out``：**该装置几何的分区根**（时间戳子目录由录制程序建）。
 
-    为什么是根、不是 ``data/stereo/<时间戳>``（2026-10-31 修，缺陷 #3）
-    ------------------------------------------------------------------
+    为什么是根、不是 ``<根>/<时间戳>``（2026-10-31 修，缺陷 #3）
+    ----------------------------------------------------------
     ``record_stereo.py`` 的 ``--out`` 是**根**：它自己调
     ``stereo.sessions.create_session(root)``，在 root 下新建
-    ``YYYYMMDD-HHMMSS``（同名已存在则加 ``-01`` 后缀）。所以：
+    ``YYYYMMDD-HHMMSS``（同名已存在则加 ``-01`` 后缀）。传具体会话目录
+    反而会再套一层 —— 除非在这里另写一份命名与去重逻辑，那就成了
+    "目录名有两处来源"。
 
-    - 传 ``data/stereo`` → 得到 ``data/stereo/20261031-181500``，会话扫描
-      （``sphere_tracker.paths.stereo_roots()`` = ``data/stereo`` + ``data/sessions``）
-      一眼就能列出它，第 ④ 步的「选择…」和工作台里都看得到；
-    - 传 ``data/stereo/<时间戳>`` 反而会再套一层 —— 除非在这里另写一份命名与
-      去重逻辑，那就成了"目录名有两处来源"。
+    为什么要按 mode 分区（2026-11-04，用户报"两种装置的会话没隔离"）
+    ------------------------------------------------------------
+    以前所有会话都落 ``data/stereo/<时间戳>``，平行和 90° 装置物理混在一起，
+    只能靠 ``session.json`` 的 ``stereo_mode`` 在列表里过滤 —— 而 29/43 段
+    老会话没有这个字段，于是两个窗口都列得出来。现在按窗口的装置几何落到
+    ``data/stereo/<mode>/<时间戳>``：**哪段属于哪套装置成了目录结构本身**。
 
-    上一版返回 ``data/<标签>``：既不在扫描范围里（录完永远列不出来，只能手打
-    路径），目录名又固定（第二段录制落进同一个目录、和第一段混在一起）。
-    标签现在走 ``--label`` 进 ``session.json``，**不再参与拼路径**。
+    ``mode`` 不传（或非法）= 落旧扁平根 ``data/stereo``。这条兜底只给测试和
+    老调用方用；界面一律传本窗的 mode（``parallel``/``angled``）。
     """
-    return root if root is not None else STEREO_ROOT
+    if root is not None:
+        return root
+    try:
+        return stereo_mode_root(str(mode or ""))
+    except ValueError:
+        return STEREO_ROOT
 
 
 def session_name_of(visualization: Path | str) -> str:
@@ -171,68 +188,76 @@ def session_name_of(visualization: Path | str) -> str:
 # --------------------------------------------------------------------------- #
 # 会话选择：三态过滤（匹配 / 不匹配 / 未记录）
 # --------------------------------------------------------------------------- #
-def scan_sessions(base: Path | tuple[Path, ...] | None = None) -> list[dict]:
-    """读 ``data/stereo/*/session.json``（以及旧位置 ``data/sessions/*``）的摘要。
+def scan_sessions(base: Path | tuple[Path, ...] | None = None, *,
+                  mode: str | None = None) -> list[dict]:
+    """读双目会话的摘要：``data/stereo/<mode>/<时间戳>/session.json``（新布局）
+    与 ``data/stereo/<时间戳>`` / ``data/sessions/<时间戳>``（旧布局）。
 
     只读 JSON、**不构造 ``Session`` 对象**：几十个会话也能瞬间列完，
     而且不会因为某一份坏文件把整个列表打断。
 
-    ``base`` 不传 = 扫 ``stereo_roots()``（新的在前），迁移前后都列得全；
+    ``base`` 不传 = 扫 ``stereo_roots()``，迁移前后都列得全；
     传一个目录/tuple 只扫那些（测试要造临时会话，不能依赖这台机器录过什么）。
-    同一个会话名两边都在时只留**新的那份**（先扫到的），避免迁移中途列表出现两行同名。
+    同一个会话名多处都在时只留**先扫到的**（新布局在前），避免迁移中途
+    列表里出现两行同名。
+
+    ``mode`` 传了就**只留这一种装置的会话**（`None` = 跨装置，工作台用）。
+    这里做过滤而不是留给调用方：调用方（会话列表 / 状态卡）各有各的用法，
+    过滤规则写两遍必然分叉 —— 2026-11-04 的隔离问题就是这么来的。
 
     ``mode`` 字段可能是 ``None`` —— 那表示**这份会话没有记录装置模式**。
     老会话都缺这个字段（``record_stereo`` 写入 ``stereo_mode`` 是
     ``a137766`` 才加的），所以**不能默认成 parallel**。
+
+    每行除了原有字段，还带 ``layout``（按目录推断的模式，旧扁平层为 None）
+    与 ``legacy``（是否躺在旧扁平层——会话管理器据此提示"可整理到分区"）。
     """
     if base is None:
-        roots: tuple[Path, ...] = stereo_roots()
-    elif isinstance(base, (str, Path)):
-        roots = (Path(base),)
+        dirs = candidate_session_dirs()
     else:
-        roots = tuple(Path(b) for b in base)
+        roots = ((Path(base),) if isinstance(base, (str, Path))
+                 else tuple(Path(b) for b in base))
+        dirs = candidate_session_dirs(roots)
 
     rows: list[dict] = []
     seen: set[str] = set()
-    for root in roots:
-        for row in _scan_one_root(root):
-            if row["id"] in seen:
-                continue
-            seen.add(row["id"])
-            rows.append(row)
+    for d in dirs:
+        if not looks_like_session(d):
+            continue
+        if d.name in seen:
+            continue
+        row = _row_of(d)
+        # 过滤用 `effective_mode`：分区目录里的会话即便没写字段，也知道自己是谁
+        # （摆在哪就是哪）。旧扁平层里没字段的会话返回 None，——只在
+        # `mode is None`（跨装置）时才留下，这正是"未记录"该有的行为。
+        if mode is not None and effective_mode(d) != mode:
+            continue
+        seen.add(d.name)
+        rows.append(row)
     rows.sort(key=lambda r: r["id"], reverse=True)
     return rows
 
 
-def _scan_one_root(root: Path) -> list[dict]:
-    """扫单个根的直接子目录（新→旧按目录名），返回还没去重的行。"""
-    rows: list[dict] = []
+def _row_of(d: Path) -> dict:
+    """一份会话的列表行（解析失败也不抛：坏目录要能被列出来给人处理）。"""
     try:
-        dirs = sorted((d for d in root.iterdir() if d.is_dir()),
-                      key=lambda d: d.name, reverse=True)
-    except OSError:
-        return rows
-    for d in dirs:
-        sj = d / "session.json"
-        if not sj.is_file():
-            continue
-        try:
-            raw = json.loads(sj.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raw = {}
-        if not isinstance(raw, dict):
-            raw = {}
-        left = raw.get("left") if isinstance(raw.get("left"), dict) else {}
-        rows.append({
-            "path": d,
-            "id": d.name,
-            "label": str(raw.get("label") or ""),
-            "created": str(raw.get("created") or ""),
-            "mode": raw.get("stereo_mode"),
-            # 会话里帧数叫 frame_count（实测 20261024-173619: 301 帧），不是 frames
-            "frames": left.get("frame_count") or "",
-        })
-    return rows
+        raw = json.loads((d / "session.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    left = raw.get("left") if isinstance(raw.get("left"), dict) else {}
+    return {
+        "path": d,
+        "id": d.name,
+        "label": str(raw.get("label") or ""),
+        "created": str(raw.get("created") or ""),
+        "mode": raw.get("stereo_mode"),
+        # 会话里帧数叫 frame_count（实测 20261024-173619: 301 帧），不是 frames
+        "frames": left.get("frame_count") or "",
+        "layout": layout_mode_of(d),
+        "legacy": is_legacy_flat(d),
+    }
 
 
 def pick_seeds(parent, session_dir: str | Path) -> Path | None:
@@ -253,47 +278,67 @@ def pick_seeds(parent, session_dir: str | Path) -> Path | None:
 
 
 class SessionPicker(tk.Toplevel):
-    """选一段会话：列出磁盘上的会话，按装置模式**三态**标注。
+    """选一段会话：列出**本装置分区**里的会话，按装置模式**三态**标注。
 
     为什么要有它：旧界面把"会话目录"做成输入框，用户得自己记住并粘贴路径 ——
-    那是"把该由系统做的事转嫁给用户"。
+    那是"该由系统做的事转嫁给用户"。
 
     为什么是三态而不是两态：老会话没有 ``stereo_mode`` 字段。两态（匹配/不匹配）
     会把它们当成 parallel，于是 90° 装置录的会话在平行窗里看起来"可用" ——
     **比不过滤更糟**。所以第三态叫"未记录"，如实标注、让人自己确认。
 
+    **未记录默认不显示**（2026-11-04 改）：以前它与"匹配"一样默认列出，于是
+    43 段会话里的 29 段未记录会话在两个窗口都能看到 —— 用户原话是
+    "平行和大角度的会话没有完全隔离开"。未记录不是"可能匹配"，是"不知道"；
+    拿不知道的几何去解算会得到系统性错的深度且不报错，所以默认藏起来。
+
     ``mode=None`` 表示**跨装置**（会话工作台用）：不按几何过滤、也不标不匹配 ——
     工作台要处理磁盘上任意一段会话，"只看本窗模式"在那里是错的过滤。
+
+    「移到回收站」是**软删除**（复用 ``apps/_cleanup`` 的回收站）；
+    「改装置模式…」同时改 ``session.json`` 并把目录搬进对应分区 —— 后者存在的
+    理由很实际：磁盘上 29/43 段会话没有模式字段，没有这个动作它们永远归不了位。
     """
 
-    COLS = (("id", "目录", 130), ("label", "标签", 150),
-            ("created", "创建时间", 150), ("mode", "模式", 100),
-            ("frames", "帧数", 70))
+    COLS = (("id", "目录", 130), ("label", "标签", 140),
+            ("created", "创建时间", 145), ("mode", "模式", 105),
+            ("frames", "帧数", 60), ("where", "位置", 85))
 
     def __init__(self, parent, *, mode: str | None, on_pick,
-                 current: str = "") -> None:
+                 current: str = "", on_changed=None) -> None:
         super().__init__(parent)
         self.mode = mode
         self.on_pick = on_pick
+        # 删除/改模式之后父窗口要重判"当前会话还在不在" —— 否则它会继续
+        # 拿着一个已经被移进回收站的路径去录制/分析。
+        self.on_changed = on_changed
         self.title("选择会话 · " + {
             "parallel": "平行双目", "angled": "大角度双目",
         }.get(str(mode), "任意装置"))
-        self.geometry("820x560")
-        self.minsize(680, 440)
+        self.geometry("900x580")
+        self.minsize(720, 460)
         self.configure(bg=BG)
         self.surface = Surface(self)
         # 跨装置时"显示全部"没有意义：直接置真，也不放那个复选框
         self.var_all = tk.BooleanVar(value=mode is None)
         self._rows = scan_sessions()
 
-        box = self.surface.card(
-            self, "会话",
-            "这里列出 data/stereo 下的会话（旧位置 data/sessions 也一起列）。"
-            "默认只显示与当前窗口同一种装置几何的；"
-            "老会话没有记录装置模式，标为「未记录」—— 用之前请自己确认它是哪种装置录的。")
+        if mode is None:
+            intro = ("这里列出全部双目会话（新布局 data/stereo/<模式>/<时间戳>、"
+                     "旧扁平层 data/stereo/<时间戳>、以及 data/sessions 都认）。"
+                     "工作台不管你用哪套装置，所以不做过滤。")
+        else:
+            intro = (f"这里只列「{mode_label(mode)}」的会话：新布局在 "
+                     f"data/stereo/{mode}/ 下；旧扁平层的会话按 session.json 的 "
+                     "stereo_mode 归位。未记录的默认不显示 —— "
+                     "它不是\"可能匹配\"，是\"不知道\"，"
+                     "用错几何解算会得到系统性错的深度且不报错。")
+        box = self.surface.card(self, "会话", intro)
+        self.lbl_note = self.surface.hint(box, "")   # 统计/过滤提示
+        self.lbl_sel = self.surface.hint(box, "")    # 选中那一行的说明
         if mode is not None:
             ttk.Checkbutton(
-                box, text="显示不属于本窗口模式的会话（标灰，选中时会说明风险）",
+                box, text="显示不属于本窗口模式的会话（标灰；未记录的也在内，慎用）",
                 variable=self.var_all,
                 command=self._refresh).grid(
                 row=self.surface._next_row(box), column=0, columnspan=9,
@@ -315,11 +360,24 @@ class SessionPicker(tk.Toplevel):
             self.tree.tag_configure(tag, foreground=colour)
         self.tree.bind("<Double-1>", lambda _e: self._accept())
         self.tree.bind("<Return>", lambda _e: self._accept())
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._describe_selected())
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", padx=16, pady=10)
         self.surface.primary(actions, "用这个会话", self._accept)
+        self.surface.secondary(actions, "移到回收站", self._delete)
+        self.surface.secondary(actions, "改装置模式…", self._change_mode)
+        self.surface.secondary(actions, "整理旧会话…", self._tidy_legacy)
+        self.surface.secondary(actions, "刷新", self._rescan)
         self.surface.secondary(actions, "取消", self.destroy)
+        notes = ttk.Frame(self)
+        notes.pack(fill="x", padx=16, pady=(0, 10))
+        self.surface.hint(
+            notes,
+            "「移到回收站」是软删除：整个会话（含原始视频）进 data/_trash，"
+            "之后能在数据管理里恢复。「改装置模式…」会把会话归到对应装置分区"
+            "（data/stereo/parallel 或 angled）；「整理旧会话…」一次性把**已记录模式**"
+            "的旧会话搬进分区（没记录的那些不会动，需要你逐条判断）。")
 
         self._refresh()
         if current:
@@ -334,43 +392,247 @@ class SessionPicker(tk.Toplevel):
         if self.mode is None:
             # 跨装置：不存在"不匹配"这回事，三态退回一态
             return "匹配", ""
-        raw = row.get("mode")
-        if raw is None or str(raw).strip() == "":
+        rec = row.get("mode")
+        if rec is None or str(rec).strip() == "":
+            # 没有字段时看它摆在哪：分区目录里躺着 = 知道是哪套装置录的
+            lay = row.get("layout")
+            if lay:
+                return ("匹配", "") if lay == self.mode else (
+                    "不匹配", f"它摆在 {lay}/ 分区里，属于另一种装置")
             return "未记录", "这份会话没记录装置模式，用之前请确认是哪套装置录的"
-        if str(raw) == self.mode:
+        if str(rec) == self.mode:
             return "匹配", ""
-        return "不匹配", f"这段会话是按 {raw} 几何录的，用本窗解算会得到错的深度"
+        return "不匹配", f"这段会话是按 {rec} 几何录的，用本窗解算会得到错的深度"
 
     def _refresh(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
         shown = 0
+        hidden = 0
         for row in self._rows:
             state, _why = self._state_of(row)
-            if state == "不匹配" and not self.var_all.get():
+            # 只有"匹配"默认可见。"不匹配"和"未记录"都要显式勾选才出现 ——
+            # 未记录也算"不该默认给你"：不知道几何时用错装置解算不会报错。
+            if state != "匹配" and not self.var_all.get():
+                hidden += 1
                 continue
             tag = {"匹配": "ok", "不匹配": "mismatch", "未记录": "unknown"}[state]
-            label = row["label"] or ("（无标签）" if state != "未记录" else "（无标签）")
-            mode_text = row["mode"] if row["mode"] else "未记录"
+            label = row["label"] or "（无标签）"
+            mode_text = mode_label(row["mode"]) if row["mode"] else "未记录"
+            where = f"{row['layout']}/" if row.get("layout") else "旧扁平层"
             self.tree.insert("", "end", iid=str(row["path"]),
                              values=(row["id"], label, row["created"],
-                                     mode_text, row["frames"]),
+                                     mode_text, row["frames"], where),
                              tags=(tag,))
             shown += 1
         if shown == 0:
             self.tree.insert("", "end", iid="__none__",
-                             values=("（没有会话）", "", "", "", ""), tags=("mismatch",))
+                             values=("（没有会话）", "", "", "", "", ""),
+                             tags=("mismatch",))
+        if self.mode is not None:
+            area = mode_label(self.mode)
+            if shown == 0:
+                # 空列表最容易被误读成"会话丢了"。说清是**本窗只列这套装置**，
+                # 并给出下一步（勾显示全部 → 改装置模式归位）。
+                msg = (f"还没有「{area}」的会话。本窗口只列这套装置的会话 —— "
+                       "另一种装置录的、或没记录装置模式的会话都不在这里")
+                if hidden:
+                    msg += (f"（共 {hidden} 段被隐藏：勾上面的复选框就能看到，"
+                            "再选中它们点「改装置模式…」归位）")
+                self.lbl_note.configure(text=msg, style="Hint.TLabel")
+            elif hidden:
+                self.lbl_note.configure(
+                    text=f"另有 {hidden} 段不是本装置的会话被隐藏"
+                         "（勾上面的复选框可以看到；它们要么是另一种装置录的，"
+                         "要么没记录装置模式）",
+                    style="Hint.TLabel")
+            else:
+                self.lbl_note.configure(text="", style="Hint.TLabel")
+        self._describe_selected()
 
-    def _accept(self) -> None:
+    def _selected(self) -> dict | None:
         sel = self.tree.selection()
         if not sel or sel[0] == "__none__":
+            return None
+        return next((r for r in self._rows if str(r["path"]) == sel[0]), None)
+
+    def _describe_selected(self) -> None:
+        """选中一行时说清"它摆在哪、记录是什么"（位置与记录不符要明说）。"""
+        row = self._selected()
+        if row is None or self.mode is None:
             return
-        row = next((r for r in self._rows if str(r["path"]) == sel[0]), None)
+        rec = row.get("mode")
+        lay = row.get("layout")
+        if rec and lay and str(rec) != lay:
+            note = (f"记录是 {mode_label(rec)}，却摆在 {lay}/ 分区里 —— "
+                    "位置与记录不符，点「改装置模式…」可修正")
+        elif not lay:
+            note = (f"记录是 {mode_label(rec)}，但还在旧扁平目录"
+                    "（data/stereo/ 下没分区）—— 点「改装置模式…」可搬进分区")
+        else:
+            note = f"装置：{mode_label(rec)}　位置：{lay}/"
+        self.lbl_sel.configure(text=note, style="Hint.TLabel")
+
+    def _rescan(self) -> None:
+        """重扫磁盘（删完/搬完/外部新增会话后用它，不必关窗再开）。"""
+        self._rows = scan_sessions()
+        self._refresh()
+
+    def _accept(self) -> None:
+        row = self._selected()
         if row is None:
             return
         _state, why = self._state_of(row)
-        self.on_pick(sel[0], why)
+        self.on_pick(str(row["path"]), why)
         self.destroy()
+
+    def _delete(self) -> None:
+        """移到回收站（**不是彻底删除**）：录像是不可再生的。"""
+        from tkinter import messagebox
+
+        from apps._stereo_sessions import delete_stereo_session
+
+        row = self._selected()
+        if row is None:
+            return
+        ok = messagebox.askyesno(
+            "移到回收站",
+            f"把整个会话目录 {row['id']} 移到回收站吗？\n\n"
+            f"{row['path']}\n\n"
+            "视频和派生结果会一起移走，之后可以从数据管理里的回收站恢复。",
+            parent=self)
+        if not ok:
+            return
+        try:
+            batch = delete_stereo_session(row["path"])
+        except (OSError, ValueError) as exc:
+            self.lbl_sel.configure(text=f"没移成：{exc}", style="Warn.TLabel")
+            return
+        self.lbl_sel.configure(
+            text=f"已移到回收站：{batch.parent.name}/{batch.name}"
+                 "（要恢复请用数据管理里的回收站）", style="Hint.TLabel")
+        self._rescan()
+        if self.on_changed is not None:
+            self.on_changed()
+
+    def _change_mode(self) -> None:
+        """改这段会话的装置几何（同时把目录搬进对应分区）。"""
+        from apps._stereo_sessions import set_session_mode
+
+        row = self._selected()
+        if row is None:
+            return
+        target = _ask_stereo_mode(self, row)
+        if not target:
+            return
+        try:
+            new_path = set_session_mode(row["path"], target)
+        except (OSError, ValueError) as exc:
+            self.lbl_sel.configure(text=f"没改成：{exc}", style="Warn.TLabel")
+            return
+        self.lbl_sel.configure(
+            text=f"已改为{mode_label(target)}，目录现在在 "
+                 f"{new_path.parent.name}/{new_path.name}", style="Hint.TLabel")
+        self._rescan()
+        if self.on_changed is not None:
+            self.on_changed()
+
+
+    def _tidy_legacy(self) -> None:
+        """把**有装置模式的**旧扁平会话搬进对应分区（一次性整理）。
+
+        为什么需要它（2026-11-04）：改动只影响**新录**的会话，而磁盘上已有
+        43 段全在旧扁平层 —— 其中 14 段有 ``stereo_mode``、29 段没有。
+        没有这个动作，用户升级完看到的仍是"混在一起"，等于什么都没解决。
+
+        **只搬有字段的**：没有 ``stereo_mode`` 的会话，无法从元数据判断是哪套
+        装置录的。猜（比如"没 fov 就是 angled"）会猜错 —— 而猜错的后果是用错
+        几何解算得到系统性错的深度且不报错。那些留给用户逐条「改装置模式…」。
+        """
+        from tkinter import messagebox
+
+        from apps._stereo_sessions import set_session_mode
+
+        rows = scan_sessions()
+        todo = [r for r in rows if r.get("mode") and r.get("layout") != r["mode"]]
+        unknown = [r for r in rows if not r.get("mode") and not r.get("layout")]
+        if not todo:
+            self.lbl_sel.configure(
+                text="没有需要整理的有模式会话"
+                     + (f"；另有 {len(unknown)} 段没记录装置模式，需要逐条「改装置模式…」"
+                        if unknown else ""),
+                style="Hint.TLabel")
+            return
+        ok = messagebox.askyesno(
+            "整理旧会话",
+            f"把 {len(todo)} 段有装置模式的会话搬进对应分区吗？\n\n"
+            "只搬 session.json 里**已经写了** stereo_mode 的那些；"
+            f"另有 {len(unknown)} 段没记录的不会动（它们要你逐条判断）。\n\n"
+            "搬动是移动整个目录，会话不会被删除。",
+            parent=self)
+        if not ok:
+            return
+        moved, failed = 0, []
+        for r in todo:
+            try:
+                set_session_mode(r["path"], str(r["mode"]))
+                moved += 1
+            except (OSError, ValueError) as exc:
+                failed.append(f"{r['id']}（{exc}）")
+        note = f"已整理 {moved} 段到各自分区"
+        if unknown:
+            note += f"；{len(unknown)} 段没记录模式，仍需逐条「改装置模式…」"
+        if failed:
+            note += "；失败：" + "；".join(failed[:3])
+        self.lbl_sel.configure(
+            text=note, style="Hint.TLabel" if not failed else "Warn.TLabel")
+        self._rescan()
+        if self.on_changed is not None:
+            self.on_changed()
+
+
+def _ask_stereo_mode(parent, row: dict) -> str | None:
+    """问「归到哪种装置」的小模态框；返回 ``parallel``/``angled`` 或 None。
+
+    为什么不用 ``tk.Menu`` 弹出菜单：菜单要有事件循环才展开，无头测试里驱动不了，
+    而且它无法写清"会把目录搬走"这句 —— 那是这个动作最需要先说清的部分。
+    """
+    dlg = tk.Toplevel(parent)
+    dlg.title("改装置模式")
+    dlg.configure(bg=BG)
+    dlg.transient(parent)
+    dlg.resizable(False, False)
+    body = ttk.Frame(dlg, padding=14)
+    body.pack(fill="both", expand=True)
+
+    current = str(row.get("mode") or "").strip() or str(row.get("layout") or "").strip()
+    ttk.Label(body, text=f"会话 {row['id']}", font=("", 10, "bold")).pack(anchor="w")
+    ttk.Label(body, text=f"当前：{mode_label(current)}",
+              foreground=MUTED).pack(anchor="w", pady=(2, 8))
+    ttk.Label(body, wraplength=380, foreground=MUTED,
+              text="改完会把整个目录搬到 data/stereo/<模式>/ 下 —— "
+                   "只改字段不改位置，隔离仍然不成立。"
+                   "若目录正被别的程序打开，搬动会失败，但记录已经改好；"
+                   "关掉占用后再点一次即可。").pack(anchor="w", pady=(0, 8))
+
+    var = tk.StringVar(value=current if current in ("parallel", "angled") else "parallel")
+    for value in ("parallel", "angled"):
+        ttk.Radiobutton(body, text=MODE_LABELS[value], value=value,
+                        variable=var).pack(anchor="w")
+
+    out: dict[str, str | None] = {"value": None}
+    bar = ttk.Frame(body)
+    bar.pack(fill="x", pady=(10, 0))
+
+    def ok() -> None:
+        out["value"] = var.get()
+        dlg.destroy()
+
+    ttk.Button(bar, text="确定", command=ok).pack(side="right")
+    ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=(0, 6))
+    dlg.grab_set()
+    parent.wait_window(dlg)
+    return out["value"]
 
 
 class StereoWindow(tk.Toplevel):
@@ -956,24 +1218,47 @@ class StereoWindow(tk.Toplevel):
             self.status.set_status(
                 f"先解决标定再录：{why.replace('**', '')}", "warn")
             return
-        out = record_out_dir()
+        out = record_out_dir(self.mode)
         cmd = record_args(left=self.var_left.get(), right=self.var_right.get(),
                           duration=self.var_seconds.get(), out=str(out),
+                          mode=self.mode,
                           label=self.var_label.get())
         self.app.tasks.start(cmd, "双目录制")
         label = self.var_label.get().strip()
-        # 落点写"根 + 新时间戳目录"：目录名由录制程序生成（它同时负责重名去重），
-        # 这里不猜具体时间，但必须说清"录完在第 ④ 步能选到它" —— 上一版落进
-        # `data/stereo_session`，不在扫描范围，用户录完在列表里找不到。
+        # 落点写清"哪个分区 + 新时间戳目录"：目录名由录制程序生成（它同时负责
+        # 重名去重），这里不猜具体时间，但必须说清"录完在第 ④ 步能选到它" ——
+        # 上一版落进 `data/stereo_session`，不在扫描范围，用户录完在列表里找不到。
         self.status.set_status(
             f"预览窗口已开：确认两路都有画面后按【空格】开始（再倒计时进行录制）；"
-            f"录 {self.var_seconds.get() or '10'} 秒 → data/stereo/ 下的新会话目录"
+            f"录 {self.var_seconds.get() or '10'} 秒 → {out.name}/ 下的新会话目录"
             f"（标签「{label or '空'}」）", "info")
 
     def _pick_session(self) -> None:
-        """打开会话选择器（按本窗模式三态过滤）。"""
+        """打开会话选择器（只列本装置分区的会话 + 回收站/改模式）。"""
         SessionPicker(self, mode=self.mode, on_pick=self._set_session,
-                      current=self.var_session.get().strip())
+                      current=self.var_session.get().strip(),
+                      on_changed=self._on_sessions_changed)
+
+    def _on_sessions_changed(self) -> None:
+        """会话被删掉或搬走之后：当前选中的那条若已不存在，必须清掉。
+
+        为什么不能只是"刷新一下列表"：录制/分析都是按 ``var_session`` 的路径
+        起子进程的，路径已经没了还留着，症状是"点开始才报路径不存在" ——
+        而真正的原因（我刚把它移进回收站）早就不在屏幕上了。
+        """
+        cur = self.var_session.get().strip()
+        if cur and not Path(cur).is_dir():
+            self.var_session.set("")
+            self.status.set_status(
+                "当前会话已被移走/移动，已清空选择；用「选择…」重新挑一段", "warn")
+            return
+        if cur:
+            # 改装置模式会换目录：按 id（时间戳目录名）在新位置里找回来。
+            name = Path(cur).name
+            for row in scan_sessions():
+                if row["id"] == name:
+                    self.var_session.set(str(row["path"]))
+                    break
 
     def _set_session(self, path: str, why: str = "") -> None:
         """选中一个会话。``why`` 非空表示"它不属于本窗模式"，必须说出来。"""

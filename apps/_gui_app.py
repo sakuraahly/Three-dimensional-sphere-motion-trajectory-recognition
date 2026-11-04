@@ -420,23 +420,24 @@ class App(tk.Tk):
         # 延迟 import：`sphere_tracker` 的包初始化会拉起 cv2/numpy，而门厅启动不需要
         # （本项目已有先例：不为了一个默认值给启动路径加重量级依赖）。
         # 这里仍是**读**路径，所以用 stereo_roots() + `data/` 根（早期会话直接放 data/ 下）。
+        #
+        # 枚举走 `_stereo_layout.candidate_session_dirs`：会话按装置分区后
+        # （``data/stereo/parallel/<时间戳>``）只扫一层会把分区目录当成会话，
+        # 于是"默认打开哪一段"永远指向 parallel/ 这种目录、直接找不到 visualization。
         from sphere_tracker.paths import DATA_ROOT, stereo_roots
 
-        for base in (*stereo_roots(), DATA_ROOT):
-            try:
-                subs = [d for d in base.iterdir() if d.is_dir()]
-            except OSError:
-                continue
-            for d in subs:
-                for rel in ("derived/visualization.json", "visualization.json"):
-                    f = d / rel
-                    try:
-                        if f.is_file():
-                            m = re.match(r"(\d{8}-\d{6})", d.name)
-                            cands.append((m.group(1) if m else "", f))
-                            break
-                    except OSError:
-                        continue
+        from apps._stereo_layout import candidate_session_dirs
+
+        for d in candidate_session_dirs([*stereo_roots(), DATA_ROOT]):
+            for rel in ("derived/visualization.json", "visualization.json"):
+                f = d / rel
+                try:
+                    if f.is_file():
+                        m = re.match(r"(\d{8}-\d{6})", d.name)
+                        cands.append((m.group(1) if m else "", f))
+                        break
+                except OSError:
+                    continue
         if not cands:
             return None
         cands.sort(key=lambda x: x[0], reverse=True)
