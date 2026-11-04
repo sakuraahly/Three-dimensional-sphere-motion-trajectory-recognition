@@ -189,6 +189,70 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+#: `fov` 记录除 `FovAlignment` 那 8 个字段之外，允许携带的元信息。
+#: 它们的用途是**判断这份记录还能不能信**：换了相机 / 动了分辨率之后，
+#: 旧的 scale / crop_rect 就不再适用（那些是像素量纲，随分辨率变）。
+_FOV_META_KEYS = ("left_size", "right_size", "measured_at", "source")
+
+
+def _check_fov(value: Any) -> dict[str, Any] | None:
+    """校验并归一化装置档案里的 ``fov`` 记录。
+
+    校验**复用 `FovAlignment` 自己的 `__post_init__`**（reference_side /
+    crop_side / crop_rect / target_size / scale / inliers / quality 的全部规则），
+    不在这里重写一遍 —— 两份校验迟早会漂：档案放行了标定层会拒绝的值，
+    用户看到的就是"档案存进去了，一录就报错"。
+
+    额外元信息（`left_size` / `right_size` / `measured_at` / `source`）单独校验，
+    未知键**丢弃**（与 `RigProfile.from_dict` 的向前兼容口径一致）。
+    """
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ProfileError(f"fov 必须是对象或 None，收到 {type(value).__name__}")
+
+    from .fov_align import FovAlignment          # 同层，避免模块级循环
+
+    try:
+        FovAlignment.from_dict(value)            # 只用于校验，不保留实例
+    except ValueError as exc:
+        raise ProfileError(f"fov 记录不合法：{exc}") from exc
+
+    out: dict[str, Any] = {}
+    for key in ("reference_side", "crop_side", "crop_rect", "target_size",
+                "scale", "method", "inliers", "quality"):
+        out[key] = value[key]
+    # 归一化成 JSON 友好类型（tuple -> list；数值统一 python 原生类型）
+    out["crop_rect"] = [int(v) for v in value["crop_rect"]]
+    out["target_size"] = [int(v) for v in value["target_size"]]
+    out["scale"] = float(value["scale"])
+    out["inliers"] = int(value["inliers"])
+    out["quality"] = float(value["quality"])
+
+    for size_key in ("left_size", "right_size"):
+        if size_key not in value or value[size_key] is None:
+            continue
+        raw = value[size_key]
+        try:
+            size = [int(v) for v in raw]
+        except (TypeError, ValueError) as exc:
+            raise ProfileError(
+                f"fov.{size_key} 必须是 [宽, 高]，收到 {raw!r}") from exc
+        if len(size) != 2 or size[0] <= 0 or size[1] <= 0:
+            raise ProfileError(
+                f"fov.{size_key} 必须是 [宽>0, 高>0]，收到 {raw!r}")
+        out[size_key] = size
+
+    for text_key in ("measured_at", "source"):
+        if text_key not in value or value[text_key] is None:
+            continue
+        if not isinstance(value[text_key], str):
+            raise ProfileError(f"fov.{text_key} 必须是字符串")
+        out[text_key] = value[text_key].strip()
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
@@ -210,6 +274,18 @@ class RigProfile:
     calibration_path: str | None = None
     notes: str = ""
     created: str = field(default_factory=_now)
+    #: 两路相机的**固有视场差**（`stereo.fov_align.FovAlignment` 的字典 +
+    #: 测量时两路分辨率 / 时间 / 来源）。为什么不只放在某次标定的 meta 里：
+    #: 这是**装置属性**（镜头出厂焦距不同，实测左路比右路放大 ~1.5 倍），
+    #: 换一次标定不会变；而 meta 里的那份会随"重新标定"消失或变成 null。
+    #: 存进档案后，平行装置可以复用同一份裁剪参数，单目也能查到"这台机器
+    #: 两路差多少"，不必每次重新估。
+    #:
+    #: ⚠️ **90° 装置不做裁剪**：两路光轴近乎垂直、视场几乎不重叠，
+    #: 单应裁剪没有物理意义（`record_stereo` 在 angled 下明确忽略 fov）。
+    #: 档案里存它，是为了记录"这台机器的两路视场差"这个事实本身，
+    #: 以及给单目提供参考——不是让 90° 也去裁剪。
+    fov: dict[str, Any] | None = None
 
     # -- 序列化 ------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -225,6 +301,7 @@ class RigProfile:
             "calibration_path": self.calibration_path,
             "notes": self.notes,
             "created": self.created,
+            "fov": self.fov,
         }
 
     @classmethod
@@ -235,6 +312,7 @@ class RigProfile:
         known = {
             "name", "stereo_mode", "expected_baseline_mm", "working_distance_m",
             "width", "height", "fps", "calibration_path", "notes", "created",
+            "fov",
         }
         kwargs = {k: v for k, v in data.items() if k in known}
         return cls(**kwargs)
@@ -280,6 +358,7 @@ def validate_profile(
         calibration_path=_check_calibration_path(profile.calibration_path),
         notes=notes,
         created=created,
+        fov=_check_fov(profile.fov),
     )
 
 

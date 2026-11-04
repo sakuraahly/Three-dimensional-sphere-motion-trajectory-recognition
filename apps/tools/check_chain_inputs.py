@@ -11,12 +11,22 @@
 2. **参考段的板有没有动**：单板模式的前提是"参考图期间板**不动**"（T_AB=I）。
    板挪了 11° 时两路的"同一个位置"其实不是同一个位置，链出来的外参是错的。
 
+两种模式（2026-11-04 加 `--mode dual`）
+---------------------------------------
+``--mode single``（默认）：``left / right / ref_left / ref_right`` 四段。
+``--mode dual``：``left / board_b / pair`` 三段——两块刚性固定的板各看一块
+（垂直双板），``pair`` 里是**一台相机同时拍到 A、B 两板**的同框图。双板模式
+没有"参考段板不动"这条（T_AB 由同框图实测，不靠 I），取而代之要查的是
+"每张同框图能不能**同时**检出两块板"——检不出的图，标定时会被直接跳过，
+一张都检不出就整个失败。
+
 本工具只读图片、不写任何文件、不需要相机，也不改标定。
 
 用法::
 
     python apps/tools/check_chain_inputs.py --root outputs/chain/20261028-135416
     python apps/tools/check_chain_inputs.py --root <目录> --cols 8 --rows 5 --square 25
+    python apps/tools/check_chain_inputs.py --root outputs/chain_frames --mode dual
 
 退出码：0 = 可以跑 chain；1 = 有必须先修的问题；2 = 目录/参数不对。
 """
@@ -37,7 +47,8 @@ ROOT = next(p for p in Path(__file__).resolve().parents
             if (p / "sphere_tracker").is_dir())
 sys.path.insert(0, str(ROOT))
 
-from calib.board import BoardSpec, detect_board          # noqa: E402
+from calib.board import (                                 # noqa: E402
+    BoardSpec, detect_board, detect_two_boards, pose_distance)
 from calib.board_coverage import (                        # noqa: E402
     REF_STILL_PX, coverage_regions, reference_shift)
 from calib.mono_calib import QUALITY                      # noqa: E402
@@ -63,6 +74,15 @@ MIN_VIEWS_HARD = 3
 #: 混用后果很具体：拍了 12 张、覆盖 5/5 的用户会被本工具判"不能跑"，
 #: 而标定其实能跑 —— 于是白补拍一轮。
 MIN_VIEWS_ADVICE = 15
+
+#: 双板模式下"两块板在图上要能分开"的门限，单位是
+#: `calib.board.pose_distance` 的返回值（归一化到图像对角线的无量纲距离）。
+#:
+#: 取 0.02 —— **故意很保守**：它只想拦住"两块板在图上几乎重合/平行到肉眼都
+#: 像一块"这种必然让 `_assign_ab` 分不清的拍摄。正常的垂直双板（两板朝向差
+#: 约 90°）实测会远大于它。这里**不**照着 `_assign_ab` 的 5° 角度门限换算：
+#: 那需要内参做 PnP，而自检发生在标定之前、还没有 K，两个量纲不可混。
+PAIR_MIN_POSE_DIST = 0.02
 #: 内参段建议的倾斜：只用角点外接框的"短边/长边"比粗略判断有没有斜
 #: （不做 PnP，因为这里还没有内参可依赖）
 
@@ -151,12 +171,83 @@ def check_reference(d: Path, spec: BoardSpec, side: str) -> tuple[list[str], boo
     return problems, not problems
 
 
+def check_pairs(d: Path, spec: BoardSpec) -> tuple[list[str], bool]:
+    """检查同框段（**双板模式专用**）：每张要同时检出 A、B 两块板。
+
+    为什么这条是双板模式的命门：`T_AB`（两板刚性相对位姿）**只能**从这种
+    "一台相机同时看到两块板"的图里求。检不出两块 → 那张图被跳过；一张都
+    检不出 → 标定直接失败（`_run_chain` 报"没有一张图能同时检出 A、B"）。
+
+    两板"姿态距离"用 `calib.board.pose_distance` 算（对**单应**做比较，
+    不需要内参——自检发生在标定之前，还没有 K）。它归一化到图像对角线，
+    所以是 0~1 量级的无量纲值，不是角度；门限只用来兜住"两块板在图上几乎
+    重合/平行"这种必然让 A/B 分不开的拍摄。
+
+    ⚠️ 同框图必须用 **--pair-camera 指定的那一路**拍（GUI 拼的是 left）。
+    姿态是**相对相机**的，换一路拍会让 `_assign_ab` 用错姿态簇把 A/B 判反；
+    而两板夹角大时那种错误**不会**触发"差 <5°"护栏，会静默给出反向的 T_AB。
+    本工具无法从图里判断是哪一路拍的，所以只能把这句话印出来。
+    """
+    problems: list[str] = []
+    if not d.is_dir():
+        return [f"pair：同框图目录不存在 {d}"], False
+    files = sorted(list(d.glob("*.png")) + list(d.glob("*.jpg")))
+    if not files:
+        return [f"pair：同框图目录是空的 {d}"], False
+
+    ok_rows: list[tuple[str, float, float, float]] = []
+    bad: list[str] = []
+    for p in files:
+        g = _load_gray(p)
+        if g is None:
+            bad.append(f"{p.name}（读不出）")
+            continue
+        found = detect_two_boards(g, spec)
+        if found is None:
+            bad.append(f"{p.name}（没有同时检出两块板）")
+            continue
+        a, b = found
+        diag = float(np.hypot(g.shape[1], g.shape[0]))
+        # homography 可能是 None（极少数检测路径不带单应）：此时跳过距离，只记检出
+        dist = (pose_distance(a.homography, b.homography, diag)
+                if a.homography is not None and b.homography is not None else float("nan"))
+        ok_rows.append((p.name, a.area_ratio, b.area_ratio, dist))
+
+    for name, ar_a, ar_b, dist in ok_rows:
+        dist_txt = "—" if not np.isfinite(dist) else f"{dist:.3f}"
+        print(f"  pair: {name} 两板面积 {ar_a:.1%}/{ar_b:.1%}，姿态距离 {dist_txt}")
+    print(f"  pair: {len(files)} 张，{len(ok_rows)} 张能同时检出两块板")
+
+    if not ok_rows:
+        problems.append(
+            "pair：没有一张能**同时**检出 A、B 两块板 —— 双板模式求不出 T_AB。\n"
+            "     下一步：两块板都完整入画（不贴边、不互相遮挡）、光照均匀、"
+            "板之间留开一点距离（填白检测第二块时靠的就是这个间隙）")
+    elif len(ok_rows) < 2:
+        print("  [警告] pair：只有 1 张可用同框图 —— T_AB 的重复性无从评估"
+              "（建议 3~5 张，板在拍这几张时不要动）")
+    if bad:
+        problems.append(f"pair：{len(bad)} 张不可用：" + "、".join(bad[:4])
+                        + ("…" if len(bad) > 4 else ""))
+    dists = [d0 for *_r, d0 in ok_rows if np.isfinite(d0)]
+    if dists and min(dists) < PAIR_MIN_POSE_DIST:
+        problems.append(
+            f"pair：有两块板的姿态距离只有 {min(dists):.3f}"
+            f"（门限 {PAIR_MIN_POSE_DIST}）—— 它们在图上几乎重合。\n"
+            "     这会让标定分不清哪块是 A、哪块是 B（判反了 T_AB 就是逆矩阵，"
+            "外参全错）。请让两块板在图上明显朝向不同")
+    return problems, not problems
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="chain 标定输入自检（不写文件、不开相机）")
-    ap.add_argument("--root", required=True, help="四段目录的父目录")
+    ap.add_argument("--root", required=True, help="各段目录的父目录")
     ap.add_argument("--cols", type=int, default=8)
     ap.add_argument("--rows", type=int, default=5)
     ap.add_argument("--square", type=float, default=25.0)
+    ap.add_argument("--mode", choices=("single", "dual"), default="single",
+                    help="single=单板四段（left/right/ref_left/ref_right）；"
+                         "dual=双板三段（left/board_b/pair）")
     args = ap.parse_args(argv)
 
     root = Path(args.root)
@@ -170,16 +261,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print("=" * 72)
-    print(f"chain 输入自检：{root}")
+    print(f"chain 输入自检（{args.mode}）：{root}")
     print("=" * 72)
-    print("-- 内参段（板应摆满画面四角+中央，每个姿态倾斜 30–45°）--")
-    p1, ok1 = check_intrinsics(root / "left", spec, "left")
-    p2, ok2 = check_intrinsics(root / "right", spec, "right")
-    print("-- 参考段（板在这几张之间必须完全不动）--")
-    p3, ok3 = check_reference(root / "ref_left", spec, "ref_left")
-    p4, ok4 = check_reference(root / "ref_right", spec, "ref_right")
+    if args.mode == "dual":
+        print("-- 内参段 A 板 / B 板（板应摆满画面四角+中央，每个姿态倾斜 30–45°）--")
+        p1, ok1 = check_intrinsics(root / "left", spec, "left(A 板)")
+        p2, ok2 = check_intrinsics(root / "board_b", spec, "board_b(B 板)")
+        print("-- 同框段（一台相机同时拍到 A、B 两板；必须用 --pair-camera 那一路）--")
+        p3, ok3 = check_pairs(root / "pair", spec)
+        problems = p1 + p2 + p3
+    else:
+        print("-- 内参段（板应摆满画面四角+中央，每个姿态倾斜 30–45°）--")
+        p1, ok1 = check_intrinsics(root / "left", spec, "left")
+        p2, ok2 = check_intrinsics(root / "right", spec, "right")
+        print("-- 参考段（板在这几张之间必须完全不动）--")
+        p3, ok3 = check_reference(root / "ref_left", spec, "ref_left")
+        p4, ok4 = check_reference(root / "ref_right", spec, "ref_right")
+        problems = p1 + p2 + p3 + p4
 
-    problems = p1 + p2 + p3 + p4
     print()
     if problems:
         print("必须先修的问题：")
@@ -188,12 +287,17 @@ def main(argv: list[str] | None = None) -> int:
         print("\n判定结果：不能跑 chain（修完重拍后再自检一次）")
         return 1
     print("全部通过：可以跑 chain 了")
-    print("下一步：")
-    print(f"  启动程序.bat test 之外，手动跑：")
-    print(f"  python apps/calibrate_stereo.py --method chain --same-board "
-          f"--left-dir {root / 'left'} --right-dir {root / 'right'} "
-          f"--ref-left {root / 'ref_left'} --ref-right {root / 'ref_right'} "
-          f"--cols {args.cols} --rows {args.rows} --square {args.square:g}")
+    print("下一步（手动跑）：")
+    if args.mode == "dual":
+        print(f"  python apps/calibrate_stereo.py --method chain "
+              f"--left-dir {root / 'left'} --board-b-dir {root / 'board_b'} "
+              f"--pair-frame {root / 'pair'} --pair-camera left "
+              f"--cols {args.cols} --rows {args.rows} --square {args.square:g}")
+    else:
+        print(f"  python apps/calibrate_stereo.py --method chain --same-board "
+              f"--left-dir {root / 'left'} --right-dir {root / 'right'} "
+              f"--ref-left {root / 'ref_left'} --ref-right {root / 'ref_right'} "
+              f"--cols {args.cols} --rows {args.rows} --square {args.square:g}")
     print("\n判定结果：可以跑 chain")
     return 0
 

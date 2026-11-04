@@ -333,6 +333,43 @@ def detect_board_in_roi(
                    detector=obs.detector)
 
 
+def detect_two_boards(gray: np.ndarray, spec: BoardSpec):
+    """一张图里检出**两块**同名标定板（L 形 / 垂直双板靶标）。
+
+    做法：先检第一块，把它占的凸包**填白**（棋盘的黑格被抹掉，检测器就不会
+    在同一位置再报一次），再检第二块。返回 ``(obs_a, obs_b)`` 或 ``None``。
+
+    这里**不做 A/B 语义分配** —— 哪一块是"左相机看到的 A"，要看它相对哪一路
+    相机、落在谁的内参姿态簇附近，由调用方判定（`apps/calibrate_stereo.py`
+    的 `_assign_ab`）。
+
+    为什么放在库层（2026-11-04）：双板标定和"拍完先自检"必须用**同一份**
+    检测逻辑。以前它只存在于 `calibrate_stereo.py` 里，自检工具想查"这张
+    同框图到底能不能同时检出两块板"就得抄一遍——而抄出来的那份迟早会漂。
+
+    已知边界：两块板在图上靠得太近（外扩 12% 的填白区互相重叠）时，第二块
+    的角点会被抹掉，返回 ``None``。这不是 bug，是"这个拍摄位置不合格"——
+    调用方应当报"没有同时检出两块板"，让用户重拍，而不是放宽检测。
+    """
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    first = detect_board(gray, spec, exhaustive=True)
+    if not first.found or first.corners is None:
+        return None
+    masked = gray.copy()
+    pts = first.corners.reshape(-1, 2).astype(np.float32)
+    center = pts.mean(axis=0)
+    grown = ((pts - center) * 1.12 + center).astype(np.int32)
+    cv2.fillConvexPoly(masked, cv2.convexHull(grown), 255)
+    second = detect_board(masked, spec, exhaustive=True)
+    if not second.found or second.corners is None:
+        return None
+    if float(np.linalg.norm(first.corners.reshape(-1, 2)
+                            - second.corners.reshape(-1, 2))) < 1.0:
+        return None                                    # 同一块被检了两次
+    return first, second
+
+
 def pose_distance(h1: np.ndarray | None, h2: np.ndarray | None, image_diag: float) -> float:
     """两个位姿的差异（归一化到图像对角线）。
 

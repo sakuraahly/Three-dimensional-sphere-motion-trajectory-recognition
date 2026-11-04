@@ -325,6 +325,33 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
               and _has_seq(c3, ["--pair-frame", str(dirs["pair"]), "--pair-camera", "left"])
               and "--same-board" not in c3 and "--ref-left" not in c3, " ".join(c3))
 
+        # ---- 基线核对 / FOV 复用（2026-11-04）----
+        # 两条都是"档案里的值要真的进命令"：不传等于后端那段物理护栏不执行，
+        # 而它不会报错、只会静默少一项证据。
+        cb = calibrate_args("chain_dual", {}, "", "", "angled", baseline=124.0)
+        check("chain_dual：档案里的期望基线进 --baseline-mm",
+              _has_seq(cb, ["--baseline-mm", "124"]), " ".join(cb))
+        check("baseline 非法值不拼进命令（否则 argparse 直接 exit 2）",
+              "--baseline-mm" not in calibrate_args("joint", {}, "", "", "parallel",
+                                                    baseline="abc"), "abc 被忽略")
+        cf = calibrate_args("joint", {}, "", "", "parallel",
+                            fov_from_profile="平行装置")
+        check("joint：档案名进 --fov-from-profile（复用已量好的裁剪参数）",
+              _has_seq(cf, ["--fov-from-profile", "平行装置"]), " ".join(cf))
+        check("chain：不下传 --fov-from-profile（chain 不做裁剪，后端会报互斥）",
+              "--fov-from-profile" not in calibrate_args(
+                  "chain", {}, "", "", "angled", fov_from_profile="平行装置"),
+              "chain 不传")
+
+        # ---- 链式输入自检：双板要查 pair（2026-11-04）----
+        from apps._actions import check_chain_inputs as _chk
+        cd1 = _chk(cols="8", rows="5", square="25", mode="dual")
+        check("双板自检：--mode dual（查 left/board_b/pair 三段）",
+              _has_seq(cd1, ["--mode", "dual"]), " ".join(cd1))
+        check("单板自检仍默认 --mode single（行为没变）",
+              _has_seq(_chk(cols="8", rows="5", square="25"),
+                       ["--mode", "single"]), "默认 single")
+
     # ---- 对标老窗口 §8：录制参数 ----
     out_dir = record_out_dir()
     r = record_args(left="left", right="right", duration="10", out=str(out_dir))

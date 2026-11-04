@@ -517,6 +517,50 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         rp.set_active(None, path)
         checks.append(("set_active(None) 可清除", rp.get_active(path) is None))
 
+        # 5b) FOV 记录跟着装置走（2026-11-04）
+        #
+        # 守的是什么：两路焦距差是**装置属性**（同型号相机出厂焦距就不同），
+        # 以前它只活在"某一次标定"的 meta 里 —— 重标就没、估失败就 null，
+        # 于是每次标定都重猜一遍 crop_rect，内参跟着漂而屏幕上看不出来。
+        # 存进档案后它会跟着 active profile 切换，所以校验必须**复用
+        # FovAlignment 自己的规则**（两份校验迟早会漂）。
+        fov_ok = {
+            "reference_side": "left", "crop_side": "right",
+            "crop_rect": [319, 179, 1281, 721], "target_size": [1280, 720],
+            "scale": 0.6667, "method": "sift", "inliers": 793, "quality": 0.992,
+            "left_size": [1920, 1080], "right_size": [1920, 1080],
+            "measured_at": "2026-11-04T08:00:00", "source": "manual:test",
+        }
+        rp.upsert(rp.RigProfile(name="with-fov", stereo_mode="parallel",
+                                fov=fov_ok), path=path)
+        got = rp.get_profile("with-fov", path)
+        checks.append(("fov 往返一致（含 left_size / measured_at / source）",
+                       got is not None and got.fov == fov_ok))
+        checks.append(("crop_rect/target_size 落盘是 list（JSON 友好，不是 tuple）",
+                       isinstance(got.fov["crop_rect"], list)
+                       and isinstance(got.fov["target_size"], list)))
+        # 旧档案（没有 fov 这个键）必须照常可读 —— 向前兼容
+        rp.upsert(rp.RigProfile(name="no-fov", stereo_mode="parallel"), path=path)
+        checks.append(("没有 fov 键的旧档案可读（fov=None）",
+                       rp.get_profile("no-fov", path).fov is None))
+        # 非法 fov 必须被拒（每条都是真会算错外参的形状）
+        for label, bad in (
+            ("crop_side 与 reference_side 相同（参考帧不允许被裁）",
+             {**fov_ok, "crop_side": "left"}),
+            ("crop_rect 含负数", {**fov_ok, "crop_rect": [0, 0, -1, 10]}),
+            ("scale 为 0", {**fov_ok, "scale": 0.0}),
+            ("quality 超出 [0,1]", {**fov_ok, "quality": 1.5}),
+        ):
+            checks.append((f"fov：{label} 被拒", rejects(lambda b=bad: rp.upsert(
+                rp.RigProfile(name="bad-fov", stereo_mode="parallel", fov=b),
+                path=path))))
+        checks.append(("fov 不是对象（字符串）被拒", rejects(lambda: rp.upsert(
+            rp.RigProfile(name="bad-fov2", stereo_mode="parallel", fov="x"),
+            path=path))))
+        # 清掉这两条临时档案，否则下面"delete 后列表为空"会被它们打破
+        rp.delete("with-fov", path)
+        rp.delete("no-fov", path)
+
         # 6) 删除档案例（含引用计数清零）
         checks.append(("delete 已存在档案返回 True", rp.delete("parallel-desk", path)))
         checks.append(("delete 后列表为空、active 已清",
@@ -701,6 +745,106 @@ def test_resolution_ladder_comes_from_video_profiles() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_fov_measure_roundtrip() -> bool:
+    """FOV 测量 → 装置档案 → 读回：合成真值精度 + 端到端搬运。
+
+    ## 守的是什么（2026-11-04）
+
+    用户原话："两个相同摄像机打开后焦距好像不一样，但我又不能调整"。
+    这种**固定偏差**以前每次标定都重估一遍，`crop_rect` 每次差几像素，
+    内参跟着漂而屏幕上看不出来。改成"量一次、存进装置档案、之后复用"之后，
+    这条链上有三个地方会静默错：
+
+    1. **尺度估错**（合成真值能验，合成 1.5× 视场差应得 0.6667）；
+    2. **量出来却存不进去**（档案校验比 `FovAlignment` 更严 -> 白量一趟）；
+    3. **标定产物搬不进档案**（`meta.fov` 的键名/形状对不上 -> 自动收尾静默失效）。
+
+    用程序生成的纹理图跑，不依赖 data/ 下的任何真实录像。
+    """
+    print("----- FOV 测量 → 档案 → 读回 -----")
+    import json
+    import tempfile
+
+    import cv2
+    import numpy as np
+
+    from apps import _fov_store
+    from stereo import profiles as rp
+    from stereo.fov_align import estimate_fov_alignment
+
+    checks: list[tuple[str, bool]] = []
+
+    # 有纹理、可复现（不依赖外部素材）
+    rng = np.random.default_rng(7)
+    scene = np.full((1080, 1920, 3), 240, np.uint8)
+    for x in range(0, 1920, 60):
+        cv2.line(scene, (x, 0), (x, 1080), (110, 110, 110), 1)
+    for y in range(0, 1080, 60):
+        cv2.line(scene, (0, y), (1920, y), (110, 110, 110), 1)
+    for _ in range(60):
+        cv2.circle(scene,
+                   (int(rng.integers(0, 1920)), int(rng.integers(0, 1080))),
+                   int(rng.integers(8, 40)),
+                   tuple(int(v) for v in rng.integers(0, 255, 3)), -1)
+    for k in range(30):
+        cv2.putText(scene, f"T{k}", (int(rng.integers(0, 1750)),
+                                     int(rng.integers(40, 1040))),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (25, 25, 25), 2)
+
+    factor = 1.5
+    ch, cw = int(1080 / factor), int(1920 / factor)
+    y0, x0 = (1080 - ch) // 2, (1920 - cw) // 2
+    left = cv2.resize(scene[y0:y0 + ch, x0:x0 + cw], (1920, 1080))
+    try:
+        fov = estimate_fov_alignment(left, scene)
+    except ValueError as exc:
+        print(f"  [不达标] 合成图估计失败：{exc}")
+        return False
+    err = abs(fov.scale - 1.0 / factor) / (1.0 / factor) * 100
+    print(f"  合成 {factor}× 视场差 -> scale={fov.scale:.4f}"
+          f"（期望 {1 / factor:.4f}，误差 {err:.2f}%）")
+    checks.append((f"scale 误差 < 2%（实测 {err:.2f}%）", err < 2.0))
+    checks.append(("宽的视场那一路被裁（crop_side != reference_side）",
+                   fov.crop_side != fov.reference_side))
+
+    payload = dict(fov.to_dict(),
+                   left_size=[1920, 1080], right_size=[1920, 1080],
+                   measured_at="2026-11-04T08:00:00", source="test")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / "profiles.json"
+        prof = rp.RigProfile(name="fov-rig", stereo_mode="parallel", fov=payload)
+        rp.upsert(prof, path=store)
+        got = rp.get_profile("fov-rig", store)
+        checks.append(("估出来的参数能通过档案校验并原样读回",
+                       got is not None and got.fov == payload))
+
+        # 标定产物 -> 档案（自动收尾走的就是这条）
+        calib = Path(tmp) / "calib.json"
+        calib.write_text(json.dumps(
+            {"meta": {"fov": fov.to_dict(),
+                      "left_size": [1920, 1080], "right_size": [1920, 1080]}}),
+            encoding="utf-8")
+        note = _fov_store.record_fov_from_calibration(got, calib, store)
+        back = rp.get_profile("fov-rig", store)
+        checks.append(("标定 JSON 的 meta.fov 能搬进档案（自动收尾路径）",
+                       bool(note) and back is not None
+                       and abs(float(back.fov["scale"]) - fov.scale) < 1e-9))
+        checks.append(("搬运时补上 source=calibrate:<文件名>",
+                       back is not None
+                       and str(back.fov.get("source", "")).startswith("calibrate:")))
+        # 标定没有 fov（旧流程/降级）时**不许**覆盖档案里的记录
+        bare = Path(tmp) / "bare.json"
+        bare.write_text(json.dumps({"meta": {"fov": None}}), encoding="utf-8")
+        checks.append(("meta.fov=null 时不覆盖已有记录",
+                       _fov_store.record_fov_from_calibration(back, bare, store) == ""
+                       and rp.get_profile("fov-rig", store).fov is not None))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -723,7 +867,9 @@ def main() -> int:
     print()
     i = test_resolution_ladder_comes_from_video_profiles()
     print()
-    ok = a and b and c and d and e and f and g and h and i
+    j = test_fov_measure_roundtrip()
+    print()
+    ok = a and b and c and d and e and f and g and h and i and j
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 

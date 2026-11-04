@@ -104,7 +104,7 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
-| **相机 / 标定**（11） | `cameras.py` `list_cameras.py` `camera_quality.py` `capture_board.py` `check_stereo_setup.py` `check_chain_inputs.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` `set_world_frame.py` | 课题主线（含"按空格存棋盘图"的采集工具，供链式/单板标定用；"**chain 输入自检**：拍完先跑，5 秒查出姿态覆盖不足与参考段板动了"；以及"拍一张地面棋盘图定世界系"） |
+| **相机 / 标定**（12） | `cameras.py` `list_cameras.py` `camera_quality.py` `capture_board.py` `check_stereo_setup.py` `check_chain_inputs.py` `measure_fov.py` `make_calibration_board.py` `calibrate_color.py` `calibrate_focal.py` `export_calibration.py` `set_world_frame.py` | 课题主线（含"按空格存棋盘图"的采集工具，供链式/单板标定用；"**chain 输入自检**：拍完先跑，5 秒查出姿态覆盖不足、参考段板动了、双板同框图检不出两块板"；"**量两路固有视场差**：从一段双目录像取一帧存进装置档案，之后平行标定直接复用，不必每次重估"；以及"拍一张地面棋盘图定世界系"） |
 | **开题报告 PPT**（8） | `build_opening_report.py` `check_opening_report.py` `preview_pptx.py` `_preview_lib.py` `check_overflow.py` `build_opening_ppt.py` `check_opening_ppt.py` `preview_opening_ppt.py` | 与运行链路**无关** |
 | **文档与事实**（5） | `sync_facts.py` `check_standards.py` `check_silent_failure.py` `check_test_count.py` `build_sbom.py` | 校验派生事实（计数 / 清单）、规范落差（引用 / 来源）、静默失效（没出口的字段 / 吞异常 / 阈值散落）、生成 / 更新 SBOM |
 | **数据 / 会话**（4） | `check_dataset.py` `migrate_data_layout.py` `estimate_radius.py` `export_motion.py` | 校验录制会话（视频 / 标定 / 同步）；把旧布局 `data/sessions/*` 搬到 `data/stereo/*`（可 `--dry-run`，同名绝不覆盖，幂等可重跑）；**从图上复核 seed 半径**：把 `estimate_radius_px()` 的估计与 `seeds.json` 原值并排打印（`--overlay` 出圈图），两者不一致时不替人改，只标出来；**轨迹 → 运动量导出**：位置 / 速度 / 加速度逐点落盘（缺值写空串、按段切开、窗口按秒给），口径与已知局限写进 `motion_meta.json`，供下游做卡尔曼 / S-G 滤波（`docs/运动数据交付说明.md`） |
@@ -127,15 +127,15 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：15 个可执行脚本 + 16 个私有模块
+### `apps/` 顶层：16 个可执行脚本 + 17 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
 | 主线（4） | `run_stereo_video.py` `run_all.py` `run_realtime.py` `run_video.py` | 离线双目三维重建 / 一条命令编排 3→6 / 实时单目 / 离线单目 |
-| 标定与录制（5） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 |
+| 标定与录制（6） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` `fov_dialog.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 / **FOV 管理器**（两路固有视差：看/量/清，存进装置档案供标定复用） |
 | 数据与导出（4） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（15） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）**） |
+| 私有模块（16） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` `_fov_store.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）** / **FOV 记录在标定与档案间的搬运**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。

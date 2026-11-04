@@ -57,12 +57,13 @@ from apps._common import (
     setup_logging,
 )
 from calib import AutoPairCollector, BoardSpec, CalibConfig, StereoRig, calibrate_stereo
-from calib import detect_board
+from calib import detect_board, detect_two_boards
 from calib.methods import plan as method_plan
 from calib.methods import single_board as single_board_method
 from calib.relative_pose import compose, invert, rotation_angle_deg
 from calib.stereo_calib import board_pose_from_points, calibrate_mono_points
 from stereo.fov_align import (
+    FovAlignment,
     estimate_fov_alignment,
     fov_confidence_problem,
     fov_gate_action,
@@ -111,6 +112,65 @@ def _previous_calib_meta(out: str) -> dict | None:
     except (OSError, ValueError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+def _fov_from_profile(name: str, first_pair) -> FovAlignment:
+    """从装置档案读**已量好**的 FOV 参数，跳过现场估计。
+
+    ## 为什么要有这条路（2026-11-04 用户需求）
+
+    两路相机的出厂焦距不同是**装置属性**：它不会因为换一块板、换一次场景而变。
+    但以前的实现每次都从"启动帧"重估一次 —— 于是同一套装置标两次，得到两个
+    略有差别的 `scale` / `crop_rect`，内参口径跟着漂；场景纹理不足时还会直接
+    降级成 `fov=None`（按原始画面标），下一次又变回来。用户的原话是
+    "两个相同摄像机打开后焦距好像不一样，但我又不能调整" —— 这种固定偏差
+    应该**量一次就锁住**。
+
+    ## 为什么必须核对分辨率
+
+    `crop_rect` / `target_size` 是**像素量纲**。换分辨率（或换相机）之后旧数字
+    直接失效，而画面看起来仍然"有输出"：裁剪框落错位置 → 内参与画面口径对不上
+    → 视差/深度整体偏，但屏幕上一切正常。所以分辨率不一致时**报错**，
+    不静默沿用、也不静默回退到现场估计（那会让用户以为复用生效了）。
+    """
+    from stereo import profiles
+
+    try:
+        prof = profiles.get_profile(name)
+    except profiles.ProfileError as exc:
+        raise ValueError(f"装置档案 {name!r} 的记录损坏：{exc}") from exc
+    if prof is None:
+        raise ValueError(
+            f"装置档案 {name!r} 不存在（config/profiles.json）。"
+            f"先在门厅「装置档案」里建它，或去掉 --fov-from-profile 改回现场估计。")
+    raw = prof.fov
+    if not raw:
+        raise ValueError(
+            f"装置档案 {name!r} 里还没有 FOV 参数。\n"
+            f"  先量一次：python apps/tools/measure_fov.py "
+            f"--left-video <会话>/left.mkv --right-video <会话>/right.mkv "
+            f"--write-profile {name}\n"
+            f"  或去掉 --fov-from-profile，让本次标定现场估计。")
+
+    for key, frame, side in (("left_size", first_pair[0], "左"),
+                             ("right_size", first_pair[1], "右")):
+        want = raw.get(key)
+        if not want:
+            continue
+        got = (int(frame.shape[1]), int(frame.shape[0]))
+        if tuple(int(v) for v in want) != got:
+            raise ValueError(
+                f"装置档案 {name!r} 的 FOV 是在 "
+                f"{int(want[0])}x{int(want[1])} 上量的，而现在{side}路是 "
+                f"{got[0]}x{got[1]}。\n"
+                f"  这些参数是像素量纲的，分辨率一变就失效。请重新量一次"
+                f"（apps/tools/measure_fov.py --write-profile {name}），"
+                f"或去掉 --fov-from-profile。")
+
+    try:
+        return FovAlignment.from_dict(raw)
+    except ValueError as exc:
+        raise ValueError(f"装置档案 {name!r} 的 FOV 记录不合法：{exc}") from exc
 
 
 def _fov_or_none(estimate_fn, *, mode: str, require_fov: bool):
@@ -194,27 +254,14 @@ def _list_images(path: Path) -> list[Path]:
 
 
 def _detect_two_boards(gray: np.ndarray, spec: BoardSpec):
-    """一张图里检出**两块**同名标定板（L 形双板靶标）。
+    """一张图里检出**两块**同名标定板（L 形 / 垂直双板靶标）。
 
-    做法：先检第一块，把它占的凸包**填白**（棋盘的黑格被抹掉，检测器就不会
-    在同一位置再报一次），再检第二块。返回 `(obs_a, obs_b)` 或 `None`。
-    这里**不做 A/B 语义分配** —— 谁是被左相机看到的 A，由调用方用几何一致性判定。
+    实现在 `calib.board.detect_two_boards` —— 那里是唯一一份：双板标定与
+    "拍完先自检"（`apps/tools/check_chain_inputs.py --mode dual`）必须用同一套
+    检测逻辑，否则自检说"能检出两块"而标定说"检不出"就是必然的。
+    这里**不做 A/B 语义分配**（谁是被左相机看到的 A，由 `_assign_ab` 判）。
     """
-    first = detect_board(gray, spec, exhaustive=True)
-    if not first.found or first.corners is None:
-        return None
-    masked = gray.copy()
-    pts = first.corners.reshape(-1, 2).astype(np.float32)
-    center = pts.mean(axis=0)
-    grown = ((pts - center) * 1.12 + center).astype(np.int32)   # 外扩一点，避免留下边
-    cv2.fillConvexPoly(masked, cv2.convexHull(grown), 255)
-    second = detect_board(masked, spec, exhaustive=True)
-    if not second.found or second.corners is None:
-        return None
-    if float(np.linalg.norm(first.corners.reshape(-1, 2)
-                            - second.corners.reshape(-1, 2))) < 1.0:
-        return None                                    # 同一块被检了两次
-    return first, second
+    return detect_two_boards(gray, spec)
 
 
 def _pnp_reproj_rms(objp, corners, K, D) -> tuple[np.ndarray, float]:
@@ -988,15 +1035,29 @@ def main() -> int:
     ap.add_argument("--relaxed", action="store_true",
                     help="手持拍摄的宽松预设：停稳上限 10 px、额外绝对下限 400、"
                          "允许更小的板。**换来过检风险**，精度不满意就退回默认值重标")
+    ap.add_argument("--fov-from-profile", default="", metavar="NAME",
+                    help="复用指定装置档案里已量好的 FOV 裁剪参数，跳过现场估计。"
+                         "两路焦距不同是装置属性，量一次锁住可保证每次标定口径一致"
+                         "（量法：apps/tools/measure_fov.py --write-profile NAME）。"
+                         "分辨率与档案记录不一致会直接报错，不静默沿用")
     args = ap.parse_args()
     if args.skip_fov and args.require_fov:
         ap.error("--skip-fov 与 --require-fov 矛盾：前者不做 FOV 对齐，后者要求"
                  "「估不出来就失败」")
+    if args.skip_fov and args.fov_from_profile:
+        ap.error("--skip-fov 与 --fov-from-profile 矛盾：前者明确不做 FOV 对齐，"
+                 "后者要求复用它。要复用就删掉 --skip-fov")
     # chain 产出的是 none_raw（未做极线校正）的链式外参；parallel 重建依赖
     # 校正后的极线与视差（`stereo/triangulate.py` 的 dy 门限/视差范围），90° 下
     # 两者都不成立。允许标成 parallel = 让下游静默 0 配对，所以入口就拒绝。
     # （下面三处校验是**业务规则**，不是分派逻辑；方法的属性从注册表取，不比较名字。）
     method = method_plan(args.method)
+    if args.fov_from_profile and method.rectification == "none_raw":
+        ap.error(
+            f"--fov-from-profile 只对会做视场裁剪的方法有意义：{args.method} 产出"
+            f"未校正标定（none_raw）、不做 FOV 对齐 —— 90° 装置两路几乎不共视，"
+            f"单应裁剪没有物理意义。档案里的 FOV 参数仍会记在装置档案里供查，"
+            f"但不参与这条标定路。")
     if method.rectification == "none_raw" and args.stereo_mode == "parallel":
         ap.error("chain 产出的是未校正标定（none_raw），不能标成 parallel："
                  "parallel 重建依赖校正后的极线与视差，90° 下不成立。")
@@ -1155,21 +1216,40 @@ def main() -> int:
         return 1
 
     if do_fov:
-        print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
-        try:
-            fov, fov_fail_reason = _fov_or_none(
-                lambda: estimate_fov_alignment(first_pair[0], first_pair[1]),
-                mode=mode, require_fov=args.require_fov)
-        except Exception as exc:                 # noqa: BLE001 - 原始异常原样呈现
-            print("\n[错误] 无法自动估计两路 FOV 对齐，已停止（不会按原生分辨率继续）。")
-            print(f"       原因：{type(exc).__name__}: {exc}")
-            print("       请把**有纹理的物体或标定板**同时放进两路画面、光照均匀、"
-                  "对焦清晰，然后重试。")
-            print("       空白墙/纯色桌面/严重欠曝都会让特征匹配失败。")
-            print("       本次是 --require-fov 或非 parallel 模式，所以不降级。")
-            log.error("FOV 估计失败，退出（--require-fov / 非 parallel）：%s", exc)
-            src.release()
-            return 1
+        # 两条来源：复用装置档案里**已量好**的参数（推荐，口径稳定），
+        # 或者现场从启动帧估一次（旧行为，纹理不足会失败/降级）。
+        fov_fail_reason: str | None = None
+        if args.fov_from_profile:
+            try:
+                fov = _fov_from_profile(args.fov_from_profile, first_pair)
+            except ValueError as exc:
+                print(f"\n[错误] 无法复用装置档案里的 FOV 参数：{exc}")
+                log.error("复用档案 FOV 失败：%s", exc)
+                src.release()
+                return 2
+            print(f"[FOV] 复用装置档案「{args.fov_from_profile}」里已量好的参数"
+                  f"（不重新估计，口径与上次一致）")
+            print(f"[FOV] scale={fov.scale:.4f}  inliers={fov.inliers}  "
+                  f"quality={fov.quality:.3f}  crop_rect={list(fov.crop_rect)}  "
+                  f"target_size={list(fov.target_size)}")
+            log.info("FOV 复用档案 %s：%s", args.fov_from_profile, fov.to_dict())
+        else:
+            print("[FOV] 正在用启动帧估计两路视场对齐（只做一次，约数秒）…", flush=True)
+            try:
+                fov, fov_fail_reason = _fov_or_none(
+                    lambda: estimate_fov_alignment(first_pair[0], first_pair[1]),
+                    mode=mode, require_fov=args.require_fov)
+            except Exception as exc:                 # noqa: BLE001 - 原始异常原样呈现
+                print("\n[错误] 无法自动估计两路 FOV 对齐，已停止（不会按原生分辨率继续）。")
+                print(f"       原因：{type(exc).__name__}: {exc}")
+                print("       请把**有纹理的物体或标定板**同时放进两路画面、光照均匀、"
+                      "对焦清晰，然后重试。")
+                print("       空白墙/纯色桌面/严重欠曝都会让特征匹配失败。")
+                print("       本次是 --require-fov 或非 parallel 模式，所以不降级。")
+                print("       若这台装置已经量过 FOV，可用 --fov-from-profile <档案名> 复用。")
+                log.error("FOV 估计失败，退出（--require-fov / 非 parallel）：%s", exc)
+                src.release()
+                return 1
 
         if fov is None:
             print(f"\n[警告] 两路视场对齐估计失败（{fov_fail_reason}）："

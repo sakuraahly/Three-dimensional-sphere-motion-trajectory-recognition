@@ -588,6 +588,7 @@ class HubWindow(tk.Toplevel):
         # 「历史会话…」选择器功能重叠，属于旧架构遗留。BenchWindow 代码保留
         # （双目/单目窗的「历史会话…」仍能用），只是不再从门厅暴露这个跨装置的入口。
         self.surface.secondary(row, "装置档案", self._open_profiles)
+        self.surface.secondary(row, "FOV 管理器", self._open_fov)
         self.surface.secondary(row, "重新读取标定", self._reload_state)
         # 过渡入口：旧界面还没删完，明确标注并给出它将消失的时间点，
         # 而不是让用户自己猜"两个入口哪个是真的"。
@@ -617,6 +618,24 @@ class HubWindow(tk.Toplevel):
         # parent 传 **self（门厅，显示中的 Toplevel）**，不是 withdraw 的 self.app：
         # Toplevel 以 withdraw 的根为 parent 会继承 withdraw 状态，弹窗不出来。
         ProfileDialog(self, on_changed=changed)
+
+    def _open_fov(self) -> None:
+        """打开 FOV 管理器（两路固有视场差：看 / 量 / 清）。
+
+        为什么单独一个入口而不是塞进装置档案：FOV 是**要量的**（拿一段录像
+        取同一帧估一次），而装置档案是**填的**。两者的操作节奏不同，混在一个
+        对话框里会让"切换装置"这个高频动作多背一堆用不上的控件。
+
+        档案变了要重读状态：门厅/窗口的标定判定会跟着 active profile 走。
+        """
+        from apps.fov_dialog import FovDialog
+
+        def changed() -> None:
+            self.app.state.reload()
+            self._refresh()
+
+        # parent 传 self（门厅，显示中的 Toplevel），理由同 `_open_profiles`。
+        FovDialog(self, self.app, on_changed=changed)
 
     def _open_cameras(self) -> None:
         """打开相机设备管理（识别 / 固定 / 标无关）。

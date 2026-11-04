@@ -100,7 +100,8 @@ def calibrate_args(method: str, board: dict | None = None,
                    stationary: str = "", sharpness: str = "",
                    relaxed: bool = False, backend: str = "",
                    dirs: dict | None = None,
-                   out: str = "") -> list[str]:
+                   out: str = "", baseline: float | str | None = None,
+                   fov_from_profile: str = "") -> list[str]:
     """双目标定的完整 argv。
 
     三条分支的差别**只在参数**，不在文案：
@@ -108,14 +109,29 @@ def calibrate_args(method: str, board: dict | None = None,
     - ``chain``：``--method chain --same-board --left-dir/--right-dir``；
       参考段真有图时才加 ``--pair-frame``（指向不存在的目录等于给后端一个
       必然失败的证据，不如不提）。
-    - ``joint_skip_fov``：仍是共同求解，但**模式写死 angled** —— 按重叠视场
-      裁剪正是大角度装置要跳过的那一步。
+    - ``chain_dual``：双板模式（两块刚性固定的板），``--board-b-dir`` +
+      ``--pair-frame`` 求 ``T_AB``，**不加** ``--same-board``。
     - ``joint``：带**本窗口**的模式（平行窗 parallel / 大角度窗 angled）。
 
+    ⚠️ 历史上还有一个 ``joint_skip_fov`` 键：它把 ``--stereo-mode`` 写死
+    ``angled``。但大角度窗的 ``mode`` 本来就是 angled，两条命令**完全相同**；
+    而平行窗没有方法下拉（固定 joint）。也就是说它在任何窗口都是空操作，
+    只会让人误以为「跳过裁剪」和「不跳过」有区别。**已从界面下拉移除**
+    （分支保留给旧调用方，见 `_gui_stereo.METHODS` 的说明）。
+
     ``--skip-fov`` 不属于这里任何一条：它只属于旧界面那个"90° 装置"专用入口。
-    新窗口的等效做法是选 `joint_skip_fov`（它走 ``--stereo-mode angled``，
-    后端据此不再做 FOV 对齐），把这个 flag 混进普通 joint 会同时改变裁剪与
-    内参口径，属于静默改行为。
+    angled 模式后端本来就 ``do_fov = not skip_fov and (mode != "angled" or --fov)``
+    → 天然跳过 FOV 对齐，不需要额外 flag。
+
+    ``baseline`` 是**物理核对**（`--baseline-mm`）：传了它，后端才会检查
+    "解出的基线 vs 卷尺量的是不是差太远"——这是 chain 双板模式下**唯一**的
+    物理一致性证据（双板左看 A、右看 B，做不了跨路重合检查）。装置档案里
+    存着 ``expected_baseline_mm``，GUI 必须把它传下来，否则这条护栏形同虚设。
+
+    ``fov_from_profile`` 是"复用装置档案里已量好的视场裁剪参数"：不传就由
+    后端从启动帧现场估（旧行为）。只对**做裁剪的方法**下传——chain/chain_dual
+    产出 none_raw、不做 FOV 对齐（90° 无共视，单应裁剪没有物理意义），
+    传了后端会报互斥错误。
 
     ``backend`` 只在调用方给出**具体**后端（dshow/msmf）时才下传：
     ``auto`` 是脚本自己的默认值，替用户写死一遍等于把"没选"伪装成"选了"。
@@ -191,6 +207,21 @@ def calibrate_args(method: str, board: dict | None = None,
     # 重新标定就把平行装置的标定冲掉了）。
     if str(out or "").strip():
         cmd += ["--out", str(out).strip()]
+    # `--baseline-mm` 同理：空/非正数不传（等于脚本默认「不核对」）。
+    # 非数字要**忽略而不是拼进去**——拼一个 "abc" 会让 argparse 直接 exit 2，
+    # 用户看到的是"参数错误"而不是"档案里那一栏填错了"。
+    try:
+        _base = float(str(baseline).strip()) if str(baseline or "").strip() else 0.0
+    except ValueError:
+        _base = 0.0
+    if _base > 0:
+        cmd += ["--baseline-mm", f"{_base:g}"]
+    # `--fov-from-profile` **只对会做视场裁剪的方法下传**（joint 那两条）。
+    # chain/chain_dual 产出 none_raw、不做 FOV 对齐（90° 无共视，单应裁剪
+    # 没有物理意义），传了后端会直接报互斥错误。在这里判比在界面判好：
+    # argv 只有这一个产地，界面不必知道"哪种方法做裁剪"这件事。
+    if str(fov_from_profile or "").strip() and method not in ("chain", "chain_dual"):
+        cmd += ["--fov-from-profile", str(fov_from_profile).strip()]
     return cmd
 def offline_stereo(session: str | Path, *, mode: str = "",
                    anchor: bool = False, method: str = "", seed_json: str = "",
@@ -433,12 +464,21 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
 
 
 def check_chain_inputs(*, cols: str, rows: str, square: str,
-                       dirs: dict | None = None) -> list[str]:
-    """链式标定输入自检（`check_chain_inputs.py`），拍完先跑这个。"""
+                       dirs: dict | None = None,
+                       mode: str = "single") -> list[str]:
+    """链式标定输入自检（`check_chain_inputs.py`），拍完先跑这个。
+
+    ``mode`` 决定查哪几段（与 `calibrate_args` 的链式分支一一对应）：
+    ``single`` = 单板四段（left/right/ref_left/ref_right）；
+    ``dual``   = 双板三段（left/board_b/pair）。
+    以前双板只能弹一句"没有自动自检"的提示——那等于让用户拿标定去试错，
+    而一次双板拍摄是十几分钟。
+    """
     d = dirs if dirs is not None else chain_dirs()
     return _argv(
         _TOOLS / "check_chain_inputs.py", "--root", str(Path(d["left"]).parent),
-        "--cols", str(cols), "--rows", str(rows), "--square", str(square))
+        "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+        "--mode", str(mode or "single"))
 
 def check_setup_args(*, left: str = "left", right: str = "right",
                      board: dict | None = None) -> list[str]:

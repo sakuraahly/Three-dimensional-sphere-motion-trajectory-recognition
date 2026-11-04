@@ -30,6 +30,8 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
 
+from apps import _fov_store
+
 from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, METHOD_METAL,
                                PRESET_NONE, BG, INK, MUTED, WARN, BallSettings,
                                ScrollPage, StatusBar, Surface, fit_to_content)
@@ -47,7 +49,7 @@ from sphere_tracker.plugins import names as plugin_names
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
            "record_out_dir", "check_setup_args", "session_name_of",
-           "detector_methods", "preset_choices"]
+           "detector_methods", "preset_choices", "METHODS", "PICKER_METHODS"]
 
 
 def detector_methods() -> tuple[str, ...]:
@@ -71,18 +73,40 @@ def preset_choices() -> tuple[str, ...]:
 
 #: 方法在界面上的说法。键与 `calibrate_stereo.py --method` 一致（chain_dual 是
 #: 界面专用键，底层仍是 chain，只是双板模式：--board-b-dir + --pair-frame）。
+#:
+#: **每条文案必须说清"需要多少共视"**。三条路的差别就在这一点上，而它决定
+#: 用户该选哪条、以及他在自己的装置上到底能不能拍出来：
+#:
+#:   joint      每个姿态都要共视          -> 需要**大**共视区（近平行/充分重叠）
+#:   chain 单板  仅参考图那一处要共视      -> 需要**小**共视区（两路都能看到整块板）
+#:   chain 双板  零共视（同框图单相机拍）   -> 真 90° 装置唯一可行的路
+#:
+#: 历史上 `chain` 的说明写成"90 度这类几乎看不到同一区域的装置用它"——**是错的**。
+#: 它的参考段要求两路各自完整检出整块棋盘（`_ref_board_poses` 检不出就抛错），
+#: 光轴垂直时一块平板从侧向只能看到边缘，那个位置根本不存在。
 METHODS = {
     "joint": ("两路共视（joint）",
-              "两路在**每个姿态**都要同时看到同一块板。适合平行或充分共视的装置。"),
+              "两路在**每个姿态**都要同时看到同一块板。只有两路重叠区足够大时才成立"
+              "（近平行、或夹角不大）。"),
+    # 仅保留给既有调用方/CLI：大角度窗的 mode 本来就是 angled，它把
+    # --stereo-mode 再写死一遍，产出的 argv 与 joint **逐字相同**；平行窗又
+    # 没有方法下拉。也就是说它在任何窗口都是空操作，已从下拉里移除。
     "joint_skip_fov": ("两路共视，跳过视场裁剪（joint + no FOV）",
-                       "仍是共同求解，但不按重叠视场裁剪 —— 大角度装置裁完会剩太窄。"),
+                       "（已并入「两路共视」：angled 模式本来就跳过 FOV 对齐，"
+                       "这一项与它产出的命令完全相同。）"),
     "chain": ("单板链式（chain）",
-              "板不必被两路同时看到：各拍一组内参图，再用一块固定参考板把两路串起来。"
-              "90 度这类几乎看不到同一区域的装置用它。产物就是本窗口要的 angled。"),
+              "各拍一组内参图，再在**一处两路都能看到整块板**的位置拍参考图。"
+              "仍需一小块共视区——真 90° 装置通常没有这样的位置，"
+              "那种情况请用下面的双板。"),
     "chain_dual": ("双板链式（chain，两板各看一块）",
-                   "两块刚性固定的板（如垂直双板），左相机看 A、右相机看 B，"
-                   "再拍一张两板同框图求相对位姿。适合两路各看各的板的 90° 装置。"),
+                   "两块刚性固定的板（如垂直双板），左看 A、右看 B，再让一台相机拍"
+                   "一张两板同框图求相对位姿。**零共视**——两路完全看不到同一区域时"
+                   "用这条，也就是真 90° 装置。"),
 }
+
+#: 下拉里**真正列出来**的键（顺序即展示顺序）。
+#: `joint_skip_fov` 不在这里：它是空操作，列出来只会让人以为两种选法有区别。
+PICKER_METHODS = ("joint", "chain", "chain_dual")
 
 
 # --------------------------------------------------------------------------- #
@@ -371,10 +395,14 @@ class StereoWindow(tk.Toplevel):
         self.minsize(self.WIDTH_MIN, 560)
         self.surface = Surface(self)
 
-        # 记住上次填的值。**方法不存**：它由窗口模式决定（平行=joint、大角度=chain），
+        # 记住上次填的值。**方法不存**：它由窗口模式决定（平行=joint、大角度=双板链式），
         # 存下来会让"同一窗口上次改过的方法"和"窗口代表哪种几何"打架。
+        #
+        # 大角度窗默认双板（chain_dual）而不是单板（chain）：单板链式**仍然需要
+        # 一块共视区**（参考图那处两路都要看到整块板），真 90° 装置上没有这样的
+        # 位置——光轴垂直时一块平板从侧向只能看到边缘。零共视的只有双板。
         prefs = app.prefs
-        default_method = "joint" if mode == "parallel" else "chain"
+        default_method = "joint" if mode == "parallel" else "chain_dual"
         self.var_method = tk.StringVar(value=METHODS[default_method][0])
         self.var_target = tk.StringVar(value=prefs.get_str("stereo.target", "40"))
         self.var_cols = tk.StringVar(value=prefs.get_str("board.cols", "8"))
@@ -457,9 +485,9 @@ class StereoWindow(tk.Toplevel):
         hint = ("这一步决定第 4 步能不能用。平行装置只需要 joint；"
                 "如果两路看不到同一区域，就该去「大角度双目」窗口。"
                 if self.mode == "parallel" else
-                "大角度有两条路：两路还能共视就用 joint（跳过视场裁剪）；"
-                "完全看不到同一区域就用单板链式 —— 板固定不动，左右各拍一组，"
-                "再用同一块板把两路串起来。链式产物直接能在第 4 步用。")
+                "按「两路还能看到多少共同画面」选方法：还能充分共视 → 两路共视；"
+                "只剩一处能同时看到整块板 → 单板链式；完全看不到同一区域 → 双板链式"
+                "（要两块刚性固定的板）。链式产物都直接能在第 4 步用。")
         box = self.surface.card(parent, "② 标定", hint)
         self.lbl_calib = self.surface.hint(box, "检查中…")
 
@@ -488,7 +516,7 @@ class StereoWindow(tk.Toplevel):
             ttk.Label(line2, text="标定方法").pack(side="left")
             cb = ttk.Combobox(line2, textvariable=self.var_method, width=34,
                               state="readonly",
-                              values=[v[0] for v in METHODS.values()])
+                              values=[METHODS[k][0] for k in PICKER_METHODS])
             cb.pack(side="left", padx=(8, 0))
             cb.bind("<<ComboboxSelected>>", lambda _e: self._refresh_method_hint())
             # 必须走 surface.hint：手工 ttk.Label 既没有 wraplength、也不在
@@ -665,16 +693,26 @@ class StereoWindow(tk.Toplevel):
             text += "｜左/右有一边没填，「检查装置」不可用：先在「高级」里填上"
         self.lbl_cams.configure(text=text)
 
+    def _fallback_method(self) -> str:
+        """下拉 label 匹配不上时的兜底键：按**本窗口模式**走，不写死。
+
+        两处兜底以前不一致（提示用 chain、取键用 joint）——那意味着同一份
+        界面状态在"显示说明"和"拼命令行"两条路上会读到不同的方法。
+        """
+        return "joint" if self.mode == "parallel" else "chain_dual"
+
     def _refresh_method_hint(self) -> None:
         if self.lbl_method is None:
             return
         label = self.var_method.get()
-        key = next((k for k, v in METHODS.items() if v[0] == label), "chain")
+        key = next((k for k, v in METHODS.items() if v[0] == label),
+                   self._fallback_method())
         self.lbl_method.configure(text=METHODS[key][1].replace("**", ""))
 
     def _method_key(self) -> str:
         label = self.var_method.get()
-        return next((k for k, v in METHODS.items() if v[0] == label), "joint")
+        return next((k for k, v in METHODS.items() if v[0] == label),
+                    self._fallback_method())
 
     def _reload_state(self) -> None:
         self.app.state.reload()
@@ -748,6 +786,18 @@ class StereoWindow(tk.Toplevel):
         # config/stereo_calibration。这样平行装置和 90° 装置各存各的标定，
         # 换装置重新标定不会覆盖另一套的数据。
         prof = getattr(self.app.state.profile, "calibration_path", None)
+        # 期望基线同理从档案取：`--baseline-mm` 是 chain 双板模式下**唯一**
+        # 的物理一致性证据（左看 A、右看 B，做不了跨路重合检查）。不传它，
+        # 后端那段"基线差 X% → 先查两板是否真刚性固定 / A/B 是否分配反"
+        # 就永远不执行 —— 档案里明明存着 expected_baseline_mm。
+        base_mm = getattr(self.app.state.profile, "expected_baseline_mm", None)
+        # FOV 也一样：档案里量过的裁剪参数优先复用（口径稳定、免于现场估失败）。
+        # **只在档案真的存了 fov 时才传**——否则后端会报"档案里还没有 FOV 参数"
+        # 而拒绝标定，等于"没量过就用不了"，把可选项变成了必选项。
+        # 没存就退回旧行为（从启动帧现场估）。
+        prof_obj = self.app.state.profile
+        has_fov = bool(getattr(prof_obj, "fov", None))
+        fov_prof = (getattr(prof_obj, "name", "") or "") if has_fov else ""
         cmd = calibrate_args(
             method,
             {"cols": self.var_cols.get(), "rows": self.var_rows.get(),
@@ -756,7 +806,7 @@ class StereoWindow(tk.Toplevel):
             stationary=self.var_stationary.get(),
             sharpness=self.var_sharpness.get(),
             relaxed=bool(self.var_relaxed.get()),
-            out=(prof or ""))
+            out=(prof or ""), baseline=base_mm, fov_from_profile=fov_prof)
         if method in ("chain", "chain_dual"):
             # 先查图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
             d = chain_dirs()
@@ -822,8 +872,13 @@ class StereoWindow(tk.Toplevel):
         def run_next(_task=None):
             if self._chain_step >= len(steps):
                 if self._method_key() == "chain_dual":
+                    # 「用左相机」必须写出来：后端拼的是 --pair-camera left，
+                    # 而 A/B 的判定用的是"左相机看 A 板"的姿态簇。换右相机拍，
+                    # 姿态簇的坐标系就变了 —— 两块板姿态差 90° 时那种错误
+                    # **不会**触发"差 <5°"护栏，会静默给出反向的 T_AB。
                     self.status.set_status(
-                        "A/B 两板图拍完。同框图需**手动**拍一张（两板同时入画）放进 "
+                        "A/B 两板图拍完。同框图要用【左相机】手动拍一张"
+                        "（两块板同时完整入画）放进 "
                         f"{d['pair']}，再点「检查链式输入」「开始标定」", "info")
                 else:
                     self.status.set_status(
@@ -839,24 +894,55 @@ class StereoWindow(tk.Toplevel):
         run_next()
 
     def _check_chain_inputs(self) -> None:
-        """拍完先自检（姿态覆盖 / 参考段板是否移动），别等标定跑完才发现图不行。"""
-        if self._method_key() == "chain_dual":
-            # 双板没有对应的自检工具（check_chain_inputs 只认单板四段目录），
-            # 这里只提示要手动确认同框图两板都完整入画。
-            self.status.set_status(
-                "双板链式没有自动自检：确认 left(A板)/board_b(B板) 各有图、"
-                "pair 里有一张两板同框图，且 A/B 相对位置全程没变", "info")
-            return
+        """拍完先自检（姿态覆盖 / 参考段板是否移动 / 同框图能否检出两板）。"""
+        dual = self._method_key() == "chain_dual"
         cmd = check_chain_inputs(
             cols=self.var_cols.get(), rows=self.var_rows.get(),
-            square=self.var_square.get())
-        self.status.set_status(
-            "检查链式输入（读 chain_frames 四段图，报姿态覆盖与参考段板是否移动）…",
-            "info")
+            square=self.var_square.get(), mode="dual" if dual else "single")
+        if dual:
+            self.status.set_status(
+                "检查双板输入（left=A板 / board_b=B板 的姿态覆盖 + pair 里每张"
+                "能否同时检出两块板）…", "info")
+        else:
+            self.status.set_status(
+                "检查链式输入（读 chain_frames 四段图，报姿态覆盖与参考段板是否移动）…",
+                "info")
         self.app.tasks.start(cmd, "链式输入自检")
 
-    def _on_calibrated(self, _task) -> None:
+    def _record_fov_to_profile(self) -> str:
+        """把本次标定产物里的 ``meta.fov`` 记进当前装置档案（自动收尾）。
+
+        ## 为什么自动做
+
+        两路焦距差是**装置属性**：量一次就该锁住，之后每次标定复用同一组
+        裁剪参数（口径不漂）。靠"记得去点一下保存"迟早会漏，而漏掉不会报错
+        —— 只会让下一次标定又现场估一遍，`crop_rect` 悄悄变几像素，内参跟着
+        变一点点，谁也不会发现。
+
+        `meta.fov` 为 null（旧流程 / `--skip-fov` / 现场估计降级）时**不写**：
+        把"没有"覆盖成"有"、或把"有"覆盖成"没有"，都会让复用逻辑拿到错前提。
+        读写细节在 `apps/_fov_store.py`（FOV 管理器用的是同一份）。
+        """
+        prof = getattr(self.app.state, "profile", None)
+        if prof is None or not (getattr(prof, "name", "") or ""):
+            return ""
+        json_path = _fov_store.calibration_json_path(
+            self.app.state._stereo_calib_path())
+        note = _fov_store.record_fov_from_calibration(prof, json_path)
+        if note and not note.startswith("（"):
+            self.app.state.reload()
+        return note
+
+    def _on_calibrated(self, task) -> None:
         self.app.state.reload()
+        # 只有真的标定成功才收 FOV：失败时 json 还是上一次的，照抄会把旧参数
+        # 记成"这次的"。
+        if getattr(task, "exit_code", None) == 0:
+            note = self._record_fov_to_profile()
+            if note:
+                self._refresh_state()
+                self.status.set_status(f"标定完成。{note}", "ok")
+                return
         self._refresh_state()
 
     def _start_record(self) -> None:
