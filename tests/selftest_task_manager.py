@@ -247,8 +247,14 @@ def main() -> int:
             "showwarning": staticmethod(lambda *a, **k: None),
         })()
         app._on_close()
-        time.sleep(0.8)
+        # 不写死 sleep(0.8)：`_on_close` 里的停树要走 taskkill，系统负载高时
+        # 0.8 s 可能不够 —— 2026-11-04 串行全量就因此偶发红过一次（单独跑必绿）。
+        # 判据本意是"**最终**必须收干净"，所以改成轮询等待、早退，而不是加长睡眠。
+        deadline = time.monotonic() + 8.0
         alive = [p for p in [t3.proc.pid, *kids3] if psutil.pid_exists(p)]
+        while alive and time.monotonic() < deadline:
+            time.sleep(0.1)
+            alive = [p for p in [t3.proc.pid, *kids3] if psutil.pid_exists(p)]
         print(f"  退出后残留={alive}（子进程 {kids3}）")
         ck("退出后父进程与子进程都没了（相机不会被一直占着）", not alive)
         app = None                                   # 已 destroy，后面不要再碰

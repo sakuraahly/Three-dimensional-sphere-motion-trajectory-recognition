@@ -39,7 +39,7 @@ from pathlib import Path
 __all__ = [
     "DANGER_GONE", "DANGER_SAFE", "DANGER_WARN",
     "JunkFile", "JunkItem", "JunkPlan",
-    "clean_junk", "human_size", "scan_junk",
+    "clean_junk", "human_size", "looks_like_data", "scan_junk",
 ]
 
 #: 删了下次跑就有（日志 / 缓存 / 调试产物 / 回收站里的垃圾）。
@@ -58,11 +58,25 @@ _KEEP_ALWAYS = {"chain_frames"}
 #: 名字不带调试前缀、但同样是"删了下次跑就有"的目录（推荐档）。
 _KNOWN_SAFE = {
     "logs": "运行日志：每次任务追加的 .log（排障看这里，但历史值不大）",
-    "test_results": "回归测试报告：run_tests.py 每次运行写的 JSON",
+    # 这条要写清代价：`timings.json` 是 `fast` 档"哪些测试太慢、该排除"的依据，
+    # 删了下次 `fast` 会退化成跑全套（约慢 7 分钟）。不是不能清，是要知道清了会怎样。
+    "test_results": "回归测试报告（run_tests.py 每次写的 JSON）。"
+                    "注意 timings.json 是 fast 档的快/慢依据，删了下次 fast 会退化成全套",
 }
 
 #: 每个会话的 `session.json.bak-*` 至少留几个（编辑元数据的回滚点）。
 KEEP_BAK_PER_SESSION = 3
+
+#: "结果类"后缀：出现得多说明这个目录更像数据/素材，而不是调试输出。
+_DATA_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff",
+    ".mp4", ".mkv", ".avi", ".mov", ".webm",
+    ".npy", ".npz", ".csv", ".json", ".pt", ".onnx",
+})
+_BIG_FILE_BYTES = 5 * 1024 * 1024       # 单个文件算"大"的门槛
+_BIG_FILE_COUNT = 3                     # 有这么多大文件就先按数据看
+_DATA_TOTAL_BYTES = 100 * 1024 * 1024   # 总量到这个数才看后缀比例
+_DATA_RATIO = 0.6                       # 结果类后缀占六成 → 像数据集
 
 _SECONDS_PER_DAY = 86400.0
 
@@ -92,6 +106,10 @@ class JunkItem:
     detail: str
     danger: str
     files: list[JunkFile] = field(default_factory=list)
+    #: 降级/升级的原因（"看起来像数据，已降级为谨慎"这类）。空串 = 无特别说明。
+    note: str = ""
+    #: 用户在界面上标了"这项不动"。它仍会列出来（不能藏），但不默认勾选。
+    muted: bool = False
 
     @property
     def size(self) -> int:
@@ -119,6 +137,9 @@ class JunkPlan:
     #: 只看到 1 项"会被读成"没有垃圾"，而实际是 3.9 GiB 里有 3.9 GiB 是新的。
     filtered_files: int = 0
     filtered_bytes: int = 0
+    #: 声明过、但这次扫描**没找到**的位置（目录被改名/移动/删掉了）。
+    #: 静默跳过会让用户以为"这里本来就没东西"，所以要能说出来。
+    missing: list[str] = field(default_factory=list)
 
     @property
     def size(self) -> int:
@@ -162,6 +183,33 @@ def _walk_files(root: Path, *, skipped: list[str]) -> list[JunkFile]:
     return out
 
 
+def looks_like_data(files: list[JunkFile]) -> str | None:
+    """这批文件看起来像**数据/素材**而不是调试产物？返回原因，否则 None。
+
+    为什么需要它（2026-11-04）：原来只看目录名 —— `outputs/_ab` 带 `_` 前缀，
+    被判"推荐"（默认勾选），可它是 1.6 GiB / 15 个文件，形状更像数据。
+    一条"按名字猜"的规则总有猜错的时候，猜错的代价是删掉不能再生的东西，
+    所以再加一道**看内容**的判据，命中就降级。
+
+    只判"是否像数据"，不判"是不是垃圾" —— 降级的语义是"我不确定，你自己勾"，
+    不是"这是垃圾"。
+    """
+    if not files:
+        return None
+    total = sum(f.size for f in files)
+    big = sum(1 for f in files if f.size >= _BIG_FILE_BYTES)
+    if big >= _BIG_FILE_COUNT:
+        return (f"有 {big} 个超过 5 MiB 的文件（共 {human_size(total)}），"
+                "形状更像数据/素材")
+    if total >= _DATA_TOTAL_BYTES:
+        n_data = sum(1 for f in files if f.path.suffix.lower() in _DATA_SUFFIXES)
+        ratio = n_data / len(files)
+        if ratio >= _DATA_RATIO:
+            return (f"共 {human_size(total)}，其中 {ratio:.0%} 是图片/视频/数组这类"
+                    "结果文件，更像数据集")
+    return None
+
+
 def _dir_item(key: str, path: Path, *, label: str, detail: str, danger: str,
               skipped: list[str]) -> JunkItem | None:
     files = _walk_files(path, skipped=skipped)
@@ -171,8 +219,20 @@ def _dir_item(key: str, path: Path, *, label: str, detail: str, danger: str,
 
 
 def _outputs_dir_item(d: Path, skipped: list[str]) -> JunkItem | None:
-    """`outputs/` 下的一个一级子目录：按前缀判定"推荐"还是"谨慎"。"""
-    if d.name in _KNOWN_SAFE:
+    """`outputs/` 下的一个一级子目录：先按名字给初判，再看内容是否要降级。
+
+    两级判据的顺序是有意的：
+
+    1. `_KNOWN_SAFE`（明确写死的名字）→ 直接推荐，**不做内容检查** ——
+       `logs` 里也可能有 .json，但它是运行日志这件事是确定的；
+    2. 前缀（`_`/`tmp_`/`agent_`）→ 初判推荐，**再过一遍 `looks_like_data`**：
+       命中就降级成谨慎并写清原因（`outputs/_ab` 1.6 GiB 就是这么拦下来的）。
+
+    新增一个 `outputs/xxx` 目录时会怎样：既不在 `_KNOWN_SAFE`、也不带调试
+    前缀的，一律落到"谨慎"档（默认不勾）—— 这是安全的一侧：不知道就先别删。
+    """
+    explicit_safe = d.name in _KNOWN_SAFE
+    if explicit_safe:
         detail, danger = _KNOWN_SAFE[d.name], DANGER_SAFE
     elif d.name.startswith(_RECOMMENDED_PREFIXES):
         detail = "调试/运行产物，删了下次跑就有"
@@ -181,9 +241,20 @@ def _outputs_dir_item(d: Path, skipped: list[str]) -> JunkItem | None:
         detail = ("某次实验的产物（数据集/标定图/走查截图等），"
                   "删了要重跑或重拍才能再生 —— 要不要留由你判断")
         danger = DANGER_WARN
-    return _dir_item(
+
+    item = _dir_item(
         f"outputs/{d.name}", d, label=f"outputs/{d.name}", detail=detail,
         danger=danger, skipped=skipped)
+    if item is None:
+        return None
+
+    if danger == DANGER_SAFE and not explicit_safe:
+        why = looks_like_data(item.files)
+        if why:
+            item.danger = DANGER_WARN
+            item.note = f"{why} —— 已从「推荐」降为「谨慎」，要清请手动勾选"
+            item.detail = item.note
+    return item
 
 
 def _session_bak_files(root: Path, skipped: list[str]) -> list[JunkFile]:
@@ -214,7 +285,8 @@ def _session_bak_files(root: Path, skipped: list[str]) -> list[JunkFile]:
     return keep
 
 
-def scan_junk(root: str | Path, *, older_than_days: float | None = None) -> JunkPlan:
+def scan_junk(root: str | Path, *, older_than_days: float | None = None,
+              muted: object = ()) -> JunkPlan:
     """盘点可清理项。
 
     ``older_than_days``：只算 **mtime 早于** ``now - N 天`` 的文件。
@@ -225,10 +297,14 @@ def scan_junk(root: str | Path, *, older_than_days: float | None = None) -> Junk
     ``filtered_bytes`` 里如实显示。
 
     只从 `_rules()` 列出的位置读，不做"全盘找像垃圾的文件"。
+
+    ``muted``：用户标过"这项不动"的 key 集合。它们**仍会被扫描并列出**
+    （藏起来会让人以为清理器漏了东西），只是不默认勾选。
     """
     repo = Path(root).resolve()
     plan = JunkPlan()
     skipped = plan.skipped
+    muted_set = {str(m) for m in (muted or ())}
 
     if not repo.is_dir():
         raise ValueError(f"仓库根不存在：{repo}")
@@ -237,6 +313,13 @@ def scan_junk(root: str | Path, *, older_than_days: float | None = None) -> Junk
     data = repo / "data"
 
     # ---- ① outputs 下的一级子目录（推荐 + 谨慎两档）----
+    # 声明过的位置如果**不存在**了，要说出来（改名/移动/删掉都算），
+    # 否则界面上"运行日志"这一项直接消失，用户会以为本来就没有。
+    for _name in _KNOWN_SAFE:
+        if not (outputs / _name).is_dir():
+            plan.missing.append(
+                f"outputs/{_name}（这次没找到 —— 目录可能被改名/移动，已跳过）")
+
     if outputs.is_dir():
         try:
             subs = sorted((d for d in outputs.iterdir()
@@ -273,6 +356,30 @@ def scan_junk(root: str | Path, *, older_than_days: float | None = None) -> Junk
                 key="outputs/散落临时文件", label="outputs 根下的临时文件",
                 detail="tmp_*/.* 这类散落在 outputs 根的文件", danger=DANGER_SAFE,
                 files=loose))
+
+        # outputs 根下**其余**的散落文件（截图 / 导出包 / 一次性脚本…）。
+        # 不归进来的话它们永远不出现在列表里 —— 用户看着有东西却清不到，
+        # 而这正是"清理器看起来不全"的来源。形状各异，判不了用途，
+        # 所以一律"谨慎"：让用户自己看一眼再勾。
+        stray: list[JunkFile] = []
+        for p in outputs.iterdir():
+            if not p.is_file() or p.is_symlink():
+                continue
+            if p.suffix in (".tmp", ".partial") or ".tmp-" in p.name:
+                continue
+            if p.name.startswith(("tmp_", "_tmp", ".")):
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            stray.append(JunkFile(path=p, size=st.st_size, mtime=st.st_mtime))
+        if stray:
+            plan.items.append(JunkItem(
+                key="outputs/散落其他文件", label="outputs 根下的其他散落文件",
+                detail="截图 / 导出包 / 一次性脚本这类散落在 outputs 根的东西 —— "
+                       "不属于任何子目录，用途只有你知道，所以默认不勾",
+                danger=DANGER_WARN, files=stray))
 
     # ---- ② 字节码缓存（全仓，含 apps/tests/sphere_tracker…）----
     pyc: list[JunkFile] = []
@@ -337,6 +444,13 @@ def scan_junk(root: str | Path, *, older_than_days: float | None = None) -> Junk
                                  detail=item.detail, danger=item.danger,
                                  files=fresh))
         plan.items = kept
+
+    if muted_set:
+        for item in plan.items:
+            if item.key in muted_set:
+                item.muted = True
+                if not item.note:
+                    item.note = "你标了「不动」—— 取消勾选会记住，下次仍不勾"
 
     plan.items.sort(key=lambda i: (i.danger != DANGER_SAFE, -i.size))
     return plan

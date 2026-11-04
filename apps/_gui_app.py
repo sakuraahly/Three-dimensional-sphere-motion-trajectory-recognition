@@ -610,7 +610,8 @@ class HubWindow(tk.Toplevel):
         """垃圾管理器：日志 / 临时产物 / 字节码 / 回收站，按项勾选 + 按时间筛。"""
         from apps.junk_dialog import JunkDialog
 
-        JunkDialog(self)
+        # 传 prefs：让「标为不动」的选择能记住（存在 config/gui_state.json）
+        JunkDialog(self, prefs=self.app.prefs)
         self.status.set_status(
             "垃圾管理器已打开：只清它列出的项，data 里的录像不会被删", "info")
 

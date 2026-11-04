@@ -672,6 +672,11 @@ def test_junk_cleanup_safety() -> bool:
         touch(repo / "outputs/ball_dataset/d.png", 777)       # 谨慎档
         touch(repo / "outputs/chain_frames/keep.png", 111)    # 正在用
         touch(repo / "outputs/x.tmp", 42)                     # 临时残留
+        # 名字带 `_`（初判推荐），但形状是数据 → 必须被自动降级
+        for _i in range(3):
+            touch(repo / f"outputs/_bigdata/f{_i}.png", 6 * 1024 * 1024)
+        # 散落在 outputs 根、既不是 tmp_* 也不在任何子目录里 —— 容易被漏掉的那类
+        touch(repo / "outputs/stray_note.txt", 500)
         touch(repo / "apps/__pycache__/m.cpython-311.pyc", 300)
         sess = repo / "data/stereo/parallel/20260101-000000"
         touch(sess / "session.json", 100)
@@ -721,6 +726,51 @@ def test_junk_cleanup_safety() -> bool:
                        == sorted([i.danger for i in plan.items],
                                  key=lambda d: d != DANGER_SAFE)))
 
+        # ---- ②b 内容降级：名字像调试产物、形状像数据 → 降为谨慎 ----
+        big = by_label.get("outputs/_bigdata")
+        checks.append(("带 `_` 前缀但像数据的目录被降级为谨慎",
+                       big is not None and big.danger == DANGER_WARN))
+        checks.append(("降级原因写进了 note（界面要显示它）",
+                       big is not None and "降为" in big.note))
+        checks.append(("小目录不降级（避免推荐档被误清空）",
+                       by_label["outputs/agent_x"].danger == DANGER_SAFE))
+
+        # ---- ②b2 散落在 outputs 根的文件也要能被收录 ----
+        stray = by_label.get("outputs 根下的其他散落文件")
+        checks.append(("outputs 根下的散落文件被收录（否则永远清不到）",
+                       stray is not None and stray.count >= 1))
+        checks.append(("散落文件属谨慎档（用途不明，不默认删）",
+                       stray is not None and stray.danger == DANGER_WARN))
+
+        # ---- ②c 规则失效：声明过的位置不在了要报出来 ----
+        # 用**另一个**临时根，不动主 repo —— 主 repo 的 outputs/logs 后面还要
+        # 被"执行清理"那段用到，先删了会让"删掉且没有失败"变成一条假红。
+        with _tempfile.TemporaryDirectory() as td2:
+            repo_m = _P(td2) / "repom"
+            touch(repo_m / "outputs/agent_x/f.bin", 100)
+            missing = scan_junk(repo_m).missing
+            checks.append(("声明过的 outputs/logs 不在时报进 missing",
+                           any("outputs/logs" in m for m in missing)))
+            checks.append(("missing 的说明写清是\"没找到\"（不是空串）",
+                           bool(missing) and all("没找到" in m for m in missing)))
+            checks.append(("主仓库的 outputs/logs 仍在（missing 不会误伤）",
+                           (repo / "outputs/logs").is_dir()))
+
+        # ---- ②d 用户标记"不动"：仍列出、但不进默认勾选 ----
+        muted_plan = scan_junk(repo, muted={"outputs/agent_x"})
+        muted_item = next((i for i in muted_plan.items
+                           if i.key == "outputs/agent_x"), None)
+        checks.append(("标为不动的项仍在列表里（不能藏）",
+                       muted_item is not None))
+        checks.append(("标为不动的项带 muted 标记", bool(muted_item and muted_item.muted)))
+
+        # ---- ②e 一键清理的目标键必须真的存在 ----
+        from apps.junk_dialog import QUICK_CACHE, QUICK_LOGS
+        checks.append(("一键清日志指向 outputs/logs",
+                       QUICK_LOGS == ("outputs/logs",)))
+        checks.append(("一键清缓存指向字节码/临时/会话备份",
+                       set(QUICK_CACHE) == {"__pycache__", "tmp_files", "session_bak"}))
+
         # ---- ③ 会话备份只清到剩 3 个 ----
         bak = next((i for i in plan.items if i.key == "session_bak"), None)
         cleaned = sorted(f.path.name for f in bak.files) if bak else []
@@ -749,6 +799,8 @@ def test_junk_cleanup_safety() -> bool:
                        not (repo / "outputs/logs").exists()))
         checks.append(("谨慎档原封不动",
                        (repo / "outputs/ball_dataset/d.png").is_file()))
+        checks.append(("被降级的数据目录原封不动（一键清推荐不会碰它）",
+                       (repo / "outputs/_bigdata/f0.png").is_file()))
         checks.append(("正在用的标定图原封不动",
                        (repo / "outputs/chain_frames/keep.png").is_file()))
         checks.append(("会话录像原封不动",
