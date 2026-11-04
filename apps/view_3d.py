@@ -164,13 +164,8 @@ VIEW_PRESETS = {
 }
 DEFAULT_VIEW = "等轴测"
 
-#: 缩放（改变分度值）的系数区间。1.0 = 数据包围盒 + 12% 边距（`_limits` 默认）。
-#: 越接近 ZOOM_MAX，坐标轴范围越窄 → 刻度间距越密（放得越大）。
-#: 下限取 0.2：再小会把一段轨迹放成一条看不清的线，也容易误以为丢数据。
-ZOOM_MIN = 0.2
-ZOOM_MAX = 20.0
-#: 每滚一格 / 每点一次按钮的缩放步长（乘除）。
-ZOOM_STEP = 1.25
+#: 鼠标滚轮缩放步长（每滚一格的范围缩放倍率）。<1 = 滚一下放大一点。
+ZOOM_STEP = 0.85
 
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
@@ -374,7 +369,10 @@ class Viewer3D:
         self._roll_drag: tuple[int, float] | None = None
         self._syncing_view = False
         self._plane_note = ""
-        self.zoom = 1.0                # 缩放系数：>1 放大（范围收窄），<1 缩小
+        # 当前显示范围（三轴 lim）。None = 还没定过，首次 `_redraw` 时按数据
+        # 包围盒 fit。之后 pan/zoom 只改它、`_redraw` 照它画，所以播放时
+        # 用户的平移/缩放**留得住**（这是"移动的是坐标轴、一松手又弹回"的根）。
+        self.lims: list[list[float]] | None = None
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -457,6 +455,7 @@ class Viewer3D:
         """
         data = load_view(path)
         self._apply(data, None, True)
+        self.lims = None               # 换会话 = 新数据，范围重新 fit
         self.slider.configure(to=max(0, self.n - 1))
         self.slider.set(0)
         self._redraw()                       # 内含 _reset_view / _update_video / _status
@@ -592,15 +591,10 @@ class Viewer3D:
         self.smooth_chk = ttk.Checkbutton(bar, text="平滑", variable=self.use_smooth,
                                           command=self._on_toggle_smooth)
         self.smooth_chk.pack(side="left", padx=(10, 0))
-        # 缩放（2026-11-04）：改变坐标轴分度值。按钮 + 滚轮双入口。
-        ttk.Button(bar, text="－", width=3,
-                   command=self._zoom_out).pack(side="left", padx=(10, 0))
-        self.zoom_lbl = ttk.Label(bar, text="1.0x", width=5, anchor="center")
-        self.zoom_lbl.pack(side="left", padx=(2, 0))
-        ttk.Button(bar, text="＋", width=3,
-                   command=self._zoom_in).pack(side="left", padx=(2, 0))
-        ttk.Button(bar, text="重置缩放", width=8,
-                   command=self._reset_zoom).pack(side="left", padx=(6, 0))
+        # 缩放/平移提示（2026-11-04）：三键交互是 matplotlib 3D 原生的，
+        # 用户看不到说明就不知道中键能平移、右键能缩放。文字放控制条右侧。
+        ttk.Label(bar, text="左键旋转 · 中键平移 · 右键缩放 · 滚轮定点缩放",
+                  style="Hint.TLabel").pack(side="right", padx=(10, 4))
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
         self.status.pack(side="bottom", fill="x")
@@ -764,31 +758,6 @@ class Viewer3D:
         return ([self.lo[i] - pad[i] for i in range(3)],
                 [self.hi[i] + pad[i] for i in range(3)])
 
-    def _fit_axes(self) -> None:
-        """按数据包围盒设三轴范围与等比例盒。
-
-        **只碰范围，不碰视角**。以前它和视角设置写在同一个 `_reset_view` 里、
-        而 `_redraw` 每帧都调 —— 播放时用户刚转到的角度下一帧就被打回默认，
-        表现就是"根本转不动"。拆开之后旋转才留得住。
-
-        缩放：把 `_limits()` 给的包围盒（含 12% 边距）再按 ``self.zoom`` 收缩
-        （zoom>1 → 范围收窄 → 放大）。边距随范围一起缩，所以放大到最深处时
-        数据仍贴着边，不会留一圈空白。刻度由 matplotlib 按新范围自动重分度。
-        """
-        lo, hi = self._limits()
-        z = max(ZOOM_MIN, self.zoom)
-        for i in range(3):
-            mid = (lo[i] + hi[i]) / 2.0
-            half = (hi[i] - lo[i]) / 2.0 / z
-            lo[i], hi[i] = mid - half, mid + half
-        self.ax.set_xlim(lo[0], hi[0])
-        self.ax.set_ylim(lo[1], hi[1])
-        self.ax.set_zlim(lo[2], hi[2])
-        try:
-            self.ax.set_box_aspect((hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]))
-        except Exception:                                   # noqa: BLE001
-            pass
-
     def _apply_view(self) -> None:
         """把 ``self.view`` 与投影方式应用到 ax。
 
@@ -869,39 +838,71 @@ class Viewer3D:
         self._apply_view()
         self.canvas.draw_idle()
 
-    # ---- 缩放：改变坐标轴范围（分度值）----
-    def _zoom_apply(self, factor: float) -> None:
-        """按 ``factor`` 缩放：范围收窄 = 放大（分度值变密），扩张 = 缩小。
+    # ---- 缩放/平移：范围持久化 + 绕点滚轮缩放 ----
+    def _zoom_around(self, factor: float, px: float, py: float, pz: float) -> None:
+        """把三轴范围绕**数据点 (px,py,pz)** 缩放 ``factor``（<1 放大）。
 
-        只改 ``self.zoom`` 并重画。范围由 `_fit_axes` 里的 `_limits()/zoom`
-        统一算，所以**视角与缩放解耦**：缩放不动旋转，旋转不动缩放。
-        上限钳在 `ZOOM_MAX`：再放大会把轨迹放成一条看不清的线。
+        这是"指定放大区域"的实现：滚轮时取鼠标在 3D 图上指向的数据点，
+        以它为锚收缩/扩张范围 —— 鼠标指着轨迹的哪一段，那段就留在屏幕原位
+        并放大，而不是绕数据中心缩（后者会把想看的地方推出画面）。
         """
-        self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom * factor))
-        self._sync_zoom_label()
-        self._redraw()
-
-    def _zoom_in(self) -> None:
-        self._zoom_apply(ZOOM_STEP)
-
-    def _zoom_out(self) -> None:
-        self._zoom_apply(1.0 / ZOOM_STEP)
-
-    def _reset_zoom(self) -> None:
-        self.zoom = 1.0
-        self._sync_zoom_label()
-        self._redraw()
-
-    def _sync_zoom_label(self) -> None:
-        lbl = getattr(self, "zoom_lbl", None)
-        if lbl is not None:
-            lbl.configure(text=f"{self.zoom:.1f}x")
+        lo, hi = self._current_lims()
+        for i, (loi, hii, c) in enumerate(zip(lo, hi, (px, py, pz))):
+            new_lo = c - (c - loi) * factor
+            new_hi = c + (hii - c) * factor
+            lo[i], hi[i] = new_lo, new_hi
+        self._set_lims(lo, hi)
 
     def _on_scroll(self, event) -> None:
-        """滚轮缩放。只在指针落在 3D 画布上时生效（视频/面板区不抢滚轮）。"""
+        """滚轮缩放：绕鼠标指向的位置放大/缩小（指定放大区域）。
+
+        mplot3d 没有公开的"屏幕点 → 数据点"反算 API，但可以用鼠标在**轴框**
+        内的归一化位置近似：鼠标在屏幕右侧 → 锚点落在数据范围的右侧。
+        X/Y 用这个相对位置映射，Z 用范围中心（深度在 2D 屏幕上本就退化，
+        用户缩放的主要意图是"哪个 X/Y 区域"）。这比绕数据中心缩更符合
+        "指着哪放大哪"的直觉。
+        """
         if event.inaxes is not self.ax:
             return
-        self._zoom_apply(ZOOM_STEP if event.button == "up" else 1.0 / ZOOM_STEP)
+        lo, hi = self._current_lims()
+        bbox = self.ax.get_window_extent()
+        fx = 0.5
+        fy = 0.5
+        if event.x is not None and bbox.width > 0 and bbox.height > 0:
+            fx = (event.x - bbox.x0) / bbox.width
+            fy = (event.y - bbox.y0) / bbox.height
+        fx = max(0.0, min(1.0, fx))
+        fy = max(0.0, min(1.0, fy))
+        # 屏幕 y 向上（bbox 顶部 = 数据 Y 较大侧），所以 fy 越大 → Y 越大。
+        cx = lo[0] + (hi[0] - lo[0]) * fx
+        cy = lo[1] + (hi[1] - lo[1]) * fy
+        cz = (lo[2] + hi[2]) / 2.0
+        factor = ZOOM_STEP if event.button == "up" else 1.0 / ZOOM_STEP
+        self._zoom_around(factor, cx, cy, cz)
+        self.canvas.draw_idle()
+
+    def _current_lims(self) -> tuple[list[float], list[float]]:
+        """当前显示范围 (lo, hi)，各 3 元素；未初始化则按数据包围盒算一次。
+
+        与 `_limits()` 同构，方便直接解包。`self.lims` 内部存 `[lo, hi]`。
+        """
+        if self.lims is None:
+            lo, hi = self._limits()
+            self.lims = [list(lo), list(hi)]
+        return self.lims[0], self.lims[1]
+
+    def _set_lims(self, lo, hi) -> None:
+        self.lims = [list(lo), list(hi)]
+        self._apply_lims()
+
+    def _apply_lims(self) -> None:
+        """把 `self.lims` 写到 ax。"""
+        if self.lims is None:
+            return
+        lo, hi = self.lims
+        self.ax.set_xlim(lo[0], hi[0])
+        self.ax.set_ylim(lo[1], hi[1])
+        self.ax.set_zlim(lo[2], hi[2])
 
     # ---- 鼠标：Shift + 左键拖动 = 绕视线滚转 ----
     def _on_mouse_press(self, event) -> None:
@@ -922,12 +923,11 @@ class Viewer3D:
             self.ax.set_navigate(True)
 
     def _reset_view(self) -> None:
-        """回到默认视角 + 默认缩放（按钮 / Home 键）。"""
+        """回到默认视角 + 默认范围（按钮 / Home 键）。"""
         e, a, r = VIEW_PRESETS[DEFAULT_VIEW]
         self.view = {"elev": e, "azim": a, "roll": r}
         self.view_box.set(DEFAULT_VIEW)
-        self.zoom = 1.0
-        self._sync_zoom_label()
+        self.lims = None               # 让下一次 `_redraw` 重新 fit 数据包围盒
         self._sync_roll_widget()
         self._redraw()
 
@@ -990,7 +990,26 @@ class Viewer3D:
         """
         return bool(self.use_smooth.get()) and bool(self.smooth_valid.any())
 
+    def _capture_lims(self) -> None:
+        """在 `ax.clear()` 之前，把 ax 当前范围回读进 `self.lims`。
+
+        为什么需要：原生中键平移 / 右键缩放会**直接改 ax 的 lim**（不走
+        `self.lims`），而 `ax.clear()` 会把 lim 重置回 autoscale。所以每次
+        `_redraw` 在 clear 之前先回读 —— 用户刚平移/缩放过的范围就留住了，
+        播放下一帧不再弹回。首次（`self.lims is None`）跳过，交给 `_current_lims`
+        按数据包围盒 fit。
+        """
+        if self.lims is None:
+            return
+        self.lims = [
+            [float(self.ax.get_xlim()[0]), float(self.ax.get_ylim()[0]),
+             float(self.ax.get_zlim()[0])],
+            [float(self.ax.get_xlim()[1]), float(self.ax.get_ylim()[1]),
+             float(self.ax.get_zlim()[1])],
+        ]
+
     def _redraw(self) -> None:
+        self._capture_lims()           # clear 会重置范围，先回读用户改过的范围
         self.ax.clear()
         # 勾了「平滑」就用平滑点画主图，否则用原始点。**范围/视角不变**：
         # `_limits` 始终按原始点算（平滑不改变量级，改范围只会让两张图对不上）。
@@ -1008,9 +1027,18 @@ class Viewer3D:
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
                           f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
-        # 顺序固定：先按数据定范围 → 平面按这个范围铺 → 最后套视角/投影。
+        # 顺序固定：范围（持久）→ 平面按这个范围铺 → 最后套视角/投影。
         # `clear()` 已经把视角打回默认，所以 `_apply_view` 必须在最后。
-        self._fit_axes()
+        # **范围只在首次/重置时 fit**（`_current_lims` 里判 None），
+        # 之后直接用 `self.lims` —— 这样用户 pan/zoom 的范围播放时不弹回。
+        lo, hi = self._current_lims()
+        self.ax.set_xlim(lo[0], hi[0])
+        self.ax.set_ylim(lo[1], hi[1])
+        self.ax.set_zlim(lo[2], hi[2])
+        try:
+            self.ax.set_box_aspect((hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]))
+        except Exception:                                   # noqa: BLE001
+            pass
         self._draw_planes()
         self._apply_view()
         self._redraw_inset()
@@ -1096,7 +1124,6 @@ class Viewer3D:
                  f"X={float(x):.4f}  Y={float(y):.4f}  Z={float(z):.4f} m   "
                  f"模式={mode}   "
                  f"坐标={self.data.get('coordinate_system', '?')}   "
-                 f"缩放 {self.zoom:.1f}x   "
                  f"视角 {self.view['elev']:.0f}/{self.view['azim']:.0f}/"
                  f"{self.view['roll']:.0f}°")
 

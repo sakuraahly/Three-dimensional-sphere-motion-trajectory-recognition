@@ -253,32 +253,34 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            not _np.allclose(p_proj, v.ax.get_proj())))
             v.ortho.set(True)
 
-            # ---- 8d-3. 缩放（改分度值）+ 可拖动四宫格（2026-11-04）----
-            # 用户："增加放大缩小（改变分度值），四宫格做成可以拖动放大缩小"。
-            # 钉两件事：① 缩放真的改坐标轴范围（不是只改一个数字），且旋转
-            # 与缩放解耦（缩放不碰视角）；② 四宫格是可拖的 PanedWindow。
+            # ---- 8d-3. 缩放/平移 + 可拖动四宫格（2026-11-04）----
+            # 用户："放大缩小只有线动、坐标轴没自动适配，不能指定放大区域，
+            # 不能前后左右移动（现在移动的是坐标轴）。"
+            # 钉三件事：① 范围是**持久状态**——原生 pan/zoom 改了 ax 的 lim 后，
+            # `_redraw`（播放下一帧）必须保留，不能弹回；② 绕点缩放真的以给定
+            # 点为锚；③ 原生三键（左旋转/中平移/右缩放）映射在位。
             import numpy as _np2
             from tkinter import ttk as _ttk
-            xr0 = tuple(v.ax.get_xlim())
-            v._zoom_in()
-            xr1 = tuple(v.ax.get_xlim())
-            checks.append(("放大后坐标轴范围收窄（分度值变密）",
-                           (xr1[1] - xr1[0]) < (xr0[1] - xr0[0]) and v.zoom > 1.0))
+            v.ax.set_xlim(-3, 3); v.ax.set_ylim(-3, 3); v.ax.set_zlim(-3, 3)
+            v._redraw()
+            lo, hi = v._current_lims()
+            checks.append(("原生平移后 _redraw 保留范围（不弹回）",
+                           [round(x, 1) for x in lo] == [-3.0, -3.0, -3.0]
+                           and [round(x, 1) for x in hi] == [3.0, 3.0, 3.0]))
             el_before, az_before = v.ax.elev, v.ax.azim
-            v._zoom_out()
-            v._zoom_out()
-            checks.append(("缩小后范围变宽、且旋转角没被缩放带跑",
-                           (v.ax.get_xlim()[1] - v.ax.get_xlim()[0])
-                           > (xr0[1] - xr0[0])
+            v._zoom_around(0.5, 0.0, 0.0, 0.0)
+            lo_z, hi_z = v._current_lims()
+            checks.append(("绕点缩放以给定点为锚（绕原点缩 0.5 → [-1.5,1.5]）",
+                           abs(lo_z[0] + 1.5) < 1e-6 and abs(hi_z[0] - 1.5) < 1e-6
                            and abs(v.ax.elev - el_before) < 1e-6
                            and abs(v.ax.azim - az_before) < 1e-6))
-            v.zoom = 50.0
-            v._zoom_in()
-            checks.append(("放大到上限被钳住（不会放成一条线）",
-                           v.zoom <= 20.0 + 1e-6))
+            checks.append(("原生三键映射在位（左旋转/中平移/右缩放）",
+                           v.ax._rotate_btn == [1] and v.ax._pan_btn == [2]
+                           and v.ax._zoom_btn == [3]))
             v._reset_view()
-            checks.append(("重置视角同时重置缩放（zoom 回 1.0）",
-                           v.zoom == 1.0 and v.zoom_lbl.cget("text") == "1.0x"))
+            checks.append(("重置后范围重新 fit（lims 置空再按包围盒算）",
+                           v.lims is None or
+                           v._current_lims()[0][0] <= v.lo[0]))
             checks.append(("四宫格外层是可拖动的 PanedWindow",
                            isinstance(v._grid, _ttk.PanedWindow)))
             # 初始视频区不能塌成 0（2026-11-04 用户报"视频显示范围为 0，得
