@@ -251,6 +251,36 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
             v._on_proj_toggle()
             checks.append(("正交 / 透视可切换（投影矩阵确实不同）",
                            not _np.allclose(p_proj, v.ax.get_proj())))
+            v.ortho.set(True)
+
+            # ---- 8d-3. 缩放（改分度值）+ 可拖动四宫格（2026-11-04）----
+            # 用户："增加放大缩小（改变分度值），四宫格做成可以拖动放大缩小"。
+            # 钉两件事：① 缩放真的改坐标轴范围（不是只改一个数字），且旋转
+            # 与缩放解耦（缩放不碰视角）；② 四宫格是可拖的 PanedWindow。
+            import numpy as _np2
+            from tkinter import ttk as _ttk
+            xr0 = tuple(v.ax.get_xlim())
+            v._zoom_in()
+            xr1 = tuple(v.ax.get_xlim())
+            checks.append(("放大后坐标轴范围收窄（分度值变密）",
+                           (xr1[1] - xr1[0]) < (xr0[1] - xr0[0]) and v.zoom > 1.0))
+            el_before, az_before = v.ax.elev, v.ax.azim
+            v._zoom_out()
+            v._zoom_out()
+            checks.append(("缩小后范围变宽、且旋转角没被缩放带跑",
+                           (v.ax.get_xlim()[1] - v.ax.get_xlim()[0])
+                           > (xr0[1] - xr0[0])
+                           and abs(v.ax.elev - el_before) < 1e-6
+                           and abs(v.ax.azim - az_before) < 1e-6))
+            v.zoom = 50.0
+            v._zoom_in()
+            checks.append(("放大到上限被钳住（不会放成一条线）",
+                           v.zoom <= 20.0 + 1e-6))
+            v._reset_view()
+            checks.append(("重置视角同时重置缩放（zoom 回 1.0）",
+                           v.zoom == 1.0 and v.zoom_lbl.cget("text") == "1.0x"))
+            checks.append(("四宫格外层是可拖动的 PanedWindow",
+                           isinstance(v._grid, _ttk.PanedWindow)))
         finally:
             if v is not None:
                 v.close()       # 释放 cap，否则临时目录删不掉（WinError 32）

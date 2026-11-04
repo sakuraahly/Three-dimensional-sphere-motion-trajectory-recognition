@@ -164,6 +164,14 @@ VIEW_PRESETS = {
 }
 DEFAULT_VIEW = "等轴测"
 
+#: 缩放（改变分度值）的系数区间。1.0 = 数据包围盒 + 12% 边距（`_limits` 默认）。
+#: 越接近 ZOOM_MAX，坐标轴范围越窄 → 刻度间距越密（放得越大）。
+#: 下限取 0.2：再小会把一段轨迹放成一条看不清的线，也容易误以为丢数据。
+ZOOM_MIN = 0.2
+ZOOM_MAX = 20.0
+#: 每滚一格 / 每点一次按钮的缩放步长（乘除）。
+ZOOM_STEP = 1.25
+
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
     "XY": (2, "#60a5fa"),
@@ -366,6 +374,7 @@ class Viewer3D:
         self._roll_drag: tuple[int, float] | None = None
         self._syncing_view = False
         self._plane_note = ""
+        self.zoom = 1.0                # 缩放系数：>1 放大（范围收窄），<1 缩小
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -469,23 +478,23 @@ class Viewer3D:
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
-        # 2×2：左上左视频 / 右上右视频 / 左下 3D / 右下视角面板
-        grid = ttk.Frame(self.root)
-        self._grid = grid
-        grid.rowconfigure(0, weight=0)
-        grid.rowconfigure(1, weight=1)
-        for c in (0, 1):
-            grid.columnconfigure(c, weight=1, uniform="pane")
-        grid.bind("<Configure>", self._fit_video_rows)
+        # 四宫格改为**可拖动**（2026-11-04 用户："四宫格做成可以拖动放大缩小"）。
+        # 结构：外层竖直 PanedWindow 分上下两半；上半内再套水平 PanedWindow
+        # 分左/右视频，下半同理分 3D / 视角面板。拖 sash 即调各格大小，
+        # 鼠标拖动条两侧内容各自响应 resize（视频 cover-crop、3D 图随画布缩放）。
+        # 比例初始按旧 grid 的 16:9 / 1:1 给，用户可拖。
+        self._grid = ttk.PanedWindow(self.root, orient="vertical")
+        # 上半：左右视频
+        top = ttk.PanedWindow(self._grid, orient="horizontal")
+        # 下半：3D + 视角面板
+        bottom = ttk.PanedWindow(self._grid, orient="horizontal")
 
         # Canvas 的 request size 固定为 1×1：图像只作为 item 画进去，
-        # 不会反过来把 grid 撑大（之前用 Label + PhotoImage 会正反馈放大到全屏）。
-        self.video_l = tk.Canvas(grid, bg="#0f172a", highlightthickness=0,
+        # 不会反过来把容器撑大（之前用 Label + PhotoImage 会正反馈放大到全屏）。
+        self.video_l = tk.Canvas(top, bg="#0f172a", highlightthickness=0,
                                  width=1, height=1)
-        self.video_r = tk.Canvas(grid, bg="#0f172a", highlightthickness=0,
+        self.video_r = tk.Canvas(top, bg="#0f172a", highlightthickness=0,
                                  width=1, height=1)
-        self.video_l.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
-        self.video_r.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
         self._left_raw = None
         self._right_raw = None
         self._left_photo = None
@@ -493,8 +502,7 @@ class Viewer3D:
         self.video_l.bind("<Configure>", lambda _e: self._render_video())
         self.video_r.bind("<Configure>", lambda _e: self._render_video())
 
-        plot_frame = ttk.Frame(grid)
-        plot_frame.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
+        plot_frame = ttk.Frame(bottom)
         self.fig = plt.Figure(figsize=(5.5, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111, projection="3d")
         self.fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.90)
@@ -505,10 +513,18 @@ class Viewer3D:
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # 右下角：视角 / 参考平面。放在这里而不是塞进底部控制条 ——
-        # 控制条已经有播放/帧/速度/平滑，再挤会把 3D 图压矮。
-        side = ttk.LabelFrame(grid, text="视角 / 参考平面", padding=(10, 8))
-        side.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+        # 右下角：视角 / 参考平面。
+        side = ttk.LabelFrame(bottom, text="视角 / 参考平面", padding=(10, 8))
+
+        # 组装 paned：先 add 内容，再 add 嵌套 paned 到外层（顺序决定 sash 位置）。
+        top.add(self.video_l, weight=1)
+        top.add(self.video_r, weight=1)
+        bottom.add(plot_frame, weight=3)
+        bottom.add(side, weight=1)
+        self._grid.add(top, weight=2)
+        self._grid.add(bottom, weight=3)
+        self._top_pane = top
+        self._bottom_pane = bottom
 
         row = ttk.Frame(side)
         row.pack(fill="x")
@@ -566,6 +582,15 @@ class Viewer3D:
         self.smooth_chk = ttk.Checkbutton(bar, text="平滑", variable=self.use_smooth,
                                           command=self._on_toggle_smooth)
         self.smooth_chk.pack(side="left", padx=(10, 0))
+        # 缩放（2026-11-04）：改变坐标轴分度值。按钮 + 滚轮双入口。
+        ttk.Button(bar, text="－", width=3,
+                   command=self._zoom_out).pack(side="left", padx=(10, 0))
+        self.zoom_lbl = ttk.Label(bar, text="1.0x", width=5, anchor="center")
+        self.zoom_lbl.pack(side="left", padx=(2, 0))
+        ttk.Button(bar, text="＋", width=3,
+                   command=self._zoom_in).pack(side="left", padx=(2, 0))
+        ttk.Button(bar, text="重置缩放", width=8,
+                   command=self._reset_zoom).pack(side="left", padx=(6, 0))
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
         self.status.pack(side="bottom", fill="x")
@@ -591,8 +616,8 @@ class Viewer3D:
         self.source_note = ttk.Label(src, text="")
         self.source_note.pack(side="left", padx=(10, 0))
         # 先给控制条/状态栏留位置，再把四宫格填满剩余空间；
-        # 否则 grid 的 expand 会把后面的 pack 控件压成 1px。
-        grid.pack(fill="both", expand=True, padx=4, pady=4)
+        # 否则 paned 的 expand 会把后面的 pack 控件压成 1px。
+        self._grid.pack(fill="both", expand=True, padx=4, pady=4)
         self.root.after(0, self._fit_video_rows)
         self.root.minsize(900, 700)
         self.root.bind("<space>", self._on_space)
@@ -605,6 +630,7 @@ class Viewer3D:
         self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_sources()
         self._sync_mono_note()
@@ -668,10 +694,23 @@ class Viewer3D:
             self._sync_source_row()
 
     def _fit_video_rows(self, _event=None) -> None:
-        """顶上两格锁 16:9，避免 cover-crop 切掉左右叠加文字。"""
-        width = max(100, self._grid.winfo_width() - 8)
-        pane_w = max(80, width // 2)
-        self._grid.rowconfigure(0, minsize=max(90, int(round(pane_w * 9 / 16))))
+        """初始给上半（视频）一个 16:9 的 sash 位置，之后交给用户拖。
+
+        只做**一次**初始定位（首次显示前），不反复覆盖用户拖过的位置 ——
+        否则拖完一松手又被弹回 16:9。cover-crop 在 `<Configure>` 里自适应，
+        拖到非 16:9 也只是裁得多/少，不会崩。
+        """
+        if getattr(self, "_paned_seeded", False):
+            return
+        self._paned_seeded = True
+        try:
+            self.root.update_idletasks()
+            total = max(120, self._grid.winfo_height())
+            # 视频区约占整高 2/5（16:9 里视频高占 pane 宽 9/16 的折中），
+            # 用户可随时拖。
+            self._grid.sashpos(0, int(total * 0.4))
+        except Exception:                                   # noqa: BLE001
+            pass
 
     def _on_space(self, event) -> None:
         # 勾选框聚焦时按空格 = 切「平滑」；不排除它，空格会**同时**切播放
@@ -722,8 +761,17 @@ class Viewer3D:
         **只碰范围，不碰视角**。以前它和视角设置写在同一个 `_reset_view` 里、
         而 `_redraw` 每帧都调 —— 播放时用户刚转到的角度下一帧就被打回默认，
         表现就是"根本转不动"。拆开之后旋转才留得住。
+
+        缩放：把 `_limits()` 给的包围盒（含 12% 边距）再按 ``self.zoom`` 收缩
+        （zoom>1 → 范围收窄 → 放大）。边距随范围一起缩，所以放大到最深处时
+        数据仍贴着边，不会留一圈空白。刻度由 matplotlib 按新范围自动重分度。
         """
         lo, hi = self._limits()
+        z = max(ZOOM_MIN, self.zoom)
+        for i in range(3):
+            mid = (lo[i] + hi[i]) / 2.0
+            half = (hi[i] - lo[i]) / 2.0 / z
+            lo[i], hi[i] = mid - half, mid + half
         self.ax.set_xlim(lo[0], hi[0])
         self.ax.set_ylim(lo[1], hi[1])
         self.ax.set_zlim(lo[2], hi[2])
@@ -812,6 +860,40 @@ class Viewer3D:
         self._apply_view()
         self.canvas.draw_idle()
 
+    # ---- 缩放：改变坐标轴范围（分度值）----
+    def _zoom_apply(self, factor: float) -> None:
+        """按 ``factor`` 缩放：范围收窄 = 放大（分度值变密），扩张 = 缩小。
+
+        只改 ``self.zoom`` 并重画。范围由 `_fit_axes` 里的 `_limits()/zoom`
+        统一算，所以**视角与缩放解耦**：缩放不动旋转，旋转不动缩放。
+        上限钳在 `ZOOM_MAX`：再放大会把轨迹放成一条看不清的线。
+        """
+        self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom * factor))
+        self._sync_zoom_label()
+        self._redraw()
+
+    def _zoom_in(self) -> None:
+        self._zoom_apply(ZOOM_STEP)
+
+    def _zoom_out(self) -> None:
+        self._zoom_apply(1.0 / ZOOM_STEP)
+
+    def _reset_zoom(self) -> None:
+        self.zoom = 1.0
+        self._sync_zoom_label()
+        self._redraw()
+
+    def _sync_zoom_label(self) -> None:
+        lbl = getattr(self, "zoom_lbl", None)
+        if lbl is not None:
+            lbl.configure(text=f"{self.zoom:.1f}x")
+
+    def _on_scroll(self, event) -> None:
+        """滚轮缩放。只在指针落在 3D 画布上时生效（视频/面板区不抢滚轮）。"""
+        if event.inaxes is not self.ax:
+            return
+        self._zoom_apply(ZOOM_STEP if event.button == "up" else 1.0 / ZOOM_STEP)
+
     # ---- 鼠标：Shift + 左键拖动 = 绕视线滚转 ----
     def _on_mouse_press(self, event) -> None:
         if event.button == 1 and event.key == "shift":
@@ -831,10 +913,12 @@ class Viewer3D:
             self.ax.set_navigate(True)
 
     def _reset_view(self) -> None:
-        """回到默认视角（按钮 / Home 键）。只改角度，不碰数据范围。"""
+        """回到默认视角 + 默认缩放（按钮 / Home 键）。"""
         e, a, r = VIEW_PRESETS[DEFAULT_VIEW]
         self.view = {"elev": e, "azim": a, "roll": r}
         self.view_box.set(DEFAULT_VIEW)
+        self.zoom = 1.0
+        self._sync_zoom_label()
         self._sync_roll_widget()
         self._redraw()
 
@@ -1003,6 +1087,7 @@ class Viewer3D:
                  f"X={float(x):.4f}  Y={float(y):.4f}  Z={float(z):.4f} m   "
                  f"模式={mode}   "
                  f"坐标={self.data.get('coordinate_system', '?')}   "
+                 f"缩放 {self.zoom:.1f}x   "
                  f"视角 {self.view['elev']:.0f}/{self.view['azim']:.0f}/"
                  f"{self.view['roll']:.0f}°")
 
