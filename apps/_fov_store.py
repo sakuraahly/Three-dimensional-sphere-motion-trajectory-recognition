@@ -27,7 +27,18 @@ FOV_KEYS = ("reference_side", "crop_side", "crop_rect", "target_size",
 
 
 def fov_payload_from_calibration(json_path: str | Path) -> dict[str, Any] | None:
-    """从标定 JSON 里取出 ``meta.fov``，补上 ``measured_at`` / ``source``。
+    """从标定 JSON 里取出 FOV 记录，补上 ``measured_at`` / ``source``。
+
+    ## 读的是**顶层** ``fov``，不是 ``meta.fov``（2026-11-04 修的真 bug）
+
+    `calib.params.StereoRig.load()` 是把**整个 JSON 的顶层**塞进 ``rig.meta``：
+
+        meta = json.loads(js.read_text(...));  return cls(..., meta=meta)
+
+    所以 `record_stereo` 里的 ``rig.meta.get("fov")`` 读的就是顶层 ``fov``。
+    本函数第一版写成 ``data["meta"]["fov"]``，而标定 JSON 根本没有 ``meta``
+    这一层 —— 于是「从当前标定读入」永远报"没有 FOV 记录"，标定成功后的
+    自动收尾也永远不生效，而**两边都不报错**。
 
     返回 ``None`` 表示"这份标定没有 FOV 记录"（旧流程 / ``--skip-fov`` /
     现场估计降级成 ``fov=null``）—— 调用方**不要**把它当成空记录去覆盖档案。
@@ -40,8 +51,11 @@ def fov_payload_from_calibration(json_path: str | Path) -> dict[str, Any] | None
         return None
     if not isinstance(data, dict):
         return None
-    meta = data.get("meta")
-    raw = meta.get("fov") if isinstance(meta, dict) else None
+    raw = data.get("fov")
+    if raw is None:
+        # 兼容分层写法（别人手工造的 json / 将来的格式）：优先顶层，其次 meta。
+        nested = data.get("meta")
+        raw = nested.get("fov") if isinstance(nested, dict) else None
     if not isinstance(raw, dict) or not raw:
         return None
     payload = {k: raw[k] for k in FOV_KEYS if k in raw}

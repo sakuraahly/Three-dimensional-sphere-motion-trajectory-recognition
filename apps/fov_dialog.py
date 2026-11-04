@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -45,6 +46,23 @@ from stereo import profiles                                 # noqa: E402
 
 #: 会话里认作"两路视频"的名字（与 `record_stereo` 的产物一致）。
 _VIDEO_NAMES = ("left.mkv", "left.mp4", "left.avi")
+
+
+def _session_has_fov_record(sess: Path) -> bool:
+    """这段会话有没有 ``rig.fov``（标定当时在**原始画面**上算的那份）。
+
+    有它就该直接读，不该在录像上重新量：平行装置的录像通常已按它裁剪过，
+    在裁剪后的画面上再量是"二次裁剪"的残余差（详见 `_measure_from_session`）。
+    """
+    try:
+        data = json.loads((Path(sess) / "session.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    rig = data.get("rig")
+    fov = rig.get("fov") if isinstance(rig, dict) else None
+    return isinstance(fov, dict) and bool(fov)
 
 
 class FovDialog(tk.Toplevel):
@@ -106,7 +124,7 @@ class FovDialog(tk.Toplevel):
         bar.pack(fill="x")
         ttk.Button(bar, text="刷新", command=self._load).pack(side="left")
         ttk.Button(bar, text="清除记录", command=self._clear).pack(side="right")
-        ttk.Button(bar, text="从会话量一次…", command=self._measure_from_session).pack(
+        ttk.Button(bar, text="从会话取 FOV…", command=self._measure_from_session).pack(
             side="right", padx=(0, 6))
         ttk.Button(bar, text="从当前标定读入", command=self._import_from_calibration).pack(
             side="right", padx=(0, 6))
@@ -214,8 +232,21 @@ class FovDialog(tk.Toplevel):
             self.on_changed()
 
     def _measure_from_session(self) -> None:
-        """选一段双目录像，取同一帧量一次（两路本来就是同步录的）。"""
-        if not self._profile_name():
+        """从一段双目会话取 FOV：**优先读记录，其次才现场量**。
+
+        ## 为什么顺序反不得（2026-11-04 实测）
+
+        平行装置的录像通常是**已按 FOV 裁剪过**的（`record_stereo` 用
+        `fov.target_size` 写盘）。在这种画面上再估一次单应，量到的是"残余
+        视场差"：数字自洽、quality 0.988 很好看，但套到原始画面上裁剪框会
+        落错位置 —— 这是个**看起来特别成功**的错误结果。
+
+        而 session.json 里的 `rig.fov` 是**标定当时在原始画面上**算的，才是
+        该用的那份。所以：有记录就直接读（`--from-session`），没有才现场量
+        （`measure_fov.py` 自己会拒绝已裁剪的录像）。
+        """
+        name = self._profile_name()
+        if not name:
             self.status.configure(text="先选一个装置档案", foreground=WARN)
             return
         start = STEREO_ROOT if Path(STEREO_ROOT).is_dir() else ROOT
@@ -237,12 +268,19 @@ class FovDialog(tk.Toplevel):
             return
 
         tool = ROOT / "apps" / "tools" / "measure_fov.py"
-        cmd = [sys.executable, str(tool),
-               "--left-video", str(left), "--right-video", str(right),
-               "--frame", "30", "--write-profile", self._profile_name()]
-        self.status.configure(
-            text=f"正在量 {sess.name} 的第 30 帧（约数秒）…", foreground=MUTED)
-        self.app.tasks.start(cmd, f"测量 FOV（{sess.name}）",
+        if _session_has_fov_record(sess):
+            # 记录里是**原始画面**上的裁剪参数，比在已裁剪的录像上重量可信得多
+            cmd = [sys.executable, str(tool), "--from-session", str(sess),
+                   "--write-profile", name]
+            note = f"正在读 {sess.name} 里记录的 FOV 参数…"
+        else:
+            cmd = [sys.executable, str(tool),
+                   "--left-video", str(left), "--right-video", str(right),
+                   "--frame", "30", "--write-profile", name]
+            note = (f"{sess.name} 没有 FOV 记录，正在用第 30 帧现场量…"
+                    f"（若这段录像已裁剪，会被拒绝而不是给假值）")
+        self.status.configure(text=note, foreground=MUTED)
+        self.app.tasks.start(cmd, f"取 FOV（{sess.name}）",
                              on_done=self._on_measured)
 
     def _on_measured(self, task) -> None:
@@ -252,13 +290,14 @@ class FovDialog(tk.Toplevel):
         self.app.state.reload()
         self._load()
         if code == 0:
-            self.status.configure(text="量完了，已写进档案", foreground=MUTED)
+            self.status.configure(text="取到了，已写进档案", foreground=MUTED)
             if self.on_changed:
                 self.on_changed()
         else:
             self.status.configure(
-                text="没量出来。最常见的原因是这段录像里两路没有共同视场"
-                     "（90° 装置的正常情况）或画面纹理不足 —— 详细原因在运行日志里。",
+                text="没取到。常见原因：① 这段会话没记 FOV，且两路没有共同视场"
+                     "（90° 装置的正常情况）；② 录像已被裁剪（会拒绝，避免二次"
+                     "裁剪的假值）；③ 画面纹理不足。详细原因在运行日志里。",
                 foreground=WARN)
 
     def _clear(self) -> None:

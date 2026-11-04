@@ -820,25 +820,69 @@ def test_fov_measure_roundtrip() -> bool:
                        got is not None and got.fov == payload))
 
         # 标定产物 -> 档案（自动收尾走的就是这条）
+        #
+        # ⚠️ 格式必须是**顶层 fov**：`StereoRig.load()` 把整个 JSON 顶层塞进
+        # `rig.meta`，所以 `record_stereo` 的 `rig.meta.get("fov")` 读的就是
+        # 顶层那份。本判据第一版按 `{"meta": {"fov": ...}}` 造，结果把
+        # `_fov_store` 读错层级这个真 bug **一起验证成了绿** —— 判据跟着错的
+        # 格式走，比没有判据更糟。
         calib = Path(tmp) / "calib.json"
         calib.write_text(json.dumps(
-            {"meta": {"fov": fov.to_dict(),
-                      "left_size": [1920, 1080], "right_size": [1920, 1080]}}),
+            {"stereo_mode": "parallel", "image_size": [1920, 1080],
+             "fov": dict(fov.to_dict(), left_size=[1920, 1080],
+                         right_size=[1920, 1080])}),
             encoding="utf-8")
         note = _fov_store.record_fov_from_calibration(got, calib, store)
         back = rp.get_profile("fov-rig", store)
-        checks.append(("标定 JSON 的 meta.fov 能搬进档案（自动收尾路径）",
+        checks.append(("标定 JSON 顶层 fov 能搬进档案（自动收尾路径）",
                        bool(note) and back is not None
                        and abs(float(back.fov["scale"]) - fov.scale) < 1e-9))
         checks.append(("搬运时补上 source=calibrate:<文件名>",
                        back is not None
                        and str(back.fov.get("source", "")).startswith("calibrate:")))
+        # 兼容分层写法（别人手工造的 json）：仍然认
+        nested = Path(tmp) / "nested.json"
+        nested.write_text(json.dumps({"meta": {"fov": fov.to_dict()}}),
+                          encoding="utf-8")
+        checks.append(("兼容 meta.fov 的分层写法",
+                       _fov_store.fov_payload_from_calibration(nested) is not None))
         # 标定没有 fov（旧流程/降级）时**不许**覆盖档案里的记录
         bare = Path(tmp) / "bare.json"
-        bare.write_text(json.dumps({"meta": {"fov": None}}), encoding="utf-8")
-        checks.append(("meta.fov=null 时不覆盖已有记录",
+        bare.write_text(json.dumps({"fov": None}), encoding="utf-8")
+        checks.append(("fov=null 时不覆盖已有记录",
                        _fov_store.record_fov_from_calibration(back, bare, store) == ""
                        and rp.get_profile("fov-rig", store).fov is not None))
+
+        # ---- 已裁剪的录像必须被拒绝（否则量到的是"二次裁剪"的假值）----
+        #
+        # 2026-11-04 实测：平行装置的录像通常是已按 fov.target_size 裁剪过的。
+        # 在那种画面上再估一次单应，得到 scale=1.486 / quality=0.988 的
+        # "残余视场差"——数字自洽、指标漂亮，套到原始画面上裁剪框会落错位置。
+        import importlib.util as _ilu
+        root_dir = Path(__file__).resolve().parents[1]
+        spec = _ilu.spec_from_file_location(
+            "_measure_fov_under_test", root_dir / "apps" / "tools" / "measure_fov.py")
+        mf = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mf)
+        cropped_dir = Path(tmp) / "cropped_sess"
+        cropped_dir.mkdir()
+        (cropped_dir / "session.json").write_text(json.dumps(
+            {"rig": {"fov": {"target_size": [1718, 972], "scale": 0.665,
+                             "crop_side": "right", "crop_rect": [404, 195, 1718, 973]}}}),
+            encoding="utf-8")
+        checks.append(("已裁剪录像被拒绝（target_size == 视频分辨率）",
+                       bool(mf.already_cropped_problem(cropped_dir / "left.mkv",
+                                                       (1718, 972)))))
+        checks.append(("未裁剪录像不被误拦（分辨率与 target_size 不同）",
+                       mf.already_cropped_problem(cropped_dir / "left.mkv",
+                                                  (1920, 1080)) == ""))
+        plain_dir = Path(tmp) / "plain_sess"
+        plain_dir.mkdir()
+        (plain_dir / "session.json").write_text(json.dumps({"rig": {"fov": None}}),
+                                                encoding="utf-8")
+        checks.append(("没有 fov 记录的录像不拦（那是 90° 的正常情况）",
+                       mf.already_cropped_problem(plain_dir / "left.mkv",
+                                                  (1920, 1080)) == ""))
 
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
