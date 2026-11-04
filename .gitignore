@@ -55,6 +55,14 @@ $RECYCLE.BIN/
 #   所以这里明确忽略。）
 outputs/
 
+# ---------- 运行日志 ----------
+# 2026-11-04 起日志不再待在 outputs/ 里，而是与 data/ config/ 平级的 logs/：
+#   logs/<来源>/<时间片>/    来源 = tasks|calib|capture|realtime|misc
+# 日志跟 outputs/ 的区别：outputs/ 删了全部可再生，日志是**出问题后唯一能回看
+# 的东西**（"上次标定为什么只收了 8 对"）。所以它单独放、单独忽略、单独清理。
+# 结构由 sphere_tracker/paths.py 的 log_dir() 决定，别在别处硬编码路径。
+/logs/
+
 # ---------- 本机标定结果 ----------
 # config/ 里是"这台相机 + 这个机位"相关的参数：
 #   camera_modes.json        相机模式探测缓存（换相机/换 USB 口就失效）

@@ -16,7 +16,7 @@
 --------------
 - **新增** `outputs/<新名字>`：不在白名单名字里、又不带调试前缀 → 落到"谨慎"
   （默认不勾）。不知道就先别删，这是安全的一侧。
-- **改名/移走** 了白名单里声明的位置（如 `outputs/logs`）：这次扫描找不到，
+- **改名/移走** 了白名单里声明的位置（如 `outputs/test_results`）：这次扫描找不到，
   会列在"找不到的位置"里提示出来 —— 静默跳过会让人以为"本来就没有"。
 - **你自己拿主意**：右键某一行可以「标为不动」，选择记在 `config/gui_state.json`，
   下次仍不默认勾它。
@@ -65,7 +65,7 @@ RANGES: tuple[tuple[str, int | None], ...] = (
 )
 
 #: 三个"一键"的目标。键与 `_junk.scan_junk` 产出的 `JunkItem.key` 一致。
-QUICK_LOGS = ("outputs/logs",)
+QUICK_LOGS = ("logs", "outputs/logs")
 QUICK_CACHE = ("__pycache__", "tmp_files", "session_bak")
 
 _PICKED = "☑"
@@ -369,7 +369,7 @@ class JunkDialog(tk.Toplevel):
     # ---------- 一键 ----------
     def _quick_logs(self) -> None:
         self._run_quick(keys=QUICK_LOGS, title="一键清日志",
-                        missing_hint="没有找到 outputs/logs —— 可能这个项目还没跑过任务，"
+                        missing_hint="没有找到 logs/ —— 可能这个项目还没跑过任务，"
                                      "或它被改名/移动了")
 
     def _quick_cache(self) -> None:

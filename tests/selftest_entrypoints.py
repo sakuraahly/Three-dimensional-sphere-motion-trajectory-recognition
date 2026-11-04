@@ -666,8 +666,9 @@ def test_junk_cleanup_safety() -> bool:
             _os.utime(p, (old, old))
 
     def fixture(repo: _P) -> None:
-        touch(repo / "outputs/logs/a.log")
-        touch(repo / "outputs/logs/old.log", 2048, age_days=40)
+        # 日志 2026-11-04 起在项目根，按来源/时间片分目录
+        touch(repo / "logs/calib/2026-01/a.log")
+        touch(repo / "logs/calib/2026-01/old.log", 2048, age_days=40)
         touch(repo / "outputs/agent_x/f1.bin", 5000)
         touch(repo / "outputs/ball_dataset/d.png", 777)       # 谨慎档
         touch(repo / "outputs/chain_frames/keep.png", 111)    # 正在用
@@ -699,7 +700,7 @@ def test_junk_cleanup_safety() -> bool:
         by_label = {i.label: i for i in plan.items}
 
         # ---- ① 白名单：只报允许的 ----
-        checks.append(("列出运行日志", "outputs/logs" in labels))
+        checks.append(("列出运行日志（项目根 logs/）", "logs/" in labels))
         checks.append(("列出调试产物目录（推荐档）", "outputs/agent_x" in labels))
         checks.append(("列出字节码缓存", "Python 字节码缓存" in labels))
         checks.append(("列出临时文件残留", "临时文件残留" in labels))
@@ -716,7 +717,7 @@ def test_junk_cleanup_safety() -> bool:
 
         # ---- ② 分档：界面的"默认只勾推荐"靠它 ----
         checks.append(("logs 是推荐档（删了下次跑就有）",
-                       by_label["outputs/logs"].danger == DANGER_SAFE))
+                       by_label["logs/"].danger == DANGER_SAFE))
         checks.append(("ball_dataset 是谨慎档（删了要重跑）",
                        by_label["outputs/ball_dataset"].danger == DANGER_WARN))
         checks.append(("回收站是 gone（不可恢复）",
@@ -743,18 +744,22 @@ def test_junk_cleanup_safety() -> bool:
                        stray is not None and stray.danger == DANGER_WARN))
 
         # ---- ②c 规则失效：声明过的位置不在了要报出来 ----
-        # 用**另一个**临时根，不动主 repo —— 主 repo 的 outputs/logs 后面还要
+        # 用**另一个**临时根，不动主 repo —— 主 repo 的 logs/ 后面还要
         # 被"执行清理"那段用到，先删了会让"删掉且没有失败"变成一条假红。
         with _tempfile.TemporaryDirectory() as td2:
             repo_m = _P(td2) / "repom"
             touch(repo_m / "outputs/agent_x/f.bin", 100)
             missing = scan_junk(repo_m).missing
-            checks.append(("声明过的 outputs/logs 不在时报进 missing",
-                           any("outputs/logs" in m for m in missing)))
+            checks.append(("声明过的 outputs/test_results 不在时报进 missing",
+                           any("outputs/test_results" in m for m in missing)))
             checks.append(("missing 的说明写清是\"没找到\"（不是空串）",
                            bool(missing) and all("没找到" in m for m in missing)))
-            checks.append(("主仓库的 outputs/logs 仍在（missing 不会误伤）",
-                           (repo / "outputs/logs").is_dir()))
+            # 旧位置 outputs/logs 搬家后**不存在是正常状态**，不该报 missing ——
+            # 否则每个新克隆的仓库一打开就看见一条假警报。
+            checks.append(("旧位置 outputs/logs 不存在时不报 missing",
+                           not any("outputs/logs" in m for m in missing)))
+            checks.append(("主仓库的 logs/ 仍在（missing 不会误伤）",
+                           (repo / "logs").is_dir()))
 
         # ---- ②d 用户标记"不动"：仍列出、但不进默认勾选 ----
         muted_plan = scan_junk(repo, muted={"outputs/agent_x"})
@@ -766,8 +771,8 @@ def test_junk_cleanup_safety() -> bool:
 
         # ---- ②e 一键清理的目标键必须真的存在 ----
         from apps.junk_dialog import QUICK_CACHE, QUICK_LOGS
-        checks.append(("一键清日志指向 outputs/logs",
-                       QUICK_LOGS == ("outputs/logs",)))
+        checks.append(("一键清日志指向 logs/（并兼容旧位置）",
+                       set(QUICK_LOGS) == {"logs", "outputs/logs"}))
         checks.append(("一键清缓存指向字节码/临时/会话备份",
                        set(QUICK_CACHE) == {"__pycache__", "tmp_files", "session_bak"}))
 
@@ -781,7 +786,7 @@ def test_junk_cleanup_safety() -> bool:
 
         # ---- ④ 时间过滤 + 如实报"筛掉多少" ----
         old_plan = scan_junk(repo, older_than_days=30)
-        old_logs = next((i for i in old_plan.items if i.key == "outputs/logs"), None)
+        old_logs = next((i for i in old_plan.items if i.key == "logs"), None)
         checks.append(("30 天前只剩老日志",
                        old_logs is not None and old_logs.count == 1))
         checks.append(("如实记下被时间筛掉的文件数", old_plan.filtered_files > 0))
@@ -796,7 +801,7 @@ def test_junk_cleanup_safety() -> bool:
                        deleted > 0 and not failures))
         checks.append(("释放字节数 > 0", freed > 0))
         checks.append(("日志目录被回收（不留空壳）",
-                       not (repo / "outputs/logs").exists()))
+                       not (repo / "logs").exists()))
         checks.append(("谨慎档原封不动",
                        (repo / "outputs/ball_dataset/d.png").is_file()))
         checks.append(("被降级的数据目录原封不动（一键清推荐不会碰它）",

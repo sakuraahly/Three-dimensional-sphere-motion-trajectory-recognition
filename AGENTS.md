@@ -84,9 +84,10 @@ apps/             可执行程序；tools/ 放一次性设置与诊断
 tests/            回归测试（26 个，改动后必跑）
 docs/             文档
 assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / 运行期产物
+logs/             运行日志（按来源 + 时间分片；路径唯一来源 paths.log_dir()）
 ```
 
-### 六条放置规则
+### 七条放置规则
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
@@ -99,6 +100,13 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 6. **不可再生的录制数据放 `data/`**，不要放 `outputs/`（语义是"删了能再生"），
    也不要放 `assets/`（那是入库的静态素材）。`data/` 默认不入库，
    **必须单独备份**；一次采集 = 一个目录 + `session.json`。
+7. **日志写 `logs/<来源>/<时间片>/`，不写 `outputs/`**（2026-11-04）。
+   来源 = `tasks` / `calib` / `capture` / `realtime` / `misc`，路径只能来自
+   `sphere_tracker.paths.log_dir()`。新入口加日志时，在 `apps/_common.LOG_TAGS`
+   登记 tag → 来源；漏了会落到 `misc`（不丢，但下次排障得先猜）。
+   与 `outputs/` 的区别是**为什么把它放在根目录**：`outputs/` 整个删了都能重跑，
+   日志却是出问题后唯一能回看的东西 —— 所以它平级放在根目录、单独清理，
+   不跟着 `outputs/` 一起被当成一次性产物。
 
 ### `apps/tools/` 里其实是七组东西
 

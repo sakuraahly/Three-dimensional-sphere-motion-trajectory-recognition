@@ -36,7 +36,18 @@ from typing import Callable
 __all__ = ["ROOT", "Task", "TaskRunner", "alive_pids", "child_pids", "POLL_MS",
            "TAIL_LINES"]
 
-ROOT = Path(__file__).resolve().parent.parent
+#: 按标记上溯（`sphere_tracker/` 在哪，根就在哪），不数层数 —— 文件被移动时
+#: `parent.parent` 会静默指到别处；理由同 `sphere_tracker.paths.ROOT`。
+ROOT = next(p for p in Path(__file__).resolve().parents
+            if (p / "sphere_tracker").is_dir())
+#: 根进 sys.path 才能 import `sphere_tracker.paths` —— 日志路径的唯一来源。
+#: 没有这一段，`python apps/_task_runner.py --selftest` 会因为 sys.path[0]
+#: 是 apps/ 而找不到包。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from sphere_tracker.paths import log_dir as _log_dir  # noqa: E402
+
 POLL_MS = 200
 
 #: 任务结束时留在 ``Task.tail`` 里的最后几行输出。
@@ -175,7 +186,9 @@ class TaskRunner:
         self._root = root
         self._on_log = on_log
         self._on_change = on_change or (lambda: None)
-        self._log_dir = log_dir if log_dir is not None else ROOT / "outputs" / "logs"
+        # 默认 logs/tasks/<日期>/：启动器这一层的日志单独一个抽屉，
+        # 与各程序自己的日志分开（见 sphere_tracker.paths.log_dir）。
+        self._log_dir = log_dir if log_dir is not None else _log_dir("tasks")
         self._poll_ms = poll_ms
         self._tasks: list[Task] = []
         self._tid = 0
@@ -293,9 +306,9 @@ class TaskRunner:
                 pass                                        # UI 挂了不该拖死任务
 
     def _task_log_path(self, tid: int, title: str) -> Path | None:
-        """给每个任务一个日志文件：``outputs/logs/task<序号>_<时间>_<标题>.log``。
+        """给每个任务一个日志文件：``logs/tasks/<日期>/task<序号>_<时间>_<标题>.log``。
 
-        **为什么按任务分开**：同一个 ``outputs/logs/`` 里已经有各程序自己的日志
+        **为什么按任务分开**：同一个 ``logs/`` 下已经有各程序自己的日志
         （``calibrate_*.log`` 等），但启动器这一层的输出（谁起的、什么时候、
         被谁停的、退出码多少）只有这里才有。
         """

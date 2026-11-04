@@ -2,7 +2,7 @@
 
 为什么需要它
 ------------
-真机第一次双目标定跑完留下的两份日志（`outputs/logs/calibrate_2026*.log`）
+真机第一次双目标定跑完留下的两份日志（`logs/calib/2026-10/calibrate_2026*.log`）
 是**目前唯一一份真机证据**。它里面的判定口径值得钉住，否则下一次
 "到底算不算失败、失败在哪一步"又要靠人重新推。
 
@@ -96,7 +96,7 @@ from selftest_board_corner_order import (  # noqa: E402
 import cv2  # noqa: E402
 
 # --------------------------------------------------------------------------
-# 真机那次的实测值（outputs/logs/calibrate_20261010_162029.log）
+# 真机那次的实测值（logs/calib/2026-10/calibrate_20261010_162029.log）
 # 全部内嵌，**不依赖 outputs/ 是否还在** —— 那份日志本身是被 gitignore 的
 # --------------------------------------------------------------------------
 REAL_LOG_TAG = "calibrate_20261010_162029.log"
@@ -119,7 +119,7 @@ REAL_EPIPOLAR_RMS = 15978.5150
 REAL_EPIPOLAR_MAX = 32735.3656
 REAL_BASELINE_MM = 199.67
 
-# 日志原文片段（排版与 outputs/logs/ 里的真实文件逐字一致，含对齐空格）
+# 日志原文片段（排版与 logs/calib/2026-10/ 里的真实文件逐字一致，含对齐空格）
 LOG_EXCERPT = "\n".join([
     f"16:22:39.564 INFO  共处理 {REAL_FRAMES_TOTAL} 帧：收下 {REAL_PAIRS_KEPT} 对，"
     f"拒收 {REAL_FRAMES_REJECTED} 帧",

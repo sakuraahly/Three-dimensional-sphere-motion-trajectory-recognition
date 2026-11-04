@@ -45,19 +45,14 @@ LOG = logging.getLogger("calibrate_mono")
 
 
 def _setup_logging() -> Path:
-    """日志落到 ``outputs/logs/calibrate_mono_<时间>.log``（与其它入口一致）。"""
-    d = ROOT / "outputs" / "logs"
-    d.mkdir(parents=True, exist_ok=True)
-    import time
-    path = d / f"calibrate_mono_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[logging.FileHandler(path, encoding="utf-8"),
-                  logging.StreamHandler(sys.stdout)],
-    )
-    return path
+    """日志落到 ``logs/calib/<年月>/calibrate_mono_<时间>.log``。
+
+    复用 `apps/_common.setup_logging`：这里原来自带一份 ``basicConfig``，路径与
+    分区规则各写一遍 —— 改日志布局时最容易漏掉的正是这种"第二处实现"。
+    """
+    from apps._common import setup_logging
+
+    return setup_logging("calibrate_mono")
 
 
 def _image_paths(d: Path) -> list[Path]:

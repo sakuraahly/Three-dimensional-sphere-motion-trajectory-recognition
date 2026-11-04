@@ -51,6 +51,7 @@ BG = "#eef2f8"
 # 现在加一个检测器只改注册表一处，界面与命令行不可能再对不上。
 # 顺序 = 注册顺序；默认值 = 注册表声明的默认（= `DetectorConfig.method`），
 # 不再靠"列表首项"这种隐式约定 —— 展示顺序与默认值是两件独立的事。
+from sphere_tracker.paths import log_dir as _paths_log_dir  # noqa: E402
 from sphere_tracker.config import ColorConfig as _ColorConfig  # noqa: E402
 from sphere_tracker.detectors import registry as _detector_registry  # noqa: E402,F401  （import 即注册）
 from sphere_tracker.plugins import default as _plugin_default  # noqa: E402
@@ -342,7 +343,7 @@ class Task:
 
     **`log_path`：每个任务都把完整输出落盘一份。** 日志区是给眼睛看的，
     会被下一条任务冲掉；而"上一次到底报了什么"恰恰是出问题时唯一能查的东西
-    （这次定位标定问题就是靠 `outputs/logs/calibrate_*.log`）。
+    （这次定位标定问题就是靠 `logs/calib/<年月>/calibrate_*.log`）。
     """
 
     tid: int
@@ -2698,14 +2699,14 @@ class Launcher(tk.Tk):
 
     @staticmethod
     def _task_log_path(tid: int, title: str) -> Path | None:
-        """给每个任务一个日志文件：`outputs/logs/task<序号>_<时间>_<标题>.log`。
+        """给每个任务一个日志文件：`logs/tasks/<年月>/task<序号>_<时间>_<标题>.log`。
 
-        **为什么要按任务分开**：同一个 `outputs/logs/` 里已经有各程序自己的日志
+        **为什么要按任务分开**：同一个 `logs/` 下已经有各程序自己的日志
         （`calibrate_*.log` 等），但启动器这一层的输出（谁起的、什么时候、
         被谁停的、退出码多少）只有这里才有。分开写才追得下去。
         """
         try:
-            d = ROOT / "outputs" / "logs"
+            d = _paths_log_dir("tasks")
             d.mkdir(parents=True, exist_ok=True)
             safe = re.sub(r'[\\/:*?"<>|\s]+', "_", title).strip("_")[:40] or "task"
             stamp = time.strftime("%Y%m%d_%H%M%S")

@@ -470,7 +470,7 @@ python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.m
 **窗口按键**：`f` / F11 = 全屏，`Esc` = **全屏时退出全屏**（不在全屏时才退出程序）。
 `q` 退出，`c` 切方法，`m` 看掩膜，`s` 存快照，`p` 预测开关，`v` 录制，`3` 三维面板，空格暂停。
 
-**日志**：`outputs/logs/realtime_<时间>.log` —— 含每 5 秒一行健康度
+**日志**：`logs/realtime/<年月>/realtime_<时间>.log` —— 含每 5 秒一行健康度
 （`cap` / `loop` / `detect` / `age` / `drop`）、逐帧明细（DEBUG）、按过的键。
 **卡顿时把那一行健康度发出来就能定位。**
 

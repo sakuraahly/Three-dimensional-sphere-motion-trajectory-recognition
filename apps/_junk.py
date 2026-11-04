@@ -12,9 +12,9 @@
 
 为什么分"推荐 / 谨慎"两档
 -------------------------
-`outputs/` 下有两类完全不同的东西：
+`outputs/` 下（以及 2026-11-04 之后项目根的 `logs/`）有两类完全不同的东西：
 
-- ``_ab`` / ``tmp_frames3`` / ``agent_detector`` / ``logs`` / ``test_results``：
+- ``_ab`` / ``tmp_frames3`` / ``agent_detector`` / ``test_results`` / 根目录的 ``logs/``：
   调试与运行产物，删了下次跑就有了 → **推荐**（默认勾选）；
 - ``chain``（链式标定图）/ ``ball_dataset``（YOLO 数据集）/ ``mono_calib_frames``：
   某次实验的输入，删了要**重拍/重跑**才能再生 → **谨慎**（默认不勾，写清代价）。
@@ -56,8 +56,12 @@ _RECOMMENDED_PREFIXES = ("_", "tmp_", "agent_")
 _KEEP_ALWAYS = {"chain_frames"}
 
 #: 名字不带调试前缀、但同样是"删了下次跑就有"的目录（推荐档）。
+#:
+#: ⚠️ `logs` 2026-11-04 起已搬到**项目根**（`<repo>/logs`），不再在 `outputs/` 下，
+#: 所以从这张表里移出去了 —— 但它仍是推荐档，由 `scan_junk` 单独收（见 ⓪ 段）。
+#: `outputs/logs` 若还存在，只当"旧位置迁移残留"列出，且**不报 missing**：
+#: 新装/已迁移的仓库里它本来就不该存在。
 _KNOWN_SAFE = {
-    "logs": "运行日志：每次任务追加的 .log（排障看这里，但历史值不大）",
     # 这条要写清代价：`timings.json` 是 `fast` 档"哪些测试太慢、该排除"的依据，
     # 删了下次 `fast` 会退化成跑全套（约慢 7 分钟）。不是不能清，是要知道清了会怎样。
     "test_results": "回归测试报告（run_tests.py 每次写的 JSON）。"
@@ -232,6 +236,13 @@ def _outputs_dir_item(d: Path, skipped: list[str]) -> JunkItem | None:
     前缀的，一律落到"谨慎"档（默认不勾）—— 这是安全的一侧：不知道就先别删。
     """
     explicit_safe = d.name in _KNOWN_SAFE
+    if d.name == "logs":
+        # 旧日志位置（搬家前是 outputs/logs）。还在 = 迁移没做完/旧版本写的残留；
+        # 不存在是正常状态，所以它不参与下面的 missing 检查。
+        return _dir_item(
+            "outputs/logs", d, label="outputs/logs（旧日志位置）",
+            detail="搬到项目根 logs/ 之前的残留 —— 删了不影响现在的日志",
+            danger=DANGER_SAFE, skipped=skipped)
     if explicit_safe:
         detail, danger = _KNOWN_SAFE[d.name], DANGER_SAFE
     elif d.name.startswith(_RECOMMENDED_PREFIXES):
@@ -311,6 +322,18 @@ def scan_junk(root: str | Path, *, older_than_days: float | None = None,
 
     outputs = repo / "outputs"
     data = repo / "data"
+
+    # ---- ⓪ 项目根的 logs/（推荐档）----
+    # 日志是排障时**唯一能回看的东西**，所以既不能混进 outputs/ 被整类清掉，
+    # 也不能因为搬了家就从"一键清日志"里消失。
+    logs_root = repo / "logs"
+    if logs_root.is_dir():
+        item = _dir_item(
+            "logs", logs_root, label="logs/",
+            detail="运行日志：按来源（tasks/calib/capture/realtime）与月份分目录",
+            danger=DANGER_SAFE, skipped=skipped)
+        if item is not None:
+            plan.items.append(item)
 
     # ---- ① outputs 下的一级子目录（推荐 + 谨慎两档）----
     # 声明过的位置如果**不存在**了，要说出来（改名/移动/删掉都算），
@@ -470,7 +493,7 @@ def clean_junk(plan: JunkPlan, root: str | Path) -> tuple[int, int, list[str]]:
        带走整个 `outputs/`，而逐文件删到失败就停，最坏情况也只是留下一半。
 
     删完把空目录自底向上 rmdir（只 rmdir 空目录，非空会失败并忽略）：
-    留着 `outputs/logs/` 这种空壳，下次看列表会以为"没删掉"。
+    留着 `logs/` 这种空壳，下次看列表会以为"没删掉"。
     """
     repo = Path(root).resolve()
     deleted = freed = 0

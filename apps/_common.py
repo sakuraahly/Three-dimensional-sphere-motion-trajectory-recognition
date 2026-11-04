@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from sphere_tracker.paths import LOGS_ROOT, new_log_path
 from sphere_tracker.video_profiles import DEFAULT_FPS
 
 import argparse
@@ -32,10 +33,27 @@ from pathlib import Path
 
 # apps/_common.py 的上一级就是项目根（apps/ 在根目录下）。
 ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = ROOT / "outputs" / "logs"
+#: 旧名保留：日志根已上移到 ``<项目根>/logs``（见 `sphere_tracker.paths.LOGS_ROOT`）。
+#: 不再有 ``outputs/logs`` 这个写入位置，`LOG_DIR` 现在指向新的根。
+LOG_DIR = LOGS_ROOT
 
 _LOG_FORMAT = "%(asctime)s %(levelname)-5s %(message)s"
 _LOG_DATEFMT = "%H:%M:%S"
+
+#: 日志 tag → 分区目录（`logs/<分区>/<年月>/`）。
+#:
+#: tag 是"哪段代码在写"，分区是"排障时该去哪个抽屉找"——两者不总同名：
+#: `capture_board` 采的是标定板图，归 `calib` 而不是 `capture`。
+#:
+#: **新增带日志的入口时在这里登记一行**；漏登记不会丢日志（落到 `misc`），
+#: 但会落到"其他"里，跟一次性脚本混在一起，下次排障就得先猜。
+LOG_TAGS = {
+    "calibrate": "calib",
+    "calibrate_mono": "calib",
+    "capture_board": "calib",
+    "record": "capture",
+    "realtime": "realtime",
+}
 
 
 class _MillisecondFormatter(logging.Formatter):
@@ -53,15 +71,28 @@ class _MillisecondFormatter(logging.Formatter):
 def setup_logging(
     tag: str,
     *,
+    category: str | None = None,
     log_dir: Path | None = None,
     console_level: int = logging.INFO,
     file_level: int = logging.DEBUG,
 ) -> Path:
-    """把日志**同时**写到终端和 ``outputs/logs/<tag>_<时间戳>.log``，返回文件路径。
+    """把日志**同时**写到终端和 ``logs/<分区>/<年月>/<tag>_<时间戳>.log``。
+
+    返回值就是这个文件路径，各入口会把它打印出来（"本次日志：..."）——
+    用户报问题时第一件事就是贴那行路径，所以路径必须真实、可点开。
 
     为什么要落盘：本项目最贵的一类失败是**静默失败** —— 标定收了 8 对就不动了，
     进程一退，拒绝原因的计数就没了，只能靠人在窗口前反复试。落盘之后，
     "为什么没收满"变成一个可以回看、可以贴给别人、可以跨次比对的文件。
+
+    为什么分区（2026-11-04）：原先 9196 个日志平铺在 ``outputs/logs/`` 一层，
+    找"上次标定为什么失败"要在一屏几百行里按文件名猜。现在第一层是来源
+    （`calib` / `capture` / `realtime` / `tasks`），第二层是时间片
+    （任务按日、其余按月，见 `paths._LOG_GRANULARITY`），
+    打开目录就能定位到"这个月、这个程序"。
+
+    ``category`` 不给时按 `LOG_TAGS` 从 ``tag`` 推；两者都没有就落 `misc`。
+    ``log_dir`` 是给测试用的显式覆盖（临时目录），优先级最高。
 
     分工（照 STC 的"库不配日志、app 才配"）：
       - **库层**（``calib/`` ``stereo/`` …）只 ``getLogger(__name__)`` 并写记录，
@@ -72,9 +103,12 @@ def setup_logging(
     级别分工：文件收 ``DEBUG``（每帧判定都留），终端只显示 ``INFO`` ——
     一帧一行打到终端会把有用信息淹掉。
     """
-    directory = Path(log_dir) if log_dir is not None else LOG_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    if log_dir is not None:
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    else:
+        path = new_log_path(category or LOG_TAGS.get(tag, "misc"), tag)
 
     root = logging.getLogger()
     # 只配置一次：同一个进程里被调用两次（或测试里反复跑）不应重复叠加 handler。

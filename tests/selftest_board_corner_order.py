@@ -77,7 +77,7 @@ N_COLS, N_ROWS, N = SPEC.cols, SPEC.rows, SPEC.n_points
 
 # 真值基线（用户用尺子量的两镜头中心间距，下 60 上 70）
 TAPE_BASELINE_MM = 65.0
-# 真机标定算出来的基线（outputs/logs/calibrate_20261010_162029.log）
+# 真机标定算出来的基线（logs/calib/2026-10/calibrate_20261010_162029.log）
 REAL_RIG_BASELINE_MM = 199.67
 # 守卫容差：正确对应必须落在 [0.8x, 2.0x]，错配必须 >= 5x（实测 8~15x）
 GUARD_LO, GUARD_HI = 0.8, 2.0
