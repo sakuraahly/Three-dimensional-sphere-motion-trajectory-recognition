@@ -482,7 +482,6 @@ class Viewer3D:
         # 结构：外层竖直 PanedWindow 分上下两半；上半内再套水平 PanedWindow
         # 分左/右视频，下半同理分 3D / 视角面板。拖 sash 即调各格大小，
         # 鼠标拖动条两侧内容各自响应 resize（视频 cover-crop、3D 图随画布缩放）。
-        # 比例初始按旧 grid 的 16:9 / 1:1 给，用户可拖。
         self._grid = ttk.PanedWindow(self.root, orient="vertical")
         # 上半：左右视频
         top = ttk.PanedWindow(self._grid, orient="horizontal")
@@ -516,7 +515,12 @@ class Viewer3D:
         # 右下角：视角 / 参考平面。
         side = ttk.LabelFrame(bottom, text="视角 / 参考平面", padding=(10, 8))
 
-        # 组装 paned：先 add 内容，再 add 嵌套 paned 到外层（顺序决定 sash 位置）。
+        # 组装 paned：先 add 内容，再 add 嵌套 paned 到外层。
+        # **初始比例靠 weight，不靠手动 sashpos**（2026-11-04 修）：
+        # weight 会在 sash 未被拖动时按比例分配剩余空间（视频区 2/5 = 40%），
+        # 一旦用户拖了，就转成绝对位置、weight 失效 —— 正好是"初始给比例、
+        # 之后交给用户"的正确语义。手动 `sashpos` 在窗口首帧尺寸还没算好时
+        # 会读到 winfo_height()==1，把 sash 设到 0，视频区塌成一条缝。
         top.add(self.video_l, weight=1)
         top.add(self.video_r, weight=1)
         bottom.add(plot_frame, weight=3)
@@ -525,6 +529,12 @@ class Viewer3D:
         self._grid.add(bottom, weight=3)
         self._top_pane = top
         self._bottom_pane = bottom
+        # 首次真正布局后，把上下 sash 定位到"视频区约占 40% 高"。视频 Canvas
+        # 请求尺寸是 1×1（避免正反馈撑大），所以 weight 只够给个最小值，
+        # 视频区会塌成一条缝 —— 必须等 paned 有了真实高度后补一次 sashpos。
+        # 只做一次（`_paned_seeded` 门），之后用户拖到哪就是哪。
+        self._paned_seeded = False
+        self._grid.bind("<Configure>", self._seed_video_sash)
 
         row = ttk.Frame(side)
         row.pack(fill="x")
@@ -618,7 +628,6 @@ class Viewer3D:
         # 先给控制条/状态栏留位置，再把四宫格填满剩余空间；
         # 否则 paned 的 expand 会把后面的 pack 控件压成 1px。
         self._grid.pack(fill="both", expand=True, padx=4, pady=4)
-        self.root.after(0, self._fit_video_rows)
         self.root.minsize(900, 700)
         self.root.bind("<space>", self._on_space)
         self.root.bind("<Left>", self._on_left)
@@ -634,6 +643,25 @@ class Viewer3D:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_sources()
         self._sync_mono_note()
+
+    def _seed_video_sash(self, _event=None) -> None:
+        """首帧布局完成后给视频区一个 40% 高的 sash，只做一次。
+
+        不能用 `after(0)`：那时 paned 还没被映射，`winfo_height()` 是 1，
+        sash 会被设到 0（就是用户报的"视频显示范围为 0"）。等到
+        `<Configure>` 且高度真实（>100）再设，且 `_paned_seeded` 保证不反复
+        覆盖用户后续的拖动。
+        """
+        if self._paned_seeded:
+            return
+        h = self._grid.winfo_height()
+        if h < 100:                       # 还没真正布局，等下一次 Configure
+            return
+        self._paned_seeded = True
+        try:
+            self._grid.sashpos(0, int(h * 0.4))
+        except Exception:                                   # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # 换数据源
@@ -692,25 +720,6 @@ class Viewer3D:
             # 走到这里 self 还没被动过），只把下拉拉回去。
             messagebox.showwarning("这个源打不开", f"{f}\n\n{exc}", parent=self.root)
             self._sync_source_row()
-
-    def _fit_video_rows(self, _event=None) -> None:
-        """初始给上半（视频）一个 16:9 的 sash 位置，之后交给用户拖。
-
-        只做**一次**初始定位（首次显示前），不反复覆盖用户拖过的位置 ——
-        否则拖完一松手又被弹回 16:9。cover-crop 在 `<Configure>` 里自适应，
-        拖到非 16:9 也只是裁得多/少，不会崩。
-        """
-        if getattr(self, "_paned_seeded", False):
-            return
-        self._paned_seeded = True
-        try:
-            self.root.update_idletasks()
-            total = max(120, self._grid.winfo_height())
-            # 视频区约占整高 2/5（16:9 里视频高占 pane 宽 9/16 的折中），
-            # 用户可随时拖。
-            self._grid.sashpos(0, int(total * 0.4))
-        except Exception:                                   # noqa: BLE001
-            pass
 
     def _on_space(self, event) -> None:
         # 勾选框聚焦时按空格 = 切「平滑」；不排除它，空格会**同时**切播放

@@ -281,6 +281,35 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            v.zoom == 1.0 and v.zoom_lbl.cget("text") == "1.0x"))
             checks.append(("四宫格外层是可拖动的 PanedWindow",
                            isinstance(v._grid, _ttk.PanedWindow)))
+            # 初始视频区不能塌成 0（2026-11-04 用户报"视频显示范围为 0，得
+            # 让人拖出来"）。根因是首帧时 `sashpos` 读到 winfo_height()==1。
+            # 这里不依赖真实窗口映射（本测试窗口是 withdraw 的，paned 高度
+            # 恒为 1、sashpos 会被 clamp 到 0），改为直接验 `_seed_video_sash`
+            # 的分支逻辑：用一个假 sashpos 记录它要设的值。
+            calls: list[int] = []
+            v._paned_seeded = False
+            _real_sashpos = v._grid.sashpos
+            _real_h = v._grid.winfo_height
+            v._grid.winfo_height = lambda: 500
+            v._grid.sashpos = lambda i, pos: calls.append(pos)
+            try:
+                v._seed_video_sash()            # 高度够 → 应设 500*0.4=200
+                v._seed_video_sash()            # 已 seeded → 不应再设
+            finally:
+                v._grid.winfo_height = _real_h
+                v._grid.sashpos = _real_sashpos
+            checks.append(("视频区 sash 首次定位到非 0（约总高 40%）",
+                           calls == [200]))
+            # 高度不足时不动：重置门，高度 1 → 不设、且门仍开着
+            v._paned_seeded = False
+            calls.clear()
+            v._grid.winfo_height = lambda: 1
+            try:
+                v._seed_video_sash()
+            finally:
+                v._grid.winfo_height = _real_h
+            checks.append(("首帧高度不足时不设 sash（避免设到 0）且门仍开",
+                           calls == [] and v._paned_seeded is False))
         finally:
             if v is not None:
                 v.close()       # 释放 cap，否则临时目录删不掉（WinError 32）
