@@ -1152,10 +1152,10 @@ class StereoWindow(tk.Toplevel):
             steps = [
                 ("双板·拍 A 板（左相机，板可移动）",
                  capture_chain_frames(stage="left", left=left, right=right,
-                                      target="15", **board_base)),
+                                      target="5", min_cover=4, **board_base)),
                 ("双板·拍 B 板（右相机，板可移动）",
                  capture_chain_frames(stage="dual_b", left=left, right=right,
-                                      target="15", **board_base)),
+                                      target="5", min_cover=4, **board_base)),
                 ("双板·拍同框图（左相机，两板同时入画，不检板）",
                  capture_pair_frame(camera=left, **board_base)),
             ]
@@ -1163,10 +1163,10 @@ class StereoWindow(tk.Toplevel):
             steps = [
                 ("内参段·左（板可移动，多姿态）",
                  capture_chain_frames(stage="left", left=left, right=right,
-                                      target="15", **board_base)),
+                                      target="5", min_cover=4, **board_base)),
                 ("内参段·右（板可移动，多姿态）",
                  capture_chain_frames(stage="right", left=left, right=right,
-                                      target="15", **board_base)),
+                                      target="5", min_cover=4, **board_base)),
                 ("参考段（板**固定不动**，左右成对拍）",
                  capture_chain_frames(stage="ref", left=left, right=right,
                                       target="3", **board_base)),

@@ -445,7 +445,7 @@ def capture_board(*, out: str | Path, cols: str, rows: str, square: str,
 
 def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
                          target: str, left: str = "left", right: str = "right",
-                         dirs: dict | None = None) -> list[str]:
+                         min_cover: int = 0, dirs: dict | None = None) -> list[str]:
     """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
 
     ``stage`` ∈ {``left``, ``right``, ``ref``, ``dual_b``}：
@@ -473,14 +473,16 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
             "--side", "right",
             "--camera", str(right or "").strip() or "right",
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-            "--target", str(target), "--auto")
+            "--target", str(target), "--auto",
+            *(["--min-cover", str(min_cover)] if min_cover > 0 else []))
     side = "left" if stage == "left" else "right"
     out = d["left"] if stage == "left" else d["right"]
     return _argv(
         _TOOLS / "capture_board.py", "--out", str(out), "--side", side,
         "--camera", str(left if stage == "left" else right or "").strip() or side,
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-        "--target", str(target), "--auto")
+        "--target", str(target), "--auto",
+        *(["--min-cover", str(min_cover)] if min_cover > 0 else []))
 
 
 def capture_pair_frame(*, cols: str, rows: str, square: str,
