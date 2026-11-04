@@ -101,7 +101,7 @@ def calibrate_args(method: str, board: dict | None = None,
                    relaxed: bool = False, backend: str = "",
                    dirs: dict | None = None,
                    out: str = "", baseline: float | str | None = None,
-                   fov_from_profile: str = "") -> list[str]:
+                   fov_from_profile: str = "", use_fov: bool = True) -> list[str]:
     """双目标定的完整 argv。
 
     三条分支的差别**只在参数**，不在文案：
@@ -119,9 +119,14 @@ def calibrate_args(method: str, board: dict | None = None,
     只会让人误以为「跳过裁剪」和「不跳过」有区别。**已从界面下拉移除**
     （分支保留给旧调用方，见 `_gui_stereo.METHODS` 的说明）。
 
-    ``--skip-fov`` 不属于这里任何一条：它只属于旧界面那个"90° 装置"专用入口。
-    angled 模式后端本来就 ``do_fov = not skip_fov and (mode != "angled" or --fov)``
-    → 天然跳过 FOV 对齐，不需要额外 flag。
+    ``use_fov`` 是"这次标定要不要做视场对齐"（2026-11-04 用户："FOV 有点影响
+    平行双目标定了"）。``False`` 时对**会做裁剪**的方法传 ``--skip-fov``：
+    两路按原始画面标定，不裁像素、不重采样。默认 ``True`` = 老行为，
+    旧调用方与判据不受影响。
+
+    ``--skip-fov`` 不在 chain/chain_dual 下传：它们产出 none_raw，后端
+    ``do_fov = not skip_fov and (mode != "angled" or --fov)`` 本来就为 False
+    （链式是 angled），再传只是噪音。
 
     ``baseline`` 是**物理核对**（`--baseline-mm`）：传了它，后端才会检查
     "解出的基线 vs 卷尺量的是不是差太远"——这是 chain 双板模式下**唯一**的
@@ -216,12 +221,17 @@ def calibrate_args(method: str, board: dict | None = None,
         _base = 0.0
     if _base > 0:
         cmd += ["--baseline-mm", f"{_base:g}"]
-    # `--fov-from-profile` **只对会做视场裁剪的方法下传**（joint 那两条）。
-    # chain/chain_dual 产出 none_raw、不做 FOV 对齐（90° 无共视，单应裁剪
-    # 没有物理意义），传了后端会直接报互斥错误。在这里判比在界面判好：
-    # argv 只有这一个产地，界面不必知道"哪种方法做裁剪"这件事。
-    if str(fov_from_profile or "").strip() and method not in ("chain", "chain_dual"):
-        cmd += ["--fov-from-profile", str(fov_from_profile).strip()]
+    # FOV 三件事**在同一个地方**判，argv 只有这一个产地：
+    #   ① 关掉 → `--skip-fov`（明确不做对齐，也不做现场估计）；
+    #   ② 开着且档案里有名字 → `--fov-from-profile`（复用量好的参数）；
+    #   ③ 开着但没名字 → 什么都不传（后端从启动帧现场估，老行为）。
+    # `--fov-from-profile` 与 `--skip-fov` 互斥：关掉时绝不带上档案名，
+    # 否则后端会直接 argparse 报错（1055 行那条校验）。
+    if method not in ("chain", "chain_dual"):
+        if not use_fov:
+            cmd += ["--skip-fov"]
+        elif str(fov_from_profile or "").strip():
+            cmd += ["--fov-from-profile", str(fov_from_profile).strip()]
     return cmd
 def offline_stereo(session: str | Path, *, mode: str = "",
                    anchor: bool = False, method: str = "", seed_json: str = "",

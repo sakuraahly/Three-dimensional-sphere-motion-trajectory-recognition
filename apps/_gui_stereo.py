@@ -676,6 +676,12 @@ class StereoWindow(tk.Toplevel):
             value=prefs.get_str("stereo.min_sharpness", "800"))
         self.var_relaxed = tk.BooleanVar(
             value=prefs.get_bool("stereo.relaxed", False))
+        # FOV 裁剪开关：**默认关**（2026-11-04 用户："FOV 有点影响平行双目标定了"）。
+        # 只有两路视场明显不一致（一路明显更广）时才需要对齐；关掉 = `--skip-fov`，
+        # 两路按原始画面标定，不裁像素也不重采样。默认关而不是"跟着档案走"：
+        # 档案里存着 FOV 只说明**量过**，不代表这次标定该用它。
+        self.var_use_fov = tk.BooleanVar(
+            value=prefs.get_bool("stereo.use_fov", False))
         self.var_left = tk.StringVar(value="left")
         self.var_right = tk.StringVar(value="right")
         self.var_session = tk.StringVar(value="")
@@ -807,6 +813,14 @@ class StereoWindow(tk.Toplevel):
             side="left", padx=(6, 0))
         ttk.Checkbutton(inner, text="放宽模式（手持拍摄：只放松面积/边距/亮度四项）",
                         variable=self.var_relaxed).pack(anchor="w", pady=(6, 0))
+        # FOV 对齐（2026-11-04 用户："FOV 有点影响平行双目标定了"）。
+        # 和「放宽模式」同类 —— 都是改变标定口径的进阶开关，所以放高级折叠区，
+        # 不占首屏、也不占 L1 预算。默认关：关 = `--skip-fov`，两路按原始画面标定。
+        ttk.Checkbutton(inner, text="用 FOV 裁剪对齐两路视场（默认关）",
+                        variable=self.var_use_fov).pack(anchor="w", pady=(6, 0))
+        self.lbl_fov = ttk.Label(inner, text="", style="Hint.TLabel")
+        self.lbl_fov.pack(anchor="w")
+        self._sync_fov_hint()
         ttk.Label(inner,
                   text="停稳与清晰度填了就以你填的为准：放宽模式不会覆盖这两个值。",
                   style="Hint.TLabel").pack(anchor="w")
@@ -827,6 +841,27 @@ class StereoWindow(tk.Toplevel):
             # 下的四段图，GUI 没地方采，点了标定只能看"缺图"报错。
             self.surface.secondary(actions, "采集标定板图…", self._capture_chain_frames)
             self.surface.secondary(actions, "检查链式输入", self._check_chain_inputs)
+
+    def _sync_fov_hint(self) -> None:
+        """把档案里 FOV 的状态写清：勾了会发生什么、不勾会发生什么。
+
+        这不是装饰。FOV 一关，两路像素尺度不一致时视差/深度会有系统偏差，
+        用户必须知道代价；反过来档案里根本没量过 FOV 时，勾了也只是现场估计，
+        不能让人以为"勾了就复用档案里那份"。
+        """
+        lbl = getattr(self, "lbl_fov", None)
+        if lbl is None:
+            return
+        fov = getattr(self.app.state.profile, "fov", None)
+        if fov:
+            side = str(fov.get("crop_side") or "?")
+            size = fov.get("target_size") or []
+            size_txt = f"→{size[0]}×{size[1]}" if len(size) == 2 else ""
+            lbl.configure(text=f"档案已记录 FOV（裁 {side}{size_txt}）；"
+                               "不勾 = 按原始画面标定")
+        else:
+            lbl.configure(text="档案里还没量过 FOV；勾选 = 本次从启动帧现场估计"
+                               "（估不出来会降级为不裁剪，并写 fov=null）")
 
     # ------------------------------------------------------------------ #
     # ③ 采集
@@ -979,6 +1014,8 @@ class StereoWindow(tk.Toplevel):
     def _reload_state(self) -> None:
         self.app.state.reload()
         self._refresh_state()
+        # 档案可能换了（换装置/重新标定），FOV 提示要跟着变。
+        self._sync_fov_hint()
 
     # ------------------------------------------------------------------ #
     # 动作
@@ -1053,10 +1090,11 @@ class StereoWindow(tk.Toplevel):
         # 后端那段"基线差 X% → 先查两板是否真刚性固定 / A/B 是否分配反"
         # 就永远不执行 —— 档案里明明存着 expected_baseline_mm。
         base_mm = getattr(self.app.state.profile, "expected_baseline_mm", None)
-        # FOV 也一样：档案里量过的裁剪参数优先复用（口径稳定、免于现场估失败）。
-        # **只在档案真的存了 fov 时才传**——否则后端会报"档案里还没有 FOV 参数"
-        # 而拒绝标定，等于"没量过就用不了"，把可选项变成了必选项。
-        # 没存就退回旧行为（从启动帧现场估）。
+        # FOV：**由第②步的勾选决定用不用**（2026-11-04 用户："FOV 有点影响
+        # 平行双目标定了"）。勾着且档案里量过就复用档案参数；不勾就明确传
+        # `--skip-fov`，两路按原始画面标定。
+        # **只在档案真的存了 fov 时才给名字**——否则后端会报"档案里还没有
+        # FOV 参数"而拒绝标定，等于把可选项变成了必选项。
         prof_obj = self.app.state.profile
         has_fov = bool(getattr(prof_obj, "fov", None))
         fov_prof = (getattr(prof_obj, "name", "") or "") if has_fov else ""
@@ -1068,7 +1106,8 @@ class StereoWindow(tk.Toplevel):
             stationary=self.var_stationary.get(),
             sharpness=self.var_sharpness.get(),
             relaxed=bool(self.var_relaxed.get()),
-            out=(prof or ""), baseline=base_mm, fov_from_profile=fov_prof)
+            out=(prof or ""), baseline=base_mm, fov_from_profile=fov_prof,
+            use_fov=bool(self.var_use_fov.get()))
         if method in ("chain", "chain_dual"):
             # 先查图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
             d = chain_dirs()

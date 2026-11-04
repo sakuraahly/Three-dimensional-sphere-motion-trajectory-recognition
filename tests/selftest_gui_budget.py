@@ -51,7 +51,10 @@ L2_CLICKABLE_MAX = 12
 # 大角度（angled）第②步：链式标定比 joint 多「标定方法下拉 + 采集标定板图 +
 # 检查链式输入」三个控件，是**真实且必要**的内容差异，不是"长回一个窗口装全部"。
 # 单独给它放宽 L2 上限，其余窗口仍守 12。
-ANGLED_L2_CLICKABLE_MAX = 14
+# 2026-11-04 再加「FOV 对齐」勾选（用户报"FOV 影响平行标定"，要能关掉）——
+# 它与「放宽模式」同为改变标定口径的进阶开关，落在高级折叠区，仍算 L2 可点。
+# 14 → 15：也是真实且必要的新增，不是结构长回去。
+ANGLED_L2_CLICKABLE_MAX = 15
 
 
 def walk(widget):
@@ -188,19 +191,32 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     check("普通 joint（大角度窗）：带当前模式 angled",
           _has_seq(ang, ["--stereo-mode", "angled"]), " ".join(ang))
 
-    # ---- 对标老窗口 §8b/§8c：--skip-fov 只属于 90° 专用入口 ----
-    # 新窗口没有那个入口（等效做法是 joint_skip_fov → --stereo-mode angled）。
-    # 一旦有人把 flag 塞进普通 joint，裁剪与内参口径会同时变，属于静默改行为。
-    branches = {"joint/parallel": p, "joint/angled": ang,
-                "joint_skip_fov": s}
-    offenders = [k for k, v in branches.items() if "--skip-fov" in v]
-    check("--skip-fov 不出现在任何普通标定分支（那是 90° 专用入口的参数）",
-          not offenders,
-          "；".join(f"{k}: {' '.join(v)}" for k, v in branches.items()))
-    check("若将来引入 90° 入口，--skip-fov 必须与 --stereo-mode angled 成对出现",
-          all(("--skip-fov" not in v)
-              or _has_seq(v, ["--stereo-mode", "angled"])
-              for v in branches.values()))
+    # ---- FOV 开关（2026-11-04）：默认不动老行为，显式关才 skip ----
+    # 用户报"FOV 有点影响平行双目标定了"，第②步加了勾选（默认关）。
+    #
+    # 旧判据是"--skip-fov 不许出现在任何普通分支"：那时界面没有开关，
+    # 谁把 flag 塞进去就等于静默改裁剪口径。现在它变成**用户显式选择**，
+    # 判据跟着改成三件事：默认不出现 / 关掉必须落命令行 / 关掉不能同时
+    # 带 --fov-from-profile（后端 1055 行判互斥，会直接 argparse 报错）。
+    p_default = calibrate_args("joint", {}, "", "", "parallel")
+    p_off = calibrate_args("joint", {}, "", "", "parallel", use_fov=False)
+    p_off_prof = calibrate_args("joint", {}, "", "", "parallel",
+                                fov_from_profile="rig", use_fov=False)
+    p_on_prof = calibrate_args("joint", {}, "", "", "parallel",
+                               fov_from_profile="rig")
+    check("默认（不传 use_fov）不出现 --skip-fov（老行为不变）",
+          "--skip-fov" not in p_default, " ".join(p_default))
+    check("界面关掉 FOV → 命令行真的带 --skip-fov",
+          "--skip-fov" in p_off, " ".join(p_off))
+    check("关掉时不再带 --fov-from-profile（后端会判互斥）",
+          "--skip-fov" in p_off_prof and "--fov-from-profile" not in p_off_prof,
+          " ".join(p_off_prof))
+    check("打开且档案有名字 → 带 --fov-from-profile、不带 skip",
+          "--fov-from-profile" in p_on_prof
+          and "--skip-fov" not in p_on_prof, " ".join(p_on_prof))
+    chain_off = calibrate_args("chain_dual", {}, "", "", "angled", use_fov=False)
+    check("链式（none_raw）不下传 --skip-fov（它本来就不做 FOV）",
+          "--skip-fov" not in chain_off, " ".join(chain_off))
 
     # ---- 录制：预览开关必须传下去（"标定完实时画面没了"的根因）----
     #
