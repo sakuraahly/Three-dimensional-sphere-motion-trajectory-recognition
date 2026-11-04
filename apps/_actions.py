@@ -483,6 +483,22 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
         "--target", str(target), "--auto")
 
 
+def capture_pair_frame(*, cols: str, rows: str, square: str,
+                       camera: str = "left",
+                       dirs: dict | None = None) -> list[str]:
+    """拍双板链式的**同框图**（pair）：单相机、不做单板检测、按空格存。
+
+    双板模式求 T_AB 需要一张"两块板同时入画"的图，`capture_board.py` 的单板
+    检测器检不了它，所以走 ``--pair`` 模式（2026-11-04 前这块只能让用户手动拍）。
+    """
+    d = dirs if dirs is not None else chain_dirs()
+    return _argv(
+        _TOOLS / "capture_board.py", "--out", str(d["pair"]),
+        "--camera", str(camera or "left").strip() or "left",
+        "--cols", str(cols), "--rows", str(rows), "--square", str(square),
+        "--target", "1", "--pair")
+
+
 def check_chain_inputs(*, cols: str, rows: str, square: str,
                        dirs: dict | None = None,
                        mode: str = "single") -> list[str]:

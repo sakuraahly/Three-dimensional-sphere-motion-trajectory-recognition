@@ -40,7 +40,8 @@ from apps._collapsible import CollapsibleSection
 # 不再自己拼命令行 —— 否则同一个动作会有两份参数清单，已经因此出过三次缺陷。
 from apps._actions import (CHAIN_ROOT, board_args, calibrate_args,
                            chain_dirs, check_chain_inputs, check_setup_args,
-                           capture_chain_frames, offline_args, record_args)
+                           capture_chain_frames, capture_pair_frame,
+                           offline_args, record_args)
 from apps import _actions
 from apps._stereo_layout import (
     MODE_LABELS,
@@ -1155,6 +1156,8 @@ class StereoWindow(tk.Toplevel):
                 ("双板·拍 B 板（右相机，板可移动）",
                  capture_chain_frames(stage="dual_b", left=left, right=right,
                                       target="15", **board_base)),
+                ("双板·拍同框图（左相机，两板同时入画，不检板）",
+                 capture_pair_frame(camera=left, **board_base)),
             ]
         else:
             steps = [
@@ -1173,14 +1176,13 @@ class StereoWindow(tk.Toplevel):
         def run_next(_task=None):
             if self._chain_step >= len(steps):
                 if self._method_key() == "chain_dual":
-                    # 「用左相机」必须写出来：后端拼的是 --pair-camera left，
-                    # 而 A/B 的判定用的是"左相机看 A 板"的姿态簇。换右相机拍，
-                    # 姿态簇的坐标系就变了 —— 两块板姿态差 90° 时那种错误
-                    # **不会**触发"差 <5°"护栏，会静默给出反向的 T_AB。
+                    # 同框图也是【左相机】拍（后端拼 --pair-camera left）：
+                    # A/B 的判定用的是"左相机看 A 板"的姿态簇，换右相机拍，
+                    # 姿态簇坐标系就变了——两块板差 90° 时那种错误不会触发
+                    # "差 <5°"护栏，会静默给出反向的 T_AB。
                     self.status.set_status(
-                        "A/B 两板图拍完。同框图要用【左相机】手动拍一张"
-                        "（两块板同时完整入画）放进 "
-                        f"{d['pair']}，再点「检查链式输入」「开始标定」", "info")
+                        "A/B 两板 + 同框图都拍完了。点「检查链式输入」确认"
+                        "两块板都被检出，再点「开始标定」", "info")
                 else:
                     self.status.set_status(
                         "四段图拍完。点「检查链式输入」确认没问题，再点「开始标定」",

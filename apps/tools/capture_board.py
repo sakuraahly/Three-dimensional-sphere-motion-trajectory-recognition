@@ -562,6 +562,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          "（=Laplacian 方差 × 格子像素数，默认 800.0）。"
                          "绝对阈值没有刻度，真正起作用的是相对判据：focus 低于"
                          "已存帧中位数 40%% 才判糊（阈值取自 CaptureConfig）；越小越宽松")
+    ap.add_argument("--pair", action="store_true",
+                    help="同框图模式（双板链式的 T_AB 用）：单相机、**不做单板检测**，"
+                         "按空格存一帧就落盘（或 --auto 定时存），存够 --target 退。"
+                         "同一画面有两块板，单板检测器必然失败，所以必须跳过检测")
     ap.add_argument("--auto", action="store_true",
                     help="停稳自动存（不用按空格）")
     ap.add_argument("--auto-hold", type=int, default=6,
@@ -630,6 +634,91 @@ def _make_dir(path: str | None) -> Path | None:
     return p
 
 
+def _run_pair(args, out_dir: Path, show: bool, auto: bool,
+             gap: float) -> int:
+    """双板链式的**同框图**采集：单相机、**不做单板检测**、按空格/定时存一帧。
+
+    为什么单独立一个函数而不是塞进 `_run_single`：同框图里**两块板同时入画**，
+    单板检测器（`detect_board`）必然失败，`gate_frame` 那套"检板→判稳→判糊"
+    完全用不上。硬塞进去只会让"pair 特例"污染正常的标定图采集循环。
+
+    存图只靠人按空格（或 --auto 定时）：同框图的正确性由**人当场判断**
+    （两块板都完整、清晰、不糊），机器在这件事上帮不上忙。
+    """
+    # 窗口助手在第一次用之前建好（`selftest_window_mode` 的"先建后用"约定）
+    wins = WindowManager()
+
+    try:
+        src = _open_source(args.source, args.camera, args, side=args.side)
+    except Exception as exc:                                     # noqa: BLE001
+        print(f"[错误] 打不开相机/视频：{(str(exc).splitlines() or [type(exc).__name__])[0]}")
+        return 1
+    log.info("同框图（pair）模式：单相机 %s %dx%d fps=%.0f，不做单板检测",
+             src.info.kind, src.info.width, src.info.height, src.info.fps)
+
+    saved = 0
+    last_save_ts: float | None = None
+    t0 = time.perf_counter()
+    try:
+        while True:
+            if args.timeout > 0 and time.perf_counter() - t0 >= args.timeout:
+                log.info("到 --timeout %.1f s，停止", args.timeout)
+                break
+            ok, frame, ts = src.read()
+            if not ok or frame is None:
+                log.info("输入结束")
+                break
+
+            pressed = -1
+            if show:
+                footer = (f"{saved}/{args.target} 张   同框图：两块板都完整、清晰再存   "
+                          f"空格 保存   q 退出   {wins.fullscreen_hint()}")
+                # obs 用空观测（found=False）而不是 None：`_paint_lane` 会读
+                # obs.found，传 None 直接 AttributeError。同框图不检板，所以
+                # 引导框/角点都不该出现，只画原图 + 底部提示。
+                canvas = _compose(
+                    [{"title": f"{args.side or '相机'}", "frame": frame,
+                      "obs": BoardObservation(), "ok": True, "reason": "",
+                      "spec": None}],
+                    _canvas_size(VIEW_SINGLE), footer, True)
+                wins.show(VIEW_SINGLE, canvas)
+                pressed = cv2.waitKey(1) & 0xFF
+                if wins.handle_key(VIEW_SINGLE, pressed, canvas):
+                    continue
+                if pressed == ord("q") or pressed == 27:
+                    log.info("用户退出（q/ESC）")
+                    break
+
+            manual = show and pressed == 32
+            since = float("inf") if last_save_ts is None else ts - last_save_ts
+            auto_fire = auto and last_save_ts is not None and since >= gap
+            # 第一张不自动存：让用户先摆好、按空格确认，之后 --auto 才定时续存
+            if not (manual or auto_fire):
+                continue
+
+            name = f"pair_{saved + 1:02d}_{int(time.time() * 1000)}.png"
+            path = out_dir / name
+            if not cv2.imwrite(str(path), frame):
+                print(f"[错误] 写不进文件：{path}")
+                return 1
+            saved += 1
+            last_save_ts = ts
+            print(f"已存 {saved}/{args.target}  {name}")
+            log.info("保存同框图 %s", path)
+            if saved >= args.target:
+                break
+    finally:
+        src.release()
+        if show:
+            cv2.destroyAllWindows()
+
+    print(f"共保存 {saved} 张同框图 → {out_dir}")
+    if saved == 0:
+        print("[提示] 一张都没存：同框图是双板链式求 T_AB 的必需输入，"
+              "没有它「开始标定」会缺 --pair-frame")
+    return 0 if saved >= args.target else 3
+
+
 def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     # 有 --source 一律不建窗口；无窗口时**只能自动存**，否则没有任何保存途径。
     show = not (args.no_show or args.source)
@@ -638,6 +727,9 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     # 窗口助手必须在**第一次调用它之前**建好（静态看没毛病，跑起来才炸
     # UnboundLocalError —— `run_realtime` 踩过这个，见 `selftest_window_mode` §3）。
     wins = WindowManager()
+
+    if args.pair:
+        return _run_pair(args, out_dir, show, auto, gap)
 
     try:
         src = _open_source(args.source, args.camera, args, side=args.side)
