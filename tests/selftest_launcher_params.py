@@ -204,6 +204,53 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            v._smooth_active() is False))
             v.use_smooth.set(True)
             v._on_toggle_smooth()
+
+            # ---- 8d-2. 视角：CAD 方向预设 / 任意滚转 / 重画不弹回（2026-11-04）----
+            # 用户报"旋转自由度不够、要像 CAD 那样选方向"。这里钉三件事：
+            # ① 预设真的改到 ax（不是只改下拉文字）；
+            # ② 滚转（第三个自由度）生效；
+            # ③ **换帧重画不会把视角打回默认** —— 老实现每帧 view_init(22,-62)，
+            #    播放时根本转不动，这才是"自由度不够"的真因。
+            import numpy as _np
+            v.view_box.set("俯视（从头顶）")
+            v._on_view_preset()
+            checks.append(("选「俯视」后 ax 的仰角/方位角真的变了",
+                           abs(v.ax.elev - 0.0) < 1e-6
+                           and abs(v.ax.azim + 90.0) < 1e-6))
+            v.view_box.set("前视（相机看到的）")
+            v._on_view_preset()
+            checks.append(("「前视」是相机视角（elev=-90，屏幕 X 右 / Y 下）",
+                           abs(v.ax.elev + 90.0) < 1e-6))
+            v.view.update(elev=12.0, azim=34.0, roll=56.0)
+            v._redraw()
+            checks.append(("换帧重画后视角不被弹回（旋转留得住）",
+                           abs(v.ax.elev - 12.0) < 1e-6
+                           and abs(v.ax.azim - 34.0) < 1e-6
+                           and abs(getattr(v.ax, "roll", 0.0) - 56.0) < 1e-6))
+            v._set_roll(-30.0)
+            checks.append(("滚转滑块生效（roll 是第三个自由度）",
+                           abs(v.ax.roll + 30.0) < 1e-6
+                           and abs(v.roll_scale.get() + 30.0) < 1e-6))
+            n_base = len(v.ax.collections) + len(v.ax.lines)
+            v.show_planes["XY"].set(True)
+            v._on_plane_toggle()
+            n_xy = len(v.ax.collections) + len(v.ax.lines)
+            checks.append(("勾选 XY 平面后多出图元（面 + 网格线）", n_xy > n_base))
+            v.show_planes["XZ"].set(True)
+            v.show_planes["YZ"].set(True)
+            v._on_plane_toggle()
+            checks.append(("三个平面能同时开",
+                           len(v.ax.collections) + len(v.ax.lines) > n_xy))
+            for _name in v.show_planes:
+                v.show_planes[_name].set(False)
+            v._on_plane_toggle()
+            checks.append(("全部取消后回到原来的图元数",
+                           len(v.ax.collections) + len(v.ax.lines) == n_base))
+            p_proj = v.ax.get_proj().copy()
+            v.ortho.set(False)
+            v._on_proj_toggle()
+            checks.append(("正交 / 透视可切换（投影矩阵确实不同）",
+                           not _np.allclose(p_proj, v.ax.get_proj())))
         finally:
             if v is not None:
                 v.close()       # 释放 cap，否则临时目录删不掉（WinError 32）

@@ -144,6 +144,34 @@ INSET_SMOOTH_COLOR = "#f97316"
 #: 小图里的中文（matplotlib 默认字体没有汉字，会画成方框）。按顺序回退。
 INSET_FONTS = ("Microsoft YaHei", "SimHei", "DejaVu Sans")
 
+#: CAD 式标准视角：(elev, azim, roll)，单位度。
+#:
+#: 键是**用户看到的说法**，不是轴的正负号。相机系 Y 向下，所以"俯视"
+#: （从头顶看）是观察者在 **-Y** —— 写成 (0, -90)，不是 (90, 0)。
+#:
+#: "前视"为什么是 elev=-90（实测，别凭直觉改）：
+#: matplotlib 的相机位置是 (cos e·cos a, cos e·sin a, sin e)。
+#: elev=-90 把眼睛放在 **-Z**（光心处）朝 +Z 看，屏幕上 X 右 / Y 下 ——
+#: 与相机拍到的画面同向；elev=+90 是从场景背后回看，Y 会翻到屏幕上方。
+VIEW_PRESETS = {
+    "等轴测": (35.264, -45.0, 0.0),
+    "前视（相机看到的）": (-90.0, -90.0, 0.0),
+    "后视（从背后）": (90.0, -90.0, 0.0),
+    "右视": (0.0, 0.0, 0.0),
+    "左视": (0.0, 180.0, 0.0),
+    "俯视（从头顶）": (0.0, -90.0, 0.0),
+    "仰视（从下方）": (0.0, 90.0, 0.0),
+}
+DEFAULT_VIEW = "等轴测"
+
+#: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
+PLANE_STYLES = {
+    "XY": (2, "#60a5fa"),
+    "XZ": (1, "#34d399"),
+    "YZ": (0, "#fbbf24"),
+}
+_AXIS_NAMES = ("X", "Y", "Z")
+
 
 def track_arrays(points: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """点列 → ``(t, P, P_smooth, valid)``，**四个数组长度都等于 `len(points)`**。
@@ -328,6 +356,16 @@ class Viewer3D:
         # 不指定 master 的布尔变量会绑到"默认根"上，换到第二个窗口就抛
         # `too many values to unpack` / 变量失效。
         self.use_smooth = tk.BooleanVar(master=root, value=True)
+        # 视角与参考平面同样是**用户偏好**，放在 `_apply` 之外：换会话还是同一套
+        # 坐标系，把视角弹回默认没有道理（用户的旋转应该留得住）。
+        _e, _a, _r = VIEW_PRESETS[DEFAULT_VIEW]
+        self.view = {"elev": _e, "azim": _a, "roll": _r}
+        self.show_planes = {name: tk.BooleanVar(master=root, value=False)
+                            for name in PLANE_STYLES}
+        self.ortho = tk.BooleanVar(master=root, value=True)
+        self._roll_drag: tuple[int, float] | None = None
+        self._syncing_view = False
+        self._plane_note = ""
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -431,7 +469,7 @@ class Viewer3D:
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
-        # 2×2：左上左视频 / 右上右视频 / 左下 3D / 右下待定
+        # 2×2：左上左视频 / 右上右视频 / 左下 3D / 右下视角面板
         grid = ttk.Frame(self.root)
         self._grid = grid
         grid.rowconfigure(0, weight=0)
@@ -467,11 +505,46 @@ class Viewer3D:
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        reserved = ttk.LabelFrame(grid, text="右下 · 待定", padding=10)
-        reserved.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
-        ttk.Label(reserved, text="预留区（下一阶段再定）\n\n"
-                                "候选：误差曲线 / 速度 / 预测 / 多会话对比",
-                  style="Hint.TLabel", justify="left").pack(anchor="nw")
+        # 右下角：视角 / 参考平面。放在这里而不是塞进底部控制条 ——
+        # 控制条已经有播放/帧/速度/平滑，再挤会把 3D 图压矮。
+        side = ttk.LabelFrame(grid, text="视角 / 参考平面", padding=(10, 8))
+        side.grid(row=1, column=1, sticky="nsew", padx=2, pady=2)
+
+        row = ttk.Frame(side)
+        row.pack(fill="x")
+        ttk.Label(row, text="观察方向").pack(side="left")
+        self.view_box = ttk.Combobox(row, values=list(VIEW_PRESETS),
+                                     state="readonly", width=15)
+        self.view_box.set(DEFAULT_VIEW)
+        self.view_box.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        self.view_box.bind("<<ComboboxSelected>>", self._on_view_preset)
+
+        ttk.Label(side, text="绕视线滚转（也可 Shift + 左键拖动）",
+                  style="Hint.TLabel").pack(anchor="w", pady=(10, 0))
+        roll_row = ttk.Frame(side)
+        roll_row.pack(fill="x")
+        self.roll_scale = ttk.Scale(roll_row, from_=-180, to=180,
+                                    command=self._on_roll)
+        self.roll_scale.pack(side="left", fill="x", expand=True)
+        self.roll_lbl = ttk.Label(roll_row, text="0°", width=5, anchor="e")
+        self.roll_lbl.pack(side="left", padx=(6, 0))
+
+        ttk.Label(side, text="参考平面（过原点）",
+                  style="Hint.TLabel").pack(anchor="w", pady=(10, 2))
+        for _name in PLANE_STYLES:
+            ttk.Checkbutton(side, text=f"{_name} 平面",
+                            variable=self.show_planes[_name],
+                            command=self._on_plane_toggle).pack(anchor="w")
+        self.ortho_chk = ttk.Checkbutton(
+            side, text="正交投影（CAD 风格）", variable=self.ortho,
+            command=self._on_proj_toggle)
+        self.ortho_chk.pack(anchor="w", pady=(8, 0))
+
+        self.plane_note = ttk.Label(side, text="", style="Hint.TLabel",
+                                    wraplength=250, justify="left")
+        self.plane_note.pack(anchor="w", pady=(8, 0))
+        ttk.Label(side, text="左键拖动：自由旋转（任意方位/仰角）",
+                  style="Hint.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
 
         bar = ttk.Frame(self.root, padding=(8, 4))
         bar.pack(fill="x")
@@ -526,6 +599,12 @@ class Viewer3D:
         self.root.bind("<Left>", self._on_left)
         self.root.bind("<Right>", self._on_right)
         self.root.bind("<Home>", lambda _e: self._reset_view())
+        # Shift + 左键拖动 = 绕视线滚转。matplotlib 原生只改 elev/azim，
+        # 没有 roll；elev 又被夹在 ±90°，所以少了这一个自由度就到不了
+        # "从球的正后方斜着看"这类姿态。
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_sources()
         self._sync_mono_note()
@@ -637,7 +716,13 @@ class Viewer3D:
         return ([self.lo[i] - pad[i] for i in range(3)],
                 [self.hi[i] + pad[i] for i in range(3)])
 
-    def _reset_view(self) -> None:
+    def _fit_axes(self) -> None:
+        """按数据包围盒设三轴范围与等比例盒。
+
+        **只碰范围，不碰视角**。以前它和视角设置写在同一个 `_reset_view` 里、
+        而 `_redraw` 每帧都调 —— 播放时用户刚转到的角度下一帧就被打回默认，
+        表现就是"根本转不动"。拆开之后旋转才留得住。
+        """
         lo, hi = self._limits()
         self.ax.set_xlim(lo[0], hi[0])
         self.ax.set_ylim(lo[1], hi[1])
@@ -646,8 +731,163 @@ class Viewer3D:
             self.ax.set_box_aspect((hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]))
         except Exception:                                   # noqa: BLE001
             pass
-        self.ax.view_init(elev=22, azim=-62)
+
+    def _apply_view(self) -> None:
+        """把 ``self.view`` 与投影方式应用到 ax。
+
+        `ax.clear()` 会把 `view_init` 的角度、投影类型全部打回默认，
+        所以每次 `_redraw` 都必须在画完图元后重新应用一次。
+        """
+        try:
+            self.ax.view_init(elev=self.view["elev"], azim=self.view["azim"],
+                              roll=self.view["roll"])
+        except TypeError:            # matplotlib < 3.6 没有 roll 参数
+            self.ax.view_init(elev=self.view["elev"], azim=self.view["azim"])
+        try:
+            self.ax.set_proj_type("ortho" if self.ortho.get() else "persp")
+        except (AttributeError, ValueError):
+            pass
+        self._hide_depth_axis()
+
+    def _hide_depth_axis(self) -> None:
+        """视线几乎与某根轴平行时，把那根轴的刻度与标签藏掉。
+
+        前后视（elev=±90）看的是 XY 平面、俯仰视看的是 XZ 平面 —— 此时
+        深度轴在屏幕上退化成一点，matplotlib 会把它的刻度和轴名全挤在
+        角落里糊成一团（实测 89.5° 也救不了）。CAD 的正视图本来也不标
+        深度轴，藏掉更干净。阈值 0.995 ≈ 离轴 5.7° 以内。
+
+        恢复靠 `_redraw` 里的 `ax.clear()`：所以切方向走的是重画，
+        不是只调一次 `view_init`（否则切回等轴测时轴标签还是空的）。
+        """
+        e = np.radians(self.view["elev"])
+        a = np.radians(self.view["azim"])
+        eye = (np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e))
+        k = int(np.argmax(np.abs(eye)))
+        if abs(eye[k]) < 0.995:
+            return
+        axis = (self.ax.xaxis, self.ax.yaxis, self.ax.zaxis)[k]
+        axis.set_ticklabels([])
+        axis.label.set_text("")
+
+    def _sync_roll_widget(self) -> None:
+        """把滑块/数字同步到 ``self.view["roll"]``，且不触发回调递归。"""
+        self._syncing_view = True
+        try:
+            self.roll_scale.set(self.view["roll"])
+        finally:
+            self._syncing_view = False
+        self.roll_lbl.configure(text=f"{self.view['roll']:.0f}°")
+
+    def _set_roll(self, value: float) -> None:
+        self.view["roll"] = max(-180.0, min(180.0, float(value)))
+        self._sync_roll_widget()
+        self._apply_view()
         self.canvas.draw_idle()
+
+    def _on_roll(self, value: str) -> None:
+        if self._syncing_view:
+            return
+        self.view["roll"] = float(value)
+        self.roll_lbl.configure(text=f"{float(value):.0f}°")
+        self._apply_view()
+        self.canvas.draw_idle()
+
+    def _on_view_preset(self, _event=None) -> None:
+        name = self.view_box.get()
+        if name not in VIEW_PRESETS:
+            return
+        e, a, r = VIEW_PRESETS[name]
+        self.view = {"elev": e, "azim": a, "roll": r}
+        self._sync_roll_widget()
+        # 走重画而不是只 view_init：`_hide_depth_axis` 可能藏了某根轴，
+        # 只有 `clear()` 能把它恢复回来。
+        self._redraw()
+
+    def _on_plane_toggle(self) -> None:
+        # 平面是图元（surface + 网格线），不是视角属性 —— 必须整幅重画。
+        self._redraw()
+
+    def _on_proj_toggle(self) -> None:
+        self._apply_view()
+        self.canvas.draw_idle()
+
+    # ---- 鼠标：Shift + 左键拖动 = 绕视线滚转 ----
+    def _on_mouse_press(self, event) -> None:
+        if event.button == 1 and event.key == "shift":
+            self._roll_drag = (event.x, self.view["roll"])
+            # 关掉原生的 azim/elev 旋转，否则同一个拖动会同时改两个角
+            self.ax.set_navigate(False)
+
+    def _on_mouse_move(self, event) -> None:
+        if self._roll_drag is None or event.x is None:
+            return
+        x0, r0 = self._roll_drag
+        self._set_roll(r0 + (event.x - x0) * 0.5)
+
+    def _on_mouse_release(self, _event) -> None:
+        if self._roll_drag is not None:
+            self._roll_drag = None
+            self.ax.set_navigate(True)
+
+    def _reset_view(self) -> None:
+        """回到默认视角（按钮 / Home 键）。只改角度，不碰数据范围。"""
+        e, a, r = VIEW_PRESETS[DEFAULT_VIEW]
+        self.view = {"elev": e, "azim": a, "roll": r}
+        self.view_box.set(DEFAULT_VIEW)
+        self._sync_roll_widget()
+        self._redraw()
+
+    def _draw_planes(self) -> None:
+        """画勾选的坐标平面（过原点；范围取当前轴范围）。
+
+        为什么贴边而不是死画在 0：相机系原点在光心，轨迹常在 z=1~5 m。
+        若某根轴的范围不含 0，平面画在 0 就完全看不见 —— 用户勾了没反应。
+        所以夹到最近的可见位置，并在面板上注明"这个平面其实在 X=…"。
+        """
+        self._plane_note = ""
+        lo, hi = self._limits()
+        notes: list[str] = []
+        for name, (axis, color) in PLANE_STYLES.items():
+            if not self.show_planes[name].get():
+                continue
+            if lo[axis] <= 0.0 <= hi[axis]:
+                c = 0.0
+            else:
+                c = lo[axis] if 0.0 < lo[axis] else hi[axis]
+                notes.append(f"{name} 在 {_AXIS_NAMES[axis]}={c:.3g}")
+            other = [i for i in range(3) if i != axis]
+            u0, u1 = lo[other[0]], hi[other[0]]
+            v0, v1 = lo[other[1]], hi[other[1]]
+            U, V = np.meshgrid([u0, u1], [v0, v1])
+            C = np.full_like(U, c)
+            X, Y, Z = ((C, U, V) if axis == 0 else
+                       (U, C, V) if axis == 1 else (U, V, C))
+            self.ax.plot_surface(X, Y, Z, color=color, alpha=0.06,
+                                 linewidth=0, antialiased=False, shade=False)
+            # 网格线：两个方向各 3 条，够看出是平面，又不会糊住轨迹
+            for fixed in np.linspace(v0, v1, 4):
+                p0 = [0.0, 0.0, 0.0]
+                p1 = [0.0, 0.0, 0.0]
+                p0[axis] = p1[axis] = c
+                p0[other[0]], p1[other[0]] = u0, u1
+                p0[other[1]] = p1[other[1]] = fixed
+                self.ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+                             color=color, lw=0.5, alpha=0.30)
+            for fixed in np.linspace(u0, u1, 4):
+                p0 = [0.0, 0.0, 0.0]
+                p1 = [0.0, 0.0, 0.0]
+                p0[axis] = p1[axis] = c
+                p0[other[1]], p1[other[1]] = v0, v1
+                p0[other[0]] = p1[other[0]] = fixed
+                self.ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+                             color=color, lw=0.5, alpha=0.30)
+            pos = [0.0, 0.0, 0.0]
+            pos[axis] = c
+            pos[other[0]], pos[other[1]] = u1, v1
+            self.ax.text(pos[0], pos[1], pos[2], name,
+                         color=color, fontsize=8, alpha=0.85)
+        self.plane_note.configure(text="；".join(notes))
 
     def _smooth_active(self) -> bool:
         """当前是否真的在用平滑点：勾了**且**至少有一段被平滑处理过。
@@ -659,7 +899,6 @@ class Viewer3D:
 
     def _redraw(self) -> None:
         self.ax.clear()
-        self._reset_view()
         # 勾了「平滑」就用平滑点画主图，否则用原始点。**范围/视角不变**：
         # `_limits` 始终按原始点算（平滑不改变量级，改范围只会让两张图对不上）。
         P = self.P_smooth if self._smooth_active() else self.P_raw
@@ -676,6 +915,11 @@ class Viewer3D:
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
                           f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
+        # 顺序固定：先按数据定范围 → 平面按这个范围铺 → 最后套视角/投影。
+        # `clear()` 已经把视角打回默认，所以 `_apply_view` 必须在最后。
+        self._fit_axes()
+        self._draw_planes()
+        self._apply_view()
         self._redraw_inset()
         self.canvas.draw_idle()
         self._update_video()
@@ -758,7 +1002,9 @@ class Viewer3D:
             text=f"frame {frame}   t={float(t):.3f}s   "
                  f"X={float(x):.4f}  Y={float(y):.4f}  Z={float(z):.4f} m   "
                  f"模式={mode}   "
-                 f"坐标={self.data.get('coordinate_system', '?')}")
+                 f"坐标={self.data.get('coordinate_system', '?')}   "
+                 f"视角 {self.view['elev']:.0f}/{self.view['azim']:.0f}/"
+                 f"{self.view['roll']:.0f}°")
 
     # ------------------------------------------------------------------
     def _on_slider(self, value: str) -> None:
