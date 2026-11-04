@@ -577,14 +577,18 @@ class HubWindow(tk.Toplevel):
     def _build_toolbar(self, parent) -> None:
         box = self.surface.card(
             parent, "工具",
-            "这些是跨模式的东西：会话与数据、三维查看、日志。"
-            "它们不属于某一种装置，所以放在门厅而不是某个模式窗里。")
+            "这些是跨模式的东西：会话与数据、三维查看、磁盘清理。"
+            "它们不属于某一种装置，所以放在门厅而不是某个模式窗里。"
+            "任务与日志统一走右下角状态条。")
         row = self.surface.action_row(box)
         # 相机设备放第一个：没有相机身份，标定/录制都没有起点，它比"数据管理"更靠前
         self.surface.secondary(row, "相机设备", self._open_cameras)
-        self.surface.secondary(row, "任务管理器和运行日志", self.app.open_console)
+        # 「任务管理器和运行日志」**不在这里**（2026-11-04）：
+        # 每个窗口右下角状态条已经有同一个入口（StatusBar 的按钮），
+        # 门厅再放一个是同一个动作两个按钮，用户会以为是两件事。
         self.surface.secondary(row, "数据管理", self._open_data_manager)
         self.surface.secondary(row, "3D 查看器", self._open_viewer)
+        self.surface.secondary(row, "垃圾清理", self._open_junk)
         # 「会话工作台」入口已隐藏（2026-11-03）：它和单目/双目窗各自的
         # 「历史会话…」选择器功能重叠，属于旧架构遗留。BenchWindow 代码保留
         # （双目/单目窗的「历史会话…」仍能用），只是不再从门厅暴露这个跨装置的入口。
@@ -601,6 +605,14 @@ class HubWindow(tk.Toplevel):
         self._refresh()
         ok, msg = True, "已重新读取装置与标定状态"
         self.status.set_status(msg, "ok" if ok else "warn")
+
+    def _open_junk(self) -> None:
+        """垃圾管理器：日志 / 临时产物 / 字节码 / 回收站，按项勾选 + 按时间筛。"""
+        from apps.junk_dialog import JunkDialog
+
+        JunkDialog(self)
+        self.status.set_status(
+            "垃圾管理器已打开：只清它列出的项，data 里的录像不会被删", "info")
 
     def _open_profiles(self) -> None:
         """打开装置档案管理（列出 + 切换当前装置）。

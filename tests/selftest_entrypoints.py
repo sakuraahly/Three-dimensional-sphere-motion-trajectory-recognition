@@ -624,6 +624,167 @@ def test_stereo_session_layout() -> bool:
     return all(good for _label, good in checks)
 
 
+def test_junk_cleanup_safety() -> bool:
+    """垃圾清理：白名单、分档、时间过滤、执行边界。
+
+    ## 这条守的是什么（2026-11-04 新增功能）
+
+    `apps/_junk.py` 是全项目**唯一会主动减少磁盘文件**的模块。它判错的代价
+    不是"界面显示不对"，而是**不可再生的录像没了**。所以这里主要测
+    "**不会删什么**"，而不只是"能不能删"：
+
+    1. 白名单之外的东西一律不进计划（`data/stereo` 的会话、`config/`）；
+    2. `outputs/chain_frames`（正在用的标定图）不列；
+    3. "谨慎"档（数据集/标定图）与"彻底删"档（回收站）分得开；
+    4. 执行时越界路径被拒；空目录回收，非空目录不动；
+    5. 时间过滤只留够旧的，且把"筛掉了多少"如实报出来。
+
+    反向自证：把 `_KEEP_ALWAYS` 里的 `chain_frames` 删掉、或让 `clean_junk`
+    不做 `is_relative_to` 检查，下面会红。
+
+    ## 为什么不新建 `tests/selftest_junk.py`
+
+    测试预算签死在 26（`selftest_doc_facts.REAL_TEST_COUNT` 的注释写着"要扩得
+    先有人签"）。这条守的是"清理不会误删"，属于项目级安全规约 —— 与这个文件
+    已有的"数据布局单一来源""视频原子写入"同一类，所以并进来，不扩预算。
+    """
+    import os as _os
+    import tempfile as _tempfile
+    import time as _time
+    from pathlib import Path as _P
+
+    from apps._junk import (DANGER_GONE, DANGER_SAFE, DANGER_WARN,
+                            JunkFile, JunkItem, JunkPlan, clean_junk, scan_junk)
+
+    checks: list[tuple[str, bool]] = []
+
+    def touch(p: _P, size: int = 1024, age_days: float = 0.0) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x" * size)
+        if age_days:
+            old = _time.time() - age_days * 86400.0
+            _os.utime(p, (old, old))
+
+    def fixture(repo: _P) -> None:
+        touch(repo / "outputs/logs/a.log")
+        touch(repo / "outputs/logs/old.log", 2048, age_days=40)
+        touch(repo / "outputs/agent_x/f1.bin", 5000)
+        touch(repo / "outputs/ball_dataset/d.png", 777)       # 谨慎档
+        touch(repo / "outputs/chain_frames/keep.png", 111)    # 正在用
+        touch(repo / "outputs/x.tmp", 42)                     # 临时残留
+        touch(repo / "apps/__pycache__/m.cpython-311.pyc", 300)
+        sess = repo / "data/stereo/parallel/20260101-000000"
+        touch(sess / "session.json", 100)
+        touch(sess / "left.mkv", 999)                         # 录像：绝不能碰
+        for i in range(5):
+            (sess / f"session.json.bak-2026010{i + 1}-000000").write_bytes(b"b")
+        touch(repo / "data/_trash/20260101_cleanup/sessions/a/session.json", 10)
+        touch(repo / "config/stereo_calibration.json", 50)    # 配置：绝不能碰
+
+    with _tempfile.TemporaryDirectory() as td:
+        tmp = _P(td)
+        repo = tmp / "repo"
+        fixture(repo)
+        outside = tmp / "outside"
+        touch(outside / "keep.txt", 9)
+
+        plan = scan_junk(repo)
+        labels = {i.label for i in plan.items}
+        paths = [str(f.path) for i in plan.items for f in i.files]
+        by_label = {i.label: i for i in plan.items}
+
+        # ---- ① 白名单：只报允许的 ----
+        checks.append(("列出运行日志", "outputs/logs" in labels))
+        checks.append(("列出调试产物目录（推荐档）", "outputs/agent_x" in labels))
+        checks.append(("列出字节码缓存", "Python 字节码缓存" in labels))
+        checks.append(("列出临时文件残留", "临时文件残留" in labels))
+        checks.append(("**不列**正在用的 outputs/chain_frames",
+                       not any("chain_frames" in x for x in [*labels, *paths])))
+        checks.append(("**不列** data 里的会话录像",
+                       not any("left.mkv" in x for x in paths)))
+        checks.append(("**不列** config/",
+                       not any("calibration" in x for x in paths)))
+        alive = [str(f.path) for i in plan.items if i.danger != DANGER_GONE
+                 for f in i.files]
+        checks.append(("**不列**会话里的 session.json 本体（回收站除外）",
+                       not any(x.endswith("session.json") for x in alive)))
+
+        # ---- ② 分档：界面的"默认只勾推荐"靠它 ----
+        checks.append(("logs 是推荐档（删了下次跑就有）",
+                       by_label["outputs/logs"].danger == DANGER_SAFE))
+        checks.append(("ball_dataset 是谨慎档（删了要重跑）",
+                       by_label["outputs/ball_dataset"].danger == DANGER_WARN))
+        checks.append(("回收站是 gone（不可恢复）",
+                       by_label["回收站（data/_trash）"].danger == DANGER_GONE))
+        checks.append(("推荐档排在列表前面（默认勾选的就是它们）",
+                       [i.danger for i in plan.items]
+                       == sorted([i.danger for i in plan.items],
+                                 key=lambda d: d != DANGER_SAFE)))
+
+        # ---- ③ 会话备份只清到剩 3 个 ----
+        bak = next((i for i in plan.items if i.key == "session_bak"), None)
+        cleaned = sorted(f.path.name for f in bak.files) if bak else []
+        checks.append(("5 个 session.json.bak 里只清最早的 2 个",
+                       cleaned == ["session.json.bak-20260101-000000",
+                                   "session.json.bak-20260102-000000"],
+                       ))
+
+        # ---- ④ 时间过滤 + 如实报"筛掉多少" ----
+        old_plan = scan_junk(repo, older_than_days=30)
+        old_logs = next((i for i in old_plan.items if i.key == "outputs/logs"), None)
+        checks.append(("30 天前只剩老日志",
+                       old_logs is not None and old_logs.count == 1))
+        checks.append(("如实记下被时间筛掉的文件数", old_plan.filtered_files > 0))
+        checks.append(("如实记下被时间筛掉的字节数", old_plan.filtered_bytes > 0))
+        checks.append(("不传时间范围 = 全部（不筛）",
+                       scan_junk(repo).filtered_files == 0))
+
+        # ---- ⑤ 执行：该删的删、该留的留 ----
+        picked = [i for i in plan.items if i.danger == DANGER_SAFE]
+        deleted, freed, failures = clean_junk(JunkPlan(items=picked), repo)
+        checks.append(("删掉了文件且没有失败",
+                       deleted > 0 and not failures))
+        checks.append(("释放字节数 > 0", freed > 0))
+        checks.append(("日志目录被回收（不留空壳）",
+                       not (repo / "outputs/logs").exists()))
+        checks.append(("谨慎档原封不动",
+                       (repo / "outputs/ball_dataset/d.png").is_file()))
+        checks.append(("正在用的标定图原封不动",
+                       (repo / "outputs/chain_frames/keep.png").is_file()))
+        checks.append(("会话录像原封不动",
+                       (repo / "data/stereo/parallel/20260101-000000/left.mkv").is_file()))
+        checks.append(("config 原封不动",
+                       (repo / "config/stereo_calibration.json").is_file()))
+        checks.append(("仓库外的东西原封不动", (outside / "keep.txt").is_file()))
+
+        # ---- ⑥ 越界：伪造一个指向仓库外的项，必须拒绝 ----
+        fake = JunkPlan(items=[JunkItem("fake", "伪造", "", DANGER_SAFE,
+                                        [JunkFile(outside / "keep.txt", 9,
+                                                  _time.time())])])
+        d2, _f2, fails2 = clean_junk(fake, repo)
+        checks.append(("仓库外的路径被拒绝（不删、报失败）",
+                       d2 == 0 and bool(fails2) and (outside / "keep.txt").is_file()))
+
+        # ---- ⑦ 回收站：彻底删 ----
+        trash = [i for i in scan_junk(repo).items if i.danger == DANGER_GONE]
+        if trash:
+            clean_junk(JunkPlan(items=trash), repo)
+        checks.append(("回收站被彻底删除",
+                       not (repo / "data/_trash").exists()))
+
+        # ---- ⑧ 同一文件不能同时属于两个清理项 ----
+        repo2 = tmp / "repo2"
+        fixture(repo2)
+        p2 = scan_junk(repo2)
+        allp = [f.path for i in p2.items for f in i.files]
+        checks.append(("没有重复收录的路径（否则第二条会报\"找不到\"）",
+                       len(allp) == len(set(allp))))
+
+    for label, good in checks:
+        print(f"  [{'通过' if good else '不达标'}] {label}")
+    return all(good for _label, good in checks)
+
+
 def test_shared_arg_blocks() -> bool:
     """单目两个入口的公共参数必须**出自同一个函数**，预设名单不许再手抄。
 
@@ -1450,6 +1611,7 @@ def main() -> int:
                test_path_bootstrap_is_marker_based,
                test_data_layout_single_source,
                test_stereo_session_layout,
+               test_junk_cleanup_safety,
                test_shared_arg_blocks,
                test_annotated_video_atomic_write,
                test_run_all_orchestrator,

@@ -127,15 +127,15 @@ assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / �
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：17 个可执行脚本 + 19 个私有模块
+### `apps/` 顶层：18 个可执行脚本 + 20 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
 | 主线（4） | `run_stereo_video.py` `run_all.py` `run_realtime.py` `run_video.py` | 离线双目三维重建 / 一条命令编排 3→6 / 实时单目 / 离线单目 |
 | 标定与录制（6） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` `fov_dialog.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 / **FOV 管理器**（两路固有视差：看/量/清，存进装置档案供标定复用） |
-| 数据与导出（5） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` `profile_dialog.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed / **装置档案管理**（多套装置各配一份标定路径，新建/切换） |
+| 数据与导出（6） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` `profile_dialog.py` `junk_dialog.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed / **装置档案管理**（多套装置各配一份标定路径，新建/切换）/ **垃圾管理器**（日志 / 临时产物 / 字节码 / 回收站：按项勾选 + 按时间筛，分"删了下次跑就有"与"删了要重拍"两档） |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（19） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` `_fov_store.py` `_stereo_layout.py` `_stereo_sessions.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）** / **FOV 记录在标定与档案间的搬运** / **双目会话的磁盘布局（按装置分区：找得到、判得出属于哪套装置）** / **会话管理动作（回收站软删 / 改装置模式并搬分区）**） |
+| 私有模块（20） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` `_fov_store.py` `_stereo_layout.py` `_stereo_sessions.py` `_junk.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）** / **FOV 记录在标定与档案间的搬运** / **双目会话的磁盘布局（按装置分区：找得到、判得出属于哪套装置）** / **会话管理动作（回收站软删 / 改装置模式并搬分区）** / **垃圾白名单与清理（唯一会主动减少磁盘文件的模块：只删扫描出来的路径）**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
