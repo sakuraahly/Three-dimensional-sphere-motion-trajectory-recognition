@@ -62,6 +62,7 @@ from calib.methods import plan as method_plan
 from calib.methods import single_board as single_board_method
 from calib.relative_pose import compose, invert, rotation_angle_deg
 from calib.stereo_calib import board_pose_from_points, calibrate_mono_points
+from stereo.profiles import resolve_calibration_base
 from stereo.fov_align import (
     FovAlignment,
     estimate_fov_alignment,
@@ -1018,7 +1019,9 @@ def main() -> int:
                     help="视场对齐估计失败就退出（旧的 fail-closed 语义）。"
                          "默认不要求：parallel 下估不出来时降级为不裁剪、"
                          "按两路原始画面继续标定，并在 meta 里写 fov=null")
-    ap.add_argument("--out", default="config/stereo_calibration", help="输出前缀")
+    ap.add_argument("--out", default=None,
+                    help="输出前缀；缺省写到激活装置档案的标定路径，再回落 "
+                         "config/stereo_calibration")
     ap.add_argument("--save-pairs", default=None, help="把收下的图像对另存到这个目录（便于复查）")
     ap.add_argument("--report-png", default=None, help="输出验证图路径")
     ap.add_argument("--no-show", action="store_true", help="不弹窗（批处理）")
@@ -1040,7 +1043,11 @@ def main() -> int:
                          "两路焦距不同是装置属性，量一次锁住可保证每次标定口径一致"
                          "（量法：apps/tools/measure_fov.py --write-profile NAME）。"
                          "分辨率与档案记录不一致会直接报错，不静默沿用")
+    # 标定输出路径：显式 --out 优先，否则跟随激活装置档案，再回落顶层。
+    # 2026-11-04 前这里硬编码顶层，档案"切换装置"是假动作。
     args = ap.parse_args()
+    if args.out is None:
+        args.out = str(resolve_calibration_base())
     if args.skip_fov and args.require_fov:
         ap.error("--skip-fov 与 --require-fov 矛盾：前者不做 FOV 对齐，后者要求"
                  "「估不出来就失败」")

@@ -84,6 +84,7 @@ from stereo.fov_align import (                              # noqa: E402
 from stereo.stereo_mode import (                             # noqa: E402
     optical_axes_angle_deg, resolve_auto,
 )
+from stereo.profiles import resolve_calibration_base        # noqa: E402
 from stereo.record_plan import output_size, plan_record     # noqa: E402
 from sphere_tracker.camera_registry import (                 # noqa: E402
     load_registry,
@@ -476,7 +477,9 @@ def main() -> int:
     ap.add_argument("--countdown", type=float, default=3.0)
     # 新会话一律写到 `data/stereo/`（这是**写**路径，所以只认新根，不扫旧位置）
     ap.add_argument("--out", default=str(STEREO_ROOT))
-    ap.add_argument("--calib", default=str(ROOT / "config" / "stereo_calibration"))
+    ap.add_argument("--calib", default=None,
+                    help="标定文件前缀；缺省从激活装置档案解析，再回落 "
+                         "config/stereo_calibration")
     ap.add_argument("--baseline-mm", type=float, default=None,
                     help="物理基线（只作核对；不填则会话里不记）")
     ap.add_argument("--label", default="")
@@ -494,6 +497,12 @@ def main() -> int:
     ap.add_argument("--self-check-only", action="store_true",
                     help="只做编码器写/读逐位自检，不开相机（无相机也能验）")
     args = ap.parse_args()
+    # 标定路径：显式 --calib 优先，否则跟随激活装置档案，再回落顶层。
+    # 2026-11-04 前这里硬编码顶层，档案"切换装置"是假动作。
+    # **必须在这里（最早处）解析**：下面的"采集档"分支用 args.calib 读
+    # capture_size，若这里不先把 None 换成真实路径，--self-check-only 也会
+    # 在 Path(None) 上崩掉（2026-11-04 实测）。
+    calib_base = Path(args.calib) if args.calib else resolve_calibration_base()
 
     # `--wait-key space` 没有预览窗口就收不到按键 —— 这是**参数层的矛盾**，
     # 必须在开相机之前判死：等两台相机都打开、两个 writer 都建好再说"没法等按键"，
@@ -511,11 +520,11 @@ def main() -> int:
     # 若还按名义默认请求 1440，`_open_pair` 的「实际 == 请求」校验会直接失败。
     # 标定没记该字段（旧标定）时**明确说清**、退回 RECORD_DEFAULT，不静默假定。
     if args.width is None or args.height is None:
-        _cs = calib_capture_size(args.calib)
+        _cs = calib_capture_size(calib_base)
         if _cs is not None:
             args.width, args.height = _cs
             print(f"[采集档] 采用标定记录的采集档 {_cs[0]}x{_cs[1]}"
-                  f"（{Path(args.calib).with_suffix('.json').name} 的 capture_size）")
+                  f"（{calib_base.with_suffix('.json').name} 的 capture_size）")
         else:
             args.width, args.height = RECORD_DEFAULT.width, RECORD_DEFAULT.height
             print(f"[采集档] 标定里没有采集档记录（旧标定或读不到），"
@@ -539,7 +548,6 @@ def main() -> int:
 
     tag, label = CODECS[args.codec]
     print(f"[编码] {label}")
-    calib_base = Path(args.calib)
     if not calib_base.with_suffix(".npz").exists():
         print(f"[错误] 找不到标定：{calib_base.with_suffix('.npz')}")
         return 1

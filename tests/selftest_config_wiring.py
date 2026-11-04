@@ -566,6 +566,43 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         checks.append(("delete 后列表为空、active 已清",
                        rp.list_profiles(path) == [] and rp.active_name(path) is None))
 
+        # 7) resolve_calibration_base：档案接入主链路的唯一入口（2026-11-04）
+        #
+        # 守的是什么：半成品档案的典型状态是"路径指向从没标定过的文件"，
+        # 无条件跟随会让录制直接报"找不到标定"，而顶层那份真实标定被忽略。
+        # 三种情形必须分清：配了且存在 -> 跟随；配了但不存在 -> 回落；
+        # 没配 -> 回落。回落目标是 fallback（默认顶层）。
+        import os
+        fb = Path(tmp) / "top_level"          # 模拟顶层 stereo_calibration
+        fb.with_suffix(".npz").write_bytes(b"x")
+        # 7a) 档案配了 calib_path 且文件存在 -> 跟随档案（相对 ROOT 解析）
+        #     calibration_path 是**仓库内相对路径**，必须相对 rp.ROOT（仓库根）。
+        #     用仓库里真实存在的顶层标定路径来验证"跟随"这条，不用造文件：
+        #     它指向 config/stereo_calibration，.npz 确实存在。
+        rp.upsert(rp.RigProfile(name="rig-a", stereo_mode="parallel",
+                                calibration_path="config/stereo_calibration"),
+                  path=path)
+        rp.set_active("rig-a", path)
+        got_a = rp.resolve_calibration_base(path, fallback=fb)
+        checks.append(("档案配了且 .npz 存在 -> 跟随档案（相对 ROOT）",
+                       got_a == (rp.ROOT / "config" / "stereo_calibration")))
+        # 7b) 档案配了但文件不存在 -> 回落 fallback（半成品档案的关键情形）
+        rp.upsert(rp.RigProfile(name="rig-b", stereo_mode="parallel",
+                                calibration_path="sub/rig_b"), path=path)
+        rp.set_active("rig-b", path)
+        got_b = rp.resolve_calibration_base(path, fallback=fb)
+        checks.append(("档案配了但 .npz 不存在 -> 回落 fallback（不报错）",
+                       got_b == fb))
+        # 7c) 档案没配 calib_path -> 回落 fallback
+        rp.upsert(rp.RigProfile(name="rig-c", stereo_mode="parallel"), path=path)
+        rp.set_active("rig-c", path)
+        got_c = rp.resolve_calibration_base(path, fallback=fb)
+        checks.append(("档案没配 calib_path -> 回落 fallback", got_c == fb))
+        # 7d) 没激活任何档案 -> 回落 fallback
+        rp.set_active(None, path)
+        got_d = rp.resolve_calibration_base(path, fallback=fb)
+        checks.append(("无激活档案 -> 回落 fallback", got_d == fb))
+
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)

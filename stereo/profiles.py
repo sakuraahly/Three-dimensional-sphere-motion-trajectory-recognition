@@ -76,6 +76,7 @@ __all__ = [
     "set_active",
     "get_active",
     "active_name",
+    "resolve_calibration_base",
     "validate_profile",
     "geometry_hint",
     "mode_label",
@@ -568,6 +569,45 @@ def set_active(name: str | None,
         store["active"] = key
     save_store(store, path)
     return get_active(path)
+
+
+def resolve_calibration_base(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    fallback: str | os.PathLike[str] | None = None,
+) -> Path:
+    """解析"当前该用哪份标定"：激活档案配了 ``calibration_path`` 就用它，否则回落。
+
+    这是**装置档案接入主链路的唯一入口**（2026-11-04 前档案是半成品）：
+    录制 / 重建 / 标定三个链路本都硬编码顶层 ``config/stereo_calibration``，
+    于是"在档案里切换装置"是个假动作——切了档案，标定还是顶层那一份，
+    两套装置共用一份标定，几何必然对不上。
+
+    规则（优先级从高到低）：
+
+    1. 激活档案配了 ``calibration_path``，**且它对应的 ``.npz`` 确实存在** →
+       解析成绝对路径（不带扩展名的前缀，``.npz``/``.json`` 由调用方补）。
+    2. 档案配了但文件不存在、档案没配、或 ``profiles.json`` 缺失/损坏 →
+       回落 ``fallback``（默认顶层 ``config/stereo_calibration``）。
+       **"配了但不存在"必须回落**：半成品档案的典型状态就是路径指向一个
+       从没标定过的 ``config/calib/<装置>``（2026-11-04 现场：切到"90度装置"
+       后路径指向不存在的文件，若无条件跟随，录制会直接报"找不到标定"，
+       而顶层那份真实标定被白白忽略）。
+
+    调用方若需要区分"跟随了档案"还是"回落了"，看返回路径是否等于 fallback。
+    """
+    fb = Path(fallback) if fallback is not None else ROOT / "config" / "stereo_calibration"
+    try:
+        active = get_active(path)
+    except ProfileError:
+        active = None
+    if active is not None and active.calibration_path:
+        cand = ROOT / active.calibration_path
+        if cand.with_suffix(".npz").exists():
+            return cand
+        # 档案路径是空壳：回落到顶层那份真实存在的标定
+        return fb
+    return fb
 
 
 def active_name(path: str | os.PathLike[str] | None = None) -> str | None:
