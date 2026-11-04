@@ -412,6 +412,33 @@ class AngledReconstructor:
         self.n_matched += 1
         return point
 
+    def low_match_diagnostic(self, low_rate: float = 0.10) -> list[str]:
+        """配对率低于 ``low_rate`` 时给出几何一致性诊断，否则返回空列表。
+
+        与 ``StereoReconstructor.low_match_diagnostic`` **同名同形**，因为
+        ``run_stereo_video`` 对两种重建器都无条件调用它（2026-11-04 之前
+        angled 没有这个方法，跑完直接 AttributeError）。
+        返回几行"该看什么"，不做自动放宽 —— 拒了多少就是多少，
+        那是"这段录像和它的标定对不上"的结论，不是待修的 bug。
+        """
+        if self.n_frames == 0 or self.match_rate >= low_rate:
+            return []
+        lines = [
+            f"[诊断] 配对率 {self.match_rate * 100:.1f}%"
+            f"（{self.n_matched}/{self.n_frames}）："
+            f"无左 {self.n_no_left} / 无右 {self.n_no_right} / 被拒 {self.n_rejected}",
+            f"  本质几何来自 {self.f_source}（F 的来源决定拒收口径）",
+        ]
+        if self.n_rejected and self.n_matched == 0:
+            lines.append(
+                "  拒绝集中在极线/交会角/重投影：录制时的实际几何与标定不一致"
+                "（相机被碰动/改对焦/换装置），先重新标定，别调 --max-epipolar")
+        elif self.n_rejected:
+            lines.append(
+                f"  {self.n_rejected} 帧被极线/交会角/重投影拒掉；"
+                f"先看标定自报的极线误差，与这里对不上就是几何漂了")
+        return lines
+
     def as_array(self) -> np.ndarray:
         """``(N, 4)`` float64 ``[t, X, Y, Z]``, same layout as StereoReconstructor."""
         if not self.trajectory:
