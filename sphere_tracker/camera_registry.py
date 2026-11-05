@@ -289,6 +289,46 @@ def read_windows_pnputil() -> list[dict]:
     return _parse_pnputil(out)
 
 
+# `pnputil /enum-devices /connected /problem`：只列**当前有问题**的设备，原生、~0.1 s。
+_DESCRIPTOR_FAIL_ARGS = ["pnputil", "/enum-devices", "/connected", "/problem"]
+
+
+def descriptor_failures() -> list[dict]:
+    r"""插在 USB 上但**读不出设备描述符**的设备（Windows；拿不到返回 []）。
+
+    为什么必须单独查（2026-11-05 现场）：`list_devices()` 只枚举
+    ``/class Camera``，而描述符读失败的设备在系统里**连设备类都定不下来** ——
+    它被归进「未知 USB 设备(设备描述符请求失败)」，InstanceId 恒为
+    ``USB\VID_0000&PID_0002\<端口>``。于是相机明明插着，`cameras.py list`
+    却一台都看不到，用户和排查者都会以为"没插上"。今天为此白讨论了两轮。
+
+    这几乎总是**线材/接口接触不良**：设备电气上连通（系统能看到"这个口上有
+    东西"），但 D+/D- 上的信号质量不足以把描述符读出来。该换线/换口，
+    而不是换驱动、换后端、改程序。
+
+    只按行抓 ``VID_0000&PID_0002``，不做整块字段解析 —— pnputil 的输出在不同
+    Windows 语言/编码下块结构会变，而这个标识是稳定的。
+    """
+    if current_platform() != "windows":
+        return []
+    res = _run_command(_DESCRIPTOR_FAIL_ARGS)
+    if res is None:
+        return []
+    code, out = res
+    if code != 0 or not out.strip():
+        return []
+    found: list[dict] = []
+    for line in out.splitlines():
+        if "VID_0000&PID_0002" not in line.upper():
+            continue
+        raw = line.split(":", 1)[1].strip() if ":" in line else ""
+        if not raw.upper().startswith("USB\\"):
+            continue
+        found.append({"InstanceId": raw,
+                      "port": raw.rsplit("\\", 1)[-1]})
+    return found
+
+
 _PNP_SCRIPT = (
     "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     "$ErrorActionPreference='SilentlyContinue';"
