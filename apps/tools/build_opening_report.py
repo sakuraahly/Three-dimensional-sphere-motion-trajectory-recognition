@@ -37,8 +37,9 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SRC = Path(
-    r"D:\<课程资料目录>\大二上\普通物理学实验2\开题报告.pptx")
+# 输入 pptx 是个人交付物、不进版本库：默认路径只给项目内的占位，
+# 实际请用 --src 指到你自己的文件（见 docs/PPT生成流程.md）。
+DEFAULT_SRC = ROOT / "assets" / "templates" / "开题报告.pptx"
 DEFAULT_OUT = ROOT / "outputs" / "开题报告_最终.pptx"
 
 SONG, TIMES = "宋体", "Times New Roman"
@@ -520,6 +521,7 @@ def main() -> int:
     src, out = Path(args.src), Path(args.out)
     if not src.exists():
         print(f"[失败] 找不到输入：{src}")
+        print("       输入 pptx 不进版本库，请用 --src 指向你自己的文件")
         return 1
     prs = Presentation(str(src))
     original = list(prs.slides)          # ← 快照，新增页后索引会变

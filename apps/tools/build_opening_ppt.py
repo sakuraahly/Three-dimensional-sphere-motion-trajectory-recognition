@@ -45,11 +45,11 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
 # --------------------------------------------------------------------------
-# 模板：课程提供的开题报告模版（保持可被 --src 覆盖，换机器时改这里或传参）
-SRC_TEMPLATE = Path(
-    r"D:\<课程资料目录>\大二上\普通物理学实验2\相关文件\开题报告模版.pptx"
-)
 ROOT = Path(__file__).resolve().parents[2]        # 项目根（本脚本在 apps/tools/ 下）
+# 模板 pptx 是**个人交付物、不进版本库**，所以这里不写任何人的本机目录。
+# 默认先找项目内 assets/templates/；实际用 --src 指到自己的文件
+# （见 docs/PPT生成流程.md），换机器不需要改源码。
+SRC_TEMPLATE = ROOT / "assets" / "templates" / "开题报告模版.pptx"
 
 # 配色（对齐模板的蓝灰基调）
 INK = RGBColor(0x1F, 0x28, 0x37)         # 正文近黑
@@ -635,6 +635,7 @@ def main() -> int:
     src, out = Path(args.src), Path(args.out)
     if not src.exists():
         print(f"[失败] 找不到模板：{src}")
+        print("       模板不进版本库，请用 --src 指向你自己的 pptx")
         return 1
     if src.resolve() == out.resolve():
         print("[失败] 拒绝就地覆盖模板，请另指定 --out")

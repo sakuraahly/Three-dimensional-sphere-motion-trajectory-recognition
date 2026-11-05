@@ -9,9 +9,10 @@
 
 ## 1. 先认清：PPT 不在本仓库
 
-开题报告的 `.pptx` 放在**你自己的课程目录**里，不进版本库：
+开题报告的 `.pptx` 放在**你自己的课程目录**里，不进版本库。
+下文用 `<课程资料目录>` 代指它 —— 具体路径不要写进仓库：
 
-    D:\<课程资料目录>\大二上\普通物理学实验2\开题报告.pptx
+    <课程资料目录>\开题报告.pptx
 
 原因有两个：
 
@@ -59,7 +60,7 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 
 # 正式生成
 & $PY apps\tools\build_opening_report.py `
-    --src "D:\<课程资料目录>\大二上\普通物理学实验2\开题报告.pptx" `
+    --src "<课程资料目录>\开题报告.pptx" `
     --out outputs\开题报告_最终.pptx
 ```
 
@@ -119,7 +120,7 @@ PNG 落在 `outputs/final_preview/`。这是**近似**渲染（python-pptx + PIL
 ### 3.5 交付
 
 ```powershell
-copy "outputs\开题报告_最终.pptx" "D:\<课程资料目录>\大二上\普通物理学实验2\开题报告.pptx"
+copy "outputs\开题报告_最终.pptx" "<课程资料目录>\开题报告.pptx"
 ```
 
 **拷之前先备份你课程目录里的那份**（同一条命令既是输入也是去向，很容易盖掉手工修改）。

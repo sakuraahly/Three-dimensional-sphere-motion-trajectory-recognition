@@ -14,7 +14,7 @@
     left / right 即可 —— 角色按**设备身份**（不是编号）绑定，换 USB 口也不会用错。
 
 运行：
-    C:\\Users\\<USER>\\miniforge3\\envs\\myenv\\python.exe 启动程序.py
+    %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe 启动程序.py
     （或直接双击 启动程序.bat）
 """
 

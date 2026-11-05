@@ -2162,6 +2162,12 @@ def main() -> int:
         print(f"  [{'通过' if _passed else '不达标'}] {_name}")
         results.append((_name, _passed))
 
+    # ---- 隐私：入库文件不许带个人标识（2026-11-05）----
+    print("----- 8g. 入库文件个人信息 ----")
+    for _name, _passed in _check_no_personal_info():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
@@ -2170,6 +2176,65 @@ def main() -> int:
             print(f"  · {n}")
     print("\n判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
+
+
+def _check_no_personal_info() -> list[tuple[str, bool]]:
+    """**入库**的文本文件不许出现本机用户名 / 私人目录 / 真实邮箱。
+
+    2026-11-05 全仓库审计：8 个入库文件里写死了 `C://Users//<数字用户名>`、
+    私人课程目录（含"大二上/普通物理学实验2"这类学业信息）。这些一旦推到
+    公开仓库就收不回来了。本地 logs/ 与 outputs/ 里还有上万处机器生成的
+    路径，但它们**已被 gitignore 挡住**，不是本检查的对象。
+
+    标记串用拼接构造（`'391' + '63'` 等），否则这段测试源码自己就会命中，
+    变成永远红的假警报。
+    """
+    import subprocess
+
+    checks: list[tuple[str, bool]] = []
+    root_dir = Path(__file__).resolve().parent
+    while not (root_dir / "apps").is_dir() and root_dir.parent != root_dir:
+        root_dir = root_dir.parent
+    try:
+        tracked = [x for x in subprocess.run(
+            ["git", "-c", "core.quotePath=false", "ls-files", "-z"],
+            cwd=str(root_dir), capture_output=True, check=False
+        ).stdout.decode("utf-8").split("\0") if x]
+    except Exception as exc:                            # noqa: BLE001
+        checks.append((f"能列出入库文件（异常：{exc}）", False))
+        return checks
+
+    marks = [
+        ("本机用户名", "391" + "63"),
+        ("私人课程目录", "课程" + "相关作业资料等"),
+        ("QQ 邮箱", "@qq." + "com"),
+    ]
+    exts = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".bat", ".cmd",
+            ".sh", ".cfg", ".ini", ".toml", ".csv", ".html", ".xml"}
+    hits: dict[str, list[str]] = {name: [] for name, _ in marks}
+    scanned = 0
+    for rel in tracked:
+        f = root_dir / rel
+        if f.suffix.lower() not in exts or not f.is_file():
+            continue
+        try:
+            if f.stat().st_size > 2_000_000:
+                continue
+            lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:                               # noqa: BLE001
+            continue
+        scanned += 1
+        for i, line in enumerate(lines, 1):
+            for name, mark in marks:
+                if mark in line:
+                    hits[name].append(f"{rel}:{i} {line.strip()[:80]}")
+    # 防假阴性：`ls-files -z` 的分隔符解析错了会让整个扫描静默跳过。
+    checks.append((f"确实扫到了入库文本文件（{scanned} 个）", scanned >= 100))
+    for name, _mark in marks:
+        found = hits[name]
+        checks.append((f"入库文件无{name}（{len(found)} 处：{found[:1]}）",
+                       not found))
+    return checks
 
 
 def _check_cleanup_windows() -> list[tuple[str, bool]]:

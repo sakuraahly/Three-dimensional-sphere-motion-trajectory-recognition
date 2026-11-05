@@ -7,7 +7,7 @@
 交互约定：两台相机左右的定义 —— **人面对镜头时，左手边那台为"左"**。
 
 运行：
-    C:\\Users\\<USER>\\miniforge3\\envs\\myenv\\python.exe 启动程序_命令行.py
+    %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe 启动程序_命令行.py
     （或直接双击 启动程序_命令行.bat）
 """
 
