@@ -134,7 +134,12 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
 #: ⚠️ 已知边界：窗口拉到最小（900x700，3D 画布 ~1.3:1）时 3D 轴吃满宽度，
 #: Z 标签右移到 ≈0.85，小图会压到它。这是"不许改主图布局"的代价 ——
 #: 要根治得让主图让出右边距，那属于主图行为，不在本次范围。
-INSET_RECT = (0.815, 0.100, 0.170, 0.335)
+#: 2026-11-05 改：**压到底部**（y 0.03~0.275），与 Z 轴标签在纵向错开。
+#: 原来 y 从 0.100 到 0.435，而 `Z forward (m)` 是竖排、占 y≈0.29~0.55 ——
+#: 两者本来就在同一段高度里抢地方，只是 1.0 倍缩放下恰好没压到。一旦整幅放大
+#: （zoom>1.05），Z 标签右移就撞上小图。放到 y<0.28 之后，Z 标签无论怎么右移
+#: 都碰不到它，主图也就能真正用满画布。
+INSET_RECT = (0.795, 0.030, 0.185, 0.245)
 
 #: 曲线配色（与主图一致：灰=原始、橙=平滑/小球）。
 #: 原始线用中灰而不是浅灰：浅灰在图例里几乎看不见（图例继承线条的 alpha）。
@@ -166,6 +171,12 @@ DEFAULT_VIEW = "等轴测"
 
 #: 鼠标滚轮缩放步长（每滚一格的范围缩放倍率）。<1 = 滚一下放大一点。
 ZOOM_STEP = 0.85
+
+#: 默认整幅缩放。1.0 时 3D 立方体只占画布中间一块 —— `subplots_adjust` 已经
+#: 贴到边（left=0.02/right=0.98），填不满是因为立方体在矩形内**按最紧凑方式
+#: 居中**，四周留白由投影包围盒决定，只能靠 zoom 放大（2026-11-05 用户：
+#: "做成可以占据全局大小的，不然图片中的 Y 方向实在是比例奇怪"）。
+DEFAULT_BOX_ZOOM = 1.10
 
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
@@ -366,6 +377,11 @@ class Viewer3D:
         self.show_planes = {name: tk.BooleanVar(master=root, value=False)
                             for name in PLANE_STYLES}
         self.ortho = tk.BooleanVar(master=root, value=True)
+        # 「等比例坐标」：默认 **关** —— 三轴各自拉满，形状便于阅读。
+        # 开：按真实米数等比例（Y 只动 1.7 cm 就真的只有一小截，刻度会挤成一坨）。
+        # 这是**显示**选择，不是数据选择：轨迹本身一个字都没变（2026-11-05
+        # 用户："这个坐标背景图比例很奇怪…Y 方向实在是比例奇怪"）。
+        self.equal_axes = tk.BooleanVar(master=root, value=False)
         self._roll_drag: tuple[int, float] | None = None
         self._syncing_view = False
         self._plane_note = ""
@@ -375,7 +391,7 @@ class Viewer3D:
         self.lims: list[list[float]] | None = None
         # 整幅缩放（`set_box_aspect(zoom=)`）：数据、网格、刻度一起放大。
         # 与 `lims` 是两套东西 —— lims 改"看哪一段"，zoom 改"这一幅画多大"。
-        self.box_zoom: float = 1.0
+        self.box_zoom: float = DEFAULT_BOX_ZOOM
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -459,7 +475,7 @@ class Viewer3D:
         data = load_view(path)
         self._apply(data, None, True)
         self.lims = None               # 换会话 = 新数据，范围重新 fit
-        self.box_zoom = 1.0            # 整幅缩放也归位（新数据的量级不同）
+        self.box_zoom = DEFAULT_BOX_ZOOM   # 整幅缩放归位（新数据量级不同）
         self.slider.configure(to=max(0, self.n - 1))
         self.slider.set(0)
         self._redraw()                       # 内含 _reset_view / _update_video / _status
@@ -507,7 +523,18 @@ class Viewer3D:
         plot_frame = ttk.Frame(bottom)
         self.fig = plt.Figure(figsize=(5.5, 3.6), dpi=100)
         self.ax = self.fig.add_subplot(111, projection="3d")
-        self.fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.90)
+        # 右键 = **旋转视角**，不是缩放（2026-11-05 用户："右键拖动不是我要的
+        # 拖动摄像机视角，而是特么的缩放比例"）。matplotlib 3D 默认左键旋转、
+        # 中键平移、右键 zoom；用户习惯右键转视角，所以把 3 也加进 rotate 并从
+        # zoom 里移除。滚轮已经负责缩放，右键再缩放是重复且抢手感的。
+        self._bind_mouse_buttons()
+        # bottom 从 0.02 提到 0.10：3D 轴的 **Y 轴标签排在画布下方**，原来几乎
+        # 贴着边，放大一点就被裁掉（用户看到的就是"Y 方向比例奇怪"——其实那根轴
+        # 大半被画布边缘切了）。top 留 0.92 给标题。
+        # left 0.07 / bottom 0.13：3D 轴的 X 标签在左下角、Y 标签在正下方，
+        # 两者都排在画布**外面**一点，边距不够就被裁（用户看到的"Y 比例奇怪"
+        # 有一半是那根轴被画布边缘切掉了）。top 0.92 留给标题。
+        self.fig.subplots_adjust(left=0.07, right=0.98, bottom=0.13, top=0.92)
         # 右下角俯视小图：**另叠一块 axes**，不碰主图的 subplot 布局
         # （主图的范围/视角/色标有别的判据盯着）。zorder 抬高让它盖在 3D 轴之上。
         self.ax_inset = self.fig.add_axes(INSET_RECT)
@@ -568,6 +595,10 @@ class Viewer3D:
             side, text="正交投影（CAD 风格）", variable=self.ortho,
             command=self._on_proj_toggle)
         self.ortho_chk.pack(anchor="w", pady=(8, 0))
+        self.equal_chk = ttk.Checkbutton(
+            side, text="等比例坐标（真实几何）", variable=self.equal_axes,
+            command=self._on_axes_mode)
+        self.equal_chk.pack(anchor="w", pady=(8, 0))
 
         self.plane_note = ttk.Label(side, text="", style="Hint.TLabel",
                                     wraplength=250, justify="left")
@@ -597,8 +628,8 @@ class Viewer3D:
         self.smooth_chk.pack(side="left", padx=(10, 0))
         # 缩放/平移提示（2026-11-04）：三键交互是 matplotlib 3D 原生的，
         # 用户看不到说明就不知道中键能平移、右键能缩放。文字放控制条右侧。
-        ttk.Label(bar, text="左键旋转 · 中键平移 · 滚轮缩放 · "
-                            "Shift+滚轮 定点放大 · 右键拖动",
+        ttk.Label(bar, text="左/右键拖动 旋转视角 · 中键平移 · 滚轮缩放 · "
+                            "Shift+滚轮 定点放大",
                   style="Hint.TLabel").pack(side="right", padx=(10, 4))
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
@@ -763,6 +794,17 @@ class Viewer3D:
         return ([self.lo[i] - pad[i] for i in range(3)],
                 [self.hi[i] + pad[i] for i in range(3)])
 
+    def _bind_mouse_buttons(self) -> None:
+        """左键/右键都旋转、中键平移、右键**不**缩放。
+
+        `ax.clear()` 不动这几个列表，但把它们收在一处，以后改键位只改这里。
+        `_zoom_btn = []` 是必须的：若 3 同时出现在 rotate 和 zoom 里，
+        mplot3d 的移动处理会两个都响应（拖动时一边转一边缩放）。
+        """
+        self.ax._rotate_btn = [1, 3]
+        self.ax._pan_btn = [2]
+        self.ax._zoom_btn = []
+
     def _apply_view(self) -> None:
         """把 ``self.view`` 与投影方式应用到 ax。
 
@@ -778,6 +820,7 @@ class Viewer3D:
             self.ax.set_proj_type("ortho" if self.ortho.get() else "persp")
         except (AttributeError, ValueError):
             pass
+        self._bind_mouse_buttons()     # clear() 后重设，避免键位丢
         self._hide_depth_axis()
 
     def _hide_depth_axis(self) -> None:
@@ -929,19 +972,34 @@ class Viewer3D:
         self.ax.set_zlim(lo[2], hi[2])
         self._apply_box()
 
+    def _on_axes_mode(self) -> None:
+        """切换"等比例坐标"后立刻重画（只改显示比例，不动数据与范围）。"""
+        self._apply_box()
+        self.canvas.draw_idle()
+
     def _apply_box(self) -> None:
-        """按当前范围比例 + 整幅缩放设置轴盒。
+        """按显示比例 + 整幅缩放设置轴盒。
 
         `aspect` 只有**比例**意义，必须跟着 `lims` 更新：否则滚轮改了范围、
         比例却还是旧的，曲线会被非均匀拉伸，而盒子看起来纹丝不动 —— 正是
         用户说的"背景没有跟着缩放"。
+
+        **两种比例**（2026-11-05）：
+          - 默认 ``(1,1,1)``：三轴各自拉满。球在 Y 方向只走了 1.7 cm 时，等比例
+            那张图里 Y 轴只剩短短一截、刻度全挤在角落（用户原话"Y 方向实在是
+            比例奇怪"）。拉满后三个维度都能看清。
+          - 勾了「等比例坐标」：``(dx,dy,dz)``，1 米在三个轴上等长 —— 形状是真实
+            的，但短的那个轴会真的短。要做几何判断时用这个。
         """
         if self.lims is None:
             return
         lo, hi = self.lims
-        aspect = (max(1e-9, hi[0] - lo[0]),
-                  max(1e-9, hi[1] - lo[1]),
-                  max(1e-9, hi[2] - lo[2]))
+        if self.equal_axes.get():
+            aspect = (max(1e-9, hi[0] - lo[0]),
+                      max(1e-9, hi[1] - lo[1]),
+                      max(1e-9, hi[2] - lo[2]))
+        else:
+            aspect = (1.0, 1.0, 1.0)
         try:
             self.ax.set_box_aspect(aspect, zoom=self.box_zoom)
         except TypeError:                   # matplotlib < 3.9 没有 zoom 参数

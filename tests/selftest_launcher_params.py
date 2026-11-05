@@ -274,9 +274,11 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            abs(lo_z[0] + 1.5) < 1e-6 and abs(hi_z[0] - 1.5) < 1e-6
                            and abs(v.ax.elev - el_before) < 1e-6
                            and abs(v.ax.azim - az_before) < 1e-6))
-            checks.append(("原生三键映射在位（左旋转/中平移/右缩放）",
-                           v.ax._rotate_btn == [1] and v.ax._pan_btn == [2]
-                           and v.ax._zoom_btn == [3]))
+            # 右键 = 旋转（2026-11-05 用户："右键拖动不是我要的拖动摄像机视角，
+            # 而是特么的缩放比例"）。缩放交给滚轮，右键不再抢这个手势。
+            checks.append(("三键映射：左/右键都旋转、中键平移、右键不缩放",
+                           v.ax._rotate_btn == [1, 3] and v.ax._pan_btn == [2]
+                           and v.ax._zoom_btn == []))
 
             # 滚轮默认 = **整幅缩放**（2026-11-05 用户："缩放只有曲线缩放，
             # 没有背景坐标图缩放，很别扭"）。守的是：默认滚轮不许再只改 lims
