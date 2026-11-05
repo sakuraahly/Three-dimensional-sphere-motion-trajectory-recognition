@@ -2069,6 +2069,48 @@ def make_scratch_dir() -> Path:
         return d
 
 
+def test_pin_examples_match_names() -> bool:
+    """pin 示例必须按**名字里的 left/right** 配对，不能按枚举顺序（2026-11-05）。
+
+    守的是什么：交换 USB 口之后，枚举顺序会变成"原 right 排在前"，而名字里
+    仍带着各自的 left/right。若示例机械地把第一台配给 left，用户照着执行就会
+    把两个角色**绑反** —— 绑反不报错、不崩，录出来的三维左右镜像，
+    属于最难发现的那一类错。
+    """
+    print("----- 26. pin 示例按名字配对（换口后不许绑反） -----")
+    import importlib.util
+
+    tool = (Path(__file__).resolve().parent.parent
+            / "apps" / "tools" / "cameras.py")
+    spec = importlib.util.spec_from_file_location("_cam_tool_pin", tool)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # 交换后现场的真实顺序：名字不带 left 的那台（原 right）排在 #0
+    d_front = DeviceEntry(order=0, name="aoni webcam A25",
+                          identity="USB\\VID_1BCF&PID_2A25&MI_00\\6&212acdc8&0&0000",
+                          port="6&212acdc8&0&0000")
+    d_left = DeviceEntry(order=1, name="aoni webcam A25 left",
+                         identity="USB\\VID_1BCF&PID_2A25&MI_00\\6&31324e2c&0&0000",
+                         port="6&31324e2c&0&0000")
+
+    lines = mod._pin_example_lines([d_front, d_left])
+    for ln in lines:
+        print(f"      {ln.strip()[:96]}")
+
+    left_line = next((ln for ln in lines if "pin left" in ln), "")
+    right_line = next((ln for ln in lines if "pin right" in ln), "")
+    checks = [
+        ("left 行指向名字里带 left 的那台", "aoni webcam A25 left" in left_line),
+        ("right 行**不**指向带 left 的那台", "aoni webcam A25 left" not in right_line),
+        ("right 行指向剩下那台", right_line.strip().endswith('"aoni webcam A25"')),
+    ]
+    for label, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {label}")
+    return all(ok for _, ok in checks)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="摄像头设备管理自测")
     ap.add_argument("--probe", action="store_true",
@@ -2108,6 +2150,7 @@ def main() -> int:
             test_no_frame_retries_lowres_and_translates_error(),
             test_same_camera_message_blames_config_not_cable(),
             test_resolve_camera_arg_never_prompts(),
+            test_pin_examples_match_names(),
         ]
         print()
         if args.probe:

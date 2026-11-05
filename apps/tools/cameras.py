@@ -983,11 +983,36 @@ def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     usable = _usable_for_pin(devices)
     if len(usable) < 2:
         return ["     python apps/tools/cameras.py list   # 先看有哪些设备名可用"]
-    a, b = usable[0], usable[1]
-    return [
-        f'     python apps/tools/cameras.py pin left  name:"{a.name}"',
-        f'     python apps/tools/cameras.py pin right name:"{b.name}"',
-    ]
+
+    # ⚠ 不能机械地「第一台→left、第二台→right」（2026-11-05 现场）。
+    # 交换 USB 口之后，枚举顺序可能变成「原 right 在前、原 left 在后」，而名字
+    # 里还带着各自的 left/right —— 那时按顺序配对会把两个角色**绑反**，
+    # 用户照着抄完，录出来的左右就是反的（三维坐标会镜像，且很难看出来）。
+    # 名字是设备自己报的（或用户改过的），比枚举顺序可信得多。
+    def _by_name(word: str) -> cr.DeviceEntry | None:
+        for d in usable:
+            if word in (d.name or "").lower():
+                return d
+        return None
+
+    left_dev = _by_name("left")
+    right_dev = _by_name("right")
+    if left_dev is None or right_dev is None or left_dev is right_dev:
+        # 名字里没有角色线索（或两台同名）→ 回落顺序配对，但**避开已选中的那台**
+        rest = [d for d in usable if d is not left_dev]
+        if left_dev is None:
+            left_dev = rest[0] if rest else usable[0]
+            rest = [d for d in usable if d is not left_dev]
+        if right_dev is None or right_dev is left_dev:
+            right_dev = rest[0] if rest else None
+
+    lines = [f'     python apps/tools/cameras.py pin left  name:"{left_dev.name}"']
+    if right_dev is None:
+        lines.append("     python apps/tools/cameras.py list   "
+                     "# 另一台与它同名，name 分不开 —— 改用 port: 或 id: 绑")
+    else:
+        lines.append(f'     python apps/tools/cameras.py pin right name:"{right_dev.name}"')
+    return lines
 
 
 def _usable_for_pin(devices: list[cr.DeviceEntry]) -> list[cr.DeviceEntry]:
