@@ -445,7 +445,8 @@ def capture_board(*, out: str | Path, cols: str, rows: str, square: str,
 
 def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
                          target: str, left: str = "left", right: str = "right",
-                         min_cover: int = 0, dirs: dict | None = None) -> list[str]:
+                         min_cover: int = 0, relax_after: int = 0,
+                         dirs: dict | None = None) -> list[str]:
     """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
 
     ``stage`` ∈ {``left``, ``right``, ``ref``, ``dual_b``}：
@@ -457,6 +458,10 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
 
     参考段**不传** ``--camera-left/--camera-right``：与旧界面一致，让
     `capture_board.py` 自己按 left/right 角色取相机（角色绑定更稳，索引会漂移）。
+
+    ``min_cover`` / ``relax_after`` 只对内参段有效（双板 A/B 与单板左右）：
+    前者是**首选目标**（5=五个角全绿，最理想），后者是**分化线**——拍够这么多张
+    后覆盖标准放宽到 4/5。参考段不用覆盖判据（它的规则是"板不能动"）。
     """
     d = dirs if dirs is not None else chain_dirs()
     if stage == "ref":
@@ -474,7 +479,8 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
             "--camera", str(right or "").strip() or "right",
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
             "--target", str(target), "--auto",
-            *(["--min-cover", str(min_cover)] if min_cover > 0 else []))
+            *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
+            *(["--relax-after", str(relax_after)] if relax_after > 0 else []))
     side = "left" if stage == "left" else "right"
     out = d["left"] if stage == "left" else d["right"]
     return _argv(
@@ -482,7 +488,8 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
         "--camera", str(left if stage == "left" else right or "").strip() or side,
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
         "--target", str(target), "--auto",
-        *(["--min-cover", str(min_cover)] if min_cover > 0 else []))
+        *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
+        *(["--relax-after", str(relax_after)] if relax_after > 0 else []))
 
 
 def capture_pair_frame(*, cols: str, rows: str, square: str,

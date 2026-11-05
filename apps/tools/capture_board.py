@@ -556,9 +556,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--target", type=int, default=15,
                     help="存够这么多张就退出（--both 下按对数算，默认 15）")
     ap.add_argument("--min-cover", type=int, default=0,
-                    help="内参段：覆盖满这么多区域就**提前**结束（不再等 target）。"
-                         "0=不启用。至少要拍满 min-cover 张才判（防止几张同角落就误判够）。"
-                         "与项目质量门限一致：4=四角+中央覆盖 4 个即可")
+                    help="内参段**首选目标**：覆盖满这么多区域就结束（0=不启用覆盖判据）。"
+                         "给 5 = 五个角全绿，这是最理想的结果，任何时候达标都立即结束。"
+                         "**这是目标不是上限** —— 达不到时靠 --relax-after 放宽，"
+                         "不会因为'覆盖了 4 个'就停止要求第 5 个")
+    ap.add_argument("--relax-after", type=int, default=0,
+                    help="**分化线**：拍到这么多张后，覆盖标准从 --min-cover 放宽到 "
+                         "--relax-cover。0=不放宽（一直要求 --min-cover）。"
+                         "用户界面上填的『目标对数』传到这个参数")
+    ap.add_argument("--relax-cover", type=int, default=4,
+                    help="过了分化线后的放宽标准（默认 4 = 四角+中央里覆盖 4 个即可）。"
+                         "只有拍够 --relax-after 张之后才生效")
     ap.add_argument("--stationary-px", type=float, default=3.0,
                     help="连续两帧角点最大位移上限（px，默认 3.0）")
     ap.add_argument("--min-sharpness", type=float, default=800.0,
@@ -786,13 +794,22 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                         f"q 退出   {wins.fullscreen_hint()}"
                         if auto else
                         f"空格 保存   q 退出   {wins.fullscreen_hint()}")
-                # 覆盖进度进 footer：用户眼睛只扫底部。**结束只看覆盖，不看张数**
-                # （2026-11-04 用户明确：拍 5 张就退出是错的，该看"集到几个绿色区域"）。
-                cover_txt = ""
+                # 覆盖进度进 footer。**目标是 --min-cover（通常 5=全绿），4 只是分化线
+                # 之后的兜底**——2026-11-05 用户指出上一版把 4 当上限是错的。
                 if args.min_cover > 0 and stage == "intr":
-                    missing = args.min_cover - len(covered)
-                    cover_txt = (f"  已拍 {len(saved)} 张   覆盖 {len(covered)}/{args.min_cover}"
-                                 + (f"，还差 {max(missing, 0)} 个角" if missing > 0 else "，已达标"))
+                    goal = args.min_cover
+                    missing = goal - len(covered)
+                    cover_txt = (f"  已拍 {len(saved)} 张   覆盖 {len(covered)}/{goal}"
+                                 + (f"，还差 {missing} 个角" if missing > 0
+                                    else "，全绿！"))
+                    # 分化线提示：让用户知道"还能拍多久""什么时候能降标准"
+                    if missing > 0 and args.relax_after > 0:
+                        left = args.relax_after - len(saved)
+                        if left > 0:
+                            cover_txt += (f"（再拍 {left} 张后 "
+                                          f"{args.relax_cover}/{goal} 即可）")
+                        else:
+                            cover_txt += (f"（已过分化线，{args.relax_cover}/{goal} 即可）")
                     footer = (f"{cover_txt}   "
                               f"{'可保存' if can else (reason or '—')}   "
                               f"{src.info.width}x{src.info.height}   {hint}")
@@ -865,14 +882,26 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                 if idx >= 0:
                     covered.add(idx)
             verb = "自动保存" if not manual else "已保存"
-            # 结束判据：**只覆盖满 --min-cover 个区域就收工，不设张数上限**。
-            # 2026-11-04 用户明确纠正：限制结束的该是"集到几个绿色区域"，不是"拍了
-            # 几张"。拍 5 张就退出是错的——板摆不开时该继续拍，直到四个角都绿。
-            cover_reached = (args.min_cover > 0
-                             and len(covered) >= args.min_cover)
+            # 达标判定（2026-11-05，用户澄清后的正确语义）：
+            #   ① 覆盖满 --min-cover（通常 5 = 五个角全绿）——**最理想，随时结束**；
+            #   ② 拍够 --relax-after 张（用户填的分化线）后，放宽到 --relax-cover（通常 4）。
+            # 关键：**4 不是上限**，是"拍够了还没全绿"时的兜底；5 才是首选目标。
+            # 上一版把 4 当上限（覆盖 4 个就停），用户当场指出是错的。
+            goal = args.min_cover
+            cover_reached = False
+            cover_note = ""
+            if goal > 0:
+                if len(covered) >= goal:
+                    cover_reached = True
+                    cover_note = f"  覆盖 {len(covered)}/{goal} 全绿，收工"
+                elif (args.relax_after > 0 and len(saved) >= args.relax_after
+                      and len(covered) >= args.relax_cover):
+                    cover_reached = True
+                    cover_note = (f"  已过分化线（{args.relax_after} 张），"
+                                  f"覆盖 {len(covered)}/{goal} 按 {args.relax_cover}/{goal} 收工")
             print(f"{verb} {name}  （已拍 {len(saved)} 张，"
                   f"focus {acc.focus:.0f}，原始清晰度 {acc.sharpness:.0f}，位移 {still:.1f} px）"
-                  + (f"  覆盖 {len(covered)}/{REGIONS_TOTAL} 已达标，收工" if cover_reached else ""))
+                  + cover_note)
             log.info("保存 %s（focus %.0f，原始清晰度 %.0f，格子 %.1fpx，位移 %.1f px）",
                      path, acc.focus, acc.sharpness, acc.square_px, still)
             stable = 0
@@ -897,9 +926,13 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
         print(f"[错误] 元数据边车写不进：{out_dir / SIDECAR_NAME}（{exc}）")
         return 1
     log.info("元数据边车 %s（count=%d）", sidecar, len(saved))
-    # 退出码：--min-cover 启用时按覆盖达标判；否则按张数判（旧行为）
+    # 退出码：--min-cover 启用时按**与循环同一套**达标判据（5/5 优先，过分化线后 4/5）；
+    # 否则按张数判（旧行为，供参考段/同框图用）。
     if args.min_cover > 0:
-        return 0 if len(covered) >= args.min_cover else 3
+        ok = len(covered) >= args.min_cover or (
+            args.relax_after > 0 and len(saved) >= args.relax_after
+            and len(covered) >= args.relax_cover)
+        return 0 if ok else 3
     return 0 if len(saved) >= args.target else 3
 
 

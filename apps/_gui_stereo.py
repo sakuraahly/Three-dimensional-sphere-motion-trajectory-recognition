@@ -760,13 +760,19 @@ class StereoWindow(tk.Toplevel):
         box = self.surface.card(parent, "② 标定", hint)
         self.lbl_calib = self.surface.hint(box, "检查中…")
 
-        # L1：目标对数 + 板参数（一行）
+        # L1：分化线 + 板参数（一行）
+        #
+        # 标签原叫「目标对数」，现在语义变了（2026-11-05 用户澄清）：它不是
+        # "拍多少对就停"，而是**分化线**——拍够这么多张后，覆盖标准从 5/5 放宽
+        # 到 4/5；在此之前都要求五个角全绿。名字不改会继续误导。
         line = ttk.Frame(box)
         line.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                   sticky="w", pady=(4, 0))
-        ttk.Label(line, text="目标对数").pack(side="left")
+        ttk.Label(line, text="分化线 张").pack(side="left")
         ttk.Entry(line, textvariable=self.var_target, width=5).pack(
-            side="left", padx=(8, 14))
+            side="left", padx=(8, 4))
+        ttk.Label(line, text="（拍够后 4/5 即可；之前要求 5/5 全绿）",
+                  style="Hint.TLabel").pack(side="left", padx=(0, 14))
         ttk.Label(line, text="棋盘内角点").pack(side="left")
         ttk.Entry(line, textvariable=self.var_cols, width=4).pack(
             side="left", padx=(8, 3))
@@ -1146,16 +1152,28 @@ class StereoWindow(tk.Toplevel):
         for p in d.values():
             p.mkdir(parents=True, exist_ok=True)
 
+        # 分化线：② 里填的「目标对数」在采集这一步的含义是——**拍够这么多张后，
+        # 覆盖标准从 5/5 放宽到 4/5**。它不是"拍摄总对数"（2026-11-05 用户澄清）。
+        # 空/非数字按 40（与输入框默认一致）；≤0 视为"不放宽"。
+        try:
+            relax_after = int(str(self.var_target.get()).strip() or "40")
+        except ValueError:
+            relax_after = 40
+        if relax_after < 0:
+            relax_after = 0
+
         if self._method_key() == "chain_dual":
             # 双板：A/B 两块板各拍一组（可移动），同框图需**手动**拍（capture_board
             # 只检单板，检不了同框两板）。
             steps = [
                 ("双板·拍 A 板（左相机，板可移动）",
                  capture_chain_frames(stage="left", left=left, right=right,
-                                      target="999", min_cover=4, **board_base)),
+                                      target="999", min_cover=5,
+                                      relax_after=relax_after, **board_base)),
                 ("双板·拍 B 板（右相机，板可移动）",
                  capture_chain_frames(stage="dual_b", left=left, right=right,
-                                      target="999", min_cover=4, **board_base)),
+                                      target="999", min_cover=5,
+                                      relax_after=relax_after, **board_base)),
                 ("双板·拍同框图（左相机，两板同时入画，不检板）",
                  capture_pair_frame(camera=left, **board_base)),
             ]
@@ -1163,10 +1181,12 @@ class StereoWindow(tk.Toplevel):
             steps = [
                 ("内参段·左（板可移动，多姿态）",
                  capture_chain_frames(stage="left", left=left, right=right,
-                                      target="999", min_cover=4, **board_base)),
+                                      target="999", min_cover=5,
+                                      relax_after=relax_after, **board_base)),
                 ("内参段·右（板可移动，多姿态）",
                  capture_chain_frames(stage="right", left=left, right=right,
-                                      target="999", min_cover=4, **board_base)),
+                                      target="999", min_cover=5,
+                                      relax_after=relax_after, **board_base)),
                 ("参考段（板**固定不动**，左右成对拍）",
                  capture_chain_frames(stage="ref", left=left, right=right,
                                       target="3", **board_base)),
