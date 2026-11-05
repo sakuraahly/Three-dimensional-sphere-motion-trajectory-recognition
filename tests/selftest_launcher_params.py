@@ -274,11 +274,31 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            abs(lo_z[0] + 1.5) < 1e-6 and abs(hi_z[0] - 1.5) < 1e-6
                            and abs(v.ax.elev - el_before) < 1e-6
                            and abs(v.ax.azim - az_before) < 1e-6))
-            # 右键 = 旋转（2026-11-05 用户："右键拖动不是我要的拖动摄像机视角，
-            # 而是特么的缩放比例"）。缩放交给滚轮，右键不再抢这个手势。
-            checks.append(("三键映射：左/右键都旋转、中键平移、右键不缩放",
-                           v.ax._rotate_btn == [1, 3] and v.ax._pan_btn == [2]
+            # 右键 = 平移（2026-11-05 用户："假设观察者是一个人，右键不是转动
+            # 视角，而是人前后左右的走"）。中键保留平移，缩放只归滚轮。
+            checks.append(("三键映射：左键旋转、右/中键平移、右键不缩放",
+                           v.ax._rotate_btn == [1] and v.ax._pan_btn == [2, 3]
                            and v.ax._zoom_btn == []))
+
+            # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
+            # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线
+            # 会把界面卡死。
+            # 注意：上面 `_zoom_around` 已把范围改成 [-1.5, 1.5]（跨度 3），
+            # 所以这里用 0.5（3/0.5=6 档，不会触发"过密退回"）。
+            v.tick_vars["x"].set("0.5")
+            v.tick_vars["y"].set("")
+            v.tick_vars["z"].set("")
+            v._apply_tick_steps()
+            xt = [round(float(t), 4) for t in v.ax.get_xticks()]
+            gaps = {round(b - a, 4) for a, b in zip(xt, xt[1:])}
+            checks.append(("分度值 0.5 -> X 轴刻度间隔都是 0.5",
+                           bool(xt) and gaps == {0.5}))
+            v.tick_vars["x"].set("0.0001")
+            v._apply_tick_steps()
+            checks.append(("分度值过密（0.0001）-> 退回自动，不生成上千条线",
+                           len(v.ax.get_xticks()) <= 10))
+            v.tick_vars["x"].set("")
+            v._apply_tick_steps()
 
             # 滚轮默认 = **整幅缩放**（2026-11-05 用户："缩放只有曲线缩放，
             # 没有背景坐标图缩放，很别扭"）。守的是：默认滚轮不许再只改 lims

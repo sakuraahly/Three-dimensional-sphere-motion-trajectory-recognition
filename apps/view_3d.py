@@ -382,6 +382,11 @@ class Viewer3D:
         # 这是**显示**选择，不是数据选择：轨迹本身一个字都没变（2026-11-05
         # 用户："这个坐标背景图比例很奇怪…Y 方向实在是比例奇怪"）。
         self.equal_axes = tk.BooleanVar(master=root, value=False)
+        # 三轴分度值（刻度间隔）。空 = 自动（每轴最多 4 档）。
+        # 用户要的是"我自己定网格多密"—— 0.05 就是每 5 cm 一根线
+        # （2026-11-05："补充上手动调整三轴分度值的功能"）。
+        self.tick_vars = {k: tk.StringVar(master=root, value="")
+                          for k in ("x", "y", "z")}
         self._roll_drag: tuple[int, float] | None = None
         self._syncing_view = False
         self._plane_note = ""
@@ -600,10 +605,21 @@ class Viewer3D:
             command=self._on_axes_mode)
         self.equal_chk.pack(anchor="w", pady=(8, 0))
 
+        ttk.Label(side, text="分度值 X / Y / Z（米，留空=自动）",
+                  style="Hint.TLabel").pack(anchor="w", pady=(10, 2))
+        tick_row = ttk.Frame(side)
+        tick_row.pack(fill="x")
+        for _key, _hint in (("x", "X"), ("y", "Y"), ("z", "Z")):
+            ttk.Label(tick_row, text=_hint + " ").pack(side="left")
+            _e = ttk.Entry(tick_row, textvariable=self.tick_vars[_key], width=6)
+            _e.pack(side="left", padx=(0, 4))
+            _e.bind("<Return>", self._on_tick_edit)
+            _e.bind("<FocusOut>", self._on_tick_edit)
+
         self.plane_note = ttk.Label(side, text="", style="Hint.TLabel",
                                     wraplength=250, justify="left")
         self.plane_note.pack(anchor="w", pady=(8, 0))
-        ttk.Label(side, text="左键拖动：自由旋转（任意方位/仰角）",
+        ttk.Label(side, text="左键拖动：旋转视角\n右键拖动：平移（人走动）",
                   style="Hint.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
 
         bar = ttk.Frame(self.root, padding=(8, 4))
@@ -611,6 +627,9 @@ class Viewer3D:
         self.play_btn = ttk.Button(bar, text="播放", command=self._toggle_play, width=8)
         self.play_btn.pack(side="left")
         ttk.Button(bar, text="重置3D视角", command=self._reset_view, width=10).pack(side="left", padx=4)
+        self.full_btn = ttk.Button(bar, text="全屏", command=self._toggle_fullscreen,
+                                   width=7)
+        self.full_btn.pack(side="left", padx=(0, 4))
         ttk.Label(bar, text="帧").pack(side="left", padx=(10, 2))
         self.slider = ttk.Scale(bar, from_=0, to=max(0, self.n - 1),
                                 command=self._on_slider, orient="horizontal")
@@ -628,7 +647,7 @@ class Viewer3D:
         self.smooth_chk.pack(side="left", padx=(10, 0))
         # 缩放/平移提示（2026-11-04）：三键交互是 matplotlib 3D 原生的，
         # 用户看不到说明就不知道中键能平移、右键能缩放。文字放控制条右侧。
-        ttk.Label(bar, text="左/右键拖动 旋转视角 · 中键平移 · 滚轮缩放 · "
+        ttk.Label(bar, text="左键旋转 · 右键平移（走动） · 滚轮缩放 · "
                             "Shift+滚轮 定点放大",
                   style="Hint.TLabel").pack(side="right", padx=(10, 4))
 
@@ -801,8 +820,12 @@ class Viewer3D:
         `_zoom_btn = []` 是必须的：若 3 同时出现在 rotate 和 zoom 里，
         mplot3d 的移动处理会两个都响应（拖动时一边转一边缩放）。
         """
-        self.ax._rotate_btn = [1, 3]
-        self.ax._pan_btn = [2]
+        # 右键 = **平移**（2026-11-05 用户："假设观察者是一个人，右键不是转动
+        # 视角，而是人前后左右的走"）。mplot3d 的 pan 正是这个语义：视野中心
+        # 跟着鼠标在屏幕平面里移动，看起来就是人朝那个方向走。
+        # 左键仍是旋转，中键也保留平移（老习惯），缩放只归滚轮。
+        self.ax._rotate_btn = [1]
+        self.ax._pan_btn = [2, 3]
         self.ax._zoom_btn = []
 
     def _apply_view(self) -> None:
@@ -972,6 +995,86 @@ class Viewer3D:
         self.ax.set_zlim(lo[2], hi[2])
         self._apply_box()
 
+    def _on_tick_edit(self, _event=None) -> None:
+        """分度值改了（回车或失焦）就立刻重设刻度。"""
+        self._apply_tick_steps()
+        self.canvas.draw_idle()
+
+    def _apply_tick_steps(self) -> None:
+        """按侧栏填的分度值设三轴刻度间隔；留空/非法/过密则回落到自动 4 档。
+
+        为什么要挡"过密"：填 0.001 会让这段 3 米长的数据出现 3000 条网格线，
+        matplotlib 会画上几十秒、界面看起来像卡死。超过 20 条就退回自动。
+        """
+        if self.lims is None:
+            return
+        lo, hi = self.lims
+        for i, (axis, key) in enumerate(
+                ((self.ax.xaxis, "x"), (self.ax.yaxis, "y"),
+                 (self.ax.zaxis, "z"))):
+            txt = self.tick_vars[key].get().strip()
+            step = 0.0
+            try:
+                step = float(txt) if txt else 0.0
+            except ValueError:
+                step = 0.0
+            span = max(1e-9, hi[i] - lo[i])
+            if step > 0 and span / step <= 20:
+                axis.set_major_locator(mticker.MultipleLocator(step))
+                # 网格按 step 画（要密就密），但**标签自动疏**：3D 轴在屏幕上
+                # 很短，12 个标签会糊成一片（实测 0.05 分度就是这个下场）。
+                # 目标是最多 ~10 个标签，多出来的 tick 只画网格不写字。
+                # `MultipleLocator` 会向**两端各外扩**一个刻度（-0.061 的
+                # 下限会给出 -0.08），所以估算要 +2；目标是屏幕上 ~9 个标签。
+                _n_est = span / step + 2
+                every = max(1, int(_n_est // 9) + (1 if _n_est % 9 else 0))
+                def _fmt(v, _pos=None, _s=step, _e=every):
+                    """只标每 _e 个刻度；并把浮点误差的 0 写成 "0"。
+
+                    `MultipleLocator(0.05)` 给出的"0"实际是 5.55e-17 这种值，
+                    直接 `%g` 会显示成科学计数法 —— 轴上看不见一个正常的 0。
+                    """
+                    k = round(v / _s)
+                    if abs(v / _s - k) > 1e-6 or int(k) % _e:
+                        return ""
+                    if abs(v) < _s * 1e-6:
+                        return "0"
+                    return f"{v:g}"
+
+                axis.set_major_formatter(mticker.FuncFormatter(_fmt))
+            else:
+                axis.set_major_locator(mticker.MaxNLocator(4))
+                axis.set_major_formatter(mticker.ScalarFormatter())
+
+    def _toggle_fullscreen(self) -> None:
+        """全屏 / 退出全屏（Esc 也能退）。
+
+        为什么需要它（2026-11-05 用户："做出类似这样的全屏模式，现在的坐标系
+        背景图太小，附近留白太多"）：3D 轴在画布矩形里按最紧凑方式居中，画布
+        本身越小，留白占比越大。全屏把画布撑到整个屏幕，是"占满视野"最直接的
+        办法 —— 不用去猜 zoom 该给多少。
+        """
+        self._fullscreen = not getattr(self, "_fullscreen", False)
+        top = self.root.winfo_toplevel()
+        try:
+            top.attributes("-fullscreen", self._fullscreen)
+        except tk.TclError:
+            # 个别窗口管理器不认 -fullscreen：退化成最大化
+            try:
+                top.state("zoomed" if self._fullscreen else "normal")
+            except tk.TclError:
+                pass
+        try:
+            self.full_btn.configure(text="退出全屏" if self._fullscreen else "全屏")
+        except tk.TclError:
+            pass
+        if self._fullscreen:
+            top.bind("<Escape>", self._on_escape_fullscreen)
+
+    def _on_escape_fullscreen(self, _event=None) -> None:
+        if getattr(self, "_fullscreen", False):
+            self._toggle_fullscreen()
+
     def _on_axes_mode(self) -> None:
         """切换"等比例坐标"后立刻重画（只改显示比例，不动数据与范围）。"""
         self._apply_box()
@@ -1125,11 +1228,9 @@ class Viewer3D:
         self.ax.set_xlabel("X right (m)")
         self.ax.set_ylabel("Y down (m)")
         self.ax.set_zlabel("Z forward (m)")
-        # 3D 轴在斜视角下刻度标签很容易叠在一起（Y 轴最明显：几毫米的间距里
-        # 塞了 7 个标签）。限成 4 个主刻度，数值本身已经说明范围，不需要那么密。
+        # 刻度间隔：用户填了分度值就用它（`MultipleLocator`），否则自动 4 档。
         # 必须在 `clear()` 之后设 —— 它会重置 locator。
-        for _axis in (self.ax.xaxis, self.ax.yaxis, self.ax.zaxis):
-            _axis.set_major_locator(mticker.MaxNLocator(4))
+        self._apply_tick_steps()
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
                           f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
