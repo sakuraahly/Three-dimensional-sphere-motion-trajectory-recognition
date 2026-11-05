@@ -678,6 +678,13 @@ def test_junk_cleanup_safety() -> bool:
             touch(repo / f"outputs/_bigdata/f{_i}.png", 6 * 1024 * 1024)
         # 散落在 outputs 根、既不是 tmp_* 也不在任何子目录里 —— 容易被漏掉的那类
         touch(repo / "outputs/stray_note.txt", 500)
+        # 名字像调试产物、但里面是**人工结论 / 标定结果 / 成组实验帧**：
+        # 小目录躲得过按体积的降级，必须靠语义判据拦住（2026-11-05）。
+        touch(repo / "outputs/agent_notes/f1.bin", 300)
+        touch(repo / "outputs/agent_notes/conclusion.md", 300)
+        touch(repo / "outputs/_calib_probe/stereo_calibration.json", 300)
+        for _i in range(6):
+            touch(repo / f"outputs/tmp_frames_probe/left_{_i}.jpg", 300)
         touch(repo / "apps/__pycache__/m.cpython-311.pyc", 300)
         sess = repo / "data/stereo/parallel/20260101-000000"
         touch(sess / "session.json", 100)
@@ -708,8 +715,12 @@ def test_junk_cleanup_safety() -> bool:
                        not any("chain_frames" in x for x in [*labels, *paths])))
         checks.append(("**不列** data 里的会话录像",
                        not any("left.mkv" in x for x in paths)))
+        # 判据必须是"路径落在 config/ 下"，不能是"路径里有 calibration 字样"：
+        # 后者会被 outputs/_calib_probe/stereo_calibration.json 这类**测试自己造的**
+        # 标定产物误伤（2026-11-05 加研究产物保护时发现）。
         checks.append(("**不列** config/",
-                       not any("calibration" in x for x in paths)))
+                       not any("/config/" in x.replace("\\", "/")
+                               for x in paths)))
         alive = [str(f.path) for i in plan.items if i.danger != DANGER_GONE
                  for f in i.files]
         checks.append(("**不列**会话里的 session.json 本体（回收站除外）",
@@ -735,6 +746,17 @@ def test_junk_cleanup_safety() -> bool:
                        big is not None and "降为" in big.note))
         checks.append(("小目录不降级（避免推荐档被误清空）",
                        by_label["outputs/agent_x"].danger == DANGER_SAFE))
+        # 逐项校验 53 个候选后发现：`_cvcheck` 里的 stereo_calibration.json、
+        # `_diag` 里的 txt 结论、`tmp_frames*` 里的真实抽帧，全都因为"小"
+        # 被判成了推荐档。这三条断言防止它们再次被默认勾选。
+        for _key, _why in (
+                ("outputs/agent_notes", "人工文档"),
+                ("outputs/_calib_probe", "标定结果"),
+                ("outputs/tmp_frames_probe", "成组实验帧")):
+            _it = by_label.get(_key)
+            checks.append((f"{_why}所在目录降级为谨慎（不默认勾选）",
+                           _it is not None and _it.danger == DANGER_WARN
+                           and "降为" in _it.note))
 
         # ---- ②b2 散落在 outputs 根的文件也要能被收录 ----
         stray = by_label.get("outputs 根下的其他散落文件")

@@ -39,7 +39,8 @@ from pathlib import Path
 __all__ = [
     "DANGER_GONE", "DANGER_SAFE", "DANGER_WARN",
     "JunkFile", "JunkItem", "JunkPlan",
-    "clean_junk", "human_size", "looks_like_data", "scan_junk",
+    "clean_junk", "human_size", "looks_like_data",
+    "looks_like_research_artifact", "scan_junk",
 ]
 
 #: 删了下次跑就有（日志 / 缓存 / 调试产物 / 回收站里的垃圾）。
@@ -214,6 +215,57 @@ def looks_like_data(files: list[JunkFile]) -> str | None:
     return None
 
 
+#: 文件名里出现这些词 = 人工留下的实验产物，不是随手写的调试输出。
+_RESEARCH_NAME_MARKS = (
+    "calibration", "seeds", "report", "verdict", "evidence", "baseline",
+    "review", "design", "交接", "结论",
+)
+
+
+def looks_like_research_artifact(files: list[JunkFile]) -> str | None:
+    """目录里含**人工结论 / 标定结果 / 成组实验记录**？返回原因，否则 None。
+
+    为什么必须补这一条（2026-11-05 逐项校验 53 个候选后的发现）：
+
+    原来只有 `looks_like_data`（按大文件数 + 100 MiB 总量阈值）一道闸，
+    结果下面这些**明显不能删**的目录全被判成「推荐」并默认勾选：
+
+      outputs/_cvcheck   stereo_calibration.json / .npz   —— 标定结果（才 15 KiB）
+      outputs/_diag      43 张诊断图 + 10 个 .txt 结论
+      outputs/_jr        60 个对比 CSV + 11 个 .txt
+      outputs/_handoff_read  A4_相机identify交接.md 等 44 份文档
+      outputs/agent_gui_audit  doc_evidence.md / human_review.md
+      outputs/tmp_frames* 从真实会话抽的 jpg 帧序列
+
+    它们的共同点是**小**（没到 100 MiB）或**文档多**（不是数据后缀），
+    恰好躲过了按体积/后缀比例的判据。清理器一旦默认勾上，用户点一下
+    "清理"就会把实验证据和标定结果一起送走。
+
+    所以再加三道**看语义**的判据：人写的文档、标定/seeds 这类命名、
+    成组的结果文件（哪怕总量很小）。命中一律降级为「谨慎」——
+    降级的语义是"我不确定，你自己勾"，不是"这是垃圾"。
+    """
+    if not files:
+        return None
+    docs = [f for f in files if f.path.suffix.lower() == ".md"]
+    if docs:
+        return f"含 {len(docs)} 份人工文档（.md，如 {docs[0].path.name}）"
+    txt = [f for f in files if f.path.suffix.lower() == ".txt"]
+    if len(txt) >= 3:
+        return f"含 {len(txt)} 个文字记录（.txt），可能是实验结论"
+    for f in files:
+        low = f.path.name.lower()
+        if any(mark in low for mark in _RESEARCH_NAME_MARKS):
+            return f"含实验产物：{f.path.name}"
+    n_data = sum(1 for f in files
+                 if f.path.suffix.lower() in _DATA_SUFFIXES)
+    ratio = n_data / len(files)
+    if n_data >= 5 and ratio >= 0.5:
+        return (f"{n_data} 个结果文件占 {ratio:.0%}，"
+                "是一组成组的实验记录（哪怕总量很小）")
+    return None
+
+
 def _dir_item(key: str, path: Path, *, label: str, detail: str, danger: str,
               skipped: list[str]) -> JunkItem | None:
     files = _walk_files(path, skipped=skipped)
@@ -260,7 +312,7 @@ def _outputs_dir_item(d: Path, skipped: list[str]) -> JunkItem | None:
         return None
 
     if danger == DANGER_SAFE and not explicit_safe:
-        why = looks_like_data(item.files)
+        why = looks_like_data(item.files) or looks_like_research_artifact(item.files)
         if why:
             item.danger = DANGER_WARN
             item.note = f"{why} —— 已从「推荐」降为「谨慎」，要清请手动勾选"
