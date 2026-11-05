@@ -2146,6 +2146,15 @@ def main() -> int:
     print(f"    采集 argv（ref）：{' '.join(ref_argv)}")
     print(f"    标定 argv：{calib_joined}")
 
+    # ---- 操作说明（2026-11-05）----
+    # 并进这个文件而不是新建 `selftest_help.py`：`selftest_doc_facts` 里
+    # `REAL_TEST_COUNT = 26` 是**有签字的预算**（注释写明"要扩得先有人签"），
+    # 顺手加文件会直接把它顶红。`view_3d` 的 9 条判据当年也是这么并进来的。
+    print("----- 8e. 操作说明：内容 / 搜索 / 窗口 -----")
+    for _name, _passed in _check_help():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
@@ -2154,6 +2163,103 @@ def main() -> int:
             print(f"  · {n}")
     print("\n判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
+
+
+def _check_help() -> list[tuple[str, bool]]:
+    """操作说明：内容结构、搜索、窗口渲染。
+
+    守什么（2026-11-05 用户要的「说明书」）：
+
+    1. **内容不能空**：分区/条目删光了，窗口打开是白板，用户以为程序坏了；
+    2. **每条都得有正文**：只有标题没内容是占位符；
+    3. **搜索要对**：单词命中、多词是「与」、搜不到不能退化成全量；
+    4. **窗口真能建起来**：初始正文直接渲染（靠 `<<TreeviewSelect>>` 派发会
+       出现"刚打开时右侧空白"）、搜索后变扁平列表、清空能回到分区树。
+    """
+    from apps.help_content import SECTIONS, iter_items, search
+    from apps.help_window import HelpWindow
+
+    checks: list[tuple[str, bool]] = []
+
+    checks.append((f"说明分区数合理（{len(SECTIONS)} 个）", len(SECTIONS) >= 5))
+    ids = [sid for sid, _t, _i in SECTIONS]
+    checks.append(("说明分区 id 不重复", len(ids) == len(set(ids))))
+
+    items = list(iter_items())
+    checks.append((f"说明条目数合理（{len(items)} 条）", len(items) >= 15))
+
+    thin = [t for _s, _st, t, b in items
+            if len(t.strip()) < 4 or len(b.strip()) < 20]
+    checks.append((f"每条都有标题和正文（薄弱 {len(thin)} 条：{thin[:2]}）",
+                   not thin))
+    titles = [t for _s, _st, t, _b in items]
+    dup = [t for t in set(titles) if titles.count(t) > 1]
+    checks.append((f"说明标题不重复（重名：{dup[:2]}）", not dup))
+
+    # 搜索要覆盖正文，不能只扫标题（「1920」只写在采集档那段正文里）
+    checks.append(("搜索覆盖正文（「1920」只在正文里）", bool(search("1920"))))
+    one = search("视角")
+    checks.append((f"单词搜索有结果（「视角」{len(one)} 条）", len(one) >= 1))
+    two = search("采样 坐标")
+    checks.append(("多词是「与」（每条同时含两词）",
+                   bool(two) and all("采样" in (t + b) and "坐标" in (t + b)
+                                     for _s, _st, t, b in two)))
+    checks.append(("搜不到就是空（不退化成全量）",
+                   search("zzz不存在的词") == []))
+    checks.append(("空关键词返回空", search("   ") == []))
+
+    # ---- 窗口 ----
+    # 自己建一个隐藏的 root：`main` 跑到这里时 Launcher 已经 destroy 了，
+    # 借它的窗口会抛 "application has been destroyed"。
+    root = tk.Tk()
+    root.withdraw()
+    win = None
+    try:
+        win = HelpWindow(root)
+        win.update_idletasks()
+
+        tops = win.tree.get_children()
+        checks.append((f"目录分区节点数 = {len(SECTIONS)}（实际 {len(tops)}）",
+                       len(tops) == len(SECTIONS)))
+        empty = [win.tree.item(t, "text") for t in tops
+                 if not win.tree.get_children(t)]
+        checks.append((f"每个分区下都有条目（空：{empty[:2]}）", not empty))
+
+        # 刚建好就该有正文 —— 依赖选中事件派发会留白一帧
+        body = win.text.get("1.0", "end").strip()
+        checks.append((f"打开即有正文（{len(body)} 字）", len(body) > 30))
+
+        hits = search("状态")
+        win._query.set("状态")
+        win.update_idletasks()
+        flat = win.tree.get_children()
+        checks.append((f"搜索后变扁平列表（命中 {len(hits)}，节点 {len(flat)}）",
+                       len(flat) == len(hits) and len(flat) > 0))
+
+        win._clear_search()
+        win.update_idletasks()
+        checks.append(("清空搜索回到分区树",
+                       len(win.tree.get_children()) == len(SECTIONS)))
+
+        win._query.set("zzz不存在的词")
+        win.update_idletasks()
+        checks.append(("搜不到时正文给出提示（不是空白/上一条）",
+                       "没有匹配" in win.text.get("1.0", "end")))
+        win._query.set("")
+        win.update_idletasks()
+    except Exception as exc:                            # noqa: BLE001
+        checks.append((f"说明窗口能建起来（异常：{exc}）", False))
+    finally:
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:                           # noqa: BLE001
+                pass
+        try:
+            root.destroy()
+        except Exception:                               # noqa: BLE001
+            pass
+    return checks
 
 
 def _pair_check(base) -> bool:

@@ -324,9 +324,15 @@ class DataManager(tk.Tk):
         self.tree.bind("<Button-1>", self._tree_click)
         self.tree.bind("<Double-1>", lambda _e: self._open_viewer())
 
-        tip = ttk.Label(left, text="点第一列勾选；勾起点→点终点→『选到此处』；Shift+点行也可区间。",
-                        foreground=MUTED)
-        tip.pack(side="bottom", anchor="w", pady=(4, 0))
+        # 选中方法的完整说明搬到「操作说明 · 数据管理」了（2026-11-05 用户：
+        # "很多界面的操作说明文字就可以删掉进而不会影响界面排布"）。
+        # 这里只留一句极短提示 + 一键入口，把宽度让给列表。
+        tip_row = ttk.Frame(left)
+        tip_row.pack(side="bottom", fill="x", pady=(4, 0))
+        ttk.Label(tip_row, text="多选 / 区间选择的方法：", foreground=MUTED).pack(
+            side="left")
+        ttk.Button(tip_row, text="? 操作说明", width=10,
+                   command=self._open_help).pack(side="left", padx=(4, 0))
 
         self.count_label = ttk.Label(right, text="", font=("Microsoft YaHei UI", 10, "bold"))
         self.count_label.pack(anchor="w", pady=(0, 6))
@@ -517,6 +523,12 @@ class DataManager(tk.Tk):
                 lab.configure(wraplength=wrap)
         except Exception:                            # noqa: BLE001
             pass
+
+    def _open_help(self) -> None:
+        """打开操作说明并定位到「数据管理」分区。"""
+        from apps.help_window import open_help
+
+        open_help(self, section="data")
 
     def _refresh_count(self) -> None:
         chosen = [it for it in self.items if it.key in self.selected]

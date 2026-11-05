@@ -582,6 +582,9 @@ class HubWindow(tk.Toplevel):
             "任务与日志统一走右下角状态条。")
         row = self.surface.action_row(box)
         # 相机设备放第一个：没有相机身份，标定/录制都没有起点，它比"数据管理"更靠前
+        # 「操作说明」放第一个：它是**学习入口**，第一次用的人先看它，
+        # 之后各窗口里那些挤占排版的说明文字都可以删掉挪进来（2026-11-05 用户）。
+        self.surface.secondary(row, "操作说明", self._open_help)
         self.surface.secondary(row, "相机设备", self._open_cameras)
         # 「任务管理器和运行日志」**不在这里**（2026-11-04）：
         # 每个窗口右下角状态条已经有同一个入口（StatusBar 的按钮），
@@ -605,6 +608,16 @@ class HubWindow(tk.Toplevel):
         self._refresh()
         ok, msg = True, "已重新读取装置与标定状态"
         self.status.set_status(msg, "ok" if ok else "warn")
+
+    def _open_help(self) -> None:
+        """打开操作说明（分区目录 + 搜索）。
+
+        非模态：用户可以一边看说明一边操作主窗口 —— 照着做是最常见的用法。
+        """
+        from apps.help_window import open_help
+
+        open_help(self)
+        self.status.set_status("操作说明已打开：左栏选分区，顶部可搜索关键词", "info")
 
     def _open_junk(self) -> None:
         """垃圾管理器：日志 / 临时产物 / 字节码 / 回收站，按项勾选 + 按时间筛。"""

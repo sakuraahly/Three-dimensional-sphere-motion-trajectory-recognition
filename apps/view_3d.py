@@ -140,10 +140,13 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
 #: 两者本来就在同一段高度里抢地方，只是 1.0 倍缩放下恰好没压到。一旦整幅放大
 #: （zoom>1.05），Z 标签右移就撞上小图。放到 y<0.28 之后，Z 标签无论怎么右移
 #: 都碰不到它，主图也就能真正用满画布。
-#: 2026-11-05 再缩一圈：主图铺满后，小图原来那块会压住 Y 轴刻度
-#: （铺满时立方体右下角正好落在 x≈0.80 附近）。缩小并贴到角上，
-#: 只遮住立方体的空角落。
-INSET_RECT = (0.838, 0.018, 0.154, 0.205)
+#: 2026-11-05 第三次调：往左挪一点，**右边留 5% 给刻度标签**。
+#:
+#: 小图的 x 轴刻度是画在 axes **外面**的（matplotlib 2D 的默认行为），
+#: 右边界 0.992 时那半截数字直接跑出 figure，被裁掉（用户截图：0.2 只剩
+#: 半个）。左边是空的（Y 轴刻度在 y≈0.3 一带，小图在 y<0.22，纵向不重叠），
+#: 所以往左挪不挡任何东西。
+INSET_RECT = (0.795, 0.018, 0.152, 0.200)
 
 #: 曲线配色（与主图一致：灰=原始、橙=平滑/小球）。
 #: 原始线用中灰而不是浅灰：浅灰在图例里几乎看不见（图例继承线条的 alpha）。
@@ -744,6 +747,9 @@ class Viewer3D:
         self.plane_note.pack(anchor="w", pady=(8, 0))
         ttk.Label(side, text="左键拖动：旋转视角\n右键拖动：平移（人走动）",
                   style="Hint.TLabel", justify="left").pack(anchor="w", pady=(8, 0))
+        # 说明都搬到「操作说明」窗口了，这里只留一键入口（2026-11-05）。
+        ttk.Button(side, text="? 操作说明（3D 查看器）",
+                   command=self._open_help).pack(anchor="w", pady=(6, 0))
 
         bar = ttk.Frame(self.root, padding=(8, 4))
         bar.pack(fill="x")
@@ -1595,6 +1601,12 @@ class Viewer3D:
         if self._roll_drag is not None:
             self._roll_drag = None
             self.ax.set_navigate(True)
+
+    def _open_help(self) -> None:
+        """直接打开操作说明的「3D 查看器」分区。"""
+        from apps.help_window import open_help
+
+        open_help(self, section="viewer")
 
     def _reset_view(self) -> None:
         """回到默认视角 + 默认范围（按钮 / Home 键）。"""
