@@ -762,6 +762,96 @@ def _describe_status(reg: cr.Registry, index: int,
 
 
 
+def cmd_bench(args) -> int:
+    """逐台**单独**开、计时。回答"某台慢，是它自己慢，还是被前一台拖累"。
+
+    为什么不能拿 identify 的耗时当答案（2026-11-05 用户问"为什么 left 秒开、
+    right 要等很久甚至打不开"）：identify 是**连着**开的，第 2 台的耗时会混进
+    "前一台还没释放干净"——而 MSMF 的 `release()` 慢是已知的（这台 aoni 能拖
+    几十秒）。逐台单独开、每次都等 release 走完，量出来的才是这台**自己**的成本。
+
+    两个结论怎么用：
+      · 单独开也慢  → 相机/端口/驱动的问题（换口、换线、查是不是这台的固件）
+      · 单独开很快  → 是被"上一台没释放"拖的（那就该在采集流程里等释放）
+    """
+    from sphere_tracker.sources import backend_name
+
+    backend = {
+        "msmf": __import__("cv2").CAP_MSMF,
+        "dshow": __import__("cv2").CAP_DSHOW,
+    }[args.backend]
+
+    devices = cr.list_devices()
+    if not devices:
+        print("枚举不到任何相机设备。")
+        return 1
+    want = (parse_indices(args.indices, devices, args.max_index)
+            if args.indices else [d.order for d in devices])
+
+    print("=" * 70)
+    print("逐台单独打开计时（每次等 release 走完，再开下一台）")
+    print("=" * 70)
+    print(f"后端：{backend_name(backend)}   次数：{args.repeat}   "
+          f"单次上限：{args.timeout:.0f}s")
+    print()
+
+    rows: list[tuple[str, float | None, str]] = []
+    for idx in want:
+        entry = next((d for d in devices if d.order == idx),
+                     cr.DeviceEntry(order=idx))
+        label = f"#{idx} {entry.name or '(无名)'}"
+        print(f"{label}（端口 {entry.port or '-'}）")
+        times: list[float] = []
+        fail = ""
+        for i in range(args.repeat):
+            t0 = time.perf_counter()
+            try:
+                src, _bn = _open_preview(idx, backend,
+                                         enumerated=bool(entry.name),
+                                         timeout_s=args.timeout)
+            except RuntimeError as exc:
+                fail = _first_line(exc)
+                print(f"   第{i + 1}次：✘ {fail}")
+                break
+            dt = time.perf_counter() - t0
+            if src is None:
+                fail = "打不开（等不到首帧）"
+                print(f"   第{i + 1}次：✘ {fail}（{dt:.1f}s）")
+                break
+            times.append(dt)
+            print(f"   第{i + 1}次：{dt:.1f}s")
+            _release_with_timeout(src)
+        med = sorted(times)[len(times) // 2] if times else None
+        rows.append((label, med, fail))
+        print()
+
+    print("=" * 70)
+    print("小结（中位耗时）")
+    slow_any = False
+    for label, med, fail in rows:
+        if med is None:
+            print(f"  {label:30s} ✘ {fail or '失败'}")
+            slow_any = True
+            continue
+        tag = ""
+        if med > args.slow:
+            tag = f"   ⚠ 超过 {args.slow:.0f}s，这台明显慢"
+            slow_any = True
+        print(f"  {label:30s} {med:5.1f}s{tag}")
+    print()
+    if slow_any:
+        print("有相机单独打开就很慢 → 不是「被上一台拖累」。按这个顺序查：")
+        print("  ① 把慢的那台换到另一侧的 USB 口（优先主板后置 USB 3.0 口，")
+        print("     别插前面板/扩展坞/Hub）")
+        print("  ② 退出可能占用摄像头的程序（QQ / 微信 / 会议 / 浏览器）")
+        print("  ③ 换一根线（劣质线在 2560x1440 下会握手失败或极慢）")
+        print("  ④ 只插慢的那一台，别的都拔掉，再跑一次本命令对比")
+    else:
+        print("每台单独开都不慢 → 慢的是「连着开」这件事本身（上一台没释放干净），")
+        print("  那属于采集流程的释放时序问题，不是相机的问题。")
+    return 0 if not slow_any else 3
+
+
 def cmd_probe(args) -> int:
     """回答一个**不需要知道"哪台是哪台"**的问题：**现在有几台相机真的能出图？**
 
@@ -1920,6 +2010,24 @@ def build_parser() -> argparse.ArgumentParser:
     ppr.add_argument("--backends", choices=("both", "msmf", "dshow"), default="both",
                      help="探测哪些后端（默认 both）")
     ppr.set_defaults(func=cmd_probe)
+
+    pb = sub.add_parser(
+        "bench",
+        help="**逐台单独**打开计时：判断「某台慢」是它自己慢还是被前一台拖累")
+    pb.add_argument("--indices", default=None,
+                    help="只测这些编号，如 0,1；默认测枚举到的全部")
+    pb.add_argument("--max-index", type=int, default=3,
+                    help="没给 --indices 时补探到第几个编号（默认 3）")
+    pb.add_argument("--repeat", type=int, default=2,
+                    help="每台重复几次（默认 2，取中位）")
+    pb.add_argument("--timeout", type=positive_seconds,
+                    default=PREVIEW_FIRST_FRAME_S,
+                    help=f"单次等首帧上限（秒，默认 {PREVIEW_FIRST_FRAME_S:.0f}）")
+    pb.add_argument("--slow", type=float, default=8.0,
+                    help="超过这么多秒就算「明显慢」（默认 8）")
+    pb.add_argument("--backend", choices=("msmf", "dshow"), default="msmf",
+                    help="用哪个后端（默认 msmf：只有它与系统设备列表顺序一致）")
+    pb.set_defaults(func=cmd_bench)
 
     pd = sub.add_parser(
         "doctor", help="**真开相机**体检一遍：现在能不能跑双目（只报告，不改配置）")
