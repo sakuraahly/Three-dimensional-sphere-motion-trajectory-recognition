@@ -1811,14 +1811,21 @@ def _simultaneous_grab_check(
     # （2026-11-05 实测：拔插后 bench 单开 1.2–1.6 s 正常，一跑本命令 right 立刻
     # 又报同一个码，且之后单开也一直坏）。所以这里必须**先换口**，否则用户会
     # 陷入"拔插 → 能单开 → 一录双目又死"的循环，永远走不到正解。
-    print("       → 双路同时开失败，按这个顺序（**别只拔插**）：")
-    print("         ① 把这路相机换到**机身上另一个 USB 口** —— 优先后置口，并与另一台")
-    print("            分到**不同侧**的控制器；别经 HUB / 扩展坞。")
-    print("            （`cameras.py list` 的端口前缀能看出两台是否在同一条链路上。）")
-    print("         ② 换完先 `cameras.py list` 核对端口号**真的变了**，再跑本命令复测。")
-    print("         ③ 仍失败才物理拔插（它只能重建会话，治不了并发时的链路问题）。")
-    print("         注：同一个型号两台同时开本身是可行的 —— 本机 2026-11-04 14:05")
-    print("            曾以 1920x1080 + MSMF 双路录成 302/303 帧，所以别怀疑型号。")
+    print("       → 双路同时开失败，按这个顺序（**别急着拔插**）：")
+    print("         ① 先确认请求的档不高于录制档。本命令默认已用标定里的采集档；")
+    print("            若你手动加了 --width/--height，先降回 1920x1080 复测。")
+    print("            更高档双开会超出控制器的可用带宽，把会话踢成**持久失效** ——")
+    print("            2026-11-05 实测：2560x1440 双开时 right 立刻失效，之后连单开")
+    print("            都坏、必须拔插；而同一时刻 1920x1080 双开两台都 1.0-1.1 s 出图。")
+    print("         ② 档位已一致仍失败，才换口：换到机身另一个 USB 口（优先后置，")
+    print("            别经 HUB / 扩展坞）；换完用 cameras.py list 核对端口号真变了。")
+    print("         ③ 最后才物理拔插（它只重建会话，治不了并发/带宽问题）。")
+    print("         ④ 若总是同一台坏、另一台一直好：把**两根相机线对调**再测一次。")
+    print("            坏的那路跟着相机走 → 相机（固件/线材）的问题；")
+    print("            跟着端口走 → 这个 USB 口/链路的问题。这是唯一能定性的实验，")
+    print("            比继续拔插或换程序都直接。")
+    print("         注：同型号两台同时开是可行的 —— 本机 2026-11-04 14:05 曾以")
+    print("            1920x1080 + MSMF 双路录成 302/303 帧，所以别怀疑型号。")
     return True
 
 
@@ -2041,10 +2048,34 @@ def build_parser() -> argparse.ArgumentParser:
 
     pd = sub.add_parser(
         "doctor", help="**真开相机**体检一遍：现在能不能跑双目（只报告，不改配置）")
-    pd.add_argument("--width", type=int, default=video_profiles.DEFAULT.width,
-                    help=f"目标宽度（默认档 {video_profiles.DEFAULT.label}）")
-    pd.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
-                    help=f"目标高度（默认档 {video_profiles.DEFAULT.label}）")
+    # ⚠ 默认档必须是「录制实际会用的档」，不是相机的最高档（2026-11-05 实测）。
+    #
+    # 原来默认 `video_profiles.DEFAULT`（2560x1440），而 `record_stereo` 不填
+    # --width/--height 时用的是**标定里记录的采集档**（本机 1920x1080）。于是本命令
+    # 在一个录制根本不会用的档位上双开、失败，然后判"还不能跑双目"——而同一时刻
+    # 1920x1080 双开是好的（left 1.0s / right 1.1s，各读 15/11 帧）。
+    # 更糟的是 2560 双开失败会把那一路的 MSMF 会话踢成持久失效，用户必须先拔插
+    # 才能继续 —— 一次误判的代价是一次物理插拔。
+    #
+    # 所以这里先问标定：它记着录制用哪个档，就按哪个档体检。
+    dflt_w = video_profiles.DEFAULT.width
+    dflt_h = video_profiles.DEFAULT.height
+    dflt_note = f"相机最高档 {video_profiles.DEFAULT.label}"
+    try:
+        from apps._common import calib_capture_size
+        from stereo.profiles import resolve_calibration_base
+
+        _cap = calib_capture_size(resolve_calibration_base())
+        if _cap:
+            dflt_w, dflt_h = int(_cap[0]), int(_cap[1])
+            dflt_note = f"标定记录的采集档 {dflt_w}x{dflt_h}，与录制同档"
+    except Exception:                                    # noqa: BLE001
+        pass                                             # 没标定就回落最高档
+
+    pd.add_argument("--width", type=int, default=dflt_w,
+                    help=f"目标宽度（默认{dflt_note}）")
+    pd.add_argument("--height", type=int, default=dflt_h,
+                    help=f"目标高度（默认{dflt_note}）")
     pd.add_argument(
         "--pair-timeout", type=positive_seconds, default=PAIR_FIRST_FRAME_S,
         help=f"双路同时取帧检查里每台等首帧的上限（秒，默认 {PAIR_FIRST_FRAME_S:.0f}）")
