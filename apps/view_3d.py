@@ -139,7 +139,10 @@ def bounds_of(points: list[dict]) -> tuple[list[float], list[float]]:
 #: 两者本来就在同一段高度里抢地方，只是 1.0 倍缩放下恰好没压到。一旦整幅放大
 #: （zoom>1.05），Z 标签右移就撞上小图。放到 y<0.28 之后，Z 标签无论怎么右移
 #: 都碰不到它，主图也就能真正用满画布。
-INSET_RECT = (0.795, 0.030, 0.185, 0.245)
+#: 2026-11-05 再缩一圈：主图铺满后，小图原来那块会压住 Y 轴刻度
+#: （铺满时立方体右下角正好落在 x≈0.80 附近）。缩小并贴到角上，
+#: 只遮住立方体的空角落。
+INSET_RECT = (0.838, 0.018, 0.154, 0.205)
 
 #: 曲线配色（与主图一致：灰=原始、橙=平滑/小球）。
 #: 原始线用中灰而不是浅灰：浅灰在图例里几乎看不见（图例继承线条的 alpha）。
@@ -176,7 +179,7 @@ ZOOM_STEP = 0.85
 #: 贴到边（left=0.02/right=0.98），填不满是因为立方体在矩形内**按最紧凑方式
 #: 居中**，四周留白由投影包围盒决定，只能靠 zoom 放大（2026-11-05 用户：
 #: "做成可以占据全局大小的，不然图片中的 Y 方向实在是比例奇怪"）。
-DEFAULT_BOX_ZOOM = 1.10
+DEFAULT_BOX_ZOOM = 1.0
 
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
@@ -382,6 +385,11 @@ class Viewer3D:
         # 这是**显示**选择，不是数据选择：轨迹本身一个字都没变（2026-11-05
         # 用户："这个坐标背景图比例很奇怪…Y 方向实在是比例奇怪"）。
         self.equal_axes = tk.BooleanVar(master=root, value=False)
+        # 「保持立方体比例」：默认**关** = 容器铺满画布（立方体会被宽屏拉宽）。
+        # 勾上 = 容器退回正方形，形状不变形，但宽屏下左右会各留 17% 空白。
+        # 这两个是几何上互斥的：等轴测投影近似正六边形，要它横向铺满，
+        # 就必然横向拉伸（2026-11-05）。
+        self.keep_cube = tk.BooleanVar(master=root, value=False)
         # 三轴分度值（刻度间隔）。空 = 自动（每轴最多 4 档）。
         # 用户要的是"我自己定网格多密"—— 0.05 就是每 5 cm 一根线
         # （2026-11-05："补充上手动调整三轴分度值的功能"）。
@@ -533,19 +541,31 @@ class Viewer3D:
         # 中键平移、右键 zoom；用户习惯右键转视角，所以把 3 也加进 rotate 并从
         # zoom 里移除。滚轮已经负责缩放，右键再缩放是重复且抢手感的。
         self._bind_mouse_buttons()
-        # bottom 从 0.02 提到 0.10：3D 轴的 **Y 轴标签排在画布下方**，原来几乎
-        # 贴着边，放大一点就被裁掉（用户看到的就是"Y 方向比例奇怪"——其实那根轴
-        # 大半被画布边缘切了）。top 留 0.92 给标题。
-        # left 0.07 / bottom 0.13：3D 轴的 X 标签在左下角、Y 标签在正下方，
-        # 两者都排在画布**外面**一点，边距不够就被裁（用户看到的"Y 比例奇怪"
-        # 有一半是那根轴被画布边缘切掉了）。top 0.92 留给标题。
-        self.fig.subplots_adjust(left=0.07, right=0.98, bottom=0.13, top=0.92)
+        # ── 主图**占满**画布（2026-11-05 用户："全屏不是让窗口全屏，而是让
+        # 坐标轴应用于全局画面，你自己看是不是很多留白"）────────────────────
+        #
+        # 留白有两层来源，缺一不可：
+        #
+        # ① `subplots_adjust` 的边距。那是 **2D 思维** —— 2D 轴的标签在 axes
+        #    **外面**，不留边距会被裁；3D 的标签是 mplot3d 摆在 axes **里面**
+        #    的，边距纯属浪费。
+        #
+        # ② **更隐蔽**：`Axes3D.apply_aspect()` 里 `box_aspect = 1` 是**写死**
+        #    的（matplotlib 3.11 源码），它无条件把 axes 收缩成**正方形**，
+        #    `set_aspect('auto')` 完全不生效。于是 16:10 的画布里，3D 容器
+        #    只有宽度 65%，左右各空 17.5% —— 这才是"立方体只有中间一小块"
+        #    的真正原因，和边距无关。只能把 `apply_aspect` 换成不收缩。
+        self.ax.apply_aspect = lambda position=None: None
+        self._apply_layout()
         # 右下角俯视小图：**另叠一块 axes**，不碰主图的 subplot 布局
         # （主图的范围/视角/色标有别的判据盯着）。zorder 抬高让它盖在 3D 轴之上。
         self.ax_inset = self.fig.add_axes(INSET_RECT)
         self.ax_inset.set_zorder(10)
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        # 窗口拉伸会改 figure 的物理尺寸，"保持比例"模式的方形边长得重算；
+        # 铺满模式虽然恒为 [0,0,1,.96]，重算一次也无害（幂等）。
+        self.canvas.mpl_connect("resize_event", lambda _e: self._apply_layout())
 
         # 右下角：视角 / 参考平面。
         side = ttk.LabelFrame(bottom, text="视角 / 参考平面", padding=(10, 8))
@@ -604,6 +624,10 @@ class Viewer3D:
             side, text="等比例坐标（真实几何）", variable=self.equal_axes,
             command=self._on_axes_mode)
         self.equal_chk.pack(anchor="w", pady=(8, 0))
+        self.keep_chk = ttk.Checkbutton(
+            side, text="保持立方体比例（会留白）", variable=self.keep_cube,
+            command=self._on_layout_mode)
+        self.keep_chk.pack(anchor="w", pady=(6, 0))
 
         ttk.Label(side, text="分度值 X / Y / Z（米，留空=自动）",
                   style="Hint.TLabel").pack(anchor="w", pady=(10, 2))
@@ -627,8 +651,11 @@ class Viewer3D:
         self.play_btn = ttk.Button(bar, text="播放", command=self._toggle_play, width=8)
         self.play_btn.pack(side="left")
         ttk.Button(bar, text="重置3D视角", command=self._reset_view, width=10).pack(side="left", padx=4)
-        self.full_btn = ttk.Button(bar, text="全屏", command=self._toggle_fullscreen,
-                                   width=7)
+        # 名字必须说清是**窗口**全屏：用户以为「全屏」= 坐标轴铺满画布，
+        # 于是点完发现立方体还是那么大，白失望一次（2026-11-05）。
+        # 坐标轴铺满是**默认布局**，不需要按钮。
+        self.full_btn = ttk.Button(bar, text="窗口全屏",
+                                   command=self._toggle_fullscreen, width=9)
         self.full_btn.pack(side="left", padx=(0, 4))
         ttk.Label(bar, text="帧").pack(side="left", padx=(10, 2))
         self.slider = ttk.Scale(bar, from_=0, to=max(0, self.n - 1),
@@ -1049,10 +1076,9 @@ class Viewer3D:
     def _toggle_fullscreen(self) -> None:
         """全屏 / 退出全屏（Esc 也能退）。
 
-        为什么需要它（2026-11-05 用户："做出类似这样的全屏模式，现在的坐标系
-        背景图太小，附近留白太多"）：3D 轴在画布矩形里按最紧凑方式居中，画布
-        本身越小，留白占比越大。全屏把画布撑到整个屏幕，是"占满视野"最直接的
-        办法 —— 不用去猜 zoom 该给多少。
+        **这个按钮只管窗口**（把窗口撑到屏幕），不改变坐标轴在画布里的占比 ——
+        那件事由 `_apply_layout` 的默认"铺满"负责。名字带「窗口」就是为了
+        不再和"坐标轴铺满"混淆。
         """
         self._fullscreen = not getattr(self, "_fullscreen", False)
         top = self.root.winfo_toplevel()
@@ -1065,7 +1091,7 @@ class Viewer3D:
             except tk.TclError:
                 pass
         try:
-            self.full_btn.configure(text="退出全屏" if self._fullscreen else "全屏")
+            self.full_btn.configure(text="退出全屏" if self._fullscreen else "窗口全屏")
         except tk.TclError:
             pass
         if self._fullscreen:
@@ -1074,6 +1100,33 @@ class Viewer3D:
     def _on_escape_fullscreen(self, _event=None) -> None:
         if getattr(self, "_fullscreen", False):
             self._toggle_fullscreen()
+
+    def _apply_layout(self) -> None:
+        """摆主图 axes 的盒子（铺满 or 正方形）。
+
+        默认**铺满**画布：3D 的轴标签由 mplot3d 摆在 axes 内部，不需要外边距，
+        所以容器越大、立方体越大。
+
+        「保持立方体比例」勾上时退回正方形（等轴测投影本来就是圆的，塞进宽屏
+        必然要横向拉伸；勾上就换成留白）。正方形边长取 ``min(宽, 可用高)``，
+        水平居中。两个模式都能在窗口 resize 后正确重算 —— 尺寸是从
+        ``fig.get_size_inches()`` 现读的，不是写死的比例。
+        """
+        fw, fh = self.fig.get_size_inches()
+        top = 0.96                      # 顶上 4% 留给标题
+        keep = getattr(self, "keep_cube", None)
+        if keep is None or not keep.get():
+            self.ax.set_position([0.0, 0.0, 1.0, top])
+            return
+        side_in = min(float(fw), float(fh) * top)
+        w = side_in / float(fw)
+        h = side_in / float(fh)
+        self.ax.set_position([(1.0 - w) / 2.0, (top - h) / 2.0, w, h])
+
+    def _on_layout_mode(self) -> None:
+        """切换「保持立方体比例」后立刻重排 + 重画。"""
+        self._apply_layout()
+        self.canvas.draw_idle()
 
     def _on_axes_mode(self) -> None:
         """切换"等比例坐标"后立刻重画（只改显示比例，不动数据与范围）。"""
@@ -1242,6 +1295,7 @@ class Viewer3D:
         self.ax.set_xlim(lo[0], hi[0])
         self.ax.set_ylim(lo[1], hi[1])
         self.ax.set_zlim(lo[2], hi[2])
+        self._apply_layout()       # 容器先摆好（铺满/正方形），再谈比例
         self._apply_box()          # 比例 + 整幅缩放（重画后 zoom 不能丢）
         self._draw_planes()
         self._apply_view()

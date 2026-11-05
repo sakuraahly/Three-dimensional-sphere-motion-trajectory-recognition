@@ -280,6 +280,28 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            v.ax._rotate_btn == [1] and v.ax._pan_btn == [2, 3]
                            and v.ax._zoom_btn == []))
 
+            # 主图铺满画布（2026-11-05 用户："全屏不是让窗口全屏，而是让坐标轴
+            # 应用于全局画面，你自己看是不是很多留白"）。留白有两层来源：
+            # ① subplots_adjust 的边距（3D 标签在 axes 内，边距纯浪费）；
+            # ② Axes3D.apply_aspect 里 `box_aspect=1` 写死，无条件把容器压成
+            #    正方形 —— 16:10 画布里 3D 容器就只剩 65% 宽。
+            # 断言默认 position 宽度接近 1，就等于同时守住这两条不被改回去。
+            _b = v.ax.get_position().bounds
+            checks.append(("主图铺满画布（宽度≈100%，不被压成正方形）",
+                           _b[2] > 0.95))
+            # 「保持立方体比例」勾上要退回**物理正方形**（左右留白，但不变形）
+            v.keep_cube.set(True)
+            v._apply_layout()
+            _b2 = v.ax.get_position().bounds
+            _fw, _fh = v.fig.get_size_inches()
+            checks.append(("「保持立方体比例」-> 容器退回物理正方形",
+                           abs(_b2[2] * _fw - _b2[3] * _fh) < 1e-6
+                           and _b2[2] < 0.95))
+            v.keep_cube.set(False)
+            v._apply_layout()
+            checks.append(("切回默认 -> 重新铺满",
+                           v.ax.get_position().bounds[2] > 0.95))
+
             # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
             # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线
             # 会把界面卡死。
