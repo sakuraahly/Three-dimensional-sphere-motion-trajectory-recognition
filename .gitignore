@@ -60,6 +60,19 @@
 !/tests/**/
 !/tests/**/*.py
 
+# ---------- 原生 exe 启动器的重建源码 ----------
+# 2026-11-05：根目录新增 启动器.exe（Go 编译的原生 GUI 壳，双击无黑框）。
+# exe 本身是编译产物、平台相关，**不入库**；这里只放行可重建它的源码。
+# icon.syso（windres 中间产物）与 启动器.exe 都保持忽略。
+!/native/
+/native/**
+!/native/launcher/
+!/native/launcher/main.go
+!/native/launcher/go.mod
+!/native/launcher/build.bat
+!/native/launcher/icon.rc
+!/native/launcher/icon.ico
+
 # ---------- 公开文档（GitHub 发布用，逐个列出） ----------
 # 2026-11-05 补：上面把 docs/ 整体排除了，但"其他资产全部没有"指的是实验数据、
 # 日志和内部史料，**说明文档恰恰是要带上的**。这里用精确白名单放行公开文档，

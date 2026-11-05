@@ -70,13 +70,20 @@ PUBLIC_DOCS = (
     "docs/纯色球检测方案.md", "docs/摄像头设备管理方案.md",
     "docs/插件化架构.md", "docs/主线.md", "docs/坐标系统图.png",
 )
+#: 原生 exe 启动器的重建源码（产物 exe 不进包：平台相关、体积大）
+EXTRA_BUILD_FILES = (
+    "native/launcher/main.go", "native/launcher/go.mod",
+    "native/launcher/build.bat", "native/launcher/icon.rc",
+    "native/launcher/icon.ico",
+)
 #: 发布包首页：本地 README.md 是内部状态概览，不适合当 GitHub 首页。
 #: 打包时用它替换根目录 README.md（名字不变，所以白名单与 zip 清单仍对得上）。
 GITHUB_README = ROOT / "docs" / "GitHub-README.md"
 
-ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf"}
+ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf",
+                  ".go", ".mod", ".rc", ".ico"}
 ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep"}
-TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat"}
+TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".go", ".mod", ".rc"}
 FORBIDDEN_PARTS = {
     "outputs", "logs", "legacy", ".workbuddy", "__pycache__",
     ".git", "node_modules", "venv", ".venv",
@@ -101,6 +108,8 @@ def collect(*, with_tests: bool = True, with_assets: bool = True) -> list[Path]:
     for rel in ROOT_FILES:
         add(ROOT / rel)
     for rel in PUBLIC_DOCS:
+        add(ROOT / rel)
+    for rel in EXTRA_BUILD_FILES:
         add(ROOT / rel)
     dirs = PY_DIRS if with_tests else tuple(d for d in PY_DIRS if d != "tests")
     for d in dirs:

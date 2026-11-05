@@ -2217,14 +2217,17 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
                  "config/.gitkeep",
                  # 2026-11-05：公开说明文档是要带上 GitHub 的，不是"资产"
                  "docs/GitHub-README.md", "docs/算法解析.md",
-                 "docs/用户手册.md", "docs/API.md", "docs/坐标系统图.png")
+                 "docs/用户手册.md", "docs/API.md", "docs/坐标系统图.png",
+                 # 原生 exe 启动器的重建源码（产物 exe 本身不进包）
+                 "native/launcher/main.go", "native/launcher/build.bat")
     must_ignore = ("docs/交接文档.md", "docs/待办清单.md",
                    "docs/planbooks/2026-10-10_x.md", "docs/refs/paper.pdf",
                    "docs/new_tool.py", "legacy/README.md", "AGENTS.md",
                    "assets/images/test.jpg", "config/profiles.json",
                    "data/stereo/parallel/x/derived/visualization.json",
                    "outputs/test_results/timings.json", "logs/tasks/x.log",
-                   ".workbuddy/memory/x.md", "apps/tools/tmp_debug.log")
+                   ".workbuddy/memory/x.md", "apps/tools/tmp_debug.log",
+                   "native/launcher/icon.syso", "启动器.exe")
     wrong_pass = [x for x in must_pass if ignored(x)]
     wrong_ignore = [x for x in must_ignore if not ignored(x)]
     checks.append((f"白名单放行源码/必需物（误拦 {wrong_pass[:2]}）",
@@ -2250,13 +2253,21 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
                    not any(r.startswith(forbidden) for r in rels)))
     checks.append(("包内没有内部史料文档",
                    not any(r in relics for r in rels)))
+    build_src = [r for r in rels if r.startswith("native/launcher/")]
+    checks.append((f"包内含 exe 启动器重建源码（{len(build_src)} 个）",
+                   len(build_src) == 5))
+    checks.append(("编译产物（exe / syso）不进包",
+                   "启动器.exe" not in rels
+                   and not any(r.endswith(".syso") for r in rels)))
     need = ("启动程序.py", "启动程序.bat", "启动程序_命令行.py",
             "requirements.txt", "requirements-ai.txt", "environment.yml",
             ".gitignore", "apps/view_3d.py", "sphere_tracker/paths.py",
             "stereo/profiles.py", "calib/methods.py",
             "assets/boards/chessboard_8x5_25mm_a4-landscape.png",
             "docs/GitHub-README.md", "docs/算法解析.md",
-            "docs/用户手册.md", "docs/API.md")
+            "docs/用户手册.md", "docs/API.md",
+            "native/launcher/main.go", "native/launcher/go.mod",
+            "native/launcher/build.bat", "native/launcher/icon.ico")
     checks.append((f"运行必需物齐全（缺 {[n for n in need if n not in rels][:2]}）",
                    all(n in rels for n in need)))
 
