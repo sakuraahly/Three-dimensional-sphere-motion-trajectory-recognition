@@ -38,7 +38,10 @@ from .mono_calib import QUALITY, _region_index
 
 __all__ = [
     "REF_STILL_PX", "REGIONS_TOTAL", "MIN_REGIONS",
-    "region_of", "coverage_regions", "coverage_ok", "region_boxes",
+    "MIN_PER_REGION", "COVERAGE_LEVELS",
+    "region_of", "region_counts", "green_regions", "coverage_ok_counts",
+    "coverage_level",
+    "coverage_regions", "coverage_ok", "region_boxes",
     "reference_shift",
 ]
 
@@ -52,6 +55,15 @@ REF_STILL_PX = 5.0
 #: 永远同一条 —— 今天的事故正是"三处各自判断"的代价。
 REGIONS_TOTAL: int = int(QUALITY["regions_total"])
 MIN_REGIONS: int = int(QUALITY["min_regions"])
+
+#: 每个区域**至少拍几张**才算这个角达标（2026-11-05 用户：每个角落只拍一张有风险）。
+#: 单张的风险是"这一张的角点检得不稳 / 轻微糊"，而一张图进了集合后没人复查；
+#: 三张里有一张偏了，另外两张还能把这个区域的姿态钉住。
+MIN_PER_REGION: int = 3
+
+#: 覆盖进度的颜色档位数：红(0) → 黄(1) → 蓝(2) → 绿(达标)。
+#: 用户定的顺序（2026-11-05）：「红 -> 黄 -> 蓝 -> 绿」。
+COVERAGE_LEVELS: int = 4
 
 
 def region_of(corners: np.ndarray | None, shape: Sequence[int]) -> int:
@@ -75,6 +87,61 @@ def region_of(corners: np.ndarray | None, shape: Sequence[int]) -> int:
         return -1
     h, w = int(shape[0]), int(shape[1])
     return _region_index(float(c[:, 0].mean()), float(c[:, 1].mean()), w, h)
+
+
+def region_counts(
+        corners_list: Iterable[tuple[np.ndarray | None, Sequence[int]]]
+) -> tuple[dict[int, int], int]:
+    """每个区域各拍了几张。返回 ``({区域编号: 张数}, 区域总数)``。
+
+    为什么要计数而不是只要集合（2026-11-05）：一个角只拍一张时，那一张的
+    角点检测一旦偏了，这个区域的姿态就只有一个观测、没有任何冗余，标定
+    解出来的畸变/主点会跟着抖。三张是能用"多数一致"把单张错误压下去的
+    最小代价，也是 HUD 要显示"这个角还差几张"的依据。
+    """
+    counts: dict[int, int] = {}
+    for corners, shape in corners_list:
+        idx = region_of(corners, shape)
+        if idx >= 0:
+            counts[idx] = counts.get(idx, 0) + 1
+    return counts, REGIONS_TOTAL
+
+
+def green_regions(counts: dict[int, int],
+                  need_per_region: int = MIN_PER_REGION) -> set[int]:
+    """已达标的区域编号集合（该区域张数 >= ``need_per_region``）。
+
+    "达标"= 这个角可以变绿。**不是**"拍过就算"——拍过一张只是变黄。
+    """
+    need = max(1, int(need_per_region))
+    return {idx for idx, n in counts.items() if n >= need}
+
+
+def coverage_ok_counts(counts: dict[int, int], need_regions: int | None = None,
+                       need_per_region: int = MIN_PER_REGION) -> bool:
+    """够不够 ``need_regions`` 个区域**各自达标**（默认 ``MIN_REGIONS``）。
+
+    与 :func:`coverage_ok` 的区别：后者只看"区域被碰过"，这里要求每个区域
+    都拍够 ``need_per_region`` 张。采集现场用这个，旧的两参版本留给
+    `check_chain_inputs`（它判的是"这批图能不能拿去标定"，口径可以更松）。
+    """
+    goal = MIN_REGIONS if need_regions is None else int(need_regions)
+    return len(green_regions(counts, need_per_region)) >= goal
+
+
+def coverage_level(count: int, need_per_region: int = MIN_PER_REGION) -> int:
+    """一个区域的进度档位：``0`` 红 → ``1`` 黄 → ``2`` 蓝 → ``3`` 绿（达标）。
+
+    颜色顺序是用户定的（2026-11-05）：红 → 黄 → 蓝 → 绿。
+    档位只分四级，是因为 HUD 上那 5 个小方块每个才十几像素 —— 再细分
+    也看不出来。中间两张按"过半"分档：3 张制时 1 张黄、2 张蓝。
+    """
+    if count <= 0:
+        return 0
+    need = max(1, int(need_per_region))
+    if count >= need:
+        return COVERAGE_LEVELS - 1
+    return 1 if count <= need / 2.0 else 2
 
 
 def coverage_regions(

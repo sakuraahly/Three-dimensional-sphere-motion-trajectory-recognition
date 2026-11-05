@@ -68,7 +68,8 @@ from _common import log_environment, setup_logging  # noqa: E402
 from apps._window import DEFAULT_WINDOW_SIZE, WindowManager  # noqa: E402
 from calib.board import BoardObservation, BoardSpec, detect_board  # noqa: E402
 from calib.board_coverage import (  # noqa: E402
-    REF_STILL_PX, REGIONS_TOTAL, coverage_ok, reference_shift, region_of)
+    MIN_PER_REGION, REF_STILL_PX, REGIONS_TOTAL, coverage_level,
+    coverage_ok, coverage_ok_counts, green_regions, reference_shift, region_of)
 from calib.capture import CaptureConfig, focus_gate  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
 from sphere_tracker.sources import open_source  # noqa: E402
@@ -352,9 +353,10 @@ def capture_stage(objective: str | None, out_dir: Path | None) -> str:
     return "ref" if "ref" in name else "intr"
 
 
-def lane_progress(stage: str, covered: set[int],
+def lane_progress(stage: str, counts: dict[int, int] | set[int],
                   obs: BoardObservation,
-                  ref_base: np.ndarray | None) -> dict:
+                  ref_base: np.ndarray | None,
+                  per_region: int = MIN_PER_REGION) -> dict:
     """一路的 HUD 进度：内参段给覆盖集合，参考段给与第一张的位移。纯函数。
 
     参考段的位移要**用当前帧**算（不是用已存下的上一张）：提示的意义是
@@ -369,7 +371,10 @@ def lane_progress(stage: str, covered: set[int],
             return {"ref_shift": None}
         shift, _pair = reference_shift([ref_base, obs.corners.reshape(-1, 2)])
         return {"ref_shift": shift}
-    return {"coverage": (set(covered), REGIONS_TOTAL)}
+    # 兼容旧调用方（传 set）：set 里的区域视为"拍过 1 张"。
+    if isinstance(counts, set):
+        counts = {int(i): 1 for i in counts}
+    return {"coverage": (dict(counts), REGIONS_TOTAL, int(per_region))}
 
 
 def _paint_progress(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
@@ -393,10 +398,12 @@ def _paint_progress(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
     text = ""
     color = (232, 232, 232)
     if coverage is not None:
-        got, total = coverage
-        # "够不够"由库里那条判据回答（QUALITY.min_regions），这里不写 4
-        color = (80, 220, 120) if coverage_ok(got) else (60, 180, 255)
-        text = f"覆盖 {len(got)}/{total}"
+        # coverage = (每区域张数 dict, 区域总数, 每区域需几张)
+        counts, total, per_region = coverage
+        green = green_regions(counts, per_region)
+        # 文字报"几个角达标"，达标才绿；没达标时橙色提示"继续还能补"
+        color = (80, 220, 120) if len(green) >= total else (60, 180, 255)
+        text = f"角绿 {len(green)}/{total}"
     else:
         if ref_shift is None:
             text = "参考段：等第一张存下来"
@@ -423,12 +430,20 @@ def _paint_progress(canvas: np.ndarray, x0: int, y0: int, w: int, h: int,
     # 内参段再补 5 个小方块：只给 "2/5" 用户不知道缺哪个角，画出格子才指得动。
     if coverage is None:
         return
+    # 四色档位（用户定的顺序 红 → 黄 → 蓝 → 绿）：每个方块的颜色 = 这个角
+    # 已经拍了几张。红=没拍，黄=1 张，蓝=2 张，绿=达标（默认 3 张）。
+    _LEVEL_BGR = {0: (60, 60, 230),        # 红
+                  1: (60, 200, 230),       # 黄
+                  2: (230, 140, 60),       # 蓝
+                  3: (80, 220, 120)}       # 绿
+    counts, _total, per_region = coverage
     bx = x0 + tw + int(22 * fs)
     for idx in range(n_box):
         cx = bx + idx * (side + gap)
         if cx + side > x0 + w - int(8 * fs):
             break
-        fill = (80, 220, 120) if idx in coverage[0] else (70, 70, 245)
+        lv = coverage_level(counts.get(idx, 0), per_region)
+        fill = _LEVEL_BGR.get(lv, (60, 60, 230))
         cv2.rectangle(canvas, (cx, top + lh // 2 - side // 2),
                       (cx + side, top + lh // 2 + side // 2), fill, -1)
 
@@ -564,6 +579,10 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="**分化线**：拍到这么多张后，覆盖标准从 --min-cover 放宽到 "
                          "--relax-cover。0=不放宽（一直要求 --min-cover）。"
                          "用户界面上填的『目标对数』传到这个参数")
+    ap.add_argument("--per-region", type=int, default=MIN_PER_REGION,
+                    help=f"每个区域至少拍几张才算这个角达标（默认 {MIN_PER_REGION}）。"
+                         "1=拍过就算（旧行为）；3=每个角三张，用多数一致压掉单张的"
+                         "角点抖动/轻微糊")
     ap.add_argument("--relax-cover", type=int, default=4,
                     help="过了分化线后的放宽标准（默认 4 = 四角+中央里覆盖 4 个即可）。"
                          "只有拍够 --relax-after 张之后才生效")
@@ -760,7 +779,9 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     #   intr —— 已保存的图覆盖了哪几个区域；
     #   ref  —— 第一张已保存的角点当基准，之后每帧与它比位移。
     stage = capture_stage(args.stage, out_dir)
-    covered: set[int] = set()
+    # 每区域各拍了几张（2026-11-05）：set 只能表达"拍过没有"，
+    # 而"每个角落只拍一张有风险"要的是"这个角还差几张"。
+    counts: dict[int, int] = {}
     ref_base: np.ndarray | None = None
     stable = 0
     last_save_ts: float | None = None
@@ -798,8 +819,12 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                 # 之后的兜底**——2026-11-05 用户指出上一版把 4 当上限是错的。
                 if args.min_cover > 0 and stage == "intr":
                     goal = args.min_cover
-                    missing = goal - len(covered)
-                    cover_txt = (f"  已拍 {len(saved)} 张   覆盖 {len(covered)}/{goal}"
+                    per = max(1, int(args.per_region))
+                    green = green_regions(counts, per)
+                    missing = goal - len(green)
+                    # 每个角要 per 张；缺的角还要补几张，这里只说"还差几个角"
+                    cover_txt = (f"  已拍 {len(saved)} 张   角绿 {len(green)}/{goal}"
+                                 f"（每角需 {per} 张）"
                                  + (f"，还差 {missing} 个角" if missing > 0
                                     else "，全绿！"))
                     # 分化线提示：让用户知道"还能拍多久""什么时候能降标准"
@@ -820,7 +845,8 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
                 canvas = _compose(
                     [{"title": f"{args.side or '相机'}", "frame": frame,
                       "obs": obs, "ok": can, "reason": reason, "spec": spec,
-                      **lane_progress(stage, covered, obs, ref_base)}],
+                      **lane_progress(stage, counts, obs, ref_base,
+                                      per_region=int(args.per_region))}],
                     _canvas_size(VIEW_SINGLE), footer, can)
                 wins.show(VIEW_SINGLE, canvas)
                 pressed = cv2.waitKey(1) & 0xFF
@@ -880,7 +906,7 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
             elif acc.corners is not None:
                 idx = region_of(acc.corners, gray.shape[:2])
                 if idx >= 0:
-                    covered.add(idx)
+                    counts[idx] = counts.get(idx, 0) + 1
             verb = "自动保存" if not manual else "已保存"
             # 达标判定（2026-11-05，用户澄清后的正确语义）：
             #   ① 覆盖满 --min-cover（通常 5 = 五个角全绿）——**最理想，随时结束**；
@@ -888,17 +914,19 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
             # 关键：**4 不是上限**，是"拍够了还没全绿"时的兜底；5 才是首选目标。
             # 上一版把 4 当上限（覆盖 4 个就停），用户当场指出是错的。
             goal = args.min_cover
+            per = max(1, int(args.per_region))
+            green = green_regions(counts, per)
             cover_reached = False
             cover_note = ""
             if goal > 0:
-                if len(covered) >= goal:
+                if len(green) >= goal:
                     cover_reached = True
-                    cover_note = f"  覆盖 {len(covered)}/{goal} 全绿，收工"
+                    cover_note = f"  角绿 {len(green)}/{goal} 全绿，收工"
                 elif (args.relax_after > 0 and len(saved) >= args.relax_after
-                      and len(covered) >= args.relax_cover):
+                      and len(green) >= args.relax_cover):
                     cover_reached = True
                     cover_note = (f"  已过分化线（{args.relax_after} 张），"
-                                  f"覆盖 {len(covered)}/{goal} 按 {args.relax_cover}/{goal} 收工")
+                                  f"角绿 {len(green)}/{goal} 按 {args.relax_cover}/{goal} 收工")
             print(f"{verb} {name}  （已拍 {len(saved)} 张，"
                   f"focus {acc.focus:.0f}，原始清晰度 {acc.sharpness:.0f}，位移 {still:.1f} px）"
                   + cover_note)
@@ -913,7 +941,10 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
         if show:
             cv2.destroyAllWindows()
 
-    print(f"共保存 {len(saved)} 张 → {out_dir}（覆盖 {len(covered)}/{REGIONS_TOTAL} 个区域）")
+    _green = green_regions(counts, max(1, int(args.per_region)))
+    print(f"共保存 {len(saved)} 张 → {out_dir}"
+          f"（角绿 {len(_green)}/{REGIONS_TOTAL}，每角需 {args.per_region} 张；"
+          f"各角张数 {dict(sorted(counts.items()))}）")
     if 0 < len(saved) < 3:
         print("至少需要 3 张才能标定")
     # 边车最后写：count 必须是**实际落盘**的张数（含提前退出/没到 target 的情况）
@@ -929,9 +960,9 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     # 退出码：--min-cover 启用时按**与循环同一套**达标判据（5/5 优先，过分化线后 4/5）；
     # 否则按张数判（旧行为，供参考段/同框图用）。
     if args.min_cover > 0:
-        ok = len(covered) >= args.min_cover or (
+        ok = len(_green) >= args.min_cover or (
             args.relax_after > 0 and len(saved) >= args.relax_after
-            and len(covered) >= args.relax_cover)
+            and len(_green) >= args.relax_cover)
         return 0 if ok else 3
     return 0 if len(saved) >= args.target else 3
 

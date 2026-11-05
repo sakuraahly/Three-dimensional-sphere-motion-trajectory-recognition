@@ -446,6 +446,7 @@ def capture_board(*, out: str | Path, cols: str, rows: str, square: str,
 def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
                          target: str, left: str = "left", right: str = "right",
                          min_cover: int = 0, relax_after: int = 0,
+                         per_region: int = 0,
                          dirs: dict | None = None) -> list[str]:
     """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
 
@@ -480,7 +481,8 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
             "--target", str(target), "--auto",
             *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
-            *(["--relax-after", str(relax_after)] if relax_after > 0 else []))
+            *(["--relax-after", str(relax_after)] if relax_after > 0 else []),
+            *(["--per-region", str(per_region)] if per_region > 0 else []))
     side = "left" if stage == "left" else "right"
     out = d["left"] if stage == "left" else d["right"]
     return _argv(
@@ -489,7 +491,8 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
         "--target", str(target), "--auto",
         *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
-        *(["--relax-after", str(relax_after)] if relax_after > 0 else []))
+        *(["--relax-after", str(relax_after)] if relax_after > 0 else []),
+        *(["--per-region", str(per_region)] if per_region > 0 else []))
 
 
 def capture_pair_frame(*, cols: str, rows: str, square: str,
@@ -505,7 +508,9 @@ def capture_pair_frame(*, cols: str, rows: str, square: str,
         _TOOLS / "capture_board.py", "--out", str(d["pair"]),
         "--camera", str(camera or "left").strip() or "left",
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-        "--target", "1", "--pair")
+        # 5 张同框图（2026-11-05 用户：单张有风险）。T_AB 只用其中一张，
+        # 但多拍几张能在"哪张两板都检全"上留选择余地，也防单张糊掉。
+        "--target", "5", "--pair")
 
 
 def check_chain_inputs(*, cols: str, rows: str, square: str,
