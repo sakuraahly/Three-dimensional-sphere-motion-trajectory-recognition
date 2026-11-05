@@ -744,10 +744,20 @@ class StatusBar(ttk.Frame):
     并给出**下一步该做什么**，而不是只报告"失败"。
     """
 
-    def __init__(self, master: tk.Misc, *, on_log=None, on_stop=None) -> None:
+    def __init__(self, master: tk.Misc, *, on_log=None, on_stop=None,
+                 help_section: str | None = None) -> None:
         super().__init__(master)
         self._label = ttk.Label(self, text="就绪", style="Hint.TLabel")
         self._label.pack(side="left", padx=(16, 8), pady=6)
+        # 「? 操作说明」放状态条：**每个窗口都有、位置固定**。散落在各页面里
+        # 的按钮用户找不到，而说明又刚把长段落从界面搬走（2026-11-05）。
+        if help_section is not None:
+            def _jump() -> None:
+                from apps.help_window import open_help
+                open_help(self, section=help_section)
+
+            ttk.Button(self, text="? 操作说明", command=_jump).pack(
+                side="right", padx=(0, 12))
         if on_stop is not None:
             ttk.Button(self, text="中断", command=on_stop).pack(side="right",
                                                                 padx=(0, 12))

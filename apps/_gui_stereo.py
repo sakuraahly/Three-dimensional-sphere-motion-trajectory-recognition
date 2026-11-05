@@ -706,7 +706,8 @@ class StereoWindow(tk.Toplevel):
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
         # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
         self.status = StatusBar(self, on_log=app.open_console,
-                                on_stop=self._stop_my_tasks)
+                                on_stop=self._stop_my_tasks,
+                                help_section="record")
         self.status.pack(fill="x", side="bottom")
         self._page = ScrollPage(self, self.surface)
         self._page.pack(fill="both", expand=True)

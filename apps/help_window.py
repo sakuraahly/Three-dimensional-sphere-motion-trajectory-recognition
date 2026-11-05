@@ -48,8 +48,11 @@ class HelpWindow(tk.Toplevel):
         self.title("操作说明")
         self.geometry("980x660")
         self.minsize(700, 460)
-        # 非模态：用户可以一边看说明一边操作主窗口（照着做是最常见的用法）
-        self.transient(master.winfo_toplevel())
+        # 非模态、**不是 transient**：transient 在 Windows 上会把窗口降成
+        # 工具窗口，标题栏的最大化按钮直接灰掉。说明窗口经常要被摆到旁边
+        # 一边看一边操作，它得能最大化、能最小化到任务栏、能单独 Alt+Tab
+        # （2026-11-05 用户："可以全屏，关闭最小化"）。
+        self.resizable(True, True)
 
         self._items: dict[str, tuple[str, str, str]] = {}   # iid -> (分区, 标题, 正文)
         self._query = tk.StringVar(master=self, value="")
@@ -58,7 +61,29 @@ class HelpWindow(tk.Toplevel):
         self._fill_tree()
         if section:
             self._goto_section(section)
-        self.bind("<Escape>", lambda _e: self.destroy())
+        # Esc：全屏时先退出全屏，否则才关闭窗口 —— 直接 destroy 会让
+        # "想退出全屏按 Esc" 变成"把说明窗口关了"。
+        self.bind("<Escape>", self._on_escape)
+        self.bind("<F11>", self._toggle_fullscreen)
+        # 不绑 <Double-1>：Tk 的 bindtags 会把**子控件**的双击冒泡到 Toplevel，
+        # 双击目录条目会莫名其妙全屏。标题栏双击由系统处理，不需要我们插手。
+
+    def _on_escape(self, _event=None) -> None:
+        if getattr(self, "_full", False):
+            self._toggle_fullscreen()
+        else:
+            self.destroy()
+
+    def _toggle_fullscreen(self, _event=None) -> None:
+        """F11 在"全屏"和"窗口"之间切换。"""
+        self._full = not getattr(self, "_full", False)
+        try:
+            self.attributes("-fullscreen", self._full)
+        except tk.TclError:                       # 个别窗口管理器不认
+            try:
+                self.state("zoomed" if self._full else "normal")
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
@@ -213,7 +238,13 @@ def open_help(master, section: str = "") -> HelpWindow:
     复用一个窗口而不是每次新建：用户经常「看一句 → 回主界面做一步 → 再看」，
     每次都弹新窗会堆一屏。
     """
-    top = master.winfo_toplevel()
+    # 兼容"传进来的不是 widget"：`Viewer3D` 这类是普通类，只有 `.root`。
+    # 直接 `master.winfo_toplevel()` 会 AttributeError，而且**在 tkinter 回调里
+    # 不会弹窗**，用户只会看到"按钮点了没反应"（2026-11-05 踩过）。
+    base = master if hasattr(master, "winfo_toplevel") else getattr(master, "root", None)
+    if base is None or not hasattr(base, "winfo_toplevel"):
+        raise TypeError(f"open_help 需要一个 Tk/Toplevel 或带 .root 的对象：{master!r}")
+    top = base.winfo_toplevel()
     existing = getattr(top, "_help_window", None)
     if existing is not None and existing.winfo_exists():
         existing.deiconify()

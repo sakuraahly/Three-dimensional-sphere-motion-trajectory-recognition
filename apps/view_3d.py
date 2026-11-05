@@ -1603,10 +1603,16 @@ class Viewer3D:
             self.ax.set_navigate(True)
 
     def _open_help(self) -> None:
-        """直接打开操作说明的「3D 查看器」分区。"""
+        """直接打开操作说明的「3D 查看器」分区。
+
+        **必须传 `self.root`**：`Viewer3D` 是普通类不是 widget，传 self 会在
+        `open_help` 里 `master.winfo_toplevel()` 抛 AttributeError ——
+        tkinter 回调里的异常不会弹窗，表现就是"按钮点了没反应"
+        （2026-11-05 用户截图）。
+        """
         from apps.help_window import open_help
 
-        open_help(self, section="viewer")
+        open_help(self.root, section="viewer")
 
     def _reset_view(self) -> None:
         """回到默认视角 + 默认范围（按钮 / Home 键）。"""

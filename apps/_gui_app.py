@@ -511,7 +511,8 @@ class HubWindow(tk.Toplevel):
         # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
         # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
-        self.status = StatusBar(self, on_log=app.open_console)
+        self.status = StatusBar(self, on_log=app.open_console,
+                                help_section="start")
         self.status.pack(fill="x", side="bottom")
         self._page = ScrollPage(self, self.surface)
         self._page.pack(fill="both", expand=True)
@@ -616,7 +617,7 @@ class HubWindow(tk.Toplevel):
         """
         from apps.help_window import open_help
 
-        open_help(self)
+        open_help(self, section="start")
         self.status.set_status("操作说明已打开：左栏选分区，顶部可搜索关键词", "info")
 
     def _open_junk(self) -> None:

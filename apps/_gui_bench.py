@@ -274,7 +274,8 @@ class BenchWindow(tk.Toplevel):
 
         # 先占底部：pack 从容器边缘往里分配，后 pack 的主内容区会盖住状态条
         self.status = StatusBar(self, on_log=app.open_console,
-                                on_stop=self._stop_my_tasks)
+                                on_stop=self._stop_my_tasks,
+                                help_section="data")
         self.status.pack(fill="x", side="bottom")
         self._page = ScrollPage(self, self.surface)
         self._page.pack(fill="both", expand=True)

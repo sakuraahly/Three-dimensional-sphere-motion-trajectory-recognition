@@ -2229,6 +2229,21 @@ def _check_help() -> list[tuple[str, bool]]:
         body = win.text.get("1.0", "end").strip()
         checks.append((f"打开即有正文（{len(body)} 字）", len(body) > 30))
 
+        # 标准窗口：不能有 transient（Windows 上会灰掉最大化按钮）、
+        # 必须可缩放、F11 全屏后 Esc 只退出全屏而不是关窗口。
+        checks.append(("说明窗口非 transient（标题栏最大化按钮可用）",
+                       not bool(win.transient())))
+        checks.append(("说明窗口可调整大小", win.resizable() == (True, True)
+                       or win.resizable() == (1, 1)))
+        try:
+            win._toggle_fullscreen()
+            _was_full = bool(getattr(win, "_full", False))
+            win._on_escape()
+            checks.append(("F11 全屏 / Esc 只退出全屏不关窗口",
+                           _was_full and not win._full and win.winfo_exists()))
+        except Exception as exc:                        # noqa: BLE001
+            checks.append((f"F11 全屏 / Esc（异常：{exc}）", False))
+
         hits = search("状态")
         win._query.set("状态")
         win.update_idletasks()
@@ -2247,6 +2262,52 @@ def _check_help() -> list[tuple[str, bool]]:
                        "没有匹配" in win.text.get("1.0", "end")))
         win._query.set("")
         win.update_idletasks()
+
+        # ---- 入口 ----
+        # ① `open_help` 要能接"非 widget"的对象。`Viewer3D` 是普通类（只有
+        #    `.root`），传 self 会让 `master.winfo_toplevel()` 抛 AttributeError；
+        #    **tkinter 回调里的异常不弹窗**，用户看到的就是"按钮点了没反应"
+        #    （2026-11-05 用户截图，3D 查看器侧栏那个按钮）。
+        class _FakeViewer:                 # 只保留 Viewer3D 的接口特征
+            def __init__(self, root) -> None:
+                self.root = root
+
+        from apps.help_window import open_help
+
+        r2 = tk.Tk()
+        r2.withdraw()
+        try:
+            open_help(_FakeViewer(r2), section="viewer")
+            w2 = getattr(r2, "_help_window", None)
+            ok2 = w2 is not None and w2.winfo_exists()
+            checks.append(("open_help 兼容非 widget（只带 .root 的对象）", ok2))
+            if ok2:
+                sel2 = w2.tree.selection()
+                checks.append(("  且定位到 3D 查看器分区",
+                               bool(sel2) and "鼠标怎么用"
+                               == w2.tree.item(sel2[0], "text")))
+                w2.destroy()
+        except Exception as exc:                        # noqa: BLE001
+            checks.append((f"open_help 兼容非 widget（异常：{exc}）", False))
+        finally:
+            r2.destroy()
+
+        # ② 状态栏是四个主窗口共用的，入口挂在这里 = 每个窗口都有。
+        from apps._gui_widgets import StatusBar
+
+        r3 = tk.Tk()
+        r3.withdraw()
+        try:
+            sb = StatusBar(r3, help_section="viewer")
+            sb.pack()
+            r3.update_idletasks()
+            hits = [c for c in sb.winfo_children()
+                    if c.winfo_class() == "TButton"
+                    and "操作说明" in str(c.cget("text"))]
+            checks.append((f"状态栏带「? 操作说明」按钮（{len(hits)} 个）",
+                           len(hits) == 1))
+        finally:
+            r3.destroy()
     except Exception as exc:                            # noqa: BLE001
         checks.append((f"说明窗口能建起来（异常：{exc}）", False))
     finally:
