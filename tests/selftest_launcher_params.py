@@ -339,6 +339,41 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            _c <= v.hi[0] + PAN_MARGIN * (v.hi[0] - v.lo[0])
                            + 1e-9))
 
+            # 智能最佳视角 + 坐标极值（2026-11-05 用户："智能回到最适合的
+            # 观察角度和缩放比例"、"自动计算并告知每个方向的坐标极值"）
+            import math as _m
+            from apps.view_3d import BEST_MAX_AXIS_DOT
+
+            _e, _a = v._best_view_angles()
+            _er, _ar = _m.radians(_e), _m.radians(_a)
+            _fwd = (_m.cos(_er) * _m.cos(_ar), _m.cos(_er) * _m.sin(_ar),
+                    _m.sin(_er))
+            # 视线不能贴着任何一根轴：贴着谁，谁就在屏幕上退化成一点，
+            # 刻度会全堆到画布角落（实测 azim=90 就是这个下场）。
+            checks.append(("最佳视角：视线不贴任何轴（轴不会被压成一点）",
+                           max(abs(c) for c in _fwd) <= BEST_MAX_AXIS_DOT + 1e-6))
+            checks.append(("最佳视角：仰角保留立体感（15°~60°）",
+                           15.0 <= _e <= 60.0))
+
+            v._smart_view()
+            v.canvas.draw()
+            _tb = v.ax.get_tightbbox(v.canvas.get_renderer())
+            _bx = v.ax.bbox
+            # 容差 8%：tightbbox 会把标题算进高度（标题常驻，约 103%）
+            checks.append(("最佳视角：内容（含轴标签）不越界",
+                           _tb.width <= _bx.width * 1.08
+                           and _tb.height <= _bx.height * 1.08))
+            checks.append(("最佳视角：缩放被反解成有限值",
+                           0.35 <= v.box_zoom <= 6.0))
+
+            _ext = [t.get_text() for t in v.ax.texts
+                    if "坐标极值" in t.get_text()]
+            _P = v.P_raw
+            checks.append(("坐标极值面板常驻且数值正确",
+                           bool(_ext)
+                           and f"{_P[:, 0].min():+.4f}" in _ext[0]
+                           and f"{_P[:, 2].max():+.4f}" in _ext[0]))
+
             # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
             # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线
             # 会把界面卡死。

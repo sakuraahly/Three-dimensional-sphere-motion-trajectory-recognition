@@ -201,6 +201,25 @@ SAMPLE_DOT_SIZE = 7.0
 SAMPLE_DOT_COLOR = "#2563eb"
 SAMPLE_DOT_ALPHA = 0.75
 
+#: 「最佳视角」的搜索参数。(仰角起, 仰角止, 仰角步长)，方位角全周。
+#:
+#: 为什么仰角不搜 0~90：0° 是纯侧视（3D 感全没了，跟看 2D 投影一样），
+#: 90° 是纯俯视（Z 轴压成一个点）。15~60° 这段既保留立体感，又能让轨迹
+#: 在屏幕上尽量展开 —— 用户要的是"最适合观察"，不是"投影面积最大"。
+BEST_ELEV_RANGE = (15, 60, 15)
+BEST_AZIM_STEP = 15
+
+#: 视线方向与**任一坐标轴**的点积上限（= cos(夹角)）。
+#:
+#: 0.75 对应夹角 ≥ 41°，即每根轴在屏幕上至少还有 41° 的倾斜，不会被压成
+#: 一点。没有这条约束时，搜索会选出 elev=15°/azim=90° —— 投影面积确实最大
+#: （轨迹完全展开），但视线几乎**沿着 Y 轴**，三根轴的刻度全挤到画布左边重叠
+#: 成一坨，根本读不出数（2026-11-05 实测踩到）。面积最大 ≠ 能看清。
+BEST_MAX_AXIS_DOT = 0.75
+
+#: 坐标极值面板的高度（像素），用于把"选中点信息"排在它下方。
+EXTREMES_PANEL_PX = 64
+
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
     "XY": (2, "#60a5fa"),
@@ -685,6 +704,11 @@ class Viewer3D:
         self.play_btn = ttk.Button(bar, text="播放", command=self._toggle_play, width=8)
         self.play_btn.pack(side="left")
         ttk.Button(bar, text="重置3D视角", command=self._reset_view, width=10).pack(side="left", padx=4)
+        # 「最佳视角」= 自动角度 + 自动缩放。和「重置3D视角」分开：
+        # 后者回到固定预设，前者按数据形状算 —— 用户要的是后者
+        # （2026-11-05："智能回到最适合的观察角度和缩放比例"）。
+        ttk.Button(bar, text="最佳视角", command=self._smart_view,
+                   width=9).pack(side="left", padx=(0, 4))
         # 名字必须说清是**窗口**全屏：用户以为「全屏」= 坐标轴铺满画布，
         # 于是点完发现立方体还是那么大，白失望一次（2026-11-05）。
         # 坐标轴铺满是**默认布局**，不需要按钮。
@@ -998,6 +1022,153 @@ class Viewer3D:
         self.sel_idx = i
         self._redraw()
 
+    # ── 智能视角 / 坐标极值 ─────────────────────────────────────────────
+    def _best_view_angles(self) -> tuple[float, float]:
+        """搜出让轨迹在屏幕上**展开最充分**的 (elev, azim)。
+
+        做法：对每个候选角度，把点云正交投影到屏幕平面，算投影包围盒面积，
+        取面积最大的那个。面积大 = 三个方向的差异都被摊开在画面上，而不是
+        被压成一条线或一坨。
+
+        为什么不用固定等轴测：这段数据的跨度是 X 0.39 m / Y 0.14 m / Z 0.40 m，
+        差异很大。固定 35°/-45° 时 Y 方向经常被压得几乎看不见 —— 用户之前
+        抱怨的"Y 比例奇怪"有一半就是这个（2026-11-05）。
+
+        这里的基向量与 mplot3d 的 `view_init(elev, azim)` 同一套约定：
+        相机在 `(cos e·cos a, cos e·sin a, sin e)` 方向，屏幕右方向是
+        `(-sin a, cos a, 0)`，上方向是两者叉积。所以搜出来的角度可以直接
+        喂给 `view_init`。
+        """
+        P = getattr(self, "P_raw", None)
+        if P is None or len(P) < 3:
+            e, a, _r = VIEW_PRESETS[DEFAULT_VIEW]
+            return float(e), float(a)
+        Q = P - P.mean(axis=0)               # 以质心为原点，只看形状
+        e0, e1, step = BEST_ELEV_RANGE
+        best_area, best_e, best_a = -1.0, 35.264, -45.0
+        for elev in range(e0, e1 + 1, step):
+            er = np.radians(float(elev))
+            ce, se = np.cos(er), np.sin(er)
+            for azim in range(-180, 180, BEST_AZIM_STEP):
+                ar = np.radians(float(azim))
+                # 屏幕右方向与上方向（与相机正交）
+                right = np.array([-np.sin(ar), np.cos(ar), 0.0])
+                fwd = np.array([ce * np.cos(ar), ce * np.sin(ar), se])
+                # 视线不能贴着任何一根轴：贴着谁，谁就在屏幕上退化成一点，
+                # 它的刻度会堆到画布角落。面积再大也读不出数。
+                if float(np.max(np.abs(fwd))) > BEST_MAX_AXIS_DOT:
+                    continue
+                up = np.cross(fwd, right)
+                u = Q @ right
+                v = Q @ up
+                area = float((u.max() - u.min()) * (v.max() - v.min()))
+                if area > best_area:
+                    best_area, best_e, best_a = area, float(elev), float(azim)
+        return best_e, best_a
+
+    def _smart_view(self) -> None:
+        """一键回到「最适合观察」：自动角度 + 自动缩放（按钮）。
+
+        三步：① 搜最佳仰角/方位；② 范围回到数据包围盒；③ 按点云的实际占屏
+        比例反解 zoom —— 不写死一个倍数，因为窗口大小、数据量级都会变，
+        写死的值在某些会话里会顶出画布、在另一些里又缩成一小块。
+        """
+        elev, azim = self._best_view_angles()
+        self.view = {"elev": elev, "azim": azim, "roll": 0.0}
+        self.lims = None              # 让 `_redraw` 重新 fit 数据包围盒
+        self.box_zoom = DEFAULT_BOX_ZOOM
+        self.sel_idx = None           # 视角变了，原来的选中点位置已失效
+        self._sync_roll_widget()
+        self._redraw()
+        self._fit_zoom_to_points()
+
+    def _fit_zoom_to_points(self) -> None:
+        """反解 `box_zoom`：让 3D 内容（含轴标签）**尽量大但不越界**。
+
+        为什么用二分，而不是按 bbox 比例直接算：
+
+        `ax.get_tightbbox()` 回答的是"至少需要多大才能把所有标签画下"，
+        它的**下限就是 axes 本身** —— 内容一旦缩进 axes，返回值恒等于 axes
+        bbox，再也看不出"还能放大多少"。按比例算会一直误判成"还超界"，
+        把内容越缩越小（实测缩到 0.785 才停，比合适的值小了一大截）。
+
+        所以只能试探：二分 zoom，看 tightbbox 是否越界。区间
+        [0.35, 4.0]、4 次迭代，精度 0.23 —— 每次只改轴盒 + 一次 draw
+        （约 40 ms），总共约 0.2 s，按钮点击完全可以接受。
+
+        为什么不用点云包围盒当判据：点云占 82% 时轴标签已经被挤出画布了
+        （tightbbox 要到 axes 的 1.29 倍才放得下，左下角刻度直接被切）。
+        """
+        # 图例 / 极值面板 / 选中信息 / 标题 / 小图都不是 3D 内容，
+        # 量之前先藏起来，否则它们会把 tightbbox 撑大，算出的 zoom 偏小。
+        hidden: list[tuple[object, bool]] = []
+        for art in list(self.ax.texts):
+            hidden.append((art, art.get_visible()))
+            art.set_visible(False)
+        _extras = [self.ax.get_legend(), self.ax.title]
+        for art in _extras:
+            if art is not None:
+                hidden.append((art, art.get_visible()))
+                art.set_visible(False)
+        try:
+            _inset_vis = self.ax_inset.get_visible()
+            self.ax_inset.set_visible(False)
+            try:
+                lo, hi = 0.35, 4.0
+                for _ in range(4):
+                    mid = (lo + hi) / 2.0
+                    self._set_zoom(mid)
+                    self.canvas.draw()
+                    try:
+                        tb = self.ax.get_tightbbox(
+                            self.canvas.get_renderer())
+                    except Exception:                  # noqa: BLE001
+                        return
+                    box = self.ax.bbox
+                    if tb is None or tb.width <= 1.0 or tb.height <= 1.0:
+                        return
+                    # 容差必须放宽：tightbbox 的**下限就是 axes 本身**，
+                    # 内容全部放得下时它恰好等于 100%。用 0.995 判定会把
+                    # "正好放下"也当成越界，一路缩到下限（实测缩成 0.35）。
+                    # 5% 容差 = 只有真的溢出 5% 才算被裁。
+                    over = (tb.width > box.width * 1.05
+                            or tb.height > box.height * 1.05)
+                    if over:
+                        hi = mid
+                    else:
+                        lo = mid
+                # 留 1% 余量：正好贴边时某些字体渲染会有 1px 溢出
+                self._set_zoom(lo * 0.99)
+            finally:
+                self.ax_inset.set_visible(_inset_vis)
+        finally:
+            for art, vis in hidden:
+                art.set_visible(vis)
+            # 隐藏期间的投影不是最终状态，恢复后重算一次拾取缓存
+            self.canvas.draw_idle()
+            self._cache_point_px()
+
+    def _draw_extremes(self) -> None:
+        """在左上角常驻显示三轴坐标极值（自动随会话更新）。"""
+        P = getattr(self, "P_raw", None)
+        if P is None or not len(P):
+            return
+        rows = ["坐标极值 (m)"]
+        for i, axis_name in enumerate(("X", "Y", "Z")):
+            lo = float(P[:, i].min())
+            hi = float(P[:, i].max())
+            rows.append(f"{axis_name}  {lo:+.4f} ~ {hi:+.4f}   跨度 {hi - lo:.4f}")
+        # 字体必须能显示中文：`monospace`(DejaVu Sans Mono) 没有汉字，
+        # 会渲染成一串方框并刷 UserWarning。用项目里已有的中文回退链，
+        # 数字靠 `%+.4f` 的定宽格式对齐（比例字体的数字宽度本来就接近）。
+        self.ax.text2D(
+            0.012, 0.985, "\n".join(rows), transform=self.ax.transAxes,
+            fontsize=8.5, va="top", family=list(INSET_FONTS), color="#111827",
+            linespacing=1.35,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
+                      edgecolor="#94a3b8", alpha=0.92),
+            zorder=19)
+
     def _draw_selection(self) -> None:
         """把选中的采样点圈出来，并在左上角写出它的三维坐标。"""
         i = self.sel_idx
@@ -1019,8 +1190,11 @@ class Viewer3D:
                 f"Y = {q[1]:+.4f} m\n"
                 f"Z = {q[2]:+.4f} m")
         # `text2D` 用 axes 坐标，旋转/缩放都不会跟着跑；`text` 会跟着 3D 点飞。
+        # 排在极值面板**下方**：按像素换算，窗口大小变了也不会重叠。
+        _h = max(1.0, float(self.ax.bbox.height))
+        _y = 1.0 - (EXTREMES_PANEL_PX + 10.0) / _h
         self.ax.text2D(
-            0.012, 0.985, body, transform=self.ax.transAxes,
+            0.012, _y, body, transform=self.ax.transAxes,
             fontsize=9, va="top", family="monospace", color="#111827",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
                       edgecolor="#dc2626", alpha=0.94),
@@ -1464,8 +1638,11 @@ class Viewer3D:
         # 刻度间隔：用户填了分度值就用它（`MultipleLocator`），否则自动 4 档。
         # 必须在 `clear()` 之后设 —— 它会重置 locator。
         self._apply_tick_steps()
+        # 标题带中文（"[单目]"），默认字体 DejaVu Sans 没有汉字，会渲染成方框
+        # 并刷 UserWarning —— 指定项目里的中文回退链（2026-11-05 实测单目会话）。
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
-                          f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
+                          f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}",
+                          fontfamily=list(INSET_FONTS))
         self.ax.legend(loc="upper right")
         # 顺序固定：范围（持久）→ 平面按这个范围铺 → 最后套视角/投影。
         # `clear()` 已经把视角打回默认，所以 `_apply_view` 必须在最后。
@@ -1482,6 +1659,7 @@ class Viewer3D:
         # 拾取缓存必须在 `_apply_view()` **之后** —— 视角变了投影就变了，
         # 先算会得到上一帧的位置，点哪都选不中。
         self._cache_point_px()
+        self._draw_extremes()
         self._draw_selection()
         self._redraw_inset()
         self.canvas.draw_idle()
