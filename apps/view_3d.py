@@ -162,14 +162,36 @@ INSET_FONTS = ("Microsoft YaHei", "SimHei", "DejaVu Sans")
 #: matplotlib 的相机位置是 (cos e·cos a, cos e·sin a, sin e)。
 #: elev=-90 把眼睛放在 **-Z**（光心处）朝 +Z 看，屏幕上 X 右 / Y 下 ——
 #: 与相机拍到的画面同向；elev=+90 是从场景背后回看，Y 会翻到屏幕上方。
+#: 观察方向预设：(仰角 elev, 方位角 azim, 绕视线滚转 roll)，单位度。
+#:
+#: ── 坐标约定（2026-11-05 用户明确）──────────────────────────────
+#: 相机系：**X 向右、Y 向下、Z 向前**（相机光轴朝前）。
+#:
+#: 所以"右视"（从右侧看过去）的屏幕必须是 **横轴 Z、纵轴 Y** ——
+#: 前后方向横过来，上下方向竖着。原来写的 `(0, 0, 0)` 得到的是
+#: "横轴 Y、纵轴 Z"：Z 躺成了竖轴，读起来完全不是侧视图（用户截图指出）。
+#:
+#: matplotlib 的 3D 里 **z 轴默认永远竖直**，光靠 elev/azim 换不过来，
+#: 必须用 `roll` 绕视线转 90° 才能把 Z 放平。每个角度的屏幕效果都在
+#: 注释里标了，改之前先照它验一遍（下面这些值是投影实测出来的，
+#: 不是猜的）：
+#:
+#:   前视  -90/-90/0    X→右  Y↓下  Z=深度
+#:   后视   90/ 90/0    X→左  Y↓下  Z=深度
+#:   右视    0/  0/-90  Z→右  Y↓下  X=深度
+#:   左视    0/180/ 90  Z→左  Y↓下  X=深度
+#:   俯视    0/-90/  0  X→右  Z↑上  Y=深度
+#:   仰视    0/ 90/180  X→右  Z↓下  Y=深度
+#:
+#: 深度轴会被 `_hide_depth_axis` 自动藏掉（它退化成一点，刻度会糊成一团）。
 VIEW_PRESETS = {
     "等轴测": (35.264, -45.0, 0.0),
     "前视（相机看到的）": (-90.0, -90.0, 0.0),
-    "后视（从背后）": (90.0, -90.0, 0.0),
-    "右视": (0.0, 0.0, 0.0),
-    "左视": (0.0, 180.0, 0.0),
+    "后视（从背后）": (90.0, 90.0, 0.0),
+    "右视": (0.0, 0.0, -90.0),
+    "左视": (0.0, 180.0, 90.0),
     "俯视（从头顶）": (0.0, -90.0, 0.0),
-    "仰视（从下方）": (0.0, 90.0, 0.0),
+    "仰视（从下方）": (0.0, 90.0, 180.0),
 }
 DEFAULT_VIEW = "等轴测"
 
@@ -342,15 +364,25 @@ def scan_sources(limit: int = SOURCE_LIMIT,
         # 这样"data 在哪"仍然只有 paths.py 一个来源。
         bases = tuple(dict.fromkeys(
             (*stereo_roots(), MONO_ROOT, MONO_ROOT.parent)))
+    # 枚举会话**必须**走 `candidate_session_dirs`：会话按装置分到
+    # `data/stereo/parallel/`、`data/stereo/angled/` 之后，根目录下一层已经
+    # 不是会话了。原来这里自己 `base.glob("*/derived/*")`，于是**新布局的会话
+    # 一个都扫不到** —— 表现为"数据源列表里没有最新那次实验"，默认会话只能
+    # 落到更老的目录上（2026-11-05 用户："每次打开应该默认打开最新的会话"，
+    # 查下来不是排序问题，是根本没扫到）。
+    from apps._stereo_layout import candidate_session_dirs
+
     found: dict[Path, Path] = {}
     for base in bases:
         if not base.is_dir():
             continue
-        for name in ("visualization.json", "traj3d.json"):
-            for f in base.glob(f"*/derived/{name}"):
-                sess = f.parent.parent
+        for sess in candidate_session_dirs([base]):
+            for name in ("visualization.json", "traj3d.json"):
+                f = sess / "derived" / name
+                if not f.exists():
+                    continue
                 # 同一个会话两种都写时，优先 visualization.json（它带视频叠加信息）
-                if sess not in found or f.name == "visualization.json":
+                if sess not in found or name == "visualization.json":
                     found[sess] = f
 
     def key(f: Path) -> tuple[str, float]:
@@ -491,6 +523,16 @@ class Viewer3D:
         self.lo, self.hi = bounds_of(self.points)
         self.video_path = self._resolve_video(video_path, auto_video)
         self.cap = cv2.VideoCapture(str(self.video_path)) if self.video_path else None
+        self.cap_frames = 0
+        if self.cap is not None and self.cap.isOpened():
+            # 记下总帧数：轨迹点可以有很多帧，视频却可能**只有十几帧**
+            # （生成中断/被覆盖）。不记的话，seek 越界只能报一句"解码失败"，
+            # 用户会以为是播放器坏了（2026-11-05 现场：视频 19 帧、
+            # 轨迹 301 帧，两边都显示"frame 56 解码失败"）。
+            try:
+                self.cap_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            except Exception:                       # noqa: BLE001
+                self.cap_frames = 0
         if self.cap is not None and not self.cap.isOpened():
             self.video_error = f"视频打不开：{self.video_path}"
             self.cap.release()
@@ -716,9 +758,20 @@ class Viewer3D:
                                    command=self._toggle_fullscreen, width=9)
         self.full_btn.pack(side="left", padx=(0, 4))
         ttk.Label(bar, text="帧").pack(side="left", padx=(10, 2))
+        # 逐帧步进（2026-11-05 用户："播放器那里增加前进/后退 x 帧的功能"）。
+        # 放在滑杆两侧：左边退、右边进，方向和拖动一致。±1 用于精确定位，
+        # ±10 用于快速扫一段 —— 拖滑杆在几百帧里根本对不准某一帧。
+        for _txt, _delta in (("-10", -10), ("-1", -1)):
+            ttk.Button(bar, text=_txt, width=3,
+                       command=lambda d=_delta: self._step_frames(d)
+                       ).pack(side="left", padx=(0, 2))
         self.slider = ttk.Scale(bar, from_=0, to=max(0, self.n - 1),
                                 command=self._on_slider, orient="horizontal")
         self.slider.pack(side="left", fill="x", expand=True, padx=4)
+        for _txt, _delta in (("+1", 1), ("+10", 10)):
+            ttk.Button(bar, text=_txt, width=3,
+                       command=lambda d=_delta: self._step_frames(d)
+                       ).pack(side="left", padx=(2, 0))
         ttk.Label(bar, text="速度").pack(side="left", padx=(8, 2))
         self.speed_box = ttk.Combobox(bar, values=("0.25x", "0.5x", "1x", "2x"),
                                       width=5, state="readonly")
@@ -1714,10 +1767,22 @@ class Viewer3D:
             self._render_video()
             return
         frame = int(self.points[self.idx].get("frame", self.idx))
+        if self.cap_frames and frame >= self.cap_frames:
+            # 视频比轨迹短 —— 不是解码器的问题，是这个 mp4 不完整。
+            # 说清"差多少"，用户才知道是文件坏了而不是程序坏了。
+            self.video_error = (
+                f"视频只有 {self.cap_frames} 帧，当前要点第 {frame} 帧 —— "
+                f"annotated.mp4 不完整（生成中断或被覆盖）")
+            self._left_raw = self._right_raw = None
+            self._render_video()
+            return
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame)
         ok, img = self.cap.read()
         if not ok or img is None:
-            self.video_error = f"frame {frame} 解码失败"
+            # 帧号在范围内却读不出来：真正的解码失败（文件损坏/编码不支持）。
+            self.video_error = (f"frame {frame} 解码失败"
+                                + (f"（视频共 {self.cap_frames} 帧）"
+                                   if self.cap_frames else ""))
             self._left_raw = self._right_raw = None
             self._render_video()
             return
@@ -1748,6 +1813,18 @@ class Viewer3D:
                  f"{self.view['roll']:.0f}°")
 
     # ------------------------------------------------------------------
+    def _step_frames(self, delta: int) -> None:
+        """前进/后退 delta 帧（按钮）。
+
+        夹在 ``[0, n-1]`` 内，并且**顺手停掉播放** —— 播放时按步进，
+        下一次 tick 会立刻把帧号推走，用户会觉得按钮没反应。
+        """
+        if getattr(self, "playing", False):
+            self._toggle_play()
+        self.idx = max(0, min(self.n - 1, self.idx + int(delta)))
+        self._set_slider(self.idx)
+        self._redraw()
+
     def _on_slider(self, value: str) -> None:
         if self._syncing:
             return
@@ -1795,11 +1872,25 @@ class Viewer3D:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="离线 3D 轨迹查看器（读 visualization.json）")
-    ap.add_argument("source", help="会话目录或 visualization.json / traj3d.json")
+    # 省略 source = **自动打开最新的会话**（2026-11-05 用户："每次打开应该
+    # 默认打开最新的会话的结果"）。之前是必填参数，直接跑 `view_3d.py`
+    # 只会报 usage，用户还得从主界面挑一次。
+    ap.add_argument("source", nargs="?", default=None,
+                    help="会话目录或 visualization.json / traj3d.json"
+                         "（省略 = 最新的一条结果）")
     ap.add_argument("--check", action="store_true", help="只校验数据，不开窗口")
     ap.add_argument("--video", default="", help="同步视频（默认找 derived/annotated.mp4）")
     ap.add_argument("--no-video", action="store_true", help="不加载追踪视频")
     args = ap.parse_args()
+    if args.source is None:
+        found = scan_sources(limit=1)
+        if not found:
+            print("[错误] 没有任何会话有三维结果"
+                  "（data/stereo、data/mono 下都没有 derived/）")
+            return 1
+        args.source = str(found[0])
+        # 明确说一句"替你选的是哪条"，否则用户不知道看的是哪次实验
+        print(f"[自动] 打开最新会话：{found[0].parent.parent.name}")
     try:
         data = load_view(args.source)
     except Exception as exc:                                # noqa: BLE001

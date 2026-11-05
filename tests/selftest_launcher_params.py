@@ -172,6 +172,23 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
         checks.append((f"会话列表按目录名倒序、不被 mtime 带跑（{got}）",
                        got == ["20260202-000000", "20260101-000000"]))
 
+    # 分区布局 `data/stereo/parallel/<会话>` 必须也能扫到。
+    # 2026-11-05 的现场 bug：`scan_sources` 自己 `glob("*/derived/*")` 只扫一层，
+    # 而会话按装置分到 parallel/angled 之后多了一层 —— 新布局的会话**一个都
+    # 扫不到**，表现为"数据源里没有最新那次实验，默认会话落到更老的目录"。
+    # 上面那个用例造的全是扁平布局，所以一直没抓到。
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        part = base / "parallel" / "20260303-000000"
+        (part / "derived").mkdir(parents=True)
+        (part / "derived" / "visualization.json").write_text(
+            json.dumps({"schema": "sphere-stereo-visualization",
+                        "version": 1, "trajectory": []}), encoding="utf-8")
+        mk(base, "20260101-000000", video=False)
+        got2 = [f.parent.parent.name for f in scan_sources(roots=(base,))]
+        checks.append((f"分区布局（parallel/会话）也能扫到（{got2}）",
+                       "20260303-000000" in got2 and "20260101-000000" in got2))
+
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp)
         a = mk(base, "20260101-000000", n=5, video=True)
@@ -373,6 +390,52 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            bool(_ext)
                            and f"{_P[:, 0].min():+.4f}" in _ext[0]
                            and f"{_P[:, 2].max():+.4f}" in _ext[0]))
+
+            # 六视图方向（2026-11-05 用户："左视和右视应该是错的，显然 Z 轴
+            # 才是横轴"）。坐标约定是 X 右 / Y 下 / Z 前（相机光轴朝前），
+            # 所以侧视的**横轴必须是 Z**、纵轴是 Y 且向下增大。
+            # mplot3d 里 z 轴默认永远竖直，必须靠 roll 转 90° 才放得平 ——
+            # 下面的断言就是钉住这件事，改角度前先跑它。
+            import numpy as _npv
+            from mpl_toolkits.mplot3d import proj3d as _pj
+            from apps.view_3d import VIEW_PRESETS as _VP
+
+            def _axis_dirs(e, a, r):
+                v.ax.view_init(elev=e, azim=a, roll=r)
+                v.ax.set_proj_type("ortho")
+                _M = v.ax.get_proj()
+                _o = _npv.array(_pj.proj_transform(0, 0, 0, _M)[:2])
+                _res = {}
+                for _k, _q in (("X", (1, 0, 0)), ("Y", (0, 1, 0)),
+                               ("Z", (0, 0, 1))):
+                    _w = _npv.array(_pj.proj_transform(*_q, _M)[:2]) - _o
+                    _n = float(_npv.linalg.norm(_w))
+                    _res[_k] = (_w / _n) if _n > 1e-9 else _npv.zeros(2)
+                return _res
+
+            _d = _axis_dirs(*_VP["右视"])
+            checks.append(("右视：横轴 Z（向右）、纵轴 Y（向下增大）",
+                           _d["Z"][0] > 0.9 and _d["Y"][1] < -0.9))
+            _d = _axis_dirs(*_VP["左视"])
+            checks.append(("左视：横轴 Z（向左）、纵轴 Y（向下增大）",
+                           _d["Z"][0] < -0.9 and _d["Y"][1] < -0.9))
+            _d = _axis_dirs(*_VP["前视（相机看到的）"])
+            checks.append(("前视：横轴 X（向右）、纵轴 Y（向下增大）",
+                           _d["X"][0] > 0.9 and _d["Y"][1] < -0.9))
+            _d = _axis_dirs(*_VP["俯视（从头顶）"])
+            checks.append(("俯视：横轴 X（向右）、Z 竖直",
+                           _d["X"][0] > 0.9 and abs(_d["Z"][1]) > 0.9))
+
+            # 帧步进（2026-11-05："播放器那里增加前进/后退 x 帧的功能"）
+            v.idx = 5
+            v._step_frames(-3)
+            _b1 = v.idx == 2
+            v._step_frames(-999)
+            _b2 = v.idx == 0
+            v._step_frames(99999)
+            _b3 = v.idx == v.n - 1
+            checks.append((f"帧步进：±delta 生效且夹在 [0, n-1]"
+                           f"（{_b1}/{_b2}/{_b3}）", _b1 and _b2 and _b3))
 
             # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
             # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线
