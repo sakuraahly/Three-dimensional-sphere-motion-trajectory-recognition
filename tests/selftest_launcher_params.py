@@ -2155,6 +2155,13 @@ def main() -> int:
         print(f"  [{'通过' if _passed else '不达标'}] {_name}")
         results.append((_name, _passed))
 
+    # ---- 标准窗口 + gitignore（2026-11-05）----
+    # 同样并进本文件，不动 selftest_doc_facts 里有签字的 REAL_TEST_COUNT。
+    print("----- 8f. 清理窗口 / gitignore ----")
+    for _name, _passed in _check_cleanup_windows():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
@@ -2163,6 +2170,105 @@ def main() -> int:
             print(f"  · {n}")
     print("\n判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
+
+
+def _check_cleanup_windows() -> list[tuple[str, bool]]:
+    """清理窗口是标准窗口 + 自动产物不进 git（2026-11-05）。
+
+    守两件事：
+
+    1. `transient()` 在 Windows 上把 Toplevel 降成**工具窗口**，标题栏只剩一个
+       ×（最小化/最大化灰掉、不进任务栏）。用户明确要"标准的三个按钮"。
+       配套还去掉了 `grab_set()` —— 全局抓取会让窗口最小化后主窗口点不动；
+       重复打开改由调用方单例挡住。
+    2. `.gitignore` 原来按"当时见到的目录"逐条加，漏了 data/_trash/、
+       散落的 *.log、根级 test_results/、.workbuddy/。这里用
+       `git check-ignore --stdin` 一次批量验，同时**反向**验证源码/文档/资产
+       没有被新规则误伤（比如全局忽略 *.png 会吃掉 assets/boards/）。
+    """
+    import subprocess
+
+    checks: list[tuple[str, bool]] = []
+    root_dir = Path(__file__).resolve().parent
+    while not (root_dir / "apps").is_dir() and root_dir.parent != root_dir:
+        root_dir = root_dir.parent
+
+    # ① 源码里不许再把 transient 加回来
+    for rel in ("apps/junk_dialog.py", "apps/cleanup_dialog.py"):
+        src = (root_dir / rel).read_text(encoding="utf-8")
+        checks.append((f"{rel} 不再用 transient（工具窗口只有 ×）",
+                       "self.transient(" not in src))
+
+    # ② 实际构造一次垃圾管理器：属性、快捷键、标题栏同步
+    root = tk.Tk()
+    root.withdraw()
+    dlg = None
+    try:
+        from apps.junk_dialog import JunkDialog
+
+        dlg = JunkDialog(root)
+        root.update_idletasks()
+        checks.append(("垃圾管理器是标准窗口（transient 空、可缩放）",
+                       not bool(dlg.transient())
+                       and dlg.resizable() in ((True, True), (1, 1))))
+        checks.append(("垃圾管理器支持 F11 最大化 / Esc 关闭",
+                       bool(dlg.bind("<F11>")) and bool(dlg.bind("<Escape>"))))
+        dlg.state("zoomed")
+        root.update()          # 必须用 update：`<Configure>` 靠事件循环派发，
+                               # update_idletasks() 不会触发它
+        checks.append(("标题栏最大化后窗口内按钮文字同步为「还原」",
+                       str(dlg.btn_full.cget("text")) == "还原"))
+        dlg._toggle_full()
+        root.update()
+        checks.append(("点「还原」能退回普通窗口", dlg.state() == "normal"))
+    except Exception as exc:                            # noqa: BLE001
+        checks.append((f"垃圾管理器能建起来（异常：{exc}）", False))
+    finally:
+        if dlg is not None:
+            try:
+                dlg.destroy()
+            except Exception:                           # noqa: BLE001
+                pass
+        root.destroy()
+
+    # ③ gitignore：正反向一起验
+    produced = [
+        "outputs/test_results/timings.json",
+        "logs/tasks/x.log",
+        "data/_trash/session/left.mkv",
+        "data/stereo/parallel/s/derived/visualization.json",
+        "config/profiles.json",
+        ".workbuddy/memory/note.md",
+        "apps/tools/foo.log",
+        "test_results/run.json",
+        "coverage.xml",
+        "calib/cache.npz",
+        "assets/videos/clip.mp4",
+        "gui_state.json.bak-20261105",
+    ]
+    source = [
+        "apps/new_tool.py", "docs/new.md", "tests/selftest_new.py",
+        "sphere_tracker/new_mod.py", "assets/boards/board.png",
+        "data/README.md", "config/.gitkeep", "README.md",
+    ]
+    try:
+        # 用**命令行参数**而不是 `--stdin`：Windows 下从 Python 管道喂给
+        # `check-ignore --stdin` 时，git 会把输出加引号并留 `\r`
+        # （实测 `"outputs/xxx.json\r"`），解析出来全是"漏网"。
+        # 直接当参数传一次即可，输出是干净的路径行。
+        proc = subprocess.run(
+            ["git", "check-ignore", *produced, *source], cwd=str(root_dir),
+            text=True, capture_output=True, check=False)
+        ignored = {line.strip().strip('"') for line in proc.stdout.splitlines()}
+        miss = [x for x in produced if x not in ignored]
+        hurt = [x for x in source if x in ignored]
+        checks.append((f"程序自动产物全部不进 git（漏 {len(miss)}：{miss[:2]}）",
+                       not miss))
+        checks.append((f"源码/文档/资产没有被误忽略（误伤 {hurt[:2]}）",
+                       not hurt))
+    except Exception as exc:                            # noqa: BLE001
+        checks.append((f"gitignore 能被校验（异常：{exc}）", False))
+    return checks
 
 
 def _check_help() -> list[tuple[str, bool]]:

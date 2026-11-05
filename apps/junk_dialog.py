@@ -93,8 +93,19 @@ class JunkDialog(tk.Toplevel):
         self.title("垃圾管理器 · 清日志与临时产物")
         self._place_window()
         self.configure(bg=BG)
-        self.transient(parent)
+        # ── 标准窗口（2026-11-05 用户："垃圾管理器也改成标准的管理三个按钮"）──
+        # `transient()` 在 Windows 上会把 Toplevel 降成**工具窗口**：标题栏只剩
+        # 一个 ×，最小化/最大化按钮灰掉，也不进任务栏。管理器要摆在一边慢慢
+        # 勾选、还要能收起来回主界面核对，必须是标准窗口。
+        #
+        # `grab_set()` 也一并去掉（原来在 __init__ 末尾）：全局抓取会让窗口
+        # 最小化之后主窗口点不动，看起来像卡死。重复打开由 `_open_junk`
+        # 的单例挡住，不靠模态。
         self.resizable(True, True)
+        self.bind("<F11>", lambda _e: self._toggle_full())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        # 标题栏的最大化按钮与窗口内「全屏」按钮要同步文字
+        self.bind("<Configure>", self._sync_full_btn)
 
         # ---------- 顶部 ----------
         head = ttk.Frame(self, padding=(16, 12, 16, 0))
@@ -178,9 +189,24 @@ class JunkDialog(tk.Toplevel):
         ttk.Button(actions, text="关闭", command=self.destroy).pack(side="left")
 
         self._reload()
-        self.grab_set()
 
     # ---------- 窗口 ----------
+    def _sync_full_btn(self, _event=None) -> None:
+        """标题栏最大化/还原后，窗口内「全屏」按钮的文字跟着变。
+
+        窗口刚构造时 `btn_full` 还不存在（`<Configure>` 会先触发），
+        窗口销毁后也可能再触发一次，两种都要静默放过。
+        """
+        btn = getattr(self, "btn_full", None)
+        if btn is None:
+            return
+        try:
+            want = "还原" if self.state() == "zoomed" else "全屏"
+            if str(btn.cget("text")) != want:
+                btn.configure(text=want)
+        except (tk.TclError, AttributeError):
+            pass
+
     def _place_window(self) -> None:
         """初始尺寸按屏幕比例给（不再是死 880x560），并居中。"""
         sw = max(1024, self.winfo_screenwidth())

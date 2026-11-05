@@ -749,7 +749,15 @@ class DataManager(tk.Tk):
 
     def _open_trash(self) -> None:
         from apps.cleanup_dialog import TrashDialog
-        TrashDialog(self, self.root_dir, on_done=self.refresh)
+
+        _top = self.winfo_toplevel()
+        _old = getattr(_top, "_trash_window", None)
+        if _old is not None and _old.winfo_exists():
+            _old.deiconify()
+            _old.lift()
+            return
+        _top._trash_window = TrashDialog(
+            self, self.root_dir, on_done=self.refresh)
 
     def _clean_selected(self) -> None:
         from apps.cleanup_dialog import CleanupDialog
@@ -760,8 +768,15 @@ class DataManager(tk.Tk):
         if not chosen:
             messagebox.showinfo("清理", "先勾选或选中至少一个会话。", parent=self)
             return
-        CleanupDialog(self, self.root_dir, [it.path for it in chosen],
-                      on_done=self.refresh)
+        _top = self.winfo_toplevel()
+        _old = getattr(_top, "_cleanup_window", None)
+        if _old is not None and _old.winfo_exists():
+            messagebox.showinfo(
+                "清理", "上一个清理窗口还开着，先完成或关掉它。", parent=self)
+            return
+        _top._cleanup_window = CleanupDialog(
+            self, self.root_dir, [it.path for it in chosen],
+            on_done=self.refresh)
 
     # ------------------------------------------------------------------
     def _edit_selected(self) -> None:

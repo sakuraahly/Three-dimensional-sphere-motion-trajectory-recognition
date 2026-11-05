@@ -37,8 +37,10 @@ class CleanupDialog(tk.Toplevel):
                  targets: list[str | Path], on_done=None) -> None:
         super().__init__(parent)
         self.title("清理会话（先移到回收站）")
-        self.transient(parent)
-        self.grab_set()
+        # 同垃圾管理器：去掉 `transient()`，标题栏才有标准的最小化/最大化/关闭。
+        # 原来还带 `grab_set()`，窗口最小化后主窗口会整个点不动 —— 一并去掉，
+        # 重复打开由数据管理里的单例挡住（这是移进回收站的操作，不是模态确认）。
+        self.resizable(True, True)
         self.root_dir = Path(sessions_root).resolve()
         self.targets = [Path(t) for t in targets]
         self.on_done = on_done
@@ -147,8 +149,8 @@ class TrashDialog(tk.Toplevel):
     def __init__(self, parent, sessions_root: str | Path, on_done=None) -> None:
         super().__init__(parent)
         self.title("回收站")
-        self.transient(parent)
-        self.grab_set()
+        # 同 CleanupDialog：标准窗口 + 非模态，能最小化/最大化（2026-11-05）。
+        self.resizable(True, True)
         self.root_dir = Path(sessions_root).resolve()
         self.on_done = on_done
         self.batches = []
