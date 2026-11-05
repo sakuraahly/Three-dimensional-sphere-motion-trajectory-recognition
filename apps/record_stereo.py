@@ -526,11 +526,27 @@ def main() -> int:
             print(f"[采集档] 采用标定记录的采集档 {_cs[0]}x{_cs[1]}"
                   f"（{calib_base.with_suffix('.json').name} 的 capture_size）")
         else:
-            args.width, args.height = RECORD_DEFAULT.width, RECORD_DEFAULT.height
-            print(f"[采集档] 标定里没有采集档记录（旧标定或读不到），"
-                  f"退回默认 {RECORD_DEFAULT.label}。")
-            print("         若与本机实际采集档不符，请显式给 --width/--height，"
-                  "或先重标（新标定会记下采集档）。")
+            # 标定里没有采集档（旧标定，或这台装置还没标过）→ 问**装置档案**。
+            # 这是档案里 width/height 唯一真正有用的场景：新装置第一次录，
+            # 还没有标定可依，档案就是它该用的档。比名义默认可靠得多 ——
+            # RECORD_DEFAULT 是 2560x1440，而本机实测双路同时开 2560 会让
+            # 一路的 MSMF 会话失效（2026-11-05；1920x1080 两台 15/15 稳定）。
+            _prof = None
+            try:
+                from stereo.profiles import get_active
+                _prof = get_active()
+            except Exception:                            # noqa: BLE001
+                _prof = None
+            if _prof is not None and _prof.width and _prof.height:
+                args.width, args.height = int(_prof.width), int(_prof.height)
+                print(f"[采集档] 标定里没有记录，采用装置档案「{_prof.name}」"
+                      f"的 {args.width}x{args.height}")
+            else:
+                args.width, args.height = RECORD_DEFAULT.width, RECORD_DEFAULT.height
+                print(f"[采集档] 标定与装置档案都没有采集档，退回默认 "
+                      f"{RECORD_DEFAULT.label}。")
+                print("         双路同时开 2560x1440 会让其中一路失效；请在装置档案里"
+                      "填采集档，或显式给 --width/--height。")
 
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")

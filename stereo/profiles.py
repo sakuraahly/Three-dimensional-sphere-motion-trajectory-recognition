@@ -345,6 +345,17 @@ def validate_profile(
     if not created:
         created = _now()
 
+    # 采集档：宽高**必须成对**（2026-11-05）。
+    # 只给宽会让采集变成「指定的宽 × 相机自己的默认高」—— 那个高没人能预期，
+    # 而它会被记进标定的 capture_size、决定之后所有录制请求。宁可在这里拒绝，
+    # 也不要存一个半对的档（界面上也拦一道，但底线在库里）。
+    width = _opt_positive_int(profile.width, "width")
+    height = _opt_positive_int(profile.height, "height")
+    if (width is None) != (height is None):
+        raise ProfileError(
+            "采集档的宽和高必须**一起**给（或都不给）：只给一个会变成"
+            "「指定宽 × 相机默认高」，那个尺寸没人能预期，还会被写进标定")
+
     return replace(
         profile,
         name=name,
@@ -353,8 +364,8 @@ def validate_profile(
             profile.expected_baseline_mm, "expected_baseline_mm"),
         working_distance_m=_opt_positive_float(
             profile.working_distance_m, "working_distance_m"),
-        width=_opt_positive_int(profile.width, "width"),
-        height=_opt_positive_int(profile.height, "height"),
+        width=width,
+        height=height,
         fps=_opt_positive_int(profile.fps, "fps"),
         calibration_path=_check_calibration_path(profile.calibration_path),
         notes=notes,

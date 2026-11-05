@@ -603,6 +603,25 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         got_d = rp.resolve_calibration_base(path, fallback=fb)
         checks.append(("无激活档案 -> 回落 fallback", got_d == fb))
 
+        # 8) 采集档（宽×高@fps）：能往返，且宽高必须成对（2026-11-05）
+        #
+        # 守的是什么：档案里的采集档是**拍标定图与录制共用的那一档**。若允许
+        # 只填宽，采集会变成「指定宽 × 相机默认高」，而那个尺寸会被记进标定的
+        # capture_size，决定之后所有录制请求 —— 错了要到录制失败才发现。
+        rp.upsert(rp.RigProfile(name="rig-cap", stereo_mode="parallel",
+                                width=1280, height=720, fps=60), path=path)
+        got_cap = rp.get_profile("rig-cap", path)
+        checks.append(("采集档能往返（1280x720@60）",
+                       got_cap is not None and got_cap.width == 1280
+                       and got_cap.height == 720 and got_cap.fps == 60))
+        try:
+            rp.upsert(rp.RigProfile(name="rig-half", width=1280), path=path)
+            checks.append(("只给宽被拒（不许存半对的采集档）", False))
+        except rp.ProfileError:
+            checks.append(("只给宽被拒（不许存半对的采集档）", True))
+        checks.append(("被拒后半对档案没落盘",
+                       rp.get_profile("rig-half", path) is None))
+
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)

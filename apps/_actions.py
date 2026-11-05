@@ -447,6 +447,7 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
                          target: str, left: str = "left", right: str = "right",
                          min_cover: int = 0, relax_after: int = 0,
                          per_region: int = 0,
+                         width: int = 0, height: int = 0, fps: int = 0,
                          dirs: dict | None = None) -> list[str]:
     """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
 
@@ -463,15 +464,29 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
     ``min_cover`` / ``relax_after`` 只对内参段有效（双板 A/B 与单板左右）：
     前者是**首选目标**（5=五个角全绿，最理想），后者是**分化线**——拍够这么多张
     后覆盖标准放宽到 4/5。参考段不用覆盖判据（它的规则是"板不能动"）。
+
+    ``width`` / ``height`` / ``fps`` 来自**激活装置档案**的采集档（0 = 不传，
+    由 `capture_board.py` 用它自己的默认）。为什么必须由档案给：`capture_board`
+    的默认是 2560x1440，而本机实测**双路同时开 2560x1440 会让其中一路的 MSMF
+    会话失效**（2026-11-05，1920x1080 则两台 15/15 帧稳定）。若照默认拍标定图，
+    标定的 capture_size 会被记成 2560，之后录制按它请求双开 → 必然失败。
+    所以采集档要随档案走，拍图与录制用同一档。
     """
     d = dirs if dirs is not None else chain_dirs()
+    cap: list[str] = []
+    if width > 0:
+        cap += ["--width", str(width)]
+    if height > 0:
+        cap += ["--height", str(height)]
+    if fps > 0:
+        cap += ["--fps", str(fps)]
     if stage == "ref":
         return _argv(
             _TOOLS / "capture_board.py", "--both",
             "--out-left", str(d["ref_left"]),
             "--out-right", str(d["ref_right"]),
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-            "--target", str(target), "--auto")
+            "--target", str(target), "--auto", *cap)
     if stage == "dual_b":
         # 双板模式：右相机拍 B 板，落 board_b 目录。
         return _argv(
@@ -482,7 +497,8 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
             "--target", str(target), "--auto",
             *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
             *(["--relax-after", str(relax_after)] if relax_after > 0 else []),
-            *(["--per-region", str(per_region)] if per_region > 0 else []))
+            *(["--per-region", str(per_region)] if per_region > 0 else []),
+            *cap)
     side = "left" if stage == "left" else "right"
     out = d["left"] if stage == "left" else d["right"]
     return _argv(
@@ -492,11 +508,13 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
         "--target", str(target), "--auto",
         *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
         *(["--relax-after", str(relax_after)] if relax_after > 0 else []),
-        *(["--per-region", str(per_region)] if per_region > 0 else []))
+        *(["--per-region", str(per_region)] if per_region > 0 else []),
+        *cap)
 
 
 def capture_pair_frame(*, cols: str, rows: str, square: str,
                        camera: str = "left",
+                       width: int = 0, height: int = 0, fps: int = 0,
                        dirs: dict | None = None) -> list[str]:
     """拍双板链式的**同框图**（pair）：单相机、不做单板检测、按空格存。
 
@@ -504,13 +522,22 @@ def capture_pair_frame(*, cols: str, rows: str, square: str,
     检测器检不了它，所以走 ``--pair`` 模式（2026-11-04 前这块只能让用户手动拍）。
     """
     d = dirs if dirs is not None else chain_dirs()
+    # 采集档与内参段保持一致：同一次标定的所有图应当同一口径（见
+    # `capture_chain_frames` 里那段说明）。0 = 不传，由 capture_board 用默认。
+    cap: list[str] = []
+    if width > 0:
+        cap += ["--width", str(width)]
+    if height > 0:
+        cap += ["--height", str(height)]
+    if fps > 0:
+        cap += ["--fps", str(fps)]
     return _argv(
         _TOOLS / "capture_board.py", "--out", str(d["pair"]),
         "--camera", str(camera or "left").strip() or "left",
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
         # 5 张同框图（2026-11-05 用户：单张有风险）。T_AB 只用其中一张，
         # 但多拍几张能在"哪张两板都检全"上留选择余地，也防单张糊掉。
-        "--target", "5", "--pair")
+        "--target", "5", "--pair", *cap)
 
 
 def check_chain_inputs(*, cols: str, rows: str, square: str,

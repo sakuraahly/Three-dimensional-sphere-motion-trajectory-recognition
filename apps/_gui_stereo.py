@@ -1148,6 +1148,33 @@ class StereoWindow(tk.Toplevel):
         board_base = {"cols": self.var_cols.get(), "rows": self.var_rows.get(),
                       "square": self.var_square.get()}
         left, right = self.var_left.get(), self.var_right.get()
+
+        # 采集档：拍标定图必须与之后录制**同一档**，否则标定的 capture_size
+        # 与录制请求对不上。更糟的是 `capture_board.py` 默认 2560x1440，而本机
+        # 实测双路同时开 2560 会让一路的 MSMF 会话失效（2026-11-05；1920x1080
+        # 则两台 15/15 帧稳定）—— 照默认拍一遍，之后录制必然失败。
+        # 优先级：装置档案 → 已有标定的 capture_size → 不传（用 capture_board 默认）。
+        cap_kw: dict[str, int] = {}
+        _prof = getattr(self.app.state, "profile", None)
+        for _key in ("width", "height", "fps"):
+            _val = getattr(_prof, _key, None)
+            if isinstance(_val, int) and _val > 0:
+                cap_kw[_key] = _val
+        if "width" not in cap_kw or "height" not in cap_kw:
+            try:
+                from apps._common import calib_capture_size
+                from stereo.profiles import resolve_calibration_base
+                _cs = calib_capture_size(resolve_calibration_base())
+            except Exception:                            # noqa: BLE001
+                _cs = None
+            if _cs:
+                cap_kw.setdefault("width", int(_cs[0]))
+                cap_kw.setdefault("height", int(_cs[1]))
+        if "width" not in cap_kw or "height" not in cap_kw:
+            # 宽高必须成对：只有一个传下去会让 capture_board 用「宽 x 它自己的默认高」
+            cap_kw.pop("width", None)
+            cap_kw.pop("height", None)
+
         d = chain_dirs()
         for p in d.values():
             p.mkdir(parents=True, exist_ok=True)
@@ -1170,14 +1197,14 @@ class StereoWindow(tk.Toplevel):
                  capture_chain_frames(stage="left", left=left, right=right,
                                       target="999", min_cover=5,
                                       relax_after=relax_after, per_region=3,
-                                      **board_base)),
+                                      **board_base, **cap_kw)),
                 ("双板·拍 B 板（右相机，板可移动）",
                  capture_chain_frames(stage="dual_b", left=left, right=right,
                                       target="999", min_cover=5,
                                       relax_after=relax_after, per_region=3,
-                                      **board_base)),
+                                      **board_base, **cap_kw)),
                 ("双板·拍同框图 5 张（左相机，两板同时入画，不检板）",
-                 capture_pair_frame(camera=left, **board_base)),
+                 capture_pair_frame(camera=left, **board_base, **cap_kw)),
             ]
         else:
             steps = [
@@ -1185,15 +1212,15 @@ class StereoWindow(tk.Toplevel):
                  capture_chain_frames(stage="left", left=left, right=right,
                                       target="999", min_cover=5,
                                       relax_after=relax_after, per_region=3,
-                                      **board_base)),
+                                      **board_base, **cap_kw)),
                 ("内参段·右（板可移动，多姿态）",
                  capture_chain_frames(stage="right", left=left, right=right,
                                       target="999", min_cover=5,
                                       relax_after=relax_after, per_region=3,
-                                      **board_base)),
+                                      **board_base, **cap_kw)),
                 ("参考段（板**固定不动**，左右成对拍）",
                  capture_chain_frames(stage="ref", left=left, right=right,
-                                      target="3", **board_base)),
+                                      target="3", **board_base, **cap_kw)),
             ]
         self._chain_step = 0
 
