@@ -659,6 +659,16 @@ class HubWindow(tk.Toplevel):
         （``probe`` 逐后端×逐编号实测），重画一遍只会分叉。
         ``identify`` 是交互式的，会自己开 cv2 窗口让人逐个确认。
         """
+        # 防重复启动（2026-11-05）：相机是**独占**资源，同一台不能被两个进程同时
+        # 打开。aoni 那台在 MSMF 下要 ~23 秒才给第一帧，用户等不到窗口很容易再点
+        # 一次 —— 两个 identify 抢同一台，都会卡在"打开中"，表现就是越点越卡。
+        for _t in self.app.tasks.running():
+            if "相机设备管理" in (getattr(_t, "title", "") or ""):
+                self.status.set_status(
+                    "相机管理已经在跑着了：它正在逐台打开相机（aoni 那台约 23 秒/台）。"
+                    "再点一次会起第二个进程抢同一台相机，反而更卡。"
+                    "看「任务」面板里的日志；要放弃就点「中断选中」", "warn")
+                return
         self.app.tasks.start(
             _actions.cameras(),
             "相机设备管理")

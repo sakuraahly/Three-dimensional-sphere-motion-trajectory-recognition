@@ -338,7 +338,48 @@ def _open_preview_interruptible(index: int, backend: int, *, enumerated: bool = 
 
     th = threading.Thread(target=_worker, daemon=True)
     th.start()
+
+    # ⚠️ 等首帧期间必须**看得见在动**（2026-11-05 用户报 aoni 卡顿/无响应）。
+    # aoni 在 MSMF 下要 ~23 秒才给第一帧，而这段时间 `_preview_and_assign` 的
+    # 预览窗口还没建 —— 屏幕上什么都不变，Windows 也会把没有消息循环的进程
+    # 标成"未响应"。这里先开一个自己的进度窗，把"已等几秒 / 最多几秒"画出来。
+    # 没有图形环境时静默降级（纯终端照样能跑，只是没有这个窗）。
+    wait_win = f"正在打开 #{index}…（Esc / s 跳过）"
+    have_wait_win = False
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        _cv2.namedWindow(wait_win, _cv2.WINDOW_NORMAL)
+        _cv2.resizeWindow(wait_win, 620, 190)
+        have_wait_win = True
+    except Exception:                                    # noqa: BLE001
+        have_wait_win = False
+    _wait_budget = timeout_s if timeout_s else PREVIEW_BUDGET_S
+    _wait_t0 = time.perf_counter()
+
+    def _paint_wait() -> bool:
+        """画一帧进度；返回 False 表示这窗口已经不能用了（调用方据此停手）。"""
+        if not have_wait_win:
+            return False
+        el = time.perf_counter() - _wait_t0
+        canvas = _np.full((190, 620, 3), 45, _np.uint8)
+        _cv2.putText(canvas, f"opening #{index} ... {el:.0f}s / max "
+                             f"{_wait_budget:.0f}s",
+                     (22, 78), _cv2.FONT_HERSHEY_SIMPLEX, 0.85,
+                     (80, 220, 120), 2, _cv2.LINE_AA)
+        _cv2.putText(canvas, "Esc / s = skip this camera",
+                     (22, 126), _cv2.FONT_HERSHEY_SIMPLEX, 0.66,
+                     (200, 200, 200), 1, _cv2.LINE_AA)
+        try:
+            _cv2.imshow(wait_win, canvas)
+            _cv2.waitKey(1)
+            return True
+        except _cv2.error:
+            return False
+
     while not box["done"]:
+        if not _paint_wait():
+            have_wait_win = False
         k = key_poll()
         if k in (27, ord("s"), ord("S")):
             with lock:
@@ -353,8 +394,20 @@ def _open_preview_interruptible(index: int, backend: int, *, enumerated: bool = 
                 skipped_out.append(index)
             print(f"  ⏭ 已跳过 #{index}（后台仍在尝试打开；一旦打开会自动释放）",
                   flush=True)
+            if have_wait_win:
+                try:
+                    import cv2 as _cv2
+                    _cv2.destroyWindow(wait_win)
+                except Exception:                        # noqa: BLE001
+                    pass
             return None, None
         th.join(timeout=0.05)
+    if have_wait_win:
+        try:
+            import cv2 as _cv2
+            _cv2.destroyWindow(wait_win)
+        except Exception:                                # noqa: BLE001
+            pass
     return box["src"], box["bname"]
 
 
@@ -558,10 +611,34 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
             # 画面冻在最后一帧、按键也没有反馈，用户看到的就是"卡死了"，
             # 只能去关整个窗口。**这正是"启动器卡死"报告的一个来源。**
             miss = 0
+            # 卡顿要能**被说清楚**（2026-11-05 用户报 aoni 打开后卡/无响应）：
+            # 单次读帧耗时和实际 fps 是两个不同的证据 —— 前者说明"某次卡住了"
+            # （MSMF 下某些相机常见），后者说明"一直慢"。只报一个都会误导。
+            _read_t0 = time.perf_counter()
+            _fps_n = 0
+            _slow_warned = False
+            _fps_warned = False
             while True:
+                _t_read = time.perf_counter()
                 ok, frame, _t = src.read()
+                _dt_read = time.perf_counter() - _t_read
+                if _dt_read > 3.0 and not _slow_warned:
+                    _slow_warned = True
+                    print(f"  ⚠ #{index} 这次读帧用了 {_dt_read:.1f} 秒 —— 相机出帧在卡。"
+                          f"先看是不是被别的程序（QQ/会议/浏览器）占着；"
+                          f"若要录制请换后端试（dshow 索引顺序与系统不一致，识别会错位）",
+                          flush=True)
                 if ok and frame is not None:
                     miss = 0
+                    _fps_n += 1
+                    if _fps_n == 60 and not _fps_warned:
+                        _el = time.perf_counter() - _read_t0
+                        _fps = _fps_n / _el if _el > 0 else 0.0
+                        if _fps < 8.0:
+                            _fps_warned = True
+                            print(f"  ⚠ #{index} 实际只有 {_fps:.1f} fps（这台出帧慢）。"
+                                  f"认它是哪台不受影响，但**别拿这台做录制**",
+                                  flush=True)
                     import cv2
                     # ⚠️ **显示前先降采样**（2026-10-18，用户反馈"画面依然很卡顿"）。
                     #
