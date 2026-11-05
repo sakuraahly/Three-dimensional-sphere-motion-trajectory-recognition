@@ -275,9 +275,12 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                            and abs(v.ax.elev - el_before) < 1e-6
                            and abs(v.ax.azim - az_before) < 1e-6))
             # 右键 = 平移（2026-11-05 用户："假设观察者是一个人，右键不是转动
-            # 视角，而是人前后左右的走"）。中键保留平移，缩放只归滚轮。
-            checks.append(("三键映射：左键旋转、右/中键平移、右键不缩放",
-                           v.ax._rotate_btn == [1] and v.ax._pan_btn == [2, 3]
+            # 视角，而是人前后左右的走"）。但**不能交给原生 `_pan_btn`** ——
+            # `drag_pan` 无边界，拖两下轨迹就跑出画布。平移改由
+            # `_on_press/_on_motion` 接管（带 `_clamp_pan`），所以这里断言
+            # 原生 pan 列表为空、缩放也不抢键位。
+            checks.append(("三键映射：左键旋转、平移自己接管、右键不缩放",
+                           v.ax._rotate_btn == [1] and v.ax._pan_btn == []
                            and v.ax._zoom_btn == []))
 
             # 主图铺满画布（2026-11-05 用户："全屏不是让窗口全屏，而是让坐标轴
@@ -301,6 +304,40 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
             v._apply_layout()
             checks.append(("切回默认 -> 重新铺满",
                            v.ax.get_position().bounds[2] > 0.95))
+
+            # 真实采样点 + 点击查坐标（2026-11-05 用户："在曲线上增加我们的
+            # 拍摄的真实采样点，点击这些点就可以看到我们的三维坐标值"）
+            from apps.view_3d import PAN_MARGIN, PICK_RADIUS_PX
+
+            # 先重画一次让缓存与当前范围一致（上面 `_zoom_around` 改过 lims），
+            # 再拍快照 —— `_pick_at` 内部会 `_redraw` 并按新范围重算 `_pt_px`，
+            # 拿重算后的坐标去比旧点击位置会假失败。
+            v._redraw()
+            v.canvas.draw()
+            checks.append(("采样点投影缓存 = 真实轨迹点数",
+                           v._pt_px is not None
+                           and len(v._pt_px) == len(v.P_raw)))
+            _snap = v._pt_px.copy()
+            _mid = len(_snap) // 2         # 这个用例只有 9 个点，不能写死下标
+            _px, _py = float(_snap[_mid][0]), float(_snap[_mid][1])
+            v._pick_at(_px + 1.0, _py - 1.0)          # 故意偏 1px
+            _i = v.sel_idx
+            _ok = _i is not None and (
+                ((_snap[_i][0] - _px) ** 2 + (_snap[_i][1] - _py) ** 2) ** 0.5
+                <= PICK_RADIUS_PX)
+            checks.append(("点中采样点 -> 选中它（偏 1px 仍命中）", _ok))
+            v._pick_at(-9999.0, -9999.0)
+            checks.append(("点空白 -> 取消选中", v.sel_idx is None))
+
+            # 平移必须有边界。原生 `drag_pan` 直接改三轴 lim 且无 clamp，
+            # 拖两下轨迹就整体跑出画布（用户截图："线超出被挡住"）。
+            v.ax.set_xlim(v.hi[0] + 9.0,
+                          v.hi[0] + 9.0 + (v.hi[0] - v.lo[0]))
+            v._clamp_pan()
+            _c = sum(v.ax.get_xlim()) / 2.0
+            checks.append(("平移被夹在数据附近（不会把轨迹拖出画布）",
+                           _c <= v.hi[0] + PAN_MARGIN * (v.hi[0] - v.lo[0])
+                           + 1e-9))
 
             # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
             # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线

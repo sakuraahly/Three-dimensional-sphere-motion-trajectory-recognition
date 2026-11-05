@@ -42,6 +42,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from mpl_toolkits.mplot3d import proj3d
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image, ImageTk
@@ -180,6 +181,25 @@ ZOOM_STEP = 0.85
 #: 居中**，四周留白由投影包围盒决定，只能靠 zoom 放大（2026-11-05 用户：
 #: "做成可以占据全局大小的，不然图片中的 Y 方向实在是比例奇怪"）。
 DEFAULT_BOX_ZOOM = 1.0
+
+#: 右键/中键拖动时，视野中心最多可以走出数据范围多少（占数据跨度的比例）。
+#:
+#: mplot3d 原生 pan **没有任何边界** —— `drag_pan()` 结尾是
+#: `self._set_lims_from_transformed(min+dx, max+dx, ...)`，它改的是**三轴范围**
+#: 而不是相机位置，也没有 clamp。拖两下就能把整条轨迹推出画布，屏幕上只剩
+#: 几根网格线（2026-11-05 用户截图："线超出被挡住"）。留 0.5 表示最多走半个
+#: 数据跨度，保证轨迹始终有一部分在画面里。
+PAN_MARGIN = 0.5
+
+#: 点击拾取半径（像素）。252 个采样点投影后彼此很近 —— 8px 太挤（选不中）、
+#: 20px 容易选到隔壁邻居，12px 实测最顺手。
+PICK_RADIUS_PX = 12.0
+
+#: 采样点大小（pt²）与颜色。必须小：252 个点按原尺寸画会糊成一条粗带，
+#: 反而看不出"这是逐帧采到的点"。
+SAMPLE_DOT_SIZE = 7.0
+SAMPLE_DOT_COLOR = "#2563eb"
+SAMPLE_DOT_ALPHA = 0.75
 
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
@@ -405,6 +425,14 @@ class Viewer3D:
         # 整幅缩放（`set_box_aspect(zoom=)`）：数据、网格、刻度一起放大。
         # 与 `lims` 是两套东西 —— lims 改"看哪一段"，zoom 改"这一幅画多大"。
         self.box_zoom: float = DEFAULT_BOX_ZOOM
+        # 选中的采样点下标（None = 没选）。点击拾取见 `_pick_at`。
+        self.sel_idx: int | None = None
+        # 采样点的屏幕像素坐标缓存（`_cache_point_px`）。点击时只做距离比较，
+        # 不重投影 —— 每次点击都算 252 个点会有肉眼可见的卡顿。
+        self._pt_px: "np.ndarray | None" = None
+        self._press_px: tuple[int, int] | None = None
+        self._pan_active: bool = False
+        self._pan_button: int = 3
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -566,6 +594,12 @@ class Viewer3D:
         # 窗口拉伸会改 figure 的物理尺寸，"保持比例"模式的方形边长得重算；
         # 铺满模式虽然恒为 [0,0,1,.96]，重算一次也无害（幂等）。
         self.canvas.mpl_connect("resize_event", lambda _e: self._apply_layout())
+        # 平移/拾取自己接管：原生 pan 没有边界（见 `_on_motion` 的说明），
+        # 原生 3D pick 也不可靠（`picker` 在 3D 里基本不触发），所以都走
+        # press/motion/release 三个事件自己实现。
+        self.canvas.mpl_connect("button_press_event", self._on_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
 
         # 右下角：视角 / 参考平面。
         side = ttk.LabelFrame(bottom, text="视角 / 参考平面", padding=(10, 8))
@@ -852,8 +886,145 @@ class Viewer3D:
         # 跟着鼠标在屏幕平面里移动，看起来就是人朝那个方向走。
         # 左键仍是旋转，中键也保留平移（老习惯），缩放只归滚轮。
         self.ax._rotate_btn = [1]
-        self.ax._pan_btn = [2, 3]
+        # 原生 pan（`_pan_btn`）**不能用**：`drag_pan()` 改的是三轴 lim 且完全
+        # 没有边界，拖两下轨迹就整体跑出画布（2026-11-05 用户截图）。
+        # 改由 `_on_press/_on_motion` 手动调 `drag_pan` 并立刻 `_clamp_pan`。
+        self.ax._pan_btn = []
         self.ax._zoom_btn = []
+
+    # ── 鼠标：平移（有边界）/ 点选采样点 ────────────────────────────────
+    def _on_press(self, event) -> None:
+        """记下按下位置；右/中键在**主 3D 轴内**按下则开始平移。"""
+        self._press_px = (event.x, event.y) if event.x is not None else None
+        if event.inaxes is not self.ax or event.button not in (2, 3):
+            self._pan_active = False
+            return
+        self._pan_active = True
+        self._pan_button = int(event.button)
+        try:
+            self.ax.start_pan(event.x, event.y, event.button)
+        except Exception:                       # noqa: BLE001
+            self._pan_active = False
+
+    def _on_motion(self, event) -> None:
+        """拖动 = 平移视野，每次移动后立刻夹回数据附近。"""
+        if not self._pan_active or event.x is None:
+            return
+        try:
+            self.ax.drag_pan(self._pan_button, event.key, event.x, event.y)
+        except Exception:                       # noqa: BLE001
+            return
+        self._clamp_pan()
+        self.canvas.draw_idle()
+
+    def _on_release(self, event) -> None:
+        """松开：结束平移；左键**没拖动**才算点击（拖动是在转视角）。"""
+        was_pan = self._pan_active
+        self._pan_active = False
+        if event.button != 1 or event.inaxes is not self.ax or was_pan:
+            return
+        if self._press_px is None or event.x is None:
+            return
+        # 4px 容差：手抖一两像素仍算点击，超过就是旋转手势
+        if (abs(event.x - self._press_px[0]) > 4
+                or abs(event.y - self._press_px[1]) > 4):
+            return
+        self._pick_at(event.x, event.y)
+
+    def _clamp_pan(self) -> None:
+        """把平移后的三轴范围夹回数据附近，防止把轨迹整体推出画布。
+
+        `drag_pan` 的语义是**平移数据窗口**（改 lim，不是改相机），所以它没有
+        任何边界。这里只限制**视野中心**不超出 `数据范围 ± PAN_MARGIN × 跨度`，
+        窗口大小（缩放）不动 —— 用户"往前走"的手感保留，但走不丢。
+        """
+        for i, (getter, setter) in enumerate((
+                (self.ax.get_xlim, self.ax.set_xlim),
+                (self.ax.get_ylim, self.ax.set_ylim),
+                (self.ax.get_zlim, self.ax.set_zlim))):
+            a, b = getter()
+            span = b - a
+            if span <= 0:
+                continue
+            dspan = max(1e-9, float(self.hi[i] - self.lo[i]))
+            center = (a + b) / 2.0
+            c_lo = float(self.lo[i]) - PAN_MARGIN * dspan
+            c_hi = float(self.hi[i]) + PAN_MARGIN * dspan
+            fixed = min(max(center, c_lo), c_hi)
+            if abs(fixed - center) > 1e-12:
+                setter(fixed - span / 2.0, fixed + span / 2.0)
+
+    def _cache_point_px(self) -> None:
+        """把每个采样点投影到屏幕像素，缓存起来给点击拾取用。
+
+        用 `proj3d.proj_transform` + `ax.transData` —— 这正是 mplot3d 自己把
+        3D 点画到屏幕的同一套变换（实测与渲染像素误差 0.3 px，见 2026-11-05
+        的验证）。不要在点击时现算：252 个点每次重投影会有可感的卡顿。
+        """
+        if self.P_raw is None or not len(self.P_raw):
+            self._pt_px = None
+            return
+        try:
+            M = self.ax.get_proj()
+            x2, y2, _ = proj3d.proj_transform(
+                self.P_raw[:, 0], self.P_raw[:, 1], self.P_raw[:, 2], M)
+            self._pt_px = self.ax.transData.transform(
+                np.column_stack([x2, y2]))
+            # 记下当时的画布尺寸：窗口一拉，`transData` 就变了，缓存全作废。
+            # 只靠 `resize_event` 不够（它触发时 transData 还没更新），
+            # 所以在 `_pick_at` 里按 bbox 比对一次，最稳。
+            self._pt_px_box = tuple(self.ax.bbox.bounds)
+        except Exception:                       # noqa: BLE001
+            self._pt_px = None                  # 拾取静默失效，不影响看图
+            self._pt_px_box = None
+
+    def _pick_at(self, x: float, y: float) -> None:
+        """选中离 (x, y) 最近的采样点；点空处 = 取消选中。"""
+        # 画布尺寸变了（用户拉过窗口 / 切过「保持立方体比例」）→ 缓存作废。
+        # 不重算的话，点击会按上一个尺寸的位置命中，偏出去几十像素。
+        if (self._pt_px is None
+                or getattr(self, "_pt_px_box", None)
+                != tuple(self.ax.bbox.bounds)):
+            self._cache_point_px()
+        if self._pt_px is None or not len(self._pt_px):
+            return
+        d = np.hypot(self._pt_px[:, 0] - x, self._pt_px[:, 1] - y)
+        i = int(np.argmin(d))
+        if not np.isfinite(d[i]) or d[i] > PICK_RADIUS_PX:
+            if self.sel_idx is not None:
+                self.sel_idx = None
+                self._redraw()
+            return
+        self.sel_idx = i
+        self._redraw()
+
+    def _draw_selection(self) -> None:
+        """把选中的采样点圈出来，并在左上角写出它的三维坐标。"""
+        i = self.sel_idx
+        if i is None or not (0 <= i < len(self.P_raw)):
+            return
+        q = self.P_raw[i]
+        self.ax.scatter([q[0]], [q[1]], [q[2]], s=70, facecolors="none",
+                        edgecolors="#dc2626", linewidths=1.6,
+                        depthshade=False, zorder=20)
+        meta = self.points[i] if i < len(self.points) else {}
+        head = f"#{i}"
+        if meta.get("frame") is not None:
+            head = f"frame {meta['frame']}"
+        t = meta.get("t")
+        if isinstance(t, (int, float)):
+            head += f"  t={float(t):.3f}s"
+        body = (f"{head}\n"
+                f"X = {q[0]:+.4f} m\n"
+                f"Y = {q[1]:+.4f} m\n"
+                f"Z = {q[2]:+.4f} m")
+        # `text2D` 用 axes 坐标，旋转/缩放都不会跟着跑；`text` 会跟着 3D 点飞。
+        self.ax.text2D(
+            0.012, 0.985, body, transform=self.ax.transAxes,
+            fontsize=9, va="top", family="monospace", color="#111827",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                      edgecolor="#dc2626", alpha=0.94),
+            zorder=21)
 
     def _apply_view(self) -> None:
         """把 ``self.view`` 与投影方式应用到 ax。
@@ -1275,6 +1446,15 @@ class Viewer3D:
         self.ax.plot(xs, ys, zs, color="#93c5fd", linewidth=1.2, alpha=0.8, label="trajectory")
         k = min(self.idx + 1, self.n)
         self.ax.plot(xs[:k], ys[:k], zs[:k], color="#2563eb", linewidth=2.0, label="trail")
+        # 真实采样点：`trajectory` 里的每个点就是一次 matched 的帧
+        # （252 个 matched 帧逐点对应，不是插值出来的）。画成小点，让人看出
+        # "线是这些实测点连起来的"；点太小会看不见，太大会糊成一条粗带，
+        # 7pt² 在 252 点的密度下刚好是"一串珠子"（2026-11-05 用户要求）。
+        # **始终用 P_raw**：勾了平滑时线是平滑的，但采样点仍该是实测位置。
+        self.ax.scatter(self.P_raw[:, 0], self.P_raw[:, 1], self.P_raw[:, 2],
+                        s=SAMPLE_DOT_SIZE, c=SAMPLE_DOT_COLOR,
+                        alpha=SAMPLE_DOT_ALPHA, depthshade=False,
+                        edgecolors="none", label="samples")
         cur = self.points[self.idx]
         self.ax.scatter([cur["xyz"][0]], [cur["xyz"][1]], [cur["xyz"][2]],
                         color="#f97316", s=80, depthshade=False, label="ball")
@@ -1299,6 +1479,10 @@ class Viewer3D:
         self._apply_box()          # 比例 + 整幅缩放（重画后 zoom 不能丢）
         self._draw_planes()
         self._apply_view()
+        # 拾取缓存必须在 `_apply_view()` **之后** —— 视角变了投影就变了，
+        # 先算会得到上一帧的位置，点哪都选不中。
+        self._cache_point_px()
+        self._draw_selection()
         self._redraw_inset()
         self.canvas.draw_idle()
         self._update_video()
