@@ -1,184 +1,96 @@
 # ==========================================================================
-# 球形物体三维运动轨迹识别 —— 忽略规则
+# 发布白名单 —— 只放行「源代码 + 运行必需物」，其余一律不进版本库 / 纯净包
 #
-# 原则：只忽略"能重新生成的"和"体积大的二进制"。
-# 源码、文档、标定板、参考论文一律入库。
+# 2026-11-05：最终要打包发送一个**纯净版本**，里面只有源码和运行必须物，
+# 实验数据、测试结果、日志、诊断报告、文档史料、模型权重、素材全部没有。
+# 所以从"逐条黑名单"换成"默认全忽略 + 显式放行"：
+#   漏写一条 = 少带一个文件（当场能发现）
+#   漏写黑名单 = 多带 4.6 GB 数据（推上去才发现）
+#
+# ⚠️ 三个必须知道的点：
+#  1. `.gitignore` 只管**未跟踪**文件。已经入库的 docs/、legacy/ 等 60 多份
+#     文档不会因此消失；要让 `git archive HEAD` 也纯净，得执行
+#     `git rm -r --cached`（只移出索引，**不删本地文件**）。
+#     日常打包请用 `python apps/tools/make_clean_bundle.py` —— 它按同一份
+#     白名单从工作区复制，不依赖 git 索引，产出的就是纯净 zip。
+#  2. 这里写的是「不进版本库」，**不是「可以删」**。data/ 下的实验采集、
+#     outputs/ 下的标定结果与诊断结论删了就没了，本机一律保留。
+#     `.workbuddy/` 是项目相关数据、不是临时缓存，任何时候都不要删。
+#  3. gitignore 白名单的坑：**父目录被忽略时，子文件写再多 `!` 也不生效**。
+#     所以每个放行的目录下都要 `!/目录/**/` 再把子目录放出来。
+#     新增放行项后跑一遍 `python apps/tools/make_clean_bundle.py --check`。
 # ==========================================================================
 
-# ---------- Python ----------
-__pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-.venv/
-venv/
-env/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-build/
-dist/
+# ---------- 根目录：默认全部不放行，只留以下必需文件 ----------
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/requirements.txt
+!/requirements-ai.txt
+!/environment.yml
+!/启动程序.py
+!/启动程序_命令行.py
+!/启动程序.bat
 
-# ---------- 编辑器 / IDE ----------
-.vscode/*
-!.vscode/settings.json
-!.vscode/extensions.json
-.idea/
-*.iml
-*.swp
-*.swo
-*~
+# ---------- 源码目录：只收 .py ----------
+!/apps/
+/apps/**
+!/apps/**/
+!/apps/**/*.py
 
-# ---------- 操作系统 ----------
-.DS_Store
-Thumbs.db
-desktop.ini
-$RECYCLE.BIN/
+!/sphere_tracker/
+/sphere_tracker/**
+!/sphere_tracker/**/
+!/sphere_tracker/**/*.py
 
-# ---------- Office 锁文件 ----------
-# 打开 .pptx / .docx / .xlsx 时 Office 会在同目录生成 ~$ 开头的隐藏锁文件，
-# 关闭文档后自动消失（异常退出会残留）。它不属于内容，也会挡住 git add。
-~$*
+!/stereo/
+/stereo/**
+!/stereo/**/
+!/stereo/**/*.py
 
-# ---------- 手工改稿的临时备份 ----------
-# 用脚本改 pptx 前会自动留一份"改前备份"，方便对比/回退。
-# 注意：交付物（开题报告等）不放仓库，见 docs/文件结构.md「五条放置规则」第 4 条。
-# 这条规则保留是为了将来再有就地改稿时兜底。
-*_改前备份.pptx
+!/calib/
+/calib/**
+!/calib/**/
+!/calib/**/*.py
 
-# ---------- 运行产物 ----------
-# outputs/ 里全是可再生的东西：标注视频、逐帧 PNG、轨迹 CSV、调试掩膜、临时脚本。
-# 跑一次 tests/selftest_*.py 或 apps/run_video.py 就会重新生成。
-# （历史上 output_edges.avi 曾误提交，单文件 141 MB，把 .git 撑到 119 MB，
-#   所以这里明确忽略。）
-outputs/
+!/tests/
+/tests/**
+!/tests/**/
+!/tests/**/*.py
 
-# ---------- 运行日志 ----------
-# 2026-11-04 起日志不再待在 outputs/ 里，而是与 data/ config/ 平级的 logs/：
-#   logs/<来源>/<时间片>/    来源 = tasks|calib|capture|realtime|misc
-# 日志跟 outputs/ 的区别：outputs/ 删了全部可再生，日志是**出问题后唯一能回看
-# 的东西**（"上次标定为什么只收了 8 对"）。所以它单独放、单独忽略、单独清理。
-# 结构由 sphere_tracker/paths.py 的 log_dir() 决定，别在别处硬编码路径。
-/logs/
+# ---------- 运行必需的静态资源 ----------
+# 标定板：拍标定图必须打印出来，属于运行必需物（不是"素材"）。
+!/assets/
+/assets/**
+!/assets/boards/
+!/assets/boards/*.png
+!/assets/boards/*.pdf
 
-# ---------- 本机标定结果 ----------
-# config/ 里是"这台相机 + 这个机位"相关的参数：
-#   camera_modes.json        相机模式探测缓存（换相机/换 USB 口就失效）
-#   stereo_calibration.*     双目标定结果（挪动相机就要重标）
-# 换机器就得重标，所以**整个目录都不入库**。
+# 空目录占位 + 放置说明：告诉拿到包的人素材/模型/数据该放哪。
+!/assets/videos/
+/assets/videos/**
+!/assets/videos/README.md
+!/models/
+/models/**
+!/models/README.md
+!/data/
+/data/**
+!/data/README.md
+!/config/
+/config/**
+!/config/.gitkeep
+
+# ---------- 明确不放行（列出来是为了一眼看清边界） ----------
+#   docs/            60 份：手册、计划/交接、决策记录、SBOM、史料
+#   legacy/          旧架构脚本
+#   AGENTS.md        项目协作规范（开发期用，不是运行必需）
+#   .github/ .githooks/ .vscode/    CI / 钩子 / 编辑器配置
+#   assets/images/   示例图（test.jpg）
+#   outputs/ logs/ data/stereo/ data/mono/ data/_trash/ ...  产物与实验采集
+#   config/*.json *.npz   本机标定结果（换机器要重标）
+#   *.pt *.onnx *.mp4 *.mkv *.npy ...   大二进制 / 权重 / 视频
+#   .workbuddy/      agent 会话数据（只忽略，绝不删）
 #
-# 为什么是 `config/*` 而不是逐个扩展名：
-#   原来写的是 `config/*.json` + `config/*.npz`，结果备份文件
-#   `cameras.json.bak-20261010-135226`（扩展名是 .bak-…，不是 .json）
-#   漏网被误提交。**按扩展名白名单去忽略一个"整目录都是产物"的目录，
-#   迟早漏掉下一个后缀**，所以改成忽略整目录。
-#
-# 想留一个空目录在仓库里（新克隆时目录已存在），用 .gitkeep；
-# 想存档某次标定结果，把文件拷到 docs/ 并在那里入库，别在这里开例外。
-config/*
-!config/.gitkeep
-
-# ---------- 模型权重 ----------
-# 推理权重（models/yolo11n.pt、models/sam2.1_t.pt、*.onnx…）都是可下载的二进制，
-# 动辄几 MB 到几 GB，不进版本库；首次运行时由 ultralytics 自动下载，
-# 或用 README 第六节的镜像命令手动放到 models/ 目录。
-*.pt
-*.pth
-# 训练报告是本地产物（含本机绝对路径），只作证据留在本地
-models/*.report.json
-models/*.conf.json
-*.onnx
-
-# ---------- 自己录制的素材 ----------
-# assets/videos/ 放的是待处理视频（几百 MB 起步），不入库，只保留目录说明。
-assets/videos/*
-!assets/videos/README.md
-
-# ---------- 真机录制会话 ----------
-# data/ 与 outputs/ 的区别：outputs/ 删了能重跑，data/ 删了就没了。
-# 一次采集 = 一个目录（两路无损视频 + session.json + 标定快照），体积大、不可再生。
-# 只保留 README；会话必须单独备份（外部硬盘 / 网盘），不要指望 git。
-data/sessions/*
-# 2026-10-30：双目会话搬到 data/stereo/（与 data/mono/ 对称）；旧目录仍会读
-data/stereo/*
-data/raw/*
-data/calib_pairs/*
-data/calib/*
-# 单目会话（2026-10-29 起）：data/mono/<时间戳>/clip.mkv + session.json + derived/
-# 漏这条的后果不是"多几个未跟踪文件"：HuffYUV 1920x1080 约 82 MB/s，10 秒 ≈ 800 MB，
-# 一次 `git add -A` 就能把几百 MB 无损视频塞进仓库，而且再也拿不出来。
-data/mono/*
-
-# ==========================================================================
-# 2026-11-05 补充：程序**正常跑一遍就会自动产生**的产物，一律不入库
-#
-# 上面那些规则是照"当时见到的目录"逐条加的，实测漏了三类：
-#   ① 后来新增的目录：data/_trash/（清理器的回收站）、根级 test_results/；
-#   ② 不在 logs/ 里的日志：apps/tools/xxx.log、calib/xxx.log；
-#   ③ 本机 agent 的工作目录 .workbuddy/（当时唯一还挂在 `??` 上的条目）。
-# 所以下面按**类别**兜底，不再跟着新目录名一条条追。
-#
-# 原则不变：这里写的是「不进版本库」，**不是「可以删」**。
-# data/ 下的实验采集、outputs/ 下的标定结果与诊断结论删了就没了；
-# 2026-11-05 逐项核对过 53 个候选目录，口径见 docs/用户手册.md §14。
-# ==========================================================================
-
-# ---------- 本机 agent 工作目录（只忽略，绝不删除） ----------
-# WorkBuddy 的会话记忆 / 工作日志 / 项目数据。它是**项目相关目录、不是临时缓存**，
-# 任何人任何时候都不该删它；只是每人一份、没法共享，不进版本库。
-.workbuddy/
-
-# ---------- 日志：不管落在哪 ----------
-# 原来只有 `/logs/`（仅根目录），程序在别处写 *.log 就漏网。
-**/logs/
-*.log
-*.log.*
-
-# ---------- 测试 / 覆盖率产物 ----------
-# 主结果在 outputs/test_results/（已被 outputs/ 覆盖）；这里挡的是
-# 工具或 IDE 在别处落地的同名目录、JUnit/覆盖率报告。
-test_results/
-**/test_results/
-junit.xml
-pytest.xml
-coverage.xml
-.coverage.*
-*.cover
-.tox/
-.nox/
-.hypothesis/
-
-# ---------- 实验数据 / 大二进制（按后缀兜底） ----------
-# 视频永远不入库；标定缓存、模型中间产物同理。
-# 注意 *.png / *.jpg **不能**全局忽略：assets/boards/ 的标定板是入库资产。
-*.avi
-*.mp4
-*.mkv
-*.mov
-*.wmv
-*.flv
-*.npy
-*.npz
-*.pkl
-*.joblib
-*.safetensors
-*.engine
-*.tflite
-*.bin
-
-# ---------- data/ 兜底：以后新冒出来的子目录自动不入库 ----------
-# 原来逐条列 sessions/stereo/raw/...，新增 `_trash/` 就漏了。
-# 整目录兜底 + 显式保留说明文件；上面那些具体规则保留作说明，不冲突。
-data/*
-!data/README.md
-
-# ---------- 临时文件 / 编辑器备份 ----------
-*.tmp
-*.temp
-*.bak
-*.bak-*
-*.orig
-*.rej
-*_改前备份.*
+# 旧版逐条黑名单（Python 缓存、日志、测试报告、各类后缀兜底…）已由上面的
+# 「默认全忽略」统一覆盖，不再重复。历史理由见 git 历史与 docs/用户手册.md §14。

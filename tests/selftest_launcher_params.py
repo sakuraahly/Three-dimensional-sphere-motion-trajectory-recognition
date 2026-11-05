@@ -2168,6 +2168,12 @@ def main() -> int:
         print(f"  [{'通过' if _passed else '不达标'}] {_name}")
         results.append((_name, _passed))
 
+    # ---- 纯净交付包 / 白名单式 gitignore（2026-11-05）----
+    print("----- 8h. 纯净交付包 ----")
+    for _name, _passed in _check_clean_bundle():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
@@ -2176,6 +2182,98 @@ def main() -> int:
             print(f"  · {n}")
     print("\n判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
+
+
+def _check_clean_bundle() -> list[tuple[str, bool]]:
+    """白名单式 .gitignore + 纯净交付包（2026-11-05）。
+
+    用户要"打包发送一个纯净版本，只有源代码和运行必须物，其他资产全部没有"。
+    守三件事：
+      1. 白名单规则真的按预期放行/忽略（用 `--no-index` 测规则本身，
+         不用它的话已跟踪文件一律不算忽略，docs/ 会假通过）；
+      2. `make_clean_bundle.collect()` 与 `.gitignore` 两份清单不漂移；
+      3. 实际生成的 zip 里没有禁入目录、大二进制，也没有个人标识。
+    """
+    import subprocess
+    import tempfile
+    import zipfile
+
+    checks: list[tuple[str, bool]] = []
+    root_dir = Path(__file__).resolve().parent
+    while not (root_dir / "apps").is_dir() and root_dir.parent != root_dir:
+        root_dir = root_dir.parent
+
+    def ignored(rel: str) -> bool:
+        return subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", rel],
+            cwd=str(root_dir), capture_output=True, check=False
+        ).returncode == 0
+
+    must_pass = ("apps/view_3d.py", "apps/tools/make_clean_bundle.py",
+                 "sphere_tracker/paths.py", "stereo/profiles.py",
+                 "calib/methods.py", "tests/selftest_entrypoints.py",
+                 "启动程序.py", "requirements.txt", "README.md",
+                 "assets/boards/chessboard_8x5_25mm_a4-landscape.png",
+                 "config/.gitkeep")
+    must_ignore = ("docs/用户手册.md", "legacy/README.md", "AGENTS.md",
+                   "assets/images/test.jpg", "config/profiles.json",
+                   "data/stereo/parallel/x/derived/visualization.json",
+                   "outputs/test_results/timings.json", "logs/tasks/x.log",
+                   ".workbuddy/memory/x.md", "docs/new_tool.py",
+                   "apps/tools/tmp_debug.log")
+    wrong_pass = [x for x in must_pass if ignored(x)]
+    wrong_ignore = [x for x in must_ignore if not ignored(x)]
+    checks.append((f"白名单放行源码/必需物（误拦 {wrong_pass[:2]}）",
+                   not wrong_pass))
+    checks.append((f"白名单拦住资产/产物（漏网 {wrong_ignore[:2]}）",
+                   not wrong_ignore))
+
+    from apps.tools import make_clean_bundle as m
+
+    files = m.collect()
+    rels = [f.relative_to(m.ROOT).as_posix() for f in files]
+    checks.append((f"收到合理数量的源文件（{len(files)} 个）", len(files) > 100))
+    checks.append(("纯净包内容校验无问题", not m.validate(files)))
+    checks.append(("两份白名单不漂移（gitignore 一致性）",
+                   not m.gitignore_conflicts(files)))
+
+    forbidden = ("docs/", "outputs/", "logs/", "legacy/", ".workbuddy/",
+                 "data/stereo/", "data/mono/", ".git/")
+    checks.append(("包内没有禁入目录",
+                   not any(r.startswith(forbidden) for r in rels)))
+    need = ("启动程序.py", "启动程序.bat", "启动程序_命令行.py",
+            "requirements.txt", "requirements-ai.txt", "environment.yml",
+            ".gitignore", "apps/view_3d.py", "sphere_tracker/paths.py",
+            "stereo/profiles.py", "calib/methods.py",
+            "assets/boards/chessboard_8x5_25mm_a4-landscape.png")
+    checks.append((f"运行必需物齐全（缺 {[n for n in need if n not in rels][:2]}）",
+                   all(n in rels for n in need)))
+
+    mini = [f.relative_to(m.ROOT).as_posix()
+            for f in m.collect(with_tests=False, with_assets=False)]
+    checks.append(("--no-tests --no-assets 生效（极简包）",
+                   not any(r.startswith(("tests/", "assets/")) for r in mini)
+                   and len(mini) < len(rels)))
+
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "clean.zip"
+        try:
+            m.build(files, out)
+            with zipfile.ZipFile(out) as z:
+                names = z.namelist()
+                bad_marks = []
+                for n in names:
+                    if (n.endswith((".py", ".md", ".txt", ".yml", ".bat"))
+                            or n in (".gitignore", ".gitattributes")):
+                        txt = z.read(n).decode("utf-8", "ignore")
+                        if any(mark in txt for mark in m.PRIVATE_MARKS):
+                            bad_marks.append(n)
+            checks.append(("zip 内容恰好等于白名单", names == rels))
+            checks.append((f"包内文本无个人标识（{bad_marks[:2]}）",
+                           not bad_marks))
+        except Exception as exc:                        # noqa: BLE001
+            checks.append((f"能生成 zip（异常：{exc}）", False))
+    return checks
 
 
 def _check_no_personal_info() -> list[tuple[str, bool]]:
@@ -2310,9 +2408,12 @@ def _check_cleanup_windows() -> list[tuple[str, bool]]:
         "calib/cache.npz",
         "assets/videos/clip.mp4",
         "gui_state.json.bak-20261105",
+        # 白名单式 gitignore **不放行 docs/**：文档史料不是运行必需物
+        # （2026-11-05 改白名单后，这条从"应可入库"挪到"应被忽略"）。
+        "docs/new.md",
     ]
     source = [
-        "apps/new_tool.py", "docs/new.md", "tests/selftest_new.py",
+        "apps/new_tool.py", "tests/selftest_new.py",
         "sphere_tracker/new_mod.py", "assets/boards/board.png",
         "data/README.md", "config/.gitkeep", "README.md",
     ]
@@ -2329,7 +2430,7 @@ def _check_cleanup_windows() -> list[tuple[str, bool]]:
         hurt = [x for x in source if x in ignored]
         checks.append((f"程序自动产物全部不进 git（漏 {len(miss)}：{miss[:2]}）",
                        not miss))
-        checks.append((f"源码/文档/资产没有被误忽略（误伤 {hurt[:2]}）",
+        checks.append((f"源码/运行必需资产没有被误忽略（误伤 {hurt[:2]}）",
                        not hurt))
     except Exception as exc:                            # noqa: BLE001
         checks.append((f"gitignore 能被校验（异常：{exc}）", False))
