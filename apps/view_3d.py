@@ -239,8 +239,12 @@ BEST_AZIM_STEP = 15
 #: 成一坨，根本读不出数（2026-11-05 实测踩到）。面积最大 ≠ 能看清。
 BEST_MAX_AXIS_DOT = 0.75
 
-#: 坐标极值面板的高度（像素），用于把"选中点信息"排在它下方。
-EXTREMES_PANEL_PX = 64
+#: 左上角信息面板的顶部位置（axes 坐标）。
+EXTREMES_TOP_Y = 0.985
+
+#: 极值面板高度的**兜底估算**（像素）。真正定位用 `get_window_extent()`
+#: 实测值，这个只在整个测量失败时用（比如 canvas 还没拿到 renderer）。
+EXTREMES_PANEL_PX = 72
 
 #: 三个坐标平面：名字 → (垂直的轴号, 颜色)。0/1/2 = X/Y/Z。
 PLANE_STYLES = {
@@ -1214,8 +1218,11 @@ class Viewer3D:
         # 字体必须能显示中文：`monospace`(DejaVu Sans Mono) 没有汉字，
         # 会渲染成一串方框并刷 UserWarning。用项目里已有的中文回退链，
         # 数字靠 `%+.4f` 的定宽格式对齐（比例字体的数字宽度本来就接近）。
-        self.ax.text2D(
-            0.012, 0.985, "\n".join(rows), transform=self.ax.transAxes,
+        # 存下 artist：选中面板要靠它的**实测高度**定位，不能再用常量估
+        # —— 实测面板高 67.9px，常量写的 64，一乘上窗口高度就撞在一起了
+        # （2026-11-05 用户截图：Z 那行被选中框盖住一半）。
+        self._ext_artist = self.ax.text2D(
+            0.012, EXTREMES_TOP_Y, "\n".join(rows), transform=self.ax.transAxes,
             fontsize=8.5, va="top", family=list(INSET_FONTS), color="#111827",
             linespacing=1.35,
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
@@ -1243,9 +1250,21 @@ class Viewer3D:
                 f"Y = {q[1]:+.4f} m\n"
                 f"Z = {q[2]:+.4f} m")
         # `text2D` 用 axes 坐标，旋转/缩放都不会跟着跑；`text` 会跟着 3D 点飞。
-        # 排在极值面板**下方**：按像素换算，窗口大小变了也不会重叠。
+        # 排在极值面板**下方**。两个坑都踩过（2026-11-05）：
+        # ① 基准要用面板顶部 `EXTREMES_TOP_Y`（0.985），不是 1.0 ——
+        #    差那 0.015 就是 10px，正好压住 Z 那一行；
+        # ② 面板高度要**实测**（`get_window_extent`），常量估不准：
+        #    实际 67.9px 而常量写 64，窗口越高重叠越明显。
         _h = max(1.0, float(self.ax.bbox.height))
-        _y = 1.0 - (EXTREMES_PANEL_PX + 10.0) / _h
+        _panel_h = float(EXTREMES_PANEL_PX)
+        _art = getattr(self, "_ext_artist", None)
+        if _art is not None:
+            try:
+                _panel_h = float(_art.get_window_extent(
+                    self.canvas.get_renderer()).height)
+            except Exception:                       # noqa: BLE001
+                pass                                # 量不到就退回常量
+        _y = EXTREMES_TOP_Y - (_panel_h + 8.0) / _h
         self.ax.text2D(
             0.012, _y, body, transform=self.ax.transAxes,
             fontsize=9, va="top", family="monospace", color="#111827",

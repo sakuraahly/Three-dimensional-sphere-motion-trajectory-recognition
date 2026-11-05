@@ -437,6 +437,27 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
             checks.append((f"帧步进：±delta 生效且夹在 [0, n-1]"
                            f"（{_b1}/{_b2}/{_b3}）", _b1 and _b2 and _b3))
 
+            # 左上角两个信息面板不能重叠（2026-11-05 用户截图：选中点的
+            # Z 那一行被「坐标极值」压掉一半）。根因是偏移用了 1.0 当基准
+            # （面板顶在 0.985）、且高度用常量估（实际 67.9 写成 64）。
+            v._redraw()
+            v.canvas.draw()
+            v._pick_at(*v._pt_px[len(v._pt_px) // 2])
+            v.canvas.draw()
+            _rr = v.canvas.get_renderer()
+            _ext_a = _sel_a = None
+            for _t in v.ax.texts:
+                _s = _t.get_text()
+                if "坐标极值" in _s:
+                    _ext_a = _t
+                elif "frame" in _s:
+                    _sel_a = _t
+            _no_overlap = (
+                _ext_a is not None and _sel_a is not None
+                and _ext_a.get_window_extent(_rr).y0
+                >= _sel_a.get_window_extent(_rr).y1)
+            checks.append(("左上角「坐标极值」与选中点信息不重叠", _no_overlap))
+
             # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
             # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线
             # 会把界面卡死。

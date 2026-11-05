@@ -330,8 +330,25 @@ class DataManager(tk.Tk):
 
         self.count_label = ttk.Label(right, text="", font=("Microsoft YaHei UI", 10, "bold"))
         self.count_label.pack(anchor="w", pady=(0, 6))
-        ttk.Label(right, text="状态：✓ 有3D   ◐ 已点选   ○ 已录制   ✗ 坏   — 空",
-                  foreground=MUTED, wraplength=310).pack(anchor="w", pady=(0, 6))
+        # 状态图例（2026-11-05 用户："数据管理的状态符号没有说明"）。
+        # 原来挤成一行 `✓ 有3D  ◐ 已点选  ○ 已录制  ✗ 坏  — 空`：
+        # ① 换行后第二行被面板高度裁掉，用户根本看不见完整的；
+        # ② 光列符号不解释，`◐ 已点选` 和 `○ 已录制` 差在哪看不出来。
+        # 现在把**推进顺序**写出来 —— 这三态是管线上的三个阶段，不是并列的
+        # 三种类型：录完只有视频 → 点完球心 → 跑完三维。箭头比逗号有用。
+        self.status_legend = ttk.Label(
+            right,
+            text="状态（→ 表示管线推进顺序）：\n"
+                 "○ 已录制（未点球心） → ◐ 已点选（未跑三维） → ✓ 有三维\n"
+                 "✗ 数据损坏（缺 session.json / 帧数为 0 / 左右差太多）\n"
+                 "— 空目录",
+            foreground=MUTED, justify="left", wraplength=230)
+        self.status_legend.pack(anchor="w", pady=(0, 6))
+        # 换行宽度**跟着面板走**，不能写死：右侧面板宽 251px、这段文字需要
+        # 311px，写死 wraplength 会被横向裁掉一截（用户看到的"说明不全"），
+        # 窗口拉宽了又白白折行。ttk.Label 不会自己收缩到父容器宽度，
+        # 只能由 `<Configure>` 告诉我们实际多宽。
+        right.bind("<Configure>", self._on_right_resize)
 
         cats = ttk.LabelFrame(right, text="导出类别", padding=8)
         cats.pack(fill="x", pady=(0, 8))
@@ -482,6 +499,24 @@ class DataManager(tk.Tk):
             return ""
         label = meta.get("label") if isinstance(meta, dict) else None
         return label if isinstance(label, str) else ""
+
+    def _on_right_resize(self, event) -> None:
+        """右侧面板宽度变了 -> 重设状态图例的换行宽度。
+
+        `ttk.Label` 不会自己收缩到父容器宽度：写死 `wraplength` 时，
+        面板 251px 而文字要 311px，右边那截直接被裁掉（用户看到的
+        "状态说明不全"）；窗口拉宽又白白折行。只能由 `<Configure>` 告诉
+        我们实际多宽，再回写换行宽度。
+        """
+        lab = getattr(self, "status_legend", None)
+        if lab is None:
+            return
+        wrap = max(150, int(event.width) - 20)
+        try:
+            if int(lab.cget("wraplength")) != wrap:
+                lab.configure(wraplength=wrap)
+        except Exception:                            # noqa: BLE001
+            pass
 
     def _refresh_count(self) -> None:
         chosen = [it for it in self.items if it.key in self.selected]
