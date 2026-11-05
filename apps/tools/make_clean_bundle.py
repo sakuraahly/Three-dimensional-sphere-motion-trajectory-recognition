@@ -3,6 +3,9 @@
 为什么需要它（2026-11-05）：最终要打包发送一个纯净版本，只有源码和运行
 必须物，实验数据、测试结果、日志、文档史料、模型权重、素材一律没有。
 
+纯净包**带公开文档**（README / 使用说明 / 算法解析），但不带内部史料
+（planbooks、交接文档、待办清单、论文 PDF）。
+
 `.gitignore` 已经改成**白名单式**，但它只管「未跟踪文件」—— 仓库里已经
 入库的 60 多份 docs/、legacy/ 不会因为改了忽略规则就消失，`git archive HEAD`
 照样会把它们打进去。所以本工具不读 git 索引，而是按**同一份白名单**直接从
@@ -56,12 +59,26 @@ EXTRA_GLOBS = (
     "assets/videos/README.md", "models/README.md", "data/README.md",
     "config/.gitkeep",
 )
+#: 公开文档集（GitHub 发布用）。与 .gitignore 的 `!/docs/...` 规则一一对应，
+#: 改一处必须改两处，8h 测试会用 `git check-ignore --no-index` 反查一致性。
+#: 只列面向使用者的说明文档，不含 planbooks / 交接 / 待办 / 决策 / 论文 PDF。
+PUBLIC_DOCS = (
+    "docs/GitHub-README.md", "docs/算法解析.md", "docs/项目总纲.md",
+    "docs/用户手册.md", "docs/API.md", "docs/3D查看器.md",
+    "docs/文件结构.md", "docs/数据标准.md", "docs/运动数据交付说明.md",
+    "docs/真机标定操作清单.md", "docs/标定算法对比.md",
+    "docs/纯色球检测方案.md", "docs/摄像头设备管理方案.md",
+    "docs/插件化架构.md", "docs/主线.md", "docs/坐标系统图.png",
+)
+#: 发布包首页：本地 README.md 是内部状态概览，不适合当 GitHub 首页。
+#: 打包时用它替换根目录 README.md（名字不变，所以白名单与 zip 清单仍对得上）。
+GITHUB_README = ROOT / "docs" / "GitHub-README.md"
 
 ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf"}
 ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep"}
 TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat"}
 FORBIDDEN_PARTS = {
-    "outputs", "logs", "docs", "legacy", ".workbuddy", "__pycache__",
+    "outputs", "logs", "legacy", ".workbuddy", "__pycache__",
     ".git", "node_modules", "venv", ".venv",
 }
 #: 拼接构造，避免本文件自己命中校验（它也在包里）
@@ -83,6 +100,8 @@ def collect(*, with_tests: bool = True, with_assets: bool = True) -> list[Path]:
 
     for rel in ROOT_FILES:
         add(ROOT / rel)
+    for rel in PUBLIC_DOCS:
+        add(ROOT / rel)
     dirs = PY_DIRS if with_tests else tuple(d for d in PY_DIRS if d != "tests")
     for d in dirs:
         base = ROOT / d
@@ -100,6 +119,8 @@ def collect(*, with_tests: bool = True, with_assets: bool = True) -> list[Path]:
 def validate(files: list[Path]) -> list[str]:
     """校验内容：禁入目录、文件类型、体积、个人标识。返回问题列表。"""
     problems: list[str] = []
+    if not GITHUB_README.is_file():
+        problems.append("缺少 docs/GitHub-README.md（发布包首页）")
     for p in files:
         rel = p.relative_to(ROOT).as_posix()
         parts = rel.split("/")
@@ -149,7 +170,11 @@ def build(files: list[Path], out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for p in files:
-            z.write(p, arcname=p.relative_to(ROOT).as_posix())
+            rel = p.relative_to(ROOT).as_posix()
+            if rel == "README.md" and GITHUB_README.is_file():
+                z.writestr("README.md", GITHUB_README.read_bytes())
+            else:
+                z.write(p, arcname=rel)
     # 回读校验：写进去的必须正好是收集到的那些
     with zipfile.ZipFile(out) as z:
         names = z.namelist()

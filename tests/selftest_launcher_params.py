@@ -2214,13 +2214,17 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
                  "calib/methods.py", "tests/selftest_entrypoints.py",
                  "启动程序.py", "requirements.txt", "README.md",
                  "assets/boards/chessboard_8x5_25mm_a4-landscape.png",
-                 "config/.gitkeep")
-    must_ignore = ("docs/用户手册.md", "legacy/README.md", "AGENTS.md",
+                 "config/.gitkeep",
+                 # 2026-11-05：公开说明文档是要带上 GitHub 的，不是"资产"
+                 "docs/GitHub-README.md", "docs/算法解析.md",
+                 "docs/用户手册.md", "docs/API.md", "docs/坐标系统图.png")
+    must_ignore = ("docs/交接文档.md", "docs/待办清单.md",
+                   "docs/planbooks/2026-10-10_x.md", "docs/refs/paper.pdf",
+                   "docs/new_tool.py", "legacy/README.md", "AGENTS.md",
                    "assets/images/test.jpg", "config/profiles.json",
                    "data/stereo/parallel/x/derived/visualization.json",
                    "outputs/test_results/timings.json", "logs/tasks/x.log",
-                   ".workbuddy/memory/x.md", "docs/new_tool.py",
-                   "apps/tools/tmp_debug.log")
+                   ".workbuddy/memory/x.md", "apps/tools/tmp_debug.log")
     wrong_pass = [x for x in must_pass if ignored(x)]
     wrong_ignore = [x for x in must_ignore if not ignored(x)]
     checks.append((f"白名单放行源码/必需物（误拦 {wrong_pass[:2]}）",
@@ -2237,15 +2241,22 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
     checks.append(("两份白名单不漂移（gitignore 一致性）",
                    not m.gitignore_conflicts(files)))
 
-    forbidden = ("docs/", "outputs/", "logs/", "legacy/", ".workbuddy/",
-                 "data/stereo/", "data/mono/", ".git/")
+    forbidden = ("outputs/", "logs/", "legacy/", ".workbuddy/",
+                 "data/stereo/", "data/mono/", ".git/",
+                 "docs/planbooks/", "docs/refs/")
+    relics = ("docs/交接文档.md", "docs/待办清单.md", "docs/决策记录.md",
+              "docs/团队角色与派发记录.md")
     checks.append(("包内没有禁入目录",
                    not any(r.startswith(forbidden) for r in rels)))
+    checks.append(("包内没有内部史料文档",
+                   not any(r in relics for r in rels)))
     need = ("启动程序.py", "启动程序.bat", "启动程序_命令行.py",
             "requirements.txt", "requirements-ai.txt", "environment.yml",
             ".gitignore", "apps/view_3d.py", "sphere_tracker/paths.py",
             "stereo/profiles.py", "calib/methods.py",
-            "assets/boards/chessboard_8x5_25mm_a4-landscape.png")
+            "assets/boards/chessboard_8x5_25mm_a4-landscape.png",
+            "docs/GitHub-README.md", "docs/算法解析.md",
+            "docs/用户手册.md", "docs/API.md")
     checks.append((f"运行必需物齐全（缺 {[n for n in need if n not in rels][:2]}）",
                    all(n in rels for n in need)))
 
@@ -2271,6 +2282,24 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
             checks.append(("zip 内容恰好等于白名单", names == rels))
             checks.append((f"包内文本无个人标识（{bad_marks[:2]}）",
                            not bad_marks))
+            # 发布包首页必须是面向外部的 GitHub 版，且导航链接不能指向
+            # 没被打进包的文档（否则 GitHub 上一片 404）。
+            import re as _re
+
+            # 上面的 with 块已关闭，重新开一次读首页（不要复用已关闭的句柄）
+            with zipfile.ZipFile(out) as z2:
+                readme = z2.read("README.md").decode("utf-8", "ignore")
+            checks.append(("zip 根目录 README 是 GitHub 版",
+                           "## 文档导航" in readme
+                           and "docs/算法解析.md" in readme))
+            links = _re.findall(r"\]\((docs/[^)#]+)\)", readme)
+            missing = [x for x in links if x not in names]
+            checks.append((f"README 导航链接在包内可达（缺 {missing[:2]}）",
+                           bool(links) and not missing))
+            checks.append(("包内无 planbooks / 交接 / 待办",
+                           not any(n.startswith(("docs/planbooks/", "docs/refs/"))
+                                   or n in ("docs/交接文档.md", "docs/待办清单.md")
+                                   for n in names)))
         except Exception as exc:                        # noqa: BLE001
             checks.append((f"能生成 zip（异常：{exc}）", False))
     return checks
