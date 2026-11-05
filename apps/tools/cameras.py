@@ -319,10 +319,8 @@ def _open_preview_interruptible(index: int, backend: int, *, enumerated: bool = 
                 drop = None
             box["done"] = True
         if drop is not None:
-            try:
-                drop.release()
-            except Exception:                            # noqa: BLE001
-                pass
+            # 同一把锁里 release 会拖住 worker；用带超时的版本（见 _release_with_timeout）。
+            _release_with_timeout(drop)
 
     def _worker() -> None:
         src = bname = None
@@ -545,6 +543,35 @@ def _preview_label(index: int, entry: cr.DeviceEntry) -> str:
     return f"#{index}  推测:{entry.name or '(无名字)'}  端口 {entry.port or '-'}"
 
 
+def _release_with_timeout(src, timeout_s: float = 3.0) -> None:
+    """释放相机，但**最多等 timeout_s 秒**；超时就留给后台线程慢慢收尾。
+
+    为什么不能直接 `src.release()`（2026-11-05）：MSMF 后端下某些相机
+    （实测这台 aoni）释放要**几十秒**，而它是"认完一台、开下一台"的同步
+    路径上的一环 —— 卡在这里，用户按完 `r` 之后整个识别会话就不动了，
+    看起来就是"按下 r 就卡死"。
+
+    超时后仍让它跑完（daemon 线程），**不留悬挂句柄**：只是不再等它。
+    正常情况下（release < 3s）行为与原来完全一致。
+    """
+    box = {"done": False}
+
+    def _do() -> None:
+        try:
+            src.release()
+        except Exception:                                # noqa: BLE001
+            pass
+        finally:
+            box["done"] = True
+
+    th = threading.Thread(target=_do, daemon=True)
+    th.start()
+    th.join(timeout=timeout_s)
+    if not box["done"]:
+        print(f"  ⚠ 相机释放超过 {timeout_s:.0f} 秒还没完成（后端在等驱动）——"
+              f"不等它了，继续下一台；它在后台自己收尾", flush=True)
+
+
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                         *, backend: int, first_frame_timeout: float | None = None,
                         key_poll=None,
@@ -705,12 +732,20 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
             return ans or None
         return None
     finally:
-        src.release()
+        # ⚠️ **先销毁窗口，再 release 相机**（2026-11-05 用户报"按下 r 后窗口变白、
+        # 未响应"）。原来是反的：`src.release()` 在 MSMF 后端下会阻塞（这台 aoni
+        # 实测几秒到几十秒都出现过），而这段时间窗口还活着、却没人调 `waitKey`
+        # 泵消息 —— 表现就是**窗口变白 + Windows 标"未响应"**，用户只能以为程序死了。
+        # 先 destroyWindow + 一次 waitKey，窗口立刻消失；释放相机另走
+        # `_release_with_timeout`（最多等 3 秒，超时转后台），所以"按完 r
+        # 之后要等相机慢慢关"这件事不会再卡住认下一台。
         try:
             import cv2
             cv2.destroyWindow(win)
+            cv2.waitKey(1)      # 让销毁真正生效（不 pump 一次，窗口会僵在白屏）
         except Exception:                                # noqa: BLE001
             pass
+        _release_with_timeout(src)
 
 
 def _describe_status(reg: cr.Registry, index: int,
@@ -1647,12 +1682,10 @@ def _simultaneous_grab_check(
             "h": int(getattr(info, "height", 0) or 0), "fps": fps,
         }
 
-    # 收尾：两台一起释放（无论成败都不留悬空相机）。
+    # 收尾：两台一起释放（无论成败都不留悬空相机）。同样走带超时的版本 ——
+    # MSMF 下 release 可能几十秒，诊断命令也不该卡在那儿。
     for src in srcs.values():
-        try:
-            src.release()
-        except Exception:                                 # noqa: BLE001
-            pass
+        _release_with_timeout(src)
 
     lstat, rstat = stats["left"], stats["right"]
     print(f"    实读：left(#{left_index}) {lstat['frames']}/{frames} 帧，"
