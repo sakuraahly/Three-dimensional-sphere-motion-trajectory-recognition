@@ -373,6 +373,9 @@ class Viewer3D:
         # 包围盒 fit。之后 pan/zoom 只改它、`_redraw` 照它画，所以播放时
         # 用户的平移/缩放**留得住**（这是"移动的是坐标轴、一松手又弹回"的根）。
         self.lims: list[list[float]] | None = None
+        # 整幅缩放（`set_box_aspect(zoom=)`）：数据、网格、刻度一起放大。
+        # 与 `lims` 是两套东西 —— lims 改"看哪一段"，zoom 改"这一幅画多大"。
+        self.box_zoom: float = 1.0
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -456,6 +459,7 @@ class Viewer3D:
         data = load_view(path)
         self._apply(data, None, True)
         self.lims = None               # 换会话 = 新数据，范围重新 fit
+        self.box_zoom = 1.0            # 整幅缩放也归位（新数据的量级不同）
         self.slider.configure(to=max(0, self.n - 1))
         self.slider.set(0)
         self._redraw()                       # 内含 _reset_view / _update_video / _status
@@ -593,7 +597,8 @@ class Viewer3D:
         self.smooth_chk.pack(side="left", padx=(10, 0))
         # 缩放/平移提示（2026-11-04）：三键交互是 matplotlib 3D 原生的，
         # 用户看不到说明就不知道中键能平移、右键能缩放。文字放控制条右侧。
-        ttk.Label(bar, text="左键旋转 · 中键平移 · 右键缩放 · 滚轮定点缩放",
+        ttk.Label(bar, text="左键旋转 · 中键平移 · 滚轮缩放 · "
+                            "Shift+滚轮 定点放大 · 右键拖动",
                   style="Hint.TLabel").pack(side="right", padx=(10, 4))
 
         self.status = ttk.Label(self.root, padding=(10, 4), anchor="w")
@@ -853,32 +858,51 @@ class Viewer3D:
             lo[i], hi[i] = new_lo, new_hi
         self._set_lims(lo, hi)
 
-    def _on_scroll(self, event) -> None:
-        """滚轮缩放：绕鼠标指向的位置放大/缩小（指定放大区域）。
+    def _set_zoom(self, zoom: float) -> None:
+        """设置整幅缩放倍数（1 = 原样，>1 放大）。"""
+        # 限幅：太小看不清、太大会把内容顶出 axes 区域（用户会以为程序坏了）
+        self.box_zoom = max(0.35, min(6.0, float(zoom)))
+        self._apply_box()
 
-        mplot3d 没有公开的"屏幕点 → 数据点"反算 API，但可以用鼠标在**轴框**
-        内的归一化位置近似：鼠标在屏幕右侧 → 锚点落在数据范围的右侧。
-        X/Y 用这个相对位置映射，Z 用范围中心（深度在 2D 屏幕上本就退化，
-        用户缩放的主要意图是"哪个 X/Y 区域"）。这比绕数据中心缩更符合
-        "指着哪放大哪"的直觉。
+    def _on_scroll(self, event) -> None:
+        """滚轮 = **整幅缩放**；Shift+滚轮 = 定点放大（改三轴范围）。
+
+        ## 为什么要分两种（2026-11-05 用户："缩放只有曲线缩放没有背景坐标图
+        ## 缩放，很别扭"）
+
+        原来滚轮只改 `lims`。但 3D 轴的盒子大小在画布上是**固定**的，而刻度
+        数量是自动选的 —— 范围缩小 2 倍后，盒子里依旧是那几条网格线，屏幕上
+        的间距几乎不变，只有曲线按新范围被放大。于是看起来像"背景一动不动"。
+
+        真正的"缩放"应该是整幅画面变大：数据、网格线、刻度数字、轴标签一起。
+        那是 `set_box_aspect(zoom=)` 的语义（matplotlib ≥3.9），不是 `lims`。
+
+        定点放大（只改范围、把鼠标指的位置留在屏幕原位）仍然有用 —— 它是
+        "凑近看某一段"，所以挪到 Shift+滚轮，不再占用默认滚轮。
         """
         if event.inaxes is not self.ax:
             return
-        lo, hi = self._current_lims()
-        bbox = self.ax.get_window_extent()
-        fx = 0.5
-        fy = 0.5
-        if event.x is not None and bbox.width > 0 and bbox.height > 0:
-            fx = (event.x - bbox.x0) / bbox.width
-            fy = (event.y - bbox.y0) / bbox.height
-        fx = max(0.0, min(1.0, fx))
-        fy = max(0.0, min(1.0, fy))
-        # 屏幕 y 向上（bbox 顶部 = 数据 Y 较大侧），所以 fy 越大 → Y 越大。
-        cx = lo[0] + (hi[0] - lo[0]) * fx
-        cy = lo[1] + (hi[1] - lo[1]) * fy
-        cz = (lo[2] + hi[2]) / 2.0
         factor = ZOOM_STEP if event.button == "up" else 1.0 / ZOOM_STEP
-        self._zoom_around(factor, cx, cy, cz)
+
+        if event.key == "shift":
+            # 定点放大：锚点取鼠标在轴框内的归一化位置
+            lo, hi = self._current_lims()
+            bbox = self.ax.get_window_extent()
+            fx = 0.5
+            fy = 0.5
+            if event.x is not None and bbox.width > 0 and bbox.height > 0:
+                fx = (event.x - bbox.x0) / bbox.width
+                fy = (event.y - bbox.y0) / bbox.height
+            fx = max(0.0, min(1.0, fx))
+            fy = max(0.0, min(1.0, fy))
+            # 屏幕 y 向上（bbox 顶部 = 数据 Y 较大侧），所以 fy 越大 → Y 越大。
+            cx = lo[0] + (hi[0] - lo[0]) * fx
+            cy = lo[1] + (hi[1] - lo[1]) * fy
+            cz = (lo[2] + hi[2]) / 2.0
+            self._zoom_around(factor, cx, cy, cz)
+        else:
+            # 整幅缩放：factor<1 表示放大 → zoom 要变大
+            self._set_zoom(self.box_zoom / factor)
         self.canvas.draw_idle()
 
     def _current_lims(self) -> tuple[list[float], list[float]]:
@@ -896,13 +920,32 @@ class Viewer3D:
         self._apply_lims()
 
     def _apply_lims(self) -> None:
-        """把 `self.lims` 写到 ax。"""
+        """把 `self.lims` 写到 ax，并同步轴盒比例与整幅缩放。"""
         if self.lims is None:
             return
         lo, hi = self.lims
         self.ax.set_xlim(lo[0], hi[0])
         self.ax.set_ylim(lo[1], hi[1])
         self.ax.set_zlim(lo[2], hi[2])
+        self._apply_box()
+
+    def _apply_box(self) -> None:
+        """按当前范围比例 + 整幅缩放设置轴盒。
+
+        `aspect` 只有**比例**意义，必须跟着 `lims` 更新：否则滚轮改了范围、
+        比例却还是旧的，曲线会被非均匀拉伸，而盒子看起来纹丝不动 —— 正是
+        用户说的"背景没有跟着缩放"。
+        """
+        if self.lims is None:
+            return
+        lo, hi = self.lims
+        aspect = (max(1e-9, hi[0] - lo[0]),
+                  max(1e-9, hi[1] - lo[1]),
+                  max(1e-9, hi[2] - lo[2]))
+        try:
+            self.ax.set_box_aspect(aspect, zoom=self.box_zoom)
+        except TypeError:                   # matplotlib < 3.9 没有 zoom 参数
+            self.ax.set_box_aspect(aspect)
 
     # ---- 鼠标：Shift + 左键拖动 = 绕视线滚转 ----
     def _on_mouse_press(self, event) -> None:
@@ -1024,6 +1067,11 @@ class Viewer3D:
         self.ax.set_xlabel("X right (m)")
         self.ax.set_ylabel("Y down (m)")
         self.ax.set_zlabel("Z forward (m)")
+        # 3D 轴在斜视角下刻度标签很容易叠在一起（Y 轴最明显：几毫米的间距里
+        # 塞了 7 个标签）。限成 4 个主刻度，数值本身已经说明范围，不需要那么密。
+        # 必须在 `clear()` 之后设 —— 它会重置 locator。
+        for _axis in (self.ax.xaxis, self.ax.yaxis, self.ax.zaxis):
+            _axis.set_major_locator(mticker.MaxNLocator(4))
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
                           f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}")
         self.ax.legend(loc="upper right")
@@ -1035,10 +1083,7 @@ class Viewer3D:
         self.ax.set_xlim(lo[0], hi[0])
         self.ax.set_ylim(lo[1], hi[1])
         self.ax.set_zlim(lo[2], hi[2])
-        try:
-            self.ax.set_box_aspect((hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]))
-        except Exception:                                   # noqa: BLE001
-            pass
+        self._apply_box()          # 比例 + 整幅缩放（重画后 zoom 不能丢）
         self._draw_planes()
         self._apply_view()
         self._redraw_inset()

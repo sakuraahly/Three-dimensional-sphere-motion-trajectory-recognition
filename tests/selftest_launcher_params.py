@@ -277,6 +277,36 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
             checks.append(("原生三键映射在位（左旋转/中平移/右缩放）",
                            v.ax._rotate_btn == [1] and v.ax._pan_btn == [2]
                            and v.ax._zoom_btn == [3]))
+
+            # 滚轮默认 = **整幅缩放**（2026-11-05 用户："缩放只有曲线缩放，
+            # 没有背景坐标图缩放，很别扭"）。守的是：默认滚轮不许再只改 lims
+            # —— 盒子大小固定、网格间距不变，看起来就是"背景一动不动"。
+            class _Wheel:
+                inaxes = v.ax
+                x = 120
+                y = 120
+                button = "up"
+                key = None
+
+            z_before = v.box_zoom
+            lim_before = [list(a) for a in v._current_lims()]
+            v._on_scroll(_Wheel())
+            checks.append(("默认滚轮改整幅缩放（网格/刻度一起放大），不动范围",
+                           v.box_zoom > z_before
+                           and [round(q, 6) for q in v._current_lims()[0]]
+                           == [round(q, 6) for q in lim_before[0]]))
+
+            # Shift+滚轮 = 定点放大（改 lims，不改整幅缩放）
+            z_mid = v.box_zoom
+            lim_mid = [list(a) for a in v._current_lims()]
+
+            class _WheelShift(_Wheel):
+                key = "shift"
+
+            v._on_scroll(_WheelShift())
+            checks.append(("Shift+滚轮改范围（定点放大），不动整幅缩放",
+                           abs(v.box_zoom - z_mid) < 1e-9
+                           and v._current_lims()[0][0] > lim_mid[0][0]))
             v._reset_view()
             checks.append(("重置后范围重新 fit（lims 置空再按包围盒算）",
                            v.lims is None or
