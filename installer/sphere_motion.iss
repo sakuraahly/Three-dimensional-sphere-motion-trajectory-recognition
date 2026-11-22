@@ -52,8 +52,10 @@ DisableDirPage=auto
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Shortcuts:"
-Name: "startmenu"; Description: "Create Start Menu shortcuts"; GroupDescription: "Shortcuts:"
+; 桌面快捷方式默认**不勾选**：安装器不该往桌面塞东西，用户要就自己勾。
+; 开始菜单默认勾选（卸载入口在那里，没有它用户找不到怎么卸）。
+Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+Name: "startmenu"; Description: "Create Start Menu shortcuts"; GroupDescription: "Shortcuts:"; Flags: checkedonce
 
 [Files]
 ; 源码 + 文档 + 标定板 + launcher.exe（永远装）

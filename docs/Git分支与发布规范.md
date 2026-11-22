@@ -121,14 +121,25 @@ installer\build_installer.bat                   :: 一键出 setup.exe（含运�
 | `StageDir` 相对路径 | ISCC 以 `.iss` 所在的 `installer\` 为基准，图标/payload 全找不到 | define 里写 `..\outputs\...` 回退一层 |
 | `/S<dir>` | 以为能设 SourceDir，实际是 SignTool 选项 | 别用；用相对路径 |
 | 中文语言包 | winget 国际版只有 29 种欧洲 `.isl`，无中文 | 用 `compiler:Default.isl`（英文向导）；要中文从官网下语言包 |
-| Tasks 默认勾选 | `Flags: checked/unchecked`、`Checked: yes` 本机 6.7.3 全报错 | 两个 task 都不默认勾选，用户自己选 |
+| Tasks 默认勾选 | 起初误判 `Flags: unchecked` 非法而全部删掉——后果是**静默装时默认全勾**，往用户桌面塞快捷方式 | `Flags: unchecked` / `Flags: checkedonce` 都是合法的（当时是别的语法错误）；`desktopicon` 必须 `unchecked` |
+| Temp 被安全软件拦 | 双击 setup.exe 报 `Setup was unable to create the directory "...\Temp\is-XXXX.tmp" Error 5: 拒绝访问`；但同机 PowerShell 能建目录、Temp ACL 正常 | 360/火绒等 HIPS 拦「未签名 exe 在 Temp 释放可执行文件」。解法：加信任区/临时关防护，或先把 `TMP`/`TEMP` 指到别的盘再运行（实测 `/VERYSILENT` 可过）。根治要代码签名证书 |
 | 日期格式化 | `FormatDateTime`/`DateToStr` 在 Inno 脚本子集里都不存在 | `created=` 写固定值 `by-installer`（只是元数据，非判据） |
 | `CreateInputFilePage` 参数 | 只收 4 个参数（AfterID + 3 文案），多传一个空串报错 | 按 Inno 6 官方签名传 |
 | winget 安装路径 | 不是 Program Files，而是 `%LOCALAPPDATA%\Programs\Inno Setup 6` | `build_installer.bat` 三个路径都试 |
 
 编译结果：`outputs/releases/SphereMotion-0.3.0-setup.exe`（内嵌 Python 3.14.10，
-约 200 MB，合法 PE，不入库）。安装未在本机执行（安全策略拦了执行安装包）——
-编译自检 + payload 自检 + 内嵌 import 自检全过，真正安装验证请由人双击 setup.exe 完成。
+93.9 MB，合法 PE，不入库）。
+
+**2026-11-22 首次真机安装验证通过**（装到 `D:\SphereMotionTest\app`，避开 C 盘 Temp）：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 静默安装 | 退出码 0，日志 `Installation process succeeded`；6176 文件 / 406 MB |
+| 环境指针 | `python=runtime/python/python.exe` / `kind=bundled` / `python_version=3.14.10` |
+| 内嵌解释器 | `python 3.14.10` + `cv2 5.1.0` + `numpy 2.5.5` + `scipy 1.18.1` + `tkinter OK` |
+| launcher 探测 | `--dry-run` 显示 `pointer/python/guiPython` 全部指向安装目录内 `runtime\python\*`（**tried 1 candidates**，未回落系统 Python） |
+| 卸载 | 卸载器退出码 0，桌面 lnk / 开始菜单 / HKCU 注册表项全部清除（仅留空目录） |
+| 快捷方式默认值 | 桌面 **不创建**（`Flags: unchecked`）、开始菜单创建（卸载入口） |
 
 ### 6.3 发布到 GitHub Release（需用户批准）
 
