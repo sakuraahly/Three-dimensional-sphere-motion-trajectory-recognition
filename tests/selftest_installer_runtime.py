@@ -54,9 +54,14 @@ def main() -> int:
                    "import cv2, numpy" in iss))
     checks.append((".iss 运行时按选择装（Check: WantBundledPython）",
                    "WantBundledPython" in iss and "runtime\\*" in iss))
-    checks.append((".iss 卸载清掉 runtime 与指针",
+    checks.append(("默认安装目录在 C 盘用户级 Programs",
+                   "DefaultDirName={userpf}\\SphereMotion" in iss))
+    checks.append((".iss 卸载清掉 runtime，并提供只删程序/程序+数据选择",
                    "filesandordirs; Name: \"{app}\\runtime\"" in iss
-                   and "python_env.txt" in iss))
+                   and "InitializeUninstall" in iss
+                   and "DeleteUserData" in iss
+                   and "UninstallSilent" in iss
+                   and "DelTree" in iss))
 
     # 1b. 中文向导：语言文件随仓库提供，不能依赖构建机预装语言包。
     zh = _read(ZH_ISL)

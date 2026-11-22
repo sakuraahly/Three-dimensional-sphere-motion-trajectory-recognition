@@ -81,10 +81,57 @@ def size_mb(base: Path) -> float:
     return total / 1024 / 1024
 
 
+def prune_runtime() -> int:
+    """删掉运行时不需要的东西，尤其是会触发 Windows MAX_PATH 的深层文件。
+
+    为什么必须在 import 探针**之后**再跑一次：Python 导入 numpy/scipy 时会
+    重新生成 `__pycache__`；只在 pip 后清理，最终 staging 里又会冒出几十层
+    `__pycache__`。CI 上 Inno 正是在压缩这些深层路径时失败。
+    """
+    removed = 0
+    for root, dirs, files in os.walk(STAGE, topdown=True):
+        root_path = Path(root)
+        for d in list(dirs):
+            full = root_path / d
+            rel = full.relative_to(STAGE).as_posix()
+            drop = d == "__pycache__"
+            # 包自带测试/头文件不参与运行；它们的路径最深，直接去掉。
+            if rel.startswith("Lib/site-packages/") and d in {"tests", "test"}:
+                drop = True
+            if rel.startswith("Lib/site-packages/numpy/") and d == "include":
+                drop = True
+            if rel == "Lib/site-packages/numpy/_pyinstaller":
+                drop = True
+            if drop:
+                shutil.rmtree(full, ignore_errors=True)
+                removed += 1
+                if d in dirs:
+                    dirs.remove(d)
+        for f in files:
+            if f.endswith(".pyc"):
+                try:
+                    (root_path / f).unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    # 兼容旧的显式清理项（即使上面的通用规则改坏也仍能减掉这些）
+    for rel in ("Lib/site-packages/scipy/_lib/tests",
+                "Lib/site-packages/numpy/_core/tests",
+                "Lib/site-packages/matplotlib/tests",
+                "Lib/site-packages/cv2/data",
+                "Lib/site-packages/numpy/_core/include"):
+        p = STAGE / rel
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def build(force: bool) -> None:
     download()
     if STAGE.is_dir() and not force:
-        log(f"已有运行时 {STAGE}（{size_mb(STAGE):.0f} MB），跳过；--force 可重建")
+        removed = prune_runtime()
+        log(f"已有运行时 {STAGE}（{size_mb(STAGE):.0f} MB），跳过构建；清理 {removed} 处")
         return
 
     if STAGE.is_dir():
@@ -104,20 +151,8 @@ def build(force: bool) -> None:
                     "--disable-pip-version-check", "-r", str(REQUIREMENTS)],
                    check=True, cwd=ROOT)
 
-    log("精简（__pycache__ / 包自带 tests）…")
-    removed = 0
-    for root, dirs, _files in os.walk(STAGE, topdown=False):
-        if "__pycache__" in dirs:
-            shutil.rmtree(os.path.join(root, "__pycache__"), ignore_errors=True)
-            removed += 1
-    for rel in ("Lib/site-packages/scipy/_lib/tests",
-                "Lib/site-packages/numpy/_core/tests",
-                "Lib/site-packages/matplotlib/tests",
-                "Lib/site-packages/cv2/data"):
-        p = STAGE / rel
-        if p.is_dir():
-            shutil.rmtree(p, ignore_errors=True)
-            removed += 1
+    log("精简（__pycache__ / 包自带 tests / numpy 头文件）…")
+    removed = prune_runtime()
     log(f"清理 {removed} 处")
 
     log("验证 import…")
@@ -125,6 +160,9 @@ def build(force: bool) -> None:
                        text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         raise SystemExit(f"内嵌环境 import 失败：{r.stderr}")
+    # import 会重新生成 __pycache__，必须在验证后再清一次。
+    removed = prune_runtime()
+    log(f"import 后清理 {removed} 处")
     log(f"完成：{size_mb(STAGE):.0f} MB @ {STAGE}")
 
 

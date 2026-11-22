@@ -12,8 +12,9 @@ rem    4) 列出将删内容，要求手输 UNINSTALL 二次确认；
 rem    5) 只走回收站（可还原），**绝不永久删除**；回收站失败就停下来；
 rem    6) 脚本先复制一份到 %TEMP% 再执行，否则删不掉正在运行的自己。
 rem
-rem  注意：安装后你自己采集的 data/、标定 config/、日志 logs/ 都在目录内，
-rem  会一起进回收站。要留东西请先自行备份，或到回收站还原。
+rem  注意：正式安装目录里如果存在 unins000.exe，会优先转交 Inno 卸载器：
+rem  那里可以选「只删程序」或「程序+数据」。只有找不到官方卸载器时，
+rem  下面的“整目录送回收站”兜底逻辑才会执行。
 rem ==========================================================================
 setlocal EnableExtensions
 
@@ -34,6 +35,13 @@ if not exist "%TARGET%\apps\gui_main.py" goto :not_install
 if exist "%TARGET%\.git" goto :dev_repo
 if exist "%TARGET%\.workbuddy" goto :dev_repo
 if exist "%TARGET%\AGENTS.md" goto :dev_repo
+
+rem 正式安装包用 Inno 卸载器；转交后它会弹出「只删程序 / 程序+数据」选择。
+if exist "%TARGET%\unins000.exe" (
+    echo   检测到官方卸载器，转交；可选择只删程序或连用户数据一起删。
+    start "" "%TARGET%\unins000.exe"
+    exit /b 0
+)
 
 echo   将卸载的目录：%TARGET%
 echo.

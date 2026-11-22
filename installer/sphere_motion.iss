@@ -5,8 +5,10 @@
 ; apps\tools\make_clean_bundle.py 的纯净包 + launcher.exe + 内嵌 Python 运行时。
 ;
 ; 设计原则（别改错）：
-;   1. 装到 {localappdata}，不写 Program Files → 免管理员、无 UAC、无签名摩擦；
-;   2. 卸载用 Inno 自带卸载器（可靠、可回滚）；uninstall.bat 只作为文件保留给
+;   1. 装到用户级 Programs（{userpf}\SphereMotion，C 盘、免管理员、无 UAC）；
+;      不写 Program Files，避免运行时无法写 data/config；
+;   2. 卸载用 Inno 自带卸载器（可靠、可回滚），卸载时让用户选择
+;      「只删程序」或「程序+用户数据」；uninstall.bat 只作为文件保留给
 ;      高级用户，不作为卸载入口 —— 两套删除逻辑并存必然打架；
 ;   3. 安装向导里让用户选解释器：默认用安装包自带的 Python 3.14（开箱即用，
 ;      不用自己装 Python），也可选本机已有 python.exe。选定后写入
@@ -31,7 +33,9 @@ AppId={#AppId}
 AppName={#AppName}
 AppVersion={#AppVer}
 AppPublisher={#Publisher}
-DefaultDirName={localappdata}\SphereMotion
+; {userpf} = C:\Users\<用户>\AppData\Local\Programs（用户级“Programs”）。
+; 不写死盘符；管理员模式也不改这里，保持可预测。
+DefaultDirName={userpf}\SphereMotion
 DefaultGroupName={#AppName}
 OutputDir={#OutDir}
 OutputBaseFilename={#OutBase}
@@ -76,11 +80,10 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: desktop
 Filename: "{app}\README.md"; Description: "查看快速开始说明 / View quick start"; Flags: postinstall skipifsilent unchecked
 
 [UninstallDelete]
-; 运行期产物 + 内嵌运行时 + 环境指针：都在安装目录内，卸载一并清掉
+; 运行时是程序本身，永远删。
+; 用户数据（config / data / logs / outputs）由 [Code] 的卸载选项决定：
+; 「只删程序」保留；「程序+数据」才 DelTree。
 Type: filesandordirs; Name: "{app}\runtime"
-Type: filesandordirs; Name: "{app}\config\python_env.txt"
-Type: filesandordirs; Name: "{app}\logs"
-Type: filesandordirs; Name: "{app}\outputs"
 
 [Code]
 // ---------------------------------------------------------------------------
@@ -93,6 +96,7 @@ var
   PathPage: TInputFileWizardPage;
   ChosenPython: String;
   ChosenKind: String;
+  DeleteUserData: Boolean;
 
 function IsChinese: Boolean;
 begin
@@ -246,5 +250,55 @@ begin
     lines.SaveToFile(ExpandConstant('{app}\' + '{#PointerRel}'));
   finally
     lines.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// 卸载选项：只删程序 / 程序 + 用户数据。默认保留数据（最安全的默认）。
+// 这不是安装向导页；Inno 卸载器的 [Code] 以 InitializeUninstall 的返回值
+// 决定是否继续，所以用一次经典 Yes/No/Cancel 确认。
+// ---------------------------------------------------------------------------
+function InitializeUninstall(): Boolean;
+var
+  ans: Integer;
+  msg: String;
+begin
+  // 静默卸载不弹窗，默认保留用户数据，避免脚本/部署队列误删。
+  if UninstallSilent then
+  begin
+    DeleteUserData := False;
+    Result := True;
+    Exit;
+  end;
+
+  if IsChinese then
+    msg := '卸载 球形物体三维运动轨迹识别' + #13#10 + #13#10 +
+      '是：删除程序 + 用户数据（data / config / logs / outputs）' + #13#10 +
+      '否：只删除程序，保留用户数据' + #13#10 +
+      '取消：退出卸载'
+  else
+    msg := 'Uninstall SphereMotion' + #13#10 + #13#10 +
+      'Yes: remove program + user data (data / config / logs / outputs)' + #13#10 +
+      'No: remove program only, keep user data' + #13#10 +
+      'Cancel: abort uninstall';
+
+  ans := MsgBox(msg, mbConfirmation, MB_YESNOCANCEL);
+  if ans = IDCANCEL then
+  begin
+    Result := False;
+    Exit;
+  end;
+  DeleteUserData := ans = IDYES;
+  Result := True;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if (CurUninstallStep = usPostUninstall) and DeleteUserData then
+  begin
+    DelTree(ExpandConstant('{app}\data'), True, True, True);
+    DelTree(ExpandConstant('{app}\config'), True, True, True);
+    DelTree(ExpandConstant('{app}\logs'), True, True, True);
+    DelTree(ExpandConstant('{app}\outputs'), True, True, True);
   end;
 end;
