@@ -316,4 +316,4 @@ python apps\run_tests.py fast -j auto
 
 相机标定与立体视觉的基础方法来自 OpenCV 的 `calibrateCamera` / `stereoCalibrate` / `stereoRectify` 与张正友平面标定法。
 
-**许可**：本项目采用 **MIT License**，见 [`LICENSE`](LICENSE)。第三方依赖各自遵循其原有许可证，见 [`requirements.txt`](requirements.txt) 与 [`docs/SBOM.md`](docs/SBOM.md)。
+**许可**：本项目采用 **MIT License**，见 [`LICENSE`](LICENSE)。第三方依赖各自遵循其原有许可证，见 [`requirements.txt`](requirements.txt)。

@@ -1094,6 +1094,6 @@ python apps/verify_stereo.py --left left --right right   # 用角色名，别背
 ## 许可证
 
 本项目采用 **MIT License**，见 [`LICENSE`](LICENSE)。第三方依赖的许可证见
-[`requirements.txt`](requirements.txt) 与 [`docs/SBOM.md`](docs/SBOM.md)。
+[`requirements.txt`](requirements.txt)。
 
 
