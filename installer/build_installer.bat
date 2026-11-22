@@ -6,7 +6,7 @@ rem
 rem  前置：装好 Inno Setup 6（https://jrsoftware.org/isinfo.php）
 rem        winget 用户可先跑： winget install --id JRsoftware.InnoSetup -e
 rem  用法：双击本文件，或命令行 build_installer.bat
-rem  产物：outputs\releases\SphereMotion-0.3.0-setup.exe
+rem  产物：outputs\releases\SphereMotion-0.3.1-setup.exe
 rem        内嵌 Python 3.14.10 + 依赖（约 390 MB，开箱即用）
 rem
 rem  设计要点（与项目其它入口保持一致）：
@@ -83,7 +83,7 @@ rem .iss 里的相对路径已带 ..\ 回退到仓库根（ISCC 以脚本所在�
 if errorlevel 1 goto :fail
 
 echo.
-echo   完成： outputs\releases\SphereMotion-0.3.0-setup.exe
+echo   完成： outputs\releases\SphereMotion-0.3.1-setup.exe
 echo   只生成本地文件，未发布到 GitHub。
 if not defined CI pause
 exit /b 0

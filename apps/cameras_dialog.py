@@ -102,8 +102,6 @@ DARK_WARMUP_S = 0.6
 DARK_ENTER = 8.0
 DARK_CLEAR = 16.0
 
-#: 显示用：没标过就写这个（与 `camera_registry.location_text()` 同一口径）。
-LOCATION_UNSET_TEXT = "未标注"
 #: 显示用：`capture_index` 还没实测时的写法。**不许**写 0 / #index 冒充。
 CAPTURE_UNMEASURED_TEXT = "未实测"
 
@@ -315,13 +313,16 @@ class CamerasDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(
+        hint = ttk.Label(
             body,
-            text="按画面认清哪台是左/右，然后选中它点「设为左 / 设为右」。"
-                 "预览可以同时开多路，用来并排比对；绑定按设备身份记，换 USB 口也不会漂。"
-                 "表里「PnP 位次」是系统枚举顺序，**不是**采集索引；"
-                 "「采集索引」只在实测（identify）后才有值，两种编号不可互换。",
-            wraplength=1140, foreground=MUTED).pack(anchor="w", pady=(0, 8))
+            text="按画面认清哪台是左/右，再点「设为左 / 设为右」。"
+                 "绑定按设备身份记，换 USB 口也不会漂。"
+                 "表里「PnP 位次」是系统枚举顺序，不是采集索引；"
+                 "采集索引只在实测（identify）后才有值。",
+            wraplength=880, foreground=MUTED)
+        hint.pack(anchor="w", pady=(0, 8))
+        body.bind("<Configure>",
+                  lambda e: hint.configure(wraplength=max(320, e.width - 24)))
 
         # 主分区必须可拖动（AGENTS.md §7.2）：两个内容区并排时用
         # ttk.PanedWindow，别用固定 pack(side=...) —— 内容一长就互相遮挡、
@@ -330,34 +331,33 @@ class CamerasDialog(tk.Toplevel):
         panes.pack(fill="both", expand=True)
         self.panes = panes
 
-        self._left_width = min(380, int(_w * 0.36))
+        # 左栏要容得下五列（去掉位置列后）；过窄时表头会先被裁，
+        # 先给足默认宽度，用户仍可拖 sash 调整。
+        self._left_width = min(520, int(_w * 0.52))
         left = ttk.Frame(panes, width=self._left_width)
         # ⚠️ 列名必须自己说清"PnP 位次 ≠ 采集索引"（2026-11-12）。
         # 用户报了三轮"程序显示的相机 ≠ 真实相机"，根因就是这一栏被读成了
         # `cv2.VideoCapture` 的编号 —— 而它只是**系统枚举顺序**。表头直接写出
         # 这件事，比放到说明文字里有效（用户看的是表）。
-        cols = ("idx", "name", "port", "loc", "cap", "role")
+        cols = ("idx", "name", "port", "cap", "role")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=14)
         # 表头 / 按钮一律写成显式 text= 常量：放进循环里由变量带进去的话，
         # i18n 提取器只看 AST 里的关键字常量，整排文案会静默漏译（B-187）。
-        self.tree.heading("idx", text="PnP 位次（非采集索引）")
+        self.tree.heading("idx", text="PnP 位次")
         self.tree.heading("name", text="设备")
         self.tree.heading("port", text="USB 端口")
-        self.tree.heading("loc", text="位置")
         self.tree.heading("cap", text="采集索引")
         self.tree.heading("role", text="当前角色")
-        self.tree.column("idx", width=150, anchor="w")
-        self.tree.column("name", width=160, anchor="w")
-        self.tree.column("port", width=100, anchor="w")
-        self.tree.column("loc", width=60, anchor="w")
-        self.tree.column("cap", width=80, anchor="w")
-        self.tree.column("role", width=90, anchor="w")
+        self.tree.column("idx", width=65, anchor="w")
+        self.tree.column("name", width=175, anchor="w")
+        self.tree.column("port", width=80, anchor="w")
+        self.tree.column("cap", width=65, anchor="w")
+        self.tree.column("role", width=95, anchor="w")
         self.tree.pack(side="top", fill="both", expand=True)
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
-        # 六列在窄分栏里会溢出：给一条横向滚动条，别让「位置 / 采集索引」被裁掉
-        # （裁掉的两列恰好是这次新加的关键信息）。
+        # 五列在窄分栏里仍可能溢出：保留横向滚动条，别让「采集索引 / 当前角色」被裁掉。
         xsb = ttk.Scrollbar(left, orient="horizontal", command=self.tree.xview)
         self.tree.configure(xscrollcommand=xsb.set)
         xsb.pack(side="bottom", fill="x")
@@ -433,7 +433,7 @@ class CamerasDialog(tk.Toplevel):
             side="left")
 
         self.status = ttk.Label(body, text="读取设备中…", foreground=MUTED,
-                                wraplength=1140)
+                                wraplength=880)
         self.status.pack(anchor="w", pady=(4, 0))
 
         # 内容都建好之后再 add：ttk.PanedWindow 的 pane 只认 weight，
@@ -727,7 +727,7 @@ class CamerasDialog(tk.Toplevel):
         parts = []
         for role in ("left", "right"):
             spec = reg.roles.get(role)
-            label = (spec.location or spec.name or role) if spec else "未配置"
+            label = (spec.name or role) if spec else "未配置"
             h = cr.role_health(role, reg=reg, devices=self._devices)
             if h.status == "ok":
                 parts.append(f"{role}={label} 一致")
@@ -836,12 +836,12 @@ class CamerasDialog(tk.Toplevel):
             elif is_virt:
                 # 虚拟摄像头**不参与绑定**：它不是物理设备（PnP 里没有它），
                 # 绑上去等于绑一个"换后端就指到别的东西"的编号。
-                role = "虚拟(不参与绑定)"
+                role = "虚拟(不绑定)"
             elif len(roles) > 1:
                 # 旧配置可能把同一台绑成了两个角色（set_role 以前不清其它角色）。
                 # 必须显式写出来：否则列表只显示第一个角色，看起来一切正常，
                 # 而实际两路采集会拿到同一台相机的画面。
-                role = "＋".join(sorted(roles)) + " ← 同一台，必须改"
+                role = "＋".join(sorted(roles)) + " ⚠"
             elif roles:
                 role = roles[0]
                 h = health.get(role)
@@ -850,12 +850,9 @@ class CamerasDialog(tk.Toplevel):
             elif avoided:
                 # 内置/红外这两台是**被物理遮住的**（本机就是这么配的），
                 # 点它们预览必然是黑屏。在列表里直接标出来，别让人以为是外接那台。
-                role = "内置/红外(多半无画面)"
+                role = "内置/红外"
             else:
                 role = "—"
-            loc = "、".join(dict.fromkeys(
-                cr.location_text(reg.roles[r]) for r in roles
-                if r in reg.roles)) if roles else LOCATION_UNSET_TEXT
             caps = [reg.roles[r].capture_index for r in roles
                     if r in reg.roles and reg.roles[r].capture_index is not None]
             cap = ("、".join(f"#{c}" for c in dict.fromkeys(caps))
@@ -863,7 +860,7 @@ class CamerasDialog(tk.Toplevel):
             self.tree.insert(
                 "", "end", iid=str(d.order),
                 values=(f"#{d.order}", d.name or "(没名字)",
-                        d.port or "—", loc or LOCATION_UNSET_TEXT, cap, role))
+                        d.port or "—", cap, role))
         # 2026-11-07 用户质疑「按钮不像真的在执行命令」——复现到了：
         # Treeview 默认**没有任何选中行**，而「预览这台 / 设为左 / 设为右」
         # 全都依赖 `_selected()`，于是点下去只回一句"先在左边选一台设备"，

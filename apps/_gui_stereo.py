@@ -1294,7 +1294,7 @@ class StereoWindow(tk.Toplevel):
                 if spec is None:
                     missing.append(f"{v} 未绑定")
                 elif spec.capture_index is None:
-                    label = spec.location or spec.name or v
+                    label = spec.name or v
                     missing.append(f"{v}（{label}）采集索引未实测")
             if missing:
                 cam_why = ("相机：" + "；".join(missing)

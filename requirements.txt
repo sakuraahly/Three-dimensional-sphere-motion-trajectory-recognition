@@ -3,7 +3,10 @@ numpy>=1.24
 # scipy：3D 轨迹平滑（Savitzky-Golay）与双目标定外参精化（least_squares）用；
 # 缺失不会崩，但会静默降级为滑动平均 / 跳过外参精化，精度悄悄变差。
 scipy>=1.10
-opencv-contrib-python>=4.8
+# Windows + Media Foundation：5.1.0 在部分机器上直接报
+# "backend is generally available but can't be used to capture by index"，
+# 所有相机（含内置）都打不开；5.0.0 已实测可用。不要放宽成 >=。
+opencv-contrib-python==5.0.0.93
 matplotlib>=3.7
 Pillow>=9.0        # GUI 点选球心（apps/seed_picker.py）用 ImageTk 显示视频帧
 

@@ -2791,13 +2791,14 @@ def test_identify_no_console_fails_loudly() -> bool:
                 and "is_virtual(d.name, reg.settings)" in src)
 
     checks += [
-        ("对话框列名写明「PnP 位次（非采集索引）」",
-         "PnP 位次（非采集索引）" in dlg_src),
+        ("对话框列名写明「PnP 位次」，且说明它不等于采集索引",
+         'heading("idx", text="PnP 位次")' in dlg_src
+         and "不是采集索引" in dlg_src),
         ("对话框有「采集索引」列，未实测时写「未实测」",
          'heading("cap", text="采集索引")' in dlg_src
          and "CAPTURE_UNMEASURED_TEXT" in dlg_src and "未实测" in dlg_src),
-        ("对话框保留「位置」显示，但没有床/阳台门测试按钮",
-         'heading("loc", text="位置")' in dlg_src
+        ("对话框没有「位置」列（床/阳台门已删除）",
+         'heading("loc", text="位置")' not in dlg_src
          and "标为床" not in dlg_src and "标为阳台门" not in dlg_src
          and "set_location(" not in dlg_src),
         ("对话框的 is_avoided / is_virtual **全部**带 reg.settings（不再忽略用户配置）",
@@ -2805,8 +2806,8 @@ def test_identify_no_console_fails_loudly() -> bool:
         ("反向（真变异）：把一处 settings 去掉 -> 判据会红",
          not avoid_guard_ok(dlg_src.replace("is_avoided(d.name, reg.settings)",
                                            "is_avoided(d.name)", 1))),
-        ("对话框把虚拟摄像头标成「虚拟(不参与绑定)」并拒绝设角色",
-         "虚拟(不参与绑定)" in dlg_src),
+        ("对话框把虚拟摄像头标成「虚拟(不绑定)」并拒绝设角色",
+         "虚拟(不绑定)" in dlg_src),
         ("对话框 phantom 索引命中时用 phantom_index_warning（共用一份文案）",
          "phantom_index_warning" in dlg_src),
         ("identify 会写入 capture_index；pin 支持 capture-index:N",

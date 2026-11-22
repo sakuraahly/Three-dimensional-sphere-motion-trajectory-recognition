@@ -1150,8 +1150,7 @@ def cmd_modes(args) -> int:
     for target in targets:
         idx = target["capture_index"]
         if not args.json:
-            print(f"[{target['role']}] 采集 #{idx}  {target['name'] or '(无名字)'}"
-                  + (f"  位置 {target['location']}" if target["location"] else ""))
+            print(f"[{target['role']}] 采集 #{idx}  {target['name'] or '(无名字)'}")
         results = cr.probe_modes(
             idx, modes, fps_list=fps_list, backend=api,
             sample_s=args.sample, first_frame_timeout_s=args.first_frame_timeout,
@@ -2202,9 +2201,6 @@ def cmd_check(args) -> int:
         for w in res.warnings:
             print(f"        [警告] {w}")
 
-        # 「位置」标签：只显示，不参与解析。两台同型号 aoni 在软件层面不可区分，
-        # 位置（床 / 阳台门）是用户唯一能自证"哪台是哪台"的信息，check 里也该看得见。
-        print(f"        [位置] {cr.location_text(spec)}")
         if cr.is_virtual(spec.name, reg.settings):
             danger = True
             print(f"        [危险] 这个角色绑的是**虚拟摄像头**「{spec.name}」—— "
@@ -2431,6 +2427,13 @@ def cmd_doctor(args) -> int:
         print("枚举不到任何相机设备（非 Windows / 注册表不可读 / 真的没插）。")
         return 1
 
+    exe = Path(sys.executable)
+    print(f"\nPython：{exe}")
+    if exe.drive.upper() not in ("", "C:"):
+        print("    ⚠ 这个 Python 不在 C: 盘。Windows 相机权限在部分机器上会拒绝"
+              "非系统盘进程，MSMF/DSHOW 都会报 can't capture by index；"
+              "安装器已把内嵌运行时固定到 %LOCALAPPDATA%\\SphereMotion\\runtime。")
+
     privacy, privacy_text = cr.camera_privacy_status()
     print(f"\n相机隐私：{privacy_text}")
     if privacy == "denied":
@@ -2463,8 +2466,8 @@ def cmd_doctor(args) -> int:
         try:
             r = cr.resolve_role(role, reg, devices, interactive=False)
             resolved[role] = r.index
-            print(f"    「{role}」-> 采集 #{r.index}（how={r.how}，位置 "
-                  f"{cr.location_text(spec)}，PnP 位次 #{spec.index}）")
+            print(f"    「{role}」-> 采集 #{r.index}（how={r.how}，"
+                  f"PnP 位次 #{spec.index}）")
         except cr.CaptureIndexNotVerified as exc:
             # **不拿 PnP 位次去开相机**：这条命令会真的开设备，而猜测的编号
             # 会开到另一台（内置 / 虚拟 / 红外），测出来的结论整个失真。

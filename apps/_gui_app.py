@@ -299,31 +299,22 @@ class AppState:
             bits.append(f"编号 {hit.order}")
             if not info.get("verified"):
                 bits.append("未确认")
-        # 「位置」与「采集索引」：两者都不是"编号"，必须分开写清楚。
-        # 位置（床 / 阳台门）是用户唯一能用人的知识回答"这台是哪台"的字段；
         # 采集索引是 `cv2.VideoCapture` 真正用的号，**未实测就写"未实测"**，
         # 不许拿 PnP 编号冒充（那正是"显示的相机 ≠ 真实相机"的来源）。
-        where = str(info.get("location") or "").strip()
-        if where:
-            bits.append(f"位置 {where}")
         cap = info.get("capture_index")
         bits.append(f"采集 #{cap}" if isinstance(cap, int) else "采集索引未实测")
         return "，".join(bits)
 
     def camera_role_short(self, role: str) -> str:
-        """双目第①步那一行用的**短标签**：优先位置（床/阳台门），否则设备名。
+        """双目第①步那一行用的**短标签**：设备名，不显示已废弃的“位置”。
 
-        为什么单独一个出口：完整 `camera_role_text()` 现在带 PnP 位次、位置、
-        采集索引三组信息，两路一拼会超过相机行的换行边界（实测大角度窗
-        内容高出 16 px，`selftest_window_mode` 红）。身份/采集状态在
-        「换相机…」对话框里看，不靠把这一行撑宽。
+        为什么单独一个出口：完整 `camera_role_text()` 带 PnP 位次、采集索引，
+        两路一拼会超过相机行的换行边界（实测大角度窗内容高出 16 px，
+        `selftest_window_mode` 红）。身份/采集状态在「换相机…」对话框里看。
         """
         info = self.camera_roles().get(role)
         if not isinstance(info, dict):
             return f"{role}：未固定"
-        where = str(info.get("location") or "").strip()
-        if where:
-            return where
         name = str(info.get("name") or "").strip()
         return f"{role}={name}" if name else f"{role}：未固定"
 

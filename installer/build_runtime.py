@@ -30,6 +30,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE_TAG = "20261110"
 PY_VERSION = "3.14.10"
+# 与 requirements.txt 的 pin 保持一致；版本不符时必须重建，不能复用旧 stage。
+EXPECTED_CV2 = "5.0.0"
 ARCHIVE = f"cpython-{PY_VERSION}+{RELEASE_TAG}-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
 URL = (f"https://github.com/astral-sh/python-build-standalone/releases/download/"
        f"{RELEASE_TAG}/cpython-{PY_VERSION}%2B{RELEASE_TAG}-x86_64-pc-windows-msvc-install_only_stripped.tar.gz")
@@ -127,12 +129,26 @@ def prune_runtime() -> int:
     return removed
 
 
+def cv2_version() -> str:
+    exe = STAGE / "python.exe"
+    if not exe.is_file():
+        return ""
+    r = subprocess.run(
+        [str(exe), "-c", "import cv2; print(cv2.__version__)"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def build(force: bool) -> None:
     download()
     if STAGE.is_dir() and not force:
-        removed = prune_runtime()
-        log(f"已有运行时 {STAGE}（{size_mb(STAGE):.0f} MB），跳过构建；清理 {removed} 处")
-        return
+        got = cv2_version()
+        if got == EXPECTED_CV2:
+            removed = prune_runtime()
+            log(f"已有运行时 {STAGE}（{size_mb(STAGE):.0f} MB，OpenCV {got}），"
+                f"跳过构建；清理 {removed} 处")
+            return
+        log(f"已有运行时 OpenCV={got or '无法读取'}，期望 {EXPECTED_CV2}，重建…")
 
     if STAGE.is_dir():
         log("删除旧运行时…")
@@ -173,10 +189,17 @@ def check() -> int:
     r = subprocess.run([str(STAGE / "python.exe"), "-c", PROBE],
                        capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
-    print(f"[runtime] {size_mb(STAGE):.0f} MB, import {'OK' if r.returncode == 0 else 'FAIL'}")
-    if r.returncode != 0:
-        print(r.stderr)
-    return r.returncode
+    got = cv2_version()
+    ok = r.returncode == 0 and got == EXPECTED_CV2
+    print(f"[runtime] {size_mb(STAGE):.0f} MB, OpenCV {got or '?'}, "
+          f"import {'OK' if r.returncode == 0 else 'FAIL'}")
+    if not ok:
+        if r.returncode != 0:
+            print(r.stderr)
+        if got != EXPECTED_CV2:
+            print(f"[runtime] 版本不符：期望 OpenCV {EXPECTED_CV2}")
+        return 1
+    return 0
 
 
 def main() -> int:
@@ -187,7 +210,12 @@ def main() -> int:
     if args.check:
         return check()
     build(args.force)
-    return check()
+    rc = check()
+    # check 会 import cv2/scipy，重新生成 __pycache__；必须在打包前再清一次，
+    # 否则 Inno 会去压缩几百个深层 .pyc（CI 的 MAX_PATH 就是这么爆的）。
+    removed = prune_runtime()
+    log(f"check 后清理 {removed} 处")
+    return rc
 
 
 if __name__ == "__main__":

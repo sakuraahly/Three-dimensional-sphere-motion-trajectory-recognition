@@ -14,12 +14,13 @@
 ;      不用自己装 Python），也可选本机已有 python.exe。选定后写入
 ;      config/python_env.txt —— 与 setup_env.py 的 write_pointer 同格式，
 ;      Go launcher / bat / Python 三方同读这一份真相；
-;   4. 内嵌运行时按选择装：选"自带"才复制 runtime\（几百 MB），选"自己的"
-;      就不复制，避免白占磁盘。
+;   4. 内嵌运行时按选择装：选"自带"才复制到 {localappdata}\SphereMotion\runtime
+;      （几百 MB，固定 C: 盘；Windows 相机权限会拒绝非系统盘进程），
+;      选"自己的"就不复制，避免白占磁盘。
 ; ===========================================================================
 
 #define AppName "球形物体三维运动轨迹识别"
-#define AppVer "0.3.0"
+#define AppVer "0.3.1"
 #define Publisher "SphereMotion"
 #define AppId "6E4A1B7C-2D9F-4A3E-9B11-5C8D7E2F0A44"
 ; ISCC 把脚本所在目录（installer\）当相对路径基准，回退一层到仓库根。
@@ -66,8 +67,11 @@ Name: "startmenu"; Description: "创建开始菜单快捷方式 / Create Start M
 [Files]
 ; 源码 + 文档 + 标定板 + launcher.exe（永远装）
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "runtime\*"
-; 内嵌 Python 运行时：只有用户选"用自带的"才复制（几百 MB，按需）
-Source: "{#StageDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: WantBundledPython
+; 内嵌 Python 运行时：只有用户选"用自带的"才复制（几百 MB，按需）。
+; **必须放 C: 盘**：Windows 相机权限在部分机器上会拒绝 D: 等非系统盘上的进程，
+; MSMF/DSHOW 都会报“can't be used to capture by index”（内置相机也一样）。
+; 应用本身允许装在其他盘，但 Python 进程固定到 {localappdata}（默认 C:）。
+Source: "{#StageDir}\runtime\*"; DestDir: "{localappdata}\SphereMotion\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: WantBundledPython
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: startmenu
@@ -79,11 +83,16 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: desktop
 ; 完成后可选打开说明书（不强制启动 GUI）
 Filename: "{app}\README.md"; Description: "查看快速开始说明 / View quick start"; Flags: postinstall skipifsilent unchecked
 
+[InstallDelete]
+; 旧版本把 runtime 放在 {app}；升级时清掉，避免 D: 上的旧 Python 被误用。
+Type: filesandordirs; Name: "{app}\runtime"
+
 [UninstallDelete]
-; 运行时是程序本身，永远删。
+; 运行时是程序本身，永远删（现在固定在 C: 的 localappdata）。
 ; 用户数据（config / data / logs / outputs）由 [Code] 的卸载选项决定：
 ; 「只删程序」保留；「程序+数据」才 DelTree。
 Type: filesandordirs; Name: "{app}\runtime"
+Type: filesandordirs; Name: "{localappdata}\SphereMotion\runtime"
 
 [Code]
 // ---------------------------------------------------------------------------
@@ -227,7 +236,8 @@ begin
 
   if WantBundledPython then
   begin
-    ChosenPython := 'runtime/python/python.exe';  // 相对 {app}，Go/bat 按 root 还原
+    // 绝对路径：运行时不跟 {app} 走，固定放 C:（见 [Files] 的说明）。
+    ChosenPython := ExpandConstant('{localappdata}\SphereMotion\runtime\python\python.exe');
     ChosenKind := 'bundled';
   end
   else

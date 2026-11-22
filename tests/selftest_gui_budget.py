@@ -1183,11 +1183,11 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
     out.append(("一键全流程调用 _actions.run_all（不在这里重写三步）",
                 "_actions.run_all(s.path)" in bench_src))
 
-    # 双目第①步的相机行必须用短标签（位置优先），否则两路完整状态一拼
+    # 双目第①步的相机行必须用短标签（设备名），否则两路完整状态一拼
     # 就会换行，大角度窗内容高出 16 px（selftest_window_mode 的实测）。
     app_src = (root / "apps" / "_gui_app.py").read_text(encoding="utf-8")
     stereo_src = (root / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
-    out.append(("相机行用短标签（位置优先，不把完整采集状态塞进第①步）",
+    out.append(("相机行用短标签（设备名，不把完整采集状态塞进第①步）",
                 "def camera_role_short" in app_src
                 and 'camera_role_short("left")' in stereo_src
                 and 'camera_role_text("left")' not in stereo_src))

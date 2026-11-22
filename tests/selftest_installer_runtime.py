@@ -52,12 +52,15 @@ def main() -> int:
                    "ShouldSkipPage" in iss and "PathPage.ID" in iss))
     checks.append((".iss 校验所选解释器能 import cv2/numpy",
                    "import cv2, numpy" in iss))
-    checks.append((".iss 运行时按选择装（Check: WantBundledPython）",
-                   "WantBundledPython" in iss and "runtime\\*" in iss))
+    checks.append((".iss 运行时按选择装到 C: 的 localappdata（Check: WantBundledPython）",
+                   "WantBundledPython" in iss
+                   and 'DestDir: "{localappdata}\\SphereMotion\\runtime"' in iss
+                   and "runtime\\*" in iss))
     checks.append(("默认安装目录在 C 盘用户级 Programs",
                    "DefaultDirName={userpf}\\SphereMotion" in iss))
-    checks.append((".iss 卸载清掉 runtime，并提供只删程序/程序+数据选择",
+    checks.append((".iss 卸载清掉两处 runtime，并提供只删程序/程序+数据选择",
                    "filesandordirs; Name: \"{app}\\runtime\"" in iss
+                   and "filesandordirs; Name: \"{localappdata}\\SphereMotion\\runtime\"" in iss
                    and "InitializeUninstall" in iss
                    and "DeleteUserData" in iss
                    and "UninstallSilent" in iss
@@ -100,8 +103,9 @@ def main() -> int:
     # 2. 写指针协议与 setup_env.py 一致
     for key in ("python=", "kind=", "created=", "python_version=", "verified="):
         checks.append((f".iss 写指针含 {key}", f"lines.Add('{key}" in iss))
-    checks.append((".iss 内嵌解释器写相对路径（换机仍指对）",
-                   "runtime/python/python.exe" in iss))
+    checks.append((".iss 内嵌解释器写 C: 的绝对路径（换机仍指对）",
+                   "ExpandConstant('{localappdata}\\SphereMotion\\runtime\\python\\python.exe')"
+                   in iss))
     checks.append(("setup_env.py 用同一指针格式",
                    "sphere-python-env v1" in setup and "def write_pointer" in setup))
     checks.append(("setup_env.py 仓库内写相对路径",
