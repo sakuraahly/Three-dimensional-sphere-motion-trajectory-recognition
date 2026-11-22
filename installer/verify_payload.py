@@ -74,8 +74,11 @@ def main() -> int:
     if problems:
         return _fail(problems)
 
-    n = sum(1 for _ in STAGE.rglob("*") if _.is_file())
-    print(f"payload 自检通过：{n} 个文件，关键入口齐全，launcher.exe 合法，.iss 引用可达")
+    # runtime 是几百 MB 的构建产物，单独报，不计入源码文件数
+    n = sum(1 for p in STAGE.rglob("*") if p.is_file() and "runtime" not in p.relative_to(STAGE).parts)
+    print(f"payload 自检通过：{n} 个源码文件，关键入口齐全，launcher.exe 合法，.iss 引用可达")
+    rt = STAGE / "runtime" / "python" / "python.exe"
+    print(f"内嵌运行时：{'已就绪 ' + str(round(rt.stat().st_size/1024/1024,1)) + ' MB' if rt.is_file() else '未构建（运行 build_runtime.py 或 build_installer.bat 会补上）'}")
     print("下一步：装好 Inno Setup 6 后双击 installer\\build_installer.bat")
     return 0
 

@@ -2,24 +2,29 @@
 ; 球形物体三维运动轨迹识别 —— Windows 安装程序（Inno Setup 6）
 ;
 ; 由 installer\build_installer.bat 一键编译；payload 来自
-; apps\tools\make_clean_bundle.py 的纯净包 + 根目录 launcher.exe。
+; apps\tools\make_clean_bundle.py 的纯净包 + launcher.exe + 内嵌 Python 运行时。
 ;
 ; 设计原则（别改错）：
 ;   1. 装到 {localappdata}，不写 Program Files → 免管理员、无 UAC、无签名摩擦；
 ;   2. 卸载用 Inno 自带卸载器（可靠、可回滚）；uninstall.bat 只作为文件保留给
 ;      高级用户，不作为卸载入口 —— 两套删除逻辑并存必然打架；
-;   3. 安装过程**不自动装 Python 依赖** —— 首次启动 launcher.exe 会检测环境，
-;      缺则弹窗引导跑 install.bat。安装器保持"复制文件"这一件事，失败面最小。
+;   3. 安装向导里让用户选解释器：默认用安装包自带的 Python 3.14（开箱即用，
+;      不用自己装 Python），也可选本机已有 python.exe。选定后写入
+;      config/python_env.txt —— 与 setup_env.py 的 write_pointer 同格式，
+;      Go launcher / bat / Python 三方同读这一份真相；
+;   4. 内嵌运行时按选择装：选"自带"才复制 runtime\（几百 MB），选"自己的"
+;      就不复制，避免白占磁盘。
 ; ===========================================================================
 
 #define AppName "球形物体三维运动轨迹识别"
-#define AppVer "0.2.0"
+#define AppVer "0.3.0"
 #define Publisher "SphereMotion"
 #define AppId "6E4A1B7C-2D9F-4A3E-9B11-5C8D7E2F0A44"
-; NOTE: ISCC 把脚本所在目录（installer\）当作相对路径基准，所以回退一层到仓库根。
+; ISCC 把脚本所在目录（installer\）当相对路径基准，回退一层到仓库根。
 #define StageDir "..\outputs\release_stage"
 #define OutDir "..\outputs\releases"
 #define OutBase "SphereMotion-" + AppVer + "-setup"
+#define PointerRel "config\python_env.txt"
 
 [Setup]
 AppId={#AppId}
@@ -34,31 +39,27 @@ Compression=lzma2/max
 SolidCompression=yes
 ; 免管理员：不写 Program Files、不写 HKLM
 PrivilegesRequired=lowest
-; 图标来自 Go launcher 的源码资源（纯净包里已带）
 SetupIconFile={#StageDir}\native\launcher\icon.ico
 UninstallDisplayIcon={app}\launcher.exe
-; 中文界面（Inno Setup 6 自带）
 ShowLanguageDialog=no
 LanguageDetectionMethod=locale
-; 升级覆盖：同一 AppId 重装时提示
 DisableDirPage=auto
+; 需要展示自定义向导页（单选项 + 文件选择），不能用 /VERYSILENT 时静默跳过
+; —— 但 silent 安装时 NextButtonClick 仍会被调用，默认值可用。
 
 [Languages]
-; 用内置英文界面：winget 装的国际版只带 29 种欧洲语言，不含中文 .isl。
-; 想要中文向导，从 https://jrsoftware.org/download.php/islang.exe 下载后
-; 把 ChineseSimplified.isl 放进 Inno 的 Languages\ 目录，再把下一行换成：
-;   Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; winget 国际版只带欧洲语言，不含中文 .isl。中文向导见发布规范 §6。
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-; 两个快捷方式任务都默认不勾选，由用户自己决定 —— 避免依赖版本敏感的
-; "Checked" 参数/flag（本机 Inno 6.7.3 两者都不接受，见 build 记录）。
 Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Shortcuts:"
 Name: "startmenu"; Description: "Create Start Menu shortcuts"; GroupDescription: "Shortcuts:"
 
 [Files]
-; 整个 payload 原样装入（源码 + 文档 + 标定板 + launcher.exe）
-Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 源码 + 文档 + 标定板 + launcher.exe（永远装）
+Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "runtime\*"
+; 内嵌 Python 运行时：只有用户选"用自带的"才复制（几百 MB，按需）
+Source: "{#StageDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: WantBundledPython
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: startmenu
@@ -67,15 +68,143 @@ Name: "{group}\卸载"; Filename: "{uninstallexe}"; Tasks: startmenu
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: desktopicon
 
 [Run]
-; 不自动启动：安装完成后由用户自己双击（首次启动会引导装环境）
-; 这里只写一个"打开说明书"的可选勾选项
+; 完成后可选打开说明书（不强制启动 GUI）
 Filename: "{app}\README.md"; Description: "查看快速开始说明"; Flags: postinstall skipifsilent unchecked
 
 [UninstallDelete]
-; 运行期产物不入库但会生成在用户目录，卸载时一并清掉（只删安装目录内）
+; 运行期产物 + 内嵌运行时 + 环境指针：都在安装目录内，卸载一并清掉
+Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\config\python_env.txt"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\outputs"
 
-[Messages]
-english.WelcomeLabel2=安装 {#AppName} {#AppVer} to your user directory.{newline}{newline}Setup only copies files; it never touches your system Python. On first launch, the app will guide you through installing the runtime if missing.
+[Code]
+// ---------------------------------------------------------------------------
+// 解释器选择：两个标准向导页 + 写环境指针。
+// 用 CreateInputOptionPage / CreateInputFilePage / ShouldSkipPage /
+// NextButtonClick / CurStepChanged 全部是 Inno 6 官方 API（见 is6help）。
+// ---------------------------------------------------------------------------
+var
+  ChoicePage: TInputOptionWizardPage;
+  PathPage: TInputFileWizardPage;
+  ChosenPython: String;
+  ChosenKind: String;
+
+procedure InitializeWizard;
+begin
+  // 单选页：绑在"选择安装位置"之后。Exclusive=True → 单选按钮。
+  ChoicePage := CreateInputOptionPage(wpSelectDir,
+    'Python runtime',
+    'Choose which Python interpreter to use',
+    'This package includes a ready-to-use Python 3.14 runtime with all dependencies ' +
+      '(OpenCV, NumPy, SciPy, Tkinter). You may also use a Python already installed ' +
+      'on this computer. You can change this later by editing config\python_env.txt.',
+    True, False);
+  ChoicePage.Add('Use the bundled Python 3.14 (recommended, nothing else to install)');
+  ChoicePage.Add('Use a Python interpreter already installed on this computer');
+  ChoicePage.SelectedValueIndex := 0;
+
+  // 文件选择页：绑在单选页之后，只有选"自己的"才显示。
+  PathPage := CreateInputFilePage(ChoicePage.ID,
+    'Select Python interpreter',
+    'Locate python.exe',
+    'Select the python.exe to use. It must be able to import cv2 and numpy.');
+  PathPage.Add('python.exe:', 'Python executable|python.exe|All files|*.*', '.exe');
+  PathPage.Values[0] := '';
+end;
+
+// 选"自带的"时跳过文件选择页。
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = PathPage.ID) and (ChoicePage.SelectedValueIndex = 0) then
+    Result := True;
+end;
+
+// [Files] 的 Check：选"自带的"才复制 runtime\。
+function WantBundledPython: Boolean;
+begin
+  Result := ChoicePage.SelectedValueIndex = 0;
+end;
+
+// 校验用户选的 python.exe：存在 + 能 import cv2/numpy。
+// 静默安装（/VERYSILENT）时也会走到这里，默认值=0 不需要校验路径。
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  py: String;
+  rc: Integer;
+begin
+  Result := True;
+  if CurPageID <> PathPage.ID then Exit;
+  if ChoicePage.SelectedValueIndex = 0 then Exit;
+
+  py := Trim(PathPage.Values[0]);
+  if (py = '') or not FileExists(py) then
+  begin
+    MsgBox('Please select a valid python.exe path.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  // -c 探针：真跑一次 import，不靠"路径看起来对"。SW_HIDE 避免弹黑框。
+  if Exec(py, '-c "import cv2, numpy"', '', SW_HIDE, ewWaitUntilTerminated, rc) then
+  begin
+    if rc <> 0 then
+    begin
+      MsgBox('This Python cannot import cv2 and numpy.' + #13#10 +
+             'Please choose another interpreter, or use the bundled one.', mbError, MB_OK);
+      Result := False;
+    end;
+  end
+  else
+  begin
+    MsgBox('Could not run the selected Python. Check the path and try again.', mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+// 安装完成时写 config/python_env.txt。
+// 格式与 apps/setup_env.py 的 write_pointer() 一致：
+//   python=<相对或绝对路径>  kind=...  created=...  python_version=...  verified=...
+function PyVer: String;
+begin
+  if WantBundledPython then Result := '3.14.10' else Result := 'external';
+end;
+
+function VerifiedList: String;
+begin
+  if WantBundledPython then Result := 'cv2,numpy,scipy,tkinter' else Result := 'cv2,numpy';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  lines: TStringList;
+begin
+  if CurStep <> ssPostInstall then Exit;
+
+  if WantBundledPython then
+  begin
+    ChosenPython := 'runtime/python/python.exe';  // 相对 {app}，Go/bat 按 root 还原
+    ChosenKind := 'bundled';
+  end
+  else
+  begin
+    ChosenPython := Trim(PathPage.Values[0]);
+    ChosenKind := 'adopted';
+  end;
+
+  lines := TStringList.Create;
+  try
+    lines.Add('# sphere-python-env v1 - generated by installer; do not edit');
+    lines.Add('python=' + ChosenPython);
+    lines.Add('kind=' + ChosenKind);
+    lines.Add('created=by-installer');
+    lines.Add('python_version=' + PyVer);
+    lines.Add('verified=' + VerifiedList);
+    // 确保 config\ 存在（源码包里有 .gitkeep，已随 [Files] 装好）
+    if not DirExists(ExpandConstant('{app}\config')) then
+      CreateDir(ExpandConstant('{app}\config'));
+    lines.SaveToFile(ExpandConstant('{app}\' + '{#PointerRel}'));
+  finally
+    lines.Free;
+  end;
+end;

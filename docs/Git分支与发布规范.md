@@ -71,29 +71,48 @@ git bundle create outputs/backups/repo-<tag>.bundle --all
 分支门禁（§3）管"代码能不能进 main"，本节管"怎么把当前 dev 打成能发给别人的包"。
 **当前 dev 未验收，只允许制作 dev 快照包给自己/协作者试用，不得当正式版发布。**
 
-### 6.1 三种包，按使用者选
+### 6.1 两种包，按使用者选
 
 | 形态 | 命令 | 产物 | 门槛 |
 | --- | --- | --- | --- |
 | 源码 zip | `python apps/tools/make_clean_bundle.py` | `outputs/clean_bundle_*.zip`（约 3 MiB） | 使用者需自装 Python 3.10+ |
-| Windows 安装程序 | `installer\build_installer.bat` | `outputs/releases/SphereMotion-<版本>-setup.exe` | 制作机需 Inno Setup 6；使用者双击即可 |
-| 免安装绿色包 | 规划中（内嵌 Python + 预装依赖） | 文件夹/zip，解压即用 | 制作时需处理 opencv/scipy 的 DLL |
+| **Windows 安装程序（推荐）** | `installer\build_installer.bat` | `outputs/releases/SphereMotion-<版本>-setup.exe`（约 200 MB） | 制作机需 Inno Setup 6；**使用者不用装 Python**，向导里选自带或自带之外的解释器 |
+
+> 原"免安装绿色包"方案已并入 Windows 安装程序：内嵌 Python 由向导的单选项
+> "Use the bundled Python 3.14" 提供，选它即等价于绿色包体验（解压到用户目录即用）。
 
 ### 6.2 制作 setup.exe 的前置与核对
 
 ```bat
 winget install --id JRSoftware.InnoSetup -e     :: 系统级安装，只做一次
-python installer\verify_payload.py              :: 不装 Inno 也能先验 payload
-installer\build_installer.bat                   :: 一键出 setup.exe
+python installer\verify_payload.py              :: 不装 Inno 也能先验源码 payload
+python installer\build_runtime.py --check       :: 只校验内嵌运行时（不重建）
+installer\build_installer.bat                   :: 一键出 setup.exe（含运行时下载/构建）
 ```
 
-`build_installer.bat` 内部做三件事，缺一就停：
+`build_installer.bat` 内部做四件事，缺一就停：
 1. `make_clean_bundle.py` 出纯净源码包（**包内容只有这一份真相**，不在 .iss 里重写清单）；
-2. 解压到 `outputs/release_stage` 并放入根目录的 `launcher.exe`（没有就报错，提示先编译）；
-3. 调 `ISCC.exe installer\sphere_motion.iss` 产出 setup.exe。
+2. `build_runtime.py` 构建内嵌 Python：下载 python-build-standalone 官方
+   `3.14.10+20261110` install_only_stripped（**固定 sha256 `32b6cf90…efaab8f`**），
+   装齐 `requirements.txt`，删 `__pycache__`/包自带 tests（约 390 MB）；有缓存就跳过；
+3. 把 runtime 挪出 staging 后解压源码包、放入 `launcher.exe`、再挪回 runtime
+   （几百 MB 产物不被 rmdir 误删）；
+4. 调 `ISCC.exe installer\sphere_motion.iss` 产出 setup.exe。
 
-装到 `{localappdata}\SphereMotion`、免管理员；不自动装依赖（首次启动 launcher 引导）；
-卸载用 Inno 自带卸载器，不用 `uninstall.bat`。
+**内嵌运行时的设计**：版本/URL/sha256/依赖/精简策略全集中在 `installer/build_runtime.py`
+顶部（单一真相）；产物 `outputs/release_stage/runtime/` 是**构建产物，被 gitignore、
+不入库、不进源码 zip**，只在 setup.exe 里出现。源码仓库因此保持轻量。
+
+**向导里的解释器选择（Inno Pascal Script，`sphere_motion.iss` 的 `[Code]`）**：
+- `CreateInputOptionPage` 单选：默认"用自带的 Python 3.14"，或"本机已有 python.exe"；
+- `CreateInputFilePage` + `NextButtonClick`：选外部解释器时浏览选路径，并真跑
+  `import cv2, numpy` 校验，不合格不让继续；
+- `ShouldSkipPage`：选自带时跳过路径页；`Check: WantBundledPython`：选自带才复制 runtime；
+- `CurStepChanged(ssPostInstall)`：写 `config/python_env.txt`（与 `setup_env.py`
+  的 `write_pointer()` 同格式，`python=` 用相对路径 `runtime/python/python.exe`），
+  Go launcher / bat / Python 三方同读这一份。以后换解释器改该文件的 `python=` 即可。
+
+装到 `{localappdata}\SphereMotion`、免管理员；卸载用 Inno 自带卸载器，不用 `uninstall.bat`。
 
 **2026-11-22 实测过的编译坑（别再踩）**：
 
@@ -103,11 +122,13 @@ installer\build_installer.bat                   :: 一键出 setup.exe
 | `/S<dir>` | 以为能设 SourceDir，实际是 SignTool 选项 | 别用；用相对路径 |
 | 中文语言包 | winget 国际版只有 29 种欧洲 `.isl`，无中文 | 用 `compiler:Default.isl`（英文向导）；要中文从官网下语言包 |
 | Tasks 默认勾选 | `Flags: checked/unchecked`、`Checked: yes` 本机 6.7.3 全报错 | 两个 task 都不默认勾选，用户自己选 |
+| 日期格式化 | `FormatDateTime`/`DateToStr` 在 Inno 脚本子集里都不存在 | `created=` 写固定值 `by-installer`（只是元数据，非判据） |
+| `CreateInputFilePage` 参数 | 只收 4 个参数（AfterID + 3 文案），多传一个空串报错 | 按 Inno 6 官方签名传 |
 | winget 安装路径 | 不是 Program Files，而是 `%LOCALAPPDATA%\Programs\Inno Setup 6` | `build_installer.bat` 三个路径都试 |
 
-编译结果：`outputs/releases/SphereMotion-0.2.0-setup.exe`（4.54 MB，合法 PE，不入库）。
-安装未在本机执行（安全策略拦了执行安装包）——编译自检 + payload 自检全过，
-真正安装验证请由人双击 setup.exe 完成。
+编译结果：`outputs/releases/SphereMotion-0.3.0-setup.exe`（内嵌 Python 3.14.10，
+约 200 MB，合法 PE，不入库）。安装未在本机执行（安全策略拦了执行安装包）——
+编译自检 + payload 自检 + 内嵌 import 自检全过，真正安装验证请由人双击 setup.exe 完成。
 
 ### 6.3 发布到 GitHub Release（需用户批准）
 

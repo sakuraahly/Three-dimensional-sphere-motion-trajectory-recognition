@@ -6,7 +6,8 @@ rem
 rem  前置：装好 Inno Setup 6（https://jrsoftware.org/isinfo.php）
 rem        winget 用户可先跑： winget install --id JRsoftware.InnoSetup -e
 rem  用法：双击本文件，或命令行 build_installer.bat
-rem  产物：outputs\releases\SphereMotion-0.2.0-setup.exe
+rem  产物：outputs\releases\SphereMotion-0.3.0-setup.exe
+rem        内嵌 Python 3.14.10 + 依赖（约 390 MB，开箱即用）
 rem
 rem  设计要点（与项目其它入口保持一致）：
 rem   - 源码/入口不是这里复制的，来自 apps/tools/make_clean_bundle.py 的纯净包，
@@ -39,7 +40,7 @@ if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" (
 
 rem 找 Python：优先外部传入的 PY 环境变量，其次 PATH 里的 python
 if not defined PY set "PY=python"
-echo [1/3] 生成纯净源码包（用 %PY%）...
+echo [1/4] 生成纯净源码包（用 %PY%）...
 "%PY%" apps\tools\make_clean_bundle.py --out outputs\release_payload_src.zip
 if errorlevel 1 (
     echo [失败] 生成源码包失败。若 python 不在 PATH，请先设 PY，例如：
@@ -47,26 +48,40 @@ if errorlevel 1 (
     goto :fail
 )
 
-echo [2/3] 展开到 staging 并放入 launcher.exe...
+echo [2/4] 构建内嵌 Python 运行时（下载+依赖+精简，已有则跳过）...
+"%PY%" installer\build_runtime.py
+if errorlevel 1 (
+    echo [失败] 内嵌运行时构建失败（网络/sha256/依赖安装）。
+    goto :fail
+)
+
+echo [3/4] 展开到 staging 并放入 launcher.exe...
 if not exist "launcher.exe" (
     echo [失败] 根目录没有 launcher.exe，请先编译：
     echo        cd native\launcher ^&^& build.bat
     goto :fail
 )
+rem 运行时是几百 MB 的产物，先挪出 staging，避免被下面的 rmdir 删掉
+if exist outputs\release_stage\runtime move /y outputs\release_stage\runtime outputs\runtime_cache\staged >nul
 if exist outputs\release_stage rmdir /s /q outputs\release_stage
 mkdir outputs\release_stage
 pushd outputs\release_stage
 tar -xf ..\release_payload_src.zip
 copy /y ..\..\launcher.exe launcher.exe >nul
 popd
+if exist outputs\runtime_cache\staged move /y outputs\runtime_cache\staged outputs\release_stage\runtime >nul
+if not exist outputs\release_stage\runtime\python\python.exe (
+    echo [失败] staging 里没有内嵌运行时。
+    goto :fail
+)
 
-echo [3/3] 编译 setup.exe...
+echo [4/4] 编译 setup.exe...
 rem .iss 里的相对路径已带 ..\ 回退到仓库根（ISCC 以脚本所在目录为基准）
 "%ISCC%" installer\sphere_motion.iss
 if errorlevel 1 goto :fail
 
 echo.
-echo   完成： outputs\releases\SphereMotion-0.2.0-setup.exe
+echo   完成： outputs\releases\SphereMotion-0.3.0-setup.exe
 echo   只生成本地文件，未发布到 GitHub。
 pause
 exit /b 0
