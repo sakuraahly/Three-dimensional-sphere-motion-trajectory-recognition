@@ -73,6 +73,17 @@
 !/native/launcher/icon.rc
 !/native/launcher/icon.ico
 
+# ---------- Windows 安装程序（Inno Setup）的重建源码 ----------
+# 2026-11-22：installer/ 只放"可重建 setup.exe"的脚本，不放产物 exe
+# （产物随版本变、体积大，和 launcher.exe 一样只留源码）。
+# 打包时用 installer/build_installer.bat 一键编译；verify_payload.py 可在
+# 没装 Inno Setup 时先自检 payload 完整性。
+!/installer/
+/installer/**
+!/installer/*.iss
+!/installer/*.bat
+!/installer/*.py
+
 # ---------- 公开文档（GitHub 发布用，逐个列出） ----------
 # 2026-11-05 补：上面把 docs/ 整体排除了，但"其他资产全部没有"指的是实验数据、
 # 日志和内部史料，**说明文档恰恰是要带上的**。这里用精确白名单放行公开文档，

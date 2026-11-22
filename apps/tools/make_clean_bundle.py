@@ -77,14 +77,22 @@ EXTRA_BUILD_FILES = (
     "native/launcher/build.bat", "native/launcher/icon.rc",
     "native/launcher/icon.ico",
 )
+#: Windows 安装程序（Inno Setup）的重建脚本（setup.exe 产物不进包）。
+#: 与 native/launcher 同样对待：只带源码，拿到包的人能自己重建发布物。
+INSTALLER_FILES = (
+    "installer/sphere_motion.iss",
+    "installer/build_installer.bat",
+    "installer/verify_payload.py",
+)
 #: 发布包首页：本地 README.md 是内部状态概览，不适合当 GitHub 首页。
 #: 打包时用它替换根目录 README.md（名字不变，所以白名单与 zip 清单仍对得上）。
 GITHUB_README = ROOT / "docs" / "GitHub-README.md"
 
 ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf",
-                  ".go", ".mod", ".rc", ".ico"}
+                  ".go", ".mod", ".rc", ".ico", ".iss"}
 ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep"}
-TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".go", ".mod", ".rc"}
+TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".go", ".mod", ".rc",
+               ".iss"}
 FORBIDDEN_PARTS = {
     "outputs", "logs", "legacy", ".workbuddy", "__pycache__",
     ".git", "node_modules", "venv", ".venv",
@@ -111,6 +119,8 @@ def collect(*, with_tests: bool = True, with_assets: bool = True) -> list[Path]:
     for rel in PUBLIC_DOCS:
         add(ROOT / rel)
     for rel in EXTRA_BUILD_FILES:
+        add(ROOT / rel)
+    for rel in INSTALLER_FILES:
         add(ROOT / rel)
     dirs = PY_DIRS if with_tests else tuple(d for d in PY_DIRS if d != "tests")
     for d in dirs:
