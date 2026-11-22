@@ -45,6 +45,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from apps import _actions                                    # noqa: E402
+from apps import setup_env as _setup_env                     # noqa: E402
 from apps._gui_widgets import BG, Surface, ScrollPage, StatusBar  # noqa: E402
 
 #: 图片选择框的过滤器。`capture_board` 存的是 png，用户也可能拿手机拍 jpg。
@@ -87,10 +88,12 @@ class ToolsDialog(tk.Toplevel):
         self._build_export_calib(body)
         self._build_dataset(body)
         self._build_train(body)
+        self._build_env(body)
 
         self.status.set_status(
-            "这些是「跑一次、隔很久再跑」的离线步骤。点按钮后台跑，"
-            "进度在右下角「任务日志」；产物路径写在各卡片的说明里", "info")
+            "这些是「跑一次、隔很久再跑」的离线步骤；末尾可以切换 Python 运行环境。"
+            "点按钮后台跑，进度在右下角「任务日志」；产物路径写在各卡片的说明里",
+            "info")
 
     # ------------------------------------------------------------------ #
     # 通用小工具
@@ -116,10 +119,12 @@ class ToolsDialog(tk.Toplevel):
         return ents
 
     def _path_row(self, parent, label: str, value: str = "", *,
-                  kind: str = "file", title: str = "") -> ttk.Entry:
+                  kind: str = "file", title: str = "",
+                  filetypes=None) -> ttk.Entry:
         """``标签 [路径框____________] [浏览…]``。
 
         ``kind="dir"`` 走选目录，其余走选文件 —— 少一次"我怎么填路径"的犹豫。
+        ``filetypes`` 只影响文件选择框；解释器选择必须传 Python 过滤器。
         """
         row = self.surface._next_row(parent)
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
@@ -133,7 +138,8 @@ class ToolsDialog(tk.Toplevel):
                 got = filedialog.askdirectory(parent=self, title=title or label)
             else:
                 got = filedialog.askopenfilename(
-                    parent=self, title=title or label, filetypes=_IMAGE_TYPES)
+                    parent=self, title=title or label,
+                    filetypes=filetypes or _IMAGE_TYPES)
             if got:
                 ent.delete(0, "end")
                 ent.insert(0, got)
@@ -408,6 +414,43 @@ class ToolsDialog(tk.Toplevel):
         self._start(argv, "训练球检测器",
                     "训练已开始（长任务）。进度在「任务日志」；"
                     "中途要停就点状态条上的「中断」。跑完看日志末尾的圆心误差")
+
+    # ------------------------------------------------------------------ #
+    # ⑦ Python 运行环境（安装包/启动器同读的指针）
+    # ------------------------------------------------------------------ #
+    def _build_env(self, body) -> None:
+        box = self.surface.card(
+            body, "⑦ Python 运行环境",
+            "安装包、launcher.exe 和 run.bat 都只读 config/python_env.txt 这一份指针。"
+            "这里可以换成另一个人 python.exe；会真的 import 一遍核心依赖，"
+            "不合格不会写指针。切换后关掉本程序、重新打开 launcher/GUI 才生效。")
+        current = _setup_env.read_pointer()
+        self._env_status = self.surface.hint(
+            box, "当前：" + (str(current) if current is not None else "未登记（由启动器/安装器决定）"))
+        self._env_python = self._path_row(
+            box, "python.exe", "", title="选择 Python 解释器",
+            filetypes=(("Python", "python.exe"), ("可执行文件", "*.exe"),
+                       ("全部文件", "*.*")))
+        row = self.surface.action_row(box)
+        self.surface.primary(row, "验证并切换", self._do_env_switch)
+        self.surface.secondary(row, "重新读取", self._refresh_env_status)
+        self.surface.inline_note(row, "指针：config/python_env.txt；切换需重启 GUI/launcher")
+
+    def _refresh_env_status(self) -> None:
+        current = _setup_env.read_pointer()
+        self._env_status.configure(
+            text="当前：" + (str(current) if current is not None else "未登记（由启动器/安装器决定）"))
+
+    def _do_env_switch(self) -> None:
+        python = self._text(self._env_python)
+        if not python:
+            self.status.set_status(
+                "先选一个 python.exe（点「浏览…」）；空路径不会写指针", "warn")
+            return
+        self._start(
+            _actions.setup_env_adopt(python), "切换 Python 解释器",
+            "正在验证所选解释器的 cv2/numpy/matplotlib/PIL/pyyaml/tkinter；"
+            "通过后写 config/python_env.txt。切换后请关闭并重开 GUI/launcher")
 
     def _on_close(self) -> None:
         """按 X：先停本窗起的任务，再销毁（不经 App.close_window）。"""

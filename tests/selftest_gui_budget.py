@@ -1280,6 +1280,13 @@ def _tools_action_checks() -> list[tuple[str, bool]]:
           not any(x in m2 for x in ("--data", "--epochs", "--imgsz", "--batch",
                                     "--device", "--out")), " ".join(m2))
 
+    # ⑦ 环境切换：GUI 只构造 `setup_env.py --adopt`，指针格式仍由 setup_env 唯一实现。
+    env = _actions.setup_env_adopt(r"C:\Python313\python.exe")
+    check("环境切换：走 setup_env.py --adopt",
+          any("setup_env.py" in x for x in env)
+          and _has_seq(env, ["--adopt", r"C:\Python313\python.exe"]),
+          " ".join(env))
+
     # 界面侧：对话框只许调动作模块，且六条流程都要真的调
     tree = ast.parse((ROOT / "apps" / "tools_dialog.py").read_text(encoding="utf-8"))
     lits = [n.value for n in ast.walk(tree)
@@ -1294,6 +1301,13 @@ def _tools_action_checks() -> list[tuple[str, bool]]:
             "export_ball_dataset", "train_ball_detector"}
     check("工具对话框覆盖全部六条流程（缺 %s）" % sorted(need - called),
           need <= called, str(sorted(called)))
+    tools_src = (ROOT / "apps" / "tools_dialog.py").read_text(encoding="utf-8")
+    check("工具台有 Python 运行环境卡片 + 验证切换按钮",
+          "Python 运行环境" in tools_src and "验证并切换" in tools_src)
+    check("环境切换只调 _actions.setup_env_adopt（不自己写指针）",
+          "_actions.setup_env_adopt" in tools_src
+          and "write_pointer(" not in tools_src
+          and "_setup_env.read_pointer" in tools_src)
 
     # 世界系那一卡的两个新控件必须**真的接到 argv 上**：只加输入框、不往下传，
     # 用户填了等于没填（本仓库最常见的缺陷形态）。

@@ -70,6 +70,11 @@ def _positive(name: str, value) -> list[str]:
 # 双目：标定 / 录制 / 分析（原在 `_gui_stereo.py`，2026-11-01 搬到这里）
 # --------------------------------------------------------------------------- #
 
+def setup_env_adopt(python: str) -> list[str]:
+    """登记/切换运行解释器；校验与写指针都在 setup_env.py 内完成。"""
+    return _argv(_APPS / "setup_env.py", "--adopt", str(python))
+
+
 BOARD_DEFAULTS = {"cols": "8", "rows": "5", "square": "25", "target": "40"}
 _BOARD_FLAGS = (("cols", "--cols"), ("rows", "--rows"),
                 ("square", "--square"), ("target", "--target"))
