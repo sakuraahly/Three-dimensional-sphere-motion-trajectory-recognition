@@ -1,10 +1,14 @@
 # 云端的自动门：与本地 `.githooks/pre-push` 跑同一条判据链。
 #
-# 2026-11-22 首次真跑：暴露了本地永远看不到的一类差异 —— runner 的 stdout
-# 是 cp1252，`check_standards.py` 一 print 中文标题就 UnicodeEncodeError 崩溃
-# （本地终端 UTF-8 所以从不触发）。修法：`env.PYTHONIOENCODING=utf-8` 一处覆盖
-# 所有步骤（含 run_tests 起的 26 个子进程）。这就是"必须在 runner 上跑一次"的
-# 价值：本地绿不等于云端绿。
+# 2026-11-22 首次真跑：连爆两个本地永远看不到的差异，都在这一轮修掉 ——
+#   1) runner stdout 是 cp1252，check_standards.py 一 print 中文标题就
+#      UnicodeEncodeError 崩（本地 UTF-8 从不触发）→ env.PYTHONIOENCODING=utf-8
+#      一处覆盖所有步骤（含 run_tests 的 26 个子进程）。
+#   2) actions/checkout 默认 fetch-depth:1 浅克隆，git log 只剩 1 条，
+#      待办表里所有历史 commit hash 都误报「查不到」→ fetch-depth:0 取全历史。
+# 连带：待办详情引用的 planbooks/outputs 本就被 .gitignore 排除，本地有、CI 没有，
+# check_standards 的「文件不存在」判据改用 git check-ignore 区分「丢失」与「本就不入库」。
+# 这就是"必须在 runner 上真跑一次"的价值：本地绿不等于云端绿。
 #
 # 首次跑之前（2026-10-27）本地能验的都验了：
 #   · 干净 checkout 里 `run_tests fast -j 4` → 23/23（104.7s，见交接文档 §27）
@@ -46,6 +50,9 @@ jobs:
       PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 待办表 done 条目用 commit=<短hash> 对账；浅克隆只剩 1 条 log 会全误报。
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:

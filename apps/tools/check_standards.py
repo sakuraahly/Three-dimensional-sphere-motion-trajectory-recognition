@@ -566,7 +566,12 @@ def _split_row(line: str) -> list[str]:
 
 
 def _git_commits() -> set[str] | None:
-    """`git log` 里所有短 hash；没有 git 就返回 None（不静默当成通过）。"""
+    """`git log` 里所有短 hash；没有 git 就返回 None（不静默当成通过）。
+
+    注意 CI 上 `actions/checkout` 默认 `fetch-depth: 1`（浅克隆），`git log`
+    只有 1 条，所有历史 commit hash 都会误报「查不到」。gate.yml 已设
+    `fetch-depth: 0`；这里仍只取 -2000 条，足够覆盖待办表里的历史 hash。
+    """
     try:
         proc = subprocess.run(["git", "log", "--format=%h", "-2000"],
                               capture_output=True, text=True, encoding="utf-8",
@@ -576,6 +581,24 @@ def _git_commits() -> set[str] | None:
     if proc.returncode != 0:
         return None
     return {ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()}
+
+
+@functools.lru_cache(maxsize=None)
+def _git_ignored(rel: str) -> bool:
+    """该路径是否被 .gitignore 明确排除 —— 用于区分「文件丢失」与「本就不入库」。
+
+    待办表详情列会指路 planbooks/（内部计划）、outputs/（跑出来的报告）这类
+    **故意不入库**的文件：本地有、CI 的干净 checkout 里没有。若一律按「磁盘
+    上没有」判失败，CI 必然红 —— 这是环境差异，不是文档漂移。用 git 自己
+    的 check-ignore 判断（单一真相，不另写一份前缀黑名单），被忽略就跳过
+    磁盘存在性检查；没被忽略却丢了，仍照常报错。
+    """
+    try:
+        proc = subprocess.run(["git", "check-ignore", "-q", rel],
+                              capture_output=True, cwd=str(ROOT), timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False  # 问不到 git → 保守：照常校验存在性
+    return proc.returncode == 0
 
 
 @functools.lru_cache(maxsize=16)
@@ -675,7 +698,7 @@ def check_backlog(verbose: bool) -> list[str]:
                 problems.append(
                     f"{bid}：详情指向 §{sec}，但 {' / '.join(docs)} 里没有这个编号章节")
         for ref in re.findall(r"`([^`]+\.(?:md|py|bat|json))`", detail):
-            if not (ROOT / ref).exists():
+            if not (ROOT / ref).exists() and not _git_ignored(ref):
                 problems.append(f"{bid}：详情指向 `{ref}`，但磁盘上没有")
 
     for bid, n in seen.items():
