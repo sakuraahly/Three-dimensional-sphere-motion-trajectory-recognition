@@ -340,6 +340,11 @@ def load_registry(path=None) -> Registry;  def save_registry(reg, path=None) -> 
 def set_role(reg, role, *, entry=None, index=None, verified=False) -> RoleSpec;  def format_device_table(devices, probes=None, settings=None, reg=None) -> str
 def resolve_role(role, reg=None, devices=None, *, interactive=True, probe=None) -> ResolvedCamera
 def resolve_camera_arg(value, *, reg=None, devices=None, interactive=True) -> int | None
+def device_signature(devices) -> tuple   # (order, identity, name, port, present) 稳定排序；界面自动刷新用
+@dataclass(frozen=True) RoleHealth:  role; status; detail=""; expected_name=""; current_name=""; capture_index=None
+def role_health(role, *, reg=None, devices=None) -> RoleHealth
+    # status: ok / missing / unverified / drift；只读，复用 resolve_role，不写配置、不猜编号。
+    # 相机管理界面每 1.5s 比对 device_signature，变化才刷新并显示 ✓/⚠。
 # ---- 「无关」清单（2026-10 新增）----
 def is_device_ignored(d: DeviceEntry, reg: Registry | None = None) -> bool
 def find_ignored_device(spec: RoleSpec, devices: list[DeviceEntry]) -> DeviceEntry | None   # 严格匹配，不按名字

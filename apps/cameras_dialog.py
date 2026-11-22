@@ -69,6 +69,8 @@ OPEN_BUDGET_S = 14.0
 WATCHDOG_S = 45.0
 #: 主线程轮询后台消息的间隔。
 POLL_MS = 80
+#: 设备变化自动检测间隔（pnputil 只枚举、不打开相机，单次约 0.1s）。
+DEVICE_POLL_S = 1.5
 #: 每格预览的最大尺寸。
 PANE_W, PANE_H = 320, 240
 #: 预览网格列数。
@@ -222,8 +224,10 @@ class _PreviewPane:
     """一路预览：自己的控件、自己的线程、自己的停止信号。"""
 
     def __init__(self, parent, index: int, name: str, on_close,
-                 on_retry=None) -> None:
+                 on_retry=None, identity: str = "") -> None:
         self.index = index
+        self.name = name
+        self.identity = identity
         self.frame = ttk.LabelFrame(parent, text=f"#{index} {name}")
         holder = ttk.Frame(self.frame, width=PANE_W, height=PANE_H)
         holder.pack(padx=4, pady=(4, 2))
@@ -292,6 +296,10 @@ class CamerasDialog(tk.Toplevel):
         self._after_id: str | None = None
         #: 界面刷新链 (`_pump`) 累计出错次数。出错**不会**再让界面冻结。
         self._pump_failures = 0
+        #: 设备自动检测：签名变化就刷新列表；不靠用户手动点「刷新列表」。
+        self._device_sig = None
+        self._polling = False
+        self._last_poll = time.monotonic()
 
         # 筛选门限：默认值与配置合成一次，界面显示的就是**真正生效的值**。
         # `min_pair_fps` 空 = 沿用 14.4（不把默认值伪装成用户设置）。
@@ -622,6 +630,9 @@ class CamerasDialog(tk.Toplevel):
             except BaseException:                            # noqa: BLE001
                 self._on_pump_error()
 
+        # 拔插/设备变化：后台只枚举，变化了才刷新；不阻塞预览刷新链。
+        self._maybe_poll_devices()
+
         # 看门狗：慢相机（本机实测首帧 19–24 秒）**只提示，不强停**。
         # 旧版 6 秒就 stop.set()，把正在慢慢开的相机自己掐死了。
         now = time.monotonic()
@@ -649,7 +660,7 @@ class CamerasDialog(tk.Toplevel):
         """处理一条后台消息。`_drain` 逐条兜异常，所以这里可以让它抛。"""
         kind = item[0]
         if kind == "devices":
-            self._on_devices(item[1])
+            self._on_devices(item[1], item[2] if len(item) > 2 else None)
         elif kind == "error":
             self._say(str(item[1]))
         elif kind == "pstatus":
@@ -697,19 +708,92 @@ class CamerasDialog(tk.Toplevel):
     def _enumerate_worker(self) -> None:
         try:
             devices = cr.list_devices()
-            self._events.put(("devices", devices))
+            self._events.put(("devices", devices, cr.device_signature(devices)))
         except Exception as exc:                              # noqa: BLE001
             self._events.put(("error", f"设备列表读不出来：{exc}"))
 
-    def _on_devices(self, devices: list[cr.DeviceEntry]) -> None:
-        self._devices = list(devices)
-        self._fill_tree()
-        conflict = self._role_conflict()
-        if conflict:
-            self._say(conflict, error=True)
+    def _maybe_poll_devices(self) -> None:
+        """每 DEVICE_POLL_S 后台枚举一次；签名变了才通知主线程刷新。"""
+        if self._polling:
             return
-        self._say(f"找到 {len(self._devices)} 台。可以「预览全部外接」并排比对，"
-                  "也可以选一台单开；看清后按身份绑定左右。")
+        if time.monotonic() - self._last_poll < DEVICE_POLL_S:
+            return
+        self._last_poll = time.monotonic()
+        self._polling = True
+        threading.Thread(target=self._poll_worker, daemon=True,
+                         name="camera-device-poll").start()
+
+    def _poll_worker(self) -> None:
+        try:
+            devices = cr.list_devices()
+            sig = cr.device_signature(devices)
+            if sig != self._device_sig:
+                self._events.put(("devices", devices, sig))
+        except Exception as exc:                              # noqa: BLE001
+            self._events.put(("error", f"自动检测设备失败：{exc}"))
+        finally:
+            self._polling = False
+
+    def _auto_check_text(self) -> str:
+        """自动核对 left/right：当前设备名/端口/采集索引是否符合配置。"""
+        try:
+            reg = cr.load_registry()
+        except Exception:                                     # noqa: BLE001
+            return "自动核对：配置读不出来"
+        parts = []
+        for role in ("left", "right"):
+            spec = reg.roles.get(role)
+            label = (spec.location or spec.name or role) if spec else "未配置"
+            h = cr.role_health(role, reg=reg, devices=self._devices)
+            if h.status == "ok":
+                parts.append(f"{role}={label} 一致")
+            elif h.status == "unverified":
+                parts.append(f"{role}={label} 采集索引未实测")
+            elif h.status == "missing":
+                parts.append(f"{role}={label} 不在线/身份变了")
+            else:
+                parts.append(f"{role}={label} {h.detail}")
+        return "自动核对：" + "｜".join(parts)
+
+    def _stop_stale_previews(self) -> None:
+        """设备被拔掉/同编号换了身份：停掉旧预览，别让画面冻结在旧设备上。"""
+        by_order = {d.order: d for d in self._devices}
+        for idx, pane in list(self._previews.items()):
+            dev = by_order.get(idx)
+            changed = (pane.identity and dev is not None and dev.identity
+                       and pane.identity.upper() != dev.identity.upper())
+            if dev is None or changed:
+                self._full_errors.pop(idx, None)
+                # 走统一的停止路径：它会 join 采集线程，避免“看着停了其实还占着相机”。
+                self._stop_preview(idx)
+
+    def _on_devices(self, devices: list[cr.DeviceEntry],
+                    sig: tuple | None = None) -> None:
+        selected = self._selected()
+        keep_id = selected.identity if selected is not None else ""
+        keep = selected.order if selected is not None else None
+        self._devices = list(devices)
+        self._device_sig = sig or cr.device_signature(self._devices)
+        self._stop_stale_previews()
+        self._fill_tree()
+        # 优先按身份找回同一台物理相机；PnP 位次变了也不要把高亮挪到别人身上。
+        target = next((d for d in self._devices
+                       if keep_id and d.identity
+                       and d.identity.upper() == keep_id.upper()), None)
+        if target is None and keep is not None:
+            target = next((d for d in self._devices if d.order == keep), None)
+        if target is not None:
+            try:
+                self.tree.selection_set(str(target.order))
+                self.tree.focus(str(target.order))
+            except tk.TclError:
+                pass
+        conflict = self._role_conflict()
+        check = self._auto_check_text()
+        if conflict:
+            self._say(f"{conflict}｜{check}", error=True)
+        else:
+            self._say(f"自动刷新：{len(self._devices)} 台｜{check}")
 
     def _role_conflict(self) -> str:
         """两个角色指向同一台设备时返回一句警告，否则空串。
@@ -757,6 +841,8 @@ class CamerasDialog(tk.Toplevel):
         # 漏传 settings 就等于用内置默认值判定 —— 用户改了 `config/cameras.json`
         # 也不生效，这正是"对话框忽略用户 avoid 设置"那个 bug。
         settings = reg.settings
+        health = {r: cr.role_health(r, reg=reg, devices=self._devices)
+                  for r in ("left", "right")}
         for d in self._devices:
             roles = cr.roles_of_device(reg, d)
             is_virt = cr.is_virtual(d.name, settings)
@@ -774,6 +860,9 @@ class CamerasDialog(tk.Toplevel):
                 role = "＋".join(sorted(roles)) + " ← 同一台，必须改"
             elif roles:
                 role = roles[0]
+                h = health.get(role)
+                if h is not None:
+                    role = f"{role} {'✓' if h.status == 'ok' else '⚠'}"
             elif avoided:
                 # 内置/红外这两台是**被物理遮住的**（本机就是这么配的），
                 # 点它们预览必然是黑屏。在列表里直接标出来，别让人以为是外接那台。
@@ -917,7 +1006,8 @@ class CamerasDialog(tk.Toplevel):
         pane = _PreviewPane(
             self.grid_frame, entry.order, title,
             lambda: self._stop_preview(entry.order),
-            on_retry=lambda: self._retry_preview(entry))
+            on_retry=lambda: self._retry_preview(entry),
+            identity=entry.identity)
         pane.status.bind(
             "<Double-1>",
             lambda _e, i=entry.order: self._show_full_error(i))

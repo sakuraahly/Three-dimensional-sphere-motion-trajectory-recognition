@@ -651,6 +651,77 @@ def device_properties(identity: str, *, timeout: float = 10.0) -> dict[str, str]
     return _parse_pnputil_properties(out)
 
 
+def device_signature(devices: list[DeviceEntry]) -> tuple:
+    """设备集合的稳定签名：任何名字/身份/端口/在线状态变化都会变。
+
+    相机管理界面用它做“拔插了就自动刷新”，不靠用户点「刷新列表」。
+    """
+    return tuple(sorted(
+        (int(d.order), str(d.identity), str(d.name), str(d.port), bool(d.present))
+        for d in devices))
+
+
+@dataclass(frozen=True)
+class RoleHealth:
+    """角色健康：界面自动核对用（不写配置、不打开相机）。"""
+
+    role: str
+    status: str                 # ok / missing / unverified / drift
+    detail: str = ""
+    expected_name: str = ""
+    current_name: str = ""
+    capture_index: int | None = None
+
+
+def role_health(role: str, *, reg: Registry | None = None,
+                devices: list[DeviceEntry] | None = None) -> RoleHealth:
+    """核对一个角色当前是否符合配置；**只读**，不猜、不写。"""
+    reg = reg if reg is not None else load_registry()
+    devices = list_devices() if devices is None else list(devices)
+    spec = reg.roles.get(str(role))
+    if spec is None:
+        return RoleHealth(str(role), "missing", "未配置")
+
+    def _current() -> DeviceEntry | None:
+        for d in devices:
+            if spec.identity and d.identity and \
+                    spec.identity.upper() == d.identity.upper():
+                return d
+            if spec.port and d.port and spec.port.lower() == d.port.lower():
+                return d
+        return None
+
+    current = _current()
+    cur_name = current.name if current is not None else ""
+    try:
+        res = resolve_role(str(role), reg=reg, devices=devices, interactive=False)
+    except CaptureIndexNotVerified as exc:
+        return RoleHealth(str(role), "unverified",
+                          (str(exc).splitlines() or ["采集索引未实测"])[0],
+                          spec.name, cur_name)
+    except RuntimeError as exc:
+        return RoleHealth(str(role), "missing",
+                          (str(exc).splitlines() or ["不在线"])[0],
+                          spec.name, cur_name)
+    if res.entry is not None:
+        current = res.entry
+        cur_name = current.name
+    bits: list[str] = []
+    if spec.name and cur_name and spec.name.casefold() != cur_name.casefold():
+        bits.append(f"名字 {spec.name} → {cur_name}")
+    if spec.port and current is not None and current.port \
+            and spec.port.lower() != current.port.lower():
+        bits.append("端口变了")
+    if spec.index is not None and current is not None \
+            and spec.index != current.order:
+        bits.append(f"PnP 位次 {spec.index} → {current.order}")
+    if bits:
+        return RoleHealth(str(role), "drift", "；".join(bits),
+                          spec.name, cur_name, spec.capture_index)
+    return RoleHealth(str(role), "ok", "一致", spec.name, cur_name,
+                      spec.capture_index)
+
+
 def device_parent(identity: str, *, runner=_run_powershell,
                   timeout: float = 15.0) -> str:
     """读一个设备接口的父设备 InstanceId（`DEVPKEY_Device_Parent`）。

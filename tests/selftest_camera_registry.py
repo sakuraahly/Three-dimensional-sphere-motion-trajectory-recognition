@@ -3319,6 +3319,28 @@ def test_autobind_pure(tmp: Path) -> bool:
     checks.append(("RoleSpec.serial 往返",
                    back.roles["left"].serial == "20190322001"))
 
+    cam_dev = dev(0, "cam", "USB\\A", "6&aaa")
+    sig0 = cr.device_signature([cam_dev])
+    sig1 = cr.device_signature([dev(0, "renamed", "USB\\A", "6&aaa")])
+    checks.append(("设备签名随名字变化", sig0 != sig1))
+    h = cr.role_health("left", reg=reg, devices=[cam_dev])
+    checks.append(("role_health 一致", h.status == "ok"))
+    h = cr.role_health("left", reg=reg,
+                       devices=[dev(0, "CAM", "USB\\A", "6&aaa")])
+    checks.append(("role_health 名字大小写不算漂移", h.status == "ok"))
+    h = cr.role_health("left", reg=reg,
+                       devices=[dev(0, "renamed", "USB\\A", "6&aaa")])
+    checks.append(("role_health 名字变化 -> drift",
+                   h.status == "drift" and "名字" in h.detail))
+    reg_no_cap = cr.Registry(roles={"left": cr.RoleSpec(
+        identity="USB\\A", port="6&aaa", name="cam", index=0,
+        verified=True, capture_index=None)})
+    h = cr.role_health("left", reg=reg_no_cap, devices=[cam_dev])
+    checks.append(("role_health 采集索引未实测",
+                   h.status == "unverified"))
+    h = cr.role_health("left", reg=reg, devices=[])
+    checks.append(("role_health 不在线", h.status == "missing"))
+
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)

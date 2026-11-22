@@ -788,6 +788,46 @@ def _draggable_panes(ck) -> None:
         ck("反证：普通 ttk.Frame 没有可拖的 sash", not hasattr(plain, "sashpos"))
         plain.destroy()
 
+        # 自动核对：设备改名后角色列必须变 ⚠，状态条必须写出“名字 旧 → 新”。
+        import dataclasses
+        from sphere_tracker import camera_registry as cr
+        if not dlg._devices:
+            # 首次枚举是后台线程；运行时判据不能靠“等它刚好跑完”。
+            try:
+                dlg._on_devices(cr.list_devices(), None)
+                app.update()
+            except Exception as exc:                     # noqa: BLE001
+                print(f"    [提示] 现场枚举失败：{exc}")
+        if dlg._devices:
+            reg = cr.load_registry()
+            spec = reg.roles.get("left")
+            target = next((d for d in dlg._devices
+                           if spec is not None and spec.identity
+                           and d.identity
+                           and spec.identity.upper() == d.identity.upper()),
+                          None)
+            if target is not None:
+                original = list(dlg._devices)
+                changed = [dataclasses.replace(d, name=d.name + " (renamed)")
+                           if d.order == target.order else d
+                           for d in original]
+                dlg._on_devices(changed, cr.device_signature(changed))
+                app.update()
+                row = dlg.tree.item(str(target.order), "values")
+                ck("设备改名后自动核对标 ⚠", "⚠" in str(row[-1]))
+                ck("状态条报出名字变化",
+                   "名字" in str(dlg.status.cget("text")))
+                dlg._on_devices(original, cr.device_signature(original))
+                dlg._on_devices([d for d in original
+                                 if d.order != target.order], None)
+                v = dlg.tree.item(str(target.order), "values") \
+                    if dlg.tree.exists(str(target.order)) else ()
+                ck("设备拔掉后自动刷新，旧行消失", not v)
+            else:
+                print("    [跳过] 当前没有与 left 身份匹配的设备（改名核对未验证）")
+        else:
+            print("    [跳过] 当前没有设备（改名核对未验证；跳过 ≠ 验证过）")
+
         # 塞一段超长错误进队列，卡片状态行必须只剩一行摘要。
         fake = _PreviewPane(dlg.grid_frame, 99, "fake", lambda: None)
         dlg._previews[99] = fake
@@ -799,7 +839,13 @@ def _draggable_panes(ck) -> None:
         ck("超长错误不会撑高卡片（只留摘要）", len(shown) <= BRIEF_LIMIT + 2)
         ck("完整错误仍留得下来（双击可看全文）",
            dlg._full_errors.get(99) == long_error)
-        fake.frame.destroy()
+        # 自动刷新可能已经把这张假卡片当“设备不存在”停掉；重复 destroy 会抛。
+        try:
+            fake.frame.destroy()
+        except tk.TclError:
+            pass
+        dlg._previews.pop(99, None)
+        dlg._full_errors.pop(99, None)
         dlg._close()
     except Exception as exc:                             # noqa: BLE001
         ck(f"运行时分区检查没跑起来（{type(exc).__name__}: {exc}）", False)
