@@ -34,6 +34,12 @@
 !/install.bat
 !/uninstall.bat
 
+# ---------- CI：只放 workflow 定义 ----------
+!/.github/
+/.github/**
+!/.github/workflows/
+!/.github/workflows/*.yml
+
 # ---------- 源码目录：只收 .py ----------
 !/apps/
 /apps/**
@@ -81,6 +87,7 @@
 !/installer/
 /installer/**
 !/installer/*.iss
+!/installer/*.isl
 !/installer/*.bat
 !/installer/*.py
 

@@ -120,7 +120,7 @@ installer\build_installer.bat                   :: 一键出 setup.exe（含运�
 | --- | --- | --- |
 | `StageDir` 相对路径 | ISCC 以 `.iss` 所在的 `installer\` 为基准，图标/payload 全找不到 | define 里写 `..\outputs\...` 回退一层 |
 | `/S<dir>` | 以为能设 SourceDir，实际是 SignTool 选项 | 别用；用相对路径 |
-| 中文语言包 | winget 国际版只有 29 种欧洲 `.isl`，无中文 | 用 `compiler:Default.isl`（英文向导）；要中文从官网下语言包 |
+| 中文语言包 | winget 国际版只有 29 种欧洲 `.isl`，无中文 | 仓库已带 `installer/ChineseSimplified.isl`；`[Languages]` 同时登记英文和简体中文，按系统 locale 选择 |
 | Tasks 默认勾选 | 起初误判 `Flags: unchecked` 非法而全部删掉——后果是**静默装时默认全勾**，往用户桌面塞快捷方式 | `Flags: unchecked` / `Flags: checkedonce` 都是合法的（当时是别的语法错误）；`desktopicon` 必须 `unchecked` |
 | Temp 被安全软件拦 | 双击 setup.exe 报 `Setup was unable to create the directory "...\Temp\is-XXXX.tmp" Error 5: 拒绝访问`；但同机 PowerShell 能建目录、Temp ACL 正常 | 360/火绒等 HIPS 拦「未签名 exe 在 Temp 释放可执行文件」。解法：加信任区/临时关防护，或先把 `TMP`/`TEMP` 指到别的盘再运行（实测 `/VERYSILENT` 可过）。根治要代码签名证书 |
 | 日期格式化 | `FormatDateTime`/`DateToStr` 在 Inno 脚本子集里都不存在 | `created=` 写固定值 `by-installer`（只是元数据，非判据） |

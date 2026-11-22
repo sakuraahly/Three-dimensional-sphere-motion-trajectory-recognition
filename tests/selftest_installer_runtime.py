@@ -18,6 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ISS = ROOT / "installer" / "sphere_motion.iss"
+ZH_ISL = ROOT / "installer" / "ChineseSimplified.isl"
+INSTALLER_WORKFLOW = ROOT / ".github" / "workflows" / "installer.yml"
+LAUNCHER_BAT = ROOT / "native" / "launcher" / "build.bat"
 GO = ROOT / "native" / "launcher" / "main.go"
 SETUP_ENV = ROOT / "apps" / "setup_env.py"
 BUNDLE = ROOT / "apps" / "tools" / "make_clean_bundle.py"
@@ -53,6 +56,40 @@ def main() -> int:
     checks.append((".iss 卸载清掉 runtime 与指针",
                    "filesandordirs; Name: \"{app}\\runtime\"" in iss
                    and "python_env.txt" in iss))
+
+    # 1b. 中文向导：语言文件随仓库提供，不能依赖构建机预装语言包。
+    zh = _read(ZH_ISL)
+    checks.append(("中文语言文件随仓库提供且是简体中文",
+                   ZH_ISL.is_file() and "LanguageName=简体中文" in zh
+                   and "LanguageID=$0804" in zh))
+    checks.append((".iss 引用仓库内的中文语言文件",
+                   'MessagesFile: "ChineseSimplified.isl"' in iss))
+    checks.append((".iss 按系统语言自动选中文/英文",
+                   "LanguageDetectionMethod=locale" in iss
+                   and "ActiveLanguage = 'chinesesimplified'" in iss))
+
+    # 1c. `.bat` 含中文，行尾必须是 CRLF；LF-only 会让 cmd 吃掉行首。
+    build_bat = ROOT / "installer" / "build_installer.bat"
+    raw = build_bat.read_bytes() if build_bat.is_file() else b""
+    checks.append(("build_installer.bat 是 UTF-8 无 BOM + CRLF",
+                   raw[:3] != b"\xef\xbb\xbf"
+                   and b"\r\n" in raw
+                   and b"\n" not in raw.replace(b"\r\n", b"")))
+
+    # 1d. CI 自动出包：workflow 必须真的调用仓库内构建脚本，CI 下不能卡 pause。
+    wf = _read(INSTALLER_WORKFLOW)
+    launcher_raw = LAUNCHER_BAT.read_bytes() if LAUNCHER_BAT.is_file() else b""
+    checks.append(("CI workflow 是手动触发且在 windows-latest 运行",
+                   INSTALLER_WORKFLOW.is_file()
+                   and "workflow_dispatch:" in wf
+                   and "runs-on: windows-latest" in wf))
+    checks.append(("CI workflow 构建 launcher 和 installer",
+                   "native\\launcher\\build.bat" in wf
+                   and "installer\\build_installer.bat" in wf
+                   and "actions/upload-artifact@v4" in wf))
+    checks.append(("CI 构建脚本不等待按键（CI=1 时跳过 pause）",
+                   "if not defined CI pause" in raw.decode("utf-8", "ignore")
+                   and "if not defined CI pause" in launcher_raw.decode("utf-8", "ignore")))
 
     # 2. 写指针协议与 setup_env.py 一致
     for key in ("python=", "kind=", "created=", "python_version=", "verified="):

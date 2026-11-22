@@ -1,4 +1,6 @@
 *.bat text eol=crlf
+*.iss text eol=crlf
+*.isl text eol=crlf
 # git 钩子必须是 LF：autocrlf 会把 shebang 变成 "#!/bin/sh\r"，
 # 于是 sh 报 "bad interpreter" —— 而这个错误发生在**推送时**，最容易被当成"钩子坏了"。
 .githooks/* text eol=lf

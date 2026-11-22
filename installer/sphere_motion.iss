@@ -48,14 +48,16 @@ DisableDirPage=auto
 ; —— 但 silent 安装时 NextButtonClick 仍会被调用，默认值可用。
 
 [Languages]
-; winget 国际版只带欧洲语言，不含中文 .isl。中文向导见发布规范 §6。
+; 中文语言文件随仓库提供（installer/ChineseSimplified.isl，来自 jrsoftware/issrc），
+; 构建机不需要另外安装 Inno 语言包。英文保留为回退。
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 ; 桌面快捷方式默认**不勾选**：安装器不该往桌面塞东西，用户要就自己勾。
 ; 开始菜单默认勾选（卸载入口在那里，没有它用户找不到怎么卸）。
-Name: "desktopicon"; Description: "Create desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
-Name: "startmenu"; Description: "Create Start Menu shortcuts"; GroupDescription: "Shortcuts:"; Flags: checkedonce
+Name: "desktopicon"; Description: "创建桌面快捷方式 / Create desktop shortcut"; GroupDescription: "快捷方式 / Shortcuts:"; Flags: unchecked
+Name: "startmenu"; Description: "创建开始菜单快捷方式 / Create Start Menu shortcuts"; GroupDescription: "快捷方式 / Shortcuts:"; Flags: checkedonce
 
 [Files]
 ; 源码 + 文档 + 标定板 + launcher.exe（永远装）
@@ -71,7 +73,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: desktop
 
 [Run]
 ; 完成后可选打开说明书（不强制启动 GUI）
-Filename: "{app}\README.md"; Description: "查看快速开始说明"; Flags: postinstall skipifsilent unchecked
+Filename: "{app}\README.md"; Description: "查看快速开始说明 / View quick start"; Flags: postinstall skipifsilent unchecked
 
 [UninstallDelete]
 ; 运行期产物 + 内嵌运行时 + 环境指针：都在安装目录内，卸载一并清掉
@@ -92,26 +94,52 @@ var
   ChosenPython: String;
   ChosenKind: String;
 
+function IsChinese: Boolean;
+begin
+  Result := ActiveLanguage = 'chinesesimplified';
+end;
+
 procedure InitializeWizard;
 begin
   // 单选页：绑在"选择安装位置"之后。Exclusive=True → 单选按钮。
-  ChoicePage := CreateInputOptionPage(wpSelectDir,
-    'Python runtime',
-    'Choose which Python interpreter to use',
-    'This package includes a ready-to-use Python 3.14 runtime with all dependencies ' +
-      '(OpenCV, NumPy, SciPy, Tkinter). You may also use a Python already installed ' +
-      'on this computer. You can change this later by editing config\python_env.txt.',
-    True, False);
-  ChoicePage.Add('Use the bundled Python 3.14 (recommended, nothing else to install)');
-  ChoicePage.Add('Use a Python interpreter already installed on this computer');
-  ChoicePage.SelectedValueIndex := 0;
+  if IsChinese then
+  begin
+    ChoicePage := CreateInputOptionPage(wpSelectDir,
+      'Python 运行环境',
+      '选择要使用的 Python 解释器',
+      '安装包自带可用的 Python 3.14 运行时和全部依赖（OpenCV、NumPy、' +
+        'SciPy、Tkinter）。也可以使用本机已经安装的 Python。' +
+        '之后可以编辑 config\python_env.txt 更改。',
+      True, False);
+    ChoicePage.Add('使用安装包自带的 Python 3.14（推荐，无需另外安装）');
+    ChoicePage.Add('使用本机已安装的 Python 解释器');
+    ChoicePage.SelectedValueIndex := 0;
 
-  // 文件选择页：绑在单选页之后，只有选"自己的"才显示。
-  PathPage := CreateInputFilePage(ChoicePage.ID,
-    'Select Python interpreter',
-    'Locate python.exe',
-    'Select the python.exe to use. It must be able to import cv2 and numpy.');
-  PathPage.Add('python.exe:', 'Python executable|python.exe|All files|*.*', '.exe');
+    PathPage := CreateInputFilePage(ChoicePage.ID,
+      '选择 Python 解释器',
+      '定位 python.exe',
+      '选择要使用的 python.exe。它必须能够 import cv2 和 numpy。');
+    PathPage.Add('python.exe：', 'Python executable|python.exe|All files|*.*', '.exe');
+  end
+  else
+  begin
+    ChoicePage := CreateInputOptionPage(wpSelectDir,
+      'Python runtime',
+      'Choose which Python interpreter to use',
+      'This package includes a ready-to-use Python 3.14 runtime with all dependencies ' +
+        '(OpenCV, NumPy, SciPy, Tkinter). You may also use a Python already installed ' +
+        'on this computer. You can change this later by editing config\python_env.txt.',
+      True, False);
+    ChoicePage.Add('Use the bundled Python 3.14 (recommended, nothing else to install)');
+    ChoicePage.Add('Use a Python interpreter already installed on this computer');
+    ChoicePage.SelectedValueIndex := 0;
+
+    PathPage := CreateInputFilePage(ChoicePage.ID,
+      'Select Python interpreter',
+      'Locate python.exe',
+      'Select the python.exe to use. It must be able to import cv2 and numpy.');
+    PathPage.Add('python.exe:', 'Python executable|python.exe|All files|*.*', '.exe');
+  end;
   PathPage.Values[0] := '';
 end;
 
@@ -143,7 +171,10 @@ begin
   py := Trim(PathPage.Values[0]);
   if (py = '') or not FileExists(py) then
   begin
-    MsgBox('Please select a valid python.exe path.', mbError, MB_OK);
+    if IsChinese then
+      MsgBox('请选择有效的 python.exe 路径。', mbError, MB_OK)
+    else
+      MsgBox('Please select a valid python.exe path.', mbError, MB_OK);
     Result := False;
     Exit;
   end;
@@ -152,14 +183,21 @@ begin
   begin
     if rc <> 0 then
     begin
-      MsgBox('This Python cannot import cv2 and numpy.' + #13#10 +
-             'Please choose another interpreter, or use the bundled one.', mbError, MB_OK);
+      if IsChinese then
+        MsgBox('这个 Python 无法 import cv2 和 numpy。' + #13#10 +
+               '请换一个解释器，或使用安装包自带的 Python。', mbError, MB_OK)
+      else
+        MsgBox('This Python cannot import cv2 and numpy.' + #13#10 +
+               'Please choose another interpreter, or use the bundled one.', mbError, MB_OK);
       Result := False;
     end;
   end
   else
   begin
-    MsgBox('Could not run the selected Python. Check the path and try again.', mbError, MB_OK);
+    if IsChinese then
+      MsgBox('无法运行所选的 Python。请检查路径后重试。', mbError, MB_OK)
+    else
+      MsgBox('Could not run the selected Python. Check the path and try again.', mbError, MB_OK);
     Result := False;
   end;
 end;

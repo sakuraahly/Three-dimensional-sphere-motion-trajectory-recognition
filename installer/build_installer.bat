@@ -29,11 +29,13 @@ if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" (
     set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 ) else if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
     set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
+) else if exist "C:\Program Files\Inno Setup 7\ISCC.exe" (
+    set "ISCC=C:\Program Files\Inno Setup 7\ISCC.exe"
 ) else (
-    echo [失败] 没找到 Inno Setup 6 的编译器 ISCC.exe。
+    echo [失败] 没找到 Inno Setup 的编译器 ISCC.exe。
     echo        装好后重新双击本文件；或用 winget:
     echo        winget install --id JRSoftware.InnoSetup -e
-    pause
+    if not defined CI pause
     exit /b 1
 )
 :found_iscc
@@ -83,11 +85,11 @@ if errorlevel 1 goto :fail
 echo.
 echo   完成： outputs\releases\SphereMotion-0.3.0-setup.exe
 echo   只生成本地文件，未发布到 GitHub。
-pause
+if not defined CI pause
 exit /b 0
 
 :fail
 echo.
 echo [失败] 安装程序未生成，请看上面的报错。
-pause
+if not defined CI pause
 exit /b 1

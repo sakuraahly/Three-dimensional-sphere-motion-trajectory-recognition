@@ -13,7 +13,7 @@ cd /d "%~dp0"
 where go >nul 2>nul
 if errorlevel 1 (
     echo [失败] 没找到 Go 编译器。装好 Go 后重新双击本文件： https://go.dev/dl/
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -37,7 +37,7 @@ set "CGO_ENABLED=0"
 go build -ldflags="-s -w -H windowsgui" -o "..\..\launcher.exe" .
 if errorlevel 1 (
     echo [失败] 编译失败，请看上面的报错。
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -48,4 +48,4 @@ echo.
 echo   双击根目录的 launcher.exe 即可打开图形界面；
 echo   带参数时（如 launcher.exe test）原样转给 run.bat。
 echo.
-pause
+if not defined CI pause

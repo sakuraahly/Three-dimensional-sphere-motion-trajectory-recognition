@@ -81,6 +81,7 @@ EXTRA_BUILD_FILES = (
 #: 与 native/launcher 同样对待：只带源码，拿到包的人能自己重建发布物。
 INSTALLER_FILES = (
     "installer/sphere_motion.iss",
+    "installer/ChineseSimplified.isl",
     "installer/build_installer.bat",
     "installer/verify_payload.py",
 )
@@ -89,10 +90,10 @@ INSTALLER_FILES = (
 GITHUB_README = ROOT / "docs" / "GitHub-README.md"
 
 ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf",
-                  ".go", ".mod", ".rc", ".ico", ".iss"}
+                  ".go", ".mod", ".rc", ".ico", ".iss", ".isl"}
 ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep"}
 TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".go", ".mod", ".rc",
-               ".iss"}
+               ".iss", ".isl"}
 FORBIDDEN_PARTS = {
     "outputs", "logs", "legacy", ".workbuddy", "__pycache__",
     ".git", "node_modules", "venv", ".venv",
