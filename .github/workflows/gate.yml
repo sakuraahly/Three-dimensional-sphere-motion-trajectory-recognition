@@ -1,13 +1,16 @@
 # 云端的自动门：与本地 `.githooks/pre-push` 跑同一条判据链。
 #
-# ⚠️ **这份文件在写下的那一刻还没有在 runner 上跑过**（2026-10-27）。
-#   本地能验的都验了：
-#     · 干净 checkout 里 `run_tests fast -j 4` → 23/23（104.7s，见交接文档 §27）
-#     · `check_standards` 在干净 checkout 里四类全绿（同上）
-#     · YAML 能被 parser 解析
-#   本地**验不了**的：runner 上有没有 tkinter、opencv 的 wheel 装不装得上、要跑多久。
-#   所以在它第一次真的跑绿之前，**别把"有 CI"当成"代码是好的"** ——
-#   这正是本项目反复踩的"写着的闸门不拦人"。
+# 2026-11-22 首次真跑：暴露了本地永远看不到的一类差异 —— runner 的 stdout
+# 是 cp1252，`check_standards.py` 一 print 中文标题就 UnicodeEncodeError 崩溃
+# （本地终端 UTF-8 所以从不触发）。修法：`env.PYTHONIOENCODING=utf-8` 一处覆盖
+# 所有步骤（含 run_tests 起的 26 个子进程）。这就是"必须在 runner 上跑一次"的
+# 价值：本地绿不等于云端绿。
+#
+# 首次跑之前（2026-10-27）本地能验的都验了：
+#   · 干净 checkout 里 `run_tests fast -j 4` → 23/23（104.7s，见交接文档 §27）
+#   · `check_standards` 在干净 checkout 里四类全绿（同上）
+#   · YAML 能被 parser 解析
+# 本地验不了的：runner 编码 / tkinter / opencv wheel / 耗时 —— 编码那条已踩中。
 #
 # 为什么是 windows-latest 而不是 ubuntu
 # -------------------------------------
@@ -37,6 +40,10 @@ jobs:
   gate:
     runs-on: windows-latest
     timeout-minutes: 30
+    # runner 默认 stdout=cp1252，中文 print 会 UnicodeEncodeError 崩；统一成 UTF-8。
+    # 放在 job 级一次覆盖所有步骤及其子进程（check_standards / run_tests / 26 selftest）。
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
 
