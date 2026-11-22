@@ -102,13 +102,6 @@ DARK_WARMUP_S = 0.6
 DARK_ENTER = 8.0
 DARK_CLEAR = 16.0
 
-#: 「位置」标签的两个约定值（写进 `config/cameras.json` 的角色 `location`）。
-#:
-#: 为什么是这两个词（2026-11-12 用户原话）："真实左相机=床，真实右相机=阳台门"。
-#: 它们描述的是**相机对着哪儿**，不是 left/right —— 左右会被接反，位置不会。
-#: 存在角色上（而不是设备上）：换一台相机插在同一个位置，"这里是床"这句话仍然成立。
-LOCATION_BED = "床"
-LOCATION_BALCONY = "阳台门"
 #: 显示用：没标过就写这个（与 `camera_registry.location_text()` 同一口径）。
 LOCATION_UNSET_TEXT = "未标注"
 #: 显示用：`capture_index` 还没实测时的写法。**不许**写 0 / #index 冒充。
@@ -215,8 +208,9 @@ _NO_DSHOW_HELP = (
 _OPEN_FIX_STEPS = (
     "下一步：① 先点卡片上的「重试这一路」；② 还不行就拔插一次这台相机的 USB，"
     "并关掉可能占着相机的程序（微信 / QQ / 钉钉 / OBS / Windows 相机等）；"
-    "③ 仍打不开就跑 python apps/tools/cameras.py doctor —— 它只报告，"
-    "不改配置、也不绑左右角色。"
+    "③ 所有相机（含内置）都打不开，先查 设置 → 隐私和安全性 → 相机 → "
+    "允许桌面应用访问相机；④ 仍打不开就跑 run.bat doctor 或 "
+    "python apps/tools/cameras.py doctor —— 它只报告，不改配置、也不绑左右角色。"
 )
 
 
@@ -410,16 +404,6 @@ class CamerasDialog(tk.Toplevel):
         ttk.Button(bar, text="标为无关", command=self._mark_ignored).pack(
             side="left", padx=(0, 6))
         ttk.Button(bar, text="取消无关", command=self._unmark_ignored).pack(
-            side="left", padx=(0, 6))
-        # 「位置」标注：两台同型号 aoni 在软件层面**不可区分**（同 VID/PID、同名字），
-        # 用户判断"哪台是左"的唯一真实依据就是"它对着哪儿"。把这条知识记进
-        # `RoleSpec.location`（写 config/cameras.json），下次看得见、也能按位置排查。
-        # 不做弹窗、不加新窗口：选中一行点一下就行（同一按钮再点一次 = 清空）。
-        ttk.Button(bar, text="标为床",
-                   command=lambda: self._set_location(LOCATION_BED)).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(bar, text="标为阳台门",
-                   command=lambda: self._set_location(LOCATION_BALCONY)).pack(
             side="left", padx=(0, 6))
         ttk.Button(bar, text="刷新列表", command=self._refresh_devices).pack(
             side="left", padx=(0, 6))
@@ -1454,21 +1438,8 @@ class CamerasDialog(tk.Toplevel):
             note += (f"；它原来是 {'、'.join(sorted(others))}，已一并摘掉"
                      f"（一台相机不能同时当两个角色）")
         self._save(do, note=note)
-        # 先把选中行挪到下一台没绑的（用户下一步就是设右边），再补一句位置提示。
+        # 先把选中行挪到下一台没绑的（用户下一步就是设右边）。
         self._select_next_unbound()
-        try:
-            after = cr.load_registry()
-            if role in after.roles and not after.roles[role].location:
-                # 位置没标时点一句（**接在保存提示后面**，不要盖掉"已写入 …"）：
-                # 两台同型号 aoni 在画面上分不出来，「位置」是唯一能用人的知识
-                # 回答"这台是哪台"的字段。
-                try:
-                    prev = str(self.status.cget("text"))
-                except tk.TclError:
-                    prev = ""
-                self._say(f"{prev}｜{role} 的「位置」还没标：点「标为床 / 标为阳台门」")
-        except Exception:                                     # noqa: BLE001
-            pass
 
     def _select_next_unbound(self) -> None:
         """绑完一个角色，自动把选中行挪到「还没绑角色的外接相机」。
@@ -1493,39 +1464,6 @@ class CamerasDialog(tk.Toplevel):
                 self.tree.focus(iid)
                 self.tree.see(iid)
             return
-
-    def _set_location(self, location: str) -> None:
-        """把选中设备所属**角色**的「位置」写成 床 / 阳台门（再点一次=清空）。
-
-        为什么挂在"角色"上而不是"设备"上：位置是"这个机位对着哪儿"，机位不变、
-        相机可以换。写法只改 `RoleSpec.location`，**不碰** identity / index /
-        capture_index —— 位置不参与解析，它只是把人的知识记下来。
-
-        最小可行、不加窗口：两个按钮 + 单击切换。
-        """
-        entry = self._selected() or self._default_entry()
-        if entry is None:
-            self._say("设备列表是空的：先点「刷新列表」")
-            return
-        try:
-            reg = cr.load_registry()
-        except Exception:                                     # noqa: BLE001
-            reg = cr.Registry()
-        roles = cr.roles_of_device(reg, entry)
-        if not roles:
-            self._say(f"#{entry.order} 还没有角色：先点「设为左 / 设为右」，"
-                      "再标位置（位置是记在角色上的）")
-            return
-
-        def do(reg, entry):
-            current = cr.roles_of_device(reg, entry)
-            for r in current:
-                want = "" if (reg.roles.get(r) is not None
-                              and reg.roles[r].location == location) else location
-                cr.set_location(reg, r, want)
-
-        what = "、".join(sorted(roles))
-        self._save(do, note=f"{what} 的位置 -> {location}（再点一次可清空）")
 
     def _mark_ignored(self) -> None:
         self._save(lambda reg, entry: cr.mark_ignored(

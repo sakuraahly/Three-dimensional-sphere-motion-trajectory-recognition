@@ -34,6 +34,8 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sphere_tracker import camera_registry as cr  # noqa: E402
+
 from sphere_tracker.camera_registry import (  # noqa: E402
     AmbiguousMatch,
     DeviceEntry,
@@ -2794,10 +2796,10 @@ def test_identify_no_console_fails_loudly() -> bool:
         ("对话框有「采集索引」列，未实测时写「未实测」",
          'heading("cap", text="采集索引")' in dlg_src
          and "CAPTURE_UNMEASURED_TEXT" in dlg_src and "未实测" in dlg_src),
-        ("对话框有「位置」列 + 床/阳台门标注入口（写进角色 location）",
+        ("对话框保留「位置」显示，但没有床/阳台门测试按钮",
          'heading("loc", text="位置")' in dlg_src
-         and "标为床" in dlg_src and "标为阳台门" in dlg_src
-         and "set_location(" in dlg_src),
+         and "标为床" not in dlg_src and "标为阳台门" not in dlg_src
+         and "set_location(" not in dlg_src),
         ("对话框的 is_avoided / is_virtual **全部**带 reg.settings（不再忽略用户配置）",
          avoid_guard_ok(dlg_src)),
         ("反向（真变异）：把一处 settings 去掉 -> 判据会红",
@@ -3393,6 +3395,10 @@ def main() -> int:
             test_autobind_pure(tmp),
         ]
         print()
+        privacy, privacy_text = cr.camera_privacy_status()
+        print(f"  相机隐私：{privacy_text}")
+        results.append(privacy in {"allowed", "denied", "unknown"}
+                       and bool(privacy_text))
         if args.probe:
             results.append(test_real_probe())
         else:

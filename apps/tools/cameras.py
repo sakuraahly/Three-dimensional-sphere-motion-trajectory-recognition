@@ -2431,6 +2431,11 @@ def cmd_doctor(args) -> int:
         print("枚举不到任何相机设备（非 Windows / 注册表不可读 / 真的没插）。")
         return 1
 
+    privacy, privacy_text = cr.camera_privacy_status()
+    print(f"\n相机隐私：{privacy_text}")
+    if privacy == "denied":
+        print("    ⚠ 这是系统级拦截，任何相机（含内置）都可能打不开；先修这一项再拔插。")
+
     # ---- ① 枚举 ----
     print(f"\n① 枚举到 {len(devices)} 台：")
     for d in devices:

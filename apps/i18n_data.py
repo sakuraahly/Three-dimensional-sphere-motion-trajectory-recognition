@@ -3,11 +3,11 @@
 改文案请改界面源码，然后跑：python apps/tools/i18n_extract.py --write
 人工润色译文请改 apps/i18n_seed.py（重新生成会保留本文件里已填的非空值）。
 值为空 = 待译：运行时回退中文，并用种子词典做短语级自动英文化。
-扫描到 746 条界面文案。
+扫描到 744 条界面文案。
 """
 from __future__ import annotations
 
-# EN_US: 582/746 条已有译文
+# EN_US: 582/744 条已有译文
 EN_US: dict[str, str] = {
     '**joint** —— 两路能同时看到同一块板时用。一次拍完，两路的外参直接解出来，最省事也最准。\n\n**链式** —— 两路看不到同一区域时用（大角度装置的常见情况）。做法是板不动、两路各拍一组参考图，靠参考图把两路串到同一个坐标系。\n\n选错不会崩，但外参会偏，深度会跟着偏。判据很简单：录制时两路画面里**有没有重叠区域**。': '**joint** —— 两路能同时看到同一块板时用。一次拍完，两路的Extrinsics直接解出来，最省事也最准。\n\n**链式** —— 两路看不到同一区域时用（AngledRig的常见情况）。做法是板不动、两路各拍一组参考图，靠参考图把两路串到同一个Coordinates系。\n\n选错不会崩，但Extrinsics会偏，深度会跟着偏。判据很简单：Record时两路画面里**有没有重叠区域**。',
     '**会话元数据** 最小，只有 session.json 和时长；\n**标定堆栈** 是重跑三维必需的（seeds / traj3d / visualization / CSV）；\n**轨迹与同步图** 用于出图出表；\n**视频** 体积最大，且**画面未打码** —— 涉及人脸或场地时先确认授权。\n\n默认不含视频。导出的 zip 会保留会话目录结构。': '**Session元数据** 最小，只有 session.json 和时长；\n**Calibration堆栈** 是重跑3D必需的（seeds / traj3d / visualization / CSV）；\n**Trajectory与同步图** 用于出图出表；\n**视频** 体积最大，且**画面未打码** —— 涉及人脸或场地时先Confirm授权。\n\n默认不含视频。Export的 zip 会KeepSession folder结构。',
@@ -449,9 +449,7 @@ EN_US: dict[str, str] = {
     '查看器会扫描所有会话并默认打开**最新的一条**（按目录名里的时间戳排序，不看文件修改时间 —— 补跑一次离线会刷新 mtime，按它排会把老会话顶上来）。\n\n如果最新那条不在列表里，先确认它有没有 `derived/visualization.json`。\n列表里可以手动切换任意会话。': 'View器会扫描所有Session并默认Open**最新的一条**（按目录名里的时间戳排序，不看文件修改时间 —— 补跑一次离线会Refresh mtime，按它排会把老Session顶上来）。\n\n如果最新那条不在列表里，先Confirm它有没有 `derived/visualization.json`。\n列表里可以手动切换任意Session。',
     '查看输出': 'View输出',
     '标为不动（以后别默认勾选）': '',
-    '标为床': '',
     '标为无关': 'Mark unused',
-    '标为阳台门': '',
     '标定': 'Calibration',
     '标定 90° 装置（大角度）': 'Calibration 90° Rig（Angled）',
     '标定与训练…': 'Calibration与Train…',

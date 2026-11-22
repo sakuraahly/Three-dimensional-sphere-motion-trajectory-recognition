@@ -722,6 +722,52 @@ def role_health(role: str, *, reg: Registry | None = None,
                       spec.capture_index)
 
 
+def camera_privacy_status() -> tuple[str, str]:
+    """读 Windows「相机隐私」总开关；返回 (状态, 人读说明)。
+
+    所有相机（包括内置）都打不开时，先排除这个系统级开关，而不是继续拔插：
+    Windows 11 默认可能关闭「让桌面应用访问相机」。这里只读注册表，不尝试修改。
+    """
+    if sys.platform != "win32":
+        return "unknown", "非 Windows：没有这个注册表开关"
+    try:
+        import winreg
+    except ImportError:
+        return "unknown", "读不到 winreg"
+    values: list[str] = []
+    paths = (
+        (winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"),
+        (winreg.HKEY_LOCAL_MACHINE,
+         r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam"),
+    )
+    for root, path in paths:
+        try:
+            with winreg.OpenKey(root, path) as key:
+                value, _kind = winreg.QueryValueEx(key, "Value")
+                values.append(str(value).strip().lower())
+        except OSError:
+            continue
+    try:
+        with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\Policies\Microsoft\Windows\AppPrivacy") as key:
+            policy, _kind = winreg.QueryValueEx(key, "LetAppsAccessCamera")
+            if int(policy) == 2:
+                return "denied", "组策略禁止了相机访问（LetAppsAccessCamera=2）"
+            if int(policy) == 1:
+                values.append("allow")
+    except (OSError, ValueError, TypeError):
+        pass
+    if any(v == "deny" for v in values):
+        return "denied", (
+            "Windows 相机隐私开关是 Deny；打开 设置 → 隐私和安全性 → 相机 → "
+            "允许桌面应用访问相机，然后再试")
+    if values:
+        return "allowed", "Windows 相机隐私开关未禁止桌面应用"
+    return "unknown", "注册表里没读到相机隐私开关（可能是旧版 Windows）"
+
+
 def device_parent(identity: str, *, runner=_run_powershell,
                   timeout: float = 15.0) -> str:
     """读一个设备接口的父设备 InstanceId（`DEVPKEY_Device_Parent`）。

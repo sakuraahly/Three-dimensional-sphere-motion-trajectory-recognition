@@ -17,6 +17,7 @@ rem    calibrate  直接做双目标定
 rem    verify     直接做标定复检
 rem    run        直接开始实时检测
 rem    diag       相机画质 / 链路诊断（"某一路不清晰"先跑这个）
+rem    doctor     相机体检（真开一遍：隐私开关/后端/能不能出图；只报告）
 rem    test       跑回归测试
 rem
 rem  正文是 UTF-8，所以开头必须 chcp 65001 —— cmd.exe 按当前代码页解析
@@ -162,6 +163,7 @@ if /i "%MODE%"=="calibrate" goto :do_calibrate
 if /i "%MODE%"=="verify"    goto :do_verify
 if /i "%MODE%"=="run"       goto :do_run
 if /i "%MODE%"=="diag"      goto :do_diag
+if /i "%MODE%"=="doctor"    goto :do_doctor
 if /i "%MODE%"=="test"      goto :do_test
 if /i "%MODE%"=="standards" goto :do_standards
 if /i "%MODE%"=="gate"      goto :do_gate
@@ -240,6 +242,11 @@ goto :direct
 :do_diag
 set "DIRECT=apps\tools\camera_quality.py %CAM% --together"
 set "DTITLE=相机画质 / 链路诊断（先分清是带宽不足还是光学/曝光问题）"
+goto :direct
+
+:do_doctor
+set "DIRECT=apps\tools\cameras.py doctor"
+set "DTITLE=相机体检（隐私开关 / 后端 / 逐台能不能出图；只报告）"
 goto :direct
 
 :do_test
