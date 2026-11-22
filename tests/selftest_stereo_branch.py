@@ -27,6 +27,24 @@
   5. 配对率低时要把"极线偏差 vs 标定自报"量出来——几何对不上时说"重新标定"，
      而不是让人继续调 `--max-epipolar`；
   6. 双目圆心取**轮廓**（不是高光斑）、跑满 N 对先判一次几何（`B-132` / `B-131`）。
+  7. 质量结论**两个产物各带一份**（`traj3d.json` 与 `visualization.json` 的
+     `quality` 逐键一致，verdict 与守卫判定一致）——2026-11-15 补。GUI / 3D
+     查看器只读 visualization.json，少了它用户就看不到「仅供参考」。
+  8. 重导出（`apps/export_visualization.py`）**不许冲掉** `quality` /
+     `predictions` / `smoothing` / `world_frame`：导出是重建，这几个键是
+     `run_stereo_video.py` 事后补的。轨迹没变就沿用（并写 `carried_over`
+     标记），轨迹变了就丢 —— 2026-11-15 补。
+  9. **往返一致性** `round_trip`（`stereo/round_trip.py`）：去程/回程在同一个 X
+     处的 (Y,Z) 偏移，四档结论 `retrace` / `ellipse` / `scattered` / `no_pairs`。
+     它是**轨迹的几何属性**，每次导出重算，不参与 `carried_over` —— 2026-11-15 补。
+ 10. **装置级 `fov_apply`**（`stereo/fov_policy.py`）：「启用」= 应用到当前摄像头，
+     标定与录制都服从；九个判据 + 反向自证（删掉第 2 条 -> ②⑧ 变红，字节级
+     还原后 sha256 一致）—— 2026-11-15 补。
+ 11. **双目实时入口**（`apps/run_realtime_stereo.py`）：`skew_correct` /
+     `should_drop` / `compose_hud` / `compose_canvas` 四个纯函数 + 注入假帧源的
+     端到端（60 对、8 px/帧）。核心是 P3 那条：**同一组数据注入一帧 skew，
+     补偿后 RMS 必须显著小于补偿前**（实测 665 -> 32 mm @3.6 m），
+     并把加速段（5 m/s²）的残差如实量出来 —— 2026-11-16 补。
 
     python tests/selftest_stereo_branch.py
     python tests/selftest_stereo_branch.py --scenario clean
@@ -60,6 +78,9 @@ from sphere_tracker.pipeline import SpherePipeline
 from sphere_tracker.types import Detection
 from stereo import MatchConfig, StereoReconstructor, epipolar_dy, geometry_verdict
 from stereo.triangulate import rectify_point_left, rectify_point_right
+from stereo.angled_geometry import (  # B4 refined F 的合成真值与量测
+    epipolar_line, fundamental_from_pose, point_line_distance,
+)
 
 # --------------------------------------------------------------------------
 # 双目装置真值
@@ -1039,6 +1060,2762 @@ def test_guard_step() -> bool:
     return ok
 
 
+def test_guard_classification() -> bool:
+    """几何守卫把「检出质量差」与「几何不一致」分开报（2026-11-13 事故）。
+
+    钉住四件事：
+      1. 真几何不一致（dy 大、gates 全 0、两路检出率 100%）-> geometry_mismatch，
+         原文案仍含「重新标定」、``geometry_verdict(...).suspect is True``（判定式没被改）；
+      2. 检测质量差（形状门 / 分数门拒了大量候选、检出率低）-> detection_quality，
+         新文案**不含**「重新标定」、含形状门 / 预设方向；
+      3. 保守边界：只有少量拒绝、检出率 100%、或只有 3/4 弱证据 -> 仍
+         geometry_mismatch（不许把真几何问题降级）；
+      4. 不可疑 -> ok；center_box_share>0.5 与 biggest 命中门占比>0.5 是强证据。
+
+    反向自证：把 ``stereo/triangulate.classify_guard`` 短路成永远返回
+    ``"detection_quality"``，第 1 条立刻红。
+    """
+    print("----- 几何守卫：检出质量差 / 几何不一致 分开报 -----")
+    from stereo.triangulate import classify_guard
+
+    rig = build_rig()
+    q = {"epipolar_rms": 0.56, "epipolar_max": 1.53}
+
+    def rec_with(dy: float, n: int, matched: int) -> StereoReconstructor:
+        r = StereoReconstructor(rig, MatchConfig())
+        r.n_frames, r.n_matched, r.dy_samples = 60, matched, [dy] * n
+        return r
+
+    checks: list[tuple[str, bool]] = []
+
+    # ---- 1) 真几何不一致 ----
+    v_bad = geometry_verdict([12.4] * 60, q)
+    sig_bad = {"gates": {"radius": 0, "circ": 0, "fill": 0, "radial": 0, "score": 0},
+               "candidates": 120, "biggest_gate_share": 0.0,
+               "center_box_share": None, "both_detected_rate": 1.0,
+               "seed_anchor_share": 0.0}
+    m_bad = rec_with(12.4, 60, 2).geometry_failure_message(v_bad)
+    checks += [
+        ("① 真几何不一致 -> geometry_mismatch",
+         classify_guard(v_bad, sig_bad) == "geometry_mismatch"),
+        ("① 原文案仍含「重新标定」与「第 1 步」",
+         "重新标定" in m_bad and "第 1 步" in m_bad),
+        ("① geometry_verdict(...).suspect is True（判定式没被改）",
+         v_bad.suspect is True),
+    ]
+
+    # ---- 2) 检测质量差 ----
+    v_qual = geometry_verdict([6.8] * 30, q)
+    sig_qual = {"gates": {"radius": 0, "circ": 18, "fill": 9, "radial": 0, "score": 7},
+                "both_detected_rate": 0.3}
+    m_qual = rec_with(6.8, 30, 9).geometry_failure_message(
+        v_qual, cause="detection_quality", sig=sig_qual)
+    checks += [
+        ("② 检测质量差 -> detection_quality",
+         classify_guard(v_qual, sig_qual) == "detection_quality"),
+        ("② 新文案不含「重新标定」", "重新标定" not in m_qual),
+        ("② 新文案含形状门 / 预设方向",
+         "形状门" in m_qual and ("预设" in m_qual or "specular" in m_qual)),
+        ("② 新文案给出 gates 汇总与两路检出率",
+         "circ=18" in m_qual and "30%" in m_qual),
+    ]
+
+    # ---- 3) 保守边界：不许把真几何问题降级 ----
+    sig_edge = {"gates": {"radius": 0, "circ": 2, "fill": 0, "radial": 0, "score": 0},
+                "candidates": 100, "both_detected_rate": 1.0}
+    checks += [
+        ("③ 少量拒绝（占比<0.5）+ 检出率 100% -> 仍 geometry_mismatch",
+         classify_guard(v_qual, sig_edge) == "geometry_mismatch"),
+        ("③ 不可疑 verdict -> ok",
+         classify_guard(geometry_verdict([0.3] * 30, q), sig_bad) == "ok"),
+        ("③ 3/4 弱证据（检出率低 / seed 锚点多）单独不许降级",
+         classify_guard(v_bad, {"gates": {}, "both_detected_rate": 0.3,
+                                "seed_anchor_share": 0.9}) == "geometry_mismatch"),
+        ("③ center_box_share>0.5 是强证据 -> detection_quality",
+         classify_guard(v_bad, {"gates": {}, "center_box_share": 0.8})
+         == "detection_quality"),
+        ("③ biggest 命中门占比>0.5 是强证据 -> detection_quality",
+         classify_guard(v_bad, {"gates": {}, "biggest_gate_share": 0.7})
+         == "detection_quality"),
+    ]
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_guard_no_early_stop() -> bool:
+    """端到端：**两套早停**都不中止，四种产物齐、quality 块正确、CSV 15 列。
+
+    造最小会话（``tempfile.mkdtemp`` + ``finally: shutil.rmtree``），monkeypatch「输入侧」
+    依赖，但让 ``main()`` 的**真实控制流**跑完：守卫块 / 零配对 -> 不中止 -> CSV 写盘 ->
+    ``os.replace(tmp -> 正式)`` -> export -> ``payload["quality"]`` -> ``return 0``。
+
+    两条路径各跑一次：
+      A 几何守卫：mock 重建器让 n_matched>0 + 强制 suspect + 检测质量差信号
+                  -> verdict=detection_quality（证明逐帧 gates 累加真接线）；
+      B 零配对门禁：用**真实 StereoReconstructor**（入口 allow_zero_match=True 放行
+                  门禁），40 帧全空 -> verdict=zero_match、return 0、产物齐、warnings 非空。
+
+    反向自证（4 条）：
+      - classify_guard 恒 detection_quality -> A 的 geometry_mismatch 判据红；
+      - 守卫块放回 ``return 2`` -> A 产物完整性红；
+      - 逐帧 gates 累加恒为空 -> A 的 detection_quality 强断言红；
+      - 入口 ``allow_zero_match=True`` 改回 False -> B「不中止 + 产物齐」红。
+    """
+    print("----- 端到端：两套早停都不中止 + 产物齐 -----")
+    import contextlib as _contextlib
+    import csv as _csv
+    import io as _io
+    import json as _json
+    import shutil as _shutil
+    import sys as _sys
+    import tempfile as _tempfile
+    import types as _types
+    from unittest import mock as _mock
+
+    import apps.run_stereo_video as rsv
+    from stereo.triangulate import geometry_verdict as _gv
+
+    _frame = np.zeros((540, 960, 3), np.uint8)
+
+    class _FakePairSource:
+        image_size = (960, 540)
+
+        def __init__(self, *a, **k):
+            self.n = 0
+
+        def read(self):
+            if self.n >= 40:
+                return (False, None, None)
+            self.n += 1
+            return (True, _frame, _frame)
+
+        def report_warnings(self):
+            pass
+
+        def describe(self):
+            return "fake-index"
+
+        def release(self):
+            pass
+
+    class _FakeDetector:
+        def debug_snapshot(self):
+            # 形状门 / 分数门拒了大量候选 + 最大候选死在 circ：逐帧累加后
+            # 能把 classify_guard 判成 detection_quality（证明信号真接线）。
+            return {"gates": {"radius": 0, "circ": 2, "fill": 1,
+                              "radial": 0, "score": 1},
+                    "biggest": {"gate": "circ"}}
+
+    class _FakePipeline:
+        def __init__(self):
+            self.detector = _FakeDetector()
+
+        def process(self, frame, t):
+            return _types.SimpleNamespace(track=None, detection=None)
+
+    class _FakePoint:
+        residual_px = 0.5
+
+    class _FakeRec:
+        def __init__(self, *a, **k):
+            self.n_matched = 0
+            self.n_frames = 0
+            self.dy_samples = [6.8] * 30
+            self.n_no_left = self.n_no_right = self.n_rejected = 0
+            self.trajectory = [_FakePoint()]
+            self.warmup_frames = 0
+            self.warnings = []
+
+        def update(self, t, det_l, det_r):
+            self.n_matched += 1
+            self.n_frames += 1
+            return _types.SimpleNamespace(
+                xyz=(0.1, 0.05, 3.0), u_left=(100.0, 200.0),
+                u_right=(90.0, 200.0), epipolar_px=0.5,
+                residual_px=0.5, confident=1)
+
+        @property
+        def match_rate(self):
+            return 1.0
+
+        def as_array(self):
+            return np.array([[0.0, 0.1, 0.05, 3.0]], np.float64)
+
+        def low_match_diagnostic(self):
+            return []
+
+        def geometry_failure_message(self, *a, **k):
+            return "[占位] 检出质量差 / 几何不一致 分开报文案"
+
+    class _FakeWriter:
+        def __init__(self, path, fourcc, fps, size):
+            self._path = Path(path)
+
+        def isOpened(self):
+            return True
+
+        def write(self, frame):
+            pass
+
+        def release(self):
+            # 模拟 moov atom 落盘：让 annotated.tmp.mp4 真实存在，
+            # os.replace 才能把它改名成 annotated.mp4。
+            self._path.write_bytes(b"fake-mp4")
+
+    suspect_v = _gv([6.8] * 30, {"epipolar_rms": 0.56, "epipolar_max": 1.53})
+    cam = _types.SimpleNamespace(video="left.mkv", fps_measured=30.0,
+                                 fps_requested=30.0)
+    sess = _types.SimpleNamespace(
+        left=cam, right=cam, calibration=_types.SimpleNamespace(),
+        stereo_mode="parallel", rig={},
+        sync=_types.SimpleNamespace(offset=0, method="flash"))
+
+    def _run(zero_match: bool):
+        """跑一次 main()，返回 (rc, stdout, exc_text, out_dir, tmp)。
+
+        zero_match=False -> A 几何守卫路径（mock 重建器 / 强制 suspect）；
+        zero_match=True  -> B 零配对门禁路径（**真实** StereoReconstructor，
+                            不 mock 重建器与 _guard_step，靠 allow_zero_match 放行）。
+        """
+        tmp = _tempfile.mkdtemp(prefix="dsh_guard_e2e_")
+        session_dir = Path(tmp) / "session"
+        out_dir = Path(tmp) / "out"
+        session_dir.mkdir()
+        (session_dir / "derived").mkdir()
+        fake_traj = Path(tmp) / "exported_traj3d.json"
+        fake_vis = Path(tmp) / "exported_visualization.json"
+        fake_traj.write_text(_json.dumps({
+            "schema": "sphere-stereo-trajectory", "unit": "m",
+            "n_matched": 40, "samples": []}), encoding="utf-8")
+        fake_vis.write_text(_json.dumps({
+            "schema": "sphere-stereo-visualization", "n_points": 0,
+            "bounds": {"min": [0, 0, 0], "max": [0, 0, 0]}}), encoding="utf-8")
+        argv = ["run_stereo_video.py", str(session_dir),
+                "--out", str(out_dir), "--geometry-guard", "30",
+                "--pairing", "index", "--no-plot", "--no-predict",
+                "--no-world", "--no-radius-auto", "--method", "color"]
+        rig = build_rig()      # 完整合成 StereoRig，供真实重建器 / _resolve_max_epipolar
+        base = [
+            _mock.patch.object(rsv, "load_session", return_value=(session_dir, sess)),
+            _mock.patch.object(rsv, "validate_session", return_value=([], [])),
+            _mock.patch.object(rsv, "session_calibration_file",
+                               return_value=session_dir / "calib.npz"),
+            _mock.patch.object(rsv.StereoRig, "load", return_value=rig),
+            _mock.patch.object(rsv, "resolve_auto", return_value="parallel"),
+            _mock.patch.object(rsv, "_mode_guard", return_value=("parallel", False)),
+            _mock.patch.object(rsv, "optical_axes_angle_deg", return_value=0.0),
+            _mock.patch.object(rsv, "_pick_detector", return_value=("color", "")),
+            _mock.patch.object(rsv, "PairSource", _FakePairSource),
+            _mock.patch.object(rsv, "_make_pipeline",
+                               side_effect=lambda cfg, r, side: _FakePipeline()),
+            _mock.patch.object(rsv, "_draw", side_effect=lambda *a, **k: _frame),
+            _mock.patch.object(rsv, "export_session_visualization",
+                               return_value={"trajectory": fake_traj,
+                                             "visualization": fake_vis}),
+            _mock.patch.object(rsv.cv2, "VideoWriter", _FakeWriter),
+        ]
+        if zero_match:
+            # B 路径：**不** mock StereoReconstructor / _guard_step —— 用真实重建器，
+            # 40 帧全空，验证库层 allow_zero_match=True 放行门禁后仍跑完出数。
+            patches = base
+        else:
+            # A 路径：mock 重建器让 n_matched>0、强制 suspect 触发几何守卫。
+            patches = base + [
+                _mock.patch.object(rsv, "StereoReconstructor", _FakeRec),
+                _mock.patch.object(rsv, "_guard_step", return_value=(False, suspect_v)),
+            ]
+        rc, stdout, exc_text = None, "", ""
+        buf = _io.StringIO()
+        try:
+            for p in patches:
+                p.start()
+            old_argv = _sys.argv
+            _sys.argv = argv
+            try:
+                with _contextlib.redirect_stdout(buf):
+                    rc = rsv.main()
+            finally:
+                _sys.argv = old_argv
+            stdout = buf.getvalue()
+        except Exception as exc:                                # noqa: BLE001
+            import traceback as _tb
+            exc_text = _tb.format_exc()
+            print(f"  [不达标] main() 抛异常：{exc!r}")
+            print(exc_text)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return rc, stdout, exc_text, out_dir, tmp
+    checks: list[tuple[str, bool]] = []
+    for zero_match, want, tag in ((False, "detection_quality", "A几何守卫"),
+                                  (True, "zero_match", "B零配对门禁")):
+        rc, stdout, exc_text, out_dir, tmp = _run(zero_match)
+        csv_path = out_dir / "traj3d.csv"
+        traj_path = out_dir / "traj3d.json"
+        vis_path = out_dir / "visualization.json"
+        video_path = out_dir / "annotated.mp4"
+        tmp_video = out_dir / "annotated.tmp.mp4"
+        checks.append((f"[{tag}] main() 返回 0（实际 {rc}）",
+                       rc == 0 and not exc_text))
+        for name, p in (("traj3d.csv", csv_path), ("traj3d.json", traj_path),
+                        ("visualization.json", vis_path), ("annotated.mp4", video_path)):
+            checks.append((f"[{tag}] {name} 存在", p.exists()))
+        checks.append((f"[{tag}] annotated.tmp.mp4 已被 os.replace 改名（不存在）",
+                       not tmp_video.exists()))
+        checks.append((f"[{tag}] stdout 有结构化标记行 [质量] verdict=...",
+                       "[质量] verdict=" in stdout and "结果仅供参考" in stdout))
+        try:
+            payload = _json.loads(traj_path.read_text(encoding="utf-8"))
+            q = payload.get("quality", {})
+            checks.append((f"[{tag}] quality.verdict == {want}",
+                           q.get("verdict") == want))
+            checks.append((f"[{tag}] quality 含通用字段 grade/degraded/warnings",
+                           all(k in q for k in ("grade", "degraded",
+                                                "degraded_reason", "warnings",
+                                                "dy_med_px", "gate_rejects", "note"))))
+            checks.append((f"[{tag}] grade=degraded / degraded=True",
+                           q.get("grade") == "degraded" and q.get("degraded") is True))
+            if not zero_match:
+                # A 强断言：检测质量差靠逐帧 gates 累加，不是靠 dy 猜。
+                checks.append((f"[{tag}] gate_rejects 真汇总到逐帧计数（circ>0）",
+                               (q.get("gate_rejects") or {}).get("circ", 0) > 0))
+            else:
+                # B：库层低配对率 warning 必须保留（不中止但也不静默）。
+                checks.append((f"[{tag}] zero_match 的 warnings 非空（低配对告警保留）",
+                               len(q.get("warnings") or []) > 0))
+        except Exception as exc:                                # noqa: BLE001
+            checks.append((f"[{tag}] 读 JSON quality：{exc}", False))
+        # 2026-11-15：quality 必须**两个产物各带一份**。GUI / 3D 查看器只读
+        # visualization.json，少了这个键，用户拿着"质量差"的结果却看不到标记。
+        # 两份必须**同一个结论**（同一个 dict），否则"以哪个为准"又成了第二份真相。
+        try:
+            tq = _json.loads(traj_path.read_text(encoding="utf-8")).get("quality") or {}
+            vq = _json.loads(vis_path.read_text(encoding="utf-8")).get("quality") or {}
+            checks.append((f"[{tag}] visualization.json 也带 quality.verdict == {want}",
+                           vq.get("verdict") == want))
+            checks.append((f"[{tag}] traj3d.json 与 visualization.json 的 quality 逐键一致",
+                           bool(vq) and vq == tq))
+        except Exception as exc:                                # noqa: BLE001
+            checks.append((f"[{tag}] 读 visualization.json 的 quality：{exc}", False))
+        try:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+                rd = _csv.DictReader(f)
+                header = rd.fieldnames
+                rows = list(rd)
+            checks.append((f"[{tag}] CSV 仍是 15 列（表头整串不变）",
+                           header == list(rsv.CSV_HEADER)))
+            checks.append((f"[{tag}] CSV DictReader 不错位",
+                           all(None not in r and all(v is not None for v in r.values())
+                               for r in rows)))
+        except Exception as exc:                                # noqa: BLE001
+            checks.append((f"[{tag}] 读 CSV：{exc}", False))
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_export_carryover() -> bool:
+    """重导出不许冲掉 `quality` / `predictions` / `smoothing` / `world_frame`。
+
+    根因（2026-11-15 已核实）：`build_trajectory_payload()` /
+    `build_visualization_payload()` 是**从头重建**，返回字典里根本没有 `quality`；
+    这些字段一直是 `apps/run_stereo_video.py` 在导出**之后**补写的。而
+    `apps/export_visualization.py` 以前只调 `export_session_visualization()`、
+    之后什么都不补 —— 于是用户只要重导一次，「质量仅供参考」的标记就凭空消失，
+    直接违背「质量差也要出结果，但质量状态必须记录并显示」。
+
+    这里钉住 `carry_over_runtime_extras()` 的两条边界：
+
+    - 轨迹**没变** -> 沿用上一版，并在 `carried_over` 里写明"不是本次算的"；
+    - 轨迹**变了** -> 一律丢掉旧结论，`notes` 写明"已丢弃、请重跑重建"
+      （宁可丢，也不许把旧结论挂到新轨迹上）。
+
+    所有输入输出都在 `tempfile.mkdtemp()` 里，`finally: shutil.rmtree`
+    —— 绝不碰 `data/`（用户真实录制数据）。
+    """
+    print("----- 重导出：轨迹没变沿用结论 / 轨迹变了必须丢 -----")
+    import json as _json
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+
+    from apps.export_visualization import _trajectory_changed
+    from stereo.visualization import carry_over_runtime_extras
+
+    script = ROOT / "apps" / "export_visualization.py"
+    created_old = "2026-01-01 00:00:00"
+    header = ("frame,t,matched,X,Y,Z,u_left,v_left,u_right,v_right,"
+              "epipolar_px,residual_px,confident,method_left,method_right")
+
+    def _write_csv(path: Path, n_rows: int) -> None:
+        lines = [header]
+        for i in range(1, n_rows + 1):
+            lines.append(f"{i},{i * 0.02:.3f},1,{0.10 + i * 0.01:.4f},0.05,"
+                         f"{2.0 + i * 0.005:.4f},480,270,470,270,0.3,0.4,1,"
+                         f"color,color")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _make_session(root: Path, n_rows: int = 5) -> Path:
+        session = root / "session"
+        (session / "derived").mkdir(parents=True)
+        (session / "session.json").write_text(_json.dumps({
+            "id": "carryover_probe",
+            "left": {"width": 960, "height": 540},
+            "right": {"width": 960, "height": 540},
+            "stereo_mode": "angled",
+            "calibration": {"baseline_mm": 150.0, "created": created_old,
+                            "verdict": "ok"},
+            "sync": {"offset": 0, "method": "flash"},
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_csv(session / "derived" / "traj3d.csv", n_rows)
+        return session
+
+    def _read(path: Path) -> dict:
+        return _json.loads(path.read_text(encoding="utf-8"))
+
+    def _run_cli(session: Path) -> tuple[int, str]:
+        env = dict(_os.environ, PYTHONIOENCODING="utf-8")
+        proc = _subprocess.run([sys.executable, str(script), str(session)],
+                               cwd=str(ROOT), capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", env=env,
+                               timeout=180)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    quality_old = {"verdict": "detection_quality", "grade": "degraded",
+                   "degraded": True, "degraded_reason": "检测质量差",
+                   "warnings": ["逐帧 gates 拒绝较多"], "note": "上一版算的"}
+    # 旧 JSON 里**故意不写 bounds**：这台机器上有没有 config/world_frame.json
+    # 会改变新导出的坐标，拿它比 bounds 就成了环境断言。bounds 判据直接测
+    # `_trajectory_changed()`（纯函数），见后面那三条。
+    traj_old = {
+        "schema": "sphere-stereo-trajectory", "version": 1,
+        "session": "carryover_probe", "created": created_old,
+        "unit": "m", "n_samples": 5, "n_matched": 5,
+        # `coordinate_system` 与 `world_frame` 必须**成对**出现，否则不该搬
+        "coordinate_system": "world",
+        "quality": quality_old,
+        "predictions": {"t_ref": 1.5, "state": [0.1, 0.05, 2.0, 0.0],
+                        "points": [[1.8, 0.11, 0.05, 2.02]]},
+        "smoothing": {"method": "savgol", "window": 7, "points": []},
+        "world_frame": {"source": "board", "note": "fixture",
+                        "created_at": created_old},
+        "notes": ["上一版轨迹说明"],
+    }
+    vis_old = {
+        "schema": "sphere-stereo-visualization", "version": 1,
+        "session": "carryover_probe", "created": created_old,
+        "n_points": 5,
+        "coordinate_system": "world",
+        "world_frame": {"source": "board", "note": "fixture",
+                        "created_at": created_old},
+        "quality": quality_old,
+        # 世界系跑出来的 vis 就是这么写的：一句"已应用世界系"
+        "notes": ["已应用世界系：config/world_frame.json", "上一版可视化说明"],
+    }
+    carry_keys = ("quality", "predictions", "smoothing", "world_frame")
+
+    checks: list[tuple[str, bool]] = []
+    tmp = _tempfile.mkdtemp(prefix="export_carry_")
+    try:
+        session = _make_session(Path(tmp))
+        derived = session / "derived"
+        (derived / "traj3d.json").write_text(
+            _json.dumps(traj_old, ensure_ascii=False, indent=2), encoding="utf-8")
+        (derived / "visualization.json").write_text(
+            _json.dumps(vis_old, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # ---- 判据 1/2/4/6：轨迹没变 -> 沿用，且标记显眼（走真 CLI 子进程） ----
+        rc, out = _run_cli(session)
+        checks.append((f"①⑥ 轨迹未变：CLI 退出码 0（实际 {rc}）", rc == 0))
+        checks.append(("① stdout 明说「沿用上一版」（[保留]）", "[保留]" in out))
+
+        traj_new = _read(derived / "traj3d.json")
+        carried = traj_new.get("carried_over") or {}
+        keys = list(carried.get("keys") or [])
+        checks.append(("① quality / predictions / smoothing / world_frame 四项都还在",
+                       all(k in traj_new for k in carry_keys)))
+        checks.append(("① quality.verdict 仍是 detection_quality（没被重建冲掉）",
+                       (traj_new.get("quality") or {}).get("verdict")
+                       == "detection_quality"))
+        checks.append(("① carried_over.keys 含那四项（读者能看出不是本次算的）",
+                       all(k in keys for k in carry_keys)))
+        # 判据 1（成对搬）：旧文件写着 world + world_frame -> 两个必须**一起**回来。
+        # 只搬 world_frame 会得到"标签说相机系、数据是世界系"的静默错配。
+        checks.append((f"① 成对搬：coordinate_system 跟 world_frame 一起变成 world"
+                       f"（实际 {traj_new.get('coordinate_system')!r}）",
+                       traj_new.get("coordinate_system") == "world"
+                       and "coordinate_system" in keys and "world_frame" in keys))
+        checks.append(("① carried_over.reason 交代了坐标系是沿用的",
+                       "坐标系沿用上一版" in (carried.get("reason") or "")))
+        checks.append((f"② carried_over.from_created == 旧 created"
+                       f"（{carried.get('from_created')!r}）",
+                       carried.get("from_created") == created_old))
+        checks.append(("② carried_over.reason 非空", bool((carried.get("reason") or "").strip())))
+        checks.append(("① notes 是**合并**（上一版的说明还在）",
+                       "上一版轨迹说明" in (traj_new.get("notes") or [])))
+
+        vis_new = _read(derived / "visualization.json")
+        checks.append(("④ visualization.json 也保住 quality（GUI/3D 查看器只读它）",
+                       (vis_new.get("quality") or {}).get("verdict")
+                       == "detection_quality"))
+        checks.append(("④ visualization.json 也带 carried_over 标记",
+                       bool(vis_new.get("carried_over"))))
+        # 判据 4：notes 不许自相矛盾。新文件由 `_apply_world_frame` 生成，本机没有
+        # config/world_frame.json 时它会写"当前坐标为左相机系"——搬了 world 标签后
+        # 那句已经与新标签打脸，必须换成"坐标系沿用上一版 world"，且**不许删**
+        # `_apply_world_frame` 写的其它说明（"已应用世界系…"仍然要留着）。
+        vis_notes = [str(n) for n in (vis_new.get("notes") or [])]
+        checks.append(("④ vis 的 notes 不再同时说「已应用世界系」和「未设置 world_frame.json」",
+                       not (any("已应用世界系" in n for n in vis_notes)
+                            and any("未设置 world_frame.json" in n for n in vis_notes))))
+        checks.append(("④ vis 的 notes 写明「坐标系沿用上一版 world」",
+                       any("坐标系沿用上一版 world" in n for n in vis_notes)))
+        checks.append(("④ vis 的坐标标签与那句 note 一致（都是 world）",
+                       vis_new.get("coordinate_system") == "world"))
+
+        # ---- 判据 3：轨迹变了（多一行 -> n_matched 5 -> 6）必须丢 ----
+        _write_csv(derived / "traj3d.csv", 6)
+        rc2, out2 = _run_cli(session)
+        traj_changed = _read(derived / "traj3d.json")
+        vis_changed = _read(derived / "visualization.json")
+        checks.append((f"③ 轨迹已变：CLI 退出码 0（实际 {rc2}）", rc2 == 0))
+        checks.append(("③ n_matched 真的变成 6（确认判据看的是计数）",
+                       traj_changed.get("n_matched") == 6))
+        checks.append(("③ quality 不在（旧结论没挂到新轨迹上）",
+                       "quality" not in traj_changed))
+        checks.append(("③ predictions 不在", "predictions" not in traj_changed))
+        checks.append(("③ notes 写明「轨迹已变…已丢弃」",
+                       any("轨迹已变" in str(n) and "已丢弃" in str(n)
+                           for n in (traj_changed.get("notes") or []))))
+        checks.append(("③ visualization.json 的 quality 同样丢弃",
+                       "quality" not in vis_changed))
+        checks.append(("③ 丢弃时 stdout 有 [丢弃] 摘要", "[丢弃]" in out2))
+        # 判据 3：轨迹变了连坐标标签也不许沿用 —— 丢弃分支里不动坐标系。
+        checks.append((f"③ coordinate_system 回到重建值（实际"
+                       f" {traj_changed.get('coordinate_system')!r}）",
+                       traj_changed.get("coordinate_system") == "left_camera"))
+        checks.append(("③ world_frame 不在（旧世界系连同新轨迹一起丢）",
+                       "world_frame" not in traj_changed))
+        checks.append(("③ vis 的 coordinate_system 也回到重建值",
+                       vis_changed.get("coordinate_system") == "left_camera"))
+
+        # ---- 纯函数边界：previous 不是 dict / 轨迹变了 ----
+        base_payload = {"session": "x"}
+        untouched = carry_over_runtime_extras(dict(base_payload), None,
+                                              trajectory_changed=False)
+        checks.append(("纯函数：previous=None -> 原样返回（首次导出不多事）",
+                       untouched == base_payload))
+        dropped = carry_over_runtime_extras(dict(base_payload), traj_old,
+                                            trajectory_changed=True)
+        checks.append(("纯函数：轨迹变了 -> 一个结论都不搬 + 坐标系标签也不动",
+                       not any(k in dropped for k in carry_keys)
+                       and "coordinate_system" not in dropped
+                       and any("已丢弃" in str(n) for n in dropped.get("notes") or [])))
+
+        # ---- 判据：`_trajectory_changed()` 的计数 / bounds 容差 ----
+        base = {"n_matched": 5, "n_samples": 5,
+                "bounds": {"min": [0.0, 0.0, 2.0], "max": [1.0, 1.0, 3.0]}}
+        jitter = _json.loads(_json.dumps(base))
+        jitter["bounds"]["min"][0] += 5e-9          # 浮点抖动 << 1e-6
+        checks.append(("判据：计数相同 + bounds 抖动 5e-9 -> 未变（允许沿用）",
+                       not _trajectory_changed(base, jitter)))
+        bumped = _json.loads(_json.dumps(base))
+        bumped["n_matched"] = 6
+        checks.append(("判据：n_matched 5->6 -> 已变", _trajectory_changed(base, bumped)))
+        far = _json.loads(_json.dumps(base))
+        far["bounds"]["max"][2] += 1e-3             # 1e-3 > 1e-6
+        checks.append(("判据：bounds 差 1e-3 > 1e-6 -> 已变",
+                       _trajectory_changed(base, far)))
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- 判据 2：不成对不搬（旧文件是相机系，却鬼使神差留了个 world_frame）----
+    tmp_lone = _tempfile.mkdtemp(prefix="export_carry_lone_")
+    try:
+        session_c = _make_session(Path(tmp_lone))
+        lone = dict(traj_old)
+        lone["coordinate_system"] = "rectified_left_camera"   # 相机系（脏数据）
+        lone.pop("notes", None)
+        (session_c / "derived" / "traj3d.json").write_text(
+            _json.dumps(lone, ensure_ascii=False, indent=2), encoding="utf-8")
+        rc4, out4 = _run_cli(session_c)
+        lone_new = _read(session_c / "derived" / "traj3d.json")
+        lone_keys = list((lone_new.get("carried_over") or {}).get("keys") or [])
+        checks.append((f"② 不成对：旧 coordinate_system 是相机系 -> 不搬 world_frame"
+                       f"（rc={rc4}）",
+                       rc4 == 0 and "world_frame" not in lone_new))
+        checks.append((f"② 不成对：coordinate_system 保持重建值"
+                       f"（实际 {lone_new.get('coordinate_system')!r}）",
+                       lone_new.get("coordinate_system") == "left_camera"))
+        checks.append(("② 不成对：carried_over.keys 里也没有坐标系两项",
+                       "coordinate_system" not in lone_keys
+                       and "world_frame" not in lone_keys))
+        checks.append(("② 不成对：quality 照旧沿用（不因坐标问题一起丢）",
+                       (lone_new.get("quality") or {}).get("verdict")
+                       == "detection_quality"))
+        checks.append((f"② 不成对：stdout 不说「坐标系沿用」", "坐标系沿用" not in out4))
+    finally:
+        _shutil.rmtree(tmp_lone, ignore_errors=True)
+
+    # ---- 判据 5：旧文件损坏 -> 导出仍成功，只警告、不搬、不抛 ----
+    tmp_broken = _tempfile.mkdtemp(prefix="export_carry_broken_")
+    try:
+        session_b = _make_session(Path(tmp_broken))
+        (session_b / "derived" / "traj3d.json").write_text(
+            "{ 这不是 json", encoding="utf-8")
+        rc3, out3 = _run_cli(session_b)
+        broken = _read(session_b / "derived" / "traj3d.json")
+        checks.append((f"⑤ 旧 traj3d.json 是非法 JSON：导出仍成功（rc={rc3}）",
+                       rc3 == 0 and "Traceback" not in out3))
+        checks.append(("⑤ 只打一行 [警告]，不抛", "[警告]" in out3))
+        checks.append(("⑤ 坏文件不当「上一版」：产物里没有 quality / carried_over",
+                       "quality" not in broken and "carried_over" not in broken))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"⑤ 损坏文件路径不该抛异常：{exc!r}", False))
+    finally:
+        _shutil.rmtree(tmp_broken, ignore_errors=True)
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_world_frame_in_traj_payload() -> bool:
+    """`traj3d.json` 的 xyz 必须真的换到 `coordinate_system` 说的那个系（B-134）。
+
+    问题起点：`run_stereo_video.py` 有世界系时把 `coordinate_system` 改写成 "world"、
+    并写上 `world_frame`，但 `samples[*]["xyz"]` 仍是 `traj3d.csv` 的**相机系**坐标
+    —— **标签与数据不一致**：下游按标签解释就得到错数，而且看不出来。世界系坐标
+    其实早在 `_world_block()` 里算好了（另存进 `traj3d_world.csv`），只是没写进 JSON。
+
+    这里跑三段**真实的 `main()` 控制流**（只 mock 输入侧：视频源/检测/重建/写盘，
+    与 `test_guard_no_early_stop` 同一套做法），输入输出全在 `tempfile.mkdtemp()` 里：
+
+    - ① `--no-world`：主路径不变 —— `coordinate_system` 是 `base_frame`、
+      `world_frame is None`、matched 的 xyz 与 `traj3d.csv` 同一行逐个相同（1e-12）；
+    - ② `--world-frame <非单位阵>`：matched 的 xyz 逐点 == `world.apply(相机系)`
+      （1e-9）、`coordinate_system == "world"`、`world_frame` 三字段齐全；
+    - ③ 同一次跑出来的 `visualization.json` 与 `traj3d.json` 数值一致
+      （同一段轨迹，两个文件不许各说一套）；
+    - ④ 世界系行数与 matched 样本数不一致（人为截断）：**不宣称 world**、
+      `world_skipped` 有理由、stdout 有 `[警告]`、进程仍 `return 0`。
+
+    反向自证：把 `_apply_world_to_trajectory_payload()` 里换 xyz 的那几行注掉
+    （只留标签）→ ② 与 ③ 必须变红；字节级还原后 `sha256` 与改前一致。
+    """
+    print("----- 世界系：traj3d.json 的 xyz 必须真的换系 -----")
+    import contextlib as _contextlib
+    import io as _io
+    import json as _json
+    import shutil as _shutil
+    import sys as _sys
+    import tempfile as _tempfile
+    import types as _types
+    from unittest import mock as _mock
+
+    import apps.run_stereo_video as rsv
+    from calib.world_frame import WorldFrame
+    from stereo.visualization import read_trajectory_csv
+
+    n_frames = 24
+    # 世界系必须是**非单位阵**（绕 X 转 30° + 平移）：单位阵下"没换系"也是对的，
+    # 测不出缺陷 —— 这条是判据②的前提，不是可选项。
+    ang = math.radians(30.0)
+    T_wc = np.eye(4)
+    T_wc[:3, :3] = np.array([[1.0, 0.0, 0.0],
+                             [0.0, math.cos(ang), -math.sin(ang)],
+                             [0.0, math.sin(ang), math.cos(ang)]])
+    T_wc[:3, 3] = [0.31, -0.12, 0.47]
+    world_fixture = WorldFrame(T_world_cam=T_wc, source="fixture",
+                               note="非单位阵（绕 X 30°+平移）",
+                               created_at="2026-01-01 00:00:00")
+
+    holder: dict[str, object] = {}
+    frame = np.zeros((540, 960, 3), np.uint8)
+
+    class _FakePairSource:
+        image_size = (960, 540)
+
+        def __init__(self, *a, **k):
+            self.n = 0
+
+        def read(self):
+            if self.n >= n_frames:
+                return (False, None, None)
+            self.n += 1
+            return (True, frame, frame)
+
+        def report_warnings(self):
+            pass
+
+        def describe(self):
+            return "fake-index"
+
+        def release(self):
+            pass
+
+    class _FakePipeline:
+        def __init__(self):
+            self.detector = _types.SimpleNamespace(debug_snapshot=lambda: {})
+
+        def process(self, frame, t):
+            return _types.SimpleNamespace(track=None, detection=None)
+
+    class _FakePoint:
+        residual_px = 0.5
+
+    class _FakeRec:
+        """假重建器：每帧都配一对，并把**相机系**坐标记下来供判据比对。"""
+
+        def __init__(self, *a, **k):
+            holder["rec"] = self
+            self.n_matched = 0
+            self.n_frames = 0
+            self.dy_samples = [0.4] * 30
+            self.n_no_left = self.n_no_right = self.n_rejected = 0
+            self.trajectory = [_FakePoint()]
+            self.warmup_frames = 0
+            self.warnings = []
+            self.pts: list[tuple[float, float, float]] = []
+            self.ts: list[float] = []
+
+        def update(self, t, det_l, det_r):
+            i = len(self.pts)
+            self.ts.append(float(i) * 0.033)
+            self.pts.append((0.10 + 0.005 * i, 0.20 - 0.003 * i, 3.0 + 0.01 * i))
+            self.n_matched += 1
+            self.n_frames += 1
+            return _types.SimpleNamespace(
+                xyz=self.pts[-1], u_left=(100.0, 200.0), u_right=(90.0, 200.0),
+                epipolar_px=0.5, residual_px=0.5, confident=1)
+
+        @property
+        def match_rate(self):
+            return 1.0
+
+        def as_array(self):
+            return np.array([[self.ts[i], *p] for i, p in enumerate(self.pts)],
+                            np.float64).reshape(-1, 4)
+
+        def low_match_diagnostic(self):
+            return []
+
+        def geometry_failure_message(self, *a, **k):
+            return "[占位] 检出质量差 / 几何不一致 分开报文案"
+
+    class _FakeWriter:
+        def __init__(self, path, fourcc, fps, size):
+            self._path = Path(path)
+
+        def isOpened(self):
+            return True
+
+        def write(self, frame):
+            pass
+
+        def release(self):
+            self._path.write_bytes(b"fake-mp4")
+
+    cam = _types.SimpleNamespace(video="left.mkv", fps_measured=30.0,
+                                 fps_requested=30.0)
+    sess = _types.SimpleNamespace(
+        left=cam, right=cam, calibration=_types.SimpleNamespace(),
+        stereo_mode="angled", rig={},
+        sync=_types.SimpleNamespace(offset=0, method="flash"))
+
+    def _run(*, world: bool, truncate_world: bool = False):
+        """跑一次真实 main()；返回 (rc, stdout, out_dir, tmp)。"""
+        tmp = _tempfile.mkdtemp(prefix="world_traj_")
+        session_dir = Path(tmp) / "session"
+        out_dir = Path(tmp) / "out"
+        session_dir.mkdir()
+        (session_dir / "derived").mkdir()
+        # session.json 必须是**真实文件**：export 内部会读它重建 payload。
+        (session_dir / "session.json").write_text(_json.dumps({
+            "id": "world_probe",
+            "left": {"width": 960, "height": 540},
+            "right": {"width": 960, "height": 540},
+            "stereo_mode": "angled",
+            "calibration": {"baseline_mm": 150.0, "verdict": "ok",
+                            "created": "2026-01-01 00:00:00"},
+            "sync": {"offset": 0, "method": "flash"},
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        wf_path = Path(tmp) / "world_frame.json"
+        world_fixture.save(wf_path)
+        argv = ["run_stereo_video.py", str(session_dir), "--out", str(out_dir),
+                "--pairing", "index", "--no-plot", "--no-predict",
+                "--no-radius-auto", "--method", "color", "--stereo-mode", "angled",
+                "--geometry-guard", "0"]
+        argv += ["--no-world"] if not world else ["--world-frame", str(wf_path)]
+        rig = build_rig()
+        patches = [
+            _mock.patch.object(rsv, "load_session", return_value=(session_dir, sess)),
+            _mock.patch.object(rsv, "validate_session", return_value=([], [])),
+            _mock.patch.object(rsv, "session_calibration_file",
+                               return_value=session_dir / "calib.npz"),
+            _mock.patch.object(rsv.StereoRig, "load", return_value=rig),
+            _mock.patch.object(rsv, "resolve_auto", return_value="angled"),
+            _mock.patch.object(rsv, "_mode_guard", return_value=("angled", False)),
+            _mock.patch.object(rsv, "optical_axes_angle_deg", return_value=88.0),
+            _mock.patch.object(rsv, "_pick_detector", return_value=("color", "")),
+            _mock.patch.object(rsv, "PairSource", _FakePairSource),
+            _mock.patch.object(rsv, "_make_pipeline",
+                               side_effect=lambda cfg, r, side: _FakePipeline()),
+            _mock.patch.object(rsv, "_draw", side_effect=lambda *a, **k: frame),
+            _mock.patch.object(rsv.cv2, "VideoWriter", _FakeWriter),
+            _mock.patch("stereo.angled.AngledReconstructor", _FakeRec),
+        ]
+        real_block = rsv._world_block
+        if truncate_world:
+            def _short(world_obj, arr, base_frame):
+                w_arr, block = real_block(world_obj, arr, base_frame)
+                if w_arr is None or len(w_arr) == 0:
+                    return w_arr, block
+                return w_arr[:-1], block
+            patches.append(_mock.patch.object(rsv, "_world_block", _short))
+        rc, stdout = None, ""
+        buf = _io.StringIO()
+        try:
+            for p in patches:
+                p.start()
+            old_argv = _sys.argv
+            _sys.argv = argv
+            try:
+                with _contextlib.redirect_stdout(buf):
+                    rc = rsv.main()
+            finally:
+                _sys.argv = old_argv
+            stdout = buf.getvalue()
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        if rc != 0:
+            print(f"  [调试] main() 返回 {rc}，stdout 如下：\n{stdout}")
+        return rc, stdout, out_dir, tmp
+
+    def _matched(payload: dict) -> list[list[float]]:
+        return [s["xyz"] for s in payload.get("samples") or []
+                if s.get("matched") and s.get("xyz")]
+
+    checks: list[tuple[str, bool]] = []
+
+    # ---- ① 没开世界系：主路径不变 ----
+    tmp_a = None
+    try:
+        rc, out, out_dir, tmp_a = _run(world=False)
+        traj = _json.loads((out_dir / "traj3d.json").read_text(encoding="utf-8"))
+        csv_samples = read_trajectory_csv(out_dir / "traj3d.csv")
+        csv_xyz = [s["xyz"] for s in csv_samples if s["matched"] and s["xyz"]]
+        got = _matched(traj)
+        same = (len(got) == len(csv_xyz) and len(csv_xyz) == n_frames
+                and all(abs(a[k] - b[k]) <= 1e-12
+                        for a, b in zip(got, csv_xyz) for k in range(3)))
+        checks.append((f"① --no-world：main() 返回 0（实际 {rc}）", rc == 0))
+        checks.append((f"① --no-world：coordinate_system == base_frame（实际"
+                       f" {traj.get('coordinate_system')!r}）",
+                       traj.get("coordinate_system") == "left_camera"))
+        checks.append(("① --no-world：world_frame is None", traj.get("world_frame") is None))
+        checks.append((f"① --no-world：{len(got)} 个 matched 点的 xyz 与 CSV 逐个相同（1e-12）",
+                       same))
+        checks.append(("① --no-world：没有 world_skipped（主路径不多写键）",
+                       "world_skipped" not in traj))
+    finally:
+        if tmp_a:
+            _shutil.rmtree(tmp_a, ignore_errors=True)
+
+    # ---- ②③ 给一个非单位阵世界系：xyz 必须真的换系，两个文件必须一致 ----
+    tmp_b = None
+    try:
+        rc, out, out_dir, tmp_b = _run(world=True)
+        rec = holder.get("rec")
+        cam_pts = np.array(getattr(rec, "pts", []), np.float64).reshape(-1, 3)
+        expect = world_fixture.apply(cam_pts)
+        traj = _json.loads((out_dir / "traj3d.json").read_text(encoding="utf-8"))
+        got = np.array(_matched(traj), np.float64).reshape(-1, 3)
+        checks.append((f"② --world：main() 返回 0（实际 {rc}）", rc == 0))
+        checks.append((f"② --world：coordinate_system == 'world'（实际"
+                       f" {traj.get('coordinate_system')!r}）",
+                       traj.get("coordinate_system") == "world"))
+        wf = traj.get("world_frame") or {}
+        checks.append(("② --world：world_frame 的 source/note/created_at 齐全",
+                       bool(wf.get("source")) and "note" in wf
+                       and bool(wf.get("created_at"))))
+        checks.append(("② --world：world_csv 指向 traj3d_world.csv",
+                       (traj.get("world_csv") or "").endswith("traj3d_world.csv")))
+        close = (got.shape == expect.shape and got.size > 0
+                 and float(np.max(np.abs(got - expect))) <= 1e-9)
+        checks.append((f"② --world：{len(got)} 个 matched 点 xyz == world.apply(相机系)"
+                       f"（1e-9，最大偏差 "
+                       f"{0.0 if not got.size else float(np.max(np.abs(got - expect))):.2e}）",
+                       close))
+        checks.append(("② --world：不是照抄相机系坐标（与 CSV 明显不同）",
+                       got.size > 0 and float(np.max(np.abs(got - cam_pts))) > 1e-3))
+        # bounds 必须跟着换（口径同 build_trajectory_payload）
+        b_expect = {"min": [float(expect[:, k].min()) for k in range(3)],
+                    "max": [float(expect[:, k].max()) for k in range(3)]}
+        b_got = traj.get("bounds") or {}
+        checks.append(("② --world：bounds 按换系后的点重算",
+                       bool(b_got) and all(
+                           abs(b_got[e][k] - b_expect[e][k]) <= 1e-9
+                           for e in ("min", "max") for k in range(3))))
+
+        vis = _json.loads((out_dir / "visualization.json").read_text(encoding="utf-8"))
+        vis_pts = np.array([p["xyz"] for p in (vis.get("trajectory") or [])],
+                           np.float64)
+        # 允许 2e-5：traj 的 xyz 来自未取整的 world_arr，vis 走的是 CSV（6 位小数）。
+        checks.append((f"③ 同一次 --world：visualization.json 的 {len(vis_pts)} 个点与"
+                       f" traj3d.json 一致（≤2e-5）",
+                       vis_pts.shape == got.shape and got.size > 0
+                       and float(np.max(np.abs(vis_pts - got))) <= 2e-5))
+        checks.append((f"③ 同一次 --world：visualization.json 也自称 world（实际"
+                       f" {vis.get('coordinate_system')!r}）",
+                       vis.get("coordinate_system") == "world"))
+    finally:
+        if tmp_b:
+            _shutil.rmtree(tmp_b, ignore_errors=True)
+
+    # ---- ④ 世界系行数与 matched 样本数不一致：不许宣称 world，但也不许崩 ----
+    tmp_c = None
+    try:
+        rc, out, out_dir, tmp_c = _run(world=True, truncate_world=True)
+        traj = _json.loads((out_dir / "traj3d.json").read_text(encoding="utf-8"))
+        csv_xyz = [s["xyz"] for s in read_trajectory_csv(out_dir / "traj3d.csv")
+                   if s["matched"] and s["xyz"]]
+        got = _matched(traj)
+        checks.append((f"④ 数量不一致：进程仍返回 0（实际 {rc}）", rc == 0))
+        checks.append(("④ 数量不一致：stdout 有 [警告] 说明未换系", "[警告]" in out))
+        checks.append((f"④ 数量不一致：不宣称 world（实际"
+                       f" {traj.get('coordinate_system')!r}）",
+                       traj.get("coordinate_system") == "left_camera"))
+        checks.append(("④ 数量不一致：world_skipped 写了原因",
+                       "不一致" in (traj.get("world_skipped") or "")))
+        checks.append(("④ 数量不一致：world_frame 不写（不给半套世界系）",
+                       traj.get("world_frame") is None))
+        checks.append(("④ 数量不一致：xyz 保持 CSV 原值（没换系也不许涂层）",
+                       len(got) == len(csv_xyz) and all(
+                           abs(a[k] - b[k]) <= 1e-12
+                           for a, b in zip(got, csv_xyz) for k in range(3))
+                       and float(np.max(np.abs(
+                           np.array(got) - np.array(csv_xyz)))) <= 1e-12))
+    finally:
+        if tmp_c:
+            _shutil.rmtree(tmp_c, ignore_errors=True)
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_round_trip_metric() -> bool:
+    """往返一致性：去程 / 回程在**同一个 X** 处差多少（`traj3d.json["round_trip"]`）。
+
+    为什么需要这个指标：双目只在极线方向上受硬约束，竖直 Y 与深度 Z 全靠三角
+    测量。球来回摆时，同一个 X 处若去程与回程的 (Y,Z) **系统性**错开，说明这条
+    轨迹本身不是一条线（窄椭圆 / 空回差）；若偏移方向忽正忽负，那更像逐帧检测
+    抖动。这两种情况的处置完全不同，靠眼睛看三维图分辨不出来。
+
+    全部**合成**数据（不读 `data/`），钉七件事：
+
+    - ① 原路返回（Y/Z 完全重合）-> `retrace`，且 `sep_median_mm < 0.1`；
+    - ② 窄椭圆两个来回 -> `ellipse`、`n_pairs == 2`、`sign_consistent`、
+      `dz_median_mm == +18 mm`（`Δ = 回程 - 去程`，去程 Z=-9、回程 Z=+9）；
+    - ③ 两段来回偏移方向相反（+8 / -8 mm）-> `scattered`；
+    - ④ 只有一条腿（X 单调到底）-> `no_pairs`、`pairs == []`，**不抛**；
+    - ⑤ 空数组 / 全 NaN / 只有 2 点 -> 返回 `None` 或 `no_pairs`，**不抛**
+      （明确规定：空输入返回 `None`，调用方写成 JSON `null`）；
+    - ⑥ 符号口径钉死：② 的 `dz_median_mm` 必须落在 [+17, +19]。**反向自证**：
+      把 `stereo/round_trip.py` 里 `dy = y_ret - y_out` / `dz = z_ret - z_out`
+      改成 `out - ret` -> ② 立刻变红（-18）；字节级还原后 `sha256` 与改前一致；
+    - ⑦ 不污染既有产物：`build_trajectory_payload()` 的 `n_matched` / `samples` /
+      `unit` / `bounds` 与手算值逐项相同，`round_trip` 也只是**新增**键、
+      不进 `RUNTIME_EXTRA_KEYS`（几何属性，每次重算，不靠搬运）。
+
+    所有输入输出都在 `tempfile.mkdtemp()` 里，`finally: shutil.rmtree`
+    —— 绝不碰 `data/`（用户真实录制数据）。
+    """
+    print("----- 往返一致性：去程 / 回程在同一个 X 处差多少（round_trip）-----")
+    import json as _json
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    from stereo.round_trip import analyze_round_trip
+    from stereo.visualization import RUNTIME_EXTRA_KEYS, build_trajectory_payload
+
+    def _trip(leg_spec: list[tuple[float, float, float, float]],
+              *, n: int = 50, dt: float = 0.033) -> tuple[np.ndarray, np.ndarray]:
+        """按腿拼一条轨迹。leg_spec 每项是 (x起, x止, y, z)，腿内线性。
+
+        相邻腿共用端点（上一腿的止点 == 下一腿的起点）—— 顶点那一帧差分恰好
+        为 0，正好练习「零差分沿用前一个方向、不把一条腿劈成两段」。
+        """
+        xs, ys, zs = [], [], []
+        for x0, x1, y, z in leg_spec:
+            xs.append(np.linspace(x0, x1, n))
+            ys.append(np.full(n, float(y)))
+            zs.append(np.full(n, float(z)))
+        X = np.concatenate(xs)
+        t = np.arange(X.size) * dt
+        return t, np.column_stack([X, np.concatenate(ys), np.concatenate(zs)])
+
+    checks: list[tuple[str, bool]] = []
+
+    # ---- ① 原路返回 ----
+    t1, P1 = _trip([(0.0, 0.4, 0.10, 2.0), (0.4, 0.0, 0.10, 2.0)])
+    r1 = analyze_round_trip(t1, P1)
+    checks.append((f"① 原路返回 -> verdict=retrace（实际 {r1 and r1['verdict']}）",
+                   bool(r1) and r1["verdict"] == "retrace"))
+    checks.append((f"① sep_median_mm {r1 and r1['sep_median_mm']} < 0.1 mm",
+                   bool(r1) and r1["sep_median_mm"] is not None
+                   and r1["sep_median_mm"] < 0.1))
+    checks.append((f"① n_pairs == 1（实际 {r1 and r1['n_pairs']}）",
+                   bool(r1) and r1["n_pairs"] == 1))
+
+    # ---- ② 窄椭圆：两个来回，去程 Z=-9 mm、回程 Z=+9 mm ----
+    t2, P2 = _trip([(0.0, 0.4, 0.10, -0.009), (0.4, 0.0, 0.10, 0.009),
+                    (0.0, 0.4, 0.10, -0.009), (0.4, 0.0, 0.10, 0.009)])
+    r2 = analyze_round_trip(t2, P2)
+    print(f"  ② 实际返回：{_json.dumps(r2, ensure_ascii=False)}")
+    checks.append((f"② 窄椭圆 -> verdict=ellipse（实际 {r2 and r2['verdict']}）",
+                   bool(r2) and r2["verdict"] == "ellipse"))
+    checks.append((f"② n_pairs == 2（实际 {r2 and r2['n_pairs']}）",
+                   bool(r2) and r2["n_pairs"] == 2))
+    checks.append((f"② sign_consistent is True（实际 {r2 and r2['sign_consistent']}）",
+                   bool(r2) and r2["sign_consistent"] is True))
+    checks.append((f"② dz_median_mm == +18 ± 1（实际 {r2 and r2['dz_median_mm']}）",
+                   bool(r2) and r2["dz_median_mm"] is not None
+                   and 17.0 <= r2["dz_median_mm"] <= 19.0))
+    checks.append((f"② dy_median_mm ≈ 0（实际 {r2 and r2['dy_median_mm']}）",
+                   bool(r2) and r2["dy_median_mm"] is not None
+                   and abs(r2["dy_median_mm"]) < 0.01))
+    checks.append((f"② sep_median_mm ≈ 18（|Δ| 就是间距，实际"
+                   f" {r2 and r2['sep_median_mm']}）",
+                   bool(r2) and r2["sep_median_mm"] is not None
+                   and 17.0 <= r2["sep_median_mm"] <= 19.0))
+    checks.append((f"② 每对都有速度（实际 "
+                   f"{r2 and [(p['speed_out_mm_s'], p['speed_back_mm_s']) for p in r2['pairs']]}）",
+                   bool(r2) and all(p["speed_out_mm_s"] is not None
+                                    and p["speed_back_mm_s"] is not None
+                                    and p["speed_out_mm_s"] > 0
+                                    for p in r2["pairs"])))
+    checks.append((f"② x_overlap_m 落在 [0.4] 之内（实际"
+                   f" {r2 and r2['pairs'][0]['x_overlap_m']}）",
+                   bool(r2) and 0.0 < r2["pairs"][0]["x_overlap_m"][0]
+                   < r2["pairs"][0]["x_overlap_m"][1] < 0.4))
+
+    # ---- ③ 符号乱：第一段来回 Z 偏 +8 mm、第二段 -8 mm ----
+    t3, P3 = _trip([(0.0, 0.4, 0.10, 0.0), (0.4, 0.0, 0.10, 0.008),
+                    (0.0, 0.4, 0.10, 0.0), (0.4, 0.0, 0.10, -0.008)])
+    r3 = analyze_round_trip(t3, P3)
+    checks.append((f"③ 偏移方向相反 -> verdict=scattered（实际 {r3 and r3['verdict']}）",
+                   bool(r3) and r3["verdict"] == "scattered"))
+    checks.append((f"③ sign_consistent is False（实际 {r3 and r3['sign_consistent']}）",
+                   bool(r3) and r3["sign_consistent"] is False))
+    checks.append((f"③ 两对的 dz 反号（实际 "
+                   f"{r3 and [p['dz_median_mm'] for p in r3['pairs']]}）",
+                   bool(r3) and {np.sign(p["dz_median_mm"]) for p in r3["pairs"]}
+                   == {1.0, -1.0}))
+
+    # ---- ④ 只有一条腿 ----
+    t4, P4 = _trip([(0.0, 0.4, 0.10, 2.0)], n=100)
+    r4 = analyze_round_trip(t4, P4)
+    checks.append((f"④ 只有一条腿 -> verdict=no_pairs（实际 {r4 and r4['verdict']}）",
+                   bool(r4) and r4["verdict"] == "no_pairs"))
+    checks.append((f"④ pairs == []（实际 {r4 and r4['pairs']}）",
+                   bool(r4) and r4["pairs"] == []))
+    checks.append((f"④ n_pairs == 0 且 note 非空（实际 {r4 and r4['n_pairs']}）",
+                   bool(r4) and r4["n_pairs"] == 0 and bool(r4["note"])))
+
+    # ---- ⑤ 边界输入：不抛，返回 None 或 no_pairs ----
+    def _safe(t, P) -> tuple[bool, object]:
+        try:
+            return True, analyze_round_trip(t, P)
+        except Exception as exc:                    # noqa: BLE001
+            return False, exc
+
+    empty_ok, empty_val = _safe(np.array([]), np.zeros((0, 3)))
+    nan_ok, _ = _safe(np.arange(20.0), np.full((20, 3), np.nan))
+    two_ok, two_val = _safe(np.array([0.0, 0.033]),
+                            np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]]))
+    still_ok, still_val = _safe(np.arange(30.0), np.full((30, 3), 0.0))
+    checks.append((f"⑤ 空数组：不抛，返回 None（实际 {empty_val!r}）",
+                   empty_ok and empty_val is None))
+    checks.append(("⑤ 全 NaN：不抛，返回 None 或 no_pairs（实际 "
+                   f"{nan_ok}）", nan_ok))
+    checks.append((f"⑤ 只有 2 点：不抛，返回 None（实际 {two_val!r}）",
+                   two_ok and two_val is None))
+    checks.append((f"⑤ 完全不动（30 点同一点）：不抛，no_pairs（实际"
+                   f" {(still_val or {}).get('verdict')!r}）",
+                   still_ok and still_val is not None
+                   and still_val["verdict"] == "no_pairs"))
+
+    # ---- ⑥ 符号口径：② 的 dz 必须是 +18（改成 out-ret 会变成 -18） ----
+    checks.append((f"⑥ 符号口径：Δ = 回程 - 去程（dz_median_mm={r2 and r2['dz_median_mm']}，"
+                   "改成 out-ret 会变 -18 即本条变红）",
+                   bool(r2) and 17.0 <= r2["dz_median_mm"] <= 19.0
+                   and r2["pairs"][0]["dz_median_mm"] > 0))
+
+    # ---- ⑦ 不污染既有产物 ----
+    header = ("frame,t,matched,X,Y,Z,u_left,v_left,u_right,v_right,"
+              "epipolar_px,residual_px,confident,method_left,method_right")
+    rows = []
+    xs = list(np.linspace(0.0, 0.4, 20)) + list(np.linspace(0.4, 0.0, 20))
+    for i, x in enumerate(xs):
+        rows.append(f"{i},{i * 0.02:.4f},1,{x:.6f},0.050000,2.000000,"
+                    f"480,270,470,270,0.3,0.4,1,color,color")
+    rows.insert(3, "999,0.0000,0,,,,,,,,,0,0,,")   # 一行 matched=0：不许参与
+    tmp_rt = None
+    try:
+        session = Path(_tempfile.mkdtemp(prefix="round_trip_probe_"))
+        tmp_rt = str(session)
+        (session / "derived").mkdir(parents=True)
+        (session / "session.json").write_text(_json.dumps({
+            "id": "round_trip_probe",
+            "left": {"width": 960, "height": 540},
+            "right": {"width": 960, "height": 540},
+            "stereo_mode": "parallel",
+            "calibration": {"baseline_mm": 150.0, "created": "2026-01-01 00:00:00",
+                            "verdict": "ok"},
+            "sync": {"offset": 0, "method": "flash"},
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        (session / "derived" / "traj3d.csv").write_text(
+            "\n".join([header, *rows]) + "\n", encoding="utf-8")
+
+        payload = build_trajectory_payload(session)
+        checks.append((f"⑦ n_samples == 41（40 matched + 1 未匹配，实际"
+                       f" {payload['n_samples']}）", payload["n_samples"] == 41))
+        checks.append((f"⑦ n_matched == 40（实际 {payload['n_matched']}）",
+                       payload["n_matched"] == 40))
+        checks.append((f"⑦ unit == 'm'（实际 {payload['unit']!r}）",
+                       payload["unit"] == "m"))
+        checks.append((f"⑦ bounds 与手算一致（实际 {payload['bounds']}）",
+                       payload["bounds"] == {"min": [0.0, 0.05, 2.0],
+                                             "max": [0.4, 0.05, 2.0]}))
+        keys = {"frame", "t", "matched", "xyz", "uv_left", "uv_right",
+                "epipolar_px", "residual_px", "confident",
+                "method_left", "method_right"}
+        checks.append(("⑦ samples 每条仍是原来那 11 个键（没加字段）",
+                       len(payload["samples"]) == 41
+                       and all(set(s) == keys for s in payload["samples"])))
+        checks.append(("⑦ samples[0].xyz 仍是 CSV 原值 [0, 0.05, 2]",
+                       payload["samples"][0]["xyz"] == [0.0, 0.05, 2.0]))
+        checks.append((f"⑦ round_trip 是**新增**键且算出来了（verdict="
+                       f"{(payload.get('round_trip') or {}).get('verdict')!r}）",
+                       payload.get("round_trip") is not None
+                       and payload["round_trip"]["verdict"] == "retrace"))
+        checks.append(("⑦ round_trip 不在 RUNTIME_EXTRA_KEYS（几何属性，每次重算，"
+                       "不参与 carried_over）",
+                       "round_trip" not in RUNTIME_EXTRA_KEYS))
+        checks.append((f"⑦ CSV 仍是 15 列（实际 {len(header.split(','))}）",
+                       len(header.split(",")) == 15))
+    finally:
+        if tmp_rt:
+            _shutil.rmtree(tmp_rt, ignore_errors=True)
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+def test_fov_apply() -> bool:
+    """装置级 fov_apply：数据模型往返 + 六个判定分支 + 端到端 + 反向自证。
+
+    概念（用户原话）：「启用」= 把这份 FOV 参数应用到当前装置的两路相机画面上，
+    是**装置级**事实，不是「标定时用不用」「录制时用不用」两个流程开关。标定与
+    录制只是它的下游后果，都服从 :func:`stereo.fov_policy.resolve_fov_apply`。
+
+    下列判据（全部临时目录 + 显式路径，绝不写真 config/data，也不起相机）：
+      ① RigProfile 往返 / 缺字段 / 字符串 "false" 回落 False；
+      ② 未启用+标定 fov=null -> apply=False 且无 legacy_follow/无 warning；
+      ③ 启用+档案无 fov+标定也没 fov -> 无 error（benign）；
+      ③b 启用+档案无 fov+标定带 fov -> **有 error**（内参/画面静默错配）；
+      ④ 启用+parallel+标定 fov=null -> 有 error、不许 apply；
+      ⑤ 启用+parallel+标定 fov 与档案 scale/crop_rect/target_size 任一不同 -> error；
+      ⑥ 启用+parallel+一致 -> apply=True 且返回档案那份 fov(dict)；
+      ⑦ 启用+angled -> apply=False、理由含「不共视」、无 error；
+      ⑧ 关+带 fov 旧标定 -> legacy_follow=True、warning 含「沿用标定」，端到端
+         决策链真跑最终 fov 仍是标定读出的对象（未置 None）；关+标定 fov=null 无提示；
+      ⑨ 反向自证：删掉 resolve_fov_apply 第 2 条整段 -> ②⑧ 变红；
+         字节级还原后 sha256 与改前一致，且还原后 ②⑧ 复绿。
+     ⑩ angled 忽略警告抽成纯函数 angled_ignore_message（真调，含「忽略」），
+         并钉住 angled+默认关+带 fov 标定 -> apply=False 且无 error（不拒绝录制）。
+    """
+    print("----- 装置级 fov_apply：唯一判定点 resolve_fov_apply -----")
+    import hashlib as _hashlib
+    import importlib as _importlib
+    import json as _json
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    from stereo import fov_policy, profiles
+    import apps.record_stereo as _rs
+
+    FOV = {
+        "reference_side": "left", "crop_side": "right",
+        "crop_rect": [404, 195, 1718, 973], "target_size": [1718, 972],
+        "scale": 0.664875885304807, "method": "sift",
+        "inliers": 296, "quality": 0.513,
+    }
+
+    def _prof(apply, fov=FOV):
+        return profiles.RigProfile(name="probe", fov_apply=apply, fov=fov)
+
+    checks: list[tuple[str, bool]] = []
+
+    # ① 数据模型
+    _d = _prof(True).to_dict()
+    checks.append(("① to_dict 带 fov_apply=True", _d.get("fov_apply") is True))
+    checks.append(("① from_dict 读回仍是 True",
+                   profiles.RigProfile.from_dict(_d).fov_apply is True))
+    checks.append(("① 缺字段的老档案读成 False",
+                   profiles.RigProfile.from_dict({"name": "old"}).fov_apply is False))
+    checks.append(('① 字符串 "false" 也读成 False（不能 bool("false")==True）',
+                   profiles.RigProfile.from_dict(
+                       {"name": "x", "fov_apply": "false"}).fov_apply is False))
+    checks.append(("① 非 bool 的数字 1 也回落 False",
+                   profiles.RigProfile.from_dict(
+                       {"name": "x", "fov_apply": 1}).fov_apply is False))
+    _td = _tempfile.mkdtemp(prefix="fov_apply_probe_")
+    try:
+        _pp = Path(_td) / "profiles.json"
+        profiles.upsert(_prof(True), replace_existing=True, path=_pp)
+        checks.append(("① upsert 往返仍是 True",
+                       profiles.get_profile("probe", path=_pp).fov_apply is True))
+    finally:
+        _shutil.rmtree(_td, ignore_errors=True)
+
+    # ② 未启用 + 标定 fov=null -> 两路按原始画面（无 legacy_follow / 无 warning）
+    def _case2():
+        r = fov_policy.resolve_fov_apply(_prof(False), mode="parallel",
+                                         calib_fov=None)
+        return (r["apply"] is False and r["fov"] is None and r["error"] is None
+                and r.get("legacy_follow") is False
+                and r.get("warning", "") == "")
+
+    checks.append(("② 未启用+标定 fov=null -> apply=False 且无 legacy_follow/无 warning",
+                   _case2()))
+
+    # ③ 启用但档案无 fov，且标定也没用 FOV -> benign（无 error）
+    r3 = fov_policy.resolve_fov_apply(_prof(True, fov=None), mode="parallel",
+                                      calib_fov=None)
+    checks.append(("③ 启用+档案无 fov+标定 fov=null -> apply=False 且无 error",
+                   r3["apply"] is False and r3["error"] is None
+                   and "没有 FOV 记录" in r3["reason"]))
+
+    # ③b 启用但档案无 fov，标定却带 fov -> 必须报错（内参/画面口径静默错配）
+    r3b = fov_policy.resolve_fov_apply(_prof(True, fov=None), mode="parallel",
+                                       calib_fov=FOV)
+    checks.append(("③b 启用+档案无 fov+标定带 fov -> apply=False 且有 error",
+                   r3b["apply"] is False and bool(r3b["error"])))
+    checks.append(("③b error 点明「补进档案 / 关开关并重新标定」两条出路",
+                   bool(r3b["error"]) and "从当前标定读入" in r3b["error"]
+                   and "重新标定" in r3b["error"]))
+
+    # ④ 启用 + parallel + 标定 fov null
+    r4 = fov_policy.resolve_fov_apply(_prof(True), mode="parallel", calib_fov=None)
+    checks.append(("④ 启用+parallel+标定 fov=null -> 有 error、不许 apply",
+                   r4["apply"] is False and bool(r4["error"])))
+
+    # ⑤ 启用 + parallel + 标定 fov 与档案不一致（三个字段逐一）
+    r5a = fov_policy.resolve_fov_apply(_prof(True), mode="parallel",
+                                       calib_fov=dict(FOV, scale=0.5))
+    r5b = fov_policy.resolve_fov_apply(_prof(True), mode="parallel",
+                                       calib_fov=dict(FOV, crop_rect=[1, 2, 3, 4]))
+    r5c = fov_policy.resolve_fov_apply(_prof(True), mode="parallel",
+                                       calib_fov=dict(FOV, target_size=[100, 100]))
+    checks.append(("⑤ scale 不一致 -> 有 error",
+                   r5a["apply"] is False and bool(r5a["error"])))
+    checks.append(("⑤ crop_rect / target_size 任一不一致也 -> 有 error",
+                   (r5b["apply"] is False and bool(r5b["error"]))
+                   and (r5c["apply"] is False and bool(r5c["error"]))))
+
+    # ⑥ 启用 + parallel + 一致
+    r6 = fov_policy.resolve_fov_apply(_prof(True), mode="parallel", calib_fov=FOV)
+    checks.append(("⑥ 启用+parallel+一致 -> apply=True 且返回档案那份 fov(dict)",
+                   r6["apply"] is True and r6["error"] is None
+                   and isinstance(r6["fov"], dict) and r6["fov"] == FOV))
+
+    # ⑦ 启用 + angled
+    r7 = fov_policy.resolve_fov_apply(_prof(True), mode="angled", calib_fov=FOV)
+    checks.append(("⑦ 启用+angled -> apply=False、理由含「不共视」、无 error",
+                   r7["apply"] is False and "不共视" in r7["reason"]
+                   and r7["error"] is None))
+
+    # ⑧ 关 + 带 fov 旧标定 -> 沿用标定自带的 FOV（用户裁决：旧流程行为不变）
+    def _case8():
+        with _tempfile.TemporaryDirectory(prefix="fov_apply_e2e_") as td:
+            calib = Path(td) / "stereo_calibration.json"
+            calib.write_text(_json.dumps(
+                {"fov": FOV, "stereo_mode": "parallel"}, ensure_ascii=False),
+                encoding="utf-8")
+            raw = _json.loads(calib.read_text(encoding="utf-8"))["fov"]
+            dec = _rs.decide_record_fov("parallel", raw, _prof(False))
+            ok_flag = (dec["apply"] is False and dec["error"] is None
+                       and dec.get("legacy_follow") is True
+                       and "沿用标定" in dec.get("warning", ""))
+            # 端到端决策链：真调 _load_calib_fov 拿到标定 fov 对象，再按 main
+            # 决策块走一遍（legacy_follow 分支不置 None），不起相机。
+            fov = _rs._load_calib_fov(raw)
+            if dec["error"]:
+                final_fov = None
+            elif dec.get("legacy_follow"):
+                final_fov = fov            # 沿用：保持标定读出来的对象，照旧裁剪
+            elif not dec["apply"]:
+                final_fov = None
+            else:
+                final_fov = fov
+            return ok_flag and final_fov is fov
+
+    r8 = fov_policy.resolve_fov_apply(_prof(False), mode="parallel",
+                                      calib_fov=FOV)
+    checks.append(("⑧-1 关+带 fov 标定 -> legacy_follow=True 且 warning 含「沿用标定」",
+                   r8.get("legacy_follow") is True
+                   and "沿用标定" in r8.get("warning", "")))
+    checks.append(("⑧-2 端到端决策链：最终 fov 仍是标定读出的对象、没被置 None",
+                   _case8()))
+    r8n = fov_policy.resolve_fov_apply(_prof(False), mode="parallel",
+                                       calib_fov=None)
+    checks.append(("⑧-3 关+标定 fov=null -> 无 legacy_follow、无 warning",
+                   r8n.get("legacy_follow") is False
+                   and r8n.get("warning", "") == ""))
+    checks.append(("⑧-4 legacy_follow=True 时 error is None（不拒绝、照旧录）",
+                   r8.get("legacy_follow") is True and r8["error"] is None))
+
+    # ⑨ 反向自证：删掉第 2 条整段 -> ②⑧ 变红；字节级还原 sha256 一致
+    _src = ROOT / "stereo" / "fov_policy.py"
+    _orig = _src.read_bytes()
+    _sha_before = _hashlib.sha256(_orig).hexdigest()
+    _nl = b"\r\n" if b"\r\n" in _orig else b"\n"
+    _text_lf = (_orig.decode("utf-8").replace("\r\n", "\n")
+                if _nl == b"\r\n" else _orig.decode("utf-8"))
+    # 第 2 条拆成两支后整段变长，改用起止边界定位「第 2 条整段」更稳：
+    _start_mark = "    # 2. 未启用 —— 反向自证锚点：删掉这一整段，判据 2 / 8 必须变红"
+    _end_mark = "    # 3. 启用但档案没有 FOV 记录"
+    _i0 = _text_lf.find(_start_mark)
+    _i1 = _text_lf.find(_end_mark, _i0 + 1) if _i0 >= 0 else -1
+    _hit = 1 if (_i0 >= 0 and _i1 > _i0) else 0
+    checks.append(("⑨ 反向自证锚点（第 2 条整段）命中", _hit == 1))
+    _sha_restored = False
+    if _hit == 1:
+        _mut_lf = _text_lf[:_i0] + _text_lf[_i1:]
+        _mut_bytes = (_mut_lf.replace("\n", "\r\n") if _nl == b"\r\n"
+                      else _mut_lf).encode("utf-8")
+        checks.append(("⑨ 变异注入后源码字节确实变了", _mut_bytes != _orig))
+        try:
+            _src.write_bytes(_mut_bytes)
+            _importlib.reload(fov_policy)
+            # 删掉第 2 条后：② 落到第 5 条（有 error）、⑧ 落到第 7 条
+            # （apply=True、无 legacy_follow），两条都变红。
+            checks.append(("⑨ 删掉第 2 条后 ② 变红（不再无 error）",
+                           not _case2()))
+            checks.append(("⑨ 删掉第 2 条后 ⑧ 变红（不再 legacy_follow）",
+                           not _case8()))
+        finally:
+            _src.write_bytes(_orig)                 # 字节级还原
+            _importlib.reload(fov_policy)
+            _sha_after = _hashlib.sha256(_src.read_bytes()).hexdigest()
+            _sha_restored = (_sha_after == _sha_before)
+    checks.append(("⑨ 字节级还原后 sha256 一致", _sha_restored))
+    checks.append(("⑨ 还原后 ② 复绿", _case2()))
+    checks.append(("⑨ 还原后 ⑧ 复绿", _case8()))
+
+    # ⑩ angled 忽略警告抽成纯函数：真调（不许用源码字符串匹配替代）
+    from types import SimpleNamespace as _NS
+    _fake_active = _NS(active=True, to_dict=lambda: {"crop_side": "right"})
+    _fake_inactive = _NS(active=False, to_dict=lambda: {"crop_side": "none"})
+    _ignore = _rs.angled_ignore_message(_fake_active)
+    checks.append(("⑩ angled_ignore_message(active=True) 含「忽略」",
+                   isinstance(_ignore, str) and "忽略" in _ignore))
+    checks.append(("⑩ angled_ignore_message(None) == 空串",
+                   _rs.angled_ignore_message(None) == ""))
+    checks.append(("⑩ angled_ignore_message(active=False) == 空串",
+                   _rs.angled_ignore_message(_fake_inactive) == ""))
+    # 配套：angled+默认关+带 fov 标定 -> 决策为「未启用、无 error」，决策块进
+    # apply=False 分支但（改后）不提前置 fov=None，原 angled 分支才拿得到带
+    # active 的 fov 并打出「忽略」警告。
+    r_ang = fov_policy.resolve_fov_apply(_prof(False), mode="angled", calib_fov=FOV)
+    checks.append(("⑩ angled+默认关+带 fov 标定 -> apply=False 且无 error（不拒绝录制）",
+                   r_ang["apply"] is False and r_ang["error"] is None))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+# --------------------------------------------------------------------------
+# 11. 双目实时入口（apps/run_realtime_stereo.py）：纯函数 + 注入式端到端
+# --------------------------------------------------------------------------
+RT_DT = 1.0 / 30.0        # 虚拟帧间隔（33.3 ms）——"一帧"就是判据里的这个数
+RT_Z = 3.6                # 球所在深度（米）：f=850、B=150 mm 时 1 px ≈ 102 mm
+RT_SPEED_PX = 8.0         # 要求：球在左图匀速右移 8 px/帧
+#: 对应的三维横移速度：u 每帧 8 px => dX = 8·Z/f，再折成 米/秒
+RT_V0 = RT_SPEED_PX * (1.0 / RT_DT) * RT_Z / float(K1[0, 0])
+
+
+def _rt_xyz(t, *, v0=RT_V0, a=0.0, x0=-1.0):
+    """真值三维位置。**同一个时钟**贯穿渲染与判据（t=0 是第 0 对帧）。"""
+    return np.array([x0 + v0 * t + 0.5 * a * t * t, 0.0, RT_Z], np.float64)
+
+
+def _rt_project(xyz, side):
+    """真值 -> 某一路像素 (u, v, r)，与 `selftest_stereo_branch` 的装置真值同源。"""
+    K = K1 if side == "left" else K2
+    p = np.asarray(xyz, np.float64)
+    if side == "right":
+        p = R_REL @ p + T_REL.ravel()
+    u = K[0, 2] + K[0, 0] * p[0] / p[2]
+    v = K[1, 2] + K[1, 1] * p[1] / p[2]
+    r = K[0, 0] * (BALL_DIAMETER_M / 2.0) / p[2]
+    return float(u), float(v), float(r)
+
+
+def _rt_frame(u, v, r):
+    """白圆 + 深灰底。用合成画面而不是真相机：判据要能自动跑、且真值已知。"""
+    img = np.full((HEIGHT, WIDTH, 3), 60, np.uint8)
+    cv2.circle(img, (int(round(u)), int(round(v))), int(round(r)),
+               (255, 255, 255), -1, cv2.LINE_AA)
+    return img
+
+
+def _rt_pairs(n, *, skew_ms=0.0, a=0.0, v0=RT_V0, x0=-1.0):
+    """造 n 对帧。右路拍的是 ``t + skew`` 时刻的**真实场景**，时间戳也如实带上。
+
+    这一点是判据 ⑤ 成立的前提：如果右路还按 t 渲染、却把时间戳写成 t+skew，
+    那"补偿"只是在跟一个不存在的偏差较劲。
+    """
+    out = []
+    for i in range(n):
+        t = i * RT_DT
+        t_l = 100.0 + t                     # 绝对值不重要：两路同钟、单调递增即可
+        t_r = t_l + skew_ms / 1000.0
+        ul, vl, rl = _rt_project(_rt_xyz(t, v0=v0, a=a, x0=x0), "left")
+        ur, vr, rr = _rt_project(
+            _rt_xyz(t + skew_ms / 1000.0, v0=v0, a=a, x0=x0), "right")
+        out.append((_rt_frame(ul, vl, rl), _rt_frame(ur, vr, rr),
+                    t_l, t_r, skew_ms))
+    return out
+
+
+class _RTPairSource:
+    """假帧源：只实现 `run_loop` 真正用到的那几个方法。
+
+    判据不碰相机的关键就在这里 —— 主循环跑的是**生产代码**，只有帧源是假的。
+    """
+
+    kind = "camera"
+
+    def __init__(self, pairs, stalled=()):
+        self._pairs, self._i = list(pairs), 0
+        self._stalled = set(stalled)
+        self.dropped_pairs = 0
+
+    def read_pair(self, max_skew_ms=None):
+        if self._i >= len(self._pairs):
+            return False, None, None, 0.0, 0.0, None, 0, 0
+        fl, fr, t_l, t_r, sk = self._pairs[self._i]
+        self._i += 1
+        return True, fl, fr, t_l, t_r, sk, self._i, self._i
+
+    def stalled_sides(self, timeout=1.0):
+        # read_pair 里已 +1，这里问的是**刚返回那一对**
+        return (self._i - 1 in self._stalled, False)
+
+    def release(self):
+        pass
+
+
+def _rt_run(pairs, *, skew_fix=True, stalled=(), max_skew_ms=60.0,
+            a=0.0, v0=RT_V0, x0=-1.0, shift_s=0.0,
+            session_root=None, out: dict | None = None):
+    """跑一遍生产主循环，返回 ``(stats, rec, rms_mm, errs_mm)``。
+
+    ``shift_s``：真值取哪个时刻。三角化按约定标注在**较晚**时刻，但补偿之后
+    这个点描述的是**较早**时刻的位置，所以 skew 用例传 ``-skew/1000``。
+    前 5 对不进 RMS：tracker 起步期 `hits<3` 按设计不补偿（门禁本身在判据 ②/⑦）。
+
+    ``session_root`` 给了就**走真正的落盘链路**（`_SessionRecorder` + `save`），
+    并把 ``{"dir": 会话目录或 None, "recorder": ...}`` 填进 ``out``。
+    """
+    import apps.run_realtime_stereo as rts
+
+    pipe_l, pipe_r = make_pipeline(K1), make_pipeline(K2)
+    rig = build_rig()
+    rec = StereoReconstructor(rig, MatchConfig(max_epipolar_px=2.5),
+                              allow_zero_match=True)
+    recorder = None
+    if session_root is not None:
+        recorder = rts._SessionRecorder(
+            root=session_root, mode="parallel", image_size=(WIDTH, HEIGHT),
+            fps=30.0, calib_base="<test>", rig=rig)
+    # 传的是**零参工厂**（`source_factory`），不是实例：同一进程要跑好几轮，
+    # 每轮必须拿到一对新帧源。顺带把"工厂这条路"也真跑一遍。
+    stats = rts.run_loop(lambda: _RTPairSource(pairs, stalled=stalled),
+                         pipe_l, pipe_r, rec, skew_fix=skew_fix,
+                         max_skew_ms=max_skew_ms, max_frames=len(pairs),
+                         display_width=800, panel_on=False, log_every=0,
+                         frame_sink=(recorder.write_frame if recorder
+                                     else None),
+                         collect_rows=recorder is not None)
+    if out is not None:
+        out["stats"] = stats
+        if recorder is not None:
+            out["recorder"] = recorder
+            out["dir"] = recorder.save(stats)
+    elif recorder is not None:
+        recorder.save(stats)
+    errs = []
+    for pt in rec.trajectory:
+        if pt.t < 5 * RT_DT:
+            continue
+        truth = _rt_xyz(pt.t + shift_s, v0=v0, a=a, x0=x0)
+        errs.append(float(np.linalg.norm(pt.xyz - truth)) * 1000.0)
+    rms = float(np.sqrt(np.mean(np.square(errs)))) if errs else float("nan")
+    return stats, rec, rms, errs
+
+
+def test_realtime_stereo() -> bool:
+    """双目实时入口（`apps/run_realtime_stereo.py`）的判决逻辑与端到端。
+
+    为什么这一段必须存在：这个入口是**唯一**会被真机反复使用的双目程序，
+    而它过去不存在 —— 单目实时跑得再顺，也证明不了"两路 + 时间差 + 三角测量"
+    这条链在实时节奏下成立。下面每条都**真跑**（不碰相机、不做源码字符串匹配）：
+
+      ① `skew_correct` / `skew_dt_for_side`：匀速位移正好 3.3 px、dt=0 原样、
+         负 dt 反向、**只有较晚那一路**有位移；
+      ② `should_drop`：不超限不丢 / 超 skew 丢且原因含 skew / 任一路 stalled
+         丢且原因含 stalled；
+      ③ `compose_hud` 同时含 match/res/disp/skew/drop 五个键（取不到写 n/a）；
+      ④ 注入式端到端：60 对、33.3 ms/帧 —— 三维点 > 50 且不崩；
+      ⑤ 补偿有效性：同一组数据右路延后一帧，开/关补偿各跑一遍，
+         **补偿后 RMS 必须显著小于补偿前**（两个数都打出来）；
+      ⑥ 加速边界：5 m/s²、同样一帧 skew，量出补偿后的残差（如实报，不粉饰）；
+      ⑦ stalled / |skew| 超限：该对不产出三维点，且 dropped 计数增加；
+      ⑧ 反向自证：删掉 `should_drop` 的 stalled 分支 -> ⑦ 的 stalled 半边变红；
+         字节级还原后 sha256 与改前一致，且还原后复绿。
+      ⑩ 分发：`make_reconstructor` 按标定模式选重建器（六个组合逐个真调）；
+      ⑪ `none_raw + parallel` 仍被拒（文案含「重标」「angled」）；
+      ⑫ 大角度重建器真能出点（合成真值 3 点、误差 < 1 mm、match_rate 有值）；
+      ⑬ 大角度 HUD 的 `disp` 写 n/a，收尾用「极线距离 / 交会角」；
+         `run_loop` 的模式是从重建器类型读出来的（不是写死 parallel）；
+      ⑭ 反向自证：删掉 `make_reconstructor` 的 angled 分支 -> ⑩ 变红，
+         字节级还原后 sha256 一致、复绿。
+      ⑮ 退出落会话：60 对 -> 目录 + `session.json`（`load_session` 可读、
+         `left.frame_count > 0`）；
+      ⑯ `traj3d.csv` 表头 == `CSV_HEADER`、行数 == 三维点数；
+      ⑰ `derived/seeds.json` 的 `source == "realtime"`；
+      ⑱ `derived/visualization.json` 的 schema/version/trajectory 合规；
+      ⑲ `view_3d.load_view` 能加载、数据管理判为 `traj`（✓）；
+      ⑳ 三维点 < 30 不落盘（目录都不留）；
+      ㉑ CSV 的 `frame` 与 `annotated.mp4` 的帧序号一一对应（含被丢弃的空洞）；
+      ㉒ 反向自证：把 `frame_index += 1` 挪进 `if pt is not None` ->
+         ㉑ 变红；字节级还原后 sha256 一致并复绿。
+    """
+    print("----- 11. 双目实时入口：纯函数 + 注入式端到端 -----")
+    import hashlib as _hashlib
+    import importlib as _importlib
+
+    import apps.run_realtime_stereo as rts
+
+    checks: list[tuple[str, bool]] = []
+
+    # ---- ① skew_correct / skew_dt_for_side ----
+    u2, v2 = rts.skew_correct(100.0, 200.0, 100.0, 0.0, 0.033)
+    checks.append(("① 匀速 vx=100px/s、dt=0.033s -> 位移正好 3.3 px",
+                   abs(u2 - 103.3) < 1e-6 and abs(v2 - 200.0) < 1e-9))
+    zero = rts.skew_correct(12.5, -3.0, 999.0, -999.0, 0.0)
+    checks.append(("① dt=0 原样返回（一个浮点噪声都不加）", zero == (12.5, -3.0)))
+    u3, v3 = rts.skew_correct(100.0, 200.0, 100.0, 50.0, -0.033)
+    checks.append(("① 负 dt 反向（-3.3 px / -1.65 px）",
+                   abs(u3 - 96.7) < 1e-6 and abs(v3 - 198.35) < 1e-6))
+    checks.append(("① skew>0（右路更晚）：右路 dt=-12 ms、左路 0",
+                   abs(rts.skew_dt_for_side(12.0, "right") + 0.012) < 1e-12
+                   and rts.skew_dt_for_side(12.0, "left") == 0.0))
+    checks.append(("① skew<0（左路更晚）：左路 dt=-12 ms、右路 0",
+                   abs(rts.skew_dt_for_side(-12.0, "left") + 0.012) < 1e-12
+                   and rts.skew_dt_for_side(-12.0, "right") == 0.0))
+
+    # ---- ② should_drop 三支 ----
+    d0, r0 = rts.should_drop(12.3, False, False, 60.0)
+    d1, r1 = rts.should_drop(100.0, False, False, 60.0)
+    d2, r2 = rts.should_drop(12.3, True, False, 60.0)
+    d3, r3 = rts.should_drop(12.3, False, True, 60.0)
+    checks.append(("② |skew|<=上限且不 stalled -> 不丢（原因空串）",
+                   d0 is False and r0 == ""))
+    checks.append(("② 超限 -> 丢，原因含 skew", d1 is True and "skew" in r1))
+    checks.append(("② 任一路 stalled -> 丢，原因含 stalled（左右都算）",
+                   d2 is True and "stalled" in r2 and d3 is True and "stalled" in r3))
+
+    # ---- ③ compose_hud 五个键 ----
+    line = rts.compose_hud(match_rate=0.87, residual_px=0.8, disparity_px=42.1,
+                           skew_ms=12.3, dropped=3)
+    keys = ("match", "res", "disp", "skew", "drop")
+    checks.append(("③ compose_hud 含 match/res/disp/skew/drop 五个键",
+                   all(k in line for k in keys)
+                   and "87%" in line and "42.1" in line and "+12.3" in line))
+    empty = rts.compose_hud()
+    checks.append(("③ 取不到真值时写 n/a（不拿 0 冒充测量值）",
+                   all(k in empty for k in keys) and "n/a" in empty))
+
+    # ---- ④ 注入式端到端：60 对、8 px/帧 ----
+    stats, rec, rms_clean, _ = _rt_run(_rt_pairs(60))
+    print(f"     ④ 60 对无 skew：三维点 {stats.points}，配对 {rec.n_matched}/"
+          f"{rec.n_frames}，RMS {rms_clean:.1f} mm（{RT_Z} m 处）")
+    checks.append((f"④ 注入 60 对 -> 三维点 {stats.points} > 50 且不崩",
+                   stats.points > 50 and rec.n_matched > 50))
+    checks.append(("④ HUD 的 skew/drop 与真实统计一致（不是写死的）",
+                   "skew" in rts.compose_hud(match_rate=rec.match_rate,
+                                            skew_ms=stats.skews[-1],
+                                            dropped=stats.dropped)
+                   and stats.dropped == 0))
+
+    # ---- ⑤ 补偿有效性：右路整体延后一帧 ----
+    skew_ms = 1000.0 * RT_DT
+    st_off, _, rms_off, _ = _rt_run(_rt_pairs(60, skew_ms=skew_ms), skew_fix=False,
+                                    shift_s=-skew_ms / 1000.0)
+    st_on, _, rms_on, _ = _rt_run(_rt_pairs(60, skew_ms=skew_ms), skew_fix=True,
+                                  shift_s=-skew_ms / 1000.0)
+    print(f"     ⑤ skew +{skew_ms:.1f} ms：关补偿 RMS {rms_off:.1f} mm"
+          f" -> 开补偿 {rms_on:.1f} mm（{rms_off / max(rms_on, 1e-9):.1f}×）")
+    checks.append((f"⑤ 补偿后 RMS {rms_on:.1f} mm 显著小于补偿前 {rms_off:.1f} mm",
+                   rms_on * 3.0 < rms_off and st_on.points > 50))
+
+    # ---- ⑥ 加速边界（5 m/s²）----
+    acc_kw = dict(a=5.0, v0=0.0, x0=-1.2)
+    _, _, rms_acc_off, _ = _rt_run(_rt_pairs(30, skew_ms=skew_ms, **acc_kw),
+                                   skew_fix=False, shift_s=-skew_ms / 1000.0,
+                                   **acc_kw)
+    st_acc, _, rms_acc, _ = _rt_run(_rt_pairs(30, skew_ms=skew_ms, **acc_kw),
+                                    skew_fix=True, shift_s=-skew_ms / 1000.0,
+                                    **acc_kw)
+    print(f"     ⑥ 5 m/s² + skew {skew_ms:.1f} ms：关补偿 {rms_acc_off:.1f} mm"
+          f" -> 开补偿 {rms_acc:.1f} mm（点 {st_acc.points}）")
+    # 阈值按实测设（本次 30 对实测约 65 mm，留 ~4 倍余量）：这条只防退化，
+    # 不假装"加速段也精确" —— 一阶补偿的残差本来就随加速度线性增长。
+    checks.append((f"⑥ 加速段补偿后残余 {rms_acc:.1f} mm < 250 mm（一阶补偿的边界）",
+                   rms_acc < 250.0 and rms_acc < rms_acc_off))
+
+    # ---- ⑦ stalled / skew 超限都不产出三维点 ----
+    n = 30
+    st_st, rec_st, _, _ = _rt_run(_rt_pairs(n), stalled={10, 11})
+    print(f"     ⑦ stalled 两对：dropped {st_st.dropped} "
+          f"{dict(st_st.drop_reasons)}，三维点 {st_st.points}/{n}")
+    checks.append(("⑦ 任一路 stalled -> 该对不出三维点、dropped+2",
+                   st_st.dropped == 2 and st_st.points == n - 2
+                   and all("stalled" in k for k in st_st.drop_reasons)))
+    pairs_bad = _rt_pairs(n)
+    pairs_bad[5] = (pairs_bad[5][0], pairs_bad[5][1],
+                    pairs_bad[5][2], pairs_bad[5][3], 100.0)
+    st_bad, _, _, _ = _rt_run(pairs_bad, max_skew_ms=60.0)
+    print(f"     ⑦ |skew| 100 ms 一对：dropped {st_bad.dropped} "
+          f"{dict(st_bad.drop_reasons)}，三维点 {st_bad.points}/{n}")
+    checks.append(("⑦ |skew| 超限 -> 该对不出三维点、dropped+1",
+                   st_bad.dropped == 1 and st_bad.points == n - 1
+                   and any("skew" in k for k in st_bad.drop_reasons)))
+
+    # ---- ⑧ 反向自证：删掉 should_drop 的 stalled 分支 ----
+    src_path = ROOT / "apps" / "run_realtime_stereo.py"
+    orig = src_path.read_bytes()
+    sha_before = _hashlib.sha256(orig).hexdigest()
+    nl = b"\r\n" if b"\r\n" in orig else b"\n"
+    text = orig.decode("utf-8")
+    start_mark = "    if stalled_l or stalled_r:"
+    end_mark = "    if skew_ms is None:"
+    i0 = text.find(start_mark)
+    i1 = text.find(end_mark, i0 + 1) if i0 >= 0 else -1
+    hit = i0 >= 0 and i1 > i0
+    checks.append(("⑧ 反向自证锚点（should_drop 的 stalled 分支）命中", hit))
+    restored = False
+    if hit:
+        mutated = (text[:i0] + text[i1:]).encode("utf-8")
+        checks.append(("⑧ 变异注入后源码字节确实变了", mutated != orig))
+        try:
+            src_path.write_bytes(mutated)
+            _importlib.reload(rts)
+            d_mut, r_mut = rts.should_drop(12.3, True, False, 60.0)
+            checks.append(("⑧ 删掉 stalled 分支后 ⑦ 的 stalled 判据变红",
+                           d_mut is False and "stalled" not in r_mut))
+            st_mut, _, _, _ = _rt_run(_rt_pairs(n), stalled={10, 11})
+            checks.append(("⑧ 删掉后 stalled 两对不再被丢（dropped 0）",
+                           st_mut.dropped == 0 and st_mut.points == n))
+        finally:
+            src_path.write_bytes(orig)              # 字节级还原
+            _importlib.reload(rts)
+            restored = (_hashlib.sha256(src_path.read_bytes()).hexdigest()
+                        == sha_before)
+    checks.append(("⑧ 字节级还原后 sha256 与改前一致", restored))
+    checks.append(("⑧ 还原后 ⑦ 的 stalled 判据复绿",
+                   rts.should_drop(12.3, True, False, 60.0)[0] is True))
+
+    # ---- ⑨ 并排画布：HUD 独占顶栏，小窗**独占右侧一列**（不自我遮挡）----
+    vl = np.zeros((120, 160, 3), np.uint8)
+    vr = np.zeros((120, 160, 3), np.uint8)
+    panel = np.full((40, 60, 3), 7, np.uint8)
+    canvas = rts.compose_canvas(vl, vr, "stereo  match 100%", panel=panel)
+    # 2026-11-17 用户截图：「画面自己遮挡自己」—— 旧版把小窗贴在 `w-pw`，
+    # 正好压在右相机画面上。现在宽度必须是**两路之和 + 小窗宽**。
+    checks.append(("⑨ compose_canvas：宽 = 两路之和 + 小窗宽（小窗独占一列）",
+                   canvas.shape[1] == 320 + panel.shape[1]
+                   and canvas.shape[0] > 120))
+    pasted = int(((canvas == 7).all(axis=2)).sum())
+    checks.append((f"⑨ 小窗真的贴进了画布（贴入 {pasted} 像素 = 40x60）",
+                   pasted >= 40 * 60))
+    # 画面区域（顶栏以下、前 320 列）不许出现小窗像素 —— 这才是"不遮挡"的定义。
+    body_area = canvas[canvas.shape[0] - vl.shape[0]:, :320]
+    leaked = int(((body_area == 7).all(axis=2)).sum())
+    checks.append((f"⑨ 左右画面区域内没有小窗像素（泄漏 {leaked}）", leaked == 0))
+    # 提示与指标**同一行**（2026-11-17 用户：录制帧的回显会把第二行顶掉）。
+    with_hint = rts.compose_canvas(vl, vr, "hud", panel=panel, hint="q 退出 · 空格 暂停")
+    checks.append(("⑨ 给了 hint 不增高（始终单行，提示右对齐）",
+                   with_hint.shape == canvas.shape))
+    # 提示必须画在**右半边**：左半边是指标，挤在一起就等于没分开。
+    top = with_hint[:with_hint.shape[0] - vl.shape[0]]
+    right_half = top[:, canvas.shape[1] // 2:]
+    left_half = top[:, :canvas.shape[1] // 2]
+    lit_r = int((right_half != 24).any(axis=2).sum())
+    checks.append((f"⑨ 提示真的画在顶栏右半边（右侧亮点 {lit_r}）", lit_r > 20))
+    # 角标（瞬时回显）也不许改画布尺寸。
+    with_badge = rts.compose_canvas(vl, vr, "hud", panel=panel, badge="▸ 已暂停")
+    checks.append(("⑨ 角标不改变画布尺寸（不占顶栏）",
+                   with_badge.shape == canvas.shape))
+    body_zone = with_badge[with_badge.shape[0] - vl.shape[0]:, :vl.shape[1]]
+    checks.append(("⑨ 角标画在画面左上角（画面区有角标像素）",
+                   int((body_zone != 0).any(axis=2).sum()) > 50))
+
+    # ---- ⑨b 按键必须有**画面回显**（2026-11-17 用户："按下了没有提示很可恶"）----
+    ui = object.__new__(rts._Ui)
+    ui._toast = ""
+    ui._toast_until = 0.0
+    ui._rec_frames = 0
+    idle_txt, idle_badge = ui.hint_line(), ui.badge_line()
+    ui.toast("已暂停")
+    hot_badge = ui.badge_line()
+    hot_hint = ui.hint_line()
+    ui.toast("这条已过期", ttl=0.0)
+    exp_badge = ui.badge_line()
+    checks.append(("⑨b 没有回显时角标为空、提示照常在",
+                   idle_badge == "" and idle_txt == rts.REALTIME_HINT))
+    checks.append((f"⑨b toast 之后角标出现（{hot_badge!r}）",
+                   hot_badge.startswith("▸ ") and "已暂停" in hot_badge))
+    checks.append(("⑨b 回显**不顶掉**按键提示（两者同时存在）",
+                   hot_hint == rts.REALTIME_HINT))
+    checks.append(("⑨b ttl 到期后角标消失（不会一直挂着）", exp_badge == ""))
+    # 结构：六个会改变状态的键都要回显（p/r 这类"看不见结果"的键最容易漏）。
+    _src = rts.__file__
+    _body = open(_src, encoding="utf-8").read()
+    _i = _body.index("def _handle_key")
+    _j = _body.index("def _cycle_method", _i)
+    _seg = _body[_i:_j]
+    missing = [k for k in ('ord(" ")', 'ord("r")', 'ord("3")') if k not in _seg]
+    checks.append((f"⑨b 空格/r/3 三个键都调了 toast（缺 {missing}）",
+                   not missing and _seg.count("self.toast(") >= 3))
+    checks.append(("⑨b c/s/v 三条路都有 toast",
+                   all("self.toast(" in _body[_body.index(f"def {fn}"):]
+                       for fn in ("_cycle_method", "_toggle_record", "_snapshot"))))
+
+    # ---- ⑨c 主程序**启动路径**冒烟（不需要相机）----
+    # 2026-11-17 用户点「实时 3D」→ 直接 `UnboundLocalError: recorder`：
+    # 我把 `ui.recorder = recorder` 写在了 `recorder = None` 之前。
+    # ⑨/⑨b 全绿也没用 —— 那些判据只跑 `run_loop`，压根没进 `main()`。
+    # 这条把 `resolve_rig` / `open_pair_source` / `make_pipeline` / `_Ui` /
+    # `run_loop` 全换成桩，真调一次 `main()`：**启动路径有人走过**。
+    import contextlib as _ctx
+    import io as _io
+    import types as _types
+
+    _fake_src = _types.SimpleNamespace(
+        is_live=True, pair_fps=30.0, resolved_size=(1920, 1080),
+        image_size=(1920, 1080), report_warnings=lambda: None,
+        release=lambda: None,
+        read_pair=lambda **k: (False, None, None, 0.0, 0.0, None, 0, 0))
+    _fake_rig = _types.SimpleNamespace(
+        image_size=(1920, 1080), stereo_mode="parallel",
+        rectification="stereo_rectify", baseline_mm=66.5, angle_deg=4.5,
+        quality=None)
+    _names = ("resolve_rig", "open_pair_source", "make_pipeline", "_Ui", "run_loop")
+    _orig = {k: getattr(rts, k) for k in _names}
+    _rc, _err = None, ""
+    try:
+        rts.resolve_rig = lambda calib=None: (_fake_rig, "")
+        rts.open_pair_source = lambda args: _fake_src
+        rts.make_pipeline = lambda cfg, rig, side: _types.SimpleNamespace(
+            set_detect_width=lambda w: None, reset=lambda: None, detector=None)
+        rts._Ui = lambda *a, **k: _types.SimpleNamespace(
+            recorder=None, panel_on=True, hint_line=lambda: "h",
+            badge_line=lambda: "", show=lambda *a: True,
+            write_frame=lambda *a: None, toast=lambda *a, **kw: None,
+            close=lambda: None)
+        rts.run_loop = lambda *a, **kw: rts.LoopStats()
+        with _ctx.redirect_stdout(_io.StringIO()):
+            _rc = rts.main(["--left", "left", "--right", "right", "--no-3d"])
+    except BaseException as _exc:                        # noqa: BLE001
+        _err = f"{type(_exc).__name__}: {_exc}"
+    finally:
+        for _k, _v in _orig.items():
+            setattr(rts, _k, _v)
+    checks.append((f"⑨c main() 启动路径能走完（rc={_rc}，err={_err or '无'}）",
+                   _rc == 0 and not _err))
+
+    # ---- ⑨d 两档录制：`v` 只出检测画面，`b` 额外出两路**原始**画面 ----
+    # 2026-11-17 用户要求："按下 v 只有检测视频，再加一个键，同时录检测视频和原始视频"。
+    import pathlib as _pl
+    import tempfile as _tf2
+
+    ui2 = object.__new__(rts._Ui)
+    ui2.args = _types.SimpleNamespace(record="")
+    ui2.fps = 10.0
+    ui2.record_wanted = False
+    ui2.record_mode = ""
+    ui2.record_path = None
+    ui2.writer = None
+    ui2.raw_writers = []
+    ui2.raw_paths = ()
+    ui2._rec_frames = 0
+    ui2.recorder = None
+    ui2._toast = ""
+    ui2._toast_until = 0.0
+    ui2.toast = lambda *a, **k: None
+
+    def _frames_of(path) -> tuple[int, tuple[int, int]]:
+        cap = cv2.VideoCapture(str(path))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+        cap.release()
+        return n, size
+
+    with _tf2.TemporaryDirectory() as _td:
+        canvas_f = np.zeros((60, 160, 3), np.uint8)
+        fake_stats = _types.SimpleNamespace(
+            last_left=np.zeros((120, 160, 3), np.uint8),
+            last_right=np.zeros((120, 160, 3), np.uint8))
+
+        # 两档各用**自己的**基名（命令行 --record 固定时，第二档会覆盖同名文件，
+        # 那是 `--record` 的既有语义，不是这条判据要测的东西）。
+        ui2.args.record = str(_pl.Path(_td) / "rec_v.mp4")
+        ui2._toggle_record("canvas")
+        for _ in range(3):
+            ui2.write_frame(canvas_f, fake_stats)
+        ui2._toggle_record("canvas")
+        after_v = sorted(x.name for x in _pl.Path(_td).iterdir())
+
+        ui2.args.record = str(_pl.Path(_td) / "rec_b.mp4")
+        ui2._toggle_record("both")
+        for _ in range(3):
+            ui2.write_frame(canvas_f, fake_stats)
+        ui2._toggle_record("both")
+        after_b = sorted(x.name for x in _pl.Path(_td).iterdir())
+
+        n_left, sz_left = _frames_of(_pl.Path(_td) / "rec_b_raw_left.mp4")
+        n_right, sz_right = _frames_of(_pl.Path(_td) / "rec_b_raw_right.mp4")
+        n_canvas, sz_canvas = _frames_of(_pl.Path(_td) / "rec_b.mp4")
+
+    checks.append((f"⑨d `v` 只写检测画面（v 后文件 {after_v}）",
+                   after_v == ["rec_v.mp4"]))
+    checks.append((f"⑨d `b` 额外写出两路原始（b 后 {len(after_b)} 个文件）",
+                   {"rec_b.mp4", "rec_b_raw_left.mp4", "rec_b_raw_right.mp4"}
+                   <= set(after_b)))
+    checks.append((f"⑨d 原始两路是真 120x160（left={sz_left} right={sz_right}，"
+                   f"检测画面={sz_canvas}）",
+                   sz_left == (160, 120) and sz_right == (160, 120)
+                   and sz_canvas == (160, 60)))
+    checks.append((f"⑨d 三路帧数一致且都是 3（canvas={n_canvas} L={n_left} R={n_right}）",
+                   n_canvas == n_left == n_right == 3))
+
+    # ---------------------------------------------------------------- ⑩-⑬
+    # 大角度装置（2026-11-16 用户裁决："平行和大角度各有一个实时 3D"）。
+    # 这里不重跑检测链路，只钉三件事：**分发正确**、**错标定仍拒绝**、
+    # **大角度重建器真能出点**。检测->跟踪->三角化在平行那段已覆盖。
+    from types import SimpleNamespace as _NS
+
+    from stereo.angled import AngledReconstructor as _AngledRec
+    from stereo.triangulate import StereoReconstructor as _ParRec
+
+    def _fake_rig(mode, rect):
+        """假装置：K=I、R=+90°(绕 Y)、T=(0.4,0,0) —— 与 `stereo/angled.py`
+        的 `_self_test()` 完全同一套几何（那边已经自测过它是共视的）。"""
+        K = np.eye(3, dtype=np.float64)
+        D = np.zeros(5, dtype=np.float64)
+        R = cv2.Rodrigues(np.array([0.0, np.deg2rad(90.0), 0.0]))[0]
+        T = np.array([0.4, 0.0, 0.0])
+        return _NS(K1=K, D1=D, K2=K, D2=D, R=R, T=T, F=None,
+                   stereo_mode=mode, rectification=rect,
+                   quality={"epipolar_rms": 0.62},
+                   disparity_sign=lambda: 1,
+                   meta={"stereo_mode": mode, "rectification": rect})
+
+    # ⑩ 六个分发组合
+    combos = [
+        ("angled + none_raw", "angled", "none_raw", _AngledRec),
+        ("angled + stereo_rectify", "angled", "stereo_rectify", _AngledRec),
+        ("parallel + stereo_rectify", "parallel", "stereo_rectify", _ParRec),
+        ("parallel + 缺 rectification 字段", "parallel", "", _ParRec),
+    ]
+    combo_ok = True
+    for label, mode, rect, want in combos:
+        got = rts.make_reconstructor(_fake_rig(mode, rect))
+        combo_ok = combo_ok and isinstance(got, want)
+        print(f"     ⑩ {label:34s} -> {type(got).__name__}")
+    # 第五种：只有 meta 里写 angled（对象没有 stereo_mode 属性）
+    meta_only = _fake_rig("angled", "none_raw")
+    del meta_only.stereo_mode
+    got_meta = rts.make_reconstructor(meta_only)
+    combo_ok = combo_ok and isinstance(got_meta, _AngledRec)
+    print(f"     ⑩ meta 里才是 angled{' '*22} -> {type(got_meta).__name__}")
+    checks.append(("⑩ angled -> AngledReconstructor；parallel -> StereoReconstructor"
+                   "（含 meta-only）", combo_ok))
+
+    # ⑪ none_raw + parallel 仍拒绝，且文案给了「重标 / angled」两条出路
+    refused = None
+    try:
+        rts.make_reconstructor(_fake_rig("parallel", "none_raw"))
+    except Exception as exc:                        # noqa: BLE001  判据要的是"拒绝"
+        refused = exc
+    text = str(refused or "")
+    print(f"     ⑪ none_raw + parallel -> {type(refused).__name__}："
+          f"{text.splitlines()[0][:52]}…")
+    checks.append(("⑪ none_raw + parallel 被拒（ReconstructionModeError），"
+                   "文案含「重标」与「angled」",
+                   isinstance(refused, rts.ReconstructionModeError)
+                   and "重标" in text and "angled" in text))
+
+    # ⑫ 大角度重建器真能出点（合成一对检测，真值已知）
+    a_rig = _fake_rig("angled", "none_raw")
+    a_rec = rts.make_reconstructor(a_rig)
+    K_a = np.array(a_rig.K1, np.float64)
+    D_a = np.array(a_rig.D1, np.float64)
+
+    def _a_project(xyz):
+        pts, _ = cv2.projectPoints(np.asarray(xyz, np.float64).reshape(1, 1, 3),
+                                   np.zeros(3), np.zeros(3), K_a, D_a)
+        return np.asarray(pts, np.float64).reshape(2)
+
+    truth3 = [[-0.20, 0.00, 0.30], [-0.10, 0.06, 0.35], [-0.24, -0.05, 0.25]]
+    a_err = 0.0
+    for i, p in enumerate(truth3):
+        p = np.asarray(p, np.float64)
+        pl, pr = _a_project(p), _a_project(a_rig.R @ p + a_rig.T)
+        pt = a_rec.update(0.1 * i,
+                          Detection(x=float(pl[0]), y=float(pl[1]), radius=5.0),
+                          [Detection(x=float(pr[0]), y=float(pr[1]), radius=4.5)])
+        if pt is not None:
+            a_err = max(a_err, float(np.linalg.norm(pt.xyz - p)))
+    rate_a = a_rec.match_rate                 # 是 **property**，不是方法
+    print(f"     ⑫ 大角度合成 3 点：配对 {a_rec.n_matched}/{a_rec.n_frames}"
+          f"（match_rate {rate_a * 100:.0f}%），最大三维误差 {a_err * 1000:.3f} mm")
+    checks.append(("⑫ 大角度重建器至少出 1 个点、match_rate 有值、不抛",
+                   a_rec.n_matched >= 1 and 0.0 < rate_a <= 1.0))
+    checks.append((f"⑫ 大角度三维误差 {a_err * 1000:.3f} mm < 1 mm（合成无噪声）",
+                   a_err < 1e-3))
+
+    # ⑬ HUD / 统计在大角度下**不把角度量塞进 disp**
+    hud_a = rts.compose_hud(match_rate=0.87, residual_px=0.8, disparity_px=None,
+                            skew_ms=12.3, dropped=3, note="epi 0.9 px  ang 88°")
+    print(f"     ⑬ 大角度 HUD：{hud_a}")
+    # 断言按**语义**取"disp 后面那个值"，不按空格数匹配（排版一改就假红/假绿）
+    disp_field = hud_a.split("disp", 1)[1].split("skew", 1)[0].strip()
+    checks.append((f"⑬ 大角度 HUD 的 disp 写 n/a（实测 {disp_field!r}），"
+                   "且仍含 match/skew/drop",
+                   disp_field == "n/a" and all(
+                       k in hud_a for k in ("match", "skew", "drop"))
+                   and "epi" in hud_a and "88°" in hud_a))
+    st_a = rts.LoopStats(mode="angled", points=3, pairs=3, match_rate=1.0,
+                         epipolars=[0.5, 0.9], angles=[86.0, 88.5],
+                         skews=[1.0], process_ms=[12.0])
+    lines_a = "\n".join(st_a.summary_lines())
+    checks.append(("⑬ 大角度收尾用「极线距离 / 交会角」，不出现「视差」",
+                   "极线距离" in lines_a and "交会角" in lines_a
+                   and "视差" not in lines_a and "重建模式 angled" in lines_a))
+    # 空源跑一遍主循环：确认 `run_loop` 真的从 rec 的类型读出模式（不是写死的）
+    st_mode = rts.run_loop(lambda: _RTPairSource([]), make_pipeline(K1),
+                           make_pipeline(K2), a_rec, max_frames=1,
+                           display_width=0, panel_on=False, log_every=0)
+    checks.append(("⑬ run_loop 从重建器类型读出 mode=angled（空源也成立）",
+                   st_mode.mode == "angled" and st_mode.pairs == 0))
+
+    # ⑬b GUI 的「实时 3D」按钮**不带任何相机参数**（`stereo_realtime_args()` 全默认）。
+    # 后端必须能把它解释成"自动成对挑"，否则按钮点一次只得到一句参数错误 =
+    # 又一个假入口。这里直接吞下 GUI 真产出的 argv（去掉解释器与脚本两项）。
+    import apps._actions as _actions
+    gui_argv = _actions.stereo_realtime_args()[2:]
+    gui_args = rts.parse_args(gui_argv)
+    print(f"     ⑬ GUI 默认 argv {len(gui_argv)} 项 -> auto_cameras="
+          f"{gui_args.auto_cameras}, left={gui_args.left!r}, "
+          f"detect_width={gui_args.detect_width}")
+    checks.append(("⑬ GUI 全默认 argv -> 自动成对挑相机（不再报「请指定 --left」）",
+                   gui_args.auto_cameras is True and not gui_args.left
+                   and not gui_args.right))
+
+    # ⑭ 反向自证：删掉 make_reconstructor 的 angled 分支
+    src_path = ROOT / "apps" / "run_realtime_stereo.py"
+    orig = src_path.read_bytes()
+    sha_before = _hashlib.sha256(orig).hexdigest()
+    text = orig.decode("utf-8")
+    start_mark = '    if mode == "angled":'
+    end_mark = "    if uncorrected:"
+    j0 = text.find(start_mark)
+    j1 = text.find(end_mark, j0 + 1) if j0 >= 0 else -1
+    hit2 = j0 >= 0 and j1 > j0
+    checks.append(("⑭ 反向自证锚点（make_reconstructor 的 angled 分支）命中", hit2))
+    restored2 = False
+    if hit2:
+        mutated = (text[:j0] + text[j1:]).encode("utf-8")
+        checks.append(("⑭ 变异注入后源码字节确实变了", mutated != orig))
+        try:
+            src_path.write_bytes(mutated)
+            _importlib.reload(rts)
+            try:
+                rts.make_reconstructor(_fake_rig("angled", "none_raw"))
+                red = False                        # 还能拿到重建器 = 判据没红
+            except Exception:                      # noqa: BLE001
+                red = True
+            checks.append(("⑭ 删掉 angled 分支后 ⑩ 的分发判据变红（拿不到大角度重建器）",
+                           red))
+            try:
+                rts.make_reconstructor(_fake_rig("parallel", "stereo_rectify"))
+                still_ok = True
+            except Exception:                      # noqa: BLE001
+                still_ok = False
+            checks.append(("⑭ 删掉后 parallel 仍然正常（只红该红的那条）", still_ok))
+        finally:
+            src_path.write_bytes(orig)
+            _importlib.reload(rts)
+            restored2 = (_hashlib.sha256(src_path.read_bytes()).hexdigest()
+                         == sha_before)
+    checks.append(("⑭ 字节级还原后 sha256 与改前一致", restored2))
+    checks.append(("⑭ 还原后 ⑩ 的分发复绿",
+                   isinstance(rts.make_reconstructor(_fake_rig("angled", "none_raw")),
+                              _AngledRec)))
+
+    # ---------------------------------------------------------------- ⑮-㉒
+    # 退出落会话（2026-11-17 用户）：实时跑出来的轨迹要能在「数据管理」里看见、
+    # 在「3D 查看器」里打开。这一段走**真正的落盘链路**（`_SessionRecorder` +
+    # `save`），会话根用临时目录 —— 不往 `data/` 里塞东西，测完删干净。
+    import csv as _csv
+    import json as _json
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    from apps.run_stereo_video import CSV_HEADER as _CSV_HEADER
+    from apps.view_3d import load_view as _load_view
+    from apps._workbench import summarize_session as _summarize
+    from stereo.sessions import load_session as _load_session
+    from stereo.visualization import load_seeds as _load_seeds
+
+    def _frames_of(sdir) -> list[int]:
+        """读 CSV 的 frame 列（判据 ㉑ 用）。"""
+        with open(Path(sdir) / "derived" / "traj3d.csv", encoding="utf-8",
+                  newline="") as f:
+            return [int(r["frame"]) for r in _csv.DictReader(f)]
+
+    def _video_frames(sdir) -> int:
+        cap = cv2.VideoCapture(str(Path(sdir) / "derived" / "annotated.mp4"))
+        try:
+            return int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else -1
+        finally:
+            cap.release()
+
+    sess_root = Path(_tempfile.mkdtemp(prefix="rt_session_probe_"))
+    try:
+        # ⑮ 60 对（全配对）-> 会话目录 + load_session 能读
+        box: dict = {}
+        st_sess, _, _, _ = _rt_run(_rt_pairs(60), session_root=sess_root, out=box)
+        s_dir = box.get("dir")
+        loaded = None
+        if s_dir is not None:
+            loaded = _load_session(s_dir)[1]
+        print(f"     ⑮ 会话 {s_dir.name if s_dir else None}：三维点 {st_sess.points}，"
+              f"left.frame_count={getattr(getattr(loaded, 'left', None), 'frame_count', None)}")
+        checks.append(("⑮ 跑完 60 对 -> 会话目录存在、load_session 可读、"
+                       "left.frame_count > 0",
+                       s_dir is not None and Path(s_dir).is_dir() and loaded is not None
+                       and loaded.left is not None
+                       and loaded.left.frame_count == 60
+                       and loaded.right.frame_count == 60))
+
+        # ⑯ CSV 表头（唯一产地）+ 行数 == 三维点数
+        csv_path = Path(s_dir) / "derived" / "traj3d.csv"
+        with open(csv_path, encoding="utf-8", newline="") as f:
+            hdr = next(_csv.reader(f))
+            n_rows = sum(1 for _ in f)
+        print(f"     ⑯ CSV {n_rows} 行；表头 {hdr[0]}…{hdr[-1]}")
+        checks.append((f"⑯ CSV 表头 == CSV_HEADER（{len(_CSV_HEADER)} 列）、"
+                       f"行数 {n_rows} == 三维点 {st_sess.points}",
+                       hdr == _CSV_HEADER and n_rows == st_sess.points > 0))
+
+        # ⑰ seeds：实时自动取的第一对匹配点
+        seeds = _load_seeds(Path(s_dir) / "derived" / "seeds.json")
+        print(f"     ⑰ seeds source={seeds['source']!r} seed_frame={seeds['seed_frame']}")
+        checks.append(("⑰ derived/seeds.json 存在且 source == 'realtime'",
+                       seeds.get("source") == "realtime"
+                       and int(seeds.get("seed_frame", -1)) >= 0))
+
+        # ⑱ visualization.json：schema / version / 至少 1 个点
+        vis = _json.loads((Path(s_dir) / "derived" / "visualization.json")
+                          .read_text(encoding="utf-8"))
+        print(f"     ⑱ visualization {vis.get('schema')} v{vis.get('version')}"
+              f" points={len(vis.get('trajectory') or [])}")
+        checks.append(("⑱ visualization.json schema/version/trajectory 合规",
+                       vis.get("schema") == "sphere-stereo-visualization"
+                       and int(vis.get("version", 0)) == 1
+                       and len(vis.get("trajectory") or []) >= 1))
+
+        # ⑲ 查看器 + 数据管理两处都能"看得见"（只调用，不开窗）
+        view = _load_view(s_dir)
+        summ = _summarize(s_dir)
+        print(f"     ⑲ load_view points={len(view['trajectory'])}，"
+              f"workbench status={summ.status!r} matched={summ.n_matched}")
+        checks.append(("⑲ 3D 查看器能加载（不开窗）且数据管理判为有三维（status=traj）",
+                       len(view["trajectory"]) >= 1 and summ.status == "traj"))
+
+        # ⑳ 点数 < 30 不落盘（目录都不留）
+        tiny_root = Path(_tempfile.mkdtemp(prefix="rt_session_tiny_"))
+        try:
+            box2: dict = {}
+            st_tiny, _, _, _ = _rt_run(_rt_pairs(10), session_root=tiny_root,
+                                       out=box2)
+            left_over = [p.name for p in tiny_root.iterdir()]
+            print(f"     ⑳ 10 对（点 {st_tiny.points} < 30）-> dir={box2.get('dir')}，"
+                  f"根目录残留 {left_over}")
+            checks.append((f"⑳ 三维点 {st_tiny.points} < 30 -> 不落盘、不留目录",
+                           box2.get("dir") is None and not left_over))
+        finally:
+            _shutil.rmtree(tiny_root, ignore_errors=True)
+
+        # ㉑ frame 与视频帧**一一对应**（含被丢弃的空洞）
+        gap_root = Path(_tempfile.mkdtemp(prefix="rt_session_gap_"))
+        try:
+            box3: dict = {}
+            st_gap, _, _, _ = _rt_run(_rt_pairs(40), stalled={10, 11},
+                                      session_root=gap_root, out=box3)
+            gap_dir = box3.get("dir")
+            frames = _frames_of(gap_dir) if gap_dir else []
+            n_video = _video_frames(gap_dir) if gap_dir else -1
+            want = [i for i in range(40) if i not in (10, 11)]
+            print(f"     ㉑ 40 对里 stalled 两对：点 {st_gap.points}、视频 {n_video} 帧、"
+                  f"frame {frames[:3]}…{frames[-2:]}")
+            checks.append((
+                f"㉑ CSV frame == 帧序号（跳过被丢的 {[10, 11]}），"
+                f"视频 {n_video} 帧 == 40",
+                frames == want and n_video == 40))
+        finally:
+            _shutil.rmtree(gap_root, ignore_errors=True)
+    finally:
+        _shutil.rmtree(sess_root, ignore_errors=True)
+
+    # ㉒ 反向自证：把 `frame_index += 1` 从"每对"挪进 `if pt is not None`
+    src_path = ROOT / "apps" / "run_realtime_stereo.py"
+    orig = src_path.read_bytes()
+    sha_before = _hashlib.sha256(orig).hexdigest()
+    text = orig.decode("utf-8")
+    # 行尾按文件实际（仓库里是 CRLF）：用 "\n" 拼锚点会匹配不上，
+    # 那会让"锚点命中"这条自己变红 —— 而它红了就等于后面的变异全没跑。
+    _nl = "\r\n" if b"\r\n" in orig else "\n"
+    inc = f"        stats.frame_index += 1{_nl}"
+    anchor = f"                stats.points += 1{_nl}"
+    hit4 = inc in text and anchor in text
+    checks.append(("㉒ 反向自证锚点（frame_index += 1 / points += 1）命中", hit4))
+    restored4 = False
+    if hit4:
+        # 挪进 `if pt is not None:` 里 —— 缩进必须是 16 空格（同一层），
+        # 否则删掉外面那行后 `if collect_rows:` 会顶到一层，直接 IndentationError。
+        moved = f"                stats.frame_index += 1{_nl}"
+        mutated = text.replace(inc, "", 1).replace(anchor, anchor + moved, 1)
+        checks.append(("㉒ 变异注入后源码字节确实变了",
+                       mutated.encode("utf-8") != orig))
+        try:
+            src_path.write_bytes(mutated.encode("utf-8"))
+            _importlib.reload(rts)
+            mut_root = Path(_tempfile.mkdtemp(prefix="rt_session_mut_"))
+            try:
+                box4: dict = {}
+                _rt_run(_rt_pairs(40), stalled={10, 11},
+                        session_root=mut_root, out=box4)
+                mut_dir = box4.get("dir")
+                mut_frames = _frames_of(mut_dir) if mut_dir else []
+                print(f"     ㉒ 变异后 frame {mut_frames[:3]}…{mut_frames[-2:]}"
+                      f"（max={max(mut_frames) if mut_frames else None}，应为 39）")
+                checks.append(("㉒ 挪进 if pt 后 ㉑ 变红（frame 按点计数、"
+                               "与视频帧错位）",
+                               bool(mut_frames) and max(mut_frames) != 39))
+            finally:
+                _shutil.rmtree(mut_root, ignore_errors=True)
+        finally:
+            src_path.write_bytes(orig)
+            _importlib.reload(rts)
+            restored4 = (_hashlib.sha256(src_path.read_bytes()).hexdigest()
+                         == sha_before)
+    checks.append(("㉒ 字节级还原后 sha256 与改前一致", restored4))
+    # 还原后再真跑一轮（40 对、丢 1 对 -> 39 点 >= 30 才会落盘），
+    # 确认对齐闸门回来了 —— 不是只看源码字节。
+    back_root = Path(_tempfile.mkdtemp(prefix="rt_session_back_"))
+    try:
+        box5: dict = {}
+        _rt_run(_rt_pairs(40), stalled={5}, session_root=back_root, out=box5)
+        back_dir = box5.get("dir")
+        back_frames = _frames_of(back_dir) if back_dir else []
+        checks.append(("㉒ 还原后 ㉑ 的对齐闸门复绿（frame 跳过第 5 对、max=39）",
+                       back_frames == [i for i in range(40) if i != 5]))
+    finally:
+        _shutil.rmtree(back_root, ignore_errors=True)
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# A1/A2/A5/B4：离线产物可归因 + 强制标定标记 + 阈值 CLI + refined F
+# ---------------------------------------------------------------------------
+_PROBE_COUNTERS = {"n_no_left": 2, "n_no_right": 3, "n_rejected": 4}
+
+
+def _offline_probe(*, forced: bool = False,
+                   min_angle: float | None = None,
+                   max_reproj: float | None = None) -> dict:
+    """让 `run_stereo_video.main()` 的**真实控制流**跑一段 angled 离线链。
+
+    所有输入都 mock 掉；唯一放行的是被 A1/A2/A5 改动的真实代码路径：
+    重建器构造（拿 cfg）、门限打印、quality 写入、强制标定横幅。
+    返回的 dict 里有 rc / stdout / quality / 完整 payload / cfg 实际收到值 /
+    三产物是否齐。反向自证在子进程里复用本函数，因此不要依赖外层局部状态。
+    """
+    import contextlib as _contextlib
+    import io as _io
+    import json as _json
+    import shutil as _shutil
+    import sys as _sys
+    import tempfile as _tempfile
+    import types as _types
+    from unittest import mock as _mock
+
+    import apps.run_stereo_video as rsv
+    import stereo.angled as angled_mod
+
+    tmp = _tempfile.mkdtemp(prefix="dsh_attr_")
+    result: dict = {}
+    try:
+        session_dir = Path(tmp) / "session"
+        out_dir = Path(tmp) / "out"
+        session_dir.mkdir()
+        (session_dir / "derived").mkdir()
+        fake_traj = Path(tmp) / "exported_traj3d.json"
+        fake_vis = Path(tmp) / "exported_visualization.json"
+        fake_traj.write_text(_json.dumps({
+            "schema": "sphere-stereo-trajectory", "unit": "m", "n_matched": 40,
+            "samples": [],
+            # 另一个 worker 刚加的键：A1 只补 quality 子键，绝不能删它。
+            "round_trip": {"verdict": "ellipse", "n_pairs": 3,
+                           "dy_median_mm": 1.0, "dz_median_mm": 2.0,
+                           "sign_consistent": True},
+        }), encoding="utf-8")
+        fake_vis.write_text(_json.dumps({
+            "schema": "sphere-stereo-visualization", "n_points": 0,
+            "bounds": {"min": [0, 0, 0], "max": [0, 0, 0]},
+        }), encoding="utf-8")
+
+        rig = build_rig()
+        calib_path = Path(tmp) / ("forced_calib" if forced else "plain_calib")
+        if forced:
+            # A2：真的写一份临时 json（不碰 config/ / 真实标定）。
+            rig.quality["forced_unusable"] = True
+        rig.save(calib_path)
+
+        cam = _types.SimpleNamespace(video="left.mkv", fps_measured=30.0,
+                                     fps_requested=30.0)
+        sess = _types.SimpleNamespace(
+            left=cam, right=cam, calibration=_types.SimpleNamespace(),
+            stereo_mode="angled", rig={},
+            sync=_types.SimpleNamespace(offset=0, method="flash"))
+        frame = np.zeros((540, 960, 3), np.uint8)
+
+        class FakePairSource:
+            image_size = (960, 540)
+
+            def __init__(self, *a, **k):
+                self.n = 0
+
+            def read(self):
+                if self.n >= 6:
+                    return (False, None, None)
+                self.n += 1
+                return (True, frame, frame)
+
+            def report_warnings(self):
+                pass
+
+            def describe(self):
+                return "fake-index"
+
+            def release(self):
+                pass
+
+        class FakePipeline:
+            def __init__(self):
+                self.detector = _types.SimpleNamespace(debug_snapshot=lambda: {})
+
+            def process(self, f, t):
+                return _types.SimpleNamespace(track=None, detection=None)
+
+        captured: dict = {}
+
+        class FakeRec:
+            def __init__(self, rig_arg, cfg):
+                self.n_matched = 7
+                self.n_no_left = _PROBE_COUNTERS["n_no_left"]
+                self.n_no_right = _PROBE_COUNTERS["n_no_right"]
+                self.n_rejected = _PROBE_COUNTERS["n_rejected"]
+                self.n_frames = 16
+                self.trajectory = []
+                self.warmup_frames = 0
+                self.warnings = []
+                self.dy_samples = []
+                self.f_source = "pose"
+                self.cfg = cfg
+                captured["min_angle_deg"] = getattr(cfg, "min_angle_deg", None)
+                captured["max_reproj_px"] = getattr(cfg, "max_reproj_px", None)
+                captured["max_epipolar_px"] = getattr(cfg, "max_epipolar_px", None)
+
+            @property
+            def match_rate(self):
+                return 7.0 / 16.0
+
+            def update(self, t, det_l, dets):
+                return None
+
+            def as_array(self):
+                return np.zeros((0, 4), np.float64)
+
+            def low_match_diagnostic(self):
+                return []
+
+        class FakeWriter:
+            def __init__(self, path, fourcc, fps, size):
+                self._p = Path(path)
+
+            def isOpened(self):
+                return True
+
+            def write(self, f):
+                pass
+
+            def release(self):
+                self._p.write_bytes(b"fake-mp4")
+
+        argv = ["run_stereo_video.py", str(session_dir), "--out", str(out_dir),
+                "--stereo-mode", "angled", "--pairing", "index", "--no-plot",
+                "--no-predict", "--no-world", "--no-radius-auto",
+                "--method", "color"]
+        if min_angle is not None:
+            argv += ["--min-angle-deg", str(min_angle)]
+        if max_reproj is not None:
+            argv += ["--max-reproj-px", str(max_reproj)]
+        patches = [
+            _mock.patch.object(rsv, "load_session", return_value=(session_dir, sess)),
+            _mock.patch.object(rsv, "validate_session", return_value=([], [])),
+            _mock.patch.object(rsv, "session_calibration_file", return_value=calib_path),
+            _mock.patch.object(rsv, "resolve_auto", return_value="angled"),
+            _mock.patch.object(rsv, "_mode_guard", return_value=("angled", False)),
+            _mock.patch.object(rsv, "optical_axes_angle_deg", return_value=60.0),
+            _mock.patch.object(rsv, "_pick_detector", return_value=("color", "")),
+            _mock.patch.object(rsv, "PairSource", FakePairSource),
+            _mock.patch.object(rsv, "_make_pipeline",
+                               side_effect=lambda cfg, r, side: FakePipeline()),
+            _mock.patch.object(rsv, "_draw", side_effect=lambda *a, **k: frame),
+            _mock.patch.object(rsv, "export_session_visualization",
+                               return_value={"trajectory": fake_traj,
+                                             "visualization": fake_vis}),
+            _mock.patch.object(rsv.cv2, "VideoWriter", FakeWriter),
+            _mock.patch.object(angled_mod, "AngledReconstructor", FakeRec),
+        ]
+        rc, stdout, exc_text = None, "", ""
+        buf = _io.StringIO()
+        try:
+            for p in patches:
+                p.start()
+            old_argv = _sys.argv
+            _sys.argv = argv
+            try:
+                with _contextlib.redirect_stdout(buf):
+                    rc = rsv.main()
+            finally:
+                _sys.argv = old_argv
+            stdout = buf.getvalue()
+        except Exception as exc:                            # noqa: BLE001
+            import traceback as _tb
+            exc_text = _tb.format_exc()
+            stdout = buf.getvalue()
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        payload = {}
+        traj_path = out_dir / "traj3d.json"
+        if traj_path.exists():
+            try:
+                payload = _json.loads(traj_path.read_text(encoding="utf-8"))
+            except Exception:                                # noqa: BLE001
+                pass
+        result = {
+            "rc": rc, "stdout": stdout, "exc_text": exc_text,
+            "quality": payload.get("quality") or {}, "payload": payload,
+            "captured": captured,
+            "artifacts": all((out_dir / n).exists()
+                             for n in ("traj3d.csv", "traj3d.json", "annotated.mp4")),
+        }
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+    return result
+
+
+def _probe_A1() -> bool:
+    """子进程里复用的 A1 判据（反向自证用）。"""
+    r = _offline_probe()
+    q = r["quality"]
+    want = {
+        "n_no_left": _PROBE_COUNTERS["n_no_left"],
+        "n_no_right": _PROBE_COUNTERS["n_no_right"],
+        "n_rejected": _PROBE_COUNTERS["n_rejected"],
+        "f_source": "pose", "max_epipolar_px": 8.0,
+        "min_angle_deg": 5.0, "max_reproj_px": 3.0,
+    }
+    return (r["rc"] == 0 and not r["exc_text"]
+            and all(q.get(k) == v for k, v in want.items())
+            and "round_trip" in r["payload"])
+
+
+def _probe_A2() -> bool:
+    """子进程里复用的 A2 判据（反向自证用）。"""
+    r = _offline_probe(forced=True)
+    return (r["quality"].get("calibration_forced_unusable") is True
+            and "仅链路测试" in r["stdout"]
+            and r["rc"] == 0 and r["artifacts"])
+
+
+def _probe_A5() -> bool:
+    """子进程里复用的 A5 判据（反向自证用）。"""
+    r = _offline_probe(min_angle=30.0, max_reproj=5.0)
+    d = _offline_probe()
+    c = r["captured"]
+    return (c.get("min_angle_deg") == 30.0
+            and c.get("max_reproj_px") == 5.0
+            and c.get("max_epipolar_px") == 8.0
+            and "极线 8px" in r["stdout"]
+            and "交会角 30°" in r["stdout"]
+            and "重投影 5px" in r["stdout"]
+            and d["captured"].get("min_angle_deg") == 5.0
+            and d["captured"].get("max_reproj_px") == 3.0)
+
+
+def test_offline_attribution() -> bool:
+    """判据 1（A1）：quality 分项 == 重建器真值；round_trip 不被删。"""
+    print("----- A1：离线产物可归因 -----")
+    r = _offline_probe()
+    q = r["quality"]
+    checks: list[tuple[str, bool]] = []
+    if r["exc_text"]:
+        print(r["exc_text"][-800:])
+    for key, want in (
+        ("n_no_left", _PROBE_COUNTERS["n_no_left"]),
+        ("n_no_right", _PROBE_COUNTERS["n_no_right"]),
+        ("n_rejected", _PROBE_COUNTERS["n_rejected"]),
+        ("f_source", "pose"),
+        ("max_epipolar_px", 8.0),
+        ("min_angle_deg", 5.0),
+        ("max_reproj_px", 3.0),
+    ):
+        got = q.get(key)
+        checks.append((f"A1 quality.{key}={got!r}（真值 {want!r}）", got == want))
+    checks.append(("A1 round_trip 键没被删", "round_trip" in r["payload"]))
+    checks.append(("A1 quality.verdict 没被删", "verdict" in q))
+    checks.append(("A1 stdout 有 [归因] 分项行",
+                   "[归因]" in r["stdout"]
+                   and f"n_no_left={_PROBE_COUNTERS['n_no_left']}" in r["stdout"]))
+    checks.append(("A1 main() 返回 0", r["rc"] == 0 and not r["exc_text"]))
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    print(f"  [实测] quality={q}")
+    return ok
+
+
+def test_offline_forced_calibration() -> bool:
+    """判据 2（A2）：坏标定只标记不拦，rc=0 且三产物齐。"""
+    print("----- A2：离线侧标记强制标定（不拦） -----")
+    r = _offline_probe(forced=True)
+    q = r["quality"]
+    if r["exc_text"]:
+        print(r["exc_text"][-800:])
+    checks: list[tuple[str, bool]] = [
+        ("A2 quality.calibration_forced_unusable=True（实际 "
+         f"{q.get('calibration_forced_unusable')!r}）",
+         q.get("calibration_forced_unusable") is True),
+        ("A2 stdout 含『仅链路测试』", "仅链路测试" in r["stdout"]),
+        ("A2 退出码仍是 0（实际 " + str(r["rc"]) + "）", r["rc"] == 0),
+        ("A2 三产物（traj3d.csv/json + annotated.mp4）都在", r["artifacts"]),
+    ]
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    print(f"  [实测] rc={r['rc']}, artifacts={r['artifacts']}, "
+          f"calibration_forced_unusable={q.get('calibration_forced_unusable')}")
+    return ok
+
+
+def test_cli_thresholds() -> bool:
+    """判据 3（A5）：新 CLI 透传到 AngledMatchConfig；不传仍是 5.0/3.0。"""
+    print("----- A5：阈值暴露到 CLI -----")
+    r = _offline_probe(min_angle=30.0, max_reproj=5.0)
+    d = _offline_probe()
+    checks: list[tuple[str, bool]] = []
+    if r["exc_text"] or d["exc_text"]:
+        print((r["exc_text"] + d["exc_text"])[-800:])
+    for key, want in (("min_angle_deg", 30.0), ("max_reproj_px", 5.0),
+                      ("max_epipolar_px", 8.0)):
+        got = r["captured"].get(key)
+        checks.append((f"A5 显式传参 -> 重建器 cfg.{key}={got!r}（真值 {want!r}）",
+                       got == want))
+    for token in ("极线 8px", "交会角 30°", "重投影 5px"):
+        checks.append((f"A5 日志含『{token}』", token in r["stdout"]))
+    checks.append(("A5 不传时 min_angle_deg 仍是 5.0（实际 "
+                   f"{d['captured'].get('min_angle_deg')!r}）",
+                   d["captured"].get("min_angle_deg") == 5.0))
+    checks.append(("A5 不传时 max_reproj_px 仍是 3.0（实际 "
+                   f"{d['captured'].get('max_reproj_px')!r}）",
+                   d["captured"].get("max_reproj_px") == 3.0))
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    print(f"  [实测] 显式 cfg={r['captured']}；默认 cfg={d['captured']}")
+    return ok
+
+
+def _synthetic_correspondences(angle_deg: float = 60.0, noise_px: float = 0.3,
+                               n: int = 60, n_outliers: int = 0,
+                               seed: int = 7):
+    """按给定夹角/噪声造左右对应点，返回 (left, right, pose_F, K, R, T)。"""
+    K = np.array([[800.0, 0.0, 480.0],
+                  [0.0, 800.0, 270.0],
+                  [0.0, 0.0, 1.0]], dtype=np.float64)
+    D = np.zeros(5, dtype=np.float64)
+    R = cv2.Rodrigues(np.array([0.0, np.radians(angle_deg), 0.0],
+                               dtype=np.float64))[0]
+    T = np.array([0.3, 0.0, 0.0], dtype=np.float64)
+    F = fundamental_from_pose(K, D, K, D, R, T)
+    rng = np.random.default_rng(seed)
+    left: list[np.ndarray] = []
+    right: list[np.ndarray] = []
+    while len(left) < n:
+        X = np.array([rng.uniform(-0.6, 0.6), rng.uniform(-0.3, 0.3),
+                      rng.uniform(1.5, 4.0)], dtype=np.float64)
+        X2 = R @ X + T
+        if X[2] <= 0 or X2[2] <= 0:
+            continue
+        # 不限像素落在 0..W/H：60° 夹角下两机视野重叠很窄，强加画面边界会让
+        # 采样几乎不可能收敛。F 与极线距离对任意有限像素都有定义，这里只要求
+        # 两点都在各自相机前方（z>0），这已足够检验 Hartley+RANSAC 的几何。
+        pl = (K @ X / X[2])[:2]
+        pr = (K @ X2 / X2[2])[:2]
+        left.append(pl + rng.normal(0.0, noise_px, 2))
+        right.append(pr + rng.normal(0.0, noise_px, 2))
+    left_arr = np.asarray(left, dtype=np.float64)
+    right_arr = np.asarray(right, dtype=np.float64)
+    if n_outliers:
+        idx = rng.choice(n, size=n_outliers, replace=False)
+        right_arr[idx] = rng.uniform(0, 960, size=(n_outliers, 2))
+    return left_arr, right_arr, F, K, R, T
+
+
+def _median_epipolar(F: np.ndarray, left: np.ndarray, right: np.ndarray) -> float:
+    ds = []
+    for pl, pr in zip(left, right):
+        line = epipolar_line(F, (float(pl[0]), float(pl[1])))
+        d = point_line_distance(line, (float(pr[0]), float(pr[1])))
+        if math.isfinite(d):
+            ds.append(float(d))
+    return float(np.median(ds)) if ds else float("inf")
+
+
+def test_refined_f() -> bool:
+    """判据 4（B4）：Hartley+RANSAC 重估 F 不劣于 pose-F；不足点静默回退。"""
+    print("----- B4：refined F（默认关闭，显式启用才试） -----")
+    from stereo.angled import AngledReconstructor, refine_fundamental
+
+    checks: list[tuple[str, bool]] = []
+    left, right, F_true, K, R, T = _synthetic_correspondences()
+    # 模拟 2026-11-11 的事故：对应点来自真实几何，但标定（pose）漂了，
+    # 于是 pose-F 是错的。refined-F 的价值就在这里 —— 若拿"完美 pose-F"当基线，
+    # 8 点拟合的几何残差本来就不可能低于真值，那条比较没有意义。
+    D = np.zeros(5)
+    R_bad = R @ cv2.Rodrigues(
+        np.array([0.0, np.radians(2.0), 0.0], dtype=np.float64))[0]
+    T_bad = T * 1.15
+    F_pose = fundamental_from_pose(K, D, K, D, R_bad, T_bad)
+    med_pose = _median_epipolar(F_pose, left, right)
+    result = refine_fundamental(F_pose, left, right)
+    checks.append(("B4 60° + 0.3px 噪声：refine 返回 F（点数 "
+                   f"{len(left)}）", result is not None))
+    med_ref = float("inf")
+    if result is not None:
+        F_ref, info = result
+        med_ref = _median_epipolar(F_ref, left, right)
+        checks.append((f"B4 极线中位 refined {med_ref:.4f}px ≤ pose {med_pose:.4f}px",
+                       med_ref <= med_pose + 1e-6))
+        checks.append((f"B4 内点占比 refined {info['inlier_ratio'] * 100:.1f}% "
+                       f"≥ pose {info['base_inlier_ratio'] * 100:.1f}%",
+                       info["inlier_ratio"] >= info["base_inlier_ratio"] - 1e-9))
+
+    left2, right2, F_true2, K2, R2, T2 = _synthetic_correspondences(
+        n_outliers=6, seed=11)
+    R_bad2 = R2 @ cv2.Rodrigues(
+        np.array([0.0, np.radians(2.0), 0.0], dtype=np.float64))[0]
+    T_bad2 = T2 * 1.15
+    F_pose2 = fundamental_from_pose(K2, D, K2, D, R_bad2, T_bad2)
+    med_pose2 = _median_epipolar(F_pose2, left2, right2)
+    res2 = refine_fundamental(F_pose2, left2, right2)
+    checks.append(("B4 10% 外点：refine 仍返回 F", res2 is not None))
+    if res2 is not None:
+        F_ref2, info2 = res2
+        med_ref2 = _median_epipolar(F_ref2, left2, right2)
+        checks.append((f"B4 10% 外点：极线中位 refined {med_ref2:.4f}px "
+                       f"≤ pose {med_pose2:.4f}px（不外劣）",
+                       med_ref2 <= med_pose2 + 1e-6))
+        checks.append((f"B4 10% 外点：内点数足够（{info2['n_points']} 点，"
+                       f"内点占比 {info2['inlier_ratio'] * 100:.0f}%）",
+                       info2["n_points"] >= 8 and info2["inlier_ratio"] >= 0.8))
+
+    # 点数 <8：静默回退，不抛异常，f_source 保持 pose。
+    short_l, short_r, F_true3, K3, R3, T3 = _synthetic_correspondences(n=6, seed=13)
+    F_pose3 = fundamental_from_pose(
+        K3, D, K3, D,
+        R3 @ cv2.Rodrigues(np.array([0.0, np.radians(2.0), 0.0]))[0], T3 * 1.15)
+    checks.append(("B4 点数<8：refine 返回 None（不抛）",
+                   refine_fundamental(F_pose3, short_l, short_r) is None))
+
+    class FakeRig:
+        def __init__(self):
+            self.K1, self.K2 = K, K
+            self.D1, self.D2 = np.zeros(5), np.zeros(5)
+            self.R, self.T, self.F = R_bad, T_bad, None
+
+    try:
+        rec_short = AngledReconstructor(
+            FakeRig(), f_source="refined",
+            correspondences=(short_l, short_r))
+        checks.append(("B4 点数<8：构造不抛异常，f_source 回退 pose（实际 "
+                       f"{rec_short.f_source!r}）", rec_short.f_source == "pose"))
+        rec_none = AngledReconstructor(FakeRig(), f_source="refined",
+                                       correspondences=None)
+        checks.append(("B4 无对应点：f_source 回退 pose（实际 "
+                       f"{rec_none.f_source!r}）", rec_none.f_source == "pose"))
+        rec_ok = AngledReconstructor(FakeRig(), f_source="refined",
+                                     correspondences=(left, right))
+        checks.append(("B4 好数据：f_source 采纳 refined（实际 "
+                       f"{rec_ok.f_source!r}）", rec_ok.f_source == "refined"))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"B4 构造异常 {type(exc).__name__}: {exc}", False))
+
+    # 默认不启用：不传 f_source 时仍是 pose（即使给了好对应点也不碰）。
+    rec_default = AngledReconstructor(FakeRig(), correspondences=(left, right))
+    checks.append(("B4 默认关闭：不传 f_source 时仍为 pose（实际 "
+                   f"{rec_default.f_source!r}）", rec_default.f_source == "pose"))
+
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    print(f"  [实测] 极线中位：pose {med_pose:.4f}px -> refined {med_ref:.4f}px；"
+          f"10%外点 pose {med_pose2:.4f}px -> refined "
+          f"{_median_epipolar(res2[0], left2, right2) if res2 else float('inf'):.4f}px")
+    return ok
+
+
+def test_reverse_selfcert() -> bool:
+    """判据 5（反向自证）：A1/A2/A5 写入改空操作 -> 对应判据红；还原 sha256 一致。"""
+    print("----- 反向自证：写入空操作 -> 变红 + 字节级还原 -----")
+    import hashlib as _hashlib
+    import subprocess as _subprocess
+
+    root = Path(__file__).resolve().parent
+    while not (root / "sphere_tracker").is_dir() and root.parent != root:
+        root = root.parent
+    target = root / "apps" / "run_stereo_video.py"
+    original = target.read_bytes()
+    orig_sha = _hashlib.sha256(original).hexdigest()
+    mutations = [
+        ("A1", b'            _q["max_epipolar_px"] = float(epi)\r\n',
+         b'            pass  # reverse-A1-noop\r\n', "_probe_A1"),
+        ("A2",
+         b'            _q["calibration_forced_unusable"] = forced_unusable\r\n',
+         b'            pass  # reverse-A2-noop\r\n', "_probe_A2"),
+        ("A5",
+         b'        angled_cfg = AngledMatchConfig(max_epipolar_px=epi,\r\n'
+         b'                                       min_angle_deg=_min_angle,\r\n'
+         b'                                       max_reproj_px=_max_reproj)\r\n',
+         b'        angled_cfg = AngledMatchConfig(max_epipolar_px=epi)\r\n',
+         "_probe_A5"),
+    ]
+    checks: list[tuple[str, bool]] = []
+    code = (
+        "import sys; sys.path[:0] = [{root!r}, {tests!r}]; "
+        "import selftest_stereo_branch as m; "
+        "print('RED' if not m.{probe}() else 'GREEN')"
+    )
+    for name, old, new, probe in mutations:
+        found = original.count(old)
+        checks.append((f"反向自证 {name}：源码有唯一可改点（找到 {found} 处）",
+                       found == 1))
+        if found != 1:
+            continue
+        try:
+            target.write_bytes(original.replace(old, new, 1))
+            proc = _subprocess.run(
+                [sys.executable, "-c",
+                 code.format(root=str(root), tests=str(root / "tests"),
+                             probe=probe)],
+                capture_output=True, text=True, timeout=300,
+                cwd=str(root),
+            )
+            out = (proc.stdout or "").strip()
+            checks.append((f"反向自证 {name}：写入改空操作 -> 判据变红"
+                           f"（子进程 {out or proc.returncode}）",
+                           "RED" in out))
+            if proc.returncode != 0 and "RED" not in out:
+                print((proc.stderr or "")[-600:])
+        except Exception as exc:                            # noqa: BLE001
+            checks.append((f"反向自证 {name}：子进程异常 {exc}", False))
+        finally:
+            target.write_bytes(original)
+        restored_sha = _hashlib.sha256(target.read_bytes()).hexdigest()
+        checks.append((f"反向自证 {name}：字节级还原后 sha256 一致",
+                       restored_sha == orig_sha))
+    print(f"  [实测] sha256(original)={orig_sha}")
+    ok = True
+    for label, passed in checks:
+        print(f"  [{'通过' if passed else '不达标'}] {label}")
+        ok = ok and passed
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="双目链路端到端自测（合成真值）")
     ap.add_argument("--scenario", default="all", choices=["clean", "realistic", "all"])
@@ -1077,6 +3854,42 @@ def main() -> int:
     print()
 
     guard_ok = test_guard_step()
+    print()
+
+    classify_ok = test_guard_classification()
+    print()
+
+    no_early_stop_ok = test_guard_no_early_stop()
+    print()
+
+    carry_ok = test_export_carryover()
+    print()
+
+    world_traj_ok = test_world_frame_in_traj_payload()
+    print()
+
+    round_trip_ok = test_round_trip_metric()
+    print()
+
+    fov_apply_ok = test_fov_apply()
+    print()
+
+    realtime_ok = test_realtime_stereo()
+    print()
+
+    attribution_ok = test_offline_attribution()
+    print()
+
+    forced_ok = test_offline_forced_calibration()
+    print()
+
+    cli_ok = test_cli_thresholds()
+    print()
+
+    refined_ok = test_refined_f()
+    print()
+
+    reverse_ok = test_reverse_selfcert()
     print()
 
     scenarios = ["clean", "realistic"] if args.scenario == "all" else [args.scenario]
@@ -1138,7 +3951,11 @@ def main() -> int:
         print()
 
     all_ok = (ok and sign_ok and angled_ok and seed_ok and msg_ok
-              and geom_ok and advice_ok and center_ok and radius_ok and guard_ok)
+              and geom_ok and advice_ok and center_ok and radius_ok and guard_ok
+              and classify_ok and no_early_stop_ok and carry_ok and world_traj_ok
+              and round_trip_ok and fov_apply_ok and realtime_ok
+              and attribution_ok and forced_ok and cli_ok and refined_ok
+              and reverse_ok)
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1
 

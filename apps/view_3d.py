@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import sys
 import tkinter as tk
@@ -60,11 +62,22 @@ from sphere_tracker.paths import MONO_ROOT, STEREO_ROOT, stereo_roots  # noqa: E
 # 平滑**只有这一处实现**（`stereo/motion.py` 定稿）：查看器要用，就 import，
 # 不许在这里再复制一份窗口/阶数的代码。默认 0.20 s 是实测扫出来的，别改。
 from stereo.motion import smooth_positions, split_segments  # noqa: E402
+# 原始左右录像叫什么、谁优先，**只有** `sphere_tracker/video_files.py` 说了算：
+# 以前查看器（左/右分开取）、数据管理按钮、导出（并集）各写一份元组，
+# 加一种扩展名就会"按钮说有、打开却不在"。
+from sphere_tracker.video_files import (  # noqa: E402
+    pick_left_video,
+    pick_right_video,
+)
 
 VIS_SCHEMA = "sphere-stereo-visualization"
 TRAJ_SCHEMA = "sphere-stereo-trajectory"
 MONO_SCHEMA = "sphere-mono-visualization"
 SCHEMAS = (VIS_SCHEMA, TRAJ_SCHEMA, MONO_SCHEMA)
+
+#: 降级打开（没有三维点）时空场景的半边长（米）：±0.5 m 的坐标轴/网格。
+#: 没有它就没法 `set_xlim` —— 空场景也要有可读的刻度，而不是一张空白画布。
+DEGRADED_HALF_SPAN_M = 0.5
 
 
 def resolve_json(path: str | Path) -> Path:
@@ -90,7 +103,74 @@ def is_mono(data: dict) -> bool:
     return data.get("schema") == MONO_SCHEMA or data.get("mode") == "mono"
 
 
+class _NoTrajectory(ValueError):
+    """JSON 在、但一个可用的三维点都没有 —— 不是坏源，按"降级打开"处理。"""
+
+
+def _looks_like_session(p: Path) -> bool:
+    """这个目录像不像一段**会话**（决定"降级打开"还是"按坏源报错"）。
+
+    空目录**不算**会话：那多半是路径点错了，弹错比开一个空窗口有用
+    （`selftest_launcher_params` §8d 的"坏源抛错"判据依赖这条边界）。
+    """
+    if not p.is_dir():
+        return False
+    if (p / "session.json").is_file() or (p / "derived").is_dir():
+        return True
+    return any(p.glob("*.mkv")) or any(p.glob("*.mp4")) or any(p.glob("*.avi"))
+
+
+def _degraded_view(session_dir: Path, reason: str) -> dict:
+    """没有三维结果时的**最小 vis**：窗口照常开，场景为空 + 写明原因。
+
+    只读 `session.json`（有就读出来展示，坏了也不影响开窗）。
+    """
+    info: dict = {}
+    meta = session_dir / "session.json"
+    if meta.is_file():
+        try:
+            raw = json.loads(meta.read_text(encoding="utf-8"))
+            info = raw if isinstance(raw, dict) else {}
+        except Exception:                                    # noqa: BLE001
+            info = {}
+    return {
+        "schema": VIS_SCHEMA, "version": 1,
+        "session": str(info.get("session") or session_dir.name),
+        "trajectory": [], "frames": [],
+        "degraded": True,
+        "degraded_reason": reason,
+        "session_dir": str(session_dir),
+        "session_meta": info,
+        "coordinate_system": "?",
+        "unit": "m",
+        # `_path` 仍指向**本该有**的那个文件：`_resolve_video` / 标题 / 换源比较都靠它
+        "_path": str(session_dir / "derived" / "visualization.json"),
+    }
+
+
 def load_view(path: str | Path) -> dict:
+    """读一份 3D 数据；**会话目录没有三维结果时不抛错**，返回降级视图。
+
+    降级的两条来源（都是"这段会话没有三维结果"，不是"源坏了"）：
+      ① 目录下没有 `derived/visualization.json` / `traj3d.json`；
+      ② JSON 在，但 `trajectory`/`samples` 里一个可用点都没有。
+
+    schema / version / JSON 语法错仍然抛 —— 那才叫源坏了；换源遇到它会保持
+    当前视图不动（见 `_switch_to`）。空目录也抛（它不像会话，见
+    `_looks_like_session`）。
+    """
+    try:
+        return _load_view_strict(path)
+    except (FileNotFoundError, _NoTrajectory) as exc:
+        p = Path(path)
+        session = p if p.is_dir() else (
+            p.parent.parent if p.parent.name == "derived" else p.parent)
+        if not _looks_like_session(session):
+            raise
+        return _degraded_view(session, str(exc))
+
+
+def _load_view_strict(path: str | Path) -> dict:
     p = resolve_json(path)
     data = json.loads(p.read_text(encoding="utf-8"))
     schema = data.get("schema")
@@ -103,7 +183,7 @@ def load_view(path: str | Path) -> dict:
         points = [s for s in (data.get("samples") or []) if s.get("matched") and s.get("xyz")]
     points = [p for p in points if isinstance(p.get("xyz"), (list, tuple)) and len(p["xyz"]) == 3]
     if not points:
-        raise ValueError("没有可用的三维点（trajectory/samples 都为空）")
+        raise _NoTrajectory("没有可用的三维点（trajectory/samples 都为空）")
     data = dict(data)
     data["trajectory"] = points
     data["_path"] = str(p)
@@ -156,6 +236,14 @@ INSET_SMOOTH_COLOR = "#f97316"
 #: 小图里的中文（matplotlib 默认字体没有汉字，会画成方框）。按顺序回退。
 INSET_FONTS = ("Microsoft YaHei", "SimHei", "DejaVu Sans")
 
+#: 正视（CAD 风格）"无限方格纸"2D 主图的盒子：铺满画布，只留一点边距给刻度
+#: 标签。3D 轴盒投影在宽画布里只占约 63% 宽；2D 这块占 92%，是"无限大"观感的
+#: 基础。真正的可见性由 `_flat_axes()` 决定，这里只管位置。
+FLAT_RECT = (0.06, 0.06, 0.92, 0.90)
+
+#: 2D 方格纸上横/纵轴的标签（沿用 3D 主图的物理含义措辞，0/1/2 = X/Y/Z）。
+AXIS_LABELS_2D = ("X right (m)", "Y down (m)", "Z forward (m)")
+
 #: CAD 式标准视角：(elev, azim, roll)，单位度。
 #:
 #: 键是**用户看到的说法**，不是轴的正负号。相机系 Y 向下，所以"俯视"
@@ -198,6 +286,17 @@ VIEW_PRESETS = {
 }
 DEFAULT_VIEW = "等轴测"
 
+#: 「视频来源」下拉：值与 `--video-source` 的 choices 一一对应。
+#: 标注 = derived/annotated.mp4（默认）；原始 = 会话里的 left/right 素材；
+#: 不看 = 只显示三维轨迹。旧界面把 raw 藏在数据管理的按钮里，新界面
+#: 的查看器现在也能在窗口内直接切，不必关窗重开。
+VIDEO_SOURCE_LABELS = {
+    "annotated": "标注视频",
+    "raw": "原始视频",
+    "none": "不看视频",
+}
+VIDEO_SOURCE_ORDER = ("annotated", "raw", "none")
+
 #: 鼠标滚轮缩放步长（每滚一格的范围缩放倍率）。<1 = 滚一下放大一点。
 ZOOM_STEP = 0.85
 
@@ -225,6 +324,15 @@ PICK_RADIUS_PX = 12.0
 SAMPLE_DOT_SIZE = 7.0
 SAMPLE_DOT_COLOR = "#2563eb"
 SAMPLE_DOT_ALPHA = 0.75
+
+#: 分度值 = 「每格多少米」。改分度值就按**固定格数**重设该轴显示范围 ——
+#: 和示波器的 V/格 同构：格子数不变、每格变细就是放大。用户 2026-11-15 原话
+#: 「修改分度值…图线不会自动的匹配放大和缩小」。
+TICK_GRID_CELLS = 8
+#: 用户先设了小分度值、再用滚轮缩小到跨度远大于 step 时，网格会暴涨。
+#: 超过这个数就**把网格间隔按整数倍变粗**（仍然保留用户设的量级），
+#: 而不是像以前那样整个退回自动档 —— 那是一次静默的无视。
+TICK_MAX_GRID = 20
 
 #: 「最佳视角」的搜索参数。(仰角起, 仰角止, 仰角步长)，方位角全周。
 #:
@@ -371,19 +479,24 @@ def scan_sources(limit: int = SOURCE_LIMIT,
         # 这样"data 在哪"仍然只有 paths.py 一个来源。
         bases = tuple(dict.fromkeys(
             (*stereo_roots(), MONO_ROOT, MONO_ROOT.parent)))
-    # 枚举会话**必须**走 `candidate_session_dirs`：会话按装置分到
+    # 枚举会话**必须**走 `sphere_tracker.discovery`：会话按装置分到
     # `data/stereo/parallel/`、`data/stereo/angled/` 之后，根目录下一层已经
     # 不是会话了。原来这里自己 `base.glob("*/derived/*")`，于是**新布局的会话
     # 一个都扫不到** —— 表现为"数据源列表里没有最新那次实验"，默认会话只能
     # 落到更老的目录上（2026-11-05 用户："每次打开应该默认打开最新的会话"，
     # 查下来不是排序问题，是根本没扫到）。
-    from apps._stereo_layout import candidate_session_dirs
+    #
+    # 判据用**宽**（`strict=False`）而不是"只认 session.json"：这里要的是
+    # "哪个目录里有 derived/visualization.json 或 traj3d.json"，不是"哪段会话
+    # 完整"。用户把结果目录单独拷出来（只有 `derived/`、没有 session.json）
+    # 也要能在下拉里选到 —— selftest_viz_scale 就钉着这一条。
+    from sphere_tracker.discovery import discover_session_dirs
 
     found: dict[Path, Path] = {}
     for base in bases:
         if not base.is_dir():
             continue
-        for sess in candidate_session_dirs([base]):
+        for sess in discover_session_dirs(base, recursive=True, strict=False):
             for name in ("visualization.json", "traj3d.json"):
                 f = sess / "derived" / name
                 if not f.exists():
@@ -436,12 +549,22 @@ def source_label(f: Path) -> str:
 
 class Viewer3D:
     def __init__(self, root: tk.Tk, data: dict, video_path: str | Path | None = None,
-                 auto_video: bool = True) -> None:
+                 auto_video: bool = True, video_source: str = "annotated") -> None:
         self.root = root
         self.playing = False
         self.speed = 1.0
         self._syncing = False
         self.cap: cv2.VideoCapture | None = None
+        # 「原始视频源」(raw) 用左右两个独立 cap，各记自己的帧数；sync_offset
+        # 来自 session.json 的 sync.offset。annotated / none 模式这几个一律为
+        # None / 0。video_source 放在最后且带默认值：tests 用两个位置参数实例化
+        # Viewer3D(root, data)，签名末尾加默认参数不会破坏它们。
+        self.cap_l: cv2.VideoCapture | None = None
+        self.cap_r: cv2.VideoCapture | None = None
+        self.cap_frames_l = 0
+        self.cap_frames_r = 0
+        self.video_source = video_source
+        self.sync_offset = 0
         self._left_raw = None
         self._right_raw = None
         self._sources: list[Path] = []
@@ -491,6 +614,12 @@ class Viewer3D:
         self._press_px: tuple[int, int] | None = None
         self._pan_active: bool = False
         self._pan_button: int = 3
+        # ax2d 当前画的是哪两个物理轴（_redraw_flat 里设）。切换 k（前视↔右视）
+        # 时 ax2d 上还留着上一次的横/纵轴，回读范围必须用**画过的**那对，不能用
+        # 新视角的 pair，否则会把 X 范围写进 Z 槽、切回 3D 就错了。
+        self._ax2d_pair: tuple[int, int] | None = None
+        # 正视 2D 平移起点 (x_px, y_px, xlim, ylim)；非 None 表示正在平移。
+        self._flat_pan0: tuple[float, float, tuple, tuple] | None = None
         self._apply(data, video_path, auto_video)
         try:
             self._build()
@@ -516,6 +645,13 @@ class Viewer3D:
         self._release_cap()
         self._left_raw = None
         self._right_raw = None
+        # 换会话重置原始视频源状态（三个 cap 已由 _release_cap 放掉并置 None）。
+        self.cap_frames_l = self.cap_frames_r = 0
+        self.sync_offset = 0
+        # video_source == "none" 与 --no-video 完全等价：清掉显式路径、关掉自动，
+        # 让下面 annotated 的既有逻辑自然落在「没有视频」，两路帧保持 None。
+        if self.video_source == "none":
+            video_path, auto_video = None, False
         self.data = data
         self.points = data["trajectory"]
         self.n = len(self.points)
@@ -527,35 +663,85 @@ class Viewer3D:
         _t, self.P_raw, self.P_smooth, self.smooth_valid = track_arrays(self.points)
         self.video_error = ""
         self.video_disabled = (video_path is None or video_path == "") and not auto_video
-        self.lo, self.hi = bounds_of(self.points)
+        self.degraded = bool(data.get("degraded"))
+        if self.points:
+            self.lo, self.hi = bounds_of(self.points)
+        else:
+            # 降级视图：没有点就没有包围盒。给一个 ±0.5 m 的空场景，
+            # 坐标轴/网格照样画出来（而不是崩在 bounds_of 里）。
+            self.lo = [-DEGRADED_HALF_SPAN_M] * 3
+            self.hi = [DEGRADED_HALF_SPAN_M] * 3
         self.video_path = self._resolve_video(video_path, auto_video)
-        self.cap = cv2.VideoCapture(str(self.video_path)) if self.video_path else None
-        self.cap_frames = 0
-        if self.cap is not None and self.cap.isOpened():
-            # 记下总帧数：轨迹点可以有很多帧，视频却可能**只有十几帧**
-            # （生成中断/被覆盖）。不记的话，seek 越界只能报一句"解码失败"，
-            # 用户会以为是播放器坏了（2026-11-05 现场：视频 19 帧、
-            # 轨迹 301 帧，两边都显示"frame 56 解码失败"）。
+        if self.video_source == "raw":
+            # 原始模式：直接读左右 mkv，完全绕开 annotated.mp4 —— 刚录完还没
+            # 跑三维时它可能根本没生成，且 _resolve_video 的 is_file() 门会把
+            # 「有 mkv 无 json」的会话判成连视频都打不开。
+            self.video_disabled = False
+            left_path, right_path = self._resolve_raw_videos(data)
+            self.cap_l = cv2.VideoCapture(str(left_path)) if left_path else None
+            self.cap_r = cv2.VideoCapture(str(right_path)) if right_path else None
+            for cap, attr in ((self.cap_l, "cap_frames_l"),
+                              (self.cap_r, "cap_frames_r")):
+                frames = 0
+                if cap is not None and cap.isOpened():
+                    try:
+                        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    except Exception:               # noqa: BLE001
+                        frames = 0
+                setattr(self, attr, frames)
+            if self.cap_l is not None and not self.cap_l.isOpened():
+                self.cap_l.release()
+                self.cap_l = None
+            if self.cap_r is not None and not self.cap_r.isOpened():
+                self.cap_r.release()
+                self.cap_r = None
+            # 左右录制的帧偏移：从 session.json 的 sync.offset 读；读不到/异常
+            # 都按 0 处理并留一条日志，绝不让「看一眼视频」被损坏的元数据卡住。
+            self.sync_offset = 0
             try:
-                self.cap_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            except Exception:                       # noqa: BLE001
-                self.cap_frames = 0
-        if self.cap is not None and not self.cap.isOpened():
-            self.video_error = f"视频打不开：{self.video_path}"
-            self.cap.release()
-            self.cap = None
-        if self.cap is not None and not self.mono:
-            # 只有双目才要求左右并排：单目的标注视频就是一路画面，
-            # 拿 2:1 去卡它会把每一段单目会话都判成"视频不能看"。
-            vw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            vh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            if vw > 0 and vh > 0 and vw < vh * 1.8:
-                self.video_error = f"视频不是左右并排（{vw}x{vh}），按 2:1 切分会错"
+                session = getattr(self, "_raw_session_dir", None)
+                meta = json.loads((Path(session) / "session.json")
+                                  .read_text(encoding="utf-8"))
+                self.sync_offset = int(
+                    (meta.get("sync") or {}).get("offset", 0) or 0)
+            except Exception as exc:                 # noqa: BLE001
+                self.sync_offset = 0
+                print(f"[view_3d] raw: 读取 sync.offset 失败，按 0 处理：{exc}")
+            if self.cap_l is None and self.cap_r is None:
+                self.video_error = "raw video not found (left/right.mkv)"
+        else:
+            # annotated / none：以下是既有逻辑，原样保留。2:1 校验只在这里 ——
+            # 原始 1920×1080 是单路满幅画面，拿 2:1 去卡会误判成「不合格」。
+            self.cap = cv2.VideoCapture(str(self.video_path)) if self.video_path else None
+            self.cap_frames = 0
+            if self.cap is not None and self.cap.isOpened():
+                # 记下总帧数：轨迹点可以有很多帧，视频却可能**只有十几帧**
+                # （生成中断/被覆盖）。不记的话，seek 越界只能报一句"解码失败"，
+                # 用户会以为是播放器坏了（2026-11-05 现场：视频 19 帧、
+                # 轨迹 301 帧，两边都显示"frame 56 解码失败"）。
+                try:
+                    self.cap_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                except Exception:                       # noqa: BLE001
+                    self.cap_frames = 0
+            if self.cap is not None and not self.cap.isOpened():
+                self.video_error = f"视频打不开：{self.video_path}"
                 self.cap.release()
                 self.cap = None
-        kind = "[单目] " if self.mono else "[双目] "
+            if self.cap is not None and not self.mono:
+                # 只有双目才要求左右并排：单目的标注视频就是一路画面，
+                # 拿 2:1 去卡它会把每一段单目会话都判成"视频不能看"。
+                vw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                vh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if vw > 0 and vh > 0 and vw < vh * 1.8:
+                    self.video_error = f"视频不是左右并排（{vw}x{vh}），按 2:1 切分会错"
+                    self.cap.release()
+                    self.cap = None
+        kind = "[降级] " if self.degraded else ("[单目] " if self.mono else "[双目] ")
         self.root.title(f"3D 轨迹 · {kind}{data.get('session', '')} · {self.n} points")
         self._sync_mono_note()
+        # 换会话只调 `_apply`、不重建窗口：按钮在 __init__ 里只建一次，
+        # 不在这里重算 state 就会残留上一段的"可点"（切到无视频会话仍亮着）。
+        self._sync_video_button()
 
     def _sync_mono_note(self) -> None:
         """单目时把"尺度从哪来"常驻在图下方；双目时清空。
@@ -603,6 +789,89 @@ class Viewer3D:
             if cand.exists():
                 return cand
         return None
+
+    def _resolve_raw_videos(self, data: dict) -> tuple[Path | None, Path | None]:
+        """定位会话里的原始左右录像素材（left/right.mkv|mp4）。
+
+        会话目录走**两路兜底**：降级视图带 ``session_dir``；严格视图只有
+        ``_path``，按 ``_resolve_video`` 的 parent.parent 逻辑往上推。绝不能套
+        ``_resolve_video`` 里的 ``p.is_file()`` 门 —— 刚录完还没跑三维时
+        ``_path`` 指向的 json 根本不存在，那个门会让连原始视频都打不开
+        （2026-11 现场：192530 有 left/right.mkv 却没有 visualization.json）。
+        """
+        p = Path(data.get("_path", ""))
+        derived = p.parent.parent if p.parent.name == "derived" else p.parent
+        dirs: list[Path] = []
+        sd = data.get("session_dir")
+        if sd:
+            dirs.append(Path(sd))
+        dirs.append(derived)
+        self._raw_session_dir: Path | None = None
+
+        left = right = None
+        for session in dirs:
+            if not session.is_dir():
+                continue
+            if self._raw_session_dir is None:
+                self._raw_session_dir = session
+            # 文件名与 mkv 优先的次序由 `sphere_tracker/video_files.py` 决定，
+            # 这里只负责"两路兜底"的目录顺序与"找到就停"。
+            left = left or pick_left_video(session)
+            right = right or pick_right_video(session)
+            if left and right:
+                break
+        return left, right
+
+    def _sync_video_button(self) -> None:
+        """「用系统播放器打开视频」跟着当前会话重算（由 `_apply` 末尾调用）。
+
+        按钮在 __init__ 里只建一次；换会话只重置数据，不重算就会残留上一段
+        的可点状态。_apply 先于 _build 执行，那时按钮还不存在 —— 守卫跳过，
+        _build 建完按钮后再调一次即可覆盖首次打开。
+        """
+        btn = getattr(self, "btn_open_video", None)
+        if btn is None:
+            return
+        if self.video_source == "raw":
+            # raw 模式没有单一「标注视频」可开：self.video_path 指向的
+            # annotated.mp4 可能根本不存在。禁用按钮并用 ASCII 说明，
+            # 避免点了打开一个错文件（不新增中文界面文案）。
+            btn.configure(state="disabled",
+                          text="open raw videos (left/right.mkv in session dir)")
+            return
+        reason = ""
+        if not self.video_path:
+            reason = "这段会话没有标注视频"
+        elif self.video_error:
+            reason = self.video_error.replace("**", "")
+        if reason:
+            btn.configure(state="disabled",
+                          text=f"用系统播放器打开视频（{reason}）")
+        else:
+            btn.configure(state="normal", text="用系统播放器打开视频")
+
+    def _open_video(self) -> None:
+        """用系统播放器单独打开当前会话的 derived/annotated.mp4。"""
+        if self.video_source == "raw":
+            # 按钮此时已禁用，这里再兜一层：绝不落到 annotated.mp4，
+            # 只在状态栏给出两路原始素材的完整路径（ASCII）。
+            left, right = self._resolve_raw_videos(self.data)
+            self.status.configure(text=f"raw videos: {left} / {right}")
+            return
+        opener = getattr(os, "startfile", None)
+        video = self.video_path
+        if opener is None or not video:
+            # 平台不支持（或没解析到路径）：给出完整路径，不吞。
+            self.status.configure(
+                text=f"这个平台不能直接开视频，文件在："
+                     f"{video or '（未找到 derived/annotated.mp4）'}")
+            return
+        try:
+            opener(str(video))
+        except OSError as exc:
+            self.status.configure(text=f"打不开 {Path(video).name}：{exc}")
+            return
+        self.status.configure(text=f"已用系统播放器打开 {Path(video).name}")
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
@@ -652,6 +921,12 @@ class Viewer3D:
         #    只有宽度 65%，左右各空 17.5% —— 这才是"立方体只有中间一小块"
         #    的真正原因，和边距无关。只能把 `apply_aspect` 换成不收缩。
         self.ax.apply_aspect = lambda position=None: None
+        # 正视（CAD 风格）观察方向下改用的 2D 方格纸主图：**另叠一块普通 axes**，
+        # 与 3D 主图同尺寸、互斥可见。zorder=1 低于右下小图（10）；非正视时
+        # 保持隐藏，3D 渲染路径一个字都不变。位置由 `_apply_layout()` 统一摆。
+        # 初始先给定尺寸，`_apply_layout()` 紧接着会按真实画布重设。
+        self.ax2d = self.fig.add_axes(list(FLAT_RECT), zorder=1)
+        self.ax2d.set_visible(False)
         self._apply_layout()
         # 右下角俯视小图：**另叠一块 axes**，不碰主图的 subplot 布局
         # （主图的范围/视角/色标有别的判据盯着）。zorder 抬高让它盖在 3D 轴之上。
@@ -731,7 +1006,7 @@ class Viewer3D:
             command=self._on_layout_mode)
         self.keep_chk.pack(anchor="w", pady=(6, 0))
 
-        ttk.Label(side, text="分度值 X / Y / Z（米，留空=自动）",
+        ttk.Label(side, text="分度值 X / Y / Z（米/格，留空=自动）",
                   style="Hint.TLabel").pack(anchor="w", pady=(10, 2))
         tick_row = ttk.Frame(side)
         tick_row.pack(fill="x")
@@ -793,6 +1068,12 @@ class Viewer3D:
         self.smooth_chk = ttk.Checkbutton(bar, text="平滑", variable=self.use_smooth,
                                           command=self._on_toggle_smooth)
         self.smooth_chk.pack(side="left", padx=(10, 0))
+        # 「用系统播放器打开视频」：3D 查看器本来就同屏加载 annotated.mp4，
+        # 这里补的是"单独用外部播放器打开"这一动作（不在模式窗 L1 加第 6 个按钮）。
+        self.btn_open_video = ttk.Button(
+            bar, text="用系统播放器打开视频", command=self._open_video)
+        self.btn_open_video.pack(side="left", padx=(10, 0))
+        self._sync_video_button()   # _build 在 _apply 之后：首次打开也要重算
         # 缩放/平移提示（2026-11-04）：三键交互是 matplotlib 3D 原生的，
         # 用户看不到说明就不知道中键能平移、右键能缩放。文字放控制条右侧。
         ttk.Label(bar, text="左键旋转 · 右键平移（走动） · 滚轮缩放 · "
@@ -820,6 +1101,17 @@ class Viewer3D:
         self.source_box.bind("<<ComboboxSelected>>", self._on_pick_source)
         ttk.Button(src, text="打开目录…", width=10,
                    command=self._on_browse_source).pack(side="left")
+        # 视频来源（2026-11-20）：老界面在数据管理里给过 raw 入口；新界面
+        # 此前只能按启动参数走，窗口内切不了。换来源**不重建窗口**，只重开
+        # 视频 cap 并把游标留在原帧。
+        ttk.Label(src, text="视频").pack(side="left", padx=(14, 0))
+        self.video_box = ttk.Combobox(
+            src, width=8, state="readonly",
+            values=[VIDEO_SOURCE_LABELS[k] for k in VIDEO_SOURCE_ORDER])
+        self.video_box.set(VIDEO_SOURCE_LABELS.get(self.video_source,
+                                                   VIDEO_SOURCE_LABELS["annotated"]))
+        self.video_box.bind("<<ComboboxSelected>>", self._on_pick_video_source)
+        self.video_box.pack(side="left", padx=(8, 0))
         self.source_note = ttk.Label(src, text="")
         self.source_note.pack(side="left", padx=(10, 0))
         # 先给控制条/状态栏留位置，再把四宫格填满剩余空间；
@@ -903,9 +1195,52 @@ class Viewer3D:
         try:
             f = resolve_json(d)                 # 目录 -> 具体 json（会校验存在性）
         except Exception as exc:                # noqa: BLE001
+            if _looks_like_session(Path(d)):
+                # 会话目录但没有三维结果：**降级打开**（不是坏源）。
+                # 用户要的是"能看到这段会话是什么、为什么没有结果"。
+                self._switch_to(Path(d))
+                return
             messagebox.showwarning("这里没有三维结果", f"{d}\n\n{exc}", parent=self.root)
             return
         self._switch_to(f)
+
+    def _axis_labels(self) -> tuple[str, str, str]:
+        """轴标签**跟着数据走**：世界系的 `style.axes` 优先，否则用相机系措辞。
+
+        `stereo/visualization.py` 在应用 `world_frame.json` 时会把
+        `style.axes` 换成 World X/Y/Z（地面棋盘列/行/法向）。查看器原来写死
+        `X right / Y down / Z forward`，于是世界系数据配着相机系标签 ——
+        数据没错、标签在说谎。三个绘制路径（2D 方格纸 / 3D 主图 / 降级空场景）
+        都从这一个出口取标签。
+        """
+        axes = ((self.data.get("style") or {}).get("axes") or {})
+        return (
+            str(axes.get("x") or AXIS_LABELS_2D[0]),
+            str(axes.get("y") or AXIS_LABELS_2D[1]),
+            str(axes.get("z") or AXIS_LABELS_2D[2]),
+        )
+
+    def _on_pick_video_source(self, _event=None) -> None:
+        """切「标注 / 原始 / 不看」：重开视频源，**保留当前帧与视角**。
+
+        不能只改 `self.video_source` 就 `_update_video()`：raw 模式要重新打开
+        左右两路 cap，annotated 模式要重新解析并校验 2:1，`none` 要清掉旧帧 ——
+        这些都在 `_apply` 里。`_apply` 会把游标归零（换会话语义），所以这里
+        先记下 `idx`、切完再放回去，用户看到的是同一帧换了视频来源。
+        """
+        label = self.video_box.get()
+        source = next((k for k, v in VIDEO_SOURCE_LABELS.items() if v == label), None)
+        if source is None or source == self.video_source:
+            return
+        keep = self.idx
+        self.video_source = source
+        self._apply(self.data, None, True)
+        self.idx = min(keep, max(0, self.n - 1))
+        try:
+            self.slider.set(self.idx)
+        except Exception:                                # noqa: BLE001
+            pass
+        self._redraw()
 
     def _switch_to(self, f: Path) -> None:
         if str(f) == str(self.data.get("_path") or ""):
@@ -937,9 +1272,14 @@ class Viewer3D:
         self._step(1)
 
     def _release_cap(self) -> None:
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        # 三个 cap 都要放：Windows 上不放会一直占着 mkv（annotated.mp4 的
+        # 教训见 close()），关窗后删不掉 / 覆盖不了。getattr 兜底 __init__
+        # 尚未建好属性时构造异常路径（:579）也能安全走到这里。
+        for attr in ("cap", "cap_l", "cap_r"):
+            cap = getattr(self, attr, None)
+            if cap is not None:
+                cap.release()
+                setattr(self, attr, None)
 
     def close(self) -> None:
         """释放视频句柄并关窗。
@@ -981,34 +1321,83 @@ class Viewer3D:
 
     # ── 鼠标：平移（有边界）/ 点选采样点 ────────────────────────────────
     def _on_press(self, event) -> None:
-        """记下按下位置；右/中键在**主 3D 轴内**按下则开始平移。"""
+        """记下按下位置；右/中键在**当前生效轴内**按下则开始平移。"""
         self._press_px = (event.x, event.y) if event.x is not None else None
-        if event.inaxes is not self.ax or event.button not in (2, 3):
+        active = self._active_axes()
+        if event.inaxes is not active or event.button not in (2, 3):
             self._pan_active = False
             return
         self._pan_active = True
         self._pan_button = int(event.button)
+        if self._flat_axes() is not None:
+            # 正视 2D：不用 mplot3d 的 start_pan/drag_pan，也不用 `_clamp_pan`
+            # —— 用户要"无限向右拖，直到找到任意一个点"。记下按下时的像素和
+            # 范围，motion 里按像素位移直接改 ax2d 的 lim。
+            self._flat_pan0 = (float(event.x), float(event.y),
+                               tuple(active.get_xlim()), tuple(active.get_ylim()))
+            return
         try:
-            self.ax.start_pan(event.x, event.y, event.button)
+            active.start_pan(event.x, event.y, event.button)
         except Exception:                       # noqa: BLE001
             self._pan_active = False
 
+    def _flat_pan(self, event) -> None:
+        """正视 2D 的无限平移：按鼠标像素位移换算成数据位移，直接改 ax2d 范围。
+
+        没有 `_clamp_pan` —— 数据一个点都没删，窗口可以从数据内一路拖到数据外
+        3 倍跨度，再拖回来点还在原处。屏幕 Y 向下、纵轴可能是反转的，但两套
+        情况都可以用**数据顺序的正跨度**统一处理：内容跟鼠标同方向走。
+        """
+        p0 = getattr(self, "_flat_pan0", None)
+        if p0 is None or event.x is None or event.y is None:
+            return
+        x0, y0, xlim0, ylim0 = p0
+        bbox = self.ax2d.bbox
+        span_x = max(1e-12, max(xlim0) - min(xlim0))
+        span_y = max(1e-12, max(ylim0) - min(ylim0))
+        shift_x = (event.x - x0) / max(1.0, bbox.width) * span_x
+        shift_y = (event.y - y0) / max(1.0, bbox.height) * span_y
+        # 内容跟鼠标同向：窗口反向平移。
+        # **纵轴反转时（ylim0=(hi,lo)，物理 Y 向下）要翻转 y 的符号**：
+        # matplotlib 的 event.y 向上增大，而非反转轴惯例是"内容跟手走、
+        # 窗口反向移"，即 ylim 减 shift；反转轴屏幕方向倒过来了，同样减
+        # shift 就变成"鼠标往上拖、内容往上跑反了"（用户 2026-11-18 实测）。
+        fa = getattr(self, "_ax2d_pair", None) or self._flat_axes()
+        y_sign = -1.0 if (fa is not None and self._flat_y_reversed(fa)) else 1.0
+        self.ax2d.set_xlim(xlim0[0] - shift_x, xlim0[1] - shift_x)
+        self.ax2d.set_ylim(ylim0[0] - y_sign * shift_y,
+                           ylim0[1] - y_sign * shift_y)
+        # 立刻把 ax2d 的范围写回 self.lims（含反转还原），否则下一次 `_redraw`
+        # 的 `_capture_lims()` 之前若 self.lims 还是 None 会重新 fit 回数据。
+        if self.lims is None:
+            self._current_lims()
+        self._capture_lims()
+
     def _on_motion(self, event) -> None:
-        """拖动 = 平移视野，每次移动后立刻夹回数据附近。"""
+        """拖动 = 平移视野；正视 2D 无限平移，3D 仍夹回数据附近。"""
         if not self._pan_active or event.x is None:
             return
-        try:
-            self.ax.drag_pan(self._pan_button, event.key, event.x, event.y)
-        except Exception:                       # noqa: BLE001
-            return
-        self._clamp_pan()
+        if self._flat_axes() is not None:
+            self._flat_pan(event)
+        else:
+            try:
+                self.ax.drag_pan(self._pan_button, event.key, event.x, event.y)
+            except Exception:                   # noqa: BLE001
+                return
+            self._clamp_pan()
+            # 关键：drag_pan 直接改 ax 的 lim（不走 self.lims），掩码若重算就会
+            # 冻结在平移前 —— 拖到新窗口一片空白。只重算两条 Line3D 的 x/y/zdata，
+            # 不整幅 `_redraw()`（pan 期间 40ms/帧太卡），数据源一概不动。
+            self._refresh_3d_clip()
         self.canvas.draw_idle()
 
     def _on_release(self, event) -> None:
         """松开：结束平移；左键**没拖动**才算点击（拖动是在转视角）。"""
         was_pan = self._pan_active
         self._pan_active = False
-        if event.button != 1 or event.inaxes is not self.ax or was_pan:
+        self._flat_pan0 = None
+        if (event.button != 1 or event.inaxes is not self._active_axes()
+                or was_pan):
             return
         if self._press_px is None or event.x is None:
             return
@@ -1050,6 +1439,20 @@ class Viewer3D:
         """
         if self.P_raw is None or not len(self.P_raw):
             self._pt_px = None
+            self._pt_px_box = None
+            return
+        fa = self._flat_axes()
+        if fa is not None:
+            # 正视 2D：横/纵就是两个物理坐标，普通 `transData` 自带 ylim 反转，
+            # 不用 proj3d —— 它只适用于 3D 轴盒的投影。
+            h, v = fa
+            try:
+                self._pt_px = self.ax2d.transData.transform(
+                    np.column_stack([self.P_raw[:, h], self.P_raw[:, v]]))
+                self._pt_px_box = tuple(self.ax2d.bbox.bounds)
+            except Exception:                   # noqa: BLE001
+                self._pt_px = None
+                self._pt_px_box = None
             return
         try:
             M = self.ax.get_proj()
@@ -1071,7 +1474,7 @@ class Viewer3D:
         # 不重算的话，点击会按上一个尺寸的位置命中，偏出去几十像素。
         if (self._pt_px is None
                 or getattr(self, "_pt_px_box", None)
-                != tuple(self.ax.bbox.bounds)):
+                != tuple(self._active_axes().bbox.bounds)):
             self._cache_point_px()
         if self._pt_px is None or not len(self._pt_px):
             return
@@ -1221,14 +1624,24 @@ class Viewer3D:
             lo = float(P[:, i].min())
             hi = float(P[:, i].max())
             rows.append(f"{axis_name}  {lo:+.4f} ~ {hi:+.4f}   跨度 {hi - lo:.4f}")
+        # 可见标记：让用户一眼看出加载的是**新**查看器（2026-11-17 坐标布改造）。
+        # 用户报"完全没修改"时，先核对这一行在不在 —— 旧进程看不出任何差别。
+        # 正视 2D 方格纸是本次新增的模式，文案直接点明，免得和旧版混淆。
+        rows.append("正视=2D无限方格纸 · 点线不删"
+                    if self._flat_axes() is not None
+                    else "坐标布 无限 · 视外轨迹裁剪")
         # 字体必须能显示中文：`monospace`(DejaVu Sans Mono) 没有汉字，
         # 会渲染成一串方框并刷 UserWarning。用项目里已有的中文回退链，
         # 数字靠 `%+.4f` 的定宽格式对齐（比例字体的数字宽度本来就接近）。
         # 存下 artist：选中面板要靠它的**实测高度**定位，不能再用常量估
         # —— 实测面板高 67.9px，常量写的 64，一乘上窗口高度就撞在一起了
         # （2026-11-05 用户截图：Z 那行被选中框盖住一半）。
-        self._ext_artist = self.ax.text2D(
-            0.012, EXTREMES_TOP_Y, "\n".join(rows), transform=self.ax.transAxes,
+        # 文字面板用 `text2D`（Axes3D 才有这个名字；普通 2D Axes 只有 `.text`）
+        # 挂在**当前可见**的 axes 上，否则正视 2D 模式下文字会落在隐藏的 3D 轴上。
+        active = self._active_axes()
+        text2d = getattr(active, "text2D", active.text)
+        self._ext_artist = text2d(
+            0.012, EXTREMES_TOP_Y, "\n".join(rows), transform=active.transAxes,
             fontsize=8.5, va="top", family=list(INSET_FONTS), color="#111827",
             linespacing=1.35,
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
@@ -1241,9 +1654,16 @@ class Viewer3D:
         if i is None or not (0 <= i < len(self.P_raw)):
             return
         q = self.P_raw[i]
-        self.ax.scatter([q[0]], [q[1]], [q[2]], s=70, facecolors="none",
-                        edgecolors="#dc2626", linewidths=1.6,
-                        depthshade=False, zorder=20)
+        fa = self._flat_axes()
+        active = self._active_axes()
+        if fa is None:
+            self.ax.scatter([q[0]], [q[1]], [q[2]], s=70, facecolors="none",
+                            edgecolors="#dc2626", linewidths=1.6,
+                            depthshade=False, zorder=20)
+        else:
+            h, v = fa
+            active.scatter([q[h]], [q[v]], s=70, facecolors="none",
+                           edgecolors="#dc2626", linewidths=1.6, zorder=20)
         meta = self.points[i] if i < len(self.points) else {}
         head = f"#{i}"
         if meta.get("frame") is not None:
@@ -1261,7 +1681,7 @@ class Viewer3D:
         #    差那 0.015 就是 10px，正好压住 Z 那一行；
         # ② 面板高度要**实测**（`get_window_extent`），常量估不准：
         #    实际 67.9px 而常量写 64，窗口越高重叠越明显。
-        _h = max(1.0, float(self.ax.bbox.height))
+        _h = max(1.0, float(active.bbox.height))
         _panel_h = float(EXTREMES_PANEL_PX)
         _art = getattr(self, "_ext_artist", None)
         if _art is not None:
@@ -1271,8 +1691,9 @@ class Viewer3D:
             except Exception:                       # noqa: BLE001
                 pass                                # 量不到就退回常量
         _y = EXTREMES_TOP_Y - (_panel_h + 8.0) / _h
-        self.ax.text2D(
-            0.012, _y, body, transform=self.ax.transAxes,
+        text2d = getattr(active, "text2D", active.text)
+        text2d(
+            0.012, _y, body, transform=active.transAxes,
             fontsize=9, va="top", family="monospace", color="#111827",
             bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
                       edgecolor="#dc2626", alpha=0.94),
@@ -1295,6 +1716,48 @@ class Viewer3D:
             pass
         self._bind_mouse_buttons()     # clear() 后重设，避免键位丢
         self._hide_depth_axis()
+
+    def _flat_axes(self) -> tuple[int, int] | None:
+        """当前观察方向是否**正视**（CAD 风格）。
+
+        这是"用 2D 方格纸还是 3D 轴盒"的**唯一产地**。判据与
+        `_hide_depth_axis()` 完全相同（照抄，别只改一处）：相机方向
+        ``eye = (cos e·cos a, cos e·sin a, sin e)``，取 ``k = argmax(|eye|)``，
+        ``|eye[k]| >= 0.995``（离轴 5.7° 以内）才算正视。正视时视线垂直于某张
+        坐标平面，深度轴在屏幕上退化成一点 —— 正是该摊平成 2D 方格纸的场景；
+        其它视角（等轴测等）必须保持原来的 3D 渲染。
+
+        返回值是要在 2D 图上画的 ``(横轴下标, 纵轴下标)``（0/1/2 = X/Y/Z）：
+          - k=2（前/后视）→ (0, 1)：X 横、Y 纵；Y 向下，要反转纵轴；
+          - k=1（俯/仰视）→ (0, 2)：X 横、Z 纵；Z 向前，不反转；
+          - k=0（左/右视）→ (2, 1)：Z 横、Y 纵；Y 向下，要反转纵轴。
+        每组下标与 `VIEW_PRESETS` 里每条预设的屏幕朝向逐一对应。
+        """
+        e = np.radians(self.view["elev"])
+        a = np.radians(self.view["azim"])
+        eye = (np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e))
+        k = int(np.argmax(np.abs(eye)))
+        if abs(eye[k]) < 0.995:
+            return None
+        # 元组按 k 索引排列：k=0 → (Z横,Y纵)，k=1 → (X横,Z纵)，k=2 → (X横,Y纵)。
+        return ((2, 1), (0, 2), (0, 1))[k]
+
+    @staticmethod
+    def _flat_y_reversed(pair: tuple[int, int]) -> bool:
+        """方格纸纵轴要不要反转：纵轴是物理 Y（相机系向下）时反转。
+
+        反转后屏幕上方 = 数据 Y 小，才和相机拍到的画面同向（`VIEW_PRESETS`
+        的注释实测过）；纵轴是 Z 的俯视沿用"Z 向上"的老习惯，不反转。
+        """
+        return pair[1] == 1
+
+    def _active_axes(self):
+        """当前真正显示给用户的 axes（flat → 2D 方格纸，否则 → 3D 主图）。
+
+        所有事件入口（press/motion/release/scroll/pick）与左上角文字面板都走
+        这里，不在两套 axes 之间写死 `self.ax`。
+        """
+        return self.ax2d if self._flat_axes() is not None else self.ax
 
     def _hide_depth_axis(self) -> None:
         """视线几乎与某根轴平行时，把那根轴的刻度与标签藏掉。
@@ -1356,8 +1819,9 @@ class Viewer3D:
         self._redraw()
 
     def _on_proj_toggle(self) -> None:
-        self._apply_view()
-        self.canvas.draw_idle()
+        # 投影方式切换和视角预设一样走整幅重画：正视/非正视的可见性由
+        # `_redraw()` 里的 `_flat_axes()` 决定，只调 `_apply_view()` 不会切。
+        self._redraw()
 
     # ---- 缩放/平移：范围持久化 + 绕点滚轮缩放 ----
     def _zoom_around(self, factor: float, px: float, py: float, pz: float) -> None:
@@ -1380,6 +1844,36 @@ class Viewer3D:
         self.box_zoom = max(0.35, min(6.0, float(zoom)))
         self._apply_box()
 
+    def _flat_zoom(self, factor: float, event) -> None:
+        """正视 2D 的滚轮缩放：以鼠标位置为锚，缩放 ax2d 的两轴范围。
+
+        与 3D 路径的 `set_box_aspect(zoom=)` 不同，这里直接改 lim —— 2D 没有
+        一个会缩放的"轴盒"，网格是普通 2D 刻度线，范围一缩格子自然变大。
+        锚点用 bbox 的归一化位置插值，对反转的纵轴同样成立（ylim 反转只交换
+        两端，线性插值不变）。
+        """
+        ax = self.ax2d
+        xlo, xhi = ax.get_xlim()
+        ylo, yhi = ax.get_ylim()
+        bbox = ax.bbox
+        fx = (0.5 if event.x is None or bbox.width <= 0
+              else (event.x - bbox.x0) / bbox.width)
+        fy = (0.5 if event.y is None or bbox.height <= 0
+              else (event.y - bbox.y0) / bbox.height)
+        fx = max(0.0, min(1.0, fx))
+        fy = max(0.0, min(1.0, fy))
+        ax_x = xlo + (xhi - xlo) * fx
+        ax_y = ylo + (yhi - ylo) * fy
+        ax.set_xlim(ax_x - (ax_x - xlo) * factor,
+                    ax_x + (xhi - ax_x) * factor)
+        ax.set_ylim(ax_y - (ax_y - ylo) * factor,
+                    ax_y + (yhi - ax_y) * factor)
+        if self.lims is None:
+            self._current_lims()
+        self._capture_lims()
+        self._cache_point_px()
+        self.canvas.draw_idle()
+
     def _on_scroll(self, event) -> None:
         """滚轮 = **整幅缩放**；Shift+滚轮 = 定点放大（改三轴范围）。
 
@@ -1396,9 +1890,13 @@ class Viewer3D:
         定点放大（只改范围、把鼠标指的位置留在屏幕原位）仍然有用 —— 它是
         "凑近看某一段"，所以挪到 Shift+滚轮，不再占用默认滚轮。
         """
-        if event.inaxes is not self.ax:
+        if event.inaxes is not self._active_axes():
             return
         factor = ZOOM_STEP if event.button == "up" else 1.0 / ZOOM_STEP
+        fa = self._flat_axes()
+        if fa is not None:
+            self._flat_zoom(factor, event)
+            return
 
         if event.key == "shift":
             # 定点放大：锚点取鼠标在轴框内的归一化位置
@@ -1446,39 +1944,118 @@ class Viewer3D:
         self._apply_box()
 
     def _on_tick_edit(self, _event=None) -> None:
-        """分度值改了（回车或失焦）就立刻重设刻度。"""
-        self._apply_tick_steps()
+        """分度值改了（回车或失焦）：按「每格多少米」重设该轴范围，再重设刻度。"""
+        changed = self._apply_tick_span()
+        if changed:
+            # 三个格子全空时 `_apply_tick_span()` 把 `lims` 设成 None（= 回到自动），
+            # 而 `_apply_lims()` 见到 None 会直接 return —— 只调它的话「清空」在
+            # 暂停时**什么都不会发生**，要等下一次重画才回到数据范围。所以先让
+            # `_current_lims()` 按数据把范围算回来，再写进 ax（2026-11-15 实测）。
+            self._current_lims()
+            self._apply_lims()          # 写 ax + 轴盒比例；不要只 draw_idle
+            # 正视 2D：上面 `_apply_lims()` 只写 3D 的 ax，可见的 ax2d 没动 ——
+            # 这正是"改分度值图线不跟着缩放"的根因（2026-11-18 用户报）。
+            # 先把新 lims 写进 ax2d（含纵轴反转），再整幅重画：这样 `_redraw`
+            # 开头的 `_capture_lims()` 从 ax2d 回读到的就是新值，不会被旧范围
+            # 覆盖回去。
+            if self.ax2d.get_visible() and self._ax2d_pair is not None:
+                fa = self._ax2d_pair
+                h, v = fa
+                lo, hi = self._current_lims()
+                self.ax2d.set_xlim(lo[h], hi[h])
+                if self._flat_y_reversed(fa):
+                    self.ax2d.set_ylim(hi[v], lo[v])
+                else:
+                    self.ax2d.set_ylim(lo[v], hi[v])
+                self._redraw()
+                return
+        self._apply_tick_locators()
         self.canvas.draw_idle()
 
-    def _apply_tick_steps(self) -> None:
-        """按侧栏填的分度值设三轴刻度间隔；留空/非法/过密则回落到自动 4 档。
+    def _tick_step(self, key: str) -> float:
+        """读某一轴的分度值；留空 / 非数字 / 非正数一律当 0（= 自动）。"""
+        txt = self.tick_vars[key].get().strip()
+        try:
+            step = float(txt) if txt else 0.0
+        except ValueError:
+            step = 0.0
+        return step if step > 0 else 0.0
 
-        为什么要挡"过密"：填 0.001 会让这段 3 米长的数据出现 3000 条网格线，
-        matplotlib 会画上几十秒、界面看起来像卡死。超过 20 条就退回自动。
+    def _apply_tick_span(self) -> bool:
+        """按「每格多少米」重设**填了合法分度值**的轴显示范围，返回是否改过。
+
+        语义照示波器的「V/格」：格子数固定（`TICK_GRID_CELLS`），每格代表多少米
+        由分度值决定。所以分度值变小 → 同样 8 格装下更小的跨度 → 曲线放大；
+        分度值变大 → 曲线缩小。
+
+        为什么必须改 `lims` 而不只是 locator：用户 2026-11-15 报的缺陷就是
+        「改分度值坐标轴会变，但图线不会自动匹配放大缩小」—— 只换 locator
+        时视图跨度一动不动，曲线在屏幕上也就一动不动。
+
+        三个格子都空 → 回到「自动」（`lims = None`，下次 `_current_lims()`
+        按数据包围盒重算）；部分为空时只动填了的那几根轴，别的轴范围不动。
+        """
+        lo, hi = self._current_lims()
+        keys = ("x", "y", "z")
+        steps = [self._tick_step(k) for k in keys]
+        if not any(steps):
+            self.lims = None
+            return True
+        for i, step in enumerate(steps):
+            if step <= 0:
+                continue
+            # 分度值 = 每格多少米，格数固定 → 目标跨度**只由 step 决定**。
+            # 不再夹到数据包围盒：坐标布是全局无限的，窗口可以落在数据之外。
+            # 2026-11-17 用户截图里"分度值很小依旧溢出"，根因就是旧版把窗口
+            # 死死夹在数据范围内 —— 数据比窗口大时，mplot3d 的线不裁剪，
+            # 就从轴盒两侧漏出去。现在窗口只按 step 走，线由下面按窗口裁剪。
+            target = step * TICK_GRID_CELLS
+            c = (lo[i] + hi[i]) / 2.0
+            nlo = math.floor((c - target / 2.0) / step + 1e-9) * step
+            nhi = nlo + target
+            lo[i], hi[i] = nlo, nhi
+        self.lims = [lo, hi]
+        return True
+
+    def _apply_tick_locators(self) -> None:
+        """按侧栏填的分度值设三轴刻度间隔；留空 / 非法回落自动 4 档。
+
+        **只碰 locator/formatter，绝不碰 `lims`** —— `_redraw` 每帧都调它，
+        若这里顺手改范围，用户一 pan/zoom 就被每帧拽回分度值窗口（比原缺陷更糟）。
+
+        以前"过密就整体退回自动档"（`span / step > 20` → `MaxNLocator(4)`）是一次
+        **静默的无视**：用户填 0.0001 既不缩放也没有任何提示。现在改成把网格
+        间隔按**整数倍变粗**到 `TICK_MAX_GRID` 格以内，保留用户设的量级。
         """
         if self.lims is None:
             return
         lo, hi = self.lims
-        for i, (axis, key) in enumerate(
-                ((self.ax.xaxis, "x"), (self.ax.yaxis, "y"),
-                 (self.ax.zaxis, "z"))):
-            txt = self.tick_vars[key].get().strip()
-            step = 0.0
-            try:
-                step = float(txt) if txt else 0.0
-            except ValueError:
-                step = 0.0
+        fa = self._flat_axes()
+        if fa is not None:
+            # 方正纸只画两个物理轴：横/纵下标直接决定读哪个分度值输入框。
+            h, v = fa
+            pairs = ((h, self.ax2d.xaxis, "xyz"[h]),
+                     (v, self.ax2d.yaxis, "xyz"[v]))
+        else:
+            pairs = ((0, self.ax.xaxis, "x"), (1, self.ax.yaxis, "y"),
+                     (2, self.ax.zaxis, "z"))
+        for i, axis, key in pairs:
+            step = self._tick_step(key)
             span = max(1e-9, hi[i] - lo[i])
-            if step > 0 and span / step <= 20:
-                axis.set_major_locator(mticker.MultipleLocator(step))
-                # 网格按 step 画（要密就密），但**标签自动疏**：3D 轴在屏幕上
+            if step > 0:
+                n = max(1, math.ceil(span / step))
+                step_eff = step
+                if n > TICK_MAX_GRID:
+                    step_eff = step * math.ceil(n / TICK_MAX_GRID)
+                axis.set_major_locator(mticker.MultipleLocator(step_eff))
+                # 网格按 step_eff 画（要密就密），但**标签自动疏**：3D 轴在屏幕上
                 # 很短，12 个标签会糊成一片（实测 0.05 分度就是这个下场）。
                 # 目标是最多 ~10 个标签，多出来的 tick 只画网格不写字。
                 # `MultipleLocator` 会向**两端各外扩**一个刻度（-0.061 的
                 # 下限会给出 -0.08），所以估算要 +2；目标是屏幕上 ~9 个标签。
-                _n_est = span / step + 2
+                _n_est = span / step_eff + 2
                 every = max(1, int(_n_est // 9) + (1 if _n_est % 9 else 0))
-                def _fmt(v, _pos=None, _s=step, _e=every):
+                def _fmt(v, _pos=None, _s=step_eff, _e=every):
                     """只标每 _e 个刻度；并把浮点误差的 0 写成 "0"。
 
                     `MultipleLocator(0.05)` 给出的"0"实际是 5.55e-17 这种值，
@@ -1537,6 +2114,10 @@ class Viewer3D:
         """
         fw, fh = self.fig.get_size_inches()
         top = 0.96                      # 顶上 4% 留给标题
+        # 2D 方格纸始终铺满（留一点边距给刻度标签），不受「保持立方体比例」影响：
+        # 那个选项是 3D 立方体投影的几何互斥，跟平面坐标系无关。
+        if getattr(self, "ax2d", None) is not None:
+            self.ax2d.set_position(list(FLAT_RECT))
         keep = getattr(self, "keep_cube", None)
         if keep is None or not keep.get():
             self.ax.set_position([0.0, 0.0, 1.0, top])
@@ -1672,7 +2253,40 @@ class Viewer3D:
             pos[other[0]], pos[other[1]] = u1, v1
             self.ax.text(pos[0], pos[1], pos[2], name,
                          color=color, fontsize=8, alpha=0.85)
+        _an = self._aspect_note()
+        if _an:
+            notes.append(_an)
         self.plane_note.configure(text="；".join(notes))
+
+    def _aspect_note(self) -> str:
+        """「非等比例」提示：三轴各自拉满时，短的那个轴会被放大到失真。
+
+        `_apply_box()` 默认 `set_box_aspect((1, 1, 1))` —— 不管数据跨度差多少，
+        三个轴盒在屏幕上一样长。所以跨度 0.48 m 的 X 和跨度 0.065 m 的 Y 一起
+        显示时，Y 被放大约 7.4 倍：真实 5 mm 的偏移被画成几十毫米的"弯曲轨迹"，
+        用户就是照这张图判断"球弯得很厉害"的（2026-11-15）。
+
+        这不是缺陷（那个比例是用户明确要的：等比例时短轴只剩一小截、刻度全
+        挤在角落），但**必须说出来**，否则形状会被当成真实几何。所以只在
+        未勾「等比例坐标」且跨度比 > 3 时，往已有提示标签里加一句。
+
+        放进**已有**的 `plane_note` 是有意的：新加一个标签会改变侧栏高度
+        （`selftest_window_mode.py`）与可点控件预算（`selftest_gui_budget.py`）。
+
+        量的是**数据本身**的跨度（`_limits()`），不是当前窗口：窗口随用户
+        pan/zoom 变，按窗口算这句提示会边走边跳，而"这段数据 Y 只有 X 的
+        1/7"是个稳定事实。
+        """
+        if self.equal_axes.get():
+            return ""
+        lo, hi = self._limits()
+        spans = [max(1e-12, hi[i] - lo[i]) for i in range(3)]
+        s_max, s_min = max(spans), min(spans)
+        if s_min <= 0 or s_max / s_min <= 3.0:
+            return ""
+        short = [_AXIS_NAMES[i] for i in range(3) if spans[i] == s_min]
+        return (f"非等比例：{short[0]} 轴被放大约 {s_max / s_min:.1f} 倍，"
+                f"形状会失真；做几何判断请勾「等比例坐标」。")
 
     def _smooth_active(self) -> bool:
         """当前是否真的在用平滑点：勾了**且**至少有一段被平滑处理过。
@@ -1693,6 +2307,26 @@ class Viewer3D:
         """
         if self.lims is None:
             return
+        # 关键：从**当前可见**的那套 axes 回读，而不是从"目标模式"回读。
+        # 3D→flat 切换时 view 已经是正视，但可见的还是 3D 轴；若照 `_flat_axes()`
+        # 去读 ax2d，会把 ax2d 的初始 (0,1) 当成用户范围，轨迹一下就丢了。
+        if self.ax2d.get_visible():
+            # 正视 2D：只回读画出来的两个物理轴写回 self.lims；纵轴若是反转的
+            # （ylim=(hi,lo)），按数据顺序排序后再写，保证 self.lims 始终是
+            # [lo, hi] 且第三轴保持原值（切回 3D 时深度范围不丢）。
+            # **必须用上一次画到 ax2d 的 pair**，不能用新视角的 `_flat_axes()`。
+            fa = self._ax2d_pair
+            if fa is None:
+                return
+            h, v = fa
+            xlo, xhi = self.ax2d.get_xlim()
+            ylo, yhi = self.ax2d.get_ylim()
+            new_lo, new_hi = list(self.lims[0]), list(self.lims[1])
+            new_lo[h], new_hi[h] = float(xlo), float(xhi)
+            v_lo, v_hi = sorted((float(ylo), float(yhi)))
+            new_lo[v], new_hi[v] = v_lo, v_hi
+            self.lims = [new_lo, new_hi]
+            return
         self.lims = [
             [float(self.ax.get_xlim()[0]), float(self.ax.get_ylim()[0]),
              float(self.ax.get_zlim()[0])],
@@ -1700,21 +2334,149 @@ class Viewer3D:
              float(self.ax.get_zlim()[1])],
         ]
 
+    def _clip_3d_line(self, P: np.ndarray, lo, hi):
+        """3D Line3D 的**渲染裁剪**：只把传给 `plot` 的临时数组在视窗外写 NaN。
+
+        mplot3d 的 Line3D 不认 `clip_on`，线段会从轴盒两侧漏出去；NaN 是让它
+        断开的唯一手段。这里的边界感非常重要：
+
+          - **只生成一份临时副本**，`self.P_raw` / `self.lims` / `_pt_px` /
+            `self.points` 一个字节都不动 —— 数据一个点都没删；
+          - 每次 `_redraw` 按**当前窗口重算**，用户右键把窗口拖过去，原先被
+            掩码的点立刻重新出现（与"永久抹掉视外点"是两回事）；
+          - 只用于非正视 3D 路径。正视 2D 方格纸走 `_redraw_flat`，那里是
+            `clip_on=True` + 零 NaN，两条路互不污染。
+        """
+        inside = np.ones(len(P), dtype=bool)
+        for i in range(3):
+            inside &= ((P[:, i] >= lo[i] - 1e-12)
+                       & (P[:, i] <= hi[i] + 1e-12))
+        x, y, z = (P[:, i].copy() for i in range(3))
+        x[~inside] = y[~inside] = z[~inside] = np.nan
+        return x, y, z
+
+    def _refresh_3d_clip(self) -> None:
+        """按**当前 3D 轴范围**重算两条 Line3D 的 NaN 掩码（渲染裁剪）。
+
+        `_redraw` 和 `_on_motion` 共用这一份口径。关键在 `_on_motion`：
+        `drag_pan` 直接改的是 ax 的 lim（不走 `self.lims`），如果只 `draw_idle`
+        而不重算，掩码就**冻结在平移前的范围** —— 拖到新区域 artist 里全是
+        NaN，用户"右键拖动找得到每个点"就断了。这里只改两个 artist 的
+        x/y/zdata，不整幅重画（pan 期间 40ms/帧太卡），`self.P_raw` /
+        `self.lims` / `_pt_px` 一个字节都不动。
+        """
+        if self._flat_axes() is not None:
+            return
+        artists = self.ax.lines
+        if len(artists) < 2:
+            return
+        lo = [float(self.ax.get_xlim()[0]), float(self.ax.get_ylim()[0]),
+              float(self.ax.get_zlim()[0])]
+        hi = [float(self.ax.get_xlim()[1]), float(self.ax.get_ylim()[1]),
+              float(self.ax.get_zlim()[1])]
+        P = self.P_smooth if self._smooth_active() else self.P_raw
+        k = min(self.idx + 1, self.n)
+        for ln, arr in zip(artists[:2], (P, P[:k])):
+            xc, yc, zc = self._clip_3d_line(arr, lo, hi)
+            ln.set_data(xc, yc)
+            ln.set_3d_properties(zc)
+
+    def _redraw_flat(self, fa: tuple[int, int]) -> None:
+        """正视（CAD 风格）的 2D 无限方格纸渲染。
+
+        核心契约（2026-11-17 用户裁决）：
+          - **一个点都不删**：两条线和采样点画的是完整的 `P_raw` / `P` 数组；
+          - **线不画到网格外**靠 matplotlib 2D 的 `clip_on=True`（默认行为，
+            这里显式写出，便于反向自证），**不是**往 xdata 里塞 NaN；
+          - 用户可以无限右键拖动，窗口走到数据外 3 倍跨度也能看到那处的点。
+        """
+        h, v = fa
+        self._ax2d_pair = fa
+        rev = self._flat_y_reversed(fa)
+        self.ax.set_visible(False)
+        self.ax2d.set_visible(True)
+        self.ax2d.clear()
+        P = self.P_smooth if self._smooth_active() else self.P_raw
+        lo, hi = self._current_lims()
+        self.ax2d.set_xlim(lo[h], hi[h])
+        # 相机系 Y 向下：纵轴是物理 Y 时反转 ylim，才和照片同向；俯视纵轴是 Z，
+        # 按老习惯 Z 向上，不反转。
+        if rev:
+            self.ax2d.set_ylim(hi[v], lo[v])
+        else:
+            self.ax2d.set_ylim(lo[v], hi[v])
+        self._apply_layout()
+        self._apply_tick_locators()    # 分度值 → MultipleLocator，网格铺满
+        self.ax2d.grid(True, color="#cbd5e1", linewidth=0.5, alpha=0.6)
+        # 所有点线全画。**clip_on=True** 是"线不越界"的唯一手段，画布外的数据
+        # 仍原封不动留在数组里，拖过去就能看到（与删数据/NaN 抹点彻底分开）。
+        self.ax2d.plot(P[:, h], P[:, v], color="#93c5fd", linewidth=1.2,
+                       alpha=0.8, clip_on=True, label="trajectory")
+        k = min(self.idx + 1, self.n)
+        self.ax2d.plot(P[:k, h], P[:k, v], color="#2563eb", linewidth=2.0,
+                       clip_on=True, label="trail")
+        self.ax2d.scatter(self.P_raw[:, h], self.P_raw[:, v],
+                          s=SAMPLE_DOT_SIZE, c=SAMPLE_DOT_COLOR,
+                          alpha=SAMPLE_DOT_ALPHA, edgecolors="none",
+                          clip_on=True, label="samples")
+        cur = self.points[self.idx]
+        self.ax2d.scatter([cur["xyz"][h]], [cur["xyz"][v]],
+                          color="#f97316", s=80, clip_on=True, label="ball")
+        _labels = self._axis_labels()
+        self.ax2d.set_xlabel(_labels[h])
+        self.ax2d.set_ylabel(_labels[v])
+        self.ax2d.set_title(
+            f"{'[单目] ' if self.mono else ''}"
+            f"{self.data.get('session', '')} · {self.idx + 1}/{self.n}",
+            fontfamily=list(INSET_FONTS))
+        self.ax2d.legend(loc="upper right")
+        # 参考平面是 3D 图元，2D 方格纸不画；只把纯函数算出的非等比例提示同步
+        # 到侧栏，避免切回 3D 时残留上一模式的文字。
+        self.plane_note.configure(text=self._aspect_note())
+        self._cache_point_px()
+        self._draw_extremes()
+        self._draw_selection()
+        self._redraw_inset()
+        self.canvas.draw_idle()
+        self._update_video()
+        self._status()
+
     def _redraw(self) -> None:
+        if not self.points:
+            self._redraw_degraded()
+            return
         self._capture_lims()           # clear 会重置范围，先回读用户改过的范围
+        # 视角角度始终同步到 3D 主图，即使正视 2D 模式把它藏起来了：
+        # 旧判据（selftest_launcher_params 的「选俯视/前视后 ax 角度变了」）读的是
+        # `ax.elev/azim`。隐藏的 ax 上 view_init 没有副作用，兼容成本为零。
+        self._apply_view()
+        fa = self._flat_axes()
+        if fa is not None:
+            self._redraw_flat(fa)
+            return
+        # 非正视：恢复 3D 主图可见，隐藏 2D 方格纸；下面整条 3D 渲染路径不变。
+        self.ax.set_visible(True)
+        self.ax2d.set_visible(False)
         self.ax.clear()
         # 勾了「平滑」就用平滑点画主图，否则用原始点。**范围/视角不变**：
         # `_limits` 始终按原始点算（平滑不改变量级，改范围只会让两张图对不上）。
         P = self.P_smooth if self._smooth_active() else self.P_raw
-        xs, ys, zs = P[:, 0], P[:, 1], P[:, 2]
-        self.ax.plot(xs, ys, zs, color="#93c5fd", linewidth=1.2, alpha=0.8, label="trajectory")
+        # **所有点都在数据里，绝不删数据**（2026-11-17 用户裁决）。先画**完整**
+        # 数组，再由 `_refresh_3d_clip()` 统一按当前范围写 NaN 断开视外段：
+        # 只动 artist 的临时副本，`self.P_raw` 一个点都没少。平移时 `_on_motion`
+        # 调同一个函数重算，拖过去那些点立刻回来。
+        # 正视 2D 路径完全不同：零 NaN，靠 ax2d 的 clip_on 裁剪。
+        self.ax.plot(P[:, 0], P[:, 1], P[:, 2], color="#93c5fd", linewidth=1.2,
+                     alpha=0.8, label="trajectory")
         k = min(self.idx + 1, self.n)
-        self.ax.plot(xs[:k], ys[:k], zs[:k], color="#2563eb", linewidth=2.0, label="trail")
+        self.ax.plot(P[:k, 0], P[:k, 1], P[:k, 2], color="#2563eb",
+                     linewidth=2.0, label="trail")
         # 真实采样点：`trajectory` 里的每个点就是一次 matched 的帧
         # （252 个 matched 帧逐点对应，不是插值出来的）。画成小点，让人看出
         # "线是这些实测点连起来的"；点太小会看不见，太大会糊成一条粗带，
         # 7pt² 在 252 点的密度下刚好是"一串珠子"（2026-11-05 用户要求）。
         # **始终用 P_raw**：勾了平滑时线是平滑的，但采样点仍该是实测位置。
+        # 同样：所有采样点都画，不按窗口删（拖过去要能找到每一个点）。
         self.ax.scatter(self.P_raw[:, 0], self.P_raw[:, 1], self.P_raw[:, 2],
                         s=SAMPLE_DOT_SIZE, c=SAMPLE_DOT_COLOR,
                         alpha=SAMPLE_DOT_ALPHA, depthshade=False,
@@ -1722,12 +2484,16 @@ class Viewer3D:
         cur = self.points[self.idx]
         self.ax.scatter([cur["xyz"][0]], [cur["xyz"][1]], [cur["xyz"][2]],
                         color="#f97316", s=80, depthshade=False, label="ball")
-        self.ax.set_xlabel("X right (m)")
-        self.ax.set_ylabel("Y down (m)")
-        self.ax.set_zlabel("Z forward (m)")
+        _xl, _yl, _zl = self._axis_labels()
+        self.ax.set_xlabel(_xl)
+        self.ax.set_ylabel(_yl)
+        self.ax.set_zlabel(_zl)
         # 刻度间隔：用户填了分度值就用它（`MultipleLocator`），否则自动 4 档。
         # 必须在 `clear()` 之后设 —— 它会重置 locator。
-        self._apply_tick_steps()
+        # **必须调只动 locator 的那个版本**：`_redraw` 每帧都跑（播放时球在动），
+        # 这里若调会改 `lims` 的 `_apply_tick_span`，用户一 pan/zoom 就被每帧
+        # 拽回分度值窗口 —— 比「改分度值曲线不缩放」更糟。
+        self._apply_tick_locators()
         # 标题带中文（"[单目]"），默认字体 DejaVu Sans 没有汉字，会渲染成方框
         # 并刷 UserWarning —— 指定项目里的中文回退链（2026-11-05 实测单目会话）。
         self.ax.set_title(f"{'[单目] ' if self.mono else ''}"
@@ -1746,12 +2512,55 @@ class Viewer3D:
         self._apply_box()          # 比例 + 整幅缩放（重画后 zoom 不能丢）
         self._draw_planes()
         self._apply_view()
+        # 掩码必须在 lims 写好、平面线追加完之后再算：ax.lines 的前两条正是
+        # 主轨迹/尾迹，_refresh_3d_clip 只动这两条（平面线不动）。
+        self._refresh_3d_clip()
         # 拾取缓存必须在 `_apply_view()` **之后** —— 视角变了投影就变了，
         # 先算会得到上一帧的位置，点哪都选不中。
         self._cache_point_px()
         self._draw_extremes()
         self._draw_selection()
         self._redraw_inset()
+        self.canvas.draw_idle()
+        self._update_video()
+        self._status()
+
+    def _redraw_degraded(self) -> None:
+        """没有三维点时的**空场景**：坐标轴 + 网格 + 会话信息，不画轨迹。
+
+        为什么要单独一条：`_redraw` 里有 `self.points[self.idx]`（当前球位），
+        n=0 时会 IndexError。降级视图不该让整个窗口打不开 —— 用户要的是
+        "能看到这段会话是什么、为什么没有结果"，而不是一个崩掉的程序。
+        """
+        # 降级场景没有三维点，沿用原来的 3D 空场景；确保 2D 方格纸不残留。
+        self.ax.set_visible(True)
+        self.ax2d.set_visible(False)
+        self.ax2d.clear()
+        self.ax.clear()
+        span = DEGRADED_HALF_SPAN_M
+        self.ax.set_xlim(-span, span)
+        self.ax.set_ylim(-span, span)
+        self.ax.set_zlim(-span, span)
+        _xl, _yl, _zl = self._axis_labels()
+        self.ax.set_xlabel(_xl)
+        self.ax.set_ylabel(_yl)
+        self.ax.set_zlabel(_zl)
+        self.ax.set_title(
+            f"{self.data.get('session', '')} · 没有三维结果",
+            fontfamily=list(INSET_FONTS))
+        self.ax.grid(True, color="#cbd5e1", linewidth=0.5, alpha=0.6)
+        self.ax.text2D(0.03, 0.95, "空场景：这段会话没有可用的三维点",
+                       transform=self.ax.transAxes, fontsize=8,
+                       fontfamily=list(INSET_FONTS), color="#b45309")
+        self.ax_inset.clear()
+        self.ax_inset.set_xticks([])
+        self.ax_inset.set_yticks([])
+        self.ax_inset.text(0.5, 0.5, "没有三维结果", ha="center", va="center",
+                           fontsize=7, fontfamily=list(INSET_FONTS),
+                           color="#94a3b8", transform=self.ax_inset.transAxes)
+        self._apply_layout()
+        self._apply_box()
+        self._apply_view()
         self.canvas.draw_idle()
         self._update_video()
         self._status()
@@ -1781,14 +2590,16 @@ class Viewer3D:
                         "视频已关闭（--no-video）" if getattr(self, "video_disabled", False)
                         else "未找到 annotated.mp4"))
                 continue
-            # 填满 pane 且不拉伸：等比放大到覆盖，再中心裁剪。
+            # 等比缩放「装进」pane（contain），不再 cover-crop：旧实现用
+            # scale=max(...) 铺满后中心裁切，实测初始 pane 744×328（aspect 2.268）
+            # 对源帧 960×540（aspect 1.778）得 scale=0.775、nw,nh=744×418，上下各
+            # 裁 45px，只显示 78.5%；拖到全屏 794×431 才裁 16px（96.4%），"看着
+            # 完整"只是宽高比碰巧逼近 16:9 的巧合。改成 min(...) 后整帧都可见，
+            # 深色 Canvas 背景（#0f172a）天然当黑边，不必再分配黑底数组。
             rh, rw = raw.shape[:2]
-            scale = max(w / rw, h / rh)
-            nw, nh = max(w, int(round(rw * scale))), max(h, int(round(rh * scale)))
+            scale = min(w / rw, h / rh)
+            nw, nh = max(1, int(round(rw * scale))), max(1, int(round(rh * scale)))
             img = cv2.resize(raw, (nw, nh), interpolation=cv2.INTER_AREA)
-            x0 = max(0, (nw - w) // 2)
-            y0 = max(0, (nh - h) // 2)
-            img = img[y0:y0 + h, x0:x0 + w]
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             # `master=canvas` 不能省：同一个进程里若有**另一个** Tk 根
             # （测试里先建过 App、或以后把查看器嵌进别的窗口），不带 master 的
@@ -1796,14 +2607,41 @@ class Viewer3D:
             # `image "pyimageN" doesn't exist`。独立进程跑看不出来。
             photo = ImageTk.PhotoImage(Image.fromarray(rgb), master=canvas)
             setattr(self, attr, photo)
-            canvas.create_image(0, 0, anchor="nw", image=photo)
+            x0, y0 = (w - nw) // 2, (h - nh) // 2
+            canvas.create_image(x0, y0, anchor="nw", image=photo)
 
     def _update_video(self) -> None:
         """按当前三维点的 frame 号取 annotated.mp4 的同帧，切成左右两格。"""
+        if self.video_source == "raw":
+            # 原始模式：左右各一个 cap，不切 w//2（每路本就是完整画面）。
+            # 注意 annotated 的 frame 号是配对/处理后的序号，PairSource 的
+            # canary / 时间戳可能跳帧，与原始 mkv 的物理帧号只是**近似**对齐 ——
+            # 这个视图只用于「看拍到了什么」，绝不当逐帧测量用。
+            frame = (int(self.points[self.idx].get("frame", self.idx))
+                     if self.points else 0)
+            lf = min(max(0, frame), max(0, self.cap_frames_l - 1))
+            rf = min(max(0, frame + self.sync_offset),
+                     max(0, self.cap_frames_r - 1))
+            self._left_raw = self._right_raw = None
+            if self.cap_l is not None and self.cap_l.isOpened():
+                self.cap_l.set(cv2.CAP_PROP_POS_FRAMES, lf)
+                ok, img = self.cap_l.read()
+                if ok and img is not None:                 # 越界 / 解码失败 → 留 None
+                    self._left_raw = img
+            if self.cap_r is not None and self.cap_r.isOpened():
+                self.cap_r.set(cv2.CAP_PROP_POS_FRAMES, rf)
+                ok, img = self.cap_r.read()
+                if ok and img is not None:
+                    self._right_raw = img
+            self._render_video()
+            return
         if self.cap is None:
             self._render_video()
             return
-        frame = int(self.points[self.idx].get("frame", self.idx))
+        # 降级视图（没有三维点）也可能带 annotated.mp4：没有帧号可对，就给第 0 帧，
+        # 至少让人看到"这段会话拍到了什么"，而不是一块空白。
+        frame = (int(self.points[self.idx].get("frame", self.idx))
+                 if self.points else 0)
         if self.cap_frames and frame >= self.cap_frames:
             # 视频比轨迹短 —— 不是解码器的问题，是这个 mp4 不完整。
             # 说清"差多少"，用户才知道是文件坏了而不是程序坏了。
@@ -1835,6 +2673,17 @@ class Viewer3D:
         self._render_video()
 
     def _status(self) -> None:
+        if not self.points:
+            reason = self.data.get("degraded_reason") or "没有可用的三维点"
+            extra = ""
+            if self.data.get("session_dir"):
+                extra = f"   会话：{self.data['session_dir']}"
+            if self.video_path:
+                extra += "   （有视频，可在下方查看）"
+            self.status.configure(
+                text=f"没有三维结果：{reason}{extra}   "
+                     f"可查看会话信息 / 视频，若有")
+            return
         p = self.points[self.idx]
         frame = p.get("frame", self.idx)
         t = p.get("t", 0.0)
@@ -1893,13 +2742,19 @@ class Viewer3D:
         self._redraw()
 
     def _toggle_play(self) -> None:
+        if not self.points:
+            # 降级视图没有帧可播：空场景里让「播放」变成死按钮比说清楚更糟。
+            # 用 f-string 拼既有原因（不新增一条界面文案）。
+            reason = self.data.get("degraded_reason") or "没有可用的三维点"
+            self.status.configure(text=f"没有三维结果：{reason}（没有可播放的帧）")
+            return
         self.playing = not self.playing
         self.play_btn.configure(text="暂停" if self.playing else "播放")
         if self.playing:
             self._tick()
 
     def _tick(self) -> None:
-        if not self.playing:
+        if not self.playing or not self.points:
             return
         self.idx = (self.idx + 1) % self.n
         self._set_slider(self.idx)
@@ -1918,6 +2773,10 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="只校验数据，不开窗口")
     ap.add_argument("--video", default="", help="同步视频（默认找 derived/annotated.mp4）")
     ap.add_argument("--no-video", action="store_true", help="不加载追踪视频")
+    ap.add_argument("--video-source", choices=("annotated", "raw", "none"),
+                    default="annotated",
+                    help="video source: annotated (derived/annotated.mp4), "
+                         "raw (left/right.mkv in session dir), none (disable)")
     args = ap.parse_args()
     if args.source is None:
         found = scan_sources(limit=1)
@@ -1933,8 +2792,18 @@ def main() -> int:
     except Exception as exc:                                # noqa: BLE001
         print(f"[错误] {exc}")
         return 1
-    lo, hi = bounds_of(data["trajectory"])
+    degraded = bool(data.get("degraded"))
+    if data["trajectory"]:
+        lo, hi = bounds_of(data["trajectory"])
+    else:
+        lo = hi = [0.0, 0.0, 0.0]
     if args.check:
+        if degraded:
+            # `--check` 是给脚本/CI 判"这份数据能不能用"的：没有三维点就是没有，
+            # 退出码保持 1（**窗口能打开 ≠ 数据可用**，两者别混）。
+            print(f"[降级] 没有三维结果：{data.get('degraded_reason')}")
+            print(f"session_dir={data.get('session_dir')} points=0")
+            return 1
         mono = is_mono(data)
         print(f"文件：{data['_path']}")
         print(f"schema={data.get('schema')} version={data.get('version')} "
@@ -1974,7 +2843,9 @@ def main() -> int:
         return 0
     root = tk.Tk()
     root.geometry("1500x950")
-    Viewer3D(root, data, args.video or None, auto_video=not args.no_video)
+    source = "none" if args.no_video else args.video_source
+    Viewer3D(root, data, args.video or None, auto_video=not args.no_video,
+             video_source=source)
     root.mainloop()
     return 0
 

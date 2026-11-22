@@ -39,6 +39,11 @@ COLOR_PRESETS: dict[str, dict[str, Any]] = {
     "yellow_ball": dict(hsv_lower=[20, 100, 100], hsv_upper=[35, 255, 255]),
 }
 
+#: ``--preset`` 的"自动取色"哨兵。它**不是**一种颜色（没有 HSV 区间），
+#: 所以不进 :data:`COLOR_PRESETS`；需要它时由 :meth:`ColorConfig.preset` 转成
+#: ``ColorConfig(mode="auto")``，检测器在运行时从画面里估主色。
+AUTO_PRESET = "auto"
+
 
 @dataclass
 class ColorConfig:
@@ -59,19 +64,64 @@ class ColorConfig:
     hsv_lower2: list[int] = field(default_factory=lambda: [170, 80, 80])
     hsv_upper2: list[int] = field(default_factory=lambda: [179, 255, 255])
 
+    # ---- 取色方式（2026-11-06）----
+    # "fixed" = 用上面的 HSV 区间（预设/手工标定）；
+    # "auto"  = 从画面里找主色，**不需要点选球心**，也不需要事先知道球色。
+    #           六个预设 + 一个"画面主色"候选一起试，选形状得分最高的那个，
+    #           锁定 auto_lock_frames 帧；连续 auto_unlock_after 帧 0 候选就重选。
+    mode: str = "fixed"
+    auto_lock_frames: int = 45
+    auto_unlock_after: int = 8
+
+    # ---- 人工种子（点选球心）----
+    # 种子的语义是"就这颗球"：从点击点周围取色，半径带也以它为准。
+    # 采样环：内径 seed_sample_lo×r、外径 seed_sample_hi×r。避开球心的高光斑
+    # （高光 S≈0，会把白色也算进球色）与最外圈（边缘混背景）。
+    seed_sample_lo: float = 0.45
+    seed_sample_hi: float = 0.80
+    seed_hsv_margin_h: int = 6       # 色相外扩（OpenCV H 单位，1 ≈ 2°）
+    seed_hsv_margin_sv: int = 22     # S/V 下界外扩，吸收光照不均
+    # 种子半径带：球在轨迹里会远近变化，±40% 覆盖一两米内的景深变化；
+    # 再宽就会把"另一个同色但大小不同的圆"也放进来。
+    seed_radius_lo: float = 0.60
+    seed_radius_hi: float = 1.70
+    # 种子帧的空间门：候选必须落在点击点周围 max(seed_gate_min_px,
+    # seed_gate_ratio×r) 内 —— 同色干扰物通常不在这个圈里。
+    seed_gate_ratio: float = 2.0
+    seed_gate_min_px: float = 10.0
+    # 颜色分割失败时，沿"上一帧位置 + 速度"用亚像素射线找球缘。
+    # 这是"点选之后一定跟得住"的兜底：任何球都有边缘，不依赖颜色可分。
+    seed_edge_follow: bool = True
+
     @staticmethod
     def preset_names() -> list[str]:
-        """全部预设名，按 :data:`COLOR_PRESETS` 的**定义顺序**（= 界面展示顺序）。
+        """全部**真实颜色**预设名，按 :data:`COLOR_PRESETS` 的**定义顺序**。
 
-        这是"有哪些预设"的唯一出口：CLI 的 `choices=`、`--help` 文本、
+        这是"有哪些球色"的唯一出口：CLI 的 `choices=`、`--help` 文本、
         HSV 标定工具的数字键都从这里取。**不要在别处再抄一份名单** ——
         `tests/selftest_entrypoints.py` 会扫出来。
+
+        注意 ``auto`` **不在**这张表里：它不是一种颜色（没有 HSV 参数），
+        混进来会让 `calibrate_color.py` 的数字键指向一个空区间。
+        需要"含自动"的候选清单时用 :meth:`preset_choices`。
         """
         return list(COLOR_PRESETS)
 
     @staticmethod
+    def preset_choices() -> list[str]:
+        """``--preset`` / 界面下拉的**完整**候选：``auto`` + 六种颜色。
+
+        与 :meth:`preset_names` 分开是刻意的（见它的 docstring）：颜色表只放
+        真能落成 HSV 区间的项，``auto`` 是一个**取色策略**，由检测器在运行时
+        从画面估计。
+        """
+        return [AUTO_PRESET, *COLOR_PRESETS]
+
+    @staticmethod
     def preset(name: str) -> "ColorConfig":
         """按名字取预设。未知名字抛 `KeyError` 并列出可选值。"""
+        if name == AUTO_PRESET:
+            return ColorConfig(mode="auto")
         if name not in COLOR_PRESETS:
             raise KeyError(f"未知预设 {name!r}，可选：{sorted(COLOR_PRESETS)}")
         return ColorConfig(**COLOR_PRESETS[name])
@@ -135,6 +185,15 @@ class SpecularConfig:
     #   上限 6 → 圆心误差 1.5/2.7px ；8 → 2.8/2.9 ；12 → 1.4/3.8 ；16 → 2.1/5.4 ；24 → 7.4/6.9
     # 窗口越大越偏（大窗会吸到球外的背景边缘）。所以回到 8：这是原始默认，也是真值下第二好的。
     refine_center_max_search_px: float = 8.0
+
+    # ---- 种子半径作为尺度锚（2026-11-06）----
+    # CSRT 框的半径回答"框多大"，不是"球多大"：初始化框按 2.6×r 给，框会随
+    # 跟踪抖动。直接拿框半径当球半径，Z 就锁成了一个常数（B-130 记录过）。
+    # 这里改成：输出半径 = 种子半径 × (当前框半径 / 初始框半径)，再把倍率夹在
+    # [seed_scale_lo, seed_scale_hi] 内 —— 既保留"球走近/走远"的变化，又不会
+    # 被框的抖动放大成半径噪声。
+    seed_scale_lo: float = 0.60
+    seed_scale_hi: float = 1.60
 
 
 @dataclass
@@ -249,6 +308,11 @@ class DetectorConfig:
     # 两个检测中心相距小于 max(agree_px, agree_ratio*半径) 视为"同意"
     agree_px: float = 6.0
     agree_ratio: float = 0.45
+    # 每个成员交给簇投票的候选数。旧行为是**只取每个成员最好的一个**，于是
+    # "画面里两个同色圆"时 color 只能交一个、hough 也只能交一个，投票分不出
+    # 谁是谁。取 top-K（默认 3）后再聚类，才能真正用"多方一致"把真球挑出来。
+    # 代价只有一点后处理，三个成员本身的耗时不变。
+    fusion_topk: int = 3
     # 只拿到"一票"（没有别的检测器同意）时，总分低于此值就判为不可信、不输出。
     # 注意：**只对孤证生效** —— 多票候选的总分已经加了票数加成，不走这个门限。
     # 默认值 0.55 与旧版硬编码一致（旧版此处是死配置，改了不生效，已修）。

@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from tkinter import ttk
 from typing import TYPE_CHECKING
 
 from apps._gui_widgets import BG, Surface
+from apps.run_all import quality_note_of_task
 
 if TYPE_CHECKING:                                   # 只为类型注解，不产生运行期依赖
     from apps._gui_app import App
@@ -53,28 +55,53 @@ class ConsoleWindow(tk.Toplevel):
         # ⚠ **必须走游标**：写死 row=1 时游标仍停在 1（card() 的 hint 占了 row=0
         # 之后只推到 1），于是紧随其后的 action_row 也拿到 row=1 ——
         # 按钮直接压在第 2 行上（2026-10-28 用户截图）。
-        row_tree = self.surface._next_row(box)
-        box.rowconfigure(row_tree, weight=1)     # 纵向：表格行吃掉多余空间
-        frame = ttk.Frame(box)
-        frame.grid(row=row_tree, column=0, columnspan=9, sticky="nsew",
-                   pady=(4, 4))
         cols = ("id", "title", "pid", "elapsed", "status")
         heads = ("#", "任务", "PID", "已运行", "状态")
         # ⚠ 列宽单位是**像素**（`ttk.Treeview.column(width=)` 吃像素，不是字符数）。
         # 之前按字符数的直觉写成 (4, 34, 8, 9, 14)，结果"任务"列只有 34 px，
         # 标题被裁成"管理"两个字、行内文字还挤在一起（2026-10-28 用户截图）。
         widths = (46, 380, 84, 96, 96)
+
+        def _columns(tv: ttk.Treeview) -> None:
+            for c, h, w in zip(cols, heads, widths):
+                # 列头跟内容的对齐方式一致：标题/状态左对齐，其余居中
+                tv.heading(c, text=h,
+                           anchor="w" if c in ("title", "status") else "center")
+                tv.column(c, width=w, minwidth=w,
+                          # 只有标题列吸收额外宽度：窗口放大时该变宽的是
+                          # "任务"（它最长），不是 PID / 已运行 这种短字段。
+                          stretch=(c == "title"),
+                          anchor="w" if c in ("title", "status") else "center")
+
+        # ① 「正在运行」独立列表 —— 用户原话："过去任何和新任务混在一起可以，
+        # 但是还不够。还要单独展示现在正在运行的任务列表。"所以这是**新增**，
+        # 不是替换：下面那张混排全表原样保留。放在上方，始终可见。
+        row_run = self.surface._next_row(box)
+        box.rowconfigure(row_run, weight=4)      # 纵向：4 行高，与下表 6 行成比例
+        self._run_lf = ttk.LabelFrame(box, text="正在运行（0）")
+        self._run_lf.grid(row=row_run, column=0, columnspan=9,
+                          sticky="nsew", pady=(4, 4))
+        self.run_tree = ttk.Treeview(self._run_lf, columns=cols,
+                                     show="headings", height=4,
+                                     selectmode="browse")
+        _columns(self.run_tree)
+        bar_run = ttk.Scrollbar(self._run_lf, orient="vertical",
+                                command=self.run_tree.yview)
+        self.run_tree.configure(yscrollcommand=bar_run.set)
+        self.run_tree.pack(side="left", fill="both", expand=True)
+        bar_run.pack(side="right", fill="y")
+
+        # ② 全部任务：旧表逐字保留，只多包一层 LabelFrame 当标题。
+        row_all = self.surface._next_row(box)
+        box.rowconfigure(row_all, weight=6)
+        self._all_lf = ttk.LabelFrame(box, text="全部任务")
+        self._all_lf.grid(row=row_all, column=0, columnspan=9,
+                          sticky="nsew", pady=(4, 4))
+        frame = ttk.Frame(self._all_lf)
+        frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(frame, columns=cols, show="headings",
                                  height=6, selectmode="browse")
-        for c, h, w in zip(cols, heads, widths):
-            # 列头跟内容的对齐方式一致：标题/状态左对齐，其余居中
-            self.tree.heading(c, text=h,
-                              anchor="w" if c in ("title", "status") else "center")
-            self.tree.column(c, width=w, minwidth=w,
-                             # 只有标题列吸收额外宽度：窗口放大时该变宽的是
-                             # "任务"（它最长），不是 PID / 已运行 这种短字段。
-                             stretch=(c == "title"),
-                             anchor="w" if c in ("title", "status") else "center")
+        _columns(self.tree)
         bar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=bar.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -90,7 +117,9 @@ class ConsoleWindow(tk.Toplevel):
         # 内容仍是左上角一块（2026-10-28 截图就是这个）。
         logbox = self.surface.card(self, "运行日志", "",
                                    fill="both", expand=True)
-        self.text = tk.Text(logbox, height=14, wrap="none", state="disabled",
+        # 14 → 10：腾出 4 行给上面新增的「正在运行」表；窗口 1100x780 与
+        # minsize(760,520) 不变，日志区仍可随窗口拉伸。
+        self.text = tk.Text(logbox, height=10, wrap="none", state="disabled",
                             font=("Consolas", 9), bg="#f8fafc")
         row_log = self.surface._next_row(logbox)   # Text 与滚动条共用这一行
         self.text.grid(row=row_log, column=0, columnspan=9, sticky="nsew")
@@ -129,6 +158,16 @@ class ConsoleWindow(tk.Toplevel):
                     state = "运行中"
                 elif t.exit_code == 0:
                     state = "完成"
+                    # 质量差也返回 0、也照常出结果；把质量状态并到这一行，
+                    # 别让「完成」两个字把「仅供参考」盖过去。
+                    # 解析只在结束后发生、内部已兜底；这里再包一层，
+                    # 一行脏日志绝不能把整张任务表搞崩。
+                    try:
+                        note = quality_note_of_task(t)
+                    except Exception:                       # noqa: BLE001
+                        note = ""
+                    if note:
+                        state += note
                 else:
                     state = f"返回码 {t.exit_code}"
                 if t.kill_note:
@@ -138,8 +177,60 @@ class ConsoleWindow(tk.Toplevel):
                                          f"{t.elapsed():.1f}s", state))
             if sel is not None and self.tree.exists(str(sel)):
                 self.tree.selection_set(str(sel))
+
+            # 独立「正在运行」列表：本进程 runner 的 + 跨进程账本里的外部任务。
+            # getattr 兜底：替身/测试桩（如第 10 节的质量状态测试）没有这两个
+            # 方法时表就空着，绝不破坏既有全表渲染。
+            try:
+                local = list(self.app.tasks.running())
+            except AttributeError:                         # 旧替身没有这方法
+                local = []
+            # 跨进程：data_manager 的导出线程 / 它开的查看器都不在本进程的
+            # TaskRunner 里，只能从账本读。这是"任务没进管理器"那半边的解药。
+            try:
+                external = list(self.app.tasks.external_running())
+            except AttributeError:                         # 旧替身没有这方法
+                external = []
+            filler = getattr(self, "_fill_running", None)
+            if filler is not None:
+                filler(local, external)
         except tk.TclError:
             pass
+
+    def _fill_running(self, local: list, external: list[dict]) -> None:
+        """填「正在运行」表并更新标题计数（旧替身没有这张表时直接返回）。"""
+        run_tree = getattr(self, "run_tree", None)
+        if run_tree is None:
+            return
+        for item in run_tree.get_children():
+            run_tree.delete(item)
+        rows: list[tuple[str, tuple]] = []
+        for t in local:
+            rows.append((str(t.tid), (t.tid, t.title, t.proc.pid,
+                                      f"{t.elapsed():.1f}s", "运行中")))
+        for rec in external:
+            # runner 写的记录本进程已有 Task 对象，跳过以免同一任务显示两行；
+            # 只留 data_manager 那种跨进程的。
+            if rec.get("source") == "runner":
+                continue
+            try:
+                started = float(rec.get("started") or 0.0)
+            except (TypeError, ValueError):
+                started = 0.0
+            elapsed = max(0.0, time.time() - started) if started > 0 else 0.0
+            key = str(rec.get("key") or
+                      f"ext-{rec.get('pid')}-{rec.get('tid')}")
+            rows.append((key, (rec.get("tid", "?"), rec.get("title", "?"),
+                               rec.get("pid", "?"), f"{elapsed:.1f}s",
+                               "运行中（外部）")))
+        for iid, values in rows:
+            run_tree.insert("", "end", iid=iid, values=values)
+        lf = getattr(self, "_run_lf", None)
+        if lf is not None:
+            try:
+                lf.configure(text=f"正在运行（{len(rows)}）")
+            except tk.TclError:
+                pass
 
     def _selected_tid(self) -> int | None:
         sel = self.tree.selection()

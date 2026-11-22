@@ -79,6 +79,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker.paths import MONO_ROOT, STEREO_ROOT, stereo_roots  # noqa: E402
+from sphere_tracker.video_files import pick_left_video  # noqa: E402
 
 #: 球的**名义**直径（米）。卡尺实测 25 mm，与"有效直径 21.6 mm"是两回事：
 #: 后者是给 `Z = f·D/(2r)` 配偏小半径用的仪器常数，标注框要的是可见轮廓。
@@ -235,10 +236,16 @@ def _stereo_focal(session_dir: Path, video_w: int) -> tuple[float | None, str]:
     视频尺寸与标定不同时直接用会让 `r = f·D/(2Z)` 差一个 `video_w / calib_w`。
     """
     from calib.params import load_stereo_rig
+    from stereo.sessions import SessionError, session_calibration_file
 
-    npz = session_dir / "calib" / "stereo_calibration.npz"
+    try:
+        npz = session_calibration_file(session_dir)
+    except SessionError as exc:
+        # 没标定就退回种子半径（有意的降级，不是本轮要动的静默回落）：
+        # 但原因必须说清是"路径解析失败"，且跟着动态路径走，不再写死默认名。
+        return None, f"会话标定路径解析失败：{exc}"
     if not npz.is_file():
-        return None, "会话没带 calib/stereo_calibration.npz"
+        return None, f"会话标定文件不存在：{npz}"
     try:
         rig = load_stereo_rig(npz)
     except Exception as exc:                    # noqa: BLE001 —— 标定坏了要降级，不是崩
@@ -258,13 +265,13 @@ def _stereo_focal(session_dir: Path, video_w: int) -> tuple[float | None, str]:
 def load_stereo(session_dir: Path, box_source: str) -> Session:
     seeds_path = session_dir / "derived" / "seeds.json"
     traj_path = session_dir / "derived" / "traj3d.csv"
-    video = session_dir / "left.mkv"
+    video = pick_left_video(session_dir)
     if not seeds_path.is_file():
         raise SkipSession("没种子（derived/seeds.json 不存在）")
     if not traj_path.is_file():
         raise SkipSession("没跟踪结果（derived/traj3d.csv 不存在）")
-    if not video.is_file():
-        raise SkipSession("视频坏了（left.mkv 不存在）")
+    if video is None:
+        raise SkipSession("视频坏了（left.mkv / left.mp4 / left.avi 都不存在）")
 
     seeds = json.loads(seeds_path.read_text(encoding="utf-8-sig"))
     seed_left = seeds.get("left") or {}

@@ -13,11 +13,11 @@
 
 限制（必须知道）
 ----------------
-`g` 的方向由**世界坐标系**定义。默认 `g = (0, -9.81, 0)` 意味着"y 轴向上"——
-在没有 `world_frame.json`（世界系标定）时**这只是一个约定**，不是测量结果。
-相机俯拍/仰拍/侧装时，真实重力在相机系里是斜向量，用默认值会让 0.3 s 后的
-预测偏出几十厘米。拿到世界系给出的重力方向后，务必用 `PredictConfig(g=...)`
-覆盖。
+`g` 的方向由**坐标系**定义。本项目相机/世界系的约定是 **Y 向下**，所以默认
+`g = (0, +9.81, 0)`；如果你的数据是"Y 向上"的数学系，必须显式传
+`PredictConfig(g=(0, -9.81, 0))`。相机俯拍/仰拍/侧装时，真实重力在相机系里
+是斜向量；拿到世界系后务必用 `world_gravity_world()` / `PredictConfig(g=...)`
+覆盖，不要依赖默认值。
 
 坐标与时基约定
 --------------
@@ -42,7 +42,8 @@ _PIECE_MIN = 3            # 分段拟合每段最少点数（2 个未知数 + 1 
 class PredictConfig:
     """预测配置。`g` 可覆盖 —— 世界系不同就换这里。"""
 
-    g: tuple[float, float, float] = (0.0, -9.81, 0.0)
+    # 本项目约定 Y 向下（与相机系一致）；Y 向上的数学系请显式传负号。
+    g: tuple[float, float, float] = (0.0, 9.81, 0.0)
     horizons: tuple[float, ...] = (0.1, 0.2, 0.3, 0.5)
     min_samples: int = 5
     max_gap_s: float = 0.25
@@ -206,7 +207,7 @@ def detect_bounce(
        弹道（`max(rms_pre, rms_post) ≤ residual_gate_m`，且明显优于整段）。
        只有真反弹点能同时满足"前段是一段抛物线、后段是另一段抛物线"；
        切早或切晚都会让某一侧混进另一侧的数据，残差超标而被否决。
-       `v_y` 由负转正（重力方向上的速度反向）作为加分项，用于在多解里挑真点。
+       速度沿重力方向由同向变反向（`v·g` 由正变负）作为加分项，用于在多解里挑真点。
 
     索引是 `_prepare` 之后（排序、去重、截断）数组里的下标；正常输入（已排序、
     无重复）下与原始下标一致。
@@ -236,10 +237,13 @@ def detect_bounce(
             continue                          # 至少一侧不是合格弹道 -> 不是切分点
         if worst > 0.5 * rms_all:
             continue                          # 分段没带来明显改善 -> 不是真突变
-        flipped = bool(v_pre[up] < 0.0 < v_post[up])
+        # 反弹 = 沿重力方向的速度**由同向变反向**。不能写死
+        # `v_pre < 0 < v_post`：那假设 g 为负（Y 向上）；本项目默认 Y 向下，
+        # 下落时 v 为正、反弹后才变负。用 `v·g` 的符号判断才与 g 无关。
+        flipped = bool(v_pre[up] * g[up] > 0.0 > v_post[up] * g[up])
         score = (0 if flipped else 1, worst)
         if best is None or score < best[0]:
-            note = ("速度沿重力方向由负转正" if flipped else "分段残差显著下降")
+            note = ("速度沿重力方向由同向变反向" if flipped else "分段残差显著下降")
             best = (score, i, f"{note}：切分 {i}，前段 {rms_pre * 1e3:.1f} mm / "
                               f"后段 {rms_post * 1e3:.1f} mm（整段 {rms_all * 1e3:.1f} mm）")
     if best is None:

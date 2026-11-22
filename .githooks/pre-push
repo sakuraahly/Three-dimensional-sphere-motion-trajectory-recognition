@@ -14,7 +14,7 @@
 # 看装没装：`git config --get core.hooksPath` → 应输出 `.githooks`
 # 跳过（不推荐，会被 review 问）：`git push --no-verify`
 #
-# 为什么走 `启动程序.bat gate` 而不是直接调 python
+# 为什么走 `run.bat gate` 而不是直接调 python
 # ----------------------------------------------
 # "裸 `python` 会解析到 msys64 那个没装 opencv 的解释器"这个坑，已经在 .bat 里
 # 用"真跑一次 `import cv2`"绕开了。这里再抄一遍判断就是第二份真相 ——
@@ -32,7 +32,7 @@ cd "$root"
 # cmd 只在 Windows 上有；别的平台上直接调用会被跳过并给出提示（本项目只支持 Windows，
 # 但钩子不该在别的平台上"静默不做事" —— 那样会被误认为通过）。
 if command -v cmd.exe >/dev/null 2>&1; then
-    exec cmd.exe //c "启动程序.bat" gate
+    exec cmd.exe //c "run.bat" gate
 fi
 
 echo "[gate] 非 Windows 环境：找不到 cmd.exe，自动门跳过（本项目只在 Windows 上验证过）。" >&2

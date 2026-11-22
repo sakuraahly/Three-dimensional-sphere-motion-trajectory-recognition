@@ -60,6 +60,10 @@ class SpecularBallDetector(BaseDetector):
         self._static_frames = 0
         self._recent = deque(maxlen=25)
         self.last_error = ""
+        self.last_warning = ""
+        # 初始框半径：输出半径按"当前框 / 初始框"的倍率锚到种子半径上
+        # （见 config.SpecularConfig.seed_scale_lo/hi 的注释）。
+        self._box0_r: float | None = None
         self._snapshot: dict = {}
         # ---- 回捕状态（见 config.SpecularConfig 的 reacquire_*）----
         self._last_good: tuple[float, float, float] | None = None   # 最后一次正常跟踪的 (x,y,r)
@@ -91,6 +95,8 @@ class SpecularBallDetector(BaseDetector):
         self._static_frames = 0
         self._recent.clear()
         self.last_error = ""
+        self.last_warning = ""
+        self._box0_r = None
 
     def reset(self) -> None:
         """重置跟踪器，但**保留**人工 seed（换源后仍可重新初始化）。"""
@@ -177,11 +183,20 @@ class SpecularBallDetector(BaseDetector):
 
     # -- 建轨 / 回捕 ----------------------------------------------------
     def _lock_at(self, track_frame, gray: np.ndarray, x: float, y: float, r: float) -> bool:
-        """在 (x,y,r) 处建一条新轨（seed 与回捕共用同一份逻辑）。"""
+        """在 (x,y,r) 处建一条新轨（seed 与回捕共用同一份逻辑）。
+
+        框大小按 **1.8×r** 给（下限 24 px，r≥20 时再抬到 `init_box`，上限 `max_box`）：
+        旧版固定 `init_box=64`，对 r=10 的塑料小球等于把 3 倍球径的背景也框进来，
+        CSRT 会跟到背景边缘上。金属球 r≈36 时 1.8r≈65、再取 64 下限 —— 与旧值一致；
+        大球 r≈92 时仍是 max_box=140，**不改变已验证的那档行为**。
+        """
         c = self.cfg.specular
-        side = int(c.init_box)
-        if r > 45.0:                      # 大球（>90px 直径）才放大框；36px 球仍用 64
-            side = max(side, int(round(1.8 * r)))
+        side = max(24, int(round(1.8 * r)))
+        if r >= 20.0:
+            # 金属球那一档（r 实测 35~40，早期还量过 91）继续用 `init_box` 作下限：
+            # 64 是当时调出来的，改它会动到已验证的行为。小球（r<20，塑料球常见）
+            # 才按 1.8r 给 —— 固定 64 对 r=10 等于把 3 倍球径的背景框进来。
+            side = max(side, int(c.init_box))
         side = min(side, int(c.max_box))
         bbox = self._bbox_at(x, y, side, gray.shape)
         tracker = self._make_tracker()
@@ -195,6 +210,10 @@ class SpecularBallDetector(BaseDetector):
             return False
         self._tracker = tracker
         self._bbox = bbox
+        if self._box0_r is None:
+            # 只在**第一次**建轨时记初始框半径。回捕重建轨时保留它，否则
+            # "半径 = 种子半径 × 框缩放"的基准会被重置，半径会跳回种子值。
+            self._box0_r = max(1.0, side / 2.0)
         self._template = self._patch(gray, bbox)
         self._prev_center = (x, y)
         self._started = True
@@ -203,6 +222,21 @@ class SpecularBallDetector(BaseDetector):
         self._recent.append((x, y))
         self.last_error = ""
         return True
+
+    def _scaled_radius(self, box_radius: float) -> float:
+        """框半径 → 球半径：以种子为尺度锚，只跟随框的**相对**缩放。
+
+        CSRT 框回答"框多大"，不是"球多大"（B-130）。直接拿 `max(w,h)/2` 当球半径，
+        等于把 Z 锁成一个常数；而完全不跟随框，又丢掉"球走近/走远"的变化。
+        折中：``seed_r × (当前框半径 / 初始框半径)``，倍率夹在
+        ``[seed_scale_lo, seed_scale_hi]`` 内，既保留景深变化又压掉框抖动。
+        """
+        if self._seed is None or not self._box0_r:
+            return float(box_radius)
+        c = self.cfg.specular
+        scale = float(box_radius) / float(self._box0_r)
+        scale = min(max(scale, c.seed_scale_lo), c.seed_scale_hi)
+        return float(self._seed[2] * scale)
 
     def _search_template(self, gray: np.ndarray, center, r: float,
                          thresh: float, side: float | None):
@@ -328,6 +362,20 @@ class SpecularBallDetector(BaseDetector):
                     self.last_error = (f"seed 半径 {r:.1f} 超出建议范围 "
                                        f"{c.min_radius:.0f}~{c.max_radius:.0f}，仍尝试")
                 if not self._lock_at(track_frame, gray, x, y, r):
+                    # 种子帧**一定**给出 Detection：用户点过的地方不许报"没看见"。
+                    # 后续帧仍会重试 CSRT；只有种子帧走这条兜底，不会拿旧位置
+                    # 一直冒充"这一帧的观测"。
+                    if self._frame_idx == self._seed_frame:
+                        # 构造走 `BaseDetector.anchor_detection`（2026-11-07 收敛）：
+                        # `seed_anchor` 是跨检测器契约，`state`/`center_source`
+                        # 是本插件额外的口径，三维那边按后者分 seed/contour/box。
+                        return [self.anchor_detection(
+                            x, y, r,
+                            extra={"state": "seed-anchor",
+                                   "center_source": "seed",
+                                   "bbox": None},
+                            note="CSRT 在种子处锁定失败（那里没有可跟踪的"
+                                 "纹理/对比度）：本帧返回点选位置")]
                     return []
                 self._last_good = (x, y, r)
                 self._last_patch = self._patch(gray, self._bbox) if self._bbox else None
@@ -348,11 +396,16 @@ class SpecularBallDetector(BaseDetector):
             return []
         x, y, w, h = [int(round(v)) for v in bbox]
         cx, cy = x + w / 2.0, y + h / 2.0
-        radius = max(w, h) / 2.0
+        box_radius = max(w, h) / 2.0
+        radius = self._scaled_radius(box_radius)
         self._frames_since_seed += 1
 
-        if not (c.min_radius <= radius <= c.max_radius):
-            self.last_error = f"跟踪框半径 {radius:.1f} 超出 {c.min_radius:.0f}~{c.max_radius:.0f}"
+        # 有种子时半径已经被夹在 seed 尺度的 [lo, hi] 倍内（`_scaled_radius`），
+        # 不再用全局 min/max_radius 去拦 —— 那道门是为"自动检测"设的物理约束，
+        # 拿它拦人工点选的小球（例如 r=10 的塑料球）会把整段判成 0 检出。
+        if self._seed is None and not (c.min_radius <= radius <= c.max_radius):
+            self.last_error = (f"跟踪框半径 {radius:.1f} 超出 "
+                               f"{c.min_radius:.0f}~{c.max_radius:.0f}")
             return []
 
         jump = 1e9
@@ -432,6 +485,7 @@ class SpecularBallDetector(BaseDetector):
         rx, ry, csrc, cshift = self._refine_center(gray, cx, cy, radius)
         self._snapshot = {
             "center": (round(cx, 1), round(cy, 1)), "radius": round(radius, 1),
+            "box_radius": round(box_radius, 1),
             "ncc": round(ncc, 3), "motion": round(motion, 2), "jump": round(jump, 2),
             "bbox": (x, y, w, h), "frame": self._frames_since_seed,
             "center_source": csrc, "center_shift_px": round(cshift, 2),
@@ -442,7 +496,7 @@ class SpecularBallDetector(BaseDetector):
             score=float(max(0.0, min(1.0, 0.6 * max(0.0, ncc) + 0.4 * min(1.0, motion / 30.0)))),
             method=self.name,
             parts={"ncc": float(ncc), "motion": float(motion), "jump": float(jump),
-                   "center_shift_px": cshift},
+                   "center_shift_px": cshift, "box_radius": box_radius},
             extra={"state": "track", "bbox": (x, y, w, h),
                    "frames_since_seed": self._frames_since_seed,
                    "center_source": csrc},

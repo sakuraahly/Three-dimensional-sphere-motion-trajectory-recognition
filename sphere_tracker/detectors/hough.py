@@ -53,8 +53,12 @@ class HoughDetector(BaseDetector):
             if grad < self.cfg.hough_min_support or consistency < self.cfg.hough_min_sign_consistency:
                 continue
             edge_sup = circle_edge_support(self._edges, cx, cy, r, samples=90)
+            # 40% 圆上边缘支持 + 60% 径向梯度一致性（`grad*consistency`）。
+            # 用**关键字**写：旧版把这两个量当成位置参数传，读起来像"圆度=边缘支持"，
+            # 已经让人误判过一次"这是 bug 吗"。数值行为不变。
             score = self._score_candidate(
-                r, edge_sup, 0.0, 0.0, grad * consistency, weights=(0.4, 0.0, 0.0, 0.6)
+                r, circularity=edge_sup, edge_support=grad * consistency,
+                weights=(0.4, 0.0, 0.0, 0.6),
             )
             if score <= 0:
                 continue

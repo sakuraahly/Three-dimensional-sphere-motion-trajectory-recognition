@@ -95,7 +95,9 @@ def stereo_roots() -> tuple[Path, ...]:
 
     注意：返回的 ``data/stereo`` 下面**既有**会话目录（``<时间戳>``，旧布局），
     **也有**分区目录（``parallel`` / ``angled``）。枚举会话要用
-    `apps/_stereo_layout.candidate_session_dirs()`，它知道这个两层结构。
+    ``sphere_tracker.discovery.discover_session_dirs()``（``apps/_stereo_layout
+    .candidate_session_dirs()`` 是它的多根包装）—— 它递归往下走，认得
+    这两种位置，也认得用户自己建的嵌套目录。
     """
     return (STEREO_ROOT, LEGACY_STEREO_ROOT)
 

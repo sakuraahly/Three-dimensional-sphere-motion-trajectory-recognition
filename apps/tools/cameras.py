@@ -5,7 +5,7 @@
 就会悄悄用错设备、标定白做。这个工具把"哪台是左、哪台是右"记成**设备身份**
 （Windows 上取 PnP InstanceId / USB 端口），之后用**角色名**启动即可。
 
-六个子命令：
+十一个子命令：
 
     python apps/tools/cameras.py list                # 列设备（不开相机，任何机器都能跑）
     python apps/tools/cameras.py list --probe        # 顺带真开一下，报实际分辨率/是否全黑
@@ -14,6 +14,10 @@
     python apps/tools/cameras.py ignore 2            # 把某台标成「无关」（自动挑相机时跳过它）
     python apps/tools/cameras.py unignore --all      # 取消「无关」标记
     python apps/tools/cameras.py check               # 重插相机后比对：有没有漂移/被别的设备占用
+    python apps/tools/cameras.py probe               # 逐后端 × 逐编号：能不能出图
+    python apps/tools/cameras.py bench               # 逐台单独打开计时（谁慢）
+    python apps/tools/cameras.py modes               # 逐档真开：实际分辨率/实测帧率（只报告）
+    python apps/tools/cameras.py doctor              # 真开体检：现在能不能跑双目（只报告）
 
 `identify` 的按键：窗口里
 
@@ -119,8 +123,20 @@ def cmd_list(args) -> int:
     print(f"平台：{cr.current_platform()}")
     if cr.current_platform() != "windows":
         print("（非 Windows：不做身份识别，功能退化为按索引使用）")
-    print("检测到的相机（索引 = 枚举位次，是启发式；请用 identify 目视确认）：")
-    print(cr.format_device_table(devices, probes, settings=None, reg=cr.load_registry()))
+    reg = cr.load_registry()
+    print("检测到的相机（`#N` = **PnP 枚举位次**，不是采集索引；请用 identify 目视确认）：")
+    print(cr.format_device_table(devices, probes, settings=reg.settings, reg=reg))
+    virtuals = [d for d in devices if cr.is_virtual(d.name, reg.settings)]
+    if virtuals:
+        # 虚拟摄像头**必须单独点名**：它们不是物理设备，绑上去等于绑了一个
+        # "换个后端就指到别的东西"的编号（2026-11-11 vivo 事件）。
+        print()
+        print(f"⚠ 其中 {len(virtuals)} 台是**虚拟摄像头**（不参与绑定）：")
+        for d in virtuals:
+            print(f"     #{d.order}  {d.name}")
+        print("   含义：它们由别的软件（vivo 办公套件 / OBS / 手机投屏…）注册，"
+              "在系统设备列表里**根本不是一台相机**。")
+        print("   所以：不能设成 left/right，也不会进「预览全部外接」的候选。")
 
     if args.probe:
         extra = [i for i in probes if i not in {d.order for d in devices}]
@@ -486,6 +502,21 @@ class _WaitTicker:
                   f"（慢相机实测 ~24 秒才有画面，别关窗口）", flush=True)
 
 
+def _stdin_interactive() -> bool:
+    """stdin 能不能真读一行（GUI 起的子进程是 ``DEVNULL``，``input()`` 立刻 EOF）。
+
+    2026-11-07 修「点换相机，预览窗口打开又马上自己关了」时加：OpenCV 窗口
+    万一没建起来，老代码会退到 ``input()``；从 GUI 启动的那个进程 stdin 是
+    ``DEVNULL``，``input()`` 抛 ``EOFError`` → 被当成"用户按了 q" → 整个
+    identify 退出 → ``finally`` 销毁窗口 → 用户看到的就是"一闪就没了"，
+    而任务日志末尾还写着"已写入配置"，像成功了。
+    """
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 def _console_keys_available() -> bool:
     """当前进程能否读控制台按键（Windows msvcrt）。无控制台 → False。
 
@@ -588,7 +619,8 @@ def _release_with_timeout(src, timeout_s: float = 3.0) -> None:
 def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                         *, backend: int, first_frame_timeout: float | None = None,
                         key_poll=None,
-                        failed_out: list[int] | None = None) -> str | None:
+                        failed_out: list[int] | None = None,
+                        no_gui_out: list[int] | None = None) -> str | None:
     """开一台相机显示实时画面，返回用户按下的角色（None=跳过，''=退出）。
 
     `failed_out`：传一个 list 进来，**"这个后端打不开这台"**的索引会写进去。
@@ -636,6 +668,13 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
     try:
         import cv2
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        # 从 GUI 起的子进程不会自动获得前台焦点：OpenCV 窗口常常被主窗口压住，
+        # 用户只看到"点了一下什么都没有"。置顶 + 挪到屏幕左上，让它一定看得见。
+        try:
+            cv2.setWindowProperty(win, cv2.WND_PROP_TOPMOST, 1)
+            cv2.moveWindow(win, 80, 60)
+        except cv2.error:
+            pass
     except Exception:                                    # noqa: BLE001
         gui_ok = False
 
@@ -729,6 +768,17 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                 if key in _ASSIGN_KEYS:
                     return _ASSIGN_KEYS[key]
         if not gui_ok:
+            # 没有图形界面**而且没有控制台**时，绝不能退到 input()：
+            # DEVNULL 会立刻 EOF，老代码把 EOF 当成"用户按了 q"，整个 identify
+            # 当场退出、窗口被 finally 销毁（2026-11-07 用户报"一闪就关"）。
+            # 现在如实报错、记下来，让 cmd_identify 用非 0 退出码结束。
+            if not _stdin_interactive():
+                print(f"  [错误] #{index} 没能显示预览窗口，而本进程没有控制台可按键"
+                      "（从 GUI 启动时就是这样）。这一台跳过，角色没改；"
+                      "要绑左右请用 pin（按名字，不开相机）", flush=True)
+                if no_gui_out is not None and index not in no_gui_out:
+                    no_gui_out.append(index)
+                return None
             # 没有图形界面：打印设备信息，用命令行输入角色名
             print(f"  #{index}：{label}")
             if status:
@@ -979,6 +1029,170 @@ def cmd_probe(args) -> int:
     return 0 if best >= 1 else 1
 
 
+def _parse_mode_list(text: str | None) -> list[tuple[int, int]] | None:
+    """`"2560x1440,1920x1080"` -> 档位列表；空 -> None（用默认梯子）。"""
+    if not text:
+        return None
+    out: list[tuple[int, int]] = []
+    for piece in text.split(","):
+        raw = piece.strip()
+        if not raw:
+            continue
+        norm = raw.lower().replace("×", "x").replace(" ", "")
+        prof = video_profiles.parse(raw, default=None)  # type: ignore[arg-type]
+        if prof is None or prof.label != norm:
+            raise ValueError(f"分辨率档看不懂：{raw!r}（要 WxH，如 1920x1080）")
+        out.append((prof.width, prof.height))
+    if not out:
+        raise ValueError("--modes 给了但没有任何有效档")
+    return out
+
+
+def _parse_fps_list(text: str | None) -> tuple[float, ...]:
+    """`"24,30"` -> (24.0, 30.0)；空 -> (0.0,)（请求 30、报实测）。"""
+    if not text:
+        return (0.0,)
+    out: list[float] = []
+    for piece in text.split(","):
+        v = video_profiles.parse_fps(piece)
+        if v is None:
+            raise ValueError(f"帧率看不懂：{piece!r}（要 0<fps<=1000，可带小数）")
+        out.append(v)
+    return tuple(out)
+
+
+def cmd_modes(args) -> int:
+    """逐档**真开**相机，报实际分辨率 / 实测帧率（只报告，不写配置与缓存）。
+
+    与 `probe` 的分工：`probe` 回答"这个编号能不能出图"；本命令回答
+    "这个编号在**哪些档**下实际给什么尺寸/帧率"，供界面「使用相机实际模式」。
+    整场只用一个后端（默认 MSMF），不按索引换后端，也不自动按名字找回。
+    """
+    import cv2
+
+    devices = cr.list_devices()
+    names = {d.order: d.name for d in devices}
+    reg = cr.load_registry()
+    errors: list[str] = []
+    targets: list[dict] = []
+    seen: set[int] = set()
+
+    def _add_target(role: str, index: int, name: str, location: str = "",
+                    pnp_index: int | None = None) -> None:
+        if index in seen:
+            errors.append(f"{role}：采集 #{index} 与前面重复，跳过第二次")
+            return
+        seen.add(index)
+        targets.append({"role": role, "capture_index": int(index),
+                        "name": name, "location": location,
+                        "pnp_index": pnp_index})
+
+    if args.indices:
+        for idx in parse_indices(args.indices, devices, args.max_index):
+            nm = names.get(idx, "")
+            if not nm:
+                errors.append(f"#{idx}：不在 PnP 枚举里（phantom/虚拟设备），仍会试开但请勿据此设角色")
+            _add_target(f"#{idx}", idx, nm)
+    else:
+        for role in (args.left, args.right):
+            role = (role or "").strip()
+            if not role:
+                continue
+            spec = reg.roles.get(role)
+            if spec is None:
+                errors.append(f"角色 {role} 不在 config/cameras.json 里")
+                continue
+            try:
+                got = cr.resolve_role(role, reg=reg, devices=devices, interactive=False)
+            except cr.CaptureIndexNotVerified as exc:
+                errors.append(f"{role}：{_first_line(exc)}")
+                continue
+            except RuntimeError as exc:
+                errors.append(f"{role}：{_first_line(exc)}")
+                continue
+            _add_target(role, got.index, spec.name,
+                        location=spec.location, pnp_index=spec.index)
+
+    if not targets:
+        for e in errors:
+            print(f"[错误] {e}")
+        payload = {"backend": args.backend, "roles": [], "errors": errors}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    try:
+        modes = _parse_mode_list(args.modes)
+        fps_list = _parse_fps_list(args.fps)
+    except ValueError as exc:
+        print(f"[错误] {exc}")
+        payload = {"backend": args.backend, "roles": [], "errors": [str(exc)]}
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        return 0
+
+    api = cv2.CAP_MSMF if args.backend == "msmf" else cv2.CAP_DSHOW
+    backend_label = "MSMF" if args.backend == "msmf" else "DSHOW"
+
+    if not args.json:
+        print("=" * 72)
+        print(f"相机能力实测（{backend_label}；只报告，不写 config/ 与 camera_modes.json）")
+        print("=" * 72)
+        print("⚠️ 采集索引是 OpenCV 编号，不是 `cameras.py list` 的 PnP 位次；")
+        print("   下面的角色已经按 capture_index 解析（未实测的会明确拒绝）。")
+        print()
+
+    roles_payload: list[dict] = []
+    for target in targets:
+        idx = target["capture_index"]
+        if not args.json:
+            print(f"[{target['role']}] 采集 #{idx}  {target['name'] or '(无名字)'}"
+                  + (f"  位置 {target['location']}" if target["location"] else ""))
+        results = cr.probe_modes(
+            idx, modes, fps_list=fps_list, backend=api,
+            sample_s=args.sample, first_frame_timeout_s=args.first_frame_timeout,
+            progress=None if args.json else (
+                lambda w, h, fps, _idx=idx: print(
+                    f"    试 {w}x{h}" + (f" @ {fps:g}" if fps else ""), flush=True)),
+        )
+        usable = [r for r in results if r.ok]
+        best = max(usable, key=lambda r: (r.width * r.height, r.fps)) if usable else None
+        if not args.json:
+            if not usable:
+                print("    ✘ 没有任何一档能出图")
+            for r in results:
+                if not r.ok:
+                    print(f"    {r.requested:>10} -> ✘ {r.error}")
+                    continue
+                fall = "（请求档被相机回退）" if r.fell_back else ""
+                fps_txt = (f"{r.fps:.1f} fps" if r.fps_measured else "fps 未测到")
+                print(f"    {r.requested:>10} -> {r.actual:>10}  {fps_txt}  "
+                      f"{r.frames} 帧/{r.seconds:.1f}s{fall}")
+            if best is not None:
+                fps_txt = f"{best.fps:.1f} fps" if best.fps_measured else "fps 未测到"
+                print(f"    → 最清晰可用：{best.actual} @ {fps_txt}"
+                      f"（由请求 {best.requested} 实测）")
+            print()
+        roles_payload.append({
+            **target,
+            "modes": [asdict(r) for r in results],
+            "best": asdict(best) if best is not None else None,
+        })
+
+    payload = {"backend": args.backend, "roles": roles_payload, "errors": errors}
+    if args.json:
+        # 必须是**最后一行**：TaskRunner 只保留 tail，界面按最后一行 JSON 解析。
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        if errors:
+            print("提示：")
+            for e in errors:
+                print(f"  - {e}")
+        print("完成。结论仅供人工/界面填入，程序仍按 config/camera_modes.json 打开；"
+              "本命令不改任何配置。")
+    return 0
+
+
 def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     """按**当前实际设备**生成 `pin` 示例命令（不写死任何型号名）。
 
@@ -1039,6 +1253,7 @@ def _usable_for_pin(devices: list[cr.DeviceEntry]) -> list[cr.DeviceEntry]:
     return [d for d in devices
             if d.name
             and not cr.is_device_ignored(d, reg)
+            and not cr.is_virtual(d.name, reg.settings)
             and not cr.is_avoided(d.name, reg.settings)]
 
 
@@ -1101,8 +1316,10 @@ def _role_status_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     真正该做的是重新 `pin`。先把角色指向报出来，"配置错"和"开不出图"
     才分得开（前者不用开相机就能看见）。
 
-    全程**不开相机**：`resolve_role(interactive=False)` 只做 identity/port/name
-    静态匹配，毫秒级。
+    全程**不开相机**：`resolve_role(interactive=False, require_capture_index=False)`
+    只做 identity/port/name 静态匹配，毫秒级。这里**故意**允许缺 capture_index
+    （它只回答"这台在不在清单里"），但会把"采集索引未实测"写在同一行 ——
+    否则用户会以为"角色是 ✔ 的，那就能开"，而那正是用错相机的起点。
 
     返回空列表 = 配置里一个角色都没有（此时整段不打，免得开局就吓人）。
     """
@@ -1115,8 +1332,11 @@ def _role_status_lines(devices: list[cr.DeviceEntry]) -> list[str]:
     out: list[str] = []
     for role in order:
         spec = reg.roles[role]
+        cap_txt = (f"采集 #{spec.capture_index}" if spec.capture_index is not None
+                   else "采集索引**未实测**")
         try:
-            got = cr.resolve_role(role, reg=reg, devices=devices, interactive=False)
+            got = cr.resolve_role(role, reg=reg, devices=devices, interactive=False,
+                                  require_capture_index=False)
         except RuntimeError:
             out.append(f"  ✘ 角色 {role} 当前不在线（期望 {_role_expected(spec)}）")
             continue
@@ -1133,10 +1353,12 @@ def _role_status_lines(devices: list[cr.DeviceEntry]) -> list[str]:
         shown = f"#{got.index}"
         if got.entry is not None and got.entry.name:
             shown += f" {got.entry.name}"
-        out.append(f"  ✔ 角色 {role} → {shown}（按{how_cn}对上）")
+        where = cr.location_text(spec)
+        out.append(f"  ✔ 角色 {role} → {shown}（按{how_cn}对上；"
+                   f"PnP 位次 #{spec.index}；{cap_txt}；位置 {where}）")
 
     out.append("  （以上只是身份匹配，不开相机：✔/⚠ 只代表\"这台在设备清单里\"，"
-               "能不能出图看下面逐台的 ✔/✘）")
+               "能不能出图看下面逐台的 ✔/✘；采集索引未实测的角色**不能**按角色名启动）")
     return out
 
 
@@ -1247,12 +1469,16 @@ def cmd_identify(args) -> int:
     # `failed_out` 写进来）；**用户主动按 Esc/s 跳过的不算** —— 收尾文案说的是
     # "没能打开、去换个后端试试"，把主动跳过混进去会误导用户（2026-10-31 修）。
     _unopened: list[int] = []
+    #: 预览窗口没能显示、又没有控制台的索引。这种情况**不能算成功**：
+    # 老代码会静默退出并打印"已写入配置"，GUI 那边看起来就是"窗口一闪就没了"。
+    _no_gui: list[int] = []
     for idx in indices:
         entry = by_order.get(idx) or cr.DeviceEntry(order=idx)
         status = _describe_status(reg, idx, entry)
         role = _preview_and_assign(idx, entry, status, backend=backend,
                                    first_frame_timeout=timeout,
-                                   failed_out=_unopened)
+                                   failed_out=_unopened,
+                                   no_gui_out=_no_gui)
         if role == "":                                   # 退出
             break
         if not role:                                     # 跳过/打不开：不改配置
@@ -1269,14 +1495,41 @@ def cmd_identify(args) -> int:
         if role not in ("left", "right", "main"):
             print(f"  忽略未知角色「{role}」（只支持 left/right/main/无关）")
             continue
+        # 🚨 虚拟摄像头**不参与绑定**（2026-11-09，见交接文档 §109）：它只注册在
+        # 某个后端（vivo 只在 DSHOW、PnP 列表里根本没有），绑上去等于绑了一个
+        # "换个后端就指到别的东西"的编号。数据层 `set_role()` 也会拒绝，这里只是
+        # 把原因说在用户眼前（否则他会以为按键没生效）。
+        if cr.is_virtual(entry.name, reg.settings):
+            print(f"  [拒绝] #{idx} 「{entry.name}」是**虚拟摄像头**，不参与绑定 —— "
+                  f"它不是物理设备（PnP 列表里没有它）。请换一台真实相机。")
+            continue
+        # phantom 索引（不在 PnP 枚举里）能把画面开出来，但它**不是枚举到的物理相机**
+        # —— 拿它设角色等于绑了一个下次找不到的编号。警告后拒绝，并指路 pin。
+        if not entry.identity and not entry.name:
+            print(f"  {cr.phantom_index_warning(idx)}")
+            print(f"  [拒绝] 不给 #{idx} 设角色（它不是枚举到的物理相机）。"
+                  f"要绑左右请用 `pin <角色> name:/port:/id:`（按身份绑，不开相机）。")
+            continue
         # 反过来：一旦成为角色，就不再是「无关」
         cr.unmark_ignored(reg, entry=entry, index=idx)
-        cr.set_role(reg, role, entry=entry, index=idx, verified=verified)
+        # ⭐ 这里写入 **capture_index**：`idx` 正是刚刚**真的打开并显示出画面**的那个
+        # 编号 —— 这是全项目唯一能拿到"实测采集索引"的地方。不写它，`resolve_role`
+        # 就只能猜 PnP 位次（= "程序显示的相机 ≠ 真实相机"的根因）。
+        cr.set_role(reg, role, entry=entry, index=idx, verified=verified,
+                    capture_index=idx)
         if verified:
-            print(f"  [{role}] <- #{idx} {entry.name}（身份已记录）")
+            print(f"  [{role}] <- #{idx} {entry.name}（身份 + 采集索引 capture_index={idx} 已记录）")
         else:
-            print(f"  [{role}] <- #{idx}（**拿不到设备身份**，只记了索引；"
+            print(f"  [{role}] <- #{idx}（**拿不到设备身份**，只记了采集索引 capture_index={idx}；"
                   f"重插 USB 后可能漂移，请务必先用 identify 确认）")
+
+    if _no_gui:
+        print(f"\n[错误] 有 {len(_no_gui)} 台没能显示预览窗口"
+              f"（{', '.join('#' + str(i) for i in _no_gui)}），"
+              "而当前进程没有控制台可按键 —— 这次**没有确认任何角色**，"
+              "配置保持原样。请到任务日志看那台的原因，或改用 "
+              "`cameras.py pin left/right name:\"...\"`（按名字绑，不开相机）")
+        return 2
 
     try:
         path = cr.save_registry(reg)
@@ -1349,7 +1602,26 @@ def _resolve_device_value(
     return None, None
 
 
-_VALUE_HINT = "取值要写成 索引(0) / port:xxx / id:xxx / name:xxx"
+_VALUE_HINT = ("取值要写成 索引(0) / port:xxx / id:xxx / name:xxx / "
+               "capture-index:N（实测的采集索引，只对已有角色）")
+
+# `pin <角色> capture-index:N` 的写法（大小写不敏感；下划线/连字符都收）。
+#
+# 为什么需要它：`capture_index`（OpenCV/MSMF 真正的采集编号）**只能实测得到**，
+# 而它和 PnP 位次**不是一回事**。已经自己确认过某号就是那台相机的人（比如刚在
+# Windows 相机里看过、或刚跑完 identify 但不想再开一次）需要一个**不开相机**
+# 就能把这个号落盘的入口 —— 否则他只能反复跑 identify。
+_CAPTURE_INDEX_PREFIXES = ("capture-index:", "capture_index:", "capture:")
+
+
+def _split_capture_index(value: str) -> int | None:
+    """`capture-index:3` -> 3；不是这种写法 / 号码非法 -> None。"""
+    low = (value or "").strip().lower()
+    for prefix in _CAPTURE_INDEX_PREFIXES:
+        if low.startswith(prefix):
+            raw = value.split(":", 1)[1].strip()
+            return int(raw) if raw.isdigit() else None
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -1357,6 +1629,37 @@ _VALUE_HINT = "取值要写成 索引(0) / port:xxx / id:xxx / name:xxx"
 # --------------------------------------------------------------------------- #
 def cmd_pin(args) -> int:
     role, value = args.role, args.value
+
+    # ---- `pin <角色> capture-index:N`：只改采集索引，**不碰**身份/位次/无关清单 ----
+    #
+    # 刻意放在 `list_devices()` **之前**：这条路径根本不需要枚举设备
+    # （用户给的是他自己确认过的采集号），也就不该为它扫一遍系统。
+    low = (value or "").strip().lower()
+    if any(low.startswith(p) for p in _CAPTURE_INDEX_PREFIXES):
+        cap = _split_capture_index(value)
+        if cap is None:
+            print(f"capture-index 后面要写一个非负整数，例如 capture-index:0"
+                  f"（收到 {value!r}）")
+            return 1
+        reg = cr.load_registry()
+        if str(role) not in reg.roles:
+            known = "、".join(sorted(reg.roles)) or "（一个都没配）"
+            print(f"配置里没有角色「{role}」，无法只写采集索引。"
+                  f"已配置的角色：{known}\n先用 pin {role} port:<端口> 绑设备。")
+            return 1
+        reg.roles[str(role)].capture_index = int(cap)
+        try:
+            path = cr.save_registry(reg)
+        except OSError as exc:
+            print(f"[错误] 写配置失败：{exc}")
+            return 1
+        print(f"[{role}] capture_index <- {cap}  已写入 {path}")
+        print("  之后按角色名启动（--left left / --right right）就用这个号；"
+              "PnP 位次只作显示。")
+        print("  ⚠ 这个号只在**当前这台机器 + 当前后端**成立：换 USB 口、换机器、"
+              "换后端后要重新确认。")
+        return 0
+
     devices = cr.list_devices()
     entry, index = _resolve_device_value(value, devices)
 
@@ -1367,6 +1670,12 @@ def cmd_pin(args) -> int:
         return 1
 
     reg = cr.load_registry()
+    # 虚拟摄像头**不参与绑定**：数据层 `set_role()` 也会拒绝，这里先给出人话原因。
+    if entry is not None and cr.is_virtual(entry.name, reg.settings):
+        print(f"[拒绝] 「{entry.name}」是**虚拟摄像头**，不参与绑定 —— "
+              f"它不是物理设备（PnP 列表里没有它），编号换个后端就指到别的东西。\n"
+              f"请换一台真实相机：python apps/tools/cameras.py list")
+        return 2
     verified = bool(entry and entry.identity)
     old = cr.unmark_ignored(reg, entry=entry, index=index)
     cr.set_role(reg, role, entry=entry, index=index, verified=verified)
@@ -1383,6 +1692,13 @@ def cmd_pin(args) -> int:
     if not verified:
         print("提醒：这台拿不到设备身份，只记了索引；建议改用 identify 目视确认，"
               "否则重插 USB 后索引可能漂移。")
+    # pin **不写** capture_index（它不开相机，没有实测）—— 缺它时按角色名启动会被
+    # `resolve_role` 明确拒绝，而不是拿 PnP 位次顶上。这句话必须说，否则用户会以为
+    # "pin 完就能用了"，然后在标定/录制时撞上一条他看不懂的报错。
+    if reg.roles[str(role)].capture_index is None:
+        print("下一步：这条 pin 只固定了**身份**，采集索引还是**未实测**（capture_index 为空）。"
+              "\n  按角色名启动前先跑一次：python apps/tools/cameras.py identify"
+              f"\n  或已知编号时：python apps/tools/cameras.py pin {role} capture-index:<N>")
     return 0
 
 
@@ -1535,12 +1851,18 @@ def _role_collision_lines(
     —— 那么 `camera_registry` 里那句话改一个字，`check` 就静默退回
     「未发现危险项 / EXIT 0」，**今天这个 bug 原样复发，而且没有测试会红**。
     所以这里按事实复核；也不碰任何相机。
+
+    ⚠ 这里传 `require_capture_index=False`：「两个角色指着同一台物理相机」是
+    **配置层面的事实**（按 identity/port 就能判），与"采集索引有没有实测过"无关。
+    要求它反而会让"撞车 + 未实测"这种最该报的组合退化成"某一路解析失败"，
+    把最要紧的那条结论吞掉（check 的逐角色循环会另外报 `[危险] 采集索引未实测`）。
     """
     roles = [r for r in ("left", "right", "main") if r in reg.roles]
     if len(roles) < 2:
         return False, []
     try:
-        cr.resolve_roles(roles, reg=reg, devices=devices, interactive=False)
+        cr.resolve_roles(roles, reg=reg, devices=devices, interactive=False,
+                         require_capture_index=False)
     except RuntimeError:
         # 可能撞车，也可能只是某一路解析失败 —— 下面按索引事实区分，
         # 不看异常文本（文案一改就静默变绿，那正是要防的）。
@@ -1552,7 +1874,8 @@ def _role_collision_lines(
     entries: dict[int, cr.DeviceEntry | None] = {}
     for role in roles:
         try:
-            res = cr.resolve_role(role, reg=reg, devices=devices, interactive=False)
+            res = cr.resolve_role(role, reg=reg, devices=devices, interactive=False,
+                                  require_capture_index=False)
         except RuntimeError:
             continue
         if res.index is None:
@@ -1573,7 +1896,11 @@ def _role_collision_lines(
         others = [d for d in devices
                   if d.present and d.order not in ignored
                   and (entry is None or d.identity.upper() != entry.identity.upper())]
-        others.sort(key=lambda d: cr.is_avoided(d.name))
+        # 排序：**先排除虚拟摄像头**（它不是物理设备，拿来当"另一台"的候选等于
+        # 把人往坑里推），再让内置/红外排后面。
+        others.sort(key=lambda d: (cr.is_virtual(d.name, reg.settings),
+                                  cr.is_avoided(d.name, reg.settings)))
+        others = [d for d in others if not cr.is_virtual(d.name, reg.settings)] or others
         if len(group) == 2:
             a, b = group
             lines.append(f"         python apps/tools/cameras.py pin {a:<5} "
@@ -1637,8 +1964,28 @@ def cmd_check(args) -> int:
     for role in sorted(reg.roles):
         spec = reg.roles[role]
         tag = "已确认" if spec.verified else "未确认"
+        cap_missing = spec.capture_index is None
         try:
             res = cr.resolve_role(role, reg, devices, interactive=False)
+        except cr.CaptureIndexNotVerified as exc:
+            # 🚨 2026-11-12：这条**必须**在这里接住 —— 它是"程序显示的相机 ≠ 真实
+            # 相机"的根因（把 PnP 枚举位次当采集索引）。`check` 的职责是把危险
+            # **说出来**并给下一步，不是崩一个 traceback 给用户看。
+            # 接住之后**仍然**按"只认设备身份"的口径解析一次（require=False），
+            # 好让下面照旧报「一致 / 漂移」—— 两件事都要看得见：
+            # ① 采集索引没实测（这行）；② 配置里记的身份还对得上吗。
+            danger = True
+            print(f"[危险] 「{role}」({tag}) 采集索引未实测 —— "
+                  f"程序**不会**拿 PnP 位次替你猜着开相机")
+            for line in str(exc).splitlines():
+                if ("下一步" in line or "identify" in line or " pin " in line
+                        or "这台设备" in line):
+                    print(f"        {line.strip()}")
+            try:
+                res = cr.resolve_role(role, reg, devices, interactive=False,
+                                      require_capture_index=False)
+            except RuntimeError:
+                continue
         except RuntimeError as exc:
             # ⚠️ **解析失败必须算危险项**（2026-10-15 修）。
             # 这里原来只 `continue`，**没有置 danger** —— 于是"角色解析失败"
@@ -1655,18 +2002,44 @@ def cmd_check(args) -> int:
                     print(line)
             continue
 
+        # ⚠ 比较的**必须是同一个口径**：`spec.index` 记的是 PnP 位次，所以拿
+        # `res.entry.order`（PnP 位次）跟它比；`res.index` 是**采集索引**，
+        # 两者只有在"恰好一致"时相等。旧写法拿 res.index 比 spec.index，
+        # 一旦 capture_index 与位次不同（本机就可能），check 会误报「漂移」。
+        pnp = int(res.entry.order) if res.entry is not None else int(res.index)
+        cap_txt = (f"采集 #{res.index}" if res.capture_index_verified
+                   else "采集索引**未实测**")
         if res.how == "identity":
-            status = "一致" if res.index == spec.index else f"漂移 -> 按身份纠正到 #{res.index}"
+            status = ("一致" if pnp == spec.index
+                      else f"漂移 -> 按身份定位到 PnP #{pnp}")
         elif res.how == "port":
-            status = "一致（按端口）" if res.index == spec.index else f"漂移 -> 按端口纠正到 #{res.index}"
+            status = ("一致（按端口）" if pnp == spec.index
+                      else f"漂移 -> 按端口定位到 PnP #{pnp}")
         elif res.how == "index-fallback":
             status = f"索引兜底 #{res.index}（未确认身份，可能用错）"
         else:
             status = f"手动指定 #{res.index}"
-        print(f"[{'一致' if res.index == spec.index else '漂移'}] 「{role}」({tag}) {status}")
+        print(f"[{'一致' if pnp == spec.index else '漂移'}] 「{role}」({tag}) "
+              f"{status}（PnP #{pnp}；{cap_txt}）")
+        if cap_missing:
+            # 索引兜底那条尤其危险：它**本身就是**拿 PnP 位次当采集索引
+            # （虽然身份对不上时才会走到，但照样会开错相机）。统一在这里点出来。
+            danger = True
+            print(f"        [危险] 采集索引未实测（capture_index 为空）："
+                  f"按角色名启动会拒绝，不会猜。")
+            print(f"        修：python apps/tools/cameras.py identify"
+                  f"（或 pin {role} capture-index:<已确认的编号>）")
 
         for w in res.warnings:
             print(f"        [警告] {w}")
+
+        # 「位置」标签：只显示，不参与解析。两台同型号 aoni 在软件层面不可区分，
+        # 位置（床 / 阳台门）是用户唯一能自证"哪台是哪台"的信息，check 里也该看得见。
+        print(f"        [位置] {cr.location_text(spec)}")
+        if cr.is_virtual(spec.name, reg.settings):
+            danger = True
+            print(f"        [危险] 这个角色绑的是**虚拟摄像头**「{spec.name}」—— "
+                  f"它不参与绑定（不是物理设备），请换成真实相机。")
 
         # 危险：配置里记的那个索引，现在正被**另一台**设备占着
         if spec.identity and spec.index is not None:
@@ -1892,7 +2265,14 @@ def cmd_doctor(args) -> int:
     # ---- ① 枚举 ----
     print(f"\n① 枚举到 {len(devices)} 台：")
     for d in devices:
-        mark = "  [无关]" if cr.is_device_ignored(d, reg) else ""
+        if cr.is_device_ignored(d, reg):
+            mark = "  [无关]"
+        elif cr.is_virtual(d.name, reg.settings):
+            mark = "  [虚拟,不参与绑定]"
+        elif cr.is_avoided(d.name, reg.settings):
+            mark = "  [内置/红外,不推荐]"
+        else:
+            mark = ""
         print(f"    #{d.order}  {d.name or '(无名字)':22} 端口 {d.port or '-'}{mark}")
 
     # ---- ② 角色解析（不开相机）----
@@ -1909,7 +2289,19 @@ def cmd_doctor(args) -> int:
         try:
             r = cr.resolve_role(role, reg, devices, interactive=False)
             resolved[role] = r.index
-            print(f"    「{role}」-> #{r.index}（how={r.how}）")
+            print(f"    「{role}」-> 采集 #{r.index}（how={r.how}，位置 "
+                  f"{cr.location_text(spec)}，PnP 位次 #{spec.index}）")
+        except cr.CaptureIndexNotVerified as exc:
+            # **不拿 PnP 位次去开相机**：这条命令会真的开设备，而猜测的编号
+            # 会开到另一台（内置 / 虚拟 / 红外），测出来的结论整个失真。
+            # 所以只报告 + 指路，**跳过**这一路的实测。
+            resolved[role] = None
+            fail = True
+            print(f"    「{role}」-> **采集索引未实测**（capture_index 为空），跳过实测：")
+            for line in str(exc).splitlines():
+                if ("下一步" in line or "identify" in line or " pin " in line
+                        or "这台设备" in line):
+                    print(f"        {line.strip()}")
         except RuntimeError as exc:
             resolved[role] = None
             fail = True
@@ -2010,8 +2402,8 @@ def cmd_doctor(args) -> int:
         print("     换过 USB 口先跑 `identify` 重新确认（InstanceId 里编着端口号）。")
         return 2
     print("结论：**可以跑双目。** 下一步：")
-    print(f"    启动程序.bat precheck      （举棋盘确认两路都看得到）")
-    print(f"    启动程序.bat calibrate     （标定；基线核对记得填你量到的中心距）")
+    print(f"    run.bat precheck      （举棋盘确认两路都看得到）")
+    print(f"    run.bat calibrate     （标定；基线核对记得填你量到的中心距）")
     return 0
 
 
@@ -2044,7 +2436,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     pp = sub.add_parser("pin", help="非交互地把某角色固定到某设备")
     pp.add_argument("role", help="角色名，如 left / right / main")
-    pp.add_argument("value", help="0 | port:Port_#0001.Hub_#0003 | id:USB\\... | name:<名字片段>")
+    pp.add_argument("value",
+                    help="0 | port:Port_#0001.Hub_#0003 | id:USB\\... | name:<名字片段> "
+                         "| capture-index:N（已确认的采集索引，只对已有角色生效；"
+                         "PnP 位次与采集索引不是一回事）")
     pp.set_defaults(func=cmd_pin)
 
     pig = sub.add_parser("ignore", help="把某台相机标为「无关」（自动挑相机时跳过）")
@@ -2069,6 +2464,33 @@ def build_parser() -> argparse.ArgumentParser:
                      help="探测哪些后端（默认 both）")
     ppr.set_defaults(func=cmd_probe)
 
+    pm = sub.add_parser(
+        "modes",
+        help="逐档真开：报每档**实际**分辨率/实测帧率/是否黑帧"
+             "（只报告，不写 config 与 camera_modes.json）")
+    pm.add_argument("--left", default="left",
+                    help="左角色名（默认 left；按 capture_index 打开，未实测会拒绝）")
+    pm.add_argument("--right", default="right",
+                    help="右角色名（默认 right；给空串可只测左）")
+    pm.add_argument("--indices", default=None,
+                    help="显式采集编号，如 0,1（覆盖 --left/--right；编号是**后端自己的**）")
+    pm.add_argument("--max-index", type=int, default=6,
+                    help="--indices 没给时补探到第几个编号（默认 6）")
+    pm.add_argument("--modes", default=None,
+                    help="请求档，如 2560x1440,1920x1080；默认 video_profiles.probe_order(None)")
+    pm.add_argument("--fps", default=None,
+                    help="请求帧率，如 24,30；默认不限定（按 30 请求并实测实际值）")
+    pm.add_argument("--backend", choices=("msmf", "dshow"), default="msmf",
+                    help="整场用哪个后端（默认 msmf；不按索引换后端）")
+    pm.add_argument("--sample", type=positive_seconds, default=0.6,
+                    help="每档测帧率的采样窗口（秒，默认 0.6）")
+    pm.add_argument("--first-frame-timeout", type=positive_seconds,
+                    default=PREVIEW_FIRST_FRAME_S,
+                    help=f"每档等首帧上限（秒，默认 {PREVIEW_FIRST_FRAME_S:.0f}）")
+    pm.add_argument("--json", action="store_true",
+                    help="以 JSON 输出（最后一行；供界面解析）")
+    pm.set_defaults(func=cmd_modes)
+
     pb = sub.add_parser(
         "bench",
         help="**逐台单独**打开计时：判断「某台慢」是它自己慢还是被前一台拖累")
@@ -2089,29 +2511,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     pd = sub.add_parser(
         "doctor", help="**真开相机**体检一遍：现在能不能跑双目（只报告，不改配置）")
-    # ⚠ 默认档必须是「录制实际会用的档」，不是相机的最高档（2026-11-05 实测）。
+    # ⚠ 默认档必须是「这套装置实际会用的档」，不是相机最高档 2560x1440。
     #
-    # 原来默认 `video_profiles.DEFAULT`（2560x1440），而 `record_stereo` 不填
-    # --width/--height 时用的是**标定里记录的采集档**（本机 1920x1080）。于是本命令
-    # 在一个录制根本不会用的档位上双开、失败，然后判"还不能跑双目"——而同一时刻
-    # 1920x1080 双开是好的（left 1.0s / right 1.1s，各读 15/11 帧）。
-    # 更糟的是 2560 双开失败会把那一路的 MSMF 会话踢成持久失效，用户必须先拔插
-    # 才能继续 —— 一次误判的代价是一次物理插拔。
+    # 2560x1440 双开失败会把那一路的 MSMF 会话踢成持久失效，用户必须先
+    # 物理拔插才能继续（2026-11-05 实测）；1920x1080 才是稳定档。
     #
-    # 所以这里先问标定：它记着录制用哪个档，就按哪个档体检。
-    dflt_w = video_profiles.DEFAULT.width
-    dflt_h = video_profiles.DEFAULT.height
-    dflt_note = f"相机最高档 {video_profiles.DEFAULT.label}"
-    try:
-        from apps._common import calib_capture_size
-        from stereo.profiles import resolve_calibration_base
+    # 采集档是**装置档案的属性**（RigProfile.width/height），不是标定文件里
+    # capture_size 的属性：档案配了 calibration_path 但还没标定时，那份标定
+    # json 尚不存在，从标定读会读不到、然后静默回落到 2560，正好踩上面的坑。
+    # 所以这里从激活装置档案取宽高，没填就用 apps/_common 的 1080 安全档，
+    # 并把来源写进 --help 的说明，不谎称"标定记录 / 与录制同档 / 相机最高档"。
+    from apps._common import capture_size_from_profile
+    from stereo.profiles import get_active
 
-        _cap = calib_capture_size(resolve_calibration_base())
-        if _cap:
-            dflt_w, dflt_h = int(_cap[0]), int(_cap[1])
-            dflt_note = f"标定记录的采集档 {dflt_w}x{dflt_h}，与录制同档"
-    except Exception:                                    # noqa: BLE001
-        pass                                             # 没标定就回落最高档
+    try:
+        _prof = get_active()
+    except Exception as exc:                             # noqa: BLE001 —— 档案坏了不许让 CLI 起不来
+        _prof = None
+        _why = f"（装置档案读不了：{exc}；已用安全档）"
+    else:
+        _why = ""
+    dflt_w, dflt_h, dflt_note = capture_size_from_profile(_prof)
+    dflt_note += _why
 
     pd.add_argument("--width", type=int, default=dflt_w,
                     help=f"目标宽度（默认{dflt_note}）")

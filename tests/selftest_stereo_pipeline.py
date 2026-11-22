@@ -310,6 +310,8 @@ def test_predict3d() -> bool:
     print("----- 三维弹道预测（匀速 + 已知重力） -----")
     cfg = PredictConfig()
     g = np.asarray(cfg.g, dtype=np.float64)
+    # 默认重力必须跟本项目的坐标约定一致（Y 向下 = +9.81）；写回 -9.81 要红。
+    default_g_ok = tuple(cfg.g) == (0.0, 9.81, 0.0)
     p_origin = np.array([0.0, 1.0, 0.0])
     v_origin = np.array([2.0, 3.0, 0.0])
     t = np.arange(0.0, 0.5 + 1e-9, 1.0 / 30.0)
@@ -343,17 +345,31 @@ def test_predict3d() -> bool:
     why_short: list[str] = []
     st_short = fit_ballistic(t[:3], pts[:3], cfg, why_short)
 
-    # ---- 4. 机动检测：0.4 s 落地反弹（v_y 由负转正）----
+    # ---- 4. 机动检测：0.4 s 落地反弹（速度沿重力方向由同向变反向）----
+    # 反弹后的速度方向必须跟着 g 的符号走：默认 Y 向下（g[1]>0）时下落速度为正、
+    # 反弹后向上（负）；Y 向上的数学系则相反。写死一个符号会让合成数据与
+    # `detect_bounce` 的判据互相矛盾。
     tb = 0.4
     tt = np.arange(0.0, 0.8 + 1e-9, 1.0 / 30.0)
     y_b = 1.0 - 2.0 * tb + 0.5 * g[1] * tb ** 2
+    v_bounce = -1.5 if g[1] > 0 else 1.5
     y = np.where(tt <= tb, 1.0 - 2.0 * tt + 0.5 * g[1] * tt ** 2,
-                 y_b + 1.5 * (tt - tb) + 0.5 * g[1] * (tt - tb) ** 2)
+                 y_b + v_bounce * (tt - tb) + 0.5 * g[1] * (tt - tb) ** 2)
     bounce_pts = np.column_stack([0.5 * tt, y, 1.0 + 0.1 * tt])
     truth_idx = int(np.argmax(tt > tb))
     why_b: list[str] = []
     idx = detect_bounce(tt, bounce_pts, cfg, why_b)
     idx_err = abs(idx - truth_idx) if idx is not None else 10 ** 6
+
+    # ---- 4b. 负 g（Y 向上的数学系）也要能检出反弹：判据是 v·g，不是写死符号 ----
+    cfg_up = PredictConfig(g=(0.0, -9.81, 0.0))
+    g_up = np.asarray(cfg_up.g, dtype=np.float64)
+    y_bu = 1.0 - 2.0 * tb + 0.5 * g_up[1] * tb ** 2
+    v_bu = -1.5 if g_up[1] > 0 else 1.5
+    y_up = np.where(tt <= tb, 1.0 - 2.0 * tt + 0.5 * g_up[1] * tt ** 2,
+                    y_bu + v_bu * (tt - tb) + 0.5 * g_up[1] * (tt - tb) ** 2)
+    bounce_up = np.column_stack([0.5 * tt, y_up, 1.0 + 0.1 * tt])
+    idx_up = detect_bounce(tt, bounce_up, cfg_up, [])
 
     # 关键证伪：纯噪声（同一条弹道 + 2 mm 噪声，无反弹）必须返回 None
     tn = np.arange(0.0, 0.5 + 1e-9, 1.0 / 30.0)
@@ -394,6 +410,9 @@ def test_predict3d() -> bool:
         (f"纯噪声（无反弹）-> {idx_noise}（必须为 None）；"
          f"{why_n[0][:34] if why_n else '无'}",
          idx_noise is None),
+        (f"默认 g 是 Y 向下（+9.81），不是 Y 向上", default_g_ok),
+        (f"负 g（Y 向上）也能检出反弹：{idx_up}（真值 {truth_idx}）",
+         idx_up is not None and abs(idx_up - truth_idx) <= 2),
     ]
     ok = True
     for name, passed in checks:

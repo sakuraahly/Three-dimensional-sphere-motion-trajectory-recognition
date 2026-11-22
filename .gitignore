@@ -30,9 +30,9 @@
 !/requirements.txt
 !/requirements-ai.txt
 !/environment.yml
-!/启动程序.py
-!/启动程序_命令行.py
-!/启动程序.bat
+!/run.bat
+!/install.bat
+!/uninstall.bat
 
 # ---------- 源码目录：只收 .py ----------
 !/apps/
@@ -61,9 +61,9 @@
 !/tests/**/*.py
 
 # ---------- 原生 exe 启动器的重建源码 ----------
-# 2026-11-05：根目录新增 启动器.exe（Go 编译的原生 GUI 壳，双击无黑框）。
+# 2026-11-05：根目录新增 launcher.exe（Go 编译的原生 GUI 壳，双击无黑框）。
 # exe 本身是编译产物、平台相关，**不入库**；这里只放行可重建它的源码。
-# icon.syso（windres 中间产物）与 启动器.exe 都保持忽略。
+# icon.syso（windres 中间产物）与 launcher.exe 都保持忽略。
 !/native/
 /native/**
 !/native/launcher/

@@ -192,6 +192,8 @@ class MonoSession:
     duration_s: float = 0.0
     encoder: str = ""
     video: str = ""            # 相对会话目录的视频名；空 = 还没录
+    #: B-114：录这段时用的球径（mm）；None = 没记（不是 0，0 会被当成有效测量）
+    ball_diameter_mm: float | None = None
     has_derived: bool = False
     has_result: bool = False
     error: str = ""            # 坏目录/坏 json 的说明；正常为空
@@ -274,6 +276,11 @@ def _summarize(session_dir: Path) -> MonoSession:
 
     clip = find_clip(session_dir)
     facts = _facts_from_take(take) if take else {}
+    # B-114：球径缺值必须保持 None（JSON null），**不许兜成 0** ——
+    # 0 会被下游当成「量过的有效球径」，静默把 Z 算错。
+    _d_raw = raw.get("ball_diameter_mm")
+    known_d = (float(_d_raw) if isinstance(_d_raw, (int, float))
+               and not isinstance(_d_raw, bool) else None)
 
     derived = session_dir / "derived"
     return MonoSession(
@@ -282,6 +289,7 @@ def _summarize(session_dir: Path) -> MonoSession:
         created=str(raw.get("created") or "") or facts.get("recorded_at", ""),
         label=str(raw.get("label") or ""),
         camera=str(raw.get("camera") or "") or facts.get("camera", ""),
+        ball_diameter_mm=known_d,
         # session.json 是权威；它还没被补（录制器直接跑、窗口没接上）时用 sidecar 兜底
         width=_num(raw.get("width"), int, 0) or facts.get("width", 0),
         height=_num(raw.get("height"), int, 0) or facts.get("height", 0),
@@ -338,8 +346,14 @@ def scan_mono_sessions(root: str | Path | None = None) -> list[MonoSession]:
 # 建 / 写 / 软删除
 # --------------------------------------------------------------------------
 def _template(session_id: str, created: str, camera: str,
-              label: str, notes: str) -> dict:
-    """新建会话时的 ``session.json`` 骨架（数值全 0 = 还不知道）。"""
+              label: str, notes: str,
+              ball_diameter_mm: float | None = None) -> dict:
+    """新建会话时的 ``session.json`` 骨架（数值全 0 = 还不知道）。
+
+    B-114：球径单独处理 —— 缺值写 ``None``（落盘是 JSON ``null``），
+    **不跟宽高那样兜 0**。0 会被下游当成「量过的有效球径」，
+    静默把 Z = f·D/(2r) 算错。
+    """
     return {
         "schema": SCHEMA,
         "version": VERSION,
@@ -348,6 +362,7 @@ def _template(session_id: str, created: str, camera: str,
         "label": label,
         "notes": notes,
         "camera": camera,
+        "ball_diameter_mm": ball_diameter_mm,
         "width": 0,
         "height": 0,
         "fps": 0.0,
@@ -373,6 +388,7 @@ def _write_session(session_dir: Path, data: dict) -> Path:
 
 def create_mono_session(root: str | Path | None = None, *, camera: str = "",
                         label: str = "", notes: str = "",
+                        ball_diameter_mm: float | None = None,
                         now: float | None = None) -> Path:
     """建一个会话目录并写 ``session.json``，返回目录。
 
@@ -383,6 +399,9 @@ def create_mono_session(root: str | Path | None = None, *, camera: str = "",
     目录里此刻还没有视频 —— 视频由 ``record_mono.py --out <dir>/clip.mkv`` 写，
     实测值随后由 :func:`sync_from_take` 补回来。这样即使录制中途失败，
     目录里也有一个能说明"本来要录什么"的文件（与双目 ``create_session`` 同理）。
+
+    B-114：``ball_diameter_mm`` 是录这段时用的球径（mm）；不给就写 null，
+    不写 0（0 会被当成有效测量）。
     """
     base = Path(root) if root is not None else DEFAULT_ROOT
     base.mkdir(parents=True, exist_ok=True)
@@ -396,7 +415,7 @@ def create_mono_session(root: str | Path | None = None, *, camera: str = "",
     _write_session(session_dir, _template(
         session_dir.name,
         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
-        camera, label, notes))
+        camera, label, notes, ball_diameter_mm))
     return session_dir
 
 

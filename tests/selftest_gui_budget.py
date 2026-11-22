@@ -20,6 +20,10 @@
    为什么它属于这个测试：结构判据只数控件，**一个字都不管参数怎么拼**，
    而"界面选的板参数有没有真的进到命令行"正是这两个窗口唯一干的活
    （老窗口里同一件事有 7 节判据守着，见 `selftest_launcher_params.py`）。
+7. **实时会话的可见性**（2026-11-17 增）：实时双目落的会话要在数据管理里
+   看得出是实时（`source` 读进 `SessionItem` + 名称前缀），且第④步
+   「跑离线三维」必须**先拦**（它没有原始录像，起子进程只会 validate 失败）。
+   拦截的接线用 AST 断言"在全部 `tasks.start(` 之前"。同样**不依赖 Tk**。
 
 无显示器环境：``tk.Tk()`` 会抛 ``TclError``，此时打印 ``[跳过]`` 并返回 0 ——
 **不许假装通过**（计划书 §5.1 明写）。
@@ -47,14 +51,44 @@ MODE_WORDS = {"auto", "parallel", "angled"}
 
 L1_INPUTS_MAX = 8
 L1_BUTTONS_MAX = 5
-L2_CLICKABLE_MAX = 12
+# 12 → 13（2026-11-08）：第④步「球种类与检测参数」新增「尺寸门自动阶梯」勾选框，
+# 是**一个**真实且必要的新增控件（决定要不要下传 --no-radius-auto），不是窗口长回去。
+# 13 → 14（2026-11-14，team-lead 最终裁决）：用户点名要求新增「球直径（mm）」
+# 物理输入（接 --anchor-diameter-mm）+ 承载它的「高级」折叠区 header
+# （CollapsibleSection 的 header_button 也是 TButton、计入 L2）；同时按用户
+# 裁决**移除**「尺寸门自动阶梯」勾选框（阶梯改为默认且唯一路径，GUI 不再
+# 下传 --no-radius-auto），故 ④ 卡片净增只有 1（15 → 14）。其余窗口仍守
+# 这个上限；L1_INPUTS_MAX / L1_BUTTONS_MAX 一律不动。
+L2_CLICKABLE_MAX = 14
 # 大角度（angled）第②步：链式标定比 joint 多「标定方法下拉 + 采集标定板图 +
 # 检查链式输入」三个控件，是**真实且必要**的内容差异，不是"长回一个窗口装全部"。
-# 单独给它放宽 L2 上限，其余窗口仍守 12。
+# 单独给它放宽 L2 上限，其余窗口仍守 L2_CLICKABLE_MAX。
 # 2026-11-04 再加「FOV 对齐」勾选（用户报"FOV 影响平行标定"，要能关掉）——
 # 它与「放宽模式」同为改变标定口径的进阶开关，落在高级折叠区，仍算 L2 可点。
 # 14 → 15：也是真实且必要的新增，不是结构长回去。
-ANGLED_L2_CLICKABLE_MAX = 15
+# 15 → 16（2026-11-09）：接 §67 A1 老缺陷 —— 大角度窗「高级」里加一个
+# 「卷尺量两镜头中心距 mm（可留空）」输入框，把 --baseline-mm 真正下传。
+# 零共视链路（双板链式）没有跨路一致性证据，这个卷尺值是**唯一独立于图像
+# 之外的物理核对锚**，不是可省的装饰。它接在 line3 同一行、只在 angled 窗
+# 出现、折叠区展开高度不变（selftest_window_mode 已验证），平行窗不受影响。
+# 16 → 17（2026-11-11）：大角度 ② 标定卡的 action_row 加「重拍某一步…」
+# 一个按钮 —— 让用户只重拍出错的那一步，不必四步全重来。它挂在既有按钮行
+# （不新增一行，selftest_window_mode 已验证窗口高度不变），是 16→17 的
+# 唯一来源；L1 按钮 3→4 仍在 ≤5 内。
+# ⚠️ 前四次放宽（12→13→15→16→17）都是真实功能新增，但**连续放宽会削弱这道闸**；
+#    **后续待办**：把「高级」折叠区的控件单独计一档，而不是每次都抬高整窗上限。
+#    这条警示不因本次放宽而移除。
+# 17 → 18（2026-11-14）：**第五次放宽**，也是唯一一次「按用户明确要求」——
+# 用户原话「标定不要那么限制严苛，要增加 GUI 界面的强制通过指令」。② 标定卡
+# **复用 `:854` 已有的高级折叠区**新增一个 secondary「强制通过标定（仅链路
+# 测试）…」按钮（不新增 header），是真实功能新增（带二次确认 + 质量状态
+# 记录），不是 UI 膨胀；主操作仍恰好 1、window_mode 高度不变。② 卡片其余
+# 可点控件全是必要项（采集/重拍/检查链式输入/放宽/FOV/卷尺/相机名），
+# **无法在不删真实功能、不改 measure() 计数、不钻控件类型空子**的前提下
+# 零净增消化，故只把这一个上限从 17 调到 18。通用 L2_CLICKABLE_MAX 另因
+# ④ 卡片净增 1 从 13 调到 14（见上），L1_INPUTS_MAX / L1_BUTTONS_MAX 不动。
+# ✅ 已按 team-lead 2026-11-14 最终裁决登记（一次做到全绿）。
+ANGLED_L2_CLICKABLE_MAX = 18
 
 
 def walk(widget):
@@ -131,7 +165,7 @@ def collect_texts(win) -> list[str]:
 # 上面的结构判据只守"每步几个控件"，**一个字都不管参数怎么拼**。
 # 而新窗口真正干活的就是那两行：界面选的板参数有没有正确进到
 # `calibrate_stereo.py` 的命令行、录制有没有乱传 `--stereo-mode`。
-# 老窗口（`启动程序.py`）里同一件事有 7 节判据守着（见
+# 老窗口（`apps/gui_main.py`）里同一件事有 7 节判据守着（见
 # `tests/selftest_launcher_params.py` 的第 1/2/2.5/4/5/6/7 节），新窗口却是空的 ——
 # 于是"抽成纯函数 + 在这里盯住"就是补上这个缺口。
 #
@@ -235,6 +269,26 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     check("has_seeds：没有 derived/seeds.json → False；有 → True",
           no_seed and with_seed)
 
+    # 种子里记的球种类：界面据此决定"点选后仍用 color 还是切 specular"。
+    # 旧文件没有该字段 → 空串（读取方按 metal 兼容），坏 json 不许抛。
+    import json as _json
+    from apps._actions import seed_ball_kind
+    with tempfile.TemporaryDirectory() as td:
+        sess = Path(td)
+        (sess / "derived").mkdir()
+        seed = sess / "derived" / "seeds.json"
+        seed.write_text(_json.dumps({"ball_kind": "plastic"}), encoding="utf-8")
+        k_plastic = seed_ball_kind(sess)
+        seed.write_text(_json.dumps({"ball_kind": "metal"}), encoding="utf-8")
+        k_metal = seed_ball_kind(sess)
+        seed.write_text("{}", encoding="utf-8")
+        k_old = seed_ball_kind(sess)
+        seed.write_text("{坏 json", encoding="utf-8")
+        k_bad = seed_ball_kind(sess)
+    check("seed_ball_kind：plastic/metal 原样读，旧文件空串，坏 json 不抛",
+          (k_plastic, k_metal, k_old, k_bad) == ("plastic", "metal", "", ""),
+          f"{k_plastic!r}/{k_metal!r}/{k_old!r}/{k_bad!r}")
+
     rec = record_args(out="data/stereo", duration="10")
     check("录制必须带 --preview（否则录制时没有任何实时画面，且不报错）",
           "--preview" in rec, " ".join(rec))
@@ -289,7 +343,7 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     # 标定要写进"当前装置专属"的 calibration_path，而不是总覆盖 config/stereo_calibration
     # —— 否则换 90° 装置重新标定就把平行装置的标定冲掉了。
     no_out = calibrate_args("joint", {}, "", "", "parallel")
-    check("不传 out 时不带 --out（走脚本默认 config/stereo_calibration）",
+    check("不传 out 时不带 --out（脚本默认跟随激活装置档案的标定路径，不再写死顶层）",
           "--out" not in no_out, " ".join(no_out))
     with_out = calibrate_args("joint", {}, "", "", "parallel",
                               out="config/calib/parallel_rig")
@@ -341,11 +395,12 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
               and _has_seq(c3, ["--pair-frame", str(dirs["pair"]), "--pair-camera", "left"])
               and "--same-board" not in c3 and "--ref-left" not in c3, " ".join(c3))
 
-        # ---- 基线核对 / FOV 复用（2026-11-04）----
-        # 两条都是"档案里的值要真的进命令"：不传等于后端那段物理护栏不执行，
-        # 而它不会报错、只会静默少一项证据。
+        # ---- 基线核对 / FOV 复用（2026-11-04，2026-11-07 改口径）----
+        # 2026-11-07：装置档案不再存"期望基线"，这里验的是**显式传进来的
+        # 单次卷尺测量**（CLI / 经典界面的标定输入框）。它仍是 chain_dual
+        # 物理护栏的开关：不传等于后端那段核对不执行，且不报错、静默少一项证据。
         cb = calibrate_args("chain_dual", {}, "", "", "angled", baseline=124.0)
-        check("chain_dual：档案里的期望基线进 --baseline-mm",
+        check("chain_dual：显式给的基线锚进 --baseline-mm",
               _has_seq(cb, ["--baseline-mm", "124"]), " ".join(cb))
         check("baseline 非法值不拼进命令（否则 argparse 直接 exit 2）",
               "--baseline-mm" not in calibrate_args("joint", {}, "", "", "parallel",
@@ -384,6 +439,21 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
           _has_seq(r_ang, ["--stereo-mode", "angled"]), " ".join(r_ang))
     check("录制：没给模式就不许凭空写 auto（保持脚本默认）",
           "--stereo-mode" not in r, " ".join(r))
+    # 录制格式（2026-11-20）：老界面有 mkv/avi 下拉，新界面此前恒录 mkv。
+    # 只给两档，mp4 刻意不进来（无损编码进 mp4 会被 FFmpeg 静默换有损）。
+    r_avi = record_args(left="left", right="right", duration="10",
+                        out=str(out_dir), container="avi")
+    check("录制：格式选 avi → 命令行带 --container avi（老界面能力补回）",
+          _has_seq(r_avi, ["--container", "avi"]), " ".join(r_avi))
+    check("录制：默认不传 --container（空 = 跟随后端默认 mkv）",
+          "--container" not in r, " ".join(r))
+    _gui_src = (ROOT / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
+    check("③ 录制卡有 mkv/avi 格式下拉（没有 mp4）",
+          "var_container" in _gui_src
+          and 'values=("mkv", "avi")' in _gui_src
+          and 'values=("mkv", "avi", "mp4")' not in _gui_src)
+    check("_start_record 把 var_container 传给 record_args",
+          "container=self.var_container.get()" in _gui_src)
     check("录制：带 --left left --right right --duration 10 --out <目录>",
           _has_seq(r, ["--left", "left", "--right", "right"])
           and _has_seq(r, ["--duration", "10"])
@@ -392,6 +462,54 @@ def _stereo_param_checks() -> list[tuple[str, bool]]:
     check("录制：左右与时长留空 = left/right/10（不传空串）",
           _has_seq(r2, ["--left", "left"])
           and _has_seq(r2, ["--duration", "10"]), " ".join(r2))
+    # 自由采集档（2026-11-21）：空 = 不传；填了才下传。非法值绝不拼进
+    # argparse（"abc" 会让后端 exit 2，用户看到的是参数错误而不是输入错误）。
+    r_free = record_args(left="left", right="right", duration="10",
+                         out=str(out_dir), width="1920", height="1080",
+                         fps="29.97")
+    check("录制：自由宽高/fps 真的下传（29.97 不截断）",
+          _has_seq(r_free, ["--width", "1920"])
+          and _has_seq(r_free, ["--height", "1080"])
+          and _has_seq(r_free, ["--fps", "29.97"]), " ".join(r_free))
+    r_bad = record_args(left="left", right="right", duration="10",
+                        out=str(out_dir), width="", height="abc", fps="0")
+    check("录制：空/非法/0 的采集档不传（交给后端按标定决定）",
+          "--width" not in r_bad and "--height" not in r_bad
+          and "--fps" not in r_bad, " ".join(r_bad))
+    c_free = calibrate_args("joint", {}, "", "", "parallel",
+                            width="1280", height="720", fps="60")
+    check("标定 joint：自由宽高/fps 下传",
+          _has_seq(c_free, ["--width", "1280"])
+          and _has_seq(c_free, ["--height", "720"])
+          and _has_seq(c_free, ["--fps", "60"]), " ".join(c_free))
+    c_chain_free = calibrate_args("chain", {}, "", "", "angled",
+                                  width="1280", height="720", fps="60")
+    check("标定 chain：不传采集档（读图片目录，不是开相机）",
+          "--width" not in c_chain_free and "--height" not in c_chain_free
+          and "--fps" not in c_chain_free, " ".join(c_chain_free))
+    check("_start_record 把三个采集档输入传给 record_args",
+          "width=self.var_cap_width.get()" in _gui_src
+          and "height=self.var_cap_height.get()" in _gui_src
+          and "fps=self.var_cap_fps.get()" in _gui_src)
+    check("_start_calibrate 把三个采集档输入传给 calibrate_args",
+          "width=self.var_cap_width.get()" in _gui_src
+          and "height=self.var_cap_height.get()" in _gui_src
+          and "fps=self.var_cap_fps.get()" in _gui_src)
+    # 注意：这里只看"是否走 _actions"，**不要**用 `"cameras.py" not in 源码`
+    # 判"无字面量" —— 注释/docstring 里提到文件名是允许的，AST 判据在
+    # `_argv_single_source_checks` 里，那里才是"界面不许有脚本字面量"的守卫。
+    check("「使用相机实际模式」走 _actions.camera_modes",
+          "_actions.camera_modes(" in _gui_src)
+    from apps._actions import camera_modes as _camera_modes
+    cm = _camera_modes(left="left", right="right")
+    check("实际模式探测：cameras.py modes --json，按角色解析",
+          any("cameras.py" in x for x in cm) and "modes" in cm
+          and "--json" in cm and _has_seq(cm, ["--left", "left", "--right", "right"]),
+          " ".join(cm))
+    cm_idx = _camera_modes(indices="1,0")
+    check("实际模式探测：显式采集编号走 --indices（不再传角色）",
+          _has_seq(cm_idx, ["--indices", "1,0"]) and "--left" not in cm_idx,
+          " ".join(cm_idx))
     # 2026-10-31：`--out` 的语义改成会话**根**（时间戳子目录由 record_stereo 的
     # `create_session` 建，重名由它加 -01），标签改走 `--label` 进 session.json。
     # 旧断言"标签 → data/<标签>"因此不再成立，换成这两条（口径仍各只有一处）。
@@ -530,6 +648,99 @@ def _mono_seed_checks() -> list[tuple[str, bool]]:
         m_value, m_note = seed_arg_from_file(seed)
         ck("缺 radius 的 seed.json → 不用（半径是 Z 的分母，不能猜）",
            m_value == "" and "radius" in m_note, f"值 {m_value!r}，提示 {m_note!r}")
+    return out
+
+
+def _regression_2026_11_06_static() -> list[tuple[str, bool]]:
+    """2026-11-06 GUI 走查遗留项：**不依赖 Tk** 的那一半回归判据。
+
+    ① ③「开始录制」的禁用与起录判据同源：`_start_record` /
+       `_sync_record_enabled` 都调 `_record_gate`，不各写一份
+       parallel_status/angled_status 分支；
+    ② 「试开这台相机」的 argv 只给 `--indices N`；`camera_quality` 的
+       `resolve_targets` 在只给 indices 时确实走 indices 分支（带
+       left/right 时优先、indices 被忽略）。
+
+    成败**不按退出码**判 —— 该脚本打不开相机也 return 0，这里只验参数
+    形态与目标解析，不碰硬件、不把「退出码 0」当「能出图」的证据。
+    """
+    import argparse
+    import sys
+
+    from apps import _actions
+    from apps.tools import camera_quality as cq
+
+    out: list[tuple[str, bool]] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}")
+        if not ok and detail:
+            print(f"      实际：{detail}")
+        out.append((label, ok))
+
+    print("\n----- 2026-11-06 遗留项回归（源码 / argv，不依赖 Tk）-----")
+
+    # ---- 判据同源：status 分支只许在 _record_gate 一份 ----
+    src = (ROOT / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
+
+    def body(name: str) -> str:
+        head = src.index(f"    def {name}(")
+        tail = src.find("\n    def ", head + 1)
+        return src[head:tail if tail != -1 else len(src)]
+
+    rec = body("_start_record")
+    sync = body("_sync_record_enabled")
+    gate = body("_record_gate")
+    ok_same = ("_record_gate(" in rec and "_record_gate(" in sync
+               and "parallel_status" not in rec and "angled_status" not in rec
+               and "parallel_status" not in sync and "angled_status" not in sync
+               and "parallel_status" in gate and "angled_status" in gate)
+    check("B-181 判据同源：_start_record / _sync_record_enabled 都调"
+          " _record_gate，status 分支只在 _record_gate 一份",
+          ok_same,
+          f"rec含status={('parallel_status' in rec or 'angled_status' in rec)},"
+          f" sync含status={('parallel_status' in sync or 'angled_status' in sync)}")
+
+    # ---- 试开 argv：只含 --indices N ----
+    argv = _actions.camera_probe("0")
+    scripts = [a for a in argv if a.endswith("camera_quality.py")]
+    rest = argv[2:]
+    ok_argv = (len(argv) >= 2 and argv[0] == sys.executable
+               and len(scripts) == 1 and rest == ["--indices", "0"]
+               and "--left" not in argv and "--right" not in argv)
+    check("试开 argv 只含 --indices 0（无 --left/--right、脚本名以外无多余参数）",
+          ok_argv, " ".join(argv))
+
+    # ---- resolve_targets：只给 --indices 时走 indices 分支 ----
+    # 构造 namespace 实调（left/right 留空 → 不碰相机解析），再读源码确认
+    # 「left/right 优先于 indices」这个顺序仍成立（带 left/right 会忽略它）。
+    targets = cq.resolve_targets(
+        argparse.Namespace(left="", right="", indices="0"))
+    cq_src = (ROOT / "apps" / "tools" / "camera_quality.py").read_text(
+        encoding="utf-8")
+    rt = cq_src[cq_src.index("def resolve_targets("):
+                cq_src.index("\ndef main(")]
+    ok_targets = (targets == [(0, "")]
+                  and rt.index("if out:") < rt.index("if args.indices:")
+                  and "return [(int(i)" in rt)
+    check("camera_quality.resolve_targets：只给 --indices 走 indices 分支，"
+          "带 left/right 时优先（忽略 indices）；不用退出码判成功",
+          ok_targets, f"targets={targets}")
+
+    # ---- measure() 首帧预算：显式 ≥ 30 s，别退回库默认 3.0 ----
+    # 独立 Critic 证伪：底层诊断工具只等 3 s 会把慢相机（aoni 首帧 ~23 s）
+    # 报成「打不开」。这里静态钉住，防止以后又被删掉、退回 3 s 把慢相机判死。
+    import inspect
+    import re
+
+    measure_src = inspect.getsource(cq.measure)
+    m = re.search(
+        r"CameraSource\(.*?first_frame_timeout_s\s*=\s*([0-9.]+)",
+        measure_src, re.S)
+    timeout = float(m.group(1)) if m else 0.0
+    check("camera_quality.measure 给 CameraSource 显式传 first_frame_timeout_s ≥ 30"
+          "（防止以后又被删掉、退回 3 s 把慢相机判死）",
+          bool(m) and timeout >= 30.0, f"first_frame_timeout_s={timeout}")
     return out
 
 
@@ -677,7 +888,7 @@ def _ball_settings_checks() -> list[tuple[str, bool]]:
        f"{method_for_kind(BALL_CUSTOM)!r}")
 
     # ---- ① 纯色塑料球 + 红：--method color 且带对应 --preset ----
-    # 预设名取自注册表（`ColorConfig.preset_names()`），不是测试里手写的"red"
+    # 预设名取自注册表（`ColorConfig.preset_choices()`，含 auto），不是测试里手写的"red"
     presets = list(preset_choices())
     red = next((p for p in presets if p.startswith("red")), "")
     m, p = BallSettings.resolve(BALL_PLASTIC, "", red)
@@ -709,9 +920,12 @@ def _ball_settings_checks() -> list[tuple[str, bool]]:
     ck("自定义档的方法候选 == 注册表里的全部检测器（R7：不许手写名字）",
        bool(methods) and set(methods) == set(plugin_names("detector")),
        f"{list(methods)}")
-    ck("颜色预设候选 == ColorConfig.preset_names()（同理：不许手抄颜色清单）",
-       list(preset_choices()) == ColorConfig.preset_names(),
+    ck("颜色取色候选 == ColorConfig.preset_choices()（同理：不许手抄颜色清单）",
+       list(preset_choices()) == ColorConfig.preset_choices(),
        f"{list(preset_choices())}")
+    ck("颜色预设候选里 auto 是第一个（默认最不容易静默 0 检出的一档）",
+       list(preset_choices())[:1] == ["auto"]
+       and "auto" not in ColorConfig.preset_names(), f"{list(preset_choices())[:1]}")
 
     # ---- 预设**显示**：中文标签从预设表推，不是手写的"红=red_ball"字典 ----
     # 判据认的是"能不能从内部名推出来"，不是某几个字长什么样：
@@ -719,8 +933,11 @@ def _ball_settings_checks() -> list[tuple[str, bool]]:
     labels = preset_options(preset_choices())
     ck("预设下拉显示中文（red_ball → 红球），且与预设表一一对应",
        labels.get("红球") == "red_ball" and labels.get("绿球") == "green_ball"
+       and labels.get("自动取色") == "auto"
        and set(labels.values()) == set(preset_choices()),
        f"{labels}")
+    ck("auto 的界面名字是「自动取色」而不是英文/空白",
+       preset_label("auto") == "自动取色")
     ck("没见过的预设名照样显示（退回英文词干，不把它从下拉里藏掉）",
        preset_label("magenta_ball") == "magenta"
        and preset_label("不使用") == "不使用")
@@ -772,26 +989,72 @@ def _ball_settings_checks() -> list[tuple[str, bool]]:
            _has_seq(argv, ["--method", "color", "--preset", "red_ball"])
            and "--stereo-mode" not in argv, " ".join(argv))
 
-        # 有 seeds.json 时必须 specular：--seed-json 只有它读
+        # 2026-11-06 改：有 seeds.json **不再**强制 specular。纯色球的种子应继续
+        # 交给 color（取色 + 半径锚），否则会把能跑的检测器换成跑不动的那个。
         (sess / "derived" / "seeds.json").write_text("{}", encoding="utf-8")
         seeded = SimpleNamespace(path=sess, has_seeds=True)
         argv = offline_cmd(seeded, method="color")
-        ck("工作台：会话里有点选球心 → 强制 specular + --seed-json（种子不被静默丢掉）",
+        ck("工作台：纯色球有点选球心 → 保留 --method color，并把 --seed-json 交给它",
+           _has_seq(argv, ["--method", "color"])
+           and _has_seq(argv, ["--seed-json", str(sess / "derived" / "seeds.json")])
+           and "--method" in argv and argv[argv.index("--method") + 1] == "color",
+           " ".join(argv))
+
+        argv = offline_cmd(seeded, method="specular")
+        ck("工作台：镜面球有点选球心 → --method specular + --seed-json",
            _has_seq(argv, ["--method", "specular"])
            and _has_seq(argv, ["--seed-json", str(sess / "derived" / "seeds.json")]),
            " ".join(argv))
 
         # 行为没变的证据（搬迁不是顺手改命令）：老写法是
         # `offline_stereo(path)` 之后在 GUI 里手工追加 `--method/--seed-json`；
-        # 新写法把这两段交给 `_actions`。两条 argv 必须**逐字相等**（连顺序）。
+        # 新写法把这两段交给 `_actions`。**没给方法**时仍是老行为（specular），
+        # 两条 argv 必须逐字相等（连顺序）。
         old_seeded = _actions.offline_stereo(sess) + [
             "--method", "specular",
             "--seed-json", str(sess / "derived" / "seeds.json")]
         old_plain = _actions.offline_stereo(sess)
-        ck("工作台：有 seeds 时 argv 与改动前逐字相同（顺序也一样）",
+        ck("工作台：有 seeds 且没给方法时 argv 与改动前逐字相同（顺序也一样）",
            old_seeded == offline_cmd(seeded), " ".join(old_seeded[-4:]))
         ck("工作台：无 seeds 且不传参数时，argv 与改动前逐字相同",
            old_plain == offline_cmd(plain), " ".join(old_plain))
+
+    # ---- 门厅「双目实时 3D」：argv 默认值就是"能用实时"的那一份 ----
+    # 守两件事：① 默认必须带 `--detect-width 960`（全分辨率两路检测 35.6 ms，
+    # 帧率会掉到 20 fps 以下，"实时"就名不副实）；② 空串不许变成 `--left ""`
+    # —— 那会让子进程的角色解析报错，而界面上看不出差别。
+    rt = _actions.stereo_realtime_args()
+    ck("门厅：双目实时 argv 默认带 --detect-width 960 与 --max-skew-ms 60",
+       _has_seq(rt, ["--detect-width", "960"])
+       and _has_seq(rt, ["--max-skew-ms", "60"]),
+       " ".join(rt))
+    ck("门厅：双目实时 argv 空值不拼参数（不产生 --left \"\"）",
+       "--left" not in rt and "--right" not in rt and '""' not in rt,
+       " ".join(rt))
+    rt2 = _actions.stereo_realtime_args(left="0", right="2", method="motion")
+    ck("门厅：双目实时 argv 传了相机与方法就原样带上",
+       _has_seq(rt2, ["--left", "0"]) and _has_seq(rt2, ["--right", "2"])
+       and _has_seq(rt2, ["--method", "motion"]),
+       " ".join(rt2[-6:]))
+
+    # ---- 「双目实时 3D」的准入判据：必须走 current_calibration ----
+    # 2026-11-16 用户点按钮得到「还没有可用的双目标定（实验性质平行装置1 不存在）」，
+    # 而 config/calib/实验性质平行装置1.json + .npz **都在** —— 因为我当时写的是
+    # `Path(base).exists()`，而标定基名是**无扩展名**的，`exists()` 恒为假。
+    # 这正是 stereo/profiles.py:597 `calibration_files_exist` 文档里记着的
+    # 「必然误报」（check_stereo_setup.py:198 当年一模一样）。两条一起钉：
+    # ① 唯一判定本身的行为；② 门厅那段代码不许自己再拼一份。
+    import tempfile as _tf
+    from stereo.profiles import calibration_files_exist
+    with _tf.TemporaryDirectory() as _td:
+        _base = Path(_td) / "rigA"
+        _bare = calibration_files_exist(_base) is False
+        _base.with_suffix(".json").write_text("{}", encoding="utf-8")
+        _json = calibration_files_exist(_base) is True
+    ck("标定存在性：<base>.json 存在即算有标定（只判 base.exists() 会恒假）",
+       _bare and _json, f"裸基名={_bare}, 有 .json={_json}")
+    # 「准入不许自己拼 path.exists()」这条判据在下面各窗口的循环里
+    # （要看 `_gui_stereo.py` 的 `_start_realtime_3d`，不是门厅了）。
 
     # ---- 工作台：--method 不许再写死在函数里 ----
     # 这一条守的是"第 167 行写死 specular"那个具体缺陷：写死之后球种类那一栏
@@ -808,6 +1071,51 @@ def _ball_settings_checks() -> list[tuple[str, bool]]:
                      and n.value in ("--method", "--seed-json", "--preset")})
     ck("工作台不再自己拼 --method / --seed-json（跟随球种类，而不是写死）",
        not inline, f"仍在字面量里：{inline}" if inline else "")
+
+    # ---- 2026-11-14 极化清单：物理球直径 / 强制通过标定的 argv 与二次确认 ----
+    # 判据全部打在产出 argv 的那一层（_actions）+ handler 的结构上，不需要 Tk。
+    from apps._actions import calibrate_args
+    import ast as _ast
+    import inspect
+    import textwrap
+    from apps._gui_stereo import StereoWindow
+
+    cmd_d = offline_stereo("s", anchor=True, anchor_diameter_mm="21.6")
+    ck("物理球直径 → --anchor-diameter-mm（勾锚点门且合法才下传）",
+       _has_seq(cmd_d, ["--anchor-gate", "on",
+                        "--anchor-diameter-mm", "21.6"]), " ".join(cmd_d[1:]))
+    ck("锚点门未勾：物理球直径不下传（填了也不生效）",
+       "--anchor-diameter-mm" not in offline_stereo(
+           "s", anchor=False, anchor_diameter_mm="21.6"))
+    for bad in ("", "abc", "-3", "0"):
+        ck(f"物理球直径非法/空（{bad!r}）不拼进命令行，别让 CLI 崩",
+           "--anchor-diameter-mm" not in offline_stereo(
+               "s", anchor=True, anchor_diameter_mm=bad))
+    ck("px 框留空仍走阶梯（GUI 恒走、不加 --no-radius-auto）；CLI 显式关才加",
+       "--no-radius-auto" not in offline_stereo(
+           "s", anchor=True, radius_auto=True)
+       and "--no-radius-auto" in offline_stereo("s", radius_auto=False))
+    ck("--force-save 默认不出现，只有 force_save=True 才加",
+       "--force-save" not in calibrate_args("joint", {}, "", "", "parallel")
+       and "--force-save" in calibrate_args(
+           "joint", {}, "", "", "parallel", force_save=True))
+
+    # 二次确认：--force-save 只在确认通过后出现，且文案三点齐全。
+    # 用 AST 读 _force_calibrate 的源码与字符串常量，不做全文子串碰运气。
+    force_src = textwrap.dedent(inspect.getsource(StereoWindow._force_calibrate))
+    force_tree = _ast.parse(force_src)
+    literals = "".join(n.value for n in _ast.walk(force_tree)
+                       if isinstance(n, _ast.Constant)
+                       and isinstance(n.value, str))
+    ck("强制通过二次确认文案三点齐全（正式路径 / 产物不可用 / 仅链路测试）",
+       all(k in literals for k in (
+           "正式标定路径", "forced_unusable", "仅链路测试", "不得用于数据结论")))
+    ck("--force-save 只在二次确认通过之后才下传（先问、取消就 return）",
+       "askyesno(" in force_src and "if not" in force_src
+       and "return" in force_src
+       and 0 <= force_src.find("askyesno") < force_src.find("force_save=True")
+       and "force_save: bool = False" in inspect.getsource(
+           StereoWindow._start_calibrate))
     return out
 
 
@@ -818,7 +1126,7 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
     一边又内联一份（那正是从前那种漂移）。只要界面文件里再出现 ``"xxx.py"``，
     就说明有人在手工拼命令行，紧接着就是"同一个动作两份参数清单"。
 
-    经典界面（``启动程序.py``）是**已知豁免**：它有 22 处内联，一次改完风险大。
+    经典界面（``apps/gui_main.py``）是**已知豁免**：它有 22 处内联，一次改完风险大。
     但豁免是**棘轮**——只许减少、不许增加，否则它会悄悄长出新的内联 argv。
     """
     import ast
@@ -835,14 +1143,18 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
 
     out: list[tuple[str, bool]] = []
     print("\n----- argv 只有一个产地（apps/_actions.py）-----")
-    for f in sorted((root / "apps").glob("_gui_*.py")):
+    # `tools_dialog.py` 手工列进来：它不叫 `_gui_*`，但同样是界面文件 ——
+    # 2026-11-07 补六条离线流程时新建的，漏扫等于给"内联 argv"留了个后门。
+    gui_files = sorted((root / "apps").glob("_gui_*.py")) + [
+        root / "apps" / "tools_dialog.py"]
+    for f in gui_files:
         hits = py_literals(f)
         ok = not hits
         print(f"  [{'通过' if ok else '不达标'}] {f.name}: 脚本字面量 {len(hits)} 处"
               + ("" if ok else f"（行 {hits[:6]}）"))
         out.append((f"{f.name} 不许手写脚本路径", ok))
 
-    legacy = py_literals(root / "启动程序.py")
+    legacy = py_literals(root / "apps/gui_main.py")
     ok = len(legacy) <= legacy_budget
     print(f"  [{'通过' if ok else '不达标'}] 经典界面内联数 {len(legacy)} ≤ {legacy_budget}"
           "（棘轮：只许减）")
@@ -854,12 +1166,424 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
             "check_stereo_setup.py", "record_mono.py", "run_video.py",
             "run_realtime.py", "view_3d.py", "cameras.py", "capture_board.py",
             "check_dataset.py", "export_visualization.py", "data_manager.py",
-            "calibrate_mono.py", "calibrate_focal.py"]
+            "run_all.py", "calibrate_mono.py", "calibrate_focal.py",
+            # 2026-11-07 补进界面的六条（原先只能在命令行里走）
+            "make_calibration_board.py", "calibrate_color.py",
+            "set_world_frame.py", "export_calibration.py",
+            "export_ball_dataset.py", "train_ball_detector.py"]
     missing = [n for n in need if n not in acts]
     print(f"  [{'通过' if not missing else '不达标'}] 动作模块覆盖 {len(need) - len(missing)}/{len(need)} 个脚本"
           + ("" if not missing else f"（缺 {missing}）"))
     out.append(("_actions 覆盖全部界面动作", not missing))
+
+    # ---- 计划书 M8：一条命令跑完整系统（run_all）必须有 GUI 入口 ----
+    bench_src = (root / "apps" / "_gui_bench.py").read_text(encoding="utf-8")
+    out.append(("工作台有「一键跑全流程」入口",
+                "一键跑全流程" in bench_src and "_run_all_pipeline" in bench_src))
+    out.append(("一键全流程调用 _actions.run_all（不在这里重写三步）",
+                "_actions.run_all(s.path)" in bench_src))
+
+    # 双目第①步的相机行必须用短标签（位置优先），否则两路完整状态一拼
+    # 就会换行，大角度窗内容高出 16 px（selftest_window_mode 的实测）。
+    app_src = (root / "apps" / "_gui_app.py").read_text(encoding="utf-8")
+    stereo_src = (root / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
+    out.append(("相机行用短标签（位置优先，不把完整采集状态塞进第①步）",
+                "def camera_role_short" in app_src
+                and 'camera_role_short("left")' in stereo_src
+                and 'camera_role_text("left")' not in stereo_src))
     return out
+
+
+def _tools_action_checks() -> list[tuple[str, bool]]:
+    """「标定与训练工具」六条动作的 argv 拼装（2026-11-07 补的界面入口）。
+
+    这六条在补之前**只能在命令行里走**：README 把它们写成"下一步做什么"，
+    界面上一个入口都没有。判据钉在这里、而不是"按钮存在"上 —— 新按钮最常见
+    的错不是没画出来，是点了跑的是另一件事（或者把空串原样传下去）。
+    """
+    import ast
+
+    from apps import _actions
+
+    out: list[tuple[str, bool]] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}")
+        if not ok and detail:
+            print(f"      实际：{detail}")
+        out.append((label, ok))
+
+    print("\n----- 标定与训练工具：六条动作的 argv（apps/_actions.py）-----")
+
+    # ① 标定板：填了就进命令行；留空一律不传（落到脚本默认，不落空串）
+    a = _actions.make_board(cols="7", rows="6", square="30")
+    check("标定板：板参数进命令行",
+          _has_seq(a, ["--cols", "7", "--rows", "6", "--square", "30"]), " ".join(a))
+    b = _actions.make_board()
+    check("标定板：留空 = 不传（交给脚本默认 8×5 / 25 mm）",
+          not any(x in b for x in ("--cols", "--rows", "--square", "--page", "--out")),
+          " ".join(b))
+
+    # ② 取色：给了图片就只用图片；什么都没给也必须给一个来源
+    c = _actions.calibrate_color(image="a.png", camera="2")
+    check("取色：给了图片就只用图片（不再带 --camera）",
+          _has_seq(c, ["--image", "a.png"]) and "--camera" not in c, " ".join(c))
+    d = _actions.calibrate_color()
+    check("取色：什么都没给 → --camera 0（不是空 argv：空 argv 会起个立刻退出的进程）",
+          _has_seq(d, ["--camera", "0"]), " ".join(d))
+
+    # ③ 世界坐标系：--image 必填；板参数留空不传；试算只加 --dry-run
+    e = _actions.set_world_frame(image="g.png", cols="9", rows="6", square="40",
+                                 note="地面")
+    check("世界系：图必填 + 板参数进命令行",
+          _has_seq(e, ["--image", "g.png", "--board-cols", "9", "--board-rows", "6",
+                       "--board-square", "40", "--note", "地面"]), " ".join(e))
+    f = _actions.set_world_frame(image="g.png", dry_run=True)
+    check("世界系：试算带 --dry-run，且不带空的板参数",
+          "--dry-run" in f and "--board-cols" not in f and "--note" not in f,
+          " ".join(f))
+
+    # ③b 世界系的符号与标定来源（2026-11-20 补）：以前 GUI 根本没有这两个输入，
+    # Z 朝上/朝下只能手改文件；而符号写错的矩阵"看起来完全正常"。
+    z = _actions.set_world_frame(image="g.png", ground_axis="-z", rig="x")
+    check("世界系：Z 轴方向与标定文件真的进命令行",
+          _has_seq(z, ["--ground-axis", "-z"]) and _has_seq(z, ["--rig", "x"]),
+          " ".join(z))
+    z2 = _actions.set_world_frame(image="g.png", ground_axis="z")
+    check("世界系：Z 朝下也要显式传 --ground-axis z（不靠脚本默认值碰运气）",
+          _has_seq(z2, ["--ground-axis", "z"]), " ".join(z2))
+    blank = _actions.set_world_frame(image="g.png")
+    check("世界系：两项留空 = 一个都不传（落到当前档案 / 脚本默认）",
+          "--ground-axis" not in blank and "--rig" not in blank, " ".join(blank))
+
+    # ④ 导出标定参数
+    g = _actions.export_calibration(calib="c", out="o", formats="json")
+    check("导出标定：目录与格式进命令行",
+          _has_seq(g, ["--calib", "c", "--out", "o", "--formats", "json"]), " ".join(g))
+
+    # ⑤ 数据集：显式会话优先于 --all；两者都不给就不硬塞
+    h = _actions.export_ball_dataset(out="d", session="s1")
+    check("数据集：给了会话就只导它（不再带 --all）",
+          _has_seq(h, ["--session", "s1"]) and "--all" not in h, " ".join(h))
+    i = _actions.export_ball_dataset(out="d")
+    check("数据集：没给会话 → --all", "--all" in i, " ".join(i))
+    j = _actions.export_ball_dataset(all_sessions=False)
+    check("数据集：既没会话也不要全导 → 两个都不传（让脚本自己报缺参数）",
+          "--all" not in j and "--session" not in j, " ".join(j))
+
+    # ⑥ 训练：L3 参数留空一律不传（不在这里重复写脚本默认值）
+    k = _actions.train_ball_detector(data="ds", epochs="80")
+    check("训练：数据集与轮数进命令行",
+          _has_seq(k, ["--data", "ds", "--epochs", "80"]), " ".join(k))
+    m2 = _actions.train_ball_detector()
+    check("训练：参数留空一律不传（少一处默认值就少一处漂移）",
+          not any(x in m2 for x in ("--data", "--epochs", "--imgsz", "--batch",
+                                    "--device", "--out")), " ".join(m2))
+
+    # 界面侧：对话框只许调动作模块，且六条流程都要真的调
+    tree = ast.parse((ROOT / "apps" / "tools_dialog.py").read_text(encoding="utf-8"))
+    lits = [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and n.value.endswith(".py")]
+    check("工具对话框里没有脚本字面量（argv 仍只有 _actions 一个产地）",
+          not lits, str(lits))
+    called = {n.func.attr for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and isinstance(n.func.value, ast.Name) and n.func.value.id == "_actions"}
+    need = {"make_board", "calibrate_color", "set_world_frame", "export_calibration",
+            "export_ball_dataset", "train_ball_detector"}
+    check("工具对话框覆盖全部六条流程（缺 %s）" % sorted(need - called),
+          need <= called, str(sorted(called)))
+
+    # 世界系那一卡的两个新控件必须**真的接到 argv 上**：只加输入框、不往下传，
+    # 用户填了等于没填（本仓库最常见的缺陷形态）。
+    kw = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "set_world_frame"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "_actions"):
+            kw |= {k.arg for k in node.keywords}
+    check("工具对话框把 ground_axis / rig 真的传给 set_world_frame（缺 %s）"
+          % sorted({"ground_axis", "rig"} - kw),
+          {"ground_axis", "rig"} <= kw, str(sorted(kw)))
+
+    # 「Z 轴朝上/朝下」必须是下拉里的两个候选（写在说明里不算控件）。
+    combos = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and n.func.attr == "param_combo"]
+    axis_combo = None
+    for call in combos:
+        for arg in call.args:
+            if (isinstance(arg, ast.List)
+                    and {getattr(e, "value", None) for e in arg.elts} == {"-z", "z"}):
+                axis_combo = call
+    check("工具台有「世界 Z 轴 -z / z」下拉（控件存在，不是只有说明文字）",
+          axis_combo is not None, str([ast.unparse(c)[:60] for c in combos]))
+    return out
+
+
+def _realtime_source_checks() -> list[tuple[str, bool]]:
+    """实时双目落的会话在「读」这一侧的三件事（2026-11-17 用户要求）。
+
+    实时窗退出时会往 ``data/stereo/<模式>/<时间戳>/`` 落一段会话（有
+    ``derived/`` 三样产物、**没有原始左右录像**）。用户的原话是"实时双目也要
+    能在数据管理里看到、能在 3D 查看器里打开"，所以这里钉三条**可见性**判据：
+
+    ① ``scan_items`` 把 ``session.json`` 的 ``source`` 读进 ``SessionItem``
+       —— 读不到的话数据管理里就跟普通录制会话一模一样，没法区分；
+    ② 名称列加「实时 ·」前缀，且**只改显示、不改 label**（搜索/导出仍按原名）；
+    ③ 第④步「跑离线三维」在 GUI 里**先拦**：实时会话没有原始视频，
+       ``run_stereo_video`` 会 validate 失败退出，用户白等一次进程启动。
+
+    ③ 另有一条**结构**判据（AST）：拦截调用必须在函数体里**所有**
+    ``tasks.start(`` 之前 —— 光断言"函数返回非空"不管接线，删掉那三行
+    也照样是绿的。
+    """
+    import ast
+    import json
+    import shutil
+    import tempfile
+
+    from apps import _data_export
+
+    out: list[tuple[str, bool]] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}")
+        if not ok and detail:
+            print(f"      实际：{detail}")
+        out.append((label, ok))
+
+    print("\n----- 实时会话（source=realtime）在数据管理/双目窗里的可见性 -----")
+
+    base = Path(tempfile.mkdtemp(prefix="selftest-realtime-"))
+    try:
+        rt = base / "parallel" / "20261117-100000"
+        rt.mkdir(parents=True)
+        (rt / "session.json").write_text(json.dumps({
+            "schema": "sphere-stereo-session", "version": 1, "id": "x",
+            "created": "2026-11-17T10:00:00", "source": "realtime",
+            "label": "测试", "left": {}, "right": {},
+        }, ensure_ascii=False), encoding="utf-8")
+        plain = base / "parallel" / "20261117-110000"
+        plain.mkdir(parents=True)
+        (plain / "session.json").write_text(json.dumps({
+            "schema": "sphere-stereo-session", "version": 1, "id": "y",
+            "created": "2026-11-17T11:00:00", "label": "普通录制",
+            "left": {}, "right": {},
+        }, ensure_ascii=False), encoding="utf-8")
+
+        items = {it.path.name: it for it in _data_export.scan_items(base)}
+        got = items.get("20261117-100000")
+        ref = items.get("20261117-110000")
+        check("scan_items 把 session.json 的 source 读进 SessionItem",
+              got is not None and got.source == "realtime",
+              repr(getattr(got, "source", "<没扫到>")))
+
+        from apps.data_manager import name_cell_text
+        check("名称列对实时会话加「实时 ·」前缀（不改 label 本身）",
+              got is not None and name_cell_text(got) == "实时 · 测试"
+              and got.label == "测试",
+              repr(getattr(got, "label", "")) + " / "
+              + repr(name_cell_text(got) if got is not None else ""))
+        check("普通会话（session.json 没有 source 键）名称原样、source 为空串",
+              ref is not None and name_cell_text(ref) == "普通录制"
+              and ref.source == "",
+              repr((getattr(ref, "source", "?"),
+                    name_cell_text(ref) if ref is not None else "")))
+
+        from apps._gui_stereo import realtime_session_blocker
+        why = realtime_session_blocker(rt)
+        check("第④步前置判据：实时会话被拦住，且说清「不能重跑」",
+              bool(why) and "不能重跑" in why, repr(why))
+        check("第④步前置判据：普通会话放行（返回空串）",
+              realtime_session_blocker(plain) == "",
+              repr(realtime_session_blocker(plain)))
+        broken = base / "broken"
+        broken.mkdir()
+        (broken / "session.json").write_text("{不是 json", encoding="utf-8")
+        check("第④步前置判据：session.json 坏了当普通会话（不误拦）",
+              realtime_session_blocker(broken) == "",
+              repr(realtime_session_blocker(broken)))
+        check("第④步前置判据：目录里根本没有 session.json 也放行"
+              "（由 run_stereo_video 报更具体的问题）",
+              realtime_session_blocker(base / "no-such-dir") == "",
+              repr(realtime_session_blocker(base / "no-such-dir")))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+    # 结构判据：拦截必须真的接在 `_start_offline` 里、在起子进程之前。
+    tree = ast.parse((ROOT / "apps" / "_gui_stereo.py").read_text(encoding="utf-8"))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_start_offline"),
+              None)
+    guard = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "realtime_session_blocker"] if fn else []
+    starts = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Attribute) and n.func.attr == "start"
+              and isinstance(n.func.value, ast.Attribute)
+              and n.func.value.attr == "tasks"] if fn else []
+    check("_start_offline 里调用了 realtime_session_blocker",
+          bool(guard), "没找到调用")
+    check("拦截调用在**全部** tasks.start( 之前（删掉就红）",
+          bool(guard) and bool(starts) and max(guard) < min(starts),
+          f"guard={guard} starts={starts}")
+    return out
+
+
+def _status_symbol_checks() -> list[tuple[str, bool]]:
+    """数据管理的状态符号要覆盖「◑ 三维点过少」（2026-11-18 用户报的 bug）。
+
+    用户原话是"有 3D 处理后的数据和视频的没有 ✔ 的状态符号，没有的反而有"。
+    根因有两层：① `seeds.json`（输入）被当成 ✓ 的闸门；② 匹配点只有一两个
+    也报 ✓。第二层修完以后多出一个中间态 `traj_thin`（◑），数据管理的
+    筛选下拉 + 图例 + 过滤映射三处都要跟上，否则用户按「✓ 有3D」筛，
+    那些根本画不出轨迹的会话仍然混在里面。
+
+    这里用源码扫描（这些文案是 `data_manager.py` 方法内的局部常量，
+    没有模块级符号可 import），符号源仍从 `_workbench.STATUS_SYMBOLS` 取，
+    保证"两套图标各说各话"不会再发生。
+    """
+    from apps._workbench import STATUS_SYMBOLS
+
+    src = (ROOT / "apps" / "data_manager.py").read_text(encoding="utf-8")
+    out: list[tuple[str, bool]] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}")
+        if not ok and detail:
+            print(f"      实际：{detail}")
+        out.append((label, ok))
+
+    print("\n----- 数据管理状态符号（◑ 三维点过少）-----")
+    start = src.find("self.status_legend")
+    legend = src[start:start + 1200] if start != -1 else ""
+    has_option = '"◑ 三维点过少"' in src
+    has_mapping = '"◑ 三维点过少": "traj_thin"' in src
+    legend_ok = "◑ 三维点过少 →" in legend
+    symbol_ok = STATUS_SYMBOLS.get("traj_thin") == "◑"
+    check("状态下拉含「◑ 三维点过少」，图例文本含 ◑，过滤映射到 traj_thin，"
+          "符号与 STATUS_SYMBOLS 一致",
+          has_option and has_mapping and legend_ok and symbol_ok,
+          f"option={has_option} mapping={has_mapping} legend={legend_ok} "
+          f"symbol={STATUS_SYMBOLS.get('traj_thin')!r}")
+    # 2026-11-18：`—` 从"空目录"改成真会出现的"没录成（0 帧且零产物）"。
+    # 图例必须跟着判据一起改，否则用户按老说法去翻空目录，永远找不到那段会话。
+    check("图例把「—」解释为「没录成」而不是「空目录」（与 empty 判据同步）",
+          "没录成" in legend and "空目录" not in legend,
+          f"legend={legend!r}")
+    return out
+
+
+def _legacy_deprecation_checks() -> list[tuple[str, bool]]:
+    """经典界面必须保持「入口废止」（2026-11-20 用户裁决）。
+
+    为什么放进本测试：门厅按钮、``gui_main.main()`` 与 ``run.bat`` 是三个
+    不同入口，任何一个被顺手接回去，用户就会重新看到旧流程 —— 这件事
+    **不会报错**，只会"多一个入口"。旧实现仍保留（多个回归测试按文本与
+    导入引用它），所以这里守的是**可达性**，不是"文件存不存在"。
+
+    旧界面的 AVI 录制格式下拉不再可用（新界面录制不传 `--container`，恒录
+    mkv）；raw 视频仍可从「数据管理 → 查看原始视频」进入。要恢复任何一项，
+    必须先在 `docs/决策记录.md` 改 2026-11-20 的决策，而不是只改这里一行。
+    """
+    print("\n----- 经典界面：入口必须保持废止（2026-11-20）-----")
+    hub_src = (ROOT / "apps" / "_gui_app.py").read_text(encoding="utf-8")
+    main_src = (ROOT / "apps" / "gui_main.py").read_text(encoding="utf-8")
+    bat_src = (ROOT / "run.bat").read_text(encoding="utf-8-sig",
+                                            errors="replace")
+    # rem 行里可以写历史说明；判据只看真正会执行的正文。
+    bat_body = "\n".join(ln for ln in bat_src.splitlines()
+                         if not ln.strip().lower().startswith("rem"))
+
+    def hub_ok(src: str) -> bool:
+        """看**真实调用**，不看文本 —— docstring 里解释「不调 tasks.start」
+        不该把自己判红（第一版就这么误报过一次）。"""
+        import ast as _ast
+
+        tree = _ast.parse(src)
+        fn = next(n for n in _ast.walk(tree)
+                  if isinstance(n, _ast.FunctionDef) and n.name == "_open_legacy")
+
+        def dotted(call: _ast.Call) -> str:
+            parts: list[str] = []
+            cur = call.func
+            while isinstance(cur, _ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, _ast.Name):
+                parts.append(cur.id)
+            return ".".join(reversed(parts))
+
+        names = [dotted(n) for n in _ast.walk(fn) if isinstance(n, _ast.Call)]
+        # 钉**真正创建按钮的那一行**，不是"源码里出现过这个词"：
+        # 注释与弹窗标题里也有「已废止」，那样写反向自证会失效。
+        button = ('self.surface.secondary(row2, "经典界面（已废止）", '
+                  'self._open_legacy)')
+        return (button in src
+                and any(n.endswith("showinfo") for n in names)
+                and not any(n.endswith("tasks.start") for n in names)
+                and not any("legacy_gui" in n for n in names))
+
+    def main_ok(src: str) -> bool:
+        body = src[src.index("def main("):]
+        return ('if "--legacy" in args:' in body
+                and "return 2" in body
+                and "Launcher().mainloop()" not in body)
+
+    def bat_ok(src: str) -> bool:
+        start = src.index(":ui_legacy")
+        body = src[start:src.index("\n:ui_cli", start)]
+        return "已废止" in body and "gui_main.py --legacy" not in body
+
+    actions_src = (ROOT / "apps" / "_actions.py").read_text(encoding="utf-8")
+    results = [
+        ("门厅按钮写明「经典界面（已废止）」", "经典界面（已废止）" in hub_src),
+        ("点击「经典界面」只弹提示、不起任务", hub_ok(hub_src)),
+        ("`--legacy` 被 main() 明确拒绝（不启动 Launcher）", main_ok(main_src)),
+        ("`run.bat legacy` 只打印提示、不再起旧界面", bat_ok(bat_body)),
+        ("`_actions` 里没有 legacy_gui 第二入口",
+         "def legacy_gui" not in actions_src),
+    ]
+
+    # ---- 反向自证：三个入口各接回一处，判据必须红（不是空转）----
+    hub_start = hub_src.index("def _open_legacy(")
+    hub_end = hub_src.index("\n    def ", hub_start + 1)
+    broken_hub = (hub_src[:hub_start]
+                  + hub_src[hub_start:hub_end].replace(
+                      "        from tkinter import messagebox\n",
+                      "        self.app.tasks.start([], \"x\")\n"
+                      "        from tkinter import messagebox\n", 1)
+                  + hub_src[hub_end:])
+    main_at = main_src.index("def main(")
+    broken_main = (main_src[:main_at]
+                   + main_src[main_at:].replace(
+                       "        return 2\n", "        Launcher().mainloop()\n", 1))
+    bat_start = bat_body.index(":ui_legacy")
+    bat_end = bat_body.index("\n:ui_cli", bat_start)
+    broken_bat = (bat_body[:bat_start]
+                  + bat_body[bat_start:bat_end].replace(
+                      "exit /b 0", '"%PY%" apps\\gui_main.py --legacy', 1)
+                  + bat_body[bat_end:])
+    results += [
+        ("反向：把 tasks.start 加回 _open_legacy → 判据会红",
+         not hub_ok(broken_hub)),
+        ("反向：让 --legacy 重新 mainloop → 判据会红",
+         not main_ok(broken_main)),
+        ("反向：让 run.bat legacy 重新起旧界面 → 判据会红",
+         not bat_ok(broken_bat)),
+        ("反向：按钮名称改回「过渡」→ 判据会红",
+         not hub_ok(hub_src.replace(
+             'self.surface.secondary(row2, "经典界面（已废止）", '
+             'self._open_legacy)',
+             'self.surface.secondary(row2, "经典界面（过渡）", '
+             'self._open_legacy)', 1))),
+    ]
+    for name, ok in results:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return results
 
 
 def main() -> int:
@@ -872,8 +1596,13 @@ def main() -> int:
     results: list[tuple[str, bool]] = _stereo_param_checks()
     results += _ball_settings_checks()
     results += _argv_single_source_checks()
+    results += _tools_action_checks()
+    results += _realtime_source_checks()
+    results += _status_symbol_checks()
     results += _mono_session_checks()
     results += _mono_seed_checks()
+    results += _regression_2026_11_06_static()
+    results += _legacy_deprecation_checks()
 
     try:
         from apps._gui_app import App
@@ -894,7 +1623,48 @@ def main() -> int:
                    ("stereo(parallel)", app.open_stereo("parallel")),
                    ("stereo(angled)", app.open_stereo("angled")),
                    ("console", app.open_console())]
+        # 「标定与训练」工具台（2026-11-07 新窗口）：**必须进同一套预算与文案判据**。
+        # 不进的话它就是"没人量的那一屏"—— 实测这条加进来之前，卡片说明里的
+        # `**` 星号（B-96 同型）就原样印在截图上了。
+        app.hub._open_tools()
+        _tools = getattr(app.hub, "_tools_window", None)
+        if _tools is not None and _tools.winfo_exists():
+            windows.append(("tools", _tools))
+        else:                                               # 开不出来本身就是缺陷
+            results.append(("请点「工具 · 标定与训练…」能把工具台开出来", False))
         app.update_idletasks()
+
+        # ---- 2026-11-07：平行 / 大角度第②步不许再是同一套标定设计 ----
+        # 用户两次纠正，最终口径：平行**只有「目标对数」**（收够就停），
+        # 不许出现任何覆盖约束 ——「五个角都要拍到 / 5/5 全绿」是上一轮我
+        # 加错的：既然收够对数就停，再挂一个"必须集齐五个角"自相矛盾，
+        # 而且后端挑帧根本没有这条门限。分化线 / 4/5 放宽属于大角度链式，
+        # 同样不许出现在平行窗。大角度一侧保持不动。
+        by_name = dict(windows)
+        def _card_text(win) -> str:
+            return " ".join(collect_texts(win))
+        def _parallel_ok(text: str) -> bool:
+            return ("目标对数" in text
+                    and not any(bad in text for bad in (
+                        "五个角", "5/5", "4/5", "分化线", "全绿", "覆盖要求")))
+        p_txt = _card_text(by_name["stereo(parallel)"])
+        a_txt = _card_text(by_name["stereo(angled)"])
+        shared = "目标对数 分化线 张 （拍够后 4/5 即可；之前要求 5/5 全绿）"
+        for label, ok in (
+            ("平行第②步只有「目标对数」，没有任何覆盖/5角/4-5 限制",
+             _parallel_ok(p_txt)),
+            ("大角度第②步保留「分化线 / 4/5 即可」（本次不许被改）",
+             "分化线" in a_txt and "4/5 即可" in a_txt),
+            # 反证：把上一版"5/5 全绿"或"共用文案"喂回来，判据必须变红。
+            ("反向：写回「五个角都要拍到，5/5 全绿」会被抓到",
+             not _parallel_ok("目标对数 张 （五个角都要拍到，5/5 全绿；收够就停）")),
+            ("反向：共用文案（分化线 + 4/5 放宽）会被平行判据抓到",
+             not _parallel_ok(shared)),
+            ("反向：平行文案漏掉「目标对数」也会被抓到",
+             not _parallel_ok("（收够就停，没有覆盖要求）")),
+        ):
+            print(f"  [{'通过' if ok else '不达标'}] {label}")
+            results.append((label, ok))
 
         for name, win in windows:
             print(f"\n----- {name} -----")
@@ -965,6 +1735,67 @@ def main() -> int:
             ok = "相机" in texts
             print(f"  [{'通过' if ok else '不达标'}] {name} 第①步显示相机身份")
             results.append((f"{name} 第①步显示相机身份", ok))
+
+        # 「实时 3D」必须在**每种双目窗口自己的第③步**（2026-11-16 用户裁决：
+            # 实时与离线是同一套装置的两种处理方式，不属于门厅的跨模式工具）。
+            # 除了"按钮在"，还要钉两件事：绑了命令；准入走 current_calibration
+            # 而不是自己 Path().exists()（标定基名无扩展名，只判 exists 恒为假）。
+            if name.startswith("stereo"):
+                _rt = getattr(win, "btn_realtime", None)
+                _ok_btn = (_rt is not None
+                           and str(_rt.cget("text")).startswith("实时 3D")
+                           and bool(str(_rt.cget("command"))))
+                print(f"  [{'通过' if _ok_btn else '不达标'}] "
+                      f"{name} 第③步有「实时 3D」按钮且已绑命令")
+                results.append((f"{name} 第③步有「实时 3D」入口", _ok_btn))
+                _gs = (ROOT / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
+                _a = _gs.index("def _start_realtime_3d")
+                _b = _gs.index("def _sync_record_enabled", _a)
+                _seg = _gs[_a:_b]
+                _ok_gate = ("current_calibration(" in _seg
+                            and "path.exists()" not in _seg
+                            and "_record_gate()" in _seg)
+                print(f"  [{'通过' if _ok_gate else '不达标'}] "
+                      f"{name} 实时 3D 的准入复用 current_calibration + _record_gate")
+                results.append((f"{name} 实时 3D 准入判据", _ok_gate))
+                # 分辨率必须跟着**这套标定**走：内参是像素量纲的，喂错档后端
+                # 只会 exit 2；而大角度 2560x1440 / 平行 1920x1080 本来就不同档，
+                # 不传等于让用户自己去翻标定文件。
+                _ok_size = "image_size" in _seg
+                _arg_ok = ("stereo_realtime_args(" in _seg
+                           and "width=" in _seg and "height=" in _seg)
+                print(f"  [{'通过' if (_ok_size and _arg_ok) else '不达标'}] "
+                      f"{name} 实时 3D 按标定 image_size 传分辨率")
+                results.append((f"{name} 实时 3D 分辨率跟随标定",
+                                _ok_size and _arg_ok))
+                # **行为判据**：球种类/预设要真的传到 argv（2026-11-17 用户实测
+                # "塑料球和金属球都检不出来"—— 按钮原来只传 --method color、
+                # 不传 --preset，于是永远吃白球默认阈值；镜面球则根本不该启动）。
+                _ready, _ = win._record_gate()
+                _got: list = []
+                _orig_start = win.app.tasks.start
+                win.app.tasks.start = lambda cmd, title, **k: _got.append(cmd)
+                try:
+                    win._start_realtime_3d()
+                finally:
+                    win.app.tasks.start = _orig_start
+                if not _ready:
+                    _ok_rt = not _got        # 标定不配这个窗 → 一个任务都不许起
+                    _why_txt = "未就绪时拦住了"
+                elif win.ball.method() == "specular":
+                    _ok_rt = not _got        # 镜面球实时必然 0 检出 → 拦住
+                    _why_txt = "镜面球拦住了"
+                else:
+                    _cmd = _got[-1] if _got else []
+                    _m = win.ball.method()
+                    _p = win.ball.preset()
+                    _ok_rt = (_has_seq(_cmd, ["--method", _m])
+                              and (("--preset" in _cmd) == bool(_p))
+                              and (not _p or _has_seq(_cmd, ["--preset", _p])))
+                    _why_txt = f"method={_m} preset={_p or '(空)'}"
+                print(f"  [{'通过' if _ok_rt else '不达标'}] "
+                      f"{name} 实时 3D 把球种类/预设传下去（{_why_txt}）")
+                results.append((f"{name} 实时 3D 传球种类与预设", _ok_rt))
 
         # ---------- 单目窗：球径留空时命令行到底传了什么 ----------
         # 守的坑（2026-10-29）：三处 ``or "40"`` 兜底让"界面显示 21.6、命令行
@@ -1253,18 +2084,59 @@ def main() -> int:
                 mono.var_focal.set("")
                 mono.var_diameter.set("21.6")   # 2026-11-03：球径无默认值，必须先填才能起任务
 
+                from apps._gui_widgets import BALL_METAL, BALL_PLASTIC
+
                 captured.clear()
-                mono.var_detector.set("color")      # 用户没动检测器：默认 color
+                # 镜面球 + 种子：必须用 specular（种子初始化 CSRT）。
+                mono.ball.set_kind(BALL_METAL)
                 mono._start_video()
                 cmd = captured[0] if captured else []
                 got_seed = cmd[cmd.index("--seed") + 1] if "--seed" in cmd else ""
                 got_m = cmd[cmd.index("--method") + 1] if "--method" in cmd else ""
                 ok_seed = (got_seed == "812,530,91" and got_m == "specular"
                            and mono.var_detector.get() == "specular")
-                print(f"  [{'通过' if ok_seed else '不达标'}] 有 seed.json → 命令行 "
+                print(f"  [{'通过' if ok_seed else '不达标'}] 镜面球 + seed.json → 命令行 "
                       f"--seed {got_seed or '(缺失)'} 且 --method "
                       f"{got_m or '(缺失)'}（下拉也同步成 {mono.var_detector.get()!r}）")
-                results.append(("有种子时命令行带 --seed 且检测器 specular", ok_seed))
+                results.append(("镜面球有种子时命令行带 --seed 且检测器 specular", ok_seed))
+
+                # 纯色球 + 种子：**不许**换成 specular；种子交给 color 取色/锚半径。
+                # 2026-11-06 之前这里会被强制成 specular，纯色球点选后反而 0 检出。
+                captured.clear()
+                mono.ball.set_kind(BALL_PLASTIC)
+                mono.var_preset.set("red_ball")
+                mono._start_video()
+                cmd = captured[0] if captured else []
+                got_seed = cmd[cmd.index("--seed") + 1] if "--seed" in cmd else ""
+                got_m = cmd[cmd.index("--method") + 1] if "--method" in cmd else ""
+                ok_plastic_seed = (got_seed == "812,530,91" and got_m == "color"
+                                   and mono.var_detector.get() == "color")
+                print(f"  [{'通过' if ok_plastic_seed else '不达标'}] 纯色球 + seed.json → "
+                      f"--method {got_m or '(缺失)'}（**不换 specular**）、"
+                      f"--seed {got_seed or '(缺失)'}")
+                results.append(("纯色球有种子时仍用 color（种子取色/锚半径）", ok_plastic_seed))
+
+                # 打开一段会话时，seed.json 的 ball_kind 要能恢复球种类：
+                # 旧文件没字段 → metal（兼容）；plastic → 纯色球。
+                seed.write_text(json.dumps({
+                    "x": 812, "y": 530, "radius": 91, "frame": 0,
+                    "image_size": [1920, 1080],
+                    "created": "2026-01-02 00:00:00",
+                    "ball_kind": "plastic"}, ensure_ascii=False), encoding="utf-8")
+                mono._seed_kind_for = None
+                mono._apply_seed_kind(sess)
+                ok_restore_plastic = mono.ball.kind() == BALL_PLASTIC
+                seed.write_text(json.dumps({
+                    "x": 812, "y": 530, "radius": 91, "frame": 0,
+                    "image_size": [1920, 1080],
+                    "created": "2026-01-02 00:00:00"}, ensure_ascii=False),
+                    encoding="utf-8")
+                mono._seed_kind_for = None
+                mono._apply_seed_kind(sess)
+                ok_restore_old = mono.ball.kind() == BALL_METAL
+                print(f"  [{'通过' if ok_restore_plastic and ok_restore_old else '不达标'}] "
+                      f"打开会话时按 seed.json 恢复球种类：plastic→纯色、旧文件→金属")
+                results.append(("按 seed.json 恢复球种类", ok_restore_plastic and ok_restore_old))
 
                 # 反向：把文件删掉 → 不许再带 --seed。
                 # 否则就是"跟踪一个不存在的位置"，而且界面不会有任何提示。
@@ -1343,6 +2215,23 @@ def main() -> int:
                       f"{_val(cmd, '--ball-diameter') or '(缺失)'}（mm→m 换算是 0.03）")
                 results.append(("球种类：镜面球 → specular 且不带 preset", ok_metal))
                 results.append(("切球种类不改动球直径", ok_keep))
+
+                # 镜面球时「颜色预设」下拉必须显示「不使用」：只把值留成 red_ball、
+                # 靠 resolve 不传，界面上仍写着"红球"，用户会以为红球在生效。
+                mono.var_preset.set("red_ball")
+                mono.ball.set_kind(BALL_METAL)
+                hidden_label = mono.ball._var_preset_label.get()
+                ok_preset_hide = (hidden_label == "不使用"
+                                  and mono.ball.preset() == "")
+                mono.ball.set_kind(BALL_PLASTIC)
+                ok_preset_back = (mono.ball._var_preset_label.get() == "红球"
+                                  and mono.ball.preset() == "red_ball")
+                print(f"  [{'通过' if ok_preset_hide else '不达标'}] 镜面球时预设下拉"
+                      f"显示「{hidden_label}」、不传 --preset")
+                print(f"  [{'通过' if ok_preset_back else '不达标'}] 切回纯色球后"
+                      f"恢复原选择「{mono.ball._var_preset_label.get()}」")
+                results.append(("镜面球时预设显示不使用", ok_preset_hide))
+                results.append(("切回纯色球恢复预设", ok_preset_back))
 
                 # 预设：下拉显示中文、变量里仍是内部名（argv 只认 red_ball）
                 mono.ball._var_preset_label.set("红球")
@@ -1454,6 +2343,210 @@ def main() -> int:
         print(f"  [{'通过' if ok_cls else '不达标'}] 会话选择器可导入")
         results.append(("会话扫描可用", ok_scan))
         results.append(("会话选择器可导入", ok_cls))
+
+        # ---------- 2026-11-06 GUI 走查遗留项：需要窗口的回归判据 ----------
+        # 放在既有判据之后：这些会改 btn_record / mono._session / ball 状态，
+        # 前面的结构判据量的是初始界面，不能被它们污染。
+        def tcheck(label: str, ok: bool, detail: str = "") -> None:
+            print(f"  [{'通过' if ok else '不达标'}] {label}")
+            if not ok and detail:
+                print(f"      实际：{detail}")
+            results.append((label, ok))
+
+        print("\n----- 2026-11-06 遗留项回归（窗口）-----")
+        import json as _json
+        import tempfile
+        from unittest.mock import patch
+
+        from apps._gui_widgets import BALL_METAL, BALL_PLASTIC
+        from sphere_tracker.camera_registry import Registry, RoleSpec
+
+        wins = dict(windows)
+        # 2026-11-20：录制门禁现在也要求相机角色有**实测采集索引**。
+        # 这两张表只替换 `load_registry()` 的返回值，不碰真实 config/cameras.json。
+        fake_reg = Registry(roles={
+            "left": RoleSpec(name="aoni left", capture_index=0, location="床"),
+            "right": RoleSpec(name="aoni", capture_index=1, location="阳台门"),
+        })
+        null_cap_reg = Registry(roles={
+            "left": RoleSpec(name="aoni left", location="床"),
+            "right": RoleSpec(name="aoni", location="阳台门"),
+        })
+
+        # ① B-181 录制门禁：_refresh_state 同步的 btn_record 跟着 _record_gate 走。
+        # 打桩 AppState.parallel_status / angled_status（返回 (bool, str)），
+        # 不去真读 config 里的标定档案。
+        gate_ok = True
+        gate_detail: list[str] = []
+        for _mode, _key, _status in (
+                ("parallel", "stereo(parallel)", "parallel_status"),
+                ("angled", "stereo(angled)", "angled_status")):
+            w = wins[_key]
+            with patch("sphere_tracker.camera_registry.load_registry",
+                       return_value=fake_reg), \
+                    patch.object(app.state, _status,
+                                 return_value=(False, "**不匹配**")):
+                w._refresh_state()
+                off_state = tuple(w.btn_record.state())
+                off_text = str(w.btn_record.cget("text"))
+            with patch("sphere_tracker.camera_registry.load_registry",
+                       return_value=fake_reg), \
+                    patch.object(app.state, _status, return_value=(True, "")):
+                w._refresh_state()
+                on_state = tuple(w.btn_record.state())
+                on_text = str(w.btn_record.cget("text"))
+                on_cfg = str(w.btn_record.cget("state"))
+            part = ("disabled" in off_state and "标定" in off_text
+                    and "disabled" not in on_state
+                    and ("normal" in on_cfg or on_text == "开始录制"))
+            gate_ok = gate_ok and part
+            gate_detail.append(
+                f"{_mode}: off=({off_state},{off_text}) "
+                f"on=({on_state},{on_text},{on_cfg})")
+        tcheck("B-181 录制门禁：标定不匹配时 btn_record 禁用且文字带「标定」，"
+               "匹配时 normal /「开始录制」（由 _refresh_state 同步）",
+               gate_ok, "；".join(gate_detail))
+
+        # 采集索引未实测：即使标定就绪，录制也必须禁用，且按钮指向**相机**
+        # 而不是错误地写"先解决标定"。
+        w = wins["stereo(parallel)"]
+        with patch("sphere_tracker.camera_registry.load_registry",
+                   return_value=null_cap_reg), \
+                patch.object(app.state, "parallel_status", return_value=(True, "")):
+            w._refresh_state()
+            null_state = tuple(w.btn_record.state())
+            null_text = str(w.btn_record.cget("text"))
+        tcheck("采集索引未实测 -> 录制禁用，按钮指向「先确认相机」",
+               "disabled" in null_state and "先确认相机" in null_text,
+               f"state={null_state} text={null_text}")
+
+        # 用户显式填纯数字采集索引 -> 那是他自己的选择，不该被角色门禁误拦。
+        w.var_left.set("0")
+        w.var_right.set("2")
+        try:
+            with patch("sphere_tracker.camera_registry.load_registry",
+                       return_value=null_cap_reg), \
+                    patch.object(app.state, "parallel_status", return_value=(True, "")):
+                w._refresh_state()
+                num_state = tuple(w.btn_record.state())
+                num_text = str(w.btn_record.cget("text"))
+            tcheck("显式数字采集索引不被角色 capture_index 门禁误拦",
+                   "disabled" not in num_state, f"state={num_state} text={num_text}")
+        finally:
+            w.var_left.set("left")
+            w.var_right.set("right")
+            with patch("sphere_tracker.camera_registry.load_registry",
+                       return_value=fake_reg):
+                w._refresh_state()
+
+        # ③ 无种子会话球种类复位（双目 _set_session / 单目 _apply_seed_kind）。
+        # 全部用 tempfile，且双目/单目各用独立子根：单目 scan_mono_sessions 会
+        # 扫子根的全部直接子目录，混在一起会互相干扰。
+        with tempfile.TemporaryDirectory(prefix="gui_reset_") as _td:
+            _root = Path(_td)
+            _sr = _root / "stereo"
+            _mr = _root / "mono"
+            _sr.mkdir()
+            _mr.mkdir()
+
+            # 双目：_set_session 是会话选择器的 on_pick 回调，直接调它。
+            sw = wins["stereo(parallel)"]
+            p_no_seed = _sr / "no_seed"
+            p_no_seed.mkdir()
+            sw.ball.set_kind(BALL_METAL)
+            sw._set_session(str(p_no_seed))
+            s_kind = sw.ball.kind()
+            s_note = str(sw.status._label.cget("text"))
+            s_reset = (s_kind == BALL_PLASTIC and "复位" in s_note)
+
+            p_seeded = _sr / "seeded"
+            (p_seeded / "derived").mkdir(parents=True)
+            seeds = p_seeded / "derived" / "seeds.json"
+            sw.ball.set_kind(BALL_PLASTIC)
+            seeds.write_text(_json.dumps({"ball_kind": "metal"}), encoding="utf-8")
+            sw._set_session(str(p_seeded))
+            s_metal = sw.ball.kind() == BALL_METAL
+            sw.ball.set_kind(BALL_METAL)
+            seeds.write_text(_json.dumps({"ball_kind": "plastic"}), encoding="utf-8")
+            sw._set_session(str(p_seeded))
+            s_plastic = sw.ball.kind() == BALL_PLASTIC
+            tcheck("双目 _set_session：无 seeds.json → 复位纯色球且状态条含「复位」；"
+                   "有 ball_kind=metal/plastic 时按种子恢复（不被复位覆盖）",
+                   s_reset and s_metal and s_plastic,
+                   f"no_seed={s_kind!r}/{s_reset}, metal={s_metal}, plastic={s_plastic}")
+
+            # 单目：走真实入口 _on_session_picked（内部 _select_session →
+            # _apply_seed_kind，并把「复位」说明追加到最终那条状态文本）。
+            mono = wins["mono"]
+            real_sess = mono._session
+
+            def _make_mono(name: str, ball_kind=None) -> Path:
+                d = _mr / name
+                (d / "derived").mkdir(parents=True)
+                (d / "session.json").write_text(_json.dumps({
+                    "schema": "sphere-mono-session", "version": 1,
+                    "camera": "main", "width": 1280, "height": 720,
+                    "fps": 30.0, "frame_count": 300, "duration_s": 10.0,
+                    "encoder": "HFYU", "video": "clip.mkv"},
+                    ensure_ascii=False), encoding="utf-8")
+                if ball_kind is not None:
+                    (d / "derived" / "seed.json").write_text(
+                        _json.dumps({"ball_kind": ball_kind}), encoding="utf-8")
+                return d
+
+            m_no_seed = _make_mono("no_seed")
+            mono.ball.set_kind(BALL_METAL)
+            mono._seed_kind_for = None
+            mono._on_session_picked(str(m_no_seed))
+            m_kind = mono.ball.kind()
+            m_note = str(mono.status._label.cget("text"))
+            m_reset = (m_kind == BALL_PLASTIC and "复位" in m_note)
+
+            m_metal_d = _make_mono("metal", "metal")
+            mono.ball.set_kind(BALL_PLASTIC)
+            mono._seed_kind_for = None
+            mono._on_session_picked(str(m_metal_d))
+            m_metal = mono.ball.kind() == BALL_METAL
+            m_plastic_d = _make_mono("plastic", "plastic")
+            mono.ball.set_kind(BALL_METAL)
+            mono._seed_kind_for = None
+            mono._on_session_picked(str(m_plastic_d))
+            m_plastic = mono.ball.kind() == BALL_PLASTIC
+            tcheck("单目 _apply_seed_kind：无 seed.json → 复位纯色球且状态条含「复位」；"
+                   "有 ball_kind=metal/plastic 时按种子恢复（不被复位覆盖）",
+                   m_reset and m_metal and m_plastic,
+                   f"no_seed={m_kind!r}/{m_reset}, metal={m_metal}, plastic={m_plastic}")
+            mono._session = real_sess
+            mono._seed_kind_for = None
+            mono.ball.set_kind(BALL_PLASTIC)
+
+        # ⑤ L1 预算 / primary 不退化：单目① primary==1 & L1≤5，
+        # 「试开这台相机」在 L1、「替代：单点焦距估计」在折叠区；双目④ L1≤5。
+        def _buttons(card):
+            return [(w, str(w.cget("text"))) for w in walk(card)
+                    if w.winfo_class() == "TButton"]
+
+        c1 = next((c for c in step_cards(wins["mono"])
+                   if str(c.cget("text"))[:1] == "①"), None)
+        mm1 = measure(c1) if c1 is not None else {}
+        probe_l1 = est_fold = False
+        if c1 is not None:
+            probe_l1 = any(t == "试开这台相机" and not _inside_collapsible(b, c1)
+                           for b, t in _buttons(c1))
+            est_fold = any(t == "替代：单点焦距估计" and _inside_collapsible(b, c1)
+                           for b, t in _buttons(c1))
+        ok_budget = (c1 is not None and mm1.get("primary") == 1
+                     and mm1.get("l1_buttons", 99) <= 5
+                     and probe_l1 and est_fold)
+        c4 = next((c for c in step_cards(wins["stereo(parallel)"])
+                   if str(c.cget("text"))[:1] == "④"), None)
+        mm4 = measure(c4) if c4 is not None else {}
+        ok_budget4 = c4 is not None and mm4.get("l1_buttons", 99) <= 5
+        tcheck("L1 预算/primary 不退化：单目① primary==1 & L1≤5，"
+               "「试开这台相机」在 L1、「替代」在折叠区；双目④ L1≤5",
+               ok_budget and ok_budget4,
+               f"mono①={mm1}/probe_l1={probe_l1}/est_fold={est_fold}, "
+               f"stereo④={mm4}")
     finally:
         try:
             app.destroy()

@@ -18,6 +18,19 @@
   所以有 `apps/tools/cameras.py identify`（目视确认后写死身份）和 `check`（检测漂移）来兜底。
 - 非 Windows 平台 `list_devices()` 返回空列表，整套功能退化为"按索引"（不报错）。
 
+## 🔴 语义分离（2026-11-12，本条是"程序显示的相机 ≠ 真实相机"的根因）
+
+| 字段                     | 含义                                  | 能拿来开相机吗 |
+| ------------------------ | ------------------------------------- | -------------- |
+| `RoleSpec.index`         | **最后一次 PnP 枚举位次**（诊断/显示）| **不能**       |
+| `DeviceEntry.order`      | 本次 PnP 枚举位次                      | **不能**       |
+| `RoleSpec.capture_index` | **实测过的** OpenCV/MSMF 采集索引      | **只能用它**   |
+
+`capture_index is None` 时 `resolve_role()` / `resolve_roles()` 抛
+`CaptureIndexNotVerified`（正文见 `capture_index_error_text()`），**绝不**静默回退到
+PnP 位次 —— 因为那正是"用错相机却一切正常"的来源。写入它只有两条路：
+`cameras.py identify`（目视确认后自动写）与 `cameras.py pin <role> capture-index:N`。
+
 ## 性能
 
 `list_devices()` 每次启动都会跑。采集设备清单用 `pnputil /enum-devices /connected`
@@ -62,9 +75,11 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -91,14 +106,67 @@ DEFAULT_SETTINGS: dict = {
     # 现在搬进配置：要放宽/收紧，改 `config/cameras.json` 的
     # `settings.avoid_name_patterns` 即可（写 `[]` 表示"不再按红外自动排除"）。
     "avoid_name_patterns": ["infrared", r"\bir\b"],
+    # 名字里含这些**子串**（大小写不敏感）= **虚拟摄像头**，**不参与绑定**。
+    #
+    # 为什么不并进 `avoid_names`（2026-11-09 定案，见交接文档 §109）：
+    # `avoid_names` 说的是"内置/红外，不适合双目，但它仍是**一台真实的物理相机**"
+    # —— 那种相机降权后仍可能被选上（真没别的相机时），这是有意的兜底。
+    # 虚拟摄像头**连物理设备都不是**：vivo 办公套件 / OBS / ManyCam / DroidCam
+    # 这类只会注册在某个后端（实测 vivo 只出现在 DSHOW，PnP 列表里根本没有），
+    # 同一个编号在不同后端下指到的东西完全不确定。所以它**绝不**允许成为
+    # left/right/main，也不进预览候选 —— 而不是"降权后仍可能被选上"。
+    "virtual_names": ["vivo", "原子笔记", "atomic", "obs", "virtual",
+                      "manycam", "snap camera", "xsplit", "droidcam",
+                      "epoccam", "e2esoft", "youcam", "nvidia broadcast",
+                      "unity capture", "iriun", "camo"],
     "min_width": 1280,
     "min_height": 720,
+    # min_fps 只对**实测帧率**生效（`ProbeResult.fps_measured`）。很多相机
+    # `CAP_PROP_FPS` 只是回显请求值，拿它过滤会把好相机误杀 —— 所以
+    # select_cameras 只在真的数过帧之后才用这个门限。
     "min_fps": 15.0,
+    # 成对自适应（stereo/pair_source.py）的帧率下限；None = 沿用
+    # `AUTO_MIN_PAIR_FPS`（DEFAULT_FPS*0.6 = 14.4）。与 min_fps 语义**不同**：
+    # min_fps 管"单台能不能选"，min_pair_fps 管"两路成对跑不跑得动"。
+    "min_pair_fps": None,
     "max_index": 6,
     # phantom 索引（未被 PnP 枚举到的编号）试开一次最坏 ~40s；连续失败这么多台
     # 就视为"这段编号根本不存在"，提前停止扫描。max_index 仍作上界安全网。
     "max_consecutive_miss": 2,
 }
+
+
+def merged_settings(settings: dict | None = None,
+                    reg: "Registry | None" = None) -> dict:
+    """`DEFAULT_SETTINGS` + 配置 + 显式覆盖，**唯一**的 settings 合成点。
+
+    以前 `{**DEFAULT_SETTINGS, ...}` 在 6 处各抄一遍；新增一个键就要记得改 6 处，
+    漏一处就是"某个入口读不到用户设置"。统一到这里后，测试只需钉这一个函数。
+    """
+    merged = dict(DEFAULT_SETTINGS)
+    if reg is not None:
+        merged.update((reg.settings or {}))
+    if settings:
+        merged.update(settings)
+    return merged
+
+
+def setting_int(settings: dict, key: str, default: int) -> int:
+    """读一个正整数设置；空/非法/<=0 一律回默认（配置写错不该让选择器崩）。"""
+    try:
+        value = int(settings.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def setting_float(settings: dict, key: str, default: float) -> float:
+    """读一个正浮点设置；空/非法/非有限/<=0 一律回默认。"""
+    try:
+        value = float(settings.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 # --------------------------------------------------------------------------- #
@@ -123,11 +191,27 @@ class RoleSpec:
     identity: str = ""
     port: str = ""
     name: str = ""
+    # ⚠️ **只作最后一次 PnP 枚举位次（显示/诊断）用，绝不拿它开相机。**
+    # 想开相机请用 `capture_index`（见下面的注释）。
     index: int | None = None
     verified: bool = False
     # OpenCV/MSMF 实际设备索引（与 PnP 枚举序号可能不同）。
-    # 只有 identity/port/name 仍匹配到设备后才覆盖 entry.order；None = 旧逻辑。
+    # 只有 identity/port/name 仍匹配到设备后才覆盖 entry.order；None = 未实测。
+    #
+    # 🚨 `None` **绝不等于**"等于 PnP 位次"：那样等于把枚举顺序当成采集编号，
+    # 正是"程序显示的相机 ≠ 真实相机"的根因。所以 `resolve_role()` 在
+    # `capture_index is None` 时**抛 `CaptureIndexNotVerified`**，
+    # 逼用户跑一次 `python apps/tools/cameras.py identify` 实测确认。
     capture_index: int | None = None
+    # 「位置」标签：这台相机**指着哪儿**（本机约定 `床` / `阳台门`，留空 = 未标注）。
+    # 为什么要有它：两台同型号 aoni 在软件层面**不可区分**（同 VID/PID、同名字），
+    # 用户判断"哪台是左"的唯一真实依据就是"它在房间里对着哪儿"。
+    # `left/right` 会被左右接反，位置不会 —— 所以这一栏是把人的知识记进配置。
+    location: str = ""
+
+
+#: 「位置」的未标注值（空串）。对话框/工具按"未标注"显示。
+LOCATION_UNSET = ""
 
 
 @dataclass
@@ -151,15 +235,69 @@ class ProbeResult:
     std: float = 0.0
     error: str = ""
     entry: DeviceEntry | None = None
+    #: fps 是**数帧实测**出来的吗？`CAP_PROP_FPS` 常常只是回显请求值，
+    #: 拿它当实测去过滤相机 = 用一个弱证据下强结论。默认 False，旧构造点不变。
+    fps_measured: bool = False
 
 
 @dataclass(frozen=True)
 class ResolvedCamera:
     role: str
+    #: **采集索引**（OpenCV/MSMF 打开时用的那个号）。只有 `capture_index_verified`
+    #: 为 True 时它才是实测值；`require_capture_index=False` 的诊断路径下它可能是
+    #: PnP 位次（那种情况下面那个标记为 False，**不许拿它开相机**）。
     index: int
     how: str  # identity / port / name / manual / index-fallback
     entry: DeviceEntry | None = None
     warnings: tuple[str, ...] = ()
+    #: `index` 是不是**实测过的采集索引**（= `RoleSpec.capture_index` 有值）。
+    capture_index_verified: bool = True
+
+
+class CaptureIndexNotVerified(RuntimeError):
+    """角色的 `capture_index` 未实测 —— **不许**拿 PnP 位次顶上。
+
+    为什么单独一个异常类型（不是普通 RuntimeError）：上层要能把它与"相机掉线/
+    换 USB 口"区分开 —— 前者要用户跑 `identify` 实测一次，后者要用户查线/换口。
+    `cameras.py check` 用它打 `[危险] 采集索引未实测`；`pin --capture-index` 用它
+    提示怎么落地。它仍是 `RuntimeError` 的子类，所有旧的 `except RuntimeError`
+    照旧接得住（不许因为加了这个类型就让别人的兜底失效）。
+    """
+
+
+def capture_index_error_text(role: str, spec: RoleSpec,
+                            entry: DeviceEntry | None = None) -> str:
+    """`CaptureIndexNotVerified` 的报错正文：**说清为什么不能猜、下一步做什么**。
+
+    必须同时带上（缺一条用户就会继续被误导）：
+
+    * 角色名与设备名 —— 否则用户不知道是哪一路；
+    * **PnP 位次** —— 让用户知道"程序记的这个 #N 是什么东西"；
+    * 为什么不能拿它当采集索引 —— 否则会以为"那就先用着呗"；
+    * 下一步的确切命令 —— `python apps/tools/cameras.py identify`。
+    """
+    who = (entry.name if entry is not None and entry.name else (spec.name or "(没记名字)"))
+    order = entry.order if entry is not None else spec.index
+    order_txt = f"#{order}" if order is not None else "（未知）"
+    port_txt = (entry.port if entry is not None and entry.port else spec.port) or "-"
+    ident_txt = (entry.identity if entry is not None and entry.identity
+                 else spec.identity) or "-"
+    # ⚠️ **第一行必须自己含下一步**：有的调用方（`stereo/pair_source.py`
+    # `_resolve_arg_noninteractive`）只把 `splitlines()[0]` 接进它自己的报错里。
+    # 只把 identify 写在后面几行，那类路径上用户就看不到真正该做的那一步。
+    return (
+        f"「{role}」的**采集索引未实测**（capture_index 为空），拒绝打开相机 —— "
+        f"下一步：python apps/tools/cameras.py identify"
+        f"（或 pin {role} capture-index:<已确认的编号>）。\n"
+        f"  这台设备：{who}（PnP 位次 {order_txt}，端口 {port_txt}，身份 {ident_txt}）\n"
+        f"  为什么不能猜：PnP 位次 {order_txt} 只是**系统枚举顺序**，它不是\n"
+        f"  `cv2.VideoCapture(index)` 的编号 —— 同一个号在两套编号空间里可能指到\n"
+        f"  **不同的设备**（本项目实测：DSHOW #1 是笔记本内置，MSMF #0 才是外接；\n"
+        f"  vivo 虚拟摄像头只出现在 DSHOW、PnP 列表里根本没有）。拿枚举位次当采集\n"
+        f"  索引，会**悄悄开到另一台相机**（内置 / 红外 / 虚拟），而画面看起来一切正常。\n"
+        f"  写这个号的只有两处：identify（目视确认后自动写）/ pin {role} capture-index:N。\n"
+        f"  确认后本提示消失；重插 USB / 换口 / 换机器后需要重新确认一次。"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -473,7 +611,10 @@ def list_devices() -> list[DeviceEntry]:
 # 探测与自动选择
 # --------------------------------------------------------------------------- #
 def _default_opener(index: int, width: int, height: int, fps: int,
-                    backend: int | None = None):
+                    backend: int | None = None, *,
+                    strict_mode: bool = False,
+                    first_frame_timeout_s: float = 30.0,
+                    search_budget_s: float = 40.0):
     from .sources import INDEX_BACKEND, CameraSource  # 惰性导入：不探测就用不到 cv2
 
     # **必须固定后端**：传进来的 index 是 PnP 枚举的位次（`DeviceEntry.order`），
@@ -488,8 +629,9 @@ def _default_opener(index: int, width: int, height: int, fps: int,
     # 判成坏相机，于是它"从界面上消失"。这里给足 30 s。
     return CameraSource(index=index, width=width, height=height, fps=fps,
                         backend=INDEX_BACKEND if backend is None else backend,
-                        optimize=False, first_frame_timeout_s=30.0,
-                        search_budget_s=40.0)
+                        optimize=False, strict_mode=strict_mode,
+                        first_frame_timeout_s=first_frame_timeout_s,
+                        search_budget_s=search_budget_s)
 
 
 def probe_index(
@@ -526,14 +668,28 @@ def probe_index(
         if frame is None:
             return ProbeResult(index=index, ok=False, error="读不到画面")
         std = float(frame.std())
+        # **尺寸取真帧**，不取 cap.get()：`selftest_camera_registry` 实测过
+        # "上报 1920x1080、实际给帧 1280x1080"；标定/录制吃的是真帧尺寸。
+        h, w = frame.shape[:2]
         info = getattr(src, "info", None)
-        w = int(getattr(info, "width", 0) or 0)
-        h = int(getattr(info, "height", 0) or 0)
         rate = float(getattr(info, "fps", 0.0) or 0.0)
+        # 短测实际帧率：0.5 s 内数帧。数不到 2 帧就**不冒充实测值**。
+        n = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < 0.5 and n < 30:
+            ok, f, _t = src.read()
+            if ok and f is not None:
+                n += 1
+        elapsed = time.perf_counter() - t0
+        measured = n >= 2 and elapsed > 0.0
+        if measured:
+            rate = n / elapsed
         if std <= 1.0:
-            return ProbeResult(index=index, ok=False, width=w, height=h, fps=rate,
-                               std=std, error="画面是全黑常量流")
-        return ProbeResult(index=index, ok=True, width=w, height=h, fps=rate, std=std)
+            return ProbeResult(index=index, ok=False, width=int(w), height=int(h),
+                               fps=rate, std=std, error="画面是全黑常量流",
+                               fps_measured=measured)
+        return ProbeResult(index=index, ok=True, width=int(w), height=int(h),
+                           fps=rate, std=std, fps_measured=measured)
     except Exception as exc:  # noqa: BLE001
         return ProbeResult(index=index, ok=False, error=str(exc).splitlines()[0])
     finally:
@@ -593,8 +749,160 @@ def probe_index_with_fallback(
                   f"这次判定用 {name} 的结果", flush=True)
             return ProbeResult(index=index, ok=True, width=alt.width, height=alt.height,
                                fps=alt.fps, std=alt.std,
-                               error=f"（{backend_name(INDEX_BACKEND)} 无帧，改用 {name} 探到）")
+                               error=f"（{backend_name(INDEX_BACKEND)} 无帧，改用 {name} 探到）",
+                               fps_measured=alt.fps_measured)
     return r
+
+
+@dataclass(frozen=True)
+class ModeResult:
+    """一个「请求档 → 实际能出什么」的实测结果（`cameras.py modes` 的唯一数据形状）。
+
+    尺寸和帧率都来自**真帧**，不是 `cap.get()` 的回显值；`fps_measured=False`
+    表示采样窗口内数不到 2 帧，此时 `fps` 不能当实测值用。
+    """
+
+    index: int
+    backend: str
+    req_width: int
+    req_height: int
+    req_fps: float
+    ok: bool
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    frames: int = 0
+    std: float = 0.0
+    fell_back: bool = False
+    seconds: float = 0.0
+    error: str = ""
+    fps_measured: bool = False
+
+    @property
+    def requested(self) -> str:
+        return f"{self.req_width}x{self.req_height}"
+
+    @property
+    def actual(self) -> str:
+        return f"{self.width}x{self.height}" if self.width and self.height else "-"
+
+
+def probe_mode(
+    index: int,
+    width: int,
+    height: int,
+    *,
+    fps: float = 0.0,
+    backend: int | None = None,
+    sample_s: float = 0.6,
+    first_frame_timeout_s: float = 30.0,
+    opener=None,
+) -> ModeResult:
+    """只试**这一档**：打开 → 读真帧 → 量实际尺寸/帧率 → 释放。
+
+    与 `probe_index` 的分工：`probe_index` 回答"这台能不能用"（允许原生档），
+    本函数回答"这个具体档实际给什么"（必须给正宽高；不允许降档）。
+    `CameraSource(strict_mode=True)` 保证失败时不会拿下一档顶替。
+    """
+    req_w, req_h = int(width), int(height)
+    if req_w <= 0 or req_h <= 0:
+        return ModeResult(index=index, backend="", req_width=req_w, req_height=req_h,
+                          req_fps=float(fps or 0.0), ok=False,
+                          error="modes 需要正宽高（原生档语义未验证，不猜）")
+    try:
+        if opener is None:
+            src = _default_opener(index, req_w, req_h, float(fps or 30.0),
+                                  backend=backend, strict_mode=True,
+                                  first_frame_timeout_s=first_frame_timeout_s,
+                                  search_budget_s=max(40.0, first_frame_timeout_s + 10.0))
+        else:
+            src = opener(index, req_w, req_h, float(fps or 30.0))
+    except Exception as exc:  # noqa: BLE001
+        return ModeResult(index=index, backend="", req_width=req_w, req_height=req_h,
+                          req_fps=float(fps or 0.0), ok=False,
+                          error=(str(exc).splitlines() or ["打不开"])[0])
+
+    t_start = time.perf_counter()
+    try:
+        from .sources import BLACK_FRAME_STD  # 惰性：不探测就用不到 cv2
+    except Exception:  # noqa: BLE001 - 测试替身环境没有 cv2 时也不该崩
+        BLACK_FRAME_STD = 1.0
+
+    frame = None
+    deadline = time.perf_counter() + max(0.1, float(first_frame_timeout_s))
+    try:
+        while time.perf_counter() < deadline:
+            ok, f, _t = src.read()
+            if ok and f is not None:
+                frame = f
+                break
+        if frame is None:
+            return ModeResult(index=index, backend=str(getattr(src, "backend_name", "")),
+                              req_width=req_w, req_height=req_h,
+                              req_fps=float(fps or 0.0), ok=False,
+                              seconds=time.perf_counter() - t_start,
+                              error="读不到画面")
+        h, w = frame.shape[:2]
+        std = float(frame.std())
+        # 采样窗口内数帧；不足 2 帧就标 `fps_measured=False`，不把哨兵当测量值。
+        n = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < max(0.0, float(sample_s)) and n < 240:
+            ok, f, _t = src.read()
+            if ok and f is not None:
+                n += 1
+        elapsed = time.perf_counter() - t0
+        measured = n >= 2 and elapsed > 0.0
+        rate = (n / elapsed) if measured else 0.0
+        if std <= BLACK_FRAME_STD:
+            return ModeResult(index=index, backend=str(getattr(src, "backend_name", "")),
+                              req_width=req_w, req_height=req_h,
+                              req_fps=float(fps or 0.0), ok=False,
+                              width=int(w), height=int(h), fps=rate, frames=n,
+                              std=std, fell_back=(int(w), int(h)) != (req_w, req_h),
+                              seconds=time.perf_counter() - t_start,
+                              error="画面是全黑常量流", fps_measured=measured)
+        return ModeResult(index=index, backend=str(getattr(src, "backend_name", "")),
+                          req_width=req_w, req_height=req_h,
+                          req_fps=float(fps or 0.0), ok=True,
+                          width=int(w), height=int(h), fps=rate, frames=n,
+                          std=std, fell_back=(int(w), int(h)) != (req_w, req_h),
+                          seconds=time.perf_counter() - t_start,
+                          fps_measured=measured)
+    except Exception as exc:  # noqa: BLE001
+        return ModeResult(index=index, backend=str(getattr(src, "backend_name", "")),
+                          req_width=req_w, req_height=req_h,
+                          req_fps=float(fps or 0.0), ok=False,
+                          seconds=time.perf_counter() - t_start,
+                          error=(str(exc).splitlines() or ["读取失败"])[0])
+    finally:
+        _call(getattr(src, "release", lambda: None), default=None)
+
+
+def probe_modes(
+    index: int,
+    modes: list[tuple[int, int]] | None = None,
+    *,
+    fps_list: tuple[float, ...] = (0.0,),
+    backend: int | None = None,
+    sample_s: float = 0.6,
+    first_frame_timeout_s: float = 30.0,
+    opener=None,
+    progress=None,
+) -> list[ModeResult]:
+    """逐档调 `probe_mode`。默认候选来自 `video_profiles.probe_order(None)`。"""
+    if modes is None:
+        from .video_profiles import NATIVE, probe_order
+        modes = [m for m in probe_order(None) if tuple(m) != NATIVE]
+    results: list[ModeResult] = []
+    for w, h in modes:
+        for fps in (fps_list or (0.0,)):
+            if progress is not None:
+                progress(w, h, fps)
+            results.append(probe_mode(
+                index, w, h, fps=fps, backend=backend, sample_s=sample_s,
+                first_frame_timeout_s=first_frame_timeout_s, opener=opener))
+    return results
 
 
 def pick_backend_for_device(
@@ -674,7 +982,7 @@ def is_avoided(name: str, settings: dict | None = None) -> bool:
     **非法正则会怎样**：跳过那一条并打印警告，**不抛异常** ——
     一个配置项写错不该让整个设备管理跑不起来。剩下的规则照常生效。
     """
-    merged = {**DEFAULT_SETTINGS, **(settings or {})}
+    merged = merged_settings(settings)
     low = (name or "").lower()
     if not low:
         return False
@@ -690,6 +998,56 @@ def is_avoided(name: str, settings: dict | None = None) -> bool:
     return False
 
 
+def is_virtual(name: str, settings: dict | None = None) -> bool:
+    """名字看着像**虚拟摄像头**？（`settings.virtual_names` 的**子串**匹配，大小写不敏感）
+
+    与 `is_avoided()` 的区别（两者语义**不同**，不许合并）：
+
+    | 判定           | 含义                                   | 允许绑 left/right 吗 |
+    | -------------- | -------------------------------------- | -------------------- |
+    | `is_avoided()` | 内置 / 红外：真相机，但不适合双目      | 允许（降权，兜底可用）|
+    | `is_virtual()` | 虚拟摄像头：**根本不是物理设备**       | **绝不**（硬拒绝）   |
+
+    为什么虚拟摄像头必须硬拒绝（2026-11-11 现场）：用户点 `#3` 的 DSHOW 兜底试开，
+    画面上开出来的是 **vivo 办公套件的虚拟摄像头** —— 它只注册在 DSHOW，
+    PnP 设备列表里**根本没有它**。绑上去等于绑了"一个不存在的物理相机"：
+    下次换后端/换机器时那个编号会指到别的设备，而配置看上去完全正常。
+
+    规则同样来自配置：`settings.virtual_names`（写 `[]` 表示"我一个都不按虚拟处理"）。
+    """
+    merged = merged_settings(settings)
+    low = (name or "").strip().lower()
+    if not low:
+        return False
+    for token in merged.get("virtual_names") or []:
+        token = str(token).strip().lower()
+        if token and token in low:
+            return True
+    return False
+
+
+def is_bindable(name: str, settings: dict | None = None) -> bool:
+    """这个名字的相机**能不能被绑成 left/right/main**？（虚拟摄像头不能，其余能）
+
+    内置/红外仍返回 True —— 它们的判据是"不推荐"，不是"禁止"（真只有这一台时
+    用户可能就要用它，`is_avoided()` 只降权）。
+    """
+    return not is_virtual(name, settings)
+
+
+def phantom_index_warning(index: int) -> str:
+    """某个编号**能打开、但不在 PnP 枚举里**时的警告（"这不是枚举到的物理相机"）。
+
+    为什么必须明着说（2026-11-10 现场）：`cv2.VideoCapture(5)` 在没插相机时也可能
+    `isOpened=True` —— 开到的是残留会话 / 虚拟设备 / 别的后端编号空间里的东西。
+    用户看到"能打开"，就会以为那是他插的那台，然后拿它设角色。所以只要命中
+    "不在枚举里的编号"，一律把这句话打出来，**不让它静默通过**。
+    """
+    return (f"⚠ #{index} **能打开，但它不在 PnP 枚举到的物理相机里** —— "
+            f"这不是枚举到的物理相机（可能是虚拟摄像头 / 残留会话 / 别的后端编号），"
+            f"**不要拿它设角色**；先跑 python apps/tools/cameras.py list 核对。")
+
+
 def rank_candidates(
     devices: list[DeviceEntry],
     *,
@@ -701,7 +1059,7 @@ def rank_candidates(
     标了「无关」的一律沉到最后（比"内置/红外"的降权还狠），
     这样自动挑相机永远先挑别人 —— 用户明确说过不要的，就别再自作聪明。
     """
-    merged = {**DEFAULT_SETTINGS, **(settings or {})}
+    merged = merged_settings(settings, reg)
     reg = reg or Registry()
     pinned_ids: set[str] = set()
     pinned_ports: set[str] = set()
@@ -726,6 +1084,12 @@ def rank_candidates(
             s += 20.0
         if is_avoided(d.name, merged):
             s -= 200.0
+        if is_virtual(d.name, merged):
+            # 虚拟摄像头比"内置/红外"还低一档：它**根本不该被自动挑中**
+            # （不是物理设备，编号在一个后端里成立、换个后端就指到别的东西）。
+            # 但**刻意不在这里剔除** —— `select_cameras` 的排序/兜底口径不变，
+            # 真正的硬拒绝放在 `set_role()`（绑角色那一步）。
+            s -= 500.0
         if is_device_ignored(d, reg):
             s -= 1000.0
         return s
@@ -795,8 +1159,7 @@ def camera_availability(
     所有外部依赖（`devices` / `probe` / `reg`）可注入，
     因此没有相机的机器上也能把每条分支走一遍（见 `selftest_camera_presence.py`）。
     """
-    merged = {**DEFAULT_SETTINGS, **((reg.settings if reg else {}) or {})}
-    merged.update(settings or {})
+    merged = merged_settings(settings, reg)
 
     devices = list_devices() if devices is None else devices
     sel = select_cameras_detailed(need=need, devices=devices, probe=probe,
@@ -817,7 +1180,7 @@ def camera_availability(
             av.reason += "；" + "；".join(sel.probe_errors[:3])
         av.remedy = (
             "① 确认相机插好（换一个 USB 口，优先直插主板而不是扩展坞）；"
-            "② 跑 `启动程序.bat check` 看设备列表；"
+            "② 跑 `run.bat check` 看设备列表；"
             "③ 只是想试功能的话可以喂视频："
             "`python apps/run_video.py --source <视频文件>`"
         )
@@ -828,8 +1191,8 @@ def camera_availability(
             av.reason += "；" + "；".join(sel.probe_errors[:4])
         av.remedy = (
             "① 相机可能被别的程序占着（关掉相机 App / 会议软件 / 另一个本程序实例）；"
-            "② 跑 `启动程序.bat diag` 看是不是带宽不足或画面全黑；"
-            "③ 跑 `启动程序.bat setup` 确认「左 / 右 / 无关」的分配"
+            "② 跑 `run.bat diag` 看是不是带宽不足或画面全黑；"
+            "③ 跑 `run.bat setup` 确认「左 / 右 / 无关」的分配"
         )
     else:
         # 挑到了一些，但**不够用** —— 这条必须与"一台都没有"分开说，
@@ -838,8 +1201,8 @@ def camera_availability(
                      f"（需要 {need} 个，试开了 {sel.probed} 个索引）")
         av.remedy = (
             "① 第二台相机没插好 / 被占用 / 分辨率不达标（双目需要两台**同分辨率**的）；"
-            "② 跑 `启动程序.bat check` 逐台确认；"
-            "③ 只想试单目的话用 `启动程序.bat run`，或喂视频："
+            "② 跑 `run.bat check` 逐台确认；"
+            "③ 只想试单目的话用 `run.bat run`，或喂视频："
             "`python apps/run_video.py --source <视频文件>`"
         )
     return av
@@ -954,8 +1317,7 @@ def select_cameras(
     仍会照旧被试。且**只在 `devices` 非空（拿得到 PnP 枚举）时启用**：枚举拿不到
     时"不在清单里"不等于"不存在"（见下面那段注释）。
     """
-    merged = {**DEFAULT_SETTINGS, **((reg.settings if reg else {}) or {})}
-    merged.update(settings or {})
+    merged = merged_settings(settings, reg)
     if devices is None:
         devices = list_devices()
 
@@ -967,7 +1329,7 @@ def select_cameras(
         known = {d.order for d in ranked}
         phantom_entries = [
             DeviceEntry(order=i)
-            for i in range(int(merged["max_index"]) + 1)
+            for i in range(setting_int(merged, "max_index", 6) + 1)
             if i not in known
         ]
         phantom_ids = {id(e) for e in phantom_entries}
@@ -984,8 +1346,9 @@ def select_cameras(
             cands = keep + drop
             ignored_used = drop
 
-    min_w = int(merged["min_width"])
-    min_h = int(merged["min_height"])
+    min_w = setting_int(merged, "min_width", 1280)
+    min_h = setting_int(merged, "min_height", 720)
+    min_fps = setting_float(merged, "min_fps", 15.0)
     limit = 1 if need <= 1 else need + 2
 
     picked: list[ProbeResult] = []
@@ -999,7 +1362,12 @@ def select_cameras(
     # `list_devices()` 返回 `[]`，系统本就退化为"按索引使用"，此刻"编号不在
     # 清单里"**不能**推出"编号不存在"。独立 Critic 的反例：`devices=[]` 而 `#2`
     # 实际可开 → 早停会让它永远选不到。故只在 devices 非空时才启用早停。
-    max_miss = int(merged["max_consecutive_miss"]) if devices else 0
+    try:
+        max_miss = int(merged.get("max_consecutive_miss", 2)) if devices else 0
+    except (TypeError, ValueError):
+        max_miss = 2 if devices else 0
+    if max_miss < 0:              # 0 = 明确关闭早停；负数按默认处理
+        max_miss = 2 if devices else 0
     phantom_misses = 0
     phantom_exhausted = False
 
@@ -1015,6 +1383,14 @@ def select_cameras(
 
     for entry in cands:
         is_phantom = id(entry) in phantom_ids
+        # 虚拟摄像头（vivo 原子笔记 / OBS / …）**永不自动选中**：它不是物理
+        # 设备，拿它做双目只会得到一段看着正常、实际无效的标定。
+        if is_virtual(getattr(entry, "name", ""), merged):
+            print(f"[警告] #{entry.order} {entry.name or ''} 是虚拟摄像头，"
+                  f"自动挑选跳过")
+            if is_phantom:
+                _note_phantom_miss()
+            continue
         # phantom 已判定不存在 -> 跳过它，但**绝不 break**，
         # 排在它之后的真设备（含被标「无关」的）仍会照旧被试。
         if is_phantom and phantom_exhausted:
@@ -1039,7 +1415,7 @@ def select_cameras(
         if not isinstance(res, ProbeResult):
             continue
         res = ProbeResult(res.index, res.ok, res.width, res.height, res.fps,
-                          res.std, res.error, entry)
+                          res.std, res.error, entry, res.fps_measured)
         if not res.ok:
             probe_errors.append(f"#{entry.order} {res.error or '打不开'}")
             if is_phantom:
@@ -1051,8 +1427,22 @@ def select_cameras(
             if is_phantom:
                 _note_phantom_miss()
             continue
+        # 只有**数过帧**的 fps 才参与门限；驱动回显值不算（见 ProbeResult 注释）。
+        if res.fps_measured and res.fps > 0 and res.fps < min_fps:
+            probe_errors.append(f"#{entry.order} 实测 {res.fps:.1f} fps "
+                                f"低于要求 {min_fps:g}")
+            if is_phantom:
+                _note_phantom_miss()
+            continue
         if is_phantom:
             phantom_misses = 0
+            # phantom 能开 ≠ 它是枚举到的物理相机：可能是 DSHOW-only 的
+            # 虚拟摄像机（vivo 原子笔记/OBS）。有 PnP 清单时**不能自动选中**；
+            # 只有"根本拿不到 PnP 枚举"（devices=[]，非 Windows/枚举失败）才
+            # 保留按索引兜底，否则那台机器永远选不到相机。
+            print(f"[警告] {phantom_index_warning(entry.order)}")
+            if devices:
+                continue
         picked.append(res)
         if len(picked) >= limit:
             break
@@ -1114,6 +1504,8 @@ def load_registry(path: str | Path | None = None) -> Registry:
                 verified=bool(spec.get("verified", False)),
                 capture_index=(int(cap) if isinstance(cap, (int, float))
                                and not isinstance(cap, bool) and int(cap) >= 0 else None),
+                # 「位置」：旧配置没有这个键 -> 空串（= 未标注），**不报错、不改语义**。
+                location=str(spec.get("location") or "").strip(),
             )
     settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
     return Registry(v=int(data.get("v") or 1), roles=roles,
@@ -1141,6 +1533,7 @@ def _parse_spec_list(raw) -> list[RoleSpec]:
             verified=bool(spec.get("verified", False)),
             capture_index=(int(cap) if isinstance(cap, (int, float))
                            and not isinstance(cap, bool) and int(cap) >= 0 else None),
+            location=str(spec.get("location") or "").strip(),
         ))
     return out
 
@@ -1161,7 +1554,12 @@ def describe_identity(want: str | None) -> dict:
     取不到就返回空值，**不抛**：元数据写不全不应该让一趟采集白跑。
     """
     out = {"camera_name": "", "camera_identity": "",
-           "camera_port": "", "camera_index": None}
+           "camera_port": "", "camera_index": None,
+           # 下面四个是**新加的诚实字段**（旧键一个都不删，已有边车文件靠旧键走）：
+           # `camera_index` 在旧语义里可能是"配置里记的 PnP 位次"，
+           # 而 `capture_index`/`capture_index_measured` 才回答"这个号是实测过的采集索引吗"。
+           "camera_capture_index": None, "camera_pnp_index": None,
+           "camera_index_measured": False, "camera_location": ""}
     text = (want or "").strip()
     if not text:
         return out
@@ -1171,6 +1569,8 @@ def describe_identity(want: str | None) -> dict:
     if text.isdigit():
         idx = int(text)
         out["camera_index"] = idx           # 显式索引本身就是采集用的那个号
+        out["camera_capture_index"] = idx
+        out["camera_index_measured"] = True  # 用户/调用方显式给了号 = 已知的采集号
         for rs in reg.roles.values():
             if idx in (rs.capture_index, rs.index):
                 spec = rs
@@ -1189,7 +1589,14 @@ def describe_identity(want: str | None) -> dict:
         out["camera_name"] = str(spec.name or "")
         out["camera_identity"] = str(spec.identity or "")
         out["camera_port"] = str(spec.port or "")
-        # capture_index 是 OpenCV 实际用的号；没验证过才退回 PnP 序号。
+        out["camera_location"] = str(spec.location or "")
+        out["camera_pnp_index"] = spec.index
+        out["camera_capture_index"] = spec.capture_index
+        out["camera_index_measured"] = spec.capture_index is not None
+        # ⚠️ `camera_index` 保持旧语义（有 capture_index 用它，否则退回配置里的
+        # PnP 位次）—— 已有边车/标定元数据按它读，改它等于制造第二份真相。
+        # 但"这个号是不是实测的"现在由 `camera_index_measured` 明确回答，
+        # 不再靠调用方去猜（`resolve_role` 那条路径则**直接拒绝**未实测的）。
         out["camera_index"] = (spec.capture_index if spec.capture_index is not None
                                else spec.index)
     return out
@@ -1216,8 +1623,26 @@ def set_role(
     entry: DeviceEntry | None = None,
     index: int | None = None,
     verified: bool = False,
+    capture_index: int | None = None,
+    location: str | None = None,
+    settings: dict | None = None,
 ) -> RoleSpec:
-    """把一个角色固定到某台设备（`cameras.py pin/identify` 共用）。
+    """把一个角色固定到某台设备（`cameras.py pin/identify` 与 GUI 共用）。
+
+    ## `capture_index` / `location`（2026-11-12 加）
+
+    * `capture_index`：**实测过的** OpenCV/MSMF 采集索引。只有真正把这一号打开、
+      看到过画面（`cameras.py identify`）才能传。不传时：
+      - identity 没变 -> 沿用旧值（重复 pin 同一台不会把实测值冲掉）；
+      - identity 变了 -> **清空**（新设备没实测过，不能拿旧的号顶着）。
+    * `location`：「位置」标签（床 / 阳台门 / …）。不传时沿用旧值 —— 它描述的是
+      "这个角色对着哪儿"，与设备身份变化无关（换相机不该丢掉位置）。
+
+    ## 虚拟摄像头：**硬拒绝**（`ValueError`）
+
+    `is_virtual()` 命中的名字（vivo / OBS / ManyCam / DroidCam…）**不是物理设备**，
+    绑上去等于绑了一个"换后端就指到别的东西"的编号。所以这里直接拒绝 ——
+    放在数据层而不是界面里，任何入口（工具 / GUI / 脚本）都绕不过它。
 
     这里**自己**维护"角色与「无关」互斥"这条不变量，不指望调用方：
 
@@ -1230,21 +1655,37 @@ def set_role(
     **不变量要留在拥有数据的模块里。** 这里按 identity/port/编号三种口径
     都清一遍，任何调用顺序都不会留下矛盾状态。
     """
+    merged = merged_settings(settings, reg)
+    if entry is not None and is_virtual(entry.name, merged):
+        raise ValueError(
+            f"「{entry.name}」是**虚拟摄像头**（settings.virtual_names 命中），"
+            f"不参与绑定：它不是物理设备，编号换一个后端就指到别的东西。"
+            f"请换一台真实相机（跑 python apps/tools/cameras.py list 看哪些带"
+            f"[虚拟,不参与绑定]）。")
     old = reg.roles.get(str(role))
     new_identity = entry.identity if entry else ""
     old_capture = old.capture_index if old is not None else None
     same_identity = bool(old and old.identity and new_identity
                          and old.identity == new_identity)
-    if old_capture is not None and not same_identity:
+    if capture_index is not None:
+        new_capture = int(capture_index)
+    elif same_identity:
+        new_capture = old_capture
+    else:
+        new_capture = None
+    if old_capture is not None and not same_identity and capture_index is None:
         print(f"[警告] 「{role}」的 identity 已变化，原 capture_index="
               f"{old_capture} 已清空；请重新确认本机 MSMF 索引。")
+    new_location = (str(location).strip() if location is not None
+                    else (old.location if old is not None else LOCATION_UNSET))
     spec = RoleSpec(
         identity=new_identity,
         port=entry.port if entry else "",
         name=entry.name if entry else "",
         index=index if index is not None else (entry.order if entry else None),
         verified=verified,
-        capture_index=old_capture if same_identity else None,
+        capture_index=new_capture,
+        location=new_location,
     )
     reg.roles[str(role)] = spec
 
@@ -1254,6 +1695,55 @@ def set_role(
         dropped = unmark_ignored(reg, entry=entry)
     if dropped == 0 and spec.index is not None:
         dropped = unmark_ignored(reg, index=spec.index)
+
+    # 同一台设备也不能**同时挂两个角色**（2026-11-08 实测的真缺陷）。
+    #
+    # 用户侧的形状：相机管理默认选中 #0，他先点「设为左」、再点「设为右」
+    #（没换行），于是 left 和 right 都指向 #0。之后标定/录制两路拿到的是
+    # 同一台相机，画面一模一样，而界面上"都设好了"、看不出异常。
+    #
+    # 不变量放在这里而不是界面里：任何入口（工具、脚本、GUI）都绕不过它。
+    moved: list[str] = []
+    if entry is not None:
+        for other in [r for r in reg.roles if r != str(role)]:
+            other_spec = reg.roles.get(other)
+            if other_spec is not None and _spec_matches_device(other_spec, entry):
+                reg.roles.pop(other, None)
+                moved.append(other)
+        if moved:
+            print(f"[警告] 「{entry.name or entry.order}」原来还挂着 "
+                  f"{'、'.join(sorted(moved))}，已摘掉 —— "
+                  f"同一台相机不能同时当两个角色。")
+    return spec
+
+
+# --------------------------------------------------------------------------- #
+# 「位置」标签：这台相机对着哪儿（床 / 阳台门 / 未标注）
+# --------------------------------------------------------------------------- #
+def location_text(spec: RoleSpec | None) -> str:
+    """角色「位置」的人话（空 = 未标注）。界面/工具共用这一份口径。"""
+    text = (getattr(spec, "location", "") or "").strip()
+    return text or "未标注"
+
+
+def set_location(reg: Registry, role: str, location: str) -> RoleSpec:
+    """给一个**已存在的角色**写「位置」标签（不改 identity / index / capture_index）。
+
+    为什么单独一个入口：位置是"人知道、程序不知道"的信息（见 `RoleSpec.location`
+    的注释）。它**不参与解析**，只用于显示与以后按位置排查 —— 所以它绝不能
+    顺手改动绑定关系（改绑定的事只有 `pin/identify/set_role` 能做）。
+
+    角色不存在时抛 `ValueError`（位置必须挂在某个角色上，否则"这台是床"这句话
+    没有主语 —— 而设备身份会在换口后失效，位置一条记录也就成了孤儿）。
+    """
+    key = str(role)
+    spec = reg.roles.get(key)
+    if spec is None:
+        known = "、".join(sorted(reg.roles)) or "（一个都没配）"
+        raise ValueError(f"配置里没有角色「{role}」，无法写「位置」。"
+                         f"已配置的角色：{known}。先跑 "
+                         f"python apps/tools/cameras.py identify 固定相机。")
+    spec.location = str(location or "").strip()
     return spec
 
 
@@ -1314,6 +1804,19 @@ def role_of_device(reg: Registry, d: DeviceEntry) -> str | None:
         if _spec_matches_device(spec, d):
             return role
     return None
+
+
+def roles_of_device(reg: Registry, d: DeviceEntry) -> list[str]:
+    """这台设备挂着**全部**角色（正常是 0 或 1 个）。
+
+    为什么要"全部"：2026-11-08 之前的 `set_role` 只清「无关」清单、不清其它角色，
+    于是同一台设备可以同时是 left 和 right —— 两路拿到同一台相机，画面一模一样，
+    而列表里只显示它匹配到的第一个角色（"left"），用户完全看不出问题。
+    现在 `set_role` 会保证一台只挂一个，但**旧配置可能已经坏了**，所以读取侧
+    必须能看出"这台挂了两个"并把它显示出来。
+    """
+    return [role for role, spec in reg.roles.items()
+            if _spec_matches_device(spec, d)]
 
 
 def mark_ignored(
@@ -1399,6 +1902,10 @@ def format_device_table(
         mark = ""
         if reg is not None and is_device_ignored(d, reg):
             mark = "  [无关]"
+        elif is_virtual(d.name, settings):
+            # 「虚拟」与「内置/红外」必须分开写：前者**不参与绑定**（硬拒绝），
+            # 后者只是"不推荐"（真相机、降权）。混成一条会让用户以为都能选。
+            mark = "  [虚拟,不参与绑定]"
         elif is_avoided(d.name, settings):
             mark = "  [内置/红外,不推荐]"
         lines.append(
@@ -1513,8 +2020,14 @@ def resolve_roles(
     devices: list[DeviceEntry] | None = None,
     *,
     interactive: bool = True,
+    require_capture_index: bool = True,
 ) -> dict[str, ResolvedCamera]:
     """一次解析**多个**角色，并保证它们**不会落到同一台相机**上。
+
+    `require_capture_index=True`（默认）：任何角色缺 `capture_index` 就抛
+    `CaptureIndexNotVerified` —— **绝不**拿 PnP 位次顶上（见 `resolve_role`）。
+    只有"只想知道这个角色指向哪台设备"的诊断路径（`cameras.py check` /
+    界面上的在线判定）才传 False，那种路径**不许拿返回值去开相机**。
 
     ## 为什么必须一起解析（而不是各解析各的）
 
@@ -1540,7 +2053,17 @@ def resolve_roles(
             continue
         entry, how = _match_entry(spec, devices, taken=claimed_pnp)
         if entry is not None:
-            index = spec.capture_index if spec.capture_index is not None else entry.order
+            if spec.capture_index is not None:
+                index = int(spec.capture_index)
+                cap_ok = True
+            elif require_capture_index:
+                # 🚨 走到这里说明"设备身份对上了、但采集索引从未实测"。
+                # 旧实现会悄悄用 entry.order —— 那正是"显示的相机 ≠ 真实相机"。
+                raise CaptureIndexNotVerified(
+                    capture_index_error_text(str(role), spec, entry))
+            else:
+                index = int(entry.order)
+                cap_ok = False
             if index in taken:
                 raise RuntimeError(
                     f"「{role}」的实际采集索引 #{index} 与其他角色冲突；"
@@ -1551,11 +2074,17 @@ def resolve_roles(
             if is_device_ignored(entry, reg):
                 warns = (f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
                          f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。",)
+            if not cap_ok:
+                warns = warns + (
+                    f"「{role}」的采集索引未实测：上面这个 #{index} 只是 **PnP 位次**，"
+                    f"只能用来认出是哪台设备，**不能拿来开相机**。",)
             out[str(role)] = ResolvedCamera(role=str(role), index=index, how=how,
-                                            entry=entry, warnings=warns)
+                                            entry=entry, warnings=warns,
+                                            capture_index_verified=cap_ok)
         else:
             resolved = resolve_role(role, reg=reg, devices=devices,
-                                    interactive=interactive)
+                                    interactive=interactive,
+                                    require_capture_index=require_capture_index)
             if resolved.index is not None:
                 if int(resolved.index) in taken:
                     raise RuntimeError(
@@ -1601,11 +2130,20 @@ def explain_role_miss(spec: RoleSpec, devices: list[DeviceEntry],
     out: list[str] = []
     if not spec.name:
         return out
-    want = spec.name.lower()
-    hits = [d for d in devices if want in (d.name or "").lower()]
+    want = spec.name.strip().lower()
+    # **只认同名，不做子串**：`aoni webcam A25` 是 `aoni webcam A25 left` 的前缀，
+    # 子串匹配会把 right 的建议指到 left 那台，用户照着 pin 就会左右接反。
+    hits = [d for d in devices if (d.name or "").strip().lower() == want]
     if not hits:
-        out.append(f"当前枚举里**没有任何**名字含「{spec.name}」的设备 —— "
+        out.append(f"当前枚举里**没有同名**设备「{spec.name}」—— "
                    f"这台**真的不在线**（拔了 / 没供电 / 被禁用），不是换口。")
+        near = [d for d in devices
+                if want and want in (d.name or "").lower()]
+        if near:
+            names = "、".join(f"#{d.order} {d.name}" for d in near)
+            out.append(f"注意：当前有名字**包含**「{spec.name}」的设备（{names}），"
+                       f"但它不是同一台；**不要**照名字/端口直接 pin —— "
+                       f"先跑 identify 目视确认，否则左右会接反。")
         return out
     if len(hits) == 1:
         d = hits[0]
@@ -1635,10 +2173,24 @@ def resolve_role(
     *,
     interactive: bool = True,
     probe=None,
+    require_capture_index: bool = True,
 ) -> ResolvedCamera:
-    """把一个角色解析成**当前**索引。
+    """把一个角色解析成**当前采集索引**（`capture_index`）。
 
     优先级：identity -> port -> name（都对不上时：可交互就让你选，否则报错并附设备清单）。
+
+    ## 🚨 唯一可以用作"采集索引"的东西是 `capture_index`
+
+    `RoleSpec.index` / `DeviceEntry.order` 都是 **PnP 枚举位次**，它只回答
+    "这台设备在系统清单里排第几"，**不是** `cv2.VideoCapture(index)` 的编号。
+    两套编号只在"MSMF 且顺序恰好一致"时相等 —— 那是巧合，不是保证（实测：
+    DSHOW #1 = 笔记本内置、MSMF #0 才是外接；vivo 虚拟摄像头只出现在 DSHOW）。
+
+    所以 `capture_index is None` 时本函数**抛 `CaptureIndexNotVerified`**，
+    把"程序显示的相机 ≠ 真实相机"从"静默用错"变成"必须实测一次"。
+    `require_capture_index=False` 仅供**诊断**（`cameras.py check`、界面上的
+    在线判定）：那种返回值里的 `index` 只是 PnP 位次，`capture_index_verified`
+    为 False，**不许拿它开相机**。
 
     ⚠️ **要同时解析多个角色时请用 `resolve_roles()`** —— 它会保证两个角色
     不落到同一台相机上；单独调用本函数没有这个保证。
@@ -1656,13 +2208,26 @@ def resolve_role(
 
     entry, how = _match_entry(spec, devices)
     if entry is not None:
-        warns = ()
+        warns = []
         if is_device_ignored(entry, reg):
-            warns = (f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
-                     f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。",)
-        index = spec.capture_index if spec.capture_index is not None else entry.order
+            warns.append(
+                f"「{role}」指向的 #{entry.order} {entry.name or ''} 已被标为「无关」——"
+                f"配置自相矛盾，跑 python apps/tools/cameras.py identify 重新确认。")
+        if spec.capture_index is not None:
+            index = int(spec.capture_index)
+            cap_ok = True
+        elif require_capture_index:
+            raise CaptureIndexNotVerified(
+                capture_index_error_text(str(role), spec, entry))
+        else:
+            index = int(entry.order)
+            cap_ok = False
+            warns.append(
+                f"「{role}」的采集索引未实测：#{index} 只是 PnP 位次，"
+                f"只能用来认出是哪台设备，不能拿来开相机。")
         return ResolvedCamera(role=str(role), index=index, how=how, entry=entry,
-                              warnings=warns)
+                              warnings=tuple(warns),
+                              capture_index_verified=cap_ok)
 
     expected = []
     if spec.identity:
@@ -1678,10 +2243,22 @@ def resolve_role(
     # 说明相机真的换了/漂移了，此时**绝不能**蒙着用配置里那个旧索引
     # （那正是"左边窗口是外接、右边却是笔记本内置"的成因），必须让用户重新确认。
     if not spec.verified and spec.index is not None:
+        # 身份/端口都对不上时，配置里的 `index` 只是**最后一次 PnP 位次**，
+        # 不是采集索引。按角色真正开相机时**必须硬拒**，否则又是"用错相机
+        # 却一切正常"；只有诊断路径（require_capture_index=False）才允许把它
+        # 当参考值打印出来。
+        if require_capture_index:
+            raise CaptureIndexNotVerified(
+                f"「{role}」按身份/端口都没找到（{why}）。"
+                f"配置里只剩 PnP 位次 #{spec.index} —— 它不是 OpenCV/MSMF 采集索引，"
+                f"不能拿来开相机。先跑 python apps/tools/cameras.py identify 重新确认，"
+                f"或用 pin {role} capture-index:N 写入已确认的采集索引。")
         warn = (f"「{role}」按身份/端口都没找到（{why}），"
-                f"已退回配置里的索引 #{spec.index} —— 索引会漂移，可能用错相机，请核对！")
+                f"诊断路径下显示配置里的 PnP 位次 #{spec.index}；"
+                f"它不是采集索引，**不能拿来开相机**。")
         return ResolvedCamera(role=str(role), index=spec.index, how="index-fallback",
-                              warnings=(warn,))
+                              warnings=(warn,),
+                              capture_index_verified=False)
 
     if interactive and _stdin_is_tty() and devices:
         chosen = _prompt_pick(str(role), spec, devices, why)
@@ -1689,9 +2266,12 @@ def resolve_role(
             raise RuntimeError(f"没有为「{role}」选定相机，已中止。")
         hit = next((d for d in devices if d.order == chosen), None)
         warns = (f"「{role}」本次改用手动指定 #{chosen}（配置未改）",
+                 "注意：这个编号是**你自己按设备表**指定的 PnP 位次，程序无法证明"
+                 "它是同一台物理相机；要落地请跑 python apps/tools/cameras.py identify",
                  "如需永久生效，请重跑 python apps/tools/cameras.py identify")
         return ResolvedCamera(role=str(role), index=chosen, how="manual",
-                              entry=hit, warnings=warns)
+                              entry=hit, warnings=warns,
+                              capture_index_verified=False)
 
     # ⚠️ 非交互路径下**只有这句报错可见**（`cameras.py check` 有自己的输出通道，
     # 但脚本/子进程里就只有它）。所以"是不是换 USB 口了"这条线索必须一起塞进来 ——
@@ -1713,11 +2293,17 @@ def resolve_camera_arg(
     reg: Registry | None = None,
     devices: list[DeviceEntry] | None = None,
     interactive: bool = True,
+    require_capture_index: bool = True,
 ) -> int | None:
     """`--left/--right/--camera` 的取值 -> 索引。
 
     None/'' -> None；int -> 原样；'0' -> 0；'port:xx'/'id:xx'/'name:xx' -> 直接匹配设备；
     其它字符串 -> 当作角色名查 `config/cameras.json`。
+
+    ⚠️ **纯数字/`port:`/`id:`/`name:` 是"用户的显式选择"**，原样返回（那是用户
+    自己的编号空间，程序无从判断）；只有**角色名**这条路径要求 `capture_index`
+    实测过（`require_capture_index=True`，见 `resolve_role`）—— 这是"按角色启动
+    却用错相机"的唯一入口，也是标定/录制真正走的那条路。
     """
     if value is None:
         return None
@@ -1742,12 +2328,27 @@ def resolve_camera_arg(
             pool = devices if devices is not None else list_devices()
             for d in pool:
                 if needle in str(getattr(d, attr)).lower():
-                    return d.order
+                    if not require_capture_index:
+                        return d.order      # 诊断路径：只报告 PnP 位次
+                    # `port:/id:/name:` 是显式点名一台设备，但**打开它仍要
+                    # 采集索引**；PnP 位次不能拿来开相机。找绑定到这台设备的
+                    # 角色，用它的实测 capture_index；没有就硬拒。
+                    dev_reg = reg if reg is not None else load_registry()
+                    for role, spec in dev_reg.roles.items():
+                        hit, _how = _match_entry(spec, [d])
+                        if hit is not None and spec.capture_index is not None:
+                            return int(spec.capture_index)
+                    raise CaptureIndexNotVerified(
+                        f"{text} 匹配到 {d.name or '未命名设备'}"
+                        f"（PnP 位次 #{d.order}），但它没有实测 capture_index。"
+                        f"先跑 python apps/tools/cameras.py identify，"
+                        f"或用 pin <role> capture-index:N 写入已确认的采集索引。")
             raise RuntimeError(
                 f"没找到匹配 {text} 的相机。\n检测到的相机：\n{format_device_table(pool)}"
             )
 
-    resolved = resolve_role(text, reg, devices, interactive=interactive)
+    resolved = resolve_role(text, reg, devices, interactive=interactive,
+                            require_capture_index=require_capture_index)
     for warn in resolved.warnings:
         print(f"[警告] {warn}")
     return resolved.index

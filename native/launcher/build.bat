@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 rem ==========================================================================
-rem  编译根目录的「启动器.exe」—— 原生 Windows GUI 启动器，双击无黑框
+rem  编译根目录的「launcher.exe」—— 原生 Windows GUI 启动器，双击无黑框
 rem
 rem  源码 main.go / 图标 icon.ico + icon.rc
 rem  需要 Go（go build）；有 windres（msys64/mingw64）才嵌图标，没有也能编译。
@@ -34,7 +34,7 @@ if exist "icon.ico" if exist "icon.rc" (
 )
 
 set "CGO_ENABLED=0"
-go build -ldflags="-s -w -H windowsgui" -o "..\..\启动器.exe" .
+go build -ldflags="-s -w -H windowsgui" -o "..\..\launcher.exe" .
 if errorlevel 1 (
     echo [失败] 编译失败，请看上面的报错。
     pause
@@ -42,10 +42,10 @@ if errorlevel 1 (
 )
 
 echo.
-echo   已生成： ..\..\启动器.exe
+echo   已生成： ..\..\launcher.exe
 if defined HAS_ICON (echo   图标：   已嵌入) else (echo   图标：   未嵌入)
 echo.
-echo   双击根目录的 启动器.exe 即可打开图形界面；
-echo   带参数时（如 启动器.exe test）原样转给 启动程序.bat。
+echo   双击根目录的 launcher.exe 即可打开图形界面；
+echo   带参数时（如 launcher.exe test）原样转给 run.bat。
 echo.
 pause

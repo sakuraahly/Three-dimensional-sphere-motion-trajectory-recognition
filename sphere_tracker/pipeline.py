@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 
@@ -97,6 +98,11 @@ class SpherePipeline:
         )
         self._prev_gray: np.ndarray | None = None
         self._motion_recent: deque[float] = deque(maxlen=6)   # 最近几帧的全局位移幅值
+        # 0 检出时的诊断：**按前 24 字去重 + 全程最多 10 条**。
+        # 为什么不是"字符串变了就打印"：specular 的丢失提示里带帧号/跳变像素，
+        # 每帧都不同；按全串比较会变成每帧一行日志，把真正有用的信息淹掉。
+        self._notes_seen: set[str] = set()
+        self._warnings_seen: set[str] = set()
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -108,6 +114,8 @@ class SpherePipeline:
         self._prev_gray = None
         self._frame_index = 0
         self._prev_t = None
+        self._notes_seen.clear()
+        self._warnings_seen.clear()
 
     def set_detect_width(self, width: int | None) -> None:
         """让检测跑在**缩小的图**上（坐标会自动换算回原图）。
@@ -216,6 +224,46 @@ class SpherePipeline:
             detections = [d.scaled(1.0 / detect_scale) for d in detections]
 
         best = detections[0] if detections else None
+        # 0 检出 + 检测器给了原因 → 说一次。以前的静默失败（预设不匹配、同色背景）
+        # 只能靠人从"一条空 CSV"倒推，这里把原因带到调用方面前。
+        #
+        # **「有 detections」不等于「检到了球」**：`generic` 在种子门内一个候选都
+        # 没有时会返回**点选锚点**（`extra["seed_anchor"]`，圆心就是用户手指的位置），
+        # 好让带种子的流程继续跑。这时 last_error 才是唯一的真话。只在
+        # `best is None` 时读它，等于把诊断丢在消费端 —— 2026-11-07 Critic 75b 的
+        # P1：`pipeline` stdout 空、`FrameResult.detector_note` 为 `''`，而下游看到
+        # 的是 `detected=1`、圆心=点击值，一路当成正常检测（`grep seed_anchor`
+        # 在生产端零命中）。所以锚点这一路也必须把原因说出来。
+        note = ""
+        anchor_only = bool(
+            best is not None
+            and (getattr(best, "extra", None) or {}).get("seed_anchor"))
+        if best is None or anchor_only:
+            note = str(getattr(self.detector, "last_error", "") or "")
+            if not note and anchor_only:
+                # 有的检测器走锚点兜底时**故意不写** last_error（它们认为"人给的位置
+                # 不算错误"）：`color` 的 `_anchor_detection` 就是空的，`fusion`
+                # 还会在成功分支把 last_error 清成 `''`。可对下游来说，
+                # `detected=1` + 圆心=点击值 和"真的量到了"长得一模一样 ——
+                # 所以这里补一句，保证**任何**检测器的锚点都有话说。
+                # （2026-11-07 Critic 75c：只认 `last_error` 的话，四个检测器里
+                #  只有 generic 一路能被看见，color/specular/fusion 全被静默。）
+                note = (f"本帧返回点选锚点（{best.x:.0f},{best.y:.0f}）"
+                        f"r={best.radius:.1f}：检测器没有给出真实测量，"
+                        f"这是用户点选的位置")
+            # 数字（帧号/百分比/像素）替换掉再取前缀：同类提示只打印一次
+            key = re.sub(r"\d+", "#", note)[:40]
+            if note and key not in self._notes_seen and len(self._notes_seen) < 10:
+                self._notes_seen.add(key)
+                # 前缀带 [锚点]：一眼分清"真的检到了"和"退回用户点选值"
+                print(f"[检测器]{'[锚点]' if anchor_only else ''} {note}")
+        # 有检测结果、但检测器自己说"这一帧可疑"（例如掩膜把背景吃进来）：
+        # 不能当成错误去中断，也不能完全不说。同样按前缀去重、最多 5 条。
+        warning = str(getattr(self.detector, "last_warning", "") or "")
+        wkey = re.sub(r"\d+", "#", warning)[:40]
+        if warning and wkey not in self._warnings_seen and len(self._warnings_seen) < 5:
+            self._warnings_seen.add(wkey)
+            print(f"[检测器][注意] {warning}")
         track = self.tracker.update(detections, t)
         state = track.state() if track is not None else None
 
@@ -223,7 +271,7 @@ class SpherePipeline:
             t=t, frame_index=self._frame_index, detection=best, track=state,
             fps=self._fps_ema, detect_ms=detect_ms,
             camera_motion=motion, camera_moving=camera_moving,
-            camera_steady=steady,
+            camera_steady=steady, detector_note=note,
         )
         self._frame_index += 1
 

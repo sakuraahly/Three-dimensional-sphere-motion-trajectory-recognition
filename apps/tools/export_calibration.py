@@ -27,6 +27,7 @@ ROOT = next(p for p in Path(__file__).resolve().parents if (p / "sphere_tracker"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from apps._common import current_calibration        # noqa: E402
 from calib import StereoRig                      # noqa: E402
 from calib.export import write_export             # noqa: E402
 from sphere_tracker.plugins import names          # noqa: E402
@@ -37,8 +38,9 @@ _EXPORTERS = names("exporter")
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="导出双目标定参数（分相机 + 整体）")
-    ap.add_argument("--calib", default="config/stereo_calibration",
-                    help="标定文件前缀（不带扩展名）")
+    # 默认跟当前装置档案的标定（2026-11-10 裁决 B5：不许再写死顶层路径）
+    ap.add_argument("--calib", default=str(current_calibration(need_existing=False)[0]),
+                    help="标定文件前缀（不带扩展名，默认 = 当前装置档案的标定）")
     ap.add_argument("--out", default="outputs/calib_export",
                     help="输出目录（不存在会创建）")
     ap.add_argument("--formats", default=",".join(_EXPORTERS),

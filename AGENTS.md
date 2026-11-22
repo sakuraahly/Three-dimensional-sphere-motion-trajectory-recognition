@@ -6,7 +6,7 @@
 >
 > **基于 STC 生成（2026-10-10）。**
 > STC 的当前分支**不带检查器**，所以落差检测由本项目自己做：
-> `启动程序.bat standards` → `apps/tools/check_standards.py`（引用 / 来源 / 计数 三类）。
+> `run.bat standards` → `apps/tools/check_standards.py`（引用 / 来源 / 计数 三类）。
 > 经过与原因见 `docs/交接文档.md` §12。
 
 ---
@@ -48,7 +48,7 @@
 
 ```powershell
 cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
-启动程序.bat                  :: 双击即可：找 Python → 查依赖 → 自动装 → 启动界面
+run.bat                  :: 双击即可：找 Python → 查依赖 → 自动装 → 启动界面
 ```
 
 | 参数 | 直接做 |
@@ -63,12 +63,13 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 | `run` | 实时检测 |
 | `diag` | 相机画质 / 链路诊断 |
 | — | `python apps/tools/cameras.py doctor` —— **真开相机**体检"能不能跑双目"（只报告，不改配置） |
+| — | `python apps/tools/cameras.py modes` —— **逐档真开**报实际分辨率/实测帧率（只报告，不写 config 与 `camera_modes.json`） |
 | `test [full]` | 回归测试（默认 fast 档；`test full` 跑全套） |
 | `standards` | 规范落差自查（引用 / 来源 / 计数 / **待办** 四类） |
 | `gate` | **提交前的自动门**：`standards` + `test fast -j auto`（约 45 秒）。`.githooks/pre-push` 调它；**不 pause**，可被非交互调用 |
 
 **Python 必须用绝对路径**：`%USERPROFILE%\miniforge3\envs\myenv\python.exe`。
-裸 `python` 会解析到 msys64 那个没装 opencv 的解释器 —— 但 `启动程序.bat` 已经
+裸 `python` 会解析到 msys64 那个没装 opencv 的解释器 —— 但 `run.bat` 已经
 用"真跑一次 `import cv2`"的方式绕开了这个坑，所以**优先用 .bat，不要手敲 python**。
 
 ---
@@ -76,14 +77,15 @@ cd D:\MY_CODING_PROGRAM\Three-dimensional-sphere-motion-trajectory-recognition
 ## 3. 目录结构与放置规则（唯一权威）
 
 ```
-启动程序.bat / 启动程序.py / 启动程序_命令行.py   ← 根目录的三个启动脚本
-启动器.exe                                    ← 编译产物（不是脚本），双击静默起 GUI
-native/launcher/  Go 源码 + 图标 + build.bat ← 重建 启动器.exe 的唯一来源
-sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）
+run.bat / install.bat / uninstall.bat         ← 根目录：运行 / 安装 / 卸载入口（全英文）
+apps/gui_main.py / apps/cli_main.py          ← 入口壳：默认启动新 GUI（经典界面已废止，2026-11-20；实现仅存档，`--legacy` 已关闭）/ CLI 主程序（已搬出根目录）
+launcher.exe                                ← 编译产物（不是脚本），双击静默起 GUI
+native/launcher/  Go 源码 + 图标 + build.bat ← 重建 launcher.exe 的唯一来源
+sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）；discovery.py = 会话目录枚举（全仓库唯一口径，纯 stdlib，不拉 cv2/scipy）；video_files.py = 原始左右录像文件名唯一产地
 calib/            双目标定（离线一次）
 stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角测量）
 apps/             可执行程序；tools/ 放一次性设置与诊断
-tests/            回归测试（26 个，改动后必跑）
+tests/            回归测试（29 个，改动后必跑）
 docs/             文档
 assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / 运行期产物
 logs/             运行日志（按来源 + 时间分片；路径唯一来源 paths.log_dir()）
@@ -93,15 +95,22 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
-2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 26 个回归测试必须能一键复跑。
+2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 29 个回归测试必须能一键复跑。
 3. **能重新生成的东西不进版本库**（`outputs/`、`config/`、权重、视频素材）。
 4. **交付物不放 `outputs/`**。`outputs/` 的语义是"删了也能重新生成"，
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
-5. **根目录只放那三个启动脚本**（有意例外：唯一价值是双击即用）。
-   **不要再加第四个脚本**；要"只做某一步"就给 `启动程序.bat` 加参数。
-   2026-11-05 例外：`启动器.exe` 是**编译产物**、不是脚本，作用只是把
-   `.bat` 包成无黑框的双击入口（找 Python / 转参数都不另写一份逻辑），
-   源码在 `native/launcher/`，产物不入库、换机器用 `build.bat` 重建。
+5. **根目录只放运行 / 安装 / 卸载这三个入口脚本，且一律英文文件名**。
+   2026-11-05 放宽了旧规则（旧版写"只放那三个启动脚本、不要加第四个"）：
+   安装器与卸载器是**分发版**必需的用户入口，塞进 `apps/` 反而没人找得到。
+   现在的清单是 `run.bat`（主入口 + 所有单步参数）、`install.bat`、
+   `uninstall.bat`；两个 `.py` 主程序已搬进 `apps/`，根目录不再有 `.py`。
+   **除此以外不要在根目录加脚本**；要"只做某一步"给 `run.bat` 加参数。
+   `launcher.exe` 是**编译产物**、不是脚本：把 `.bat` 包成无黑框的双击入口
+   （找 Python / 转参数都不另写一份逻辑），源码在 `native/launcher/`，
+   产物不入库、换机器用 `build.bat` 重建。
+   同日全部入口改英文名，文档里的文件名引用已同步；旧名与对应关系见
+   git 历史（`git log --follow -- apps/gui_main.py`），历史叙述中的旧名
+   不作为当前路径使用。
 6. **不可再生的录制数据放 `data/`**，不要放 `outputs/`（语义是"删了能再生"），
    也不要放 `assets/`（那是入库的静态素材）。`data/` 默认不入库，
    **必须单独备份**；一次采集 = 一个目录 + `session.json`。
@@ -113,7 +122,88 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
    日志却是出问题后唯一能回看的东西 —— 所以它平级放在根目录、单独清理，
    不跟着 `outputs/` 一起被当成一次性产物。
 
-### `apps/tools/` 里其实是八组东西
+### 数据管理：会话枚举与分组**各只有一份产地**（2026-11-09）
+
+数据管理面板从"按时间平铺"改成"文件资源管理器式的分组目录"之后，下面两条是硬约束。
+它们不是风格偏好 —— 两条都已经被违反过一次，代价是**会话在界面上静默消失**。
+
+**① 会话枚举只有一份实现**：`sphere_tracker.discovery.discover_session_dirs()`
+（递归、命中即剪枝、深度上限 5、纯 stdlib）。数据管理、会话列表、标定入口、
+`view_3d` 默认打开**全部**走它。三个入口只是它的不同包装，谁都不许再写第二份：
+
+| 入口 | 身份 |
+| ---- | ---- |
+| `sphere_tracker.discovery.discover_session_dirs` | **唯一实现** |
+| `stereo.sessions.list_sessions` | 直接调它（`recursive=True, strict=True`）；以前是 `glob("*/session.json")`，只扫一层、漏 15 段 |
+| `apps/_stereo_layout.candidate_session_dirs` | **多根包装**（`strict=True` + resolve 跨根去重）。多根场景可以用，但别再把它当独立扫描器 —— 它已经没有自己的扫描逻辑了 |
+| `apps/_session_index` | 只转发导入（分组树 / `index.json` 仍在这里） |
+
+- **不许自己写 `iterdir()` / `rglob()` 拼一份，也不许自己写
+  `looks_like_session` 过滤** —— "漏一个判据就看不见一段会话"正是这样来的。
+  要哪一档判据就传参数：**宽**（`strict=False`，默认）= `session.json` **或**
+  视频 / `derived` / `calib`（半成品也要列出来给人修，数据管理用这档）；
+  **严**（`strict=True`）= 只认 `session.json`（会话列表 / 标定 / 校验用这档）。
+- **`recursive=False` 不是"旧口径"了**：它是**同一个循环**把深度上限压到 2
+  （根记第 0 层，正好覆盖「根 → 分区 → 会话」），**同样做过滤**。
+  旧的"不过滤、连 `实验1` 这种空目录都返回"的实现已删除。
+  想"只看两层"就传这个参数，别回去写 `glob` —— 那正是三套扫描器的起点。
+- **去重不许按目录名**：`parallel/20261021-120000` 与 `angled/20261021-120000`
+  是**两段不同会话**，按 `d.name` 去重会吃掉一段（`apps/_gui_stereo.py` 里
+  那行 `if d.name in seen` 已删）。要按 `resolve()` 后的路径。
+- **它为什么在 `sphere_tracker/` 而不是 `stereo/`**：放 `apps/` 不行
+  （`stereo/` 不许 import `apps/`）；放 `stereo/` 方向对但**代价错** ——
+  `stereo/__init__.py` 会把 `pair_source`（cv2）与 `sync`（scipy）拉起来，
+  `import apps.data_manager` 从 **0.06s 变成 1.56s**（数据管理窗口多等 1.5 秒）。
+  搬到最底层后 **0.29s**。纯 stdlib 的目录枚举不该背重依赖的账，而这个代价
+  **在代码里完全看不出来**，只能靠计时发现。
+
+**② 分组定义只有一个产地。** `apps/_session_index.group_of()`。
+树节点、`index.json` 的 `group` 字段、导出包的目录名**全部调它**。
+逻辑是"虚拟集合（`data/collections.json`）优先，没有就按磁盘相对目录兜底"。
+任何地方再写一次"父目录名就是分组"，两处迟早对不上 ——
+用户在面板里归的类和磁盘上的位置本来就是可以不一致的两件事。
+（注意两个产地要分清：**枚举**在 `sphere_tracker/discovery.py`，
+**分组**在 `apps/_session_index.py`。）
+
+> 为什么这两条要写进 AGENTS.md 而不是只写在模块文档串里：
+> 枚举口径漏扫是**静默**的（同一份磁盘 44 / 29 两个数，没有任何提示），
+> 分组口径分叉也是静默的（树上在「梨子」、表里写着「实验1」）。
+> 静默失效只能靠"不许有第二份实现"来防，加测试只能测已经想到的那几种用法。
+>
+> 判据：`tests/selftest_session_index.py` 钉四入口集合相等、宽严子集关系、
+> `recursive=False` 是真子集（含变异自证）；`tests/selftest_doc_facts.py` 守着本节的引用与计数。
+> 口径的完整说明在 `sphere_tracker/discovery.py` 的模块文档串
+> （"为什么分组是虚拟的"那半在 `apps/_session_index.py`）。
+
+### 标定图：一次采集 = 一个会话子目录（2026-11-09）
+
+`outputs/chain_frames/` 与 `outputs/mono_calib_frames/` 的**根层不放图片**，
+只放 `_current.json`（当前会话指针）和若干 `<时间戳>/` 会话目录：
+
+```
+outputs/chain_frames/
+  _current.json                  ← 当前会话指针（schema: calib-session-pointer/1）
+  20261109-195500/
+    session.json                 ← 装置档案 / 棋盘 / 采集档 / 创建时间
+    left/  board_b/  pair/  ref_pair_left/  ref_pair_right/  ...
+```
+
+- 每次点「采集标定板图…」/「拍单目标定图」由 `apps/_actions.py` 的
+  `new_chain_session()` / `new_mono_session()` 新建一次会话；四段图、自检、
+  标定**全部**读 `_current.json` 指向的那一个目录
+  （`current_chain_dirs()` / `current_mono_dir()`）。采集/自检/标定是不同子进程，
+  靠持久化指针共享会话，不靠窗口里的临时变量。
+- **没有当前会话就明确报错，绝不回落读根层图片。** 以前固定目录追加，真机实测
+  `board_b` 344 张里混了 11-04 的 304 张与 11-08 的 40 张（相机/分辨率还不同），
+  `mono_calib_frames` 60 张混了两天；相机一移动，旧图就是负面资产。
+- 旧图已按用户指示送 **Windows 回收站**（2026-11-09，可恢复；清单与不碰范围见
+  `outputs/calib_cleanup_20261109.md`）。
+- 判据：`tests/selftest_plugins.py` §17，含「退回固定目录就红」的反向自证。
+- CLI 手动跑 `calibrate_stereo.py --method chain` 仍要显式给 `--left-dir` 等；
+  `calibrate_mono.py` 的默认 `--dir` 指向根层（现在是空的），会明确报「没有图像」，
+  不会把历史图混进去。GUI 是唯一自动建会话的入口。
+
+### `apps/tools/` 里其实是十组东西
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -126,13 +216,15 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
 | **球检测器**（2） | `export_ball_dataset.py` `train_ball_detector.py` | 把"点选 + 跟踪"的结果自举成 YOLO 数据集（**按会话切分**，正/负样本都收），再微调 `yolo11n` 并用**圆心误差**（不是 mAP）验收；训完 `models/ball_yolo.pt` 会被 `YoloDetector` 自动优选 |
 | **界面走查**（1） | `gui_walkthrough.py` | 按真实用户流程走一遍新 GUI：逐步截图、量裁切、**每点一个按钮都留状态条前后对照 + 任务日志尾 + 退出码 + 产物是否出现**（截图只作证据、不作通过依据）；只走不需要硬件的路径，录制/标定/清理只检查不点击 |
 | **交付 / 打包**（1） | `make_clean_bundle.py` | 按白名单生成**纯净交付 zip**（只含源码与运行必需物）：打包前反查 `.gitignore` 一致性、禁入目录 / 大二进制 / 个人标识，`--no-tests` `--no-assets` 可再瘦身；不读 git 索引，所以已入库的 docs/ 史料不会被打进去 |
+| **多语言 / 文案**（1） | `i18n_extract.py` | 扫描 GUI 源码里**用户看得见**的中文（不收注释 / docstring / 内部日志），自动登记进双语资源并用 `apps/i18n_seed.py` 的领域词典生成英文；`--check` 给 CI 发现漏登记的新文案，`--write` 生成 `apps/i18n_data.py`（保留人工译文），`--stats` 看覆盖率。新增界面文字不用手改两份文件 |
+| **界面点按**（1） | `gui_clickthrough.py` | **真实点击**走一遍：启动 GUI → 点「平行双目·进入」→「换相机…」→「预览这台」，每步截图存 `outputs/gui_click/`。用 `pywinauto` 发真实鼠标事件（`conda install -n myenv -c conda-forge pywinauto`）；桌面锁屏（2）、没开窗（4/5）、**目标窗口切不到前台（6）**、**点了但 `camera_preview.log` 没变化（7）**、**点击坐标不在目标窗口上（8）** 一律报"没点过/没证据"并退出，**绝不假装成功**（2026-11-08 抓到过一次"✔ 点完"其实是点在 WorkBuddy 窗口上）。2026-11-09 静态查明 exit 5 的根因是**比例坐标依赖窗口尺寸**：门厅卡片贴顶固定高度，校准截图 996x865 而那次点击落在 y=1615；现在点前用 `WindowFromPoint` 核对坐标归属，并在 exit 5 时打印窗口尺寸诊断。真实鼠标点按仍待实机复验。这是 `AGENTS.md §7.3` 的执行器 |
 
 > **argv 只能有一个产地**：界面（`apps/_gui_*.py`）里**不许出现 `"xxx.py"` 字面量**，
 > 一律调 `apps/_actions.py`。理由不是整洁 —— 同一个动作在两套界面各拼一遍 argv，
 > 已经连着出过三次"界面说做了、命令行没收到"的静默缺陷（录制少了 `--preview`、
 > 球径按 mm 传给按米收的参数、「检查装置」一个参数都不传）。
-> 判据：`selftest_gui_budget` 用 AST 扫，出现即红；经典界面（`启动程序.py`）是
-> **棘轮式豁免**（只减不增）。
+> 判据：`selftest_gui_budget` 用 AST 扫，出现即红；经典界面（`apps/gui_main.py`，
+> **已废止**）是 **棘轮式豁免**（只减不增）。
 
 > 第三组把"文档说的"和"实际是什么"对齐；加工具时**必须在本表登记**
 > （`sync_facts.py` 会检查这一条）。
@@ -141,7 +233,7 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
 > **55 处**，搬家要同步改 55 处 —— 拿"目录好看"换"亲手制造一次文档漂移"，
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
-### `apps/` 顶层：18 个可执行脚本 + 20 个私有模块
+### `apps/` 顶层：18 个可执行脚本 + 24 个私有模块
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -149,7 +241,7 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
 | 标定与录制（6） | `record_stereo.py` `record_mono.py` `calibrate_stereo.py` `calibrate_mono.py` `verify_stereo.py` `fov_dialog.py` | 双路录制（含 session.json）/ **单目纯录制（只写原图，不叠标注；带 `.json` 元数据，供"先拍后检"）** / 自动标定 / 单目内参标定（棋盘图 → `config/mono_calibration.json`，带质量判定）/ 标定复检 / **FOV 管理器**（两路固有视差：看/量/清，存进装置档案供标定复用） |
 | 数据与导出（6） | `data_manager.py` `cleanup_dialog.py` `export_visualization.py` `seed_picker.py` `profile_dialog.py` `junk_dialog.py` | 数据管理面板 / 清理回收站 / 导出标准 JSON / 点选球心 seed / **装置档案管理**（多套装置各配一份标定路径，新建/切换）/ **垃圾管理器**（日志 / 临时产物 / 字节码 / 回收站：按项勾选 + 按时间筛，分"删了下次跑就有"与"删了要重拍"两档） |
 | 查看与测试（2） | `view_3d.py` `run_tests.py` | 3D 轨迹查看器 / 回归测试运行器（唯一跑全套的地方） |
-| 私有模块（20） | `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` `_fov_store.py` `_stereo_layout.py` `_stereo_sessions.py` `_junk.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）** / **FOV 记录在标定与档案间的搬运** / **双目会话的磁盘布局（按装置分区：找得到、判得出属于哪套装置）** / **会话管理动作（回收站软删 / 改装置模式并搬分区）** / **垃圾白名单与清理（唯一会主动减少磁盘文件的模块：只删扫描出来的路径）**） |
+| 私有模块（24） | `i18n.py` `i18n_seed.py` `i18n_data.py` `_common.py` `_window.py` `_workbench.py` `_data_export.py` `_cleanup.py` `_collapsible.py` `_gui_geometry.py` `_task_runner.py` `_gui_widgets.py` `_gui_app.py` `_gui_console.py` `_gui_mono.py` `_gui_stereo.py` `_gui_bench.py` `_mono_sessions.py` `_actions.py` `_fov_store.py` `_stereo_layout.py` `_stereo_sessions.py` `_junk.py` `_open_in_explorer.py` | 不是入口，被上面那些 import（**参数块**与日志 / 窗口与按键 / 会话摘要 / 导出逻辑 / 清理逻辑 / 折叠区 / 布局计算 / **任务进程管理与停树** / **新界面控件层** / **App 与门厅** / **控制台** / **单目窗** / **双目窗** / **会话工作台** / **单目会话** / **动作→命令行（argv 的唯一产地）** / **FOV 记录在标定与档案间的搬运** / **双目会话的磁盘布局（按装置分区：找得到、判得出属于哪套装置）** / **会话管理动作（回收站软删 / 改装置模式并搬分区）** / **垃圾白名单与清理（唯一会主动减少磁盘文件的模块：只删扫描出来的路径）** / **在系统文件管理器中打开或定位路径的共用薄层（纯 stdlib、不弹窗；Windows 运行时取 `os.startfile` 以便自动走查打桩不误弹窗口；失败抛 `OpenInExplorerError` 由调用方呈现）**） |
 
 > ⚠️ **这张表的组名刻意不加粗** —— `sync_facts.py` 只在 `apps/tools/` 的清单上
 > 做计数，但它解析的是 AGENTS.md 里**所有**形如 `| **名字（N）** |` 的行。
@@ -166,14 +258,37 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
 | 可执行脚本 | 全小写、下划线分词、**动词开头** | `calibrate_stereo.py` `check_stereo_setup.py` |
 | 私有辅助模块 | `_` 前缀，**必须只被 import、不能顶层执行** | `_preview_lib.py` `_common.py` |
 | 回归测试 | `selftest_<被守护的模块>.py` | `selftest_camera_motion.py` |
-| 中文文件名 | **只用于两类**：给人的入口（`启动程序.bat`）、文档（`docs/*.md`） | — |
+| 中文文件名 | 现在**只用于文档**（`docs/*.md`）；脚本 / 程序 / 产物一律英文 | — |
 | 代码标识符 | 一律英文 | — |
+| 备份文件命名 | 格式、撞车、保留份数、原子写的**唯一实现**在 `apps/_common.py`，见下「第 7 条」 | `<原名>.bak-<YYYYmmdd-HHMMSS>` |
 
 > ⚠️ **`_` 前缀有硬含义**：`_preview_lib.py` 是"import 时才定义函数"的真库；
 > 而曾经名为 `_overflow_lib.py` 的那个文件**import 就执行、还读 `sys.argv`**，
 > 是个 CLI 脚本 —— 名字与实质相反，连维护者都要先查一遍它是不是死代码。
 > 已改名为 `check_overflow.py`（动词开头，符合上表）。
 > **加文件前先对一眼这张表。**
+
+### 第 7 条：备份文件命名（2026-11-10 裁决：**只定规范、不动历史**）
+
+全仓库只有一份实现：`apps/_common.py` 的 `atomic_write_with_backup`。四处写入点
+（`apps/_session_index.py` 的 `save_collections`、`apps/data_manager.py` 的
+`update_session_meta`、`apps/_stereo_sessions.py` 的 `_rewrite_json`、
+`apps/_junk.py` 的清理策略）一律调它或引用它的策略常量，**不许再留第二份格式
+字符串**；备份查找/清理的 glob 也取自同一处的 `backup_glob`。
+
+- 备份名：`<原名>.bak-<YYYYmmdd-HHMMSS>`；同一秒撞车时从 `-2` 起追加
+  `<原名>.bak-<YYYYmmdd-HHMMSS>-<n>`（`n` 从 2 起）。
+- 临时文件：`<原名>.tmp-<pid>`，同目录写完后 `os.fsync` 再 `os.replace` 原子替换；
+  **绝不在原文件上直接 `json.dump`**。备份内容是原文件的逐字节副本（不重新序列化）。
+- 保留份数：**默认最近 5 份**（`DEFAULT_KEEP_BACKUPS`，`save_collections`）；
+  `session.json` 的回滚点是**显式策略差异** —— 写时不裁剪，由 `apps/_junk.py` 的
+  `KEEP_BAK_PER_SESSION` 在清理阶段保留**最近 3 份**（`SESSION_KEEP_BACKUPS`）。
+  两者通过 `keep_backups` 参数 / 策略常量传递，**不抹平**。
+- **历史文件保留原名，不批量改名。** `config/` 下 9 个备份名里的
+  `-before-identity-fix`、`-broken-both-roles-same` 等携带"备份发生在什么操作之前"
+  的信息，改成纯时间戳会把信息抹掉；批量改名/迁移还会动到用户资产。
+  本条只约束**新写入**，不追溯既有文件。理由与清单见 `docs/交接文档.md` §103、
+  `docs/outputs保留清单.md`。
 
 ---
 
@@ -219,6 +334,7 @@ apps / tests                        （只调用，不被调用）
 | `docs/项目总纲.md` | 项目是什么、文档怎么配合、术语 | 建立全局印象 |
 | `docs/交接文档.md` | 现状、代码地图、**踩坑（最值钱）**、命令速查 | 动代码之前 |
 | `docs/开发指南.md` | 环境、怎么加东西、方法论 | 要改代码 |
+| `docs/界面技术选型论证.md` | **为什么主界面不换 WebView2 / Electron**、代价对照、该换的触发条件（命中两条才动） | 又想说"界面要不要重做"时，先看这份 |
 | `docs/插件化架构.md` | **六个扩展点的注册表**（检测器 / 预测器 / 视频源 / 标定方法 / 导出 / 跟踪器）、七条规则、注入点（**已落地**） | 要新增一种实现 / 改出厂默认 |
 | `docs/文件结构.md` | 目录逐项说明 | 不确定东西放哪 |
 | `docs/数据标准.md` | seed / traj3d / visualization 的 JSON schema、坐标系、版本规则 | 接数据、写可视化、换格式 |
@@ -229,6 +345,7 @@ apps / tests                        （只调用，不被调用）
 | `docs/计划书.md` | 目标、里程碑 M0–M8、风险 | 想知道还剩什么 |
 | **`docs/待办清单.md`** | **"还有哪些活"的唯一来源**：每条 `B-NN` 带状态（open/doing/blocked/done/wontfix）、卡在什么、详情指路。状态**只认这里**，各章节只留细节 | **每次开工前**；要加/完成一项待办时 |
 | `docs/planbooks/` | **一次工作的计划书**（范围/优先级/验收/明确不做） | 要开工时 |
+| `docs/planbooks/2026-11-09_目录化数据管理.md` | **数据管理从"按时间排列"改成"分组目录树 \| 会话表"** 的计划书：`collections.json`（虚拟分组，用户数据）与 `index.json`（派生缓存）、递归枚举的剪枝规则、明确不做"物理搬目录"的四个理由 | 要动数据管理面板 / 会话枚举时 |
 | `docs/PPT生成流程.md` + 两份文稿 | 开题报告生成与答辩讲稿 | 要改报告 / 答辩 |
 
 **优先级分两条，不要混成一张表**（同 `STC/standards/02-文档体系.md` §3）：
@@ -276,13 +393,13 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 7. 质量底线：26 个回归测试
+## 7. 质量底线：29 个回归测试
 
 ```powershell
-启动程序.bat test              # fast 档：自动跳过中位耗时 > 60s 的慢测试（当前名单见 --list）
-启动程序.bat test full         # 全套 26 个（改代码后必跑；串行约 5.8 分钟）
-启动程序.bat test full -j 6    # 同上但并行 6 路，约 3.4 分钟（结果与串行一致）
-启动程序.bat standards         # 规范落差自查（引用 / 来源 / 计数）
+run.bat test              # fast 档：自动跳过中位耗时 > 60s 的慢测试（当前名单见 --list）
+run.bat test full         # 全套 29 个（改代码后必跑；串行约 5.8 分钟）
+run.bat test full -j 6    # 同上但并行 6 路，约 3.4 分钟（结果与串行一致）
+run.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
 
 > **`-j N` 的三条约束**（`apps/run_tests.py` 的 `EXCLUSIVE` / `CONFLICT_GROUPS` 里写着原因）：
@@ -297,6 +414,7 @@ apps / tests                        （只调用，不被调用）
 | ---- | ------ |
 | `selftest_gui_budget.py` | GUI 预算自测：防止分窗重做之后又长回"一个窗口装全部" |
 | `selftest_mono_calib.py` | 单目内参标定自测：合成棋盘回收内参 + **判定真的会红** |
+| `selftest_package.py` | P2 打包层（自包含交付包）自测：目录包往返 / 标定逐字不变 / 三态 / 覆盖语义 |
 | `selftest_plugins.py` | 插件注册表自测：清单唯一（R7）、未知名字报错（R3）、默认唯一（R4）、边界（R5） |
 | `selftest_synthetic.py` | 单目全链路（三场景） |
 | `selftest_camera_motion.py` | 相机自运动：迟滞状态机 + 位移换算方向；多目标关联（遮挡外推 / 半径法重识别 / 身份互换记账） |
@@ -310,6 +428,7 @@ apps / tests                        （只调用，不被调用）
 | `selftest_config_wiring.py` | 配置接线（每个配置项都必须真的被读） |
 | `selftest_board_corner_order.py` | SB/经典检测器的角点顺序（= `rot180`）+ 标定守卫该盯物理量而非 RMS |
 | `selftest_calib_facts.py` | 真机标定日志口径（拒收分布 / 基线 199.67 mm）+ 不可用不得保存 |
+| `selftest_session_index.py` | 数据管理的**数据层**（**69 个检查点**；其中 45 条是 2026-11-09 枚举收归那一轮的，D/E 追加第 13/14/15 节 +24 条）：集合树（三层嵌套 / 中文名 UTF-8 不转义 / 空目录不消失 / 坏 JSON 不回写成空配置）；**枚举口径 5 条**：① `candidate_session_dirs` == `discover_session_dirs(strict=True)` ② `list_sessions` 同一集合 ③ `recursive=False` 是 `recursive=True` 的**真**子集（临时树 `平行/<ts>` + `实验1/梨子/<ts>`）④ `candidate` 也看得到第 3 层 ⑤ `strict=True` 是 `strict=False` 的真子集；索引可重建（除 `built` 外逐键相同、`root` 不匹配返回 `None`）、sid 稳定（搬进 `parallel/` 不变）与撞车确定性（`same-id` / `same-id~2`）。**第 13 节**：22 份不可再生交付物逐一判「不能删」、`clean_junk` 第三道边界即使被勾推荐档也拒删、普通调试产物仍可删（保护未扩大化）、13 份走查自动产物未误列；**第 14 节**：5/3 两套保留份数、备份格式串只有 `apps/_common.py` 一份、逐字节备份与同秒撞车 `-2/-3`、`save_collections` 的 `.bak-*` 清理仍生效；**第 15 节**：冲突行提示「大角度 ⚠ 目录=parallel，记录=angled」、非冲突行不误报、与 `build_index` 的 `mode_conflict` 同源、真实数据唯一 1 处冲突且 `group` 未变。**反向自证**：枚举侧把 `candidate` 的 `recursive=True` 改回 `False` 只红第 ④ 条（真实数据没有第 3 层，靠临时树）；护栏侧「22 份伪装成可删 → 仍被拒删」「调用方再留第二份备份格式串 → 红」；没有新建 `selftest_*.py`，测试文件数仍是 27 |
 | `selftest_doc_facts.py` | 测试清单与登记不退化；并跑一遍 `check_standards.py`（引用 / 来源 / 计数）；SBOM 生成器结构 / 过期检测 |
 | `selftest_health_stats.py` | 运行健康度指标：采集 / 主循环 / 检测三个帧率分得开，`dropped` / `frame_age_ms` 语义 |
 | `selftest_calib_provenance.py` | 角点出身：检测器可辨识 + 回退必须显式 + 一对之内禁止混用（两道守卫） |
@@ -319,13 +438,104 @@ apps / tests                        （只调用，不被调用）
 | `selftest_camera_presence.py` | 没有相机时**必须立刻说清并指对方向**（判定可注入，沙箱里可跑全分支） |
 | `selftest_launcher_params.py` | 启动器标定参数面板：**默认是正式档**（40/20）、留空不传、非法输入被拦住；录制前体检「模式 vs 标定」；**3D 查看器能换任意会话**（切到没视频的会话不许留旧画面、坏源不毁当前视图） |
 | `selftest_task_manager.py` | 任务管理器：能中断、**子进程树一起收干净**（「看着停了其实还在」是最难发现的） |
-| `selftest_window_mode.py` | 窗口全屏：**所有**视频窗口都接上 `apps/_window.py`；Esc 在全屏时只退全屏、不关程序；不抢已用的键 |
+| `selftest_window_mode.py` | 窗口全屏：**所有**视频窗口都接上 `apps/_window.py`；Esc 在全屏时只退全屏、不关程序；不抢已用的键；**每个 Tk 窗口的标准标题栏三按钮**（§7.1）；**内容分区可拖动**（§7.2）；**GUI 验证必须点真按钮**（§7.3） |
+| `selftest_highspeed.py` | 高帧率 / 高分辨率扩容的**不变量**（9 组 72 项）：自动协商梯子 `probe_order(None)` 与扩容前**逐项相同**（5K/8K 不进自动协商）、`DEFAULT`/`RECORD_DEFAULT` 是**对象引用**而非 `PROFILES[下标]`（源码扫描，剥注释后再扫）、`fps_type("29.97")` 不被截成 29、**24/30 fps 下门限逐项等于旧常量**（`default_max_skew_ms` 恒 60 ms、`config_for_fps` 恒 180/30）、带宽按**单路**判、`timestamp_tolerance_s` 固定 0.033 **不按帧率派生** |
 | `selftest_mutation_guards.py` | **变异自证总集**：把 13 处"当初的缺陷"逐个放回去，证明对应判据**真的会红**（改源码前有备份/恢复 + SHA256 校验；锚点不唯一就跳过）。**慢**，属 full 档 |
 
 **判定口径**：每个都打印 `判定结果：全部通过`，且退出码 `0`。
 `[跳过]` 也算通过（缺可选依赖 / 无相机时），但**跳过 ≠ 验证过**。
 
 **改动后跑全套；只改文档跑一个轻量的即可。**
+
+### 7.1 每个 GUI 窗口必须是「标准窗口」：最小化 / 最大化 / 关闭
+
+> 2026-11-07 用户给了一张标题栏截图（— / □ / ×），要求**每个 GUI 窗口都要有这三个功能**。
+> 这条是界面硬规则，不是偏好；新开一个窗口就得满足，不允许"这个小对话框例外"。
+
+适用范围：`apps/` 下**所有** `tk.Tk` / `tk.Toplevel`（主窗口、门厅、四个模式窗、
+控制台、工作台、工具台，以及所有选择器 / 管理器 / 临时对话框）。
+
+| 禁止 | 为什么（Windows 实测） | 要什么效果就改用什么 |
+| ---- | ---------------------- | -------------------- |
+| `transient(parent)` | Toplevel 被降成工具窗口，`WS_MINIMIZEBOX` / `WS_MAXIMIZEBOX` 同时消失，标题栏只剩 ×，也不进任务栏 | 想置前用 `lift()`；想防重复打开用单例（`_open_*` 里查已有窗口） |
+| `resizable(False, ...)` | 最大化按钮灰掉（样式位同样被清掉） | 一律 `resizable(True, True)`；内容怕被拉伸就用布局的 `weight` / 最小尺寸，别锁窗口 |
+| `overrideredirect(True)`、`-toolwindow` | 整个系统标题栏消失，三个功能一个都没有 | 不许用；要无边框请用别的方案并先改本规则 |
+| `grab_set()`（全局抓取） | 窗口最小化之后主窗口整个点不动，看起来像卡死 —— 等于"能按下去但用不了" | `wait_window()` 可以保留（不抓取时 Tk 事件循环仍活着，主窗口照样能点）；重复打开由单例挡住 |
+
+判据在 `selftest_window_mode.py` §11，两层都要过：
+
+1. **静态**：AST 扫 `apps/*.py`，不允许出现上面四种调用（比字符串，注释里提到不算）；
+2. **运行时**：实例化能开的每一个窗口，用 Win32 `GetAncestor(hwnd, GA_ROOT)` +
+   `GetWindowLongW` 读 `GWL_STYLE` / `GWL_EXSTYLE`，断言 `WS_MINIMIZEBOX`、
+   `WS_MAXIMIZEBOX`、`WS_SYSMENU` 三个位都在，`WS_EX_TOOLWINDOW` 不在；
+   非 Windows 或无显示环境必须**明说"本节没验证"**，不许静默算通过。
+
+已按这条规则修过的窗口（可作参考实现）：`junk_dialog.py`、`cleanup_dialog.py`
+（含 `TrashDialog`）、`help_window.py`，以及 2026-11-07 补的 `fov_dialog.py`、
+`profile_dialog.py`、`seed_picker.py`、`cameras_dialog.py`、`data_manager.py`、
+`gui_main.py`（已废止，仅存档）、`_gui_stereo.py::_ask_stereo_mode`。
+
+### 7.2 GUI 分区必须可以拖动
+
+> 2026-11-07 用户截图：相机管理里预览卡片把上方内容挡住了，而且左右两块拉不动。
+> 原话：「对于每个 GUI 界面，如果有分区都要做成可以拖动的」。
+
+**分区的定义**：一个窗口里出现两个及以上**内容区**并排或上下（列表 + 详情、
+设备表 + 预览网格、多视图对比）。以下**不算**分区，仍用 `pack` / `grid`：
+
+* 一行里的标签 + 输入框 + 单位（行内控件排布）；
+* 按钮栏 / 工具栏；
+* 内容控件旁边的滚动条。
+
+| 规则 | 说明 |
+| ---- | ---- |
+| 分区容器必须用 `ttk.PanedWindow`（`orient="horizontal"` / `"vertical"`） | sash 可拖；用 `add(pane, weight=...)` 分配初始比例，必要时 `sashpos()` 给初始值 |
+| **禁止**用固定 `pack(side="left"/"right")` 拼两个内容区 | 内容一变长就互相遮挡，用户也没法把窄的那边拉宽 |
+| 分区里的长文本不许撑高容器 | 固定高度 + 摘要（双击看全文）/ 滚动条；否则卡片会压住相邻的分区 |
+| 嵌套分区照样用嵌套 `ttk.PanedWindow` | 参考 `data_manager.py`（垂直套水平） |
+
+已按这条规则实现的窗口（可作参考）：`data_manager.py`（嵌套）、`help_window.py`、
+`view_3d.py`（多视图）、`cameras_dialog.py`（设备表 | 预览网格）。
+
+判据在 `selftest_window_mode.py` §12：静态列出**有内容分区**的窗口并逐个断言
+`ttk.PanedWindow`；运行时真的调 `sashpos()` 改一次位置再读回，证明 sash 可拖。
+反证：把其中一个换回普通 `ttk.Frame` → 判据必须变红。
+
+### 7.3 GUI 验证必须是真的：从入口点进去、点真按钮、看用户看得见的结果
+
+> 2026-11-07 用户第五次报障，原话：「我怀疑是 GUI 对应按钮的工作流有问题，
+> 你不是真的靠按钮来执行的命令」。**他是对的**：相机管理里 Treeview 默认没有
+> 选中行，按钮依赖"当前选中"，所以点下去只回一行小字。前面几轮我全是
+> `dlg._preview_all()` 直接调方法验证，按钮和它的前置条件一次都没被走过。
+
+适用范围：**一切"用户在界面上能做"的功能验证**。库层纯函数（标定解算、三角测量、
+坐标变换等没有对应按钮的）不在此列 —— 它们没有可点的东西。
+
+| 必须 | 不许 |
+| ---- | ---- |
+| 从**真实入口**进：点「换相机…」「装置档案」「工具」等入口按钮，让窗口由产品代码自己开出来 | `CamerasDialog(app)` / `MonoWindow(app)` 直接 new 一个窗口当作"验证通过" |
+| 功能动作走**控件自己的命令**：`button.invoke()`、`Combobox`/`Checkbutton` 的 `.set()` + 事件、`tree.selection_set()` 后点按钮 | 直接调 `dlg._start_preview()` / `dlg._preview_all()` / `win._on_calibrated()` 这类内部方法绕过前置条件 |
+| 断言**用户看得见的结果**：控件文字、卡片数、状态条、`winfo_ismapped()`、走查截图 | 只断言内部变量或只查源码字符串就宣称"功能正常" |
+| 每个可点控件至少被点过一次（走查工具机械保证） | 用"源码里存在这个函数"代替"这个按钮真的能点" |
+| 硬件类动作允许跳过，但必须打印「跳过 ≠ 验证过」并说明哪一层没验 | 把跳过算成通过 |
+
+**走查（`apps/tools/gui_walkthrough.py`）是这条规则的执行工具**：它像用户那样点按钮、
+截图、量裁切。改完任何 GUI，必须重新生成走查产物；`selftest_window_mode.py` §9
+会比对指纹，过期的产物会被判"没验证"。
+
+判据在 `selftest_window_mode.py` §13：走查报告里必须能找到"相机管理 · 点「预览这台」"
+这类**动作型**步骤（不是只"观察"）；测试代码里必须存在足量的 `.invoke()`；两条反证
+（把走查里的点击退化成观察、把 `.invoke()` 全去掉）都必须变红。
+
+**方法论备忘录**：这轮还试过"替换实例方法再点按钮"来验接线 —— 不成立。Tk 的 button
+在构造时就把 bound method 存进 Tcl 命令，替换 Python 属性对它无效；测试里点「关闭」
+真的把窗口关掉了。所以验证按钮只能用**行为**，不能用替换法。
+
+**做不到点按钮时怎么办（硬条款）**：如果当前环境没有 UI 自动化能力（无
+`pywinauto`、`SendMessage` 投递的点击 Tk 不认、真实鼠标抢不到焦点），**必须明说
+"这一条我没有真的点过"**，并写清试过哪些手段、卡在哪一步。**不许**用
+`dlg._xxx()` 直接调方法来冒充"点过按钮"，也不许把"窗口能打开"说成"按钮能用"。
+做不到就说做不到 —— 这是本规则唯一允许的降级方式。
 
 ---
 
@@ -339,7 +549,7 @@ apps / tests                        （只调用，不被调用）
   - 新相机开发 = `dev/hd-camera`（当前分支）；
   - 功能/修复从 dev 切 `feature/*` / `fix/*`，合回 dev；
   - 发布候选走 `release/*`，验收通过后**必须征询用户批准**，才能合并 `main` 并打 `vX.Y.Z-lts`。
-- 合并前门禁：全量测试 26/26、`check_standards`、独立 Critic、真机证据、交接/决策文档。
+- 合并前门禁：全量测试 27/27、`check_standards`、独立 Critic、真机证据、交接/决策文档。
 - **`git push` 只在用户明确要求时执行**（仅用于跨设备同步）。
 - 提交前必须：跑验证 → 工作区干净 → 无密钥。
 - 详细规则：`docs/Git分支与发布规范.md`。
@@ -361,16 +571,26 @@ apps / tests                        （只调用，不被调用）
   **何时再议：下一次专门做"模块重排"的改动时**（不与功能改动混在一起）——
   这条从"按数量触发"改成"按机会触发"，是因为数量已经到了、但每次都被
   "别和功能混"这个更硬的理由挡住，把规则改成与实际一致，才好判断。
+- **经典界面已废止（2026-11-20 用户裁决）**：新 GUI 已覆盖完整流程。
+  三个入口全部关闭 —— 门厅按钮「经典界面（已废止）」只弹提示、不起任务；
+  `apps/gui_main.py --legacy` 打印说明并返回 2；`run.bat legacy` 只打印提示；
+  `apps/_actions.legacy_gui()` 已删除。`Launcher` 的 3000+ 行实现**保留但不可达**：
+  多个回归测试按文本与导入引用它，B-102（删旧 Launcher）仍是 `wontfix`。
+  **不要把它重新接回任何入口**；要恢复必须先改 `docs/决策记录.md` 的 2026-11-20
+  决策并补独立 Critic 判据。判据：`selftest_gui_budget._legacy_deprecation_checks`。
 - **不把 `docs/` 再分目录**：会打断几十处交叉引用，收益只是"好看"。
 - **不做大范围样板统一**（ROOT 引导 25 处、`make_scratch_dir` 3 份）：
   纯样式，动 20+ 文件换整洁，风险大于收益。**记录在案，不假装不存在。**
 - **三维可视化**：已有 `apps/view_3d.py` 读 `visualization.json`（离线、相机系）；
   缺**世界系**变换、实时 3D 面板和 Unity/网页版本。3D 平滑/Kalman 有库但未接主流程。
-- **真机标定**：已跑通并落盘 `config/stereo_calibration.*`。
-  最新一次 **2026-10-24 17:34**：基线 123.99 mm、整体 RMS 0.770 px、极线 0.584 px、
-  有效 39/40 对，判定"**可用 —— 满足三维重建要求**"。**数值一律以 config 里的为准**，
-  本文只做指引。早先 2026-10-19 那次（基线 64.60 mm、RMS 0.950 px、判"勉强可用"）已被取代。
-  **数值随每次重标而变 —— 以 `config/stereo_calibration.json` 为准，别抄这里的。**
+- **真机标定**：已跑通。**2026-11-10 起标定按装置档案落盘**——`--out` 缺省跟随
+  激活档案的 `calibration_path`（`apps/calibrate_stereo.py`），于是平行装置与 90° 装置
+  各存各的，换装置重标不会互相覆盖；顶层那份只剩"档案没配标定路径"时的回落作用。
+  最新一次 **2026-10-24 17:34**（当时仍写顶层）：基线 123.99 mm、整体 RMS 0.770 px、
+  极线 0.584 px、有效 39/40 对，判定"**可用 —— 满足三维重建要求**"。
+  **数值一律以当前装置档案指向的那份标定为准**，本文只做指引。
+  早先 2026-10-19 那次（基线 64.60 mm、RMS 0.950 px、判"勉强可用"）已被取代。
+  **数值随每次重标而变 —— 别抄这里的。**
   极线离验收线（0.3 px）还差一倍，**要提精度得按报告建议重拍** ——
   这是当前最值得做的一件事，细节见 `docs/交接文档.md` §13.2。
 - 🔴 **相机层三层根因（2026-10-18 查清，排障从这三条查起）**：
@@ -412,6 +632,14 @@ apps / tests                        （只调用，不被调用）
   - **教训**：我曾用"内置相机会黑屏"这一个可区分点，外推出"整个枚举顺序都对" ——
     **弱证据撑强结论**，与 §9 那条 `s²` 教训同型。遇到"同型号设备排序"，
     **要么承认不可知，要么让用户目视/按名字指定。** 详见 `docs/交接文档.md` §10.14。
+- 🔴 **`#N` 是 PnP 枚举位次，不是 OpenCV 采集索引（2026-11-20 契约）**：
+  `cv2.VideoCapture` 只认采集索引。角色按设备身份（identity）绑定；真正打开用
+  `role.capture_index`。未实测（`null`）时 `resolve_role` **拒绝猜**，报错指到
+  `cameras.py identify`，**绝不回退 `entry.order`**；`identify` 写实测值，
+  `pin <role> capture-index:N` 可在已确认时落地。角色带 `location`（床 / 阳台门）
+  用于人工核对；`settings.virtual_names`（vivo / 原子笔记 / OBS / …）命中的虚拟摄像机
+  不参与绑定，phantom 索引命中必须告警。判据：`selftest_camera_registry.py`
+  （缺 `capture_index` 必拒、check 报危险、virtual 不绑定、location 往返、对话框列）。
 - **不做"相机名对不上就自动按名字找回"**（2026-10-18 已决策，**别再提**）：
   两台相机已改名成 `…left` / `…right`（**名字唯一**），所以"按名字兜底"技术上可行 ——
   **但明确不做**。理由：自动兜底省的是几十秒的 `identify`，赌的是**静默用错相机**
@@ -551,4 +779,4 @@ Critic 每轮审的都是"代码有没有按 spec 实现"，没有一轮问过"�
    一行被从中间劈开、`rem` 的尾巴被当命令执行，报一堆看不懂的
    `'re' 不是内部或外部命令`。**看着像编码问题，其实是行尾问题。**
 
-改完 `启动程序.bat` **必须复跑一次**（`启动程序.bat check`，几秒）。
+改完 `run.bat` **必须复跑一次**（`run.bat check`，几秒）。

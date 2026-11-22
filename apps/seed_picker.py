@@ -2,7 +2,7 @@
 
 为什么单独成文件
 ----------------
-`启动程序.py` 已经 1600+ 行；点选窗口是独立的交互组件，放这里更容易测
+`apps/gui_main.py` 已经 1600+ 行；点选窗口是独立的交互组件，放这里更容易测
 （不依赖主界面布局）。它不是命令行程序，只被 GUI import。
 
 双目约定（``SeedPicker``）：
@@ -102,13 +102,19 @@ def z_estimate_m(fx: float | None, diameter_mm: float | None,
 class SeedPicker(tk.Toplevel):
     """模态窗口：返回 `self.result` = seeds.json 路径，或 None。"""
 
-    def __init__(self, parent, session_dir: str | Path, seed_frame: int = 0) -> None:
+    def __init__(self, parent, session_dir: str | Path, seed_frame: int = 0,
+                 *, ball_kind: str = "") -> None:
         super().__init__(parent)
         self.title("点选双目球心")
-        self.transient(parent)
-        self.grab_set()
+        # 标准窗口：最小化 / 最大化 / 关闭（AGENTS.md §7.1）。
+        # 不用 transient()（Windows 上变工具窗口、只剩 ×）、不锁尺寸、不全局 grab。
+        self.resizable(True, True)
         self.session_dir = Path(session_dir)
         self.frame_index = int(seed_frame)
+        #: ``metal`` / ``plastic`` / 空 —— 跑三维时该用哪个检测器。
+        #: 由调用方（界面上的「球种类」）给，不在这里猜：同一个球心，
+        #: 镜面球要 specular、纯色球要 color，猜错就是整段 0 检出。
+        self.ball_kind = str(ball_kind or "")
         self.left_click: tuple[float, float] | None = None
         self.right_click: tuple[float, float] | None = None
         self.left_radius = 0.0
@@ -435,6 +441,7 @@ class SeedPicker(tk.Toplevel):
                 image_size=(self.left_frame.shape[1], self.left_frame.shape[0]),
                 source="gui_click",
                 note="GUI 点选球心；圆心=点击位置，半径由 Hough 起点 + 图上轮廓复核、可微调",
+                ball_kind=self.ball_kind,
             )
         except Exception as exc:                            # noqa: BLE001
             messagebox.showerror("保存 seed", f"保存失败：{exc}", parent=self)
@@ -465,13 +472,18 @@ class MonoSeedPicker(tk.Toplevel):
 
     def __init__(self, parent, session_dir: str | Path, *,
                  fx: float | None = None, diameter_mm: float | None = None,
-                 frame_index: int = 0) -> None:
+                 frame_index: int = 0, ball_kind: str = "") -> None:
         super().__init__(parent)
         self.title("点选单目球心")
-        self.transient(parent)
-        self.grab_set()
+        # 标准窗口：最小化 / 最大化 / 关闭（AGENTS.md §7.1）。
+        # 不用 transient()（Windows 上变工具窗口、只剩 ×）、不锁尺寸、不全局 grab。
+        self.resizable(True, True)
         self.session_dir = Path(session_dir)
         self.frame_index = int(frame_index)
+        #: ``metal`` / ``plastic`` / 空 —— 下次打开这段会话时该用哪个检测器。
+        #: 由界面上的「球种类」给，不在这里猜：同一颗球心，镜面球要 specular、
+        #: 纯色球要 color，猜错就是整段 0 检出或丢掉轮廓精度。
+        self.ball_kind = str(ball_kind or "")
         # fx / 球径由调用方传：界面第②步那一栏就是唯一真相，
         # 在这里再读一遍配置等于造第二份口径（两边不一致时没人看得出）。
         self.fx = float(fx) if fx else None
@@ -639,6 +651,7 @@ class MonoSeedPicker(tk.Toplevel):
             "frame": self.frame_index,
             "image_size": [int(w), int(h)],
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "ball_kind": self.ball_kind,
         }
         path = self.session_dir / "derived" / "seed.json"
         try:

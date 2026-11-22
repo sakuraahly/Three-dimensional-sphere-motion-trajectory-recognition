@@ -4,7 +4,7 @@
 ------------
 用户要求的"标定要收足够多对 + UI 里能设标定参数"落地时，暴露了一个**真缺陷**：
 
-`启动程序.py` 原来把板参数**硬编码**在命令里（`--cols 8 --rows 5 --square 25`），
+`apps/gui_main.py` 原来把板参数**硬编码**在命令里（`--cols 8 --rows 5 --square 25`），
 而且**完全没有 `--target`** —— 于是从界面走标定，**永远用脚本默认的那一档**。
 用户以为在做正式标定，实际收到的是试标定档的结果，而**界面上没有任何迹象**。
 
@@ -77,7 +77,7 @@ try:
 except ImportError:                                        # pragma: no cover
     tk = None
 
-LAUNCHER = ROOT / "启动程序.py"
+LAUNCHER = ROOT / "apps/gui_main.py"
 
 
 def _load_launcher():
@@ -88,7 +88,7 @@ def _load_launcher():
     找不到就抛 `AttributeError: 'NoneType' object has no attribute '__dict__'`。
     直接 `exec_module` 而不注册，就是这个错。
     """
-    sys.argv = ["启动程序.py"]
+    sys.argv = ["apps/gui_main.py"]
     spec = importlib.util.spec_from_file_location("launcher_params", LAUNCHER)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["launcher_params"] = mod          # ← 关键这一行
@@ -132,7 +132,8 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
     import numpy as np
     import tkinter as tk
 
-    from apps.view_3d import Viewer3D, load_view, scan_sources
+    from apps.view_3d import (VIDEO_SOURCE_LABELS, VIDEO_SOURCE_ORDER,
+                              Viewer3D, load_view, scan_sources)
 
     def mk(base: Path, name: str, *, n: int = 3, video: bool = True) -> Path:
         sess = base / name
@@ -324,7 +325,7 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
 
             # 真实采样点 + 点击查坐标（2026-11-05 用户："在曲线上增加我们的
             # 拍摄的真实采样点，点击这些点就可以看到我们的三维坐标值"）
-            from apps.view_3d import PAN_MARGIN, PICK_RADIUS_PX
+            from apps.view_3d import PAN_MARGIN, PICK_RADIUS_PX, TICK_GRID_CELLS
 
             # 先重画一次让缓存与当前范围一致（上面 `_zoom_around` 改过 lims），
             # 再拍快照 —— `_pick_at` 内部会 `_redraw` 并按新范围重算 `_pt_px`，
@@ -459,24 +460,36 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
             checks.append(("左上角「坐标极值」与选中点信息不重叠", _no_overlap))
 
             # 分度值可调（2026-11-05 用户："补充上手动调整三轴分度值的功能"）：
-            # 填 0.05 就该每 5 cm 一根网格线；填得过密要退回自动，否则几万条线
-            # 会把界面卡死。
+            # 填 0.05 就该每 5 cm 一根网格线。
+            #
+            # **语义在 2026-11-15 换了**（用户："修改分度值，确实坐标轴会变，但是
+            # 图线不会自动的匹配放大和缩小"）：分度值 = 「每格多少米」，改它要按
+            # **固定 8 格**重设该轴范围，和示波器的 V/格 同构。所以这里改成走
+            # `_on_tick_edit()`（范围 + 刻度一起），不再只调 locator。
+             #
             # 注意：上面 `_zoom_around` 已把范围改成 [-1.5, 1.5]（跨度 3），
-            # 所以这里用 0.5（3/0.5=6 档，不会触发"过密退回"）。
+            # 而这段合成数据的 X 跨度只有 0.08 m（`_limits()` 加留白后 0.0992），
+            # 所以 0.5 × 8 = 4 远超数据跨度 → 窗口会被**夹回数据范围**；
+            # 但刻度间隔仍然是 0.5，判据照样成立。
             v.tick_vars["x"].set("0.5")
             v.tick_vars["y"].set("")
             v.tick_vars["z"].set("")
-            v._apply_tick_steps()
+            v._on_tick_edit()
             xt = [round(float(t), 4) for t in v.ax.get_xticks()]
             gaps = {round(b - a, 4) for a, b in zip(xt, xt[1:])}
             checks.append(("分度值 0.5 -> X 轴刻度间隔都是 0.5",
                            bool(xt) and gaps == {0.5}))
+            # 旧判据是「填 0.0001 → 退回自动、刻度 ≤ 10」。那条现在**必然不成立**，
+            # 因为新语义下 0.0001 是合法的放大：8 格 = 0.8 mm。这不是"为了绿而改
+            # 判据"，是模型换了 —— 旧行为（静默退回自动档）本身就是这次要修的缺陷。
             v.tick_vars["x"].set("0.0001")
-            v._apply_tick_steps()
-            checks.append(("分度值过密（0.0001）-> 退回自动，不生成上千条线",
-                           len(v.ax.get_xticks()) <= 10))
+            v._on_tick_edit()
+            _x_span = v.lims[1][0] - v.lims[0][0]
+            checks.append((f"分度值 0.0001 -> 不再退回自动，按 8 格放大"
+                           f"（X 跨度 {_x_span:.6f} ≈ 0.0008）",
+                           abs(_x_span - 0.0001 * TICK_GRID_CELLS) < 1e-9))
             v.tick_vars["x"].set("")
-            v._apply_tick_steps()
+            v._on_tick_edit()
 
             # 滚轮默认 = **整幅缩放**（2026-11-05 用户："缩放只有曲线缩放，
             # 没有背景坐标图缩放，很别扭"）。守的是：默认滚轮不许再只改 lims
@@ -542,6 +555,53 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
                 v._grid.winfo_height = _real_h
             checks.append(("首帧高度不足时不设 sash（避免设到 0）且门仍开",
                            calls == [] and v._paned_seeded is False))
+
+            # ---- 8d-4. 视频来源窗口内切换（2026-11-20）----
+            # 老界面把 raw 藏在数据管理里，新查看器此前只能按启动参数走。
+            # 这里钉三件事：下拉三档与 CLI 一致、切「不看」真的关 cap 清帧、
+            # 切回「标注」真的重开且不丢当前帧。
+            checks.append(("视频来源下拉三档与 --video-source 一致",
+                           list(v.video_box.cget("values"))
+                           == [VIDEO_SOURCE_LABELS[k] for k in VIDEO_SOURCE_ORDER]))
+            had_cap = v.cap is not None
+            v.idx = min(2, v.n - 1)
+            keep_idx = v.idx
+            v.video_box.set(VIDEO_SOURCE_LABELS["none"])
+            v._on_pick_video_source()
+            checks += [
+                ("视频来源切「不看」：video_source=none",
+                 v.video_source == "none"),
+                ("视频来源切「不看」：cap 关掉、旧帧清空",
+                 v.cap is None and v._left_raw is None and v._right_raw is None),
+            ]
+            v.video_box.set(VIDEO_SOURCE_LABELS["annotated"])
+            v._on_pick_video_source()
+            checks += [
+                ("切回「标注」：重新打开 annotated.mp4",
+                 had_cap and v.cap is not None),
+                ("切来源不丢当前帧（idx 保留）", v.idx == keep_idx),
+            ]
+
+            # ---- 8d-5. 轴标签跟着数据走（计划书 M6 世界系参考）----
+            # `visualization.py` 应用 world_frame 后会把 `style.axes` 换成
+            # World X/Y/Z；查看器若仍写死相机系标签，就是"数据换了系、标签
+            # 在说谎"。默认（无 style）必须保持原来的相机系措辞。
+            default_x = v.ax.get_xlabel()
+            v.data["style"] = {
+                "axes": {"x": "World X (board columns)",
+                         "y": "World Y (board rows)",
+                         "z": "World Z (ground normal)"},
+            }
+            v._redraw()
+            checks += [
+                ("默认轴标签是相机系（X right）", default_x.startswith("X right")),
+                ("世界系数据用 World X/Y/Z 标签（标签不说谎）",
+                 v.ax.get_xlabel() == "World X (board columns)"
+                 and v.ax.get_ylabel() == "World Y (board rows)"
+                 and v.ax.get_zlabel() == "World Z (ground normal)"),
+            ]
+            v.data.pop("style", None)
+            v._redraw()
         finally:
             if v is not None:
                 v.close()       # 释放 cap，否则临时目录删不掉（WinError 32）
@@ -605,14 +665,14 @@ def _check_view_3d_switch() -> list[tuple[str, bool]]:
     return checks
 
 
-def main() -> int:
+def _main_impl() -> int:
     print("=" * 70)
     print("启动器标定参数面板自测（读取 / 校验 / 默认正式档）")
     print("=" * 70)
 
     if tk is None:
         print("  [跳过] 这台机器没有 tkinter —— 界面测试无法进行。")
-        print("         （`启动程序.bat gui` 在这种情况下会自动改用命令行界面。）")
+        print("         （`run.bat gui` 在这种情况下会自动改用命令行界面。）")
         print("\n判定结果：全部通过")
         return 0
 
@@ -728,7 +788,7 @@ def main() -> int:
     app.calib_backend.set("msmf")
     expect("选 msmf -> 带上 --backend msmf", True, contains="--backend msmf")
     # 三条命令共用同一个决定点：源码级确认没有第二份内联写法
-    launcher_src = (ROOT / "启动程序.py").read_text(encoding="utf-8")
+    launcher_src = (ROOT / "apps/gui_main.py").read_text(encoding="utf-8")
     inline = launcher_src.count('args += ["--backend", backend]')
     uses_helper = launcher_src.count("self._backend_args()")
     print(f"  源码：内联写 backend 参数 {inline} 处；调用 _backend_args() {uses_helper} 处")
@@ -879,7 +939,7 @@ def main() -> int:
     rt_720 = " ".join(app._realtime_args())
     app.calib_res.set(res_default)
     app._refresh_res_note()
-    mod_src = (ROOT / "启动程序.py").read_text(encoding="utf-8")
+    mod_src = (ROOT / "apps/gui_main.py").read_text(encoding="utf-8")
     checks_res = [
         ("默认分辨率 = 2560x1440（video_profiles.DEFAULT；不随某台相机实际能力变）",
          res_default == mod.DEFAULT_RESOLUTION == "2560x1440"),
@@ -963,6 +1023,18 @@ def main() -> int:
     for label, good in checks_rec:
         print(f"  [{'通过' if good else '不达标'}] {label}")
         results.append((label, good))
+
+    # 判据7：GUI 录制把「录制格式」下拉透传给 record_stereo 的 --container。
+    # 反向自证：删掉 _record_args 里的 --container 行，这条必红。
+    app.record_container.set("avi")
+    rec_container_avi = " ".join(app._record_args("10", "gui_test"))
+    app.record_container.set("mkv")
+    rec_container_mkv = " ".join(app._record_args("10", "gui_test"))
+    container_ok = ("--container avi" in rec_container_avi
+                    and "--container mkv" in rec_container_mkv)
+    print(f"  [{'通过' if container_ok else '不达标'}] "
+          f"GUI 录制透传 --container（avi/mkv 随下拉切换）")
+    results.append(("GUI 录制透传 --container（avi/mkv 随下拉切换）", container_ok))
 
     app.stereo_mode_var.set("angled")
     rec_ang = " ".join(app._record_args("10", "gui_test"))
@@ -1143,7 +1215,7 @@ def main() -> int:
         ("带 --method", "--method" in off_s),
         ("显式 angled 时离线也带 --stereo-mode angled", "--stereo-mode angled" in off_ang),
         ("GUI 有「点选球」入口", hasattr(app, "_pick_stereo_seed")
-         and "点选球" in (ROOT / "启动程序.py").read_text(encoding="utf-8")),
+         and "点选球" in (ROOT / "apps/gui_main.py").read_text(encoding="utf-8")),
         ("GUI 方法列表包含 specular", "specular" in mod.METHODS),
     ]
     for label, good in checks_off:
@@ -1389,8 +1461,22 @@ def main() -> int:
     from apps._workbench import button_states, summarize_session
 
     def _make_session(base: Path, frames_l: int, frames_r: int,
-                      with_seeds: bool, with_traj: bool = False) -> Path:
-        d = base / f"s_{frames_l}_{frames_r}_{int(with_seeds)}_{int(with_traj)}"
+                      with_seeds: bool, with_traj: bool = False,
+                      n_samples: int = 2, n_matched: int = 1,
+                      with_csv: bool = False, with_ann: bool = False,
+                      verdict: str = "") -> Path:
+        # n_samples / n_matched 默认值 == 老夹具的 2 样本 / 1 匹配，
+        # 既有调用点（含目录名）行为不变；非默认才把数量缀进目录名。
+        name = f"s_{frames_l}_{frames_r}_{int(with_seeds)}_{int(with_traj)}"
+        if (n_samples, n_matched) != (2, 1):
+            name += f"_{n_samples}_{n_matched}"
+        if with_csv:
+            name += "_csv"
+        if with_ann:
+            name += "_ann"
+        if verdict:
+            name += f"_v{verdict}"
+        d = base / name
         (d / "derived").mkdir(parents=True)
         (d / "session.json").write_text(json.dumps({
             "schema": "sphere-stereo-session", "version": 1, "id": d.name,
@@ -1403,13 +1489,41 @@ def main() -> int:
         if with_seeds:
             (d / "derived" / "seeds.json").write_text("{}", encoding="utf-8")
         if with_traj:
-            (d / "derived" / "traj3d.json").write_text(json.dumps({
+            n_matched = max(0, min(n_matched, n_samples))
+            samples = [
+                ({"matched": True, "xyz": [0.1, 0.05, 0.25], "residual_px": 1.5}
+                 if i < n_matched else {"matched": False})
+                for i in range(n_samples)
+            ]
+            payload = {
                 "schema": "sphere-stereo-trajectory", "version": 1,
-                "samples": [
-                    {"matched": True, "xyz": [0.1, 0.05, 0.25], "residual_px": 1.5},
-                    {"matched": False},
-                ],
-            }), encoding="utf-8")
+                "samples": samples,
+            }
+            if verdict:
+                payload["quality"] = {"verdict": verdict, "note": "测试用"}
+            (d / "derived" / "traj3d.json").write_text(json.dumps(payload),
+                                                       encoding="utf-8")
+        if with_csv:
+            # 表头照抄真实老会话（data/stereo/20261019-193809）的格式；
+            # matched 在第 3 列，取值 "0"/"1"。
+            n_csv_matched = max(0, min(n_matched, n_samples))
+            header = ("frame,t,matched,X,Y,Z,u_left,v_left,u_right,v_right,"
+                      "epipolar_px,residual_px,confident,method_left,method_right")
+            rows = [header]
+            for i in range(n_samples):
+                t = f"{i / 30.0:.4f}"
+                if i < n_csv_matched:
+                    rows.append(",".join([
+                        str(i), t, "1", "0.1", "0.05", "0.25", "100", "100",
+                        "200", "100", "0.2", "1.5", "1", "specular", "specular"]))
+                else:
+                    rows.append(",".join([
+                        str(i), t, "0", "", "", "", "", "", "", "",
+                        "0", "0", "0", "none", "none"]))
+            (d / "derived" / "traj3d.csv").write_text("\n".join(rows) + "\n",
+                                                      encoding="utf-8")
+        if with_ann:
+            (d / "derived" / "annotated.mp4").write_bytes(b"")
         return d
 
     with tempfile.TemporaryDirectory(prefix="dsh_wb_") as tmp:
@@ -1420,12 +1534,59 @@ def main() -> int:
         small = summarize_session(_make_session(base, 364, 362, False, False))
         bad = summarize_session(_make_session(base, 302, 380, False, False))
         rec = summarize_session(_make_session(base, 302, 303, False, False))
+        # 2026-11-18 用户报的 bug：seeds.json 是**输入**，不能当 ✓ 的闸门；
+        # 匹配点只有一两个也不该谎称"有三维"。下面四条对应这两件事。
+        # ① 三维跑好了、没点过球心 —— 仍然是 ✓（改前被判 recorded）
+        traj_no_seed = summarize_session(
+            _make_session(base, 300, 300, False, True, n_samples=300, n_matched=100))
+        # ② 903 帧只匹配 1 个点（0.1%）—— ◑ 三维点过少
+        thin_1 = summarize_session(
+            _make_session(base, 903, 903, False, True, n_samples=903, n_matched=1))
+        # ③ 902 帧只匹配 24 个点（2.7%），有 seeds 也一样，匹配率说了算
+        thin_2 = summarize_session(
+            _make_session(base, 902, 902, True, True, n_samples=902, n_matched=24))
+        # ④ 跑过三维但零匹配 —— 产物在、结果空，退回 ◐ 已点选
+        zero_match = summarize_session(
+            _make_session(base, 300, 300, False, True, n_samples=300, n_matched=0))
+        # 2026-11-18 用户："怎么可能只是这四个有问题" —— 状态不能只认
+        # traj3d.json / 只认 seeds.json，要把判据本身改成"按证据强度降级"。
+        # ⑤ 老会话只有 traj3d.csv（JSON 是后来的格式）：276/304 必须仍是 ✓
+        csv_only = summarize_session(
+            _make_session(base, 304, 304, False, False, n_samples=304, n_matched=276,
+                          with_csv=True))
+        # ⑥ 只有 CSV 且零匹配 —— 产物在、结果空，退回 ◐
+        csv_zero = summarize_session(
+            _make_session(base, 301, 301, False, False, n_samples=301, n_matched=0,
+                          with_csv=True))
+        # ⑦ 只剩 annotated.mp4（跑过三维，json/csv 都不在了）—— ◐ 并说明原因
+        ann_only = summarize_session(
+            _make_session(base, 300, 300, False, False, with_ann=True))
+        # ⑧ 0 帧 + 零产物 = 录制没起来，不是数据坏了 → — empty
+        empty_s = summarize_session(_make_session(base, 0, 0, False, False))
+        # ⑨ 0 帧 + 有 seeds = 元数据与产物矛盾 → 仍是 ✗ bad
+        empty_with_seeds = summarize_session(_make_session(base, 0, 0, True, False))
+        # ⑩ 质检结论非 ok（几何与标定不一致）：匹配率 96% 也不能报 ✓
+        geom_bad = summarize_session(
+            _make_session(base, 300, 300, False, True, n_samples=300, n_matched=290,
+                          verdict="geometry_mismatch"))
+        # ⑪ verdict=ok 时照常按匹配率判 ✓
+        geom_ok = summarize_session(
+            _make_session(base, 300, 300, False, True, n_samples=300, n_matched=290,
+                          verdict="ok"))
         # 目录 mtime 不能决定默认会话：处理旧会话会刷新 mtime。
         from apps._workbench import scan_sessions
         newer = base / "20261021-120000"
         older = base / "20261020-120000"
         for d in (newer, older):
             (d / "derived").mkdir(parents=True)
+            # 2026-11-09：会话枚举改成"只认 session.json"（更早的半成品由数据管理
+            # 面板用宽判据显示）。排序要验的是**会话**的排序，所以这两个夹具也
+            # 得是会话；只建 derived/ 的目录已不再算会话。
+            (d / "session.json").write_text(json.dumps({
+                "schema": "sphere-stereo-session", "version": 1, "id": d.name,
+                "created": "2026-10-21 12:00:00",
+                "left": {"frame_count": 10}, "right": {"frame_count": 10},
+            }), encoding="utf-8")
         now = time.time()
         os.utime(newer, (now - 1000, now - 1000))   # 故意让“更新”的会话 mtime 更旧
         os.utime(older, (now, now))
@@ -1454,6 +1615,42 @@ def main() -> int:
              and not button_states(good, True, False)["run"]),
             ("文件菜单按钮有对应状态", button_states(good, True)["files"]),
             ("默认会话按时间名排序，不按 mtime", scan_order[:1] == ["20261021-120000"]),
+            # 2026-11-18 用户 bug：seeds.json 是输入，不是 ✓ 的必要条件。
+            # 这条在改前必红（改前 traj_no_seed 会被判 recorded）。
+            ("三维跑好但没点过球心 -> 仍是 traj ✓",
+             traj_no_seed.status == "traj" and traj_no_seed.symbol == "✓"),
+            ("903 帧仅 1 个匹配点（0.1%）-> traj_thin ◑，并说明匹配点过少",
+             thin_1.status == "traj_thin" and thin_1.symbol == "◑"
+             and any("匹配点过少" in p for p in thin_1.problems)),
+            ("902 帧仅 24 个匹配点（2.7%）即使有 seeds 也判 traj_thin",
+             thin_2.status == "traj_thin" and thin_2.symbol == "◑"),
+            ("跑过三维但零匹配 -> seeded ◐（产物在、结果空）",
+             zero_match.status == "seeded" and zero_match.symbol == "◐"),
+            # 判据本身：三维产物三种证据（json > csv > 可视化/标注视频）逐级降级，
+            # 不拿某个特定文件名当唯一闸门。
+            ("只有 traj3d.csv 的老会话 276/304 -> traj ✓（改前误判 recorded ○）",
+             csv_only.status == "traj" and csv_only.symbol == "✓"
+             and csv_only.n_matched == 276 and csv_only.n_samples == 304),
+            ("只有 traj3d.csv 且零匹配 -> seeded ◐",
+             csv_zero.status == "seeded" and csv_zero.symbol == "◐"),
+            ("只有 annotated.mp4 -> seeded ◐，且说明缺 json/csv",
+             ann_only.status == "seeded"
+             and any("缺 traj3d.json" in p for p in ann_only.problems)),
+            ("0 帧 + 零产物 = 没录成 -> empty —（改前误判 bad ✗）",
+             empty_s.status == "empty" and empty_s.symbol == "—"),
+            ("0 帧但有 seeds -> 仍是 bad ✗（有产物却读不到帧数）",
+             empty_with_seeds.status == "bad"),
+            ("verdict=geometry_mismatch 时 290/300（96%）也判 traj_thin ◑ 并写明原因",
+             geom_bad.status == "traj_thin"
+             and any("geometry_mismatch" in p for p in geom_bad.problems)),
+            ("verdict=ok 时照常判 traj ✓（不得因有 quality 键而误降）",
+             geom_ok.status == "traj"),
+            ("空壳会话禁用 seed/run/view（和坏数据一样，别让它白点）",
+             not button_states(empty_s, True)["seed"]
+             and not button_states(empty_s, True)["run"]
+             and not button_states(empty_s, True)["view"]),
+            ("既有 good 会话仍是 traj（防误伤）",
+             good.status == "traj" and good.symbol == "✓"),
         ]
         for name, passed in checks_wb:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
@@ -1794,8 +1991,12 @@ def main() -> int:
         checks_extra.append(("按钮文字：开始导出(zip)/导出轨迹数据(csv)/刷新数据目录",
                              btn_ok))
 
-        # 三区可拖（2026-11-03）：两个 PanedWindow（vertical + horizontal）各有 2 个 pane，
-        # 且 sash 位置可写（sashpos 设置后值变化 = 拖动机制在工作）。
+        # 分区可拖（2026-11-03）：每个 PanedWindow 至少 2 个 pane，且 sash 位置可写
+        # （sashpos 设置后值变化 = 拖动机制在工作）。
+        # ⚠️ 2026-11-09 改判据：原来写死 `len(_panes) == 2`（vertical + horizontal），
+        # 数据管理左栏拆成「目录树 | 会话表」后变成 3 个 PanedWindow，于是这条**假红**。
+        # 真正的判据是 AGENTS.md §7.2「分区必须可以拖动」—— 数量是当时的快照，不是约束。
+        # 静态覆盖在 `selftest_window_mode.py` §12（它逐个窗口钉死 PanedWindow）。
         try:
             dm5 = DataManager(sroot)   # 不 withdraw：sashpos 依赖几何映射，withdraw 后恒为 0
             for _ in range(3):
@@ -1807,8 +2008,8 @@ def main() -> int:
                     if isinstance(_c, _ttk.PanedWindow): _panes.append(_c)
                     _walk(_c)
             _walk(dm5)
-            _ok_struct = (len(_panes) == 2
-                          and all(len(_p.panes()) == 2 for _p in _panes))
+            _ok_struct = (len(_panes) >= 2
+                          and all(len(_p.panes()) >= 2 for _p in _panes))
             _ok_drag = False
             if _ok_struct:
                 _ok_drag = True
@@ -1823,7 +2024,7 @@ def main() -> int:
             pane_ok = _ok_struct and _ok_drag
         except Exception as exc:                            # noqa: BLE001
             pane_ok = False
-        checks_extra.append(("三区可拖：vertical+horizontal 各 2 pane，sash 可写", pane_ok))
+        checks_extra.append(("分区可拖：每个 PanedWindow ≥2 pane 且 sash 可写", pane_ok))
 
         # 三层结构（2026-11-03）：exports/<detailed|trajectory>/<时间戳文件夹>/…
         from apps.data_manager import DataManager as _DM
@@ -1873,6 +2074,152 @@ def main() -> int:
             ("DataManager 能打开重复 id 会话", dm_ok),
         ]
         for name, passed in checks_dup:
+            print(f"  [{'通过' if passed else '不达标'}] {name}")
+            results.append((name, passed))
+
+        # 视频隐私确认（2026-11-11）：默认按钮落在「否」，取消分支原来裸
+        # return —— 按钮不变、status 停在「等待选择」、日志一行不写，用户以为
+        # 「开始导出」坏了。这里钉住：安全默认不许改成 YES、取消要有可见反馈、
+        # 正向别被护栏堵死。输出路径一律指到本 tmp，不碰 _default_output()。
+        from unittest import mock
+        from apps._data_export import ExportResult as _ExportResult
+        import apps.data_manager as _dmmod
+        privacy_checks: list[tuple[str, bool]] = []
+        cancel_out = Path(tmp) / "zz_privacy_cancel.zip"
+        try:
+            dmc = DataManager(sroot)
+            dmc.withdraw()
+            dmc.update()
+            dmc.out_var.set(str(cancel_out))
+            dmc._cat_vars["annotated"].set(True)
+            dmc._cat_vars["raw"].set(True)
+            dmc.select_all()
+            dmc._refresh_count()
+            with mock.patch.object(_dmmod.messagebox, "askyesno",
+                                   return_value=False) as ask_no:
+                dmc.export_btn.invoke()
+                call = ask_no.call_args
+                title = call.args[0] if call else ""
+                message = call.args[1] if call and len(call.args) > 1 else ""
+                default = call.kwargs.get("default") if call else None
+            privacy_checks += [
+                ("隐私确认框被调用过（勾了视频）", bool(call)),
+                ("确认框仍是安全默认 default=NO",
+                 default == _dmmod.messagebox.NO),
+                ("确认框标题醒目、正文含「选『是』」与勾选的类别名",
+                 title == "包含视频，请确认"
+                 and "选『是』" in message
+                 and "标注视频" in message and "原始双目视频" in message),
+            ]
+            status_txt = dmc.status.cget("text")
+            log_txt = dmc.log.get("1.0", "end")
+            privacy_checks += [
+                ("取消有反馈：status 含「已取消」、导出日志含「取消」",
+                 "已取消" in status_txt and "取消" in log_txt),
+                ("取消不生成 zip、_running 为 False、按钮仍 normal",
+                 not cancel_out.exists()
+                 and not cancel_out.with_name(
+                     cancel_out.name + ".part").exists()
+                 and dmc._running is False
+                 and str(dmc.export_btn.cget("state")) == "normal"),
+            ]
+            dmc._stop_polling()
+            dmc.destroy()
+        except Exception as exc:                            # noqa: BLE001
+            print(f"    DataManager 隐私确认测试失败：{exc}")
+            privacy_checks.append(("隐私确认测试整体不抛异常", False))
+
+        # 正向：打桩返回 True，导出真的启动（状态变「导出中」），别把正常路径堵死。
+        # export_zip 也打桩，避免真写盘 / 线程残留；join 放在 patch 生效期内，
+        # 防止线程调度到 with 外时调到真实函数。
+        pos_out = Path(tmp) / "zz_privacy_positive.zip"
+        try:
+            dmp = DataManager(sroot)
+            dmp.withdraw()
+            dmp.update()
+            dmp.out_var.set(str(pos_out))
+            dmp._cat_vars["annotated"].set(True)
+            dmp.select_all()
+            with mock.patch.object(_dmmod.messagebox, "askyesno",
+                                   return_value=True):
+                with mock.patch.object(
+                        _dmmod, "export_zip",
+                        return_value=_ExportResult(
+                            output=pos_out, n_sessions=1,
+                            n_files=1, bytes_written=0)):
+                    dmp.export_btn.invoke()
+                    started = ("导出中" in dmp.status.cget("text")
+                               and dmp._running is True)
+                    if dmp._worker is not None:
+                        dmp._worker.join(timeout=2)
+            privacy_checks.append((
+                "正向（选『是』）导出真的启动、状态变「导出中」", started))
+            dmp._stop_polling()
+            dmp.destroy()
+        except Exception as exc:                            # noqa: BLE001
+            print(f"    DataManager 隐私确认正向测试失败：{exc}")
+            privacy_checks.append(("隐私确认正向测试整体不抛异常", False))
+
+        # 2026-11-11 真机实测：DataManager 的业务方法 `_options()` 与
+        # `tk.Misc._options(self, cnf, kw=None)` 撞名。`commondialog.Dialog.show()`
+        # 会执行 `master._options(self.options)`，而 master 就是 `parent=self` ——
+        # 于是所有 messagebox / filedialog 都抛 TypeError，弹窗根本出不来。
+        # 上面两组测试把 messagebox 打桩了，恰好绕开了这条路径；这里**不打桩**，
+        # 只替换 dm.tk（Tcl 调用端），让 show() 真的跑到那一行。
+        try:
+            import tkinter.filedialog as _fd
+            import tkinter.messagebox as _mb
+
+            class _FakeTk:
+                def __init__(self, ret: str) -> None:
+                    self.ret = ret
+
+                def call(self, *_args) -> str:
+                    return self.ret
+
+                def getboolean(self, _v) -> bool:
+                    return True
+
+            dmo = DataManager(sroot)
+            dmo.withdraw()
+            dmo.update()
+            try:
+                with mock.patch.object(dmo, "tk", _FakeTk("yes")):
+                    _mb.askyesno("包含视频，请确认", "测试", parent=dmo,
+                                 default=_mb.NO)
+                msgbox_ok = True
+            except TypeError:
+                msgbox_ok = False
+            except Exception:                               # noqa: BLE001
+                msgbox_ok = False
+            try:
+                with mock.patch.object(dmo, "tk", _FakeTk("")):
+                    _fd.askdirectory(parent=dmo, title="测试")
+                filedialog_ok = True
+            except TypeError:
+                filedialog_ok = False
+            except Exception:                               # noqa: BLE001
+                filedialog_ok = False
+            # 单独求值：改名回 `_options` 时这一项也会红，但不能让它把上面
+            # 两条 TypeError 判据一起吞掉（反向自证要看清红的是哪条）。
+            try:
+                opts_ok = "metadata" in dmo._export_options().categories
+            except AttributeError:
+                opts_ok = False
+            privacy_checks += [
+                ("DataManager 不再遮蔽 tk.Misc._options（业务方法已改名）",
+                 "_options" not in DataManager.__dict__),
+                ("真实 messagebox(parent=self) 不再抛 TypeError", msgbox_ok),
+                ("真实 filedialog(parent=self) 不再抛 TypeError", filedialog_ok),
+                ("导出选项方法 _export_options() 仍可用", opts_ok),
+            ]
+            dmo._stop_polling()
+            dmo.destroy()
+        except Exception as exc:                            # noqa: BLE001
+            print(f"    Tk _options 冲突测试失败：{exc}")
+            privacy_checks.append(("Tk _options 冲突测试整体不抛异常", False))
+
+        for name, passed in privacy_checks:
             print(f"  [{'通过' if passed else '不达标'}] {name}")
             results.append((name, passed))
 
@@ -2174,6 +2521,34 @@ def main() -> int:
         print(f"  [{'通过' if _passed else '不达标'}] {_name}")
         results.append((_name, _passed))
 
+    # ---- 路径可移植性（2026-11-05）----
+    # 并进本文件，同样不动 selftest_doc_facts 里有签字的 REAL_TEST_COUNT。
+    print("----- 8i. 会话根路径可移植性 ----")
+    for _name, _passed in _check_session_root_portability():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
+    # ---- 一键环境安装器（2026-11-05）----
+    print("----- 8j. 一键环境安装器 ----")
+    for _name, _passed in _check_env_installer():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
+    # ---- GUI 多语言（2026-11-05）----
+    print("----- 8k. GUI 多语言 ----")
+    for _name, _passed in _check_i18n():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
+    # ---- 8l. 三个新功能：contain / 原始视频源 / 资源管理器模块（2026-11-12）----
+    # 独立验证者钉的回归护栏：全部用临时会话 / 打桩，不依赖本机录过什么。
+    # A=运行时证明 contain（不只 grep 源码）；B=raw 双 cap + 无三维兜底；
+    # C=新模块打桩（绝不真弹资源管理器，gui_walkthrough 靠 os.startfile 属性路径）。
+    print("----- 8l. 3D 查看器 contain + 原始视频源 + 资源管理器模块 -----")
+    for _name, _passed in _check_viewer_raw_and_explorer():
+        print(f"  [{'通过' if _passed else '不达标'}] {_name}")
+        results.append((_name, _passed))
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
     if bad:
@@ -2182,6 +2557,346 @@ def main() -> int:
             print(f"  · {n}")
     print("\n判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
+
+
+def _check_session_root_portability() -> list[tuple[str, bool]]:
+    """会话根偏好不许把项目内目录固化成绝对路径（2026-11-05）。
+
+    坑：单目窗关闭时把 ``mono.session_root`` 无条件写成 ``str(Path)``，
+    连默认的 ``data/mono`` 也被记成 ``D:/.../data/mono``。整个仓库换个盘、
+    或发给别人后，界面仍指向旧机器那个目录，静默列出一份空会话列表。
+    反过来，用户自己选的**仓库外**目录必须保留绝对路径 —— 那可能只是
+    移动硬盘这次没插，替他改掉才是破坏。
+    """
+    try:
+        from apps._gui_mono import (MONO_SESSIONS_ROOT, ROOT as APP_ROOT,
+                                    _restore_session_root, _store_session_root)
+    except Exception as exc:                              # noqa: BLE001
+        return [(f"会话根路径模块可导入（{type(exc).__name__}: {exc}）", False)]
+
+    stored = _store_session_root(MONO_SESSIONS_ROOT)
+    restored = _restore_session_root(stored)
+    stale = APP_ROOT.parent / "__gone_repo__" / "data" / "mono"
+    external = APP_ROOT.parent / "__external__" / "videos"
+    inside = APP_ROOT / "outputs" / "custom"
+    src = (ROOT / "apps" / "_gui_mono.py").read_text(encoding="utf-8")
+    return [
+        ("项目内默认会话根存成相对路径（不含盘符）",
+         stored == "data/mono" and not re.match(r"^[A-Za-z]:", stored)),
+        ("相对值还原成仓库根下的绝对路径",
+         restored.is_absolute() and restored == APP_ROOT / "data" / "mono"),
+        ("空值回退到默认会话根",
+         _restore_session_root("") == MONO_SESSIONS_ROOT),
+        ("历史遗留的失效绝对路径回退默认，不指向旧机器",
+         _restore_session_root(str(stale)) == MONO_SESSIONS_ROOT),
+        ("用户自定义的仓库外目录原样保留（移动硬盘没插也别替他改）",
+         _restore_session_root(str(external)) == external),
+        ("项目内任意子目录存/取往返一致",
+         _restore_session_root(_store_session_root(inside)) == inside),
+        ("保存点确实走 _store_session_root（不许退回 str(Path)）",
+         'p.set("mono.session_root", _store_session_root(self._session_root))' in src),
+    ]
+
+
+def _check_env_installer() -> list[tuple[str, bool]]:
+    """一键环境安装器（2026-11-05）：三入口认同一份指针，路径仍可移植。
+
+    守的是这几件容易悄悄退化的事：安装器必须能在「一个第三方包都没装」
+    的机器上运行；根目录不许冒出第四个脚本；bat / Go 都要优先读指针；
+    指针里项目内的解释器必须是相对路径；本机状态不许混进纯净包。
+    """
+    import ast
+    import subprocess
+
+    installer = ROOT / "apps" / "setup_env.py"
+    bat = ROOT / "run.bat"
+    go = ROOT / "native" / "launcher" / "main.go"
+    if not installer.is_file():
+        return [("apps/setup_env.py 存在", False)]
+    src = installer.read_text(encoding="utf-8")
+    bat_src = bat.read_text(encoding="utf-8", errors="replace")
+    go_src = go.read_text(encoding="utf-8", errors="replace")
+    un = ROOT / "uninstall.bat"
+    un_src = (un.read_text(encoding="utf-8", errors="replace")
+              if un.is_file() else "")
+    # 第二遍 :execute 段单独切出来：第一遍也有 .git / AGENTS.md 关键词，
+    # 必须确保复核真的写在第二遍里，否则"只验第一遍"的退化抓不住。
+    _un_lines = un_src.splitlines()
+    _exec_at = next((i for i, ln in enumerate(_un_lines)
+                     if ln.strip() == ":execute"), None)
+    exec_part = "\n".join(_un_lines[_exec_at:]) if _exec_at is not None else ""
+
+    def ignored(rel: str) -> bool:
+        return subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", rel],
+            cwd=str(ROOT), capture_output=True, check=False).returncode == 0
+
+    from apps import setup_env as se
+    from apps.tools import make_clean_bundle as m
+
+    # 用 AST 查**真正的** import：源码注释里写着 "import cv2" 是踩坑说明，
+    # 字符串搜索会误报（这一条第一次就误报了）。
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    stdlib = set(getattr(sys, "stdlib_module_names", ()))
+    foreign = sorted(imported - stdlib) if stdlib else sorted(
+        m for m in imported
+        if m in ("cv2", "numpy", "yaml", "PIL", "sphere_tracker", "apps",
+                 "stereo", "matplotlib"))
+
+    external = se.ROOT.parent / "__external__" / "python.exe"
+    rels = [f.relative_to(m.ROOT).as_posix() for f in m.collect()]
+    checks: list[tuple[str, bool]] = [
+        (f"安装器只用标准库（环境没装好时也得能跑；多出 {foreign}）",
+         not foreign),
+        ("根目录可执行文件一律英文名（AGENTS.md 规则 5）",
+         all(p.name.isascii() for p in list(ROOT.glob("*.bat"))
+             + list(ROOT.glob("*.py")) + list(ROOT.glob("*.exe")))),
+        ("GUI / CLI 主程序已搬出根目录（根目录不再有 .py）",
+         (ROOT / "apps" / "gui_main.py").is_file()
+         and (ROOT / "apps" / "cli_main.py").is_file()
+         and not list(ROOT.glob("*.py"))),
+        ("run.bat 不再靠 glob 扫根目录找 GUI（脚本搬走后必失效）",
+         "apps\\gui_main.py" in bat_src
+         and "glob.glob('*.py')" not in bat_src),
+        ("install.bat / uninstall.bat 都在且是英文名",
+         (ROOT / "install.bat").is_file()
+         and (ROOT / "uninstall.bat").is_file()),
+        ("卸载器有开发仓库安全闸（.git / .workbuddy / AGENTS.md）",
+         all(k in un_src for k in (".git", ".workbuddy", "AGENTS.md"))),
+        ("卸载器只走回收站、需二次确认、无永久删除命令",
+         "SendToRecycleBin" in un_src and "UNINSTALL" in un_src
+         and "rmdir /s /q" not in un_src and "del /f /s /q" not in un_src),
+        ("卸载器自我复制到 TEMP 才执行（否则删不掉自己）",
+         "%TEMP%" in un_src and "--execute" in un_src),
+        ("卸载目标走临时文件传参、由独立进程执行（start 会吞带空格参数）",
+         "sphere_uninstall_target.txt" in un_src
+         and "start " in un_src and "/D " in un_src
+         and "SendToRecycleBin" in un_src),
+        # 2026-11-22：installer 可靠性两处高危缺陷的回归护栏（含反向自证）。
+        # ① install.bat 用 call ... install %* 原样转发（引号还在），run.bat 旧写法
+        #    %~2..%~5 既剥引号又丢第 5 个之后的参数 —— 反向自证必须钉住旧串消失。
+        ("run.bat 参数转发不再用写死的 %~2..%~5（反向自证）",
+         "%~2 %~3 %~4 %~5" not in bat_src),
+        ("run.bat 逐参数重新加引号转发、数量不限（INSTALL_ARGS + shift）",
+         "INSTALL_ARGS" in bat_src and "shift" in bat_src
+         and '"%BOOT%" apps\\setup_env.py %INSTALL_ARGS%' in bat_src),
+        ("py launcher 兜底先验版本再收（旧 py.exe 不会在入口语法崩）",
+         "sys.version_info>=(3,9)" in bat_src and "where py" in bat_src),
+        ("安装完成提示不再指向纯净包里没有的 launcher.exe",
+         "launcher.exe" not in next(
+             (ln for ln in bat_src.splitlines() if "环境已就绪" in ln), "")),
+        # ② 卸载第二遍从 %TEMP% 副本执行，必须重新验明目标身份 + 拦盘符根。
+        ("卸载器第二遍(:execute)复核身份与盘符根（不是只验第一遍）",
+         all(k in exec_part for k in (".git", "AGENTS.md", "%SystemDrive%"))
+         and 'if not exist "%TARGET%\\run.bat"' in exec_part
+         and 'if not exist "%TARGET%\\apps\\gui_main.py"' in exec_part),
+        ("卸载器两遍都有 .git 安全闸（反向自证：只写一处会红）",
+         un_src.count('if exist "%TARGET%\\.git"') >= 2
+         and un_src.count(".git") >= 2),
+        ("卸载目标传参文件带 <%RANDOM%> 后缀（并发卸载不互相覆盖）",
+         "sphere_uninstall_target.txt" in un_src
+         and "%RANDOM%" in un_src and "TARGETFILE" in un_src),
+        ("bat 有 install 路由",
+         'if /i "%MODE%"=="install" goto :do_install' in bat_src
+         and ":do_install" in bat_src),
+        ("bat 优先读安装器登记的环境",
+         "config\\python_env.txt" in bat_src
+         and "安装器登记的环境" in bat_src),
+        ("Go 启动器优先读环境指针",
+         "pointerPython(root)" in go_src
+         and 'if p := pointerPython(root); p != ""' in go_src),
+        ("Go 启动器找不到环境时会询问并自动安装",
+         "runInstaller(root)" in go_src and "ask(" in go_src),
+        # 2026-11-08：用户实测 **run.bat 能打开相机、launcher.exe 打不开**
+        #（同机、同代码、同环境）。两条路唯一实质差别就是"谁起的 Python"：
+        # bat 用 python.exe（有控制台），launcher 原来直接起 pythonw.exe（无控制台）。
+        # run.bat 是已验证可用的那条，启动器只许**把它藏起来跑**，不许再复制一份
+        # 启动逻辑 —— 否则这类"只有某一条入口才坏"的问题会反复出现。
+        ("启动器把 GUI 交给 run.bat（只隐藏控制台，不再自己起 pythonw）",
+         'filepath.Join(root, "run.bat")' in go_src
+         and '"/c", bat, "gui"' in go_src),
+        ("反向：把启动器改回直接起 pythonw → 判据会红",
+         not ('"/c", bat, "gui"' in
+              go_src.replace('"/c", bat, "gui"', 'script'))),
+        ("项目内解释器写相对路径",
+         se.pointer_value(se.ROOT / ".venv" / "Scripts" / "python.exe", se.ROOT)
+         == ".venv/Scripts/python.exe"),
+        ("相对指针按仓库根还原成绝对路径",
+         se.parse_pointer("python=.venv/Scripts/python.exe\n", se.ROOT)
+         == (se.ROOT / ".venv" / "Scripts" / "python.exe").resolve()),
+        ("仓库外环境保留绝对路径",
+         se.pointer_value(external, se.ROOT) == str(external)
+         and se.parse_pointer("python=" + str(external) + "\n", se.ROOT)
+         == external.resolve()),
+        ("指针里的注释行不干扰解析",
+         se.parse_pointer("# comment\n\npython=data/x\n", se.ROOT)
+         == (se.ROOT / "data" / "x").resolve()),
+        ("AI 组 ultralytics 必须 --no-deps（否则覆盖 opencv-contrib）",
+         '"ultralytics", "--no-deps"' in src
+         and src.find('"torch==2.11.0"') < src.find('"ultralytics"')),
+        ("安装器进纯净交付包", "apps/setup_env.py" in rels),
+        ("环境指针 / venv / 日志都不进纯净包",
+         not any(r.startswith((".venv/", "config/python_env", "logs/"))
+                 for r in rels)),
+        ("本机环境指针被 gitignore 挡住（含绝对路径，不能入库）",
+         ignored("config/python_env.txt")
+         and ignored(".venv/Scripts/python.exe")),
+    ]
+
+    # 安装器不能 import sphere_tracker（其 __init__ 会拉 cv2），却必须把日志
+    # 写进同一个规范目录。这里拿真正的 log_dir 对账，防止两套规则悄悄漂移。
+    from datetime import datetime
+    from sphere_tracker.paths import log_dir
+    probe_log = se.setup_log_path(datetime(2026, 11, 5, 18, 30, 0))
+    checks.append(("安装日志落在规范的 logs/misc/<月>/ 分片里",
+                   probe_log.parent == log_dir("misc", when=datetime(2026, 11, 5))
+                   and probe_log.name == "setup_env_20261105_183000.log"))
+
+    try:
+        h = subprocess.run([sys.executable, str(installer), "--help"],
+                           cwd=str(ROOT), capture_output=True, text=True,
+                           timeout=60, check=False)
+        d = subprocess.run([sys.executable, str(installer), "--dry-run"],
+                           cwd=str(ROOT), capture_output=True, text=True,
+                           timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        checks.append((f"安装器 --help / --dry-run 能跑（{exc}）", False))
+        return checks
+    checks.append(("--help 真解析参数（selftest_entrypoints 会扫）",
+                   h.returncode == 0 and "usage:" in (h.stdout or "")))
+    checks.append(("--dry-run 只打印计划、不改动环境",
+                   d.returncode == 0 and "不改动任何东西" in (d.stdout or "")))
+    return checks
+
+
+def _unscanned_gui_files() -> set[str]:
+    """界面文件里，没登记进 `i18n_extract.SCAN_NAMES` 的那些。
+
+    只挑「一定是界面」的两类：``apps/_gui_*.py`` 与 ``apps/*_dialog.py``。
+    不扫全部 `apps/*.py` —— `run_video.py` / `calibrate_stereo.py` 里的
+    argparse help 本来就不该进界面词典（那会把命令行文案也拖进翻译表）。
+    """
+    from apps.tools import i18n_extract as ex
+
+    apps_dir = ROOT / "apps"
+    gui = {p.name for p in apps_dir.glob("_gui_*.py")}
+    gui |= {p.name for p in apps_dir.glob("*_dialog.py")}
+    return gui - set(ex.SCAN_NAMES)
+
+
+def _check_i18n() -> list[tuple[str, bool]]:
+    """GUI 多语言：运行时切换 + 新增文案自动生成对应语言版本。
+
+    守两件容易悄悄退化的事：① 切换语言来回不能把译文当成新原文存下来
+    （实测踩过，界面再也切不回中文）；② 界面上新增一句中文，双语资源
+    必须自动跟上，而不是靠人记得改两份文件。
+    """
+    import subprocess
+    import tempfile
+
+    from apps import i18n, i18n_data, i18n_seed
+    from apps.tools import i18n_extract as ex
+    from apps.tools import make_clean_bundle as m
+
+    def has_cn(s: str) -> bool:
+        return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+
+    keys = ex.scan_all()
+    done = sum(1 for v in i18n_data.EN_US.values() if v)
+    checks: list[tuple[str, bool]] = [
+        ("中英文两种语言已注册",
+         "zh-CN" in i18n.LANGS and "en-US" in i18n.LANGS),
+        ("种子词典 key 含中文、译文不含中文",
+         all(has_cn(k) for k in i18n_seed.SEED)
+         and all(not has_cn(v) for v in i18n_seed.SEED.values())),
+        (f"资源覆盖全部扫描到的界面文案（{len(keys)} 条）",
+         len(keys) > 300 and keys <= set(i18n_data.EN_US)),
+        (f"英文资源有自动生成的译文（{done}/{len(i18n_data.EN_US)}）",
+         done > len(i18n_data.EN_US) // 2),
+        # `i18n_extract.SCAN_NAMES` 是白名单 —— 新加一个界面文件忘了登记时，
+        # 它不会报错，只是那个窗口在英文模式下**整块照旧中文**。2026-11-07 加
+        # `tools_dialog.py` 时正是这样漏的（`--check` 说"一致"）。
+        # 所以这里把"记得登记"变成判据：GUI 文件必须都在白名单里。
+        (f"i18n 扫描白名单覆盖全部界面文件（漏 {sorted(_unscanned_gui_files())}）",
+         not _unscanned_gui_files()),
+    ]
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        old_file, old_lang = i18n.LANG_FILE, i18n.language()
+        old_refresh = i18n.refresh_all
+        i18n.LANG_FILE = tmp / "language.txt"
+        # 本文件前面建了 GUI 窗口，切换语言时不要真的去刷那棵控件树。
+        i18n.refresh_all = lambda: None                 # type: ignore[assignment]
+        try:
+            cn = i18n.t("确定")
+            i18n.set_language("en-US")
+            en = i18n.t("确定")
+            auto = i18n.t("已选 3 个文件 / 12 个")
+            saved = i18n.LANG_FILE.read_text(encoding="utf-8").strip()
+            i18n.set_language("zh-CN")
+            back = i18n.t("确定")
+            checks += [
+                ("中文模式是恒等映射", cn == "确定"),
+                ("英文模式命中精确译文", en == "OK"),
+                ("未登记长句由词典自动组词", "Selected" in auto),
+                ("语言偏好已持久化", saved == "en-US"),
+                ("切回中文能还原（不会把译文当原文）", back == "确定"),
+            ]
+        finally:
+            i18n.LANG_FILE = old_file
+            i18n.refresh_all = old_refresh              # type: ignore[assignment]
+            if i18n.language() != old_lang:
+                i18n.set_language(old_lang)
+
+        probe = tmp / "probe.py"
+        probe.write_text(
+            '"""模块说明不该被提取"""\n'
+            'def f():\n'
+            '    """函数说明不该被提取"""\n'
+            '    tk.Label(root, text="保存新的测试")\n'
+            '    log.info("内部日志 %s 不该被提取")\n',
+            encoding="utf-8")
+        found = ex.extract_strings(probe)
+        checks += [
+            ("提取器能发现新增界面文案", "保存新的测试" in found),
+            ("提取器不收注释 / docstring / 内部日志",
+             not any("不该被提取" in s for s in found)),
+            ("新增文案能自动生成英文版本",
+             bool(ex.auto_translate("保存新的测试"))),
+        ]
+
+    gui_src = (ROOT / "apps" / "_gui_app.py").read_text(encoding="utf-8")
+    widget_src = (ROOT / "apps" / "_gui_widgets.py").read_text(encoding="utf-8")
+    help_src = (ROOT / "apps" / "help_window.py").read_text(encoding="utf-8")
+    runtime_src = (ROOT / "apps" / "i18n.py").read_text(encoding="utf-8")
+    checks += [
+        ("主界面有语言切换入口",
+         "i18n.set_language" in gui_src and "Combobox" in gui_src),
+        ("状态栏 / 消息框 / 帮助窗口都接入翻译",
+         "i18n.apply(self._label)" in widget_src
+         and "_i18n_patched" in runtime_src
+         and "i18n.t(body)" in help_src),
+    ]
+    rels = [f.relative_to(m.ROOT).as_posix() for f in m.collect()]
+    checks.append(("多语言模块与资源进纯净交付包",
+                   all(x in rels for x in (
+                       "apps/i18n.py", "apps/i18n_seed.py", "apps/i18n_data.py",
+                       "apps/tools/i18n_extract.py"))))
+    try:
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "apps" / "tools" / "i18n_extract.py"),
+             "--check"], cwd=str(ROOT), capture_output=True, text=True,
+            timeout=120, check=False)
+        checks.append(("提取器 --check 与源码一致", r.returncode == 0))
+    except (OSError, subprocess.TimeoutExpired):
+        checks.append(("提取器 --check 与源码一致", False))
+    return checks
 
 
 def _check_clean_bundle() -> list[tuple[str, bool]]:
@@ -2212,7 +2927,7 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
     must_pass = ("apps/view_3d.py", "apps/tools/make_clean_bundle.py",
                  "sphere_tracker/paths.py", "stereo/profiles.py",
                  "calib/methods.py", "tests/selftest_entrypoints.py",
-                 "启动程序.py", "requirements.txt", "README.md",
+                 "apps/gui_main.py", "requirements.txt", "README.md",
                  "assets/boards/chessboard_8x5_25mm_a4-landscape.png",
                  "config/.gitkeep",
                  # 2026-11-05：公开说明文档是要带上 GitHub 的，不是"资产"
@@ -2227,7 +2942,7 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
                    "data/stereo/parallel/x/derived/visualization.json",
                    "outputs/test_results/timings.json", "logs/tasks/x.log",
                    ".workbuddy/memory/x.md", "apps/tools/tmp_debug.log",
-                   "native/launcher/icon.syso", "启动器.exe")
+                   "native/launcher/icon.syso", "launcher.exe")
     wrong_pass = [x for x in must_pass if ignored(x)]
     wrong_ignore = [x for x in must_ignore if not ignored(x)]
     checks.append((f"白名单放行源码/必需物（误拦 {wrong_pass[:2]}）",
@@ -2257,9 +2972,10 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
     checks.append((f"包内含 exe 启动器重建源码（{len(build_src)} 个）",
                    len(build_src) == 5))
     checks.append(("编译产物（exe / syso）不进包",
-                   "启动器.exe" not in rels
+                   "launcher.exe" not in rels
                    and not any(r.endswith(".syso") for r in rels)))
-    need = ("启动程序.py", "启动程序.bat", "启动程序_命令行.py",
+    need = ("apps/gui_main.py", "run.bat", "apps/cli_main.py",
+            "install.bat", "uninstall.bat",
             "requirements.txt", "requirements-ai.txt", "environment.yml",
             ".gitignore", "apps/view_3d.py", "sphere_tracker/paths.py",
             "stereo/profiles.py", "calib/methods.py",
@@ -2660,6 +3376,938 @@ def _pair_check(base) -> bool:
                 and raw.read_bytes() == src.read_bytes() and motion.stat().st_size > 0
                 and note.exists()
                 and "数据变量说明" in note.read_text(encoding="utf-8"))
+
+
+def _check_viewer_raw_and_explorer() -> list[tuple[str, bool]]:
+    """8l. 三个新功能的独立回归护栏（2026-11-12）。
+
+    三个功能都由别人写完，这里的任务是**独立证明它们真的能用**，不是"测试
+    变绿"就算完：
+
+      A. `_render_video` 从 cover-crop 改 contain —— 运行时真起 Viewer3D，
+         把 pane 尺寸替换成 744×328，量 PhotoImage 的 583×328 与居中坐标；
+         反证时把 `min` 改 `max`，运行时判据必须红（不能只 grep 源码）。
+      B. `--video-source raw` —— 真开左右两个 cap，量两格 shape 与像素差，
+         并造"无三维 JSON"的会话证明降级视图也开得了原始视频。
+      C. `apps/_open_in_explorer.py` + 数据管理接入 —— 全部打桩，绝不真弹
+         资源管理器（`gui_walkthrough.py:265` 靠 `os.startfile` 属性路径）。
+
+    全部用 `tempfile.TemporaryDirectory()`，不依赖这台机器录过什么；真起 Tk
+    窗口一律 withdraw + close/destroy，否则 Windows 上临时目录删不掉
+    （WinError 32）。
+    """
+    checks: list[tuple[str, bool]] = []
+
+    def _run() -> None:
+        import ast
+        import inspect
+        import unittest.mock as _mock
+        from types import SimpleNamespace
+
+        import cv2
+        import numpy as np
+        import tkinter as tk
+
+        import apps._open_in_explorer as oie
+        import apps.data_manager as dmmod
+        from apps.view_3d import Viewer3D, load_view
+
+        v3d_src = (ROOT / "apps" / "view_3d.py").read_text(encoding="utf-8")
+        dm_src = (ROOT / "apps" / "data_manager.py").read_text(encoding="utf-8")
+        oie_src = (ROOT / "apps" / "_open_in_explorer.py").read_text(
+            encoding="utf-8")
+
+        def mk_video(path: Path, fill: int) -> None:
+            """合成 128×64、6 帧、mp4v 的纯色视频（两路用不同填充色）。"""
+            vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                 5.0, (128, 64))
+            if not vw.isOpened():
+                raise RuntimeError(f"视频写不了：{path}")
+            for i in range(6):
+                vw.write(np.full((64, 128, 3), fill, np.uint8))
+            vw.release()
+
+        def mk_viz(sess: Path, *, n: int = 3) -> Path:
+            (sess / "derived").mkdir(parents=True, exist_ok=True)
+            pts = [{"xyz": [0.01 * i, 0.0, 1.0], "frame": i, "t": 0.01 * i}
+                   for i in range(n)]
+            (sess / "derived" / "visualization.json").write_text(
+                json.dumps({"schema": "sphere-stereo-visualization",
+                            "version": 1, "session": sess.name,
+                            "trajectory": pts, "coordinate_system":
+                            "left_camera", "unit": "m",
+                            "stereo_mode": "parallel"}, ensure_ascii=False),
+                encoding="utf-8")
+            return sess / "derived" / "visualization.json"
+
+        # ======== A. contain（运行时证明，不能只 grep 源码）========
+        rv_src = inspect.getsource(Viewer3D._render_video)
+        checks.append(("A1 contain 源码用 min(w/rw,h/rh)、没有 max",
+                       "scale = min(w / rw, h / rh)" in rv_src
+                       and "scale = max(w / rw, h / rh)" not in rv_src))
+        checks.append(("A1 源码里没有 cover-crop 的中心裁切三行",
+                       "img[" not in rv_src and "[y0:" not in rv_src
+                       and "[x0:" not in rv_src))
+        checks.append(("A1 源码里 create_image 居中 anchor=nw",
+                       'create_image(x0, y0, anchor="nw", image=photo)'
+                       in rv_src
+                       and "(w - nw) // 2, (h - nh) // 2" in rv_src))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            viz = mk_viz(base / "contain_sess")
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                # video_source="none" 避免真开视频；_render_video 是纯绘制，
+                # 手动灌一帧 960×540（现场源帧尺寸）。
+                v = Viewer3D(root, load_view(viz), video_source="none")
+                v._left_raw = np.zeros((540, 960, 3), np.uint8)
+                v._right_raw = None
+                v.video_error = ""
+                v.mono = False
+                checks.append(("A1 Canvas 背景是深色 #0f172a（当黑边）",
+                               str(v.video_l.cget("bg")).lower()
+                               == "#0f172a"))
+
+                _real_w = v.video_l.winfo_width
+                _real_h = v.video_l.winfo_height
+                _real_ci = v.video_l.create_image
+                ci_seen: list[tuple[tuple, dict]] = []
+
+                def _spy_ci(*a, **k):
+                    ci_seen.append((a, k))
+                    return _real_ci(*a, **k)
+
+                try:
+                    v.video_l.winfo_width = lambda: 744
+                    v.video_l.winfo_height = lambda: 328
+                    ci_seen.clear()
+                    with _mock.patch.object(v.video_l, "create_image",
+                                            _spy_ci):
+                        v._render_video()
+                    w1 = int(v._left_photo.width())
+                    h1 = int(v._left_photo.height())
+                    checks.append((
+                        f"A2 contain 744×328 → 583×328（实测 {w1}×{h1}）",
+                        w1 == 583 and h1 == 328))
+                    checks.append(("A2 整帧装得下（宽≤744、高≤328，没裁）",
+                                   w1 <= 744 and h1 <= 328))
+                    ci_ok = (len(ci_seen) == 1
+                             and ci_seen[0][0][0] == (744 - 583) // 2
+                             and ci_seen[0][0][1] == (328 - 328) // 2
+                             and ci_seen[0][1].get("anchor") == "nw")
+                    checks.append(("A2 create_image 居中 (80,0)、anchor=nw",
+                                   ci_ok))
+
+                    # 换 pane 744×780（aspect 0.954）：这次该是 Y 方向留黑边。
+                    v.video_l.winfo_width = lambda: 744
+                    v.video_l.winfo_height = lambda: 780
+                    ci_seen.clear()
+                    with _mock.patch.object(v.video_l, "create_image",
+                                            _spy_ci):
+                        v._render_video()
+                    w2 = int(v._left_photo.width())
+                    h2 = int(v._left_photo.height())
+                    ci2 = ci_seen[0][0] if ci_seen else ()
+                    checks.append((
+                        f"A2 contain 744×780 → {w2}×{h2}（X 撑满、Y 留黑边）",
+                        w2 == 744 and h2 < 780 and len(ci2) >= 2
+                        and ci2[0] == 0 and ci2[1] > 0))
+                    checks.append(("A2 第二 pane 整帧仍装得下（≤744×780）",
+                                   w2 <= 744 and h2 <= 780))
+                finally:
+                    v.video_l.winfo_width = _real_w
+                    v.video_l.winfo_height = _real_h
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"A2 contain 运行时（异常：{exc}）", False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+        # ======== B. raw 视频源（双 cap / 不切分 / 无三维结果兜底）========
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "raw_sess"
+            viz = mk_viz(sess, n=3)
+            mk_video(sess / "left.mp4", 40)
+            mk_video(sess / "right.mp4", 200)
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                v = Viewer3D(root, load_view(viz), video_source="raw")
+                checks.append(("B4 raw 真开左右两个不同的 cap",
+                               v.cap_l is not None and v.cap_r is not None
+                               and v.cap_l is not v.cap_r))
+                checks.append(("B4 两路都记到了帧数（cap_frames_l/r>0）",
+                               v.cap_frames_l > 0 and v.cap_frames_r > 0))
+                lshape = getattr(v._left_raw, "shape", None)
+                rshape = getattr(v._right_raw, "shape", None)
+                checks.append((
+                    f"B4 两格都是完整 128×64 帧（shape={lshape}/{rshape}、无 w//2 切分）",
+                    lshape == (64, 128, 3) and rshape == (64, 128, 3)))
+                diff = (abs(float(v._left_raw.mean())
+                            - float(v._right_raw.mean()))
+                        if v._left_raw is not None
+                        and v._right_raw is not None else 0.0)
+                checks.append((f"B4 两格来自不同 cap（平均像素差 {diff:.1f}）",
+                               diff > 10.0))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"B4 raw 双 cap（异常：{exc}）", False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+        # B5：无三维 JSON 的会话（刚录完），降级视图仍开得了原始视频。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "no3d_sess"
+            sess.mkdir()
+            (sess / "session.json").write_text(
+                json.dumps({"schema": "sphere-stereo-session", "version": 1,
+                            "id": "no3d_sess", "sync": {"offset": 0}},
+                           ensure_ascii=False), encoding="utf-8")
+            mk_video(sess / "left.mp4", 30)
+            mk_video(sess / "right.mp4", 210)
+            data = load_view(sess)
+            checks.append(("B5 无三维 JSON → load_view 给降级视图（n=0/degraded）",
+                           bool(data.get("degraded"))
+                           and not data.get("trajectory")))
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                v = Viewer3D(root, data, video_source="raw")
+                rsd = getattr(v, "_raw_session_dir", None)
+                checks.append((
+                    f"B5 _raw_session_dir 指向该会话目录（{rsd}）",
+                    rsd is not None
+                    and Path(rsd).resolve() == sess.resolve()))
+                checks.append(("B5 降级视图仍打开左右两个 cap",
+                               v.cap_l is not None and v.cap_r is not None
+                               and v.cap_l.isOpened()
+                               and v.cap_r.isOpened()))
+                checks.append(("B5 降级视图也解码出两格完整帧",
+                               getattr(v._left_raw, "shape", None)
+                               == (64, 128, 3)
+                               and getattr(v._right_raw, "shape", None)
+                               == (64, 128, 3)))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"B5 无三维 JSON 的 raw 兜底（异常：{exc}）",
+                               False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+        # B6：video_source="none" 等价 --no-video，三个 cap 全是 None。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "none_sess"
+            viz = mk_viz(sess)
+            mk_video(sess / "left.mp4", 40)
+            mk_video(sess / "right.mp4", 200)
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                v = Viewer3D(root, load_view(viz), video_source="none")
+                checks.append(("B6 none 模式 _left_raw/_right_raw 都是 None",
+                               v._left_raw is None and v._right_raw is None))
+                checks.append(("B6 none 模式 cap/cap_l/cap_r 全 None",
+                               v.cap is None and v.cap_l is None
+                               and v.cap_r is None))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"B6 none 模式（异常：{exc}）", False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+        # B7：close() 后三个 cap 都释放，临时目录能删掉（WinError 32 反证）。
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                sess = base / "close_sess"
+                viz = mk_viz(sess)
+                mk_video(sess / "left.mp4", 40)
+                mk_video(sess / "right.mp4", 200)
+                root = tk.Tk()
+                root.withdraw()
+                v = None
+                try:
+                    v = Viewer3D(root, load_view(viz), video_source="raw")
+                finally:
+                    if v is not None:
+                        v.close()
+                        checks.append(("B7 close() 后三个 cap 都置 None",
+                                       v.cap is None and v.cap_l is None
+                                       and v.cap_r is None))
+                    else:
+                        root.destroy()
+            checks.append(("B7 临时目录能删掉（cap 已释放，无 WinError 32）",
+                           True))
+        except Exception as exc:                            # noqa: BLE001
+            checks.append((f"B7 close()/删临时目录（异常：{exc}）", False))
+
+        # B8：CLI 与 __init__ 契约（inspect.signature，不只 grep）。
+        sig = inspect.signature(Viewer3D.__init__)
+        p_vs = sig.parameters.get("video_source")
+        checks.append(("B8 Viewer3D.__init__ 的 video_source 有默认值 annotated",
+                       p_vs is not None and p_vs.default == "annotated"
+                       and p_vs.default is not inspect.Parameter.empty))
+        v3d_tree = ast.parse(v3d_src)
+        vs_call = None
+        for node in ast.walk(v3d_tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "--video-source"):
+                vs_call = node
+                break
+        choices = default = None
+        if vs_call is not None:
+            for kw in vs_call.keywords:
+                if (kw.arg == "choices"
+                        and isinstance(kw.value, (ast.Tuple, ast.List))):
+                    choices = [e.value for e in kw.value.elts
+                               if isinstance(e, ast.Constant)]
+                elif (kw.arg == "default"
+                      and isinstance(kw.value, ast.Constant)):
+                    default = kw.value.value
+        checks.append((
+            f"B8 CLI --video-source choices={choices} default={default}",
+            vs_call is not None
+            and choices == ["annotated", "raw", "none"]
+            and default == "annotated"))
+        checks.append(("B8 CLI --no-video 映射成 video_source=none",
+                       'source = "none" if args.no_video else args.video_source'
+                       in v3d_src))
+
+        # ======== C. 新模块 + 数据管理接入（全打桩，绝不真弹资源管理器）=====
+        oie_tree = ast.parse(oie_src)
+        top_mods: set[str] = set()
+        for node in oie_tree.body:
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    top_mods.add(a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top_mods.add(node.module.split(".")[0])
+        stdlib = {"__future__", "os", "subprocess", "sys", "pathlib"}
+        checks.append((
+            f"C9 新模块顶层 import 只有 stdlib（{sorted(top_mods)}）",
+            top_mods <= stdlib and "tkinter" not in top_mods
+            and "apps" not in top_mods))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            a_file = allowed / "a.txt"
+            a_file.write_text("x", encoding="utf-8")
+
+            sf: list[str] = []
+            popen: list[tuple[tuple, dict]] = []
+
+            def _popen_spy(*a, **k):
+                popen.append((a, k))
+                return None
+
+            def _startfile_rec(p, *a, **k):
+                sf.append(str(p))
+
+            def _raises(fn, *a, **k):
+                try:
+                    fn(*a, **k)
+                except oie.OpenInExplorerError:
+                    return True
+                except Exception:                           # noqa: BLE001
+                    return False
+                return False
+
+            try:
+                # C10：os.startfile 首选、Popen 未被调用（gui_walkthrough 红线）
+                sf.clear()
+                popen.clear()
+                with _mock.patch.object(os, "startfile", _startfile_rec,
+                                        create=True):
+                    with _mock.patch.object(oie.subprocess, "Popen",
+                                            _popen_spy):
+                        ret = oie.open_in_explorer(allowed,
+                                                   allowed_root=allowed)
+                checks.append(("C10 open_in_explorer 返回 True", ret is True))
+                checks.append(("C10 os.startfile 收到的正是该目录",
+                               sf == [str(allowed.resolve())]))
+                checks.append(("C10 subprocess.Popen 未被调用（打桩红线）",
+                               popen == []))
+
+                # C11：非法路径抛异常；传文件自动取 parent。
+                sf.clear()
+                popen.clear()
+                with _mock.patch.object(os, "startfile", _startfile_rec,
+                                        create=True):
+                    with _mock.patch.object(oie.subprocess, "Popen",
+                                            _popen_spy):
+                        bad_missing = _raises(oie.open_in_explorer,
+                                              allowed / "nope")
+                        bad_outside = _raises(oie.open_in_explorer, outside,
+                                              allowed_root=allowed)
+                        sf.clear()
+                        ret_file = oie.open_in_explorer(
+                            a_file, allowed_root=allowed)
+                checks.append((
+                    "C11 不存在路径/越界路径都抛 OpenInExplorerError",
+                    bad_missing and bad_outside))
+                checks.append((
+                    "C11 传文件自动取 parent（startfile 收到目录）",
+                    ret_file is True and sf == [str(allowed.resolve())]))
+
+                # C12：reveal_in_explorer 的 explorer /select, 参数
+                popen.clear()
+                with _mock.patch.object(oie.subprocess, "Popen",
+                                        _popen_spy):
+                    ret_reveal = oie.reveal_in_explorer(
+                        a_file, allowed_root=allowed)
+                a0 = popen[0][0] if popen else ()
+                kw = popen[0][1] if popen else {}
+                argv = a0[0] if a0 else None
+                exp = f"/select,{a_file.resolve()}"
+                checks.append((
+                    f"C12 reveal 参数是 [explorer, /select,<绝对路径>]（{argv}）",
+                    ret_reveal is True and isinstance(argv, list)
+                    and len(argv) == 2 and argv[0] == "explorer"
+                    and argv[1] == exp))
+                checks.append((
+                    "C12 /select 逗号后无空格、无 shell=True",
+                    isinstance(argv, list) and len(argv) == 2
+                    and argv[1].startswith("/select,")
+                    and not argv[1].startswith("/select, ")
+                    and "shell" not in kw))
+
+                # C13：os.startfile 缺失 → 走 explorer Popen 降级
+                popen.clear()
+                with _mock.patch.object(os, "startfile", None, create=True):
+                    with _mock.patch.object(oie.subprocess, "Popen",
+                                            _popen_spy):
+                        ret_fb = oie.open_in_explorer(
+                            allowed, allowed_root=allowed)
+                fb_argv = popen[0][0][0] if popen else None
+                checks.append((
+                    "C13 os.startfile 缺失 → 降级 [explorer, <目录>]",
+                    ret_fb is True
+                    and fb_argv == ["explorer", str(allowed.resolve())]))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"C10–C13 新模块打桩（异常：{exc}）", False))
+
+        # C14：真起 DataManager，选中假会话 → 打开 it.path + allowed_root。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "sess1"
+            sess.mkdir()
+            dm = None
+            try:
+                dm = dmmod.DataManager(base)
+                dm.withdraw()
+                dm.update()
+                fake = SimpleNamespace(key="sess1", path=sess, id="sess1")
+                dm.items = [fake]
+                if not dm.tree.exists(fake.key):
+                    dm.tree.insert("", "end", iid=fake.key, text=fake.id)
+                dm.tree.focus(fake.key)
+
+                real_open = dmmod.open_in_explorer
+                seen: list[tuple[Path, object]] = []
+                sf2: list[str] = []
+                infos: list = []
+
+                def _spy_open(path, *, allowed_root=None):
+                    seen.append((Path(path), allowed_root))
+                    return real_open(path, allowed_root=allowed_root)
+
+                old_open = dmmod.open_in_explorer
+                old_si = dmmod.messagebox.showinfo
+                old_se = dmmod.messagebox.showerror
+                dmmod.open_in_explorer = _spy_open
+                dmmod.messagebox.showinfo = lambda *a, **k: infos.append(a)
+                dmmod.messagebox.showerror = lambda *a, **k: None
+                try:
+                    with _mock.patch.object(
+                            os, "startfile",
+                            lambda p, *a, **k: sf2.append(str(p)),
+                            create=True):
+                        dm._open_session_in_explorer()
+                        n_after = len(sf2)
+                        dm.items = []
+                        dm.selected.clear()
+                        infos.clear()
+                        dm._open_session_in_explorer()
+                        no_sel = len(sf2) == n_after
+                finally:
+                    dmmod.open_in_explorer = old_open
+                    dmmod.messagebox.showinfo = old_si
+                    dmmod.messagebox.showerror = old_se
+                checks.append((
+                    "C14 _open_session_in_explorer 打开 it.path 且 allowed_root==root_dir",
+                    len(seen) == 1
+                    and seen[0][0].resolve() == sess.resolve()
+                    and seen[0][1] == dm.root_dir
+                    and sf2 == [str(sess.resolve())]))
+                checks.append(("C14 无选中 → 弹提示、不调用 startfile",
+                               bool(infos) and no_sel))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append(
+                    (f"C14 DataManager 打开会话文件夹（异常：{exc}）", False))
+            finally:
+                if dm is not None:
+                    dm._stop_polling()
+                    dm.destroy()
+
+        # C15：_open_viewer 的 raw / 默认 / 无视频三种 argv（打桩 Popen）。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            s_raw = base / "s_raw"
+            s_raw.mkdir()
+            (s_raw / "left.mkv").write_bytes(b"")
+            s_ann = base / "s_ann"
+            (s_ann / "derived").mkdir(parents=True)
+            (s_ann / "derived" / "annotated.mp4").write_bytes(b"")
+            s_bare = base / "s_bare"
+            s_bare.mkdir()
+            dm = None
+            try:
+                dm = dmmod.DataManager(base)
+                dm.withdraw()
+                dm.update()
+                calls: list[list[str]] = []
+                asks: list = []
+                infos2: list = []
+                old_popen = dmmod.subprocess.Popen
+                old_ask = dmmod.messagebox.askyesno
+                old_si = dmmod.messagebox.showinfo
+                old_se = dmmod.messagebox.showerror
+                dmmod.subprocess.Popen = lambda args: calls.append(args)
+                dmmod.messagebox.askyesno = lambda *a, **k: (
+                    asks.append(a), True)[1]
+                dmmod.messagebox.showinfo = lambda *a, **k: infos2.append(a)
+                dmmod.messagebox.showerror = lambda *a, **k: None
+
+                def _focus(it_path: Path, key: str) -> None:
+                    fake = SimpleNamespace(key=key, path=it_path, id=key)
+                    dm.items = [fake]
+                    if not dm.tree.exists(key):
+                        dm.tree.insert("", "end", iid=key, text=key)
+                    dm.tree.focus(key)
+
+                def _run_viewer(mode: str, it_path: Path,
+                                key: str) -> list[list[str]]:
+                    _focus(it_path, key)
+                    calls.clear()
+                    asks.clear()
+                    if mode == "raw":
+                        dm._open_viewer(mode="raw")
+                    else:
+                        dm._open_viewer()
+                    return list(calls)
+
+                try:
+                    argv_raw = _run_viewer("raw", s_raw, "s_raw")
+                    argv_ann = _run_viewer("annotated", s_ann, "s_ann")
+                    argv_bare = _run_viewer("annotated", s_bare, "s_bare")
+                    _focus(s_bare, "s_bare")
+                    calls.clear()
+                    infos2.clear()
+                    dm._open_viewer(mode="raw")
+                    raw_bare_ok = (calls == [] and bool(infos2))
+                finally:
+                    dmmod.subprocess.Popen = old_popen
+                    dmmod.messagebox.askyesno = old_ask
+                    dmmod.messagebox.showinfo = old_si
+                    dmmod.messagebox.showerror = old_se
+
+                def _first(argv: list[list[str]]) -> list[str]:
+                    return argv[0] if argv else []
+
+                a_raw = _first(argv_raw)
+                a_ann = _first(argv_ann)
+                a_bare = _first(argv_bare)
+                has_raw = ("--video-source" in a_raw
+                           and a_raw.index("--video-source") + 1 < len(a_raw)
+                           and a_raw[a_raw.index("--video-source") + 1]
+                           == "raw")
+                checks.append((
+                    f"C15 raw + left.mkv → --video-source raw 且不含 --no-video（尾 {a_raw[3:]}）",
+                    len(argv_raw) == 1 and has_raw
+                    and "--no-video" not in a_raw))
+                checks.append((
+                    "C15 默认 + 有 annotated → 与改动前一致（无视频参数）",
+                    len(argv_ann) == 1 and len(a_ann) == 3
+                    and "--no-video" not in a_ann
+                    and "--video-source" not in a_ann))
+                checks.append((
+                    "C15 默认 + 无 annotated/无 raw → askyesno + --no-video",
+                    len(argv_bare) == 1
+                    and "--no-video" in a_bare and bool(asks)))
+                checks.append(("C15 raw + 无原始视频 → 只弹提示、不 Popen",
+                               raw_bare_ok))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"C15 _open_viewer argv（异常：{exc}）", False))
+            finally:
+                if dm is not None:
+                    dm._stop_polling()
+                    dm.destroy()
+
+        # C16：源码契约：两个新按钮 / 不叫 _options / open_output_folder 用新模块。
+        checks.append(("C16 两个新按钮文案都在 data_manager.py",
+                       'text="查看原始视频"' in dm_src
+                       and 'text="在文件资源管理器中打开"' in dm_src))
+        checks.append(("C16 DataManager 没有遮蔽 tk.Misc._options",
+                       "_options" not in dmmod.DataManager.__dict__))
+        checks.append((
+            "C16 open_output_folder 调新模块且 allowed_root=None",
+            "from apps._open_in_explorer import" in dm_src
+            and "open_in_explorer(folder, allowed_root=None)" in dm_src))
+
+        # ======== X. 跨模块契约（2026-11-12 team-lead 追加裁决）========
+        # X1 `--no-video` 显式关闭优先：这个优先级的**唯一实现在 CLI 层**，
+        # 不在 Viewer3D（team-lead 裁决"保持现状、不改 view_3d.py"）。
+        #   apps/view_3d.py:2323  source = "none" if args.no_video else args.video_source
+        #   apps/view_3d.py:2324  Viewer3D(..., auto_video=not args.no_video,
+        #                                video_source=source)
+        # 裁决理由（写进注释以免将来被"好心"改偏）：
+        #  理由1 两个参数同时给时 CLI 先把 video_source 折成 "none" 再构造
+        #        Viewer3D，所以它收到的是 none 不是 raw；`auto_video` 只管
+        #        `_resolve_video` 的 annotated 自动发现路径（_apply:606），
+        #        raw 分支（_apply:633）不看它是**设计**，不是漏判。
+        #  理由2 若让 raw 分支也检查 auto_video 会制造两份真相（CLI 折一次、
+        #        Viewer 再折一次），并打掉合法组合 `auto_video=False,
+        #        video_source="raw"`（调用方想表达"别自动找 annotated.mp4，
+        #        但我要显式看原始双路"）。实测该组合双 cap 打开、两格有帧、
+        #        video_disabled=False，不该被 --no-video 语义误伤。
+        #  理由3 别的调用点手工同时拼两个参数是**调用方的错、应在调用点修**，
+        #        查看器不猜意图；优先级只在 CLI 层实现一次 = "唯一产地"规矩。
+        # data_manager 的 `if mode == "raw": ... elif not annotated.exists():`
+        # 保证正常路径两者互斥。下面四条判据：① 源码守 :2323 映射；② AST 守
+        # --no-video 的 store_true/默认 False；③ 端到端复刻 :2323-2324 证明
+        # Viewer3D 真的关掉视频；④ 直传 auto_video=False+raw 仍开双 cap，
+        # 把"开关在 CLI 层、Viewer 不猜"钉成显式契约。
+        checks.append((
+            "X1 CLI 里 --no-video 优先于 --video-source（source 折成 none 并传给 Viewer3D）",
+            'source = "none" if args.no_video else args.video_source'
+            in v3d_src and "video_source=source" in v3d_src))
+        novideo_call = None
+        for node in ast.walk(v3d_tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "--no-video"):
+                novideo_call = node
+                break
+        nv_kw = ({kw.arg: kw.value for kw in novideo_call.keywords}
+                 if novideo_call is not None else {})
+        nv_action = nv_kw.get("action")
+        nv_default = nv_kw.get("default")
+        checks.append((
+            "X1 --no-video 仍是 action=store_true 且默认 False（未被改偏）",
+            novideo_call is not None
+            and isinstance(nv_action, ast.Constant)
+            and nv_action.value == "store_true"
+            and (nv_default is None
+                 or (isinstance(nv_default, ast.Constant)
+                     and nv_default.value is False))))
+
+        # ③ 端到端：逐字复刻 CLI :2323-2324 的映射，验证 Viewer3D 真的关掉视频。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "x1_sess"
+            viz = mk_viz(sess)
+            mk_video(sess / "left.mp4", 40)
+            mk_video(sess / "right.mp4", 200)
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                args_no_video = True
+                args_video_source = "raw"
+                source = ("none" if args_no_video else args_video_source)
+                v = Viewer3D(root, load_view(viz),
+                             auto_video=not args_no_video,
+                             video_source=source)
+                checks.append((
+                    "X1 运行时：--no-video + --video-source raw → 三 cap 全 None、两格 None",
+                    v.video_source == "none"
+                    and v.cap is None and v.cap_l is None and v.cap_r is None
+                    and v._left_raw is None and v._right_raw is None))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"X1 运行时（异常：{exc}）", False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+        # ④ 契约边界：绕过 CLI 直传 auto_video=False + raw 仍开双 cap。
+        # 这不是缺陷，是"查看器不猜、开关在 CLI 层"的现状契约；若有人把
+        # auto_video 下沉进 raw 分支，这条会红，提醒他先改上面的裁决。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "x1b_sess"
+            viz = mk_viz(sess)
+            mk_video(sess / "left.mp4", 40)
+            mk_video(sess / "right.mp4", 200)
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                v = Viewer3D(root, load_view(viz), auto_video=False,
+                             video_source="raw")
+                checks.append((
+                    "X1 契约边界：auto_video 只管 annotated，直传 raw 仍开双 cap（查看器不猜）",
+                    v.cap_l is not None and v.cap_r is not None
+                    and v._left_raw is not None and v._right_raw is not None
+                    and v.video_error == ""))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"X1 契约边界（异常：{exc}）", False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+        # X2 两端原始视频文件名集合一致。
+        # 2026-11-15：文件名清单已收归 `sphere_tracker/video_files.py`（唯一产地），
+        # 所以这里不再从两个模块**各自**抽元组比集合 —— 那正是"两份手写清单"的
+        # 形状。改为守"两端都只 import、都不再写字面量"：集合相等由唯一产地直接
+        # 保证，mkv 优先也在那一条常量里（以前这两条判据是分别抽两处元组比出来的，
+        # 搬家后必须跟着搬，否则测试会替旧结构"守灵"）。
+        from sphere_tracker.video_files import (                 # noqa: PLC0415
+            ALL_RAW_VIDEO_NAMES, LEFT_VIDEO_NAMES, RIGHT_VIDEO_NAMES,
+        )
+
+        RAW_NAME_SET = set(ALL_RAW_VIDEO_NAMES)
+
+        def _const_tuple(node):
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                return [e.value for e in node.elts
+                        if isinstance(e, ast.Constant)]
+            return None
+
+        def _find_func(tree, name):
+            return next((n for n in ast.walk(tree)
+                         if isinstance(n, ast.FunctionDef)
+                         and n.name == name), None)
+
+        def _literal_raw_names(func) -> list[str]:
+            """函数体里手写的原始录像文件名（列表/元组/集合字面量）。"""
+            if func is None:
+                return ["<函数不存在>"]
+            got: list[str] = []
+            for node in ast.walk(func):
+                for name in _const_tuple(node) or []:
+                    if isinstance(name, str) and name in RAW_NAME_SET:
+                        got.append(name)
+            return got
+
+        def _called_names(func) -> set[str]:
+            """函数体里调用的裸函数名（`pick_left_video(...)` → `pick_left_video`）。"""
+            if func is None:
+                return set()
+            return {n.func.id for n in ast.walk(func)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+
+        dm_tree = ast.parse(dm_src)
+        rv_func = _find_func(v3d_tree, "_resolve_raw_videos")
+        ov_func = _find_func(dm_tree, "_open_viewer")
+        viewer_lits = _literal_raw_names(rv_func)
+        dm_lits = _literal_raw_names(ov_func)
+        checks.append((
+            f"X2 唯一产地：两端都不再手写文件名"
+            f"（viewer 字面量={sorted(set(viewer_lits))} / dm 字面量={sorted(set(dm_lits))}）",
+            RAW_NAME_SET == {"left.mkv", "right.mkv", "left.mp4", "right.mp4",
+                             "left.avi", "right.avi"}
+            and not viewer_lits and not dm_lits
+            and {"pick_left_video", "pick_right_video"} <= _called_names(rv_func)
+            and "has_any_raw_video" in _called_names(ov_func)))
+        checks.append((
+            f"X2 查看器 mkv 优先、mp4 其次、avi 兜底（LEFT={LEFT_VIDEO_NAMES} / "
+            f"RIGHT={RIGHT_VIDEO_NAMES}）",
+            tuple(LEFT_VIDEO_NAMES) == ("left.mkv", "left.mp4", "left.avi")
+            and tuple(RIGHT_VIDEO_NAMES) == ("right.mkv", "right.mp4", "right.avi")))
+
+        # X2 运行时：只有 right.mp4 的单路会话（按钮"至少一个存在就放行"安全）。
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            sess = base / "x2_sess"
+            viz = mk_viz(sess)
+            mk_video(sess / "right.mp4", 200)
+            root = tk.Tk()
+            root.withdraw()
+            v = None
+            try:
+                v = Viewer3D(root, load_view(viz), video_source="raw")
+                checks.append((
+                    "X2 运行时：只有 right.mp4 → 不崩 / cap_l None / cap_r 打开 / 右格有帧 / 无 error",
+                    v.cap_l is None and v.cap_r is not None
+                    and v.cap_r.isOpened()
+                    and v._left_raw is None and v._right_raw is not None
+                    and v.video_error == ""))
+            except Exception as exc:                        # noqa: BLE001
+                checks.append((f"X2 运行时（异常：{exc}）", False))
+            finally:
+                if v is not None:
+                    v.close()
+                else:
+                    root.destroy()
+
+    # ---- 两种新标定方式（轴向大板 / 中轴 90°）在 GUI 的接入 ----
+    # 这两条路各有自己的 argv 函数和窗口专属控件；判据钉三件事：
+    #   ① 下拉候选按窗口模式过滤（轴向不串进大角度窗、反之亦然）；
+    #   ② argv 脏数据不拼进去（"abc" 基线曾让 argparse exit 2）；
+    #   ③ device90 分支真的不带 ③④ 参数（否则"省两步"是假的）。
+    print("----- 新标定方式：轴向大板 / 中轴 90° 的 GUI 接入 -----")
+    try:
+        import ast as _ast2
+        from apps import _actions as _act
+        from apps._gui_stereo import (METHODS as _M2,
+                                      PICKER_METHODS as _PM2,
+                                      picker_methods_for as _pmf)
+
+        _b2 = {"cols": "8", "rows": "5", "square": "25", "target": "40"}
+        _ax = _act.calibrate_axial_args(root="X", board=_b2,
+                                        assume_parallel=True,
+                                        expected_baseline_mm="66.6")
+        checks.append((
+            "新标定① 轴向 argv：独立脚本 + --root + 0.05 容差 + assume_parallel",
+            len(_ax) >= 2 and _ax[1].endswith("calibrate_axial.py")
+            and "--root" in _ax and "X" in _ax
+            and "--baseline-tolerance" in _ax and "0.05" in _ax
+            and "--assume-parallel" in _ax))
+        _ax_off = _act.calibrate_axial_args(root="X", board=_b2)
+        checks.append((
+            "新标定② 轴向默认不强制 R=I（不传 --assume-parallel）",
+            "--assume-parallel" not in _ax_off))
+        _d90 = _act.calibrate_device90_args(
+            left_dir="L", right_dir="R", intrinsics="I.npz", board=_b2,
+            rot_axis="x", rot_angle="90", z_a_mm="600",
+            expected_baseline_mm="abc")
+        checks.append((
+            "新标定③ 中轴90° argv：独立脚本 + --rot-axis x + --z-a",
+            len(_d90) >= 2 and _d90[1].endswith("calibrate_device90.py")
+            and "--rot-axis" in _d90 and "x" in _d90
+            and "--z-a" in _d90 and "600" in _d90))
+        checks.append((
+            "新标定④ 脏基线不拼进 argv（abc → 不出现 --expected-baseline-mm）",
+            "--expected-baseline-mm" not in _d90))
+        checks.append((
+            "新标定⑤ 中轴90° 不带 ③④ 参数（ref-pair / pair-frame 都 absent）",
+            not any(k in _d90 for k in
+                    ("--ref-pair-left", "--ref-pair-right", "--pair-frame"))))
+
+        checks.append((
+            "新标定⑥ 下拉候选按窗口模式过滤（轴向只进平行、中轴90°只进大角度）",
+            _pmf("parallel") == ("joint", "axial")
+            and _pmf("angled") == ("chain", "chain_dual", "device90")))
+        checks.append((
+            "新标定⑦ METHODS 含两种新方法且全集 PICKER_METHODS 未改（下游 choices 不漂）",
+            "axial" in _M2 and "device90" in _M2
+            and tuple(_PM2) == ("joint", "chain", "chain_dual")))
+
+        _gsrc = (Path(__file__).resolve().parent.parent
+                 / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
+        _gtree = _ast2.parse(_gsrc)
+        _start_fn = next((n for n in _ast2.walk(_gtree)
+                          if isinstance(n, _ast2.FunctionDef)
+                          and n.name == "_start_calibrate"), None)
+        _steps_fn = next((n for n in _ast2.walk(_gtree)
+                          if isinstance(n, _ast2.FunctionDef)
+                          and n.name == "_chain_steps"), None)
+        _start_src = _ast2.get_source_segment(_gsrc, _start_fn) if _start_fn else ""
+
+        _ax_branches = [_ast2.get_source_segment(_gsrc, n) or ""
+                        for n in _ast2.walk(_start_fn)
+                        if isinstance(n, _ast2.If) and isinstance(n.test, _ast2.Compare)
+                        and isinstance(n.test.left, _ast2.Name)
+                        and n.test.left.id == "method"]
+        _d90_start = next((s for s in _ax_branches
+                           if 'method == "device90"' in s), "")
+        checks.append((
+            "新标定⑧ _start_calibrate 有 axial / device90 两条分派分支",
+            any('method == "axial"' in s for s in _ax_branches)
+            and bool(_d90_start)))
+        checks.append((
+            "新标定⑨ device90 分派不引用 ③④ 目录（ref_pair / pair）",
+            bool(_d90_start)
+            and "ref_pair" not in _d90_start
+            and "d90[\"pair\"]" not in _d90_start))
+        checks.append((
+            "新标定⑩ device90 分派调用了 calibrate_device90_args",
+            "calibrate_device90_args" in _d90_start))
+        checks.append((
+            "新标定⑪ _chain_steps 有 device90 两步分支（不会走单板三步）",
+            _steps_fn is not None
+            and 'method_key() == "device90"' in _ast2.get_source_segment(_gsrc, _steps_fn)))
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"新标定判据组整体异常（{exc}）", False))
+
+    try:
+        _run()
+    except Exception as exc:                                # noqa: BLE001
+        checks.append((f"8l 判据组整体异常（{exc}）", False))
+    return checks
+
+
+def main() -> int:
+    """把跨进程账本指到临时目录再跑主体（try/finally 覆盖早退与异常）。
+
+    本测试会真起 DataManager 的导出/查看器任务，它们走
+    ``apps._task_registry.register_start/end``，写的是模块全局
+    ``REGISTRY_PATH``。不注入的话，隐私测试的假文件名
+    ``zz_privacy_positive.zip`` 会被写进真实 ``logs/tasks/_registry.jsonl``。
+
+    两条注入缺一不可：**环境变量**给子进程（新解释器 import 时读到
+    ``SPHERE_TASK_REGISTRY``），**模块常量**给已 import 的本进程调用方。
+    临时目录随 with 退出自动清理，两者都在 finally 里还原；即使判据中途
+    抛异常也不会把测试残留留在真实运行账本里。
+    """
+    import os
+
+    import apps._task_registry as _reg
+
+    with tempfile.TemporaryDirectory(prefix="launcher_params_registry_") as td:
+        path = Path(td) / "_registry.jsonl"
+        real = _reg.REGISTRY_PATH
+        old_env = os.environ.get("SPHERE_TASK_REGISTRY")
+        _reg.REGISTRY_PATH = path
+        os.environ["SPHERE_TASK_REGISTRY"] = str(path)
+        try:
+            return _main_impl()
+        finally:
+            _reg.REGISTRY_PATH = real
+            if old_env is None:
+                os.environ.pop("SPHERE_TASK_REGISTRY", None)
+            else:
+                os.environ["SPHERE_TASK_REGISTRY"] = old_env
+            n = 0
+            if path.exists():
+                try:
+                    n = len(path.read_text(encoding="utf-8",
+                                           errors="replace").splitlines())
+                except OSError:
+                    pass
+            print(f"[账本隔离] 临时账本 {path.name} 共 {n} 行（真实 logs 未写入）")
 
 
 if __name__ == "__main__":

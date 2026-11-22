@@ -27,6 +27,11 @@
 - `exhaustive=True` + 默认 → 也不回退（**这是相对旧代码的行为变更**，
   所以下面第 2 节把它单独钉住）。
 
+第 2 节用**桩**把 SB 分支钉成确定性失败（经典分支仍是真的），测的是
+`allow_classic_fallback` 这个**开关语义**，不是"某张图 SB 检不检得出"。
+原来的做法是拿一张高斯模糊图当"SB 必然失败"的样本，SB 变强之后那张图
+`found=True detector='sb'`，判据前提消失 —— 那属于判据过时，不是产品回归。
+
 **3. 一对之内禁止混用。** 两道守卫：粗检后一道、精确复核后一道。
 用替身（stub）真造出"左 SB / 右经典"的场景，断言该帧被拒、且原因里
 **同时含"出身/检测器"字样与是哪一路**。
@@ -65,6 +70,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np
 
+from calib import board as board_module
 from calib import capture as cap_module
 from calib.board import BoardObservation, BoardSpec, detect_board, detect_board_in_roi
 from calib.capture import AutoPairCollector, CaptureConfig
@@ -119,30 +125,92 @@ def test_provenance_is_recorded() -> bool:
     return all(ok for _n, ok in checks)
 
 
+class SbBlindCv2:
+    """`calib.board` 用的 cv2 代理：**只把 SB 钉成必然失败**，经典保持真实现。
+
+    为什么需要它：本节的被测对象是 `allow_classic_fallback` 这个**开关**，
+    可它只有在"SB 找不到"时才可观察。原来靠一张高斯模糊图制造这个前提，
+    SB 检测器变强之后那张图 `found=True detector='sb'`，前提消失，
+    两条判据就必然红 —— 那是**判据依赖了某张图的检测结果**，不是产品回归。
+    改成桩之后，"SB 必然失败"是**由本测试保证**的确定性前提，
+    于是"默认不回退 / 显式允许才回退"永远可复现。
+
+    经典分支不桩：仍然真调 `cv2.findChessboardCorners` 去检真渲染的棋盘，
+    所以 `detector='classic'` 与角点数都是真跑出来的，不是编的。
+    """
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.sb_calls = 0
+        self.classic_calls = 0
+
+    def __getattr__(self, name):          # 其余接口（cvtColor/resize/cornerSubPix…）直通
+        return getattr(self._real, name)
+
+    def findChessboardCornersSB(self, *a, **kw):
+        self.sb_calls += 1
+        return False, None                # 确定性"SB 找不到"
+
+    def findChessboardCorners(self, *a, **kw):
+        self.classic_calls += 1
+        return self._real.findChessboardCorners(*a, **kw)
+
+
 def test_fallback_is_explicit() -> bool:
-    """第 2 节：不回退是默认；`exhaustive=False` 永远不回退。"""
+    """第 2 节：不回退是默认；`exhaustive=False` 永远不回退。
+
+    ⚠️ 判据不再依赖"这张图 SB 检不检得出"（那是 SB 的实现细节，会变强 /
+    会随 OpenCV 版本漂）。改成：桩让 SB 必然失败 → 观察**经典分支被调用了几次**。
+    "没回退"的硬证据是 `classic_calls == 0`，比看 `detector` 更直接。
+    """
     print("----- 2. 回退必须显式（默认不许自作主张） -----")
     img = render_board()
 
-    # 用一张"SB 找不到、经典能找到"的强模糊图来区分两条路 —— 实测 k=15 就是这个分界
-    import cv2
-    blurred = cv2.GaussianBlur(img, (15, 15), 0)
-    sb_alone = detect_board(blurred, SPEC, exhaustive=True)
-    with_fb = detect_board(blurred, SPEC, exhaustive=True, allow_classic_fallback=True)
-    coarse = detect_board(blurred, SPEC, work_width=640, exhaustive=False,
-                          allow_classic_fallback=True)
+    real_cv2 = board_module.cv2
+    stub = SbBlindCv2(real_cv2)
+    board_module.cv2 = stub
 
-    print(f"  强模糊图 SB-alone（默认）      -> found={sb_alone.found} detector={sb_alone.detector!r}")
-    print(f"  强模糊图 + 允许回退            -> found={with_fb.found} detector={with_fb.detector!r}")
-    print(f"  强模糊图 粗检(exhaustive=False)-> found={coarse.found} detector={coarse.detector!r}")
+    def run(**kw) -> tuple[BoardObservation, int, int]:
+        before = (stub.sb_calls, stub.classic_calls)
+        obs = detect_board(img, SPEC, **kw)
+        return obs, stub.sb_calls - before[0], stub.classic_calls - before[1]
+
+    try:
+        # 默认（allow_classic_fallback=False）：SB 找不到就认找不到
+        sb_alone, sb_n, cl_n = run(exhaustive=True)
+        # 显式允许：经典把它救回来
+        with_fb, _sb_n2, cl_n2 = run(exhaustive=True, allow_classic_fallback=True)
+        # 粗检路径：即使允许也不许回退（exhaustive=False 是硬闸门）
+        coarse, _sb_n3, cl_n3 = run(work_width=640, exhaustive=False,
+                                   allow_classic_fallback=True)
+        note = sb_alone.note
+    finally:
+        board_module.cv2 = real_cv2
+
+    print(f"  桩让 SB 必然失败；SB 被调用 {sb_n} 次")
+    print(f"  默认            -> found={sb_alone.found} detector={sb_alone.detector!r}"
+          f" note={note!r} 经典被调用 {cl_n} 次")
+    print(f"  显式允许回退    -> found={with_fb.found} detector={with_fb.detector!r}"
+          f" 角点 {0 if with_fb.corners is None else with_fb.corners.reshape(-1, 2).shape[0]} 个"
+          f" 经典被调用 {cl_n2} 次")
+    print(f"  粗检+允许回退   -> found={coarse.found} detector={coarse.detector!r}"
+          f" 经典被调用 {cl_n3} 次")
 
     checks = [
-        ("默认**不回退**：SB 找不到就认找不到（相对旧行为的一次刻意变更）",
+        ("桩确实生效：SB 分支被调用过（不是「根本没跑」）", sb_n >= 1),
+        ("默认**不回退**：经典分支一次都没被调用（硬证据，不靠 note 措辞）",
+         cl_n == 0),
+        ("默认 SB 找不到就认找不到：found=False 且 detector=''",
          not sb_alone.found and sb_alone.detector == ""),
-        ("显式允许后，经典能把它救回来（说明回退本身是有用的）",
-         with_fb.found and with_fb.detector == "classic"),
+        ("默认的诊断说清「没找到棋盘」（不是空着让人猜）",
+         "未检测到" in note),
+        ("显式允许后，经典被**恰好**调用一次并把板救回来（说明回退本身是有用的）",
+         cl_n2 == 1 and with_fb.found and with_fb.detector == "classic"),
+        ("救回来的角点数正确（真经典检出的，不是桩编的）",
+         with_fb.corners is not None
+         and with_fb.corners.reshape(-1, 2).shape[0] == SPEC.n_points),
         ("**粗检路径即使允许也不回退**（exhaustive=False 是硬闸门）",
-         (not coarse.found) or coarse.detector == "sb"),
+         cl_n3 == 0 and not coarse.found),
     ]
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")

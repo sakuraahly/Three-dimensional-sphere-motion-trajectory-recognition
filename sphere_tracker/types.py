@@ -140,3 +140,7 @@ class FrameResult:
     camera_motion: Any = None     # camera_motion.MotionEstimate
     camera_moving: bool = False   # 本帧相机是否在动（幅值超过阈值）
     camera_steady: bool = False   # 相机是否在"匀速"移动（匀速不破坏像素重力约束）
+    # 检测器本帧的诊断（**0 检出时**才有内容）：预设不匹配、掩膜把背景吃进来、
+    # 球太小/出画…… 由检测器写 `last_error`，pipeline 原样带出来。
+    # 存在的理由：这些失败以前是**静默**的（0 候选 + 屏幕上什么都不说）。
+    detector_note: str = ""

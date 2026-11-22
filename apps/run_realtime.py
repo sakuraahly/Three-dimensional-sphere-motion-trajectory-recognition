@@ -92,8 +92,10 @@ def parse_args() -> argparse.Namespace:
                    help=f"采集宽度（默认档 {video_profiles.DEFAULT.label}）")
     p.add_argument("--height", type=int, default=video_profiles.DEFAULT.height,
                    help=f"采集高度（默认档 {video_profiles.DEFAULT.label}）")
-    p.add_argument("--fps", type=int, default=video_profiles.DEFAULT_FPS,
-                   help=f"相机采集帧率（默认 {video_profiles.DEFAULT_FPS}）。"
+    p.add_argument("--fps", type=video_profiles.fps_type,
+                   default=video_profiles.DEFAULT_FPS,
+                   help=f"相机采集帧率（默认 {video_profiles.DEFAULT_FPS}，"
+                        "可填小数，如 29.97）。"
                         "1440p 全尺寸写盘约 24fps；"
                         "FOV 对齐后写盘 1718x972 时 30fps 实测稳定")
     # 八个流水线参数与 `run_video.py` **同源**（`apps/_common.py`）：

@@ -4,7 +4,7 @@
 ----------------
 `docs/计划书.md` 的验收口径是"一条命令跑起完整系统（双路采集 → 三维 → 预测 → 可视化）"。
 **采集本身不能被编排**（要人摆球、要相机在位），所以这条命令覆盖的是**采集之后**那一段；
-采集仍由 `启动程序.bat run` / GUI 第 0 步负责。
+采集仍由 `run.bat run` / GUI 第 0 步负责。
 
 它只做"调用 + 判读"，**不复制任何算法**：
 
@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -54,15 +55,14 @@ from sphere_tracker.plugins import default as default_method          # noqa: E4
 from sphere_tracker.plugins import describe, names as method_names    # noqa: E402
 
 STEPS = ("check", "tri", "export")
-CALIB_LABEL = "config/stereo_calibration.json"
 TRAJ_LABEL = "derived/traj3d.csv"
 
 # 每步失败后的"下一步" —— 必须指到**具体入口**，不要只说"检查一下"
 NEXT_STEP = {
     "check": "按上面日志的 [错误]/[警告] 逐条修（--strict 下警告也算不通过）："
              "未同步 sync.method=none 要重录闪光或用 --sync-offset；"
-             "缺 session.json 只能重录（启动程序.bat run）；缺标定先跑 启动程序.bat calibrate。",
-    "tri": "先跑 启动程序.bat 的『相机检查』（启动程序.bat check）确认两台相机都能出图；"
+             "缺 session.json 只能重录（run.bat run）；缺标定先跑 run.bat calibrate。",
+    "tri": "先跑 run.bat 的『相机检查』（run.bat check）确认两台相机都能出图；"
            "再按上面日志换 --detector（高光球用 specular/hough）或在 GUI 第②步点选球心。",
     "export": f"先确认 {TRAJ_LABEL} 里 matched 行不为 0；没有就先重跑 tri"
               "（python apps/run_stereo_video.py <会话>）。",
@@ -75,11 +75,123 @@ METRIC_PREFIX = {
     "export": ("轨迹 JSON：", "可视化 JSON："),
 }
 
+# 质量差但返回码 0 时，apps/run_stereo_video.py 会在 stdout 打一行固定标记：
+#   [质量] verdict=<verdict> ... 结果仅供参考（详见 traj3d.json["quality"]）
+# 这里唯一实现「从输出里认出质量状态」：ConsoleWindow / 旧 Launcher 任务表 /
+# run_all 自己的步骤结论都调它，避免「同一件事 N 份实现」。只认固定前缀
+# [质量] 与键 verdict=，其余一律忽略；认不出来就当没有标记 —— 一行脏输出
+# （ANSI 色码 / 编码噪声）绝不能把状态表或整条链路搞崩。
+_QUALITY_MARK = "[质量]"
+_QUALITY_LABELS = {
+    "detection_quality": "（检出质量差，仅供参考）",
+    "geometry_mismatch": "（几何不一致，仅供参考）",
+    "zero_match": "（0 匹配，仅供参考）",
+    # 单目链 apps/run_video.py 的 0 检出降级也走同一 [质量] 标记格式。
+    "zero_hit": "（0 检出，仅供参考）",
+}
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def quality_verdict(text: str) -> str:
+    """从一段输出里取最后一条非 ok 的 ``verdict``；没有/认不出返回空串。"""
+    try:
+        verdict = ""
+        for raw in text.splitlines():
+            line = _ANSI_RE.sub("", raw)
+            if _QUALITY_MARK not in line:
+                continue
+            m = re.search(r"verdict\s*=\s*([A-Za-z_][A-Za-z0-9_]*)", line)
+            if m and m.group(1) != "ok":
+                verdict = m.group(1)
+        return verdict
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+
+def quality_note(text: str) -> str:
+    """给状态栏/结论用的中文后缀（人话）；没有质量标记返回空串。"""
+    verdict = quality_verdict(text)
+    if not verdict:
+        return ""
+    return _QUALITY_LABELS.get(verdict, "（质量差，仅供参考）")
+
+
+def quality_note_of_task(task) -> str:
+    """从任务对象取质量后缀：优先完整日志（log_path），退回内存尾行（tail）。
+
+    只按属性名 duck-typing，不依赖具体 Task 类（新界面 _task_runner.Task、
+    旧 Launcher 的 gui_main.Task 都有 log_path）。结果缓存在任务上，避免任务表
+    每 200ms 重画时反复读同一份日志。
+    """
+    cached = getattr(task, "_quality_note", None)
+    if cached is not None:
+        return cached
+    note = ""
+    try:
+        lp = getattr(task, "log_path", None)
+        if lp is not None:
+            note = quality_note(Path(lp).read_text(encoding="utf-8", errors="replace"))
+    except Exception:                                        # noqa: BLE001
+        note = ""
+    if not note:
+        try:
+            tail = getattr(task, "tail", None) or []
+            note = quality_note("\n".join(str(x) for x in tail))
+        except Exception:                                    # noqa: BLE001
+            note = ""
+    try:
+        task._quality_note = note
+    except Exception:                                        # noqa: BLE001
+        pass
+    return note
+
+
+def _calib_label() -> str:
+    """给用户看的标定文件名 —— **当前装置档案**那一份，不再是写死的顶层名。
+
+    2026-11-10 用户裁决：CLI / GUI / 工具链一律按当前运行档案判定。以前这里
+    写死 ``config/stereo_calibration.json``，用户切到「平行装置」档案后标定
+    落在 ``config/calib/<档案名>.npz``，提示却指着一个根本不存在的顶层文件，
+    照着提示去找必然扑空。
+
+    项目内的路径显示成相对仓库根（和 ``_display`` 同一读法），项目外原样给绝对
+    路径 —— 两种都能直接粘回终端。返回的是**无扩展名基名**：提示里紧接着就写
+    「.npz/.json 都不在」，再带一个 ``.json`` 会让人以为只缺 json。
+
+    读档案本身失败时不抛：这是**提示文案**，不该让一条 message 把流程打断；
+    但也不许编一个路径（编出来的可能正是别套装置的顶层文件），只明说读不到。
+    """
+    try:
+        from apps._common import current_calibration
+
+        base, _why = current_calibration(need_existing=False)
+    except Exception as exc:                            # noqa: BLE001
+        return f"（读不到当前装置档案，无法确定标定路径：{exc}）"
+    try:
+        return Path(base).relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(base)
+
 
 def _default_calib_files(root: Path = ROOT) -> list[Path]:
-    """标定存在 = `.json` 或 `.npz` 任一在位（两者由同一次标定一起落盘）。"""
-    return [p for p in ((root / "config" / "stereo_calibration.json"),
-                        (root / "config" / "stereo_calibration.npz")) if p.exists()]
+    """当前装置档案名下的标定文件：`.json` / `.npz` 任一在位即算有（同一次标定一起落盘）。
+
+    解析口径统一走 ``apps._common.current_calibration``（唯一实现）。
+
+    ⚠️ ``root`` 参数保留（测试与调用方会传临时目录），但 ``current_calibration``
+    内部用的是 ``stereo.profiles.ROOT`` —— 两者不同时**不能**拿档案路径冒充
+    ``root`` 下的文件，否则 ``plan_steps(root=tmp)`` 会读到真实仓库的标定。
+    所以只有 ``root == ROOT`` 才按档案解析，否则退回按 ``root`` 拼（参数语义不变）。
+    """
+    root = Path(root)
+    if root.resolve() != ROOT.resolve():
+        return [p for p in ((root / "config" / "stereo_calibration.json"),
+                            (root / "config" / "stereo_calibration.npz")) if p.exists()]
+
+    from apps._common import current_calibration
+
+    base, _why = current_calibration(need_existing=False)
+    return [p for p in (base.with_suffix(".json"), base.with_suffix(".npz")) if p.exists()]
 
 
 def _read_session(path: Path) -> tuple[dict | None, str]:
@@ -160,7 +272,7 @@ def plan_steps(
             if not calib:
                 out.append(_blocked(
                     "check",
-                    f"缺标定文件 {CALIB_LABEL}（.npz/.json 都不在）—— 先跑 启动程序.bat calibrate",
+                    f"缺标定文件 {_calib_label()}（.npz/.json 都不在）—— 先跑 run.bat calibrate",
                     explicit))
                 continue
             out.append(_pending("check", [
@@ -261,14 +373,20 @@ def _run(cmd: list[str], *, echo, metric_prefix: tuple[str, ...]) -> tuple[int, 
         text=True, encoding="utf-8", errors="replace", env=env)
     tail: deque = deque(maxlen=20)
     metrics: list[str] = []
+    quality_lines: list[str] = []
     assert proc.stdout is not None
     for raw in proc.stdout:
         line = raw.rstrip("\r\n")
         echo("  " + line)
         tail.append(line)
+        if _QUALITY_MARK in line and "verdict=" in line:
+            quality_lines.append(line)
         stripped = line.strip()
         if stripped.startswith(metric_prefix):
             metrics.append(stripped)
+    # 质量标记行可能早于收尾的一长串诊断输出，被 maxlen=20 挤出 tail；
+    # 兜底追加一份，保证 main 一定能从 tail 里认出质量状态。
+    tail.extend(quality_lines)
     return proc.wait(), tail, metrics
 
 
@@ -345,10 +463,18 @@ def main(argv: list[str] | None = None) -> int:
                                    metric_prefix=METRIC_PREFIX[step["name"]])
         step["seconds"] = round(time.perf_counter() - started, 2)
         if code == 0:
-            step["status"] = "ok"
+            # 质量差也返回 0、也照常出结果；这里只给 tri 步补一个状态，
+            # **不改退出码语义**（下面的 failed/skipped 与 {"ok": exit_code == 0}
+            # 一字不动）——「只有错误才是紧急的」。
+            qv = quality_verdict("\n".join(tail)) if step["name"] == "tri" else ""
+            step["status"] = "ok_with_warning" if qv else "ok"
+            if qv:
+                step["quality"] = qv
             step["reason"] = " | ".join(_brief(m) for m in metrics) if metrics else ""
             say(f"  [ok] {step['seconds']:.1f}s"
-                + (f"  {step['reason']}" if step["reason"] else ""))
+                + (f"  {step['reason']}" if step["reason"] else "")
+                + (f'  [质量] {qv}：结果仅供参考（详见 traj3d.json["quality"]）'
+                   if qv else ""))
         else:
             step["status"] = "failed"
             step["reason"] = f"退出码 {code}"
@@ -374,7 +500,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         say("[结论] 以上是**将要执行**的命令，没有真的跑。")
     elif exit_code == 0:
-        say(f"[结论] {len(plan)} 步全部通过。")
+        warned = [s for s in plan if s["status"] == "ok_with_warning"]
+        say(f"[结论] {len(plan)} 步全部通过。"
+            + (f"（其中 {len(warned)} 步有质量提示，结果仅供参考，"
+               '详见各步 traj3d.json["quality"]）' if warned else ""))
     elif exit_code == 3:
         say(f"[结论] 已跑的都没失败，但 {len(skipped)} 步被跳过："
             f"{'、'.join(s['name'] for s in skipped)}。"

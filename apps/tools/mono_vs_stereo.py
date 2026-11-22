@@ -73,7 +73,7 @@ from calib.params import load_stereo_rig  # noqa: E402
 from sphere_tracker.config import AppConfig  # noqa: E402
 from sphere_tracker.detectors import build_detector  # noqa: E402
 from sphere_tracker.geometry import CameraModel, refine_circle_subpixel  # noqa: E402
-from stereo.sessions import load_session  # noqa: E402
+from stereo.sessions import load_session, session_calibration_file, SessionError  # noqa: E402
 from stereo.visualization import load_seeds  # noqa: E402
 
 #: 单目检测里"半径单帧跳变"的容忍度。球在 30 fps 下逐帧半径变化 <1%，
@@ -139,10 +139,13 @@ def _load_intrinsics(session_dir: Path, mono_path: Path | None,
                 f"{calib.views} 视角）",
             )
 
-    npz = session_dir / "calib" / "stereo_calibration.npz"
+    try:
+        npz = session_calibration_file(session_dir)
+    except SessionError as exc:
+        raise SystemExit(f"[错误] 会话标定路径解析失败：{exc}") from exc
     if not npz.exists():
         raise SystemExit(f"[错误] 既没有单目标定（{mono_path}），"
-                         f"会话里也没有 {npz}，无法确定焦距")
+                         f"会话标定文件也不存在（{npz}），无法确定焦距")
     rig = load_stereo_rig(npz)
     d = np.asarray(rig.D1, np.float64).ravel()
     return Intrinsics(
@@ -337,7 +340,15 @@ def main(argv: list[str] | None = None) -> int:
         seeds = load_seeds(seed_path)
 
     intr = _load_intrinsics(session_dir, Path(args.mono_calib), args.focal)
-    rig = load_stereo_rig(session_dir / "calib" / "stereo_calibration.npz")
+    try:
+        calib_file = session_calibration_file(session_dir)
+    except SessionError as exc:
+        print(f"[错误] 会话标定路径解析失败：{exc}")
+        return 1
+    if not calib_file.is_file():
+        print(f"[错误] 会话标定文件不存在：{calib_file}")
+        return 1
+    rig = load_stereo_rig(calib_file)
 
     print("=" * 78)
     print("单目 vs 双目  深度对照")

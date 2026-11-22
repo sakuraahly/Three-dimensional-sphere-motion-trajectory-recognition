@@ -20,6 +20,12 @@
 3. **点完必须判"有没有反馈"**。用户最不能接受的不是报错，是点了什么都不发生。
    每次点击前记下状态条文案与任务表长度，点完比对：既没起任务、也没弹窗、
    也没改状态条 —— 记成"静默无反馈"，这是本工具存在的主要理由。
+4. **一扇窗只量自己的控件**。控件清单**不穿过 Toplevel**：Tk 里子窗口的路径挂在
+   父控件下面（会话选择器是 ``.hub.bench.picker``），把它算进 bench 的话，坐标
+   基准不同 —— 会同时**制造假缺陷**（bench 假 ``clipped=2``）和**掩盖真溢出**
+   （门厅报 1152，其实是工具台自己的滚动页）。"屏幕上有几扇窗"是另一个问题，
+   用 :func:`_windows`；这两件事 2026-11-07 混过一次，报告里两扇窗报同一个数字
+   就是当时的线索。
 
 用法::
 
@@ -73,7 +79,8 @@ EXTERNAL_SAFE = {
     "apps/view_3d.py": "3D 轨迹",
 }
 
-#: 这些脚本**绝不**真跑：会开相机 / 写 data/ / 起经典界面。
+#: 这些脚本**绝不**真跑：会开相机 / 写 data/（经典界面已废止，不再是入口；
+#: `apps/gui_main.py` 仍在表里，因为它无参数启动的是新 GUI，同样会开窗）。
 #: 名字在这里出现一次，是为了让"为什么不跑"有据可查，而不是漏写。
 NEVER_SPAWN = {
     "apps/record_mono.py", "apps/record_stereo.py",
@@ -81,7 +88,7 @@ NEVER_SPAWN = {
     "apps/tools/capture_board.py", "apps/tools/cameras.py",
     "apps/tools/calibrate_focal.py",
     "apps/run_video.py", "apps/run_stereo_video.py", "apps/run_realtime.py",
-    "启动程序.py",
+    "apps/gui_main.py",
 }
 
 SEVERITY_ORDER = {"崩溃/卡死": 0, "静默无反馈": 1, "文案误导": 2, "裁切/错位": 3, "观感": 4}
@@ -107,6 +114,10 @@ class Step:
     clipped: list[str] = field(default_factory=list)     # 被窗口边缘切掉的控件
     overflow_px: int = 0             # 滚动页内容比视口高多少（>0 = 要滚才看得全）
     overflow_w_px: int = 0           # 横向溢出
+    #: 非空 = 这一步**按设计**就该滚（理由写在这里）。空 = 首屏必须一屏看全。
+    overflow_exempt: str = ""
+    #: 豁免后实测的 ``yview`` 终点：1.0 = 真能滚到末尾；-1 = 没测（或被豁免却没滚动页）
+    scroll_reach: float = -1.0
     status: str = ""                 # 状态条文案（用户唯一能看到的反馈）
     status_before: str = ""          # 点击前的状态条（"前后对照"是这条工具的硬产出）
     task_cmd: list[str] = field(default_factory=list)   # 真的跑了的那条 argv
@@ -345,7 +356,7 @@ class Walker:
                     "expect": []}
         if script in ("record_mono.py", "capture_board.py", "cameras.py",
                       "calibrate_focal.py", "run_stereo_video.py",
-                      "export_visualization.py", "启动程序.py"):
+                      "export_visualization.py", "apps/gui_main.py"):
             return {"mode": "skip", "run": [],
                     "why": "会开相机 / 写 data/ / 起另一个界面 —— 需硬件或会动数据，未验证",
                     "expect": []}
@@ -451,14 +462,14 @@ class Walker:
     # ------------------------------------------------------------------ #
     # 控件盘点 / 裁切
     # ------------------------------------------------------------------ #
-    def _overflow(self, win) -> tuple[int, int]:
-        """滚动页的内容比视口高出/宽出多少（>0 表示"要滚才看得全"）。
+    def _scroll_pages(self, win) -> list[tuple[object, int, int]]:
+        """这扇窗里的滚动页：``(页面, 纵向溢出, 横向溢出)``。
 
         认 ``ScrollPage`` 靠鸭子类型（它同时有 ``_canvas`` 与 ``content``）：
         它的 Tk 类名是 ``TFrame``，按类名字符串去认会认成普通 Frame 而漏掉 ——
         第一版就是这么漏的，报告里于是出现"没有裁切"的假结论。
         """
-        best = (0, 0)
+        out: list[tuple[object, int, int]] = []
         for w in _descendants(win):
             canvas = getattr(w, "_canvas", None)
             content = getattr(w, "content", None)
@@ -469,12 +480,55 @@ class Walker:
                 dx = content.winfo_reqwidth() - canvas.winfo_width()
             except tk.TclError:
                 continue
+            out.append((w, dy, dx))
+        return out
+
+    def _overflow(self, win) -> tuple[int, int]:
+        """滚动页的内容比视口高出/宽出多少（>0 表示"要滚才看得全"）。"""
+        best = (0, 0)
+        for _w, dy, dx in self._scroll_pages(win):
             best = (max(best[0], dy), max(best[1], dx))
         return best
 
+    def _scroll_reach(self, win) -> float:
+        """把每页都滚到底，回报**最差**那个 ``yview()`` 终点：1.0 = 真能滚到末尾。
+
+        为什么要这一下：``overflow_exempt``（"这扇窗按设计就是滚动页"）如果
+        只凭人写一句话就算数，那它就是个空白支票 —— 哪天 ScrollPage 的
+        ``scrollregion`` 没更新（内容加长了、``<Configure>`` 没绑上），
+        "能滚"会变成"滚到底还差一截"而没人发现：用户看到的最后一截是死区。
+        量完把位置还原，免得后面几步的截图全停在中段。
+
+        取**最小**而不是"最大那页"：一扇窗里有两页时（一长一短），只量长的那页
+        会漏掉"短页滚不到底"，而那同样是死区。
+        """
+        pages = self._scroll_pages(win)
+        if not pages:
+            return -1.0
+        worst = 1.0
+        for page, _dy, _dx in pages:
+            canvas = getattr(page, "_canvas", None)
+            try:
+                before = canvas.yview()
+                canvas.yview_moveto(1.0)
+                self._settle(0.08)
+                _lo, hi = canvas.yview()
+                canvas.yview_moveto(before[0])
+                self._settle(0.08)
+            except tk.TclError:
+                return -1.0
+            worst = min(worst, float(hi))
+        return worst
+
     def record(self, win, window: str, title: str, *, action: str = "观察",
-               extra_notes: list[str] | None = None) -> Step:
-        """拍一张、盘一次控件、算一次裁切，落成一步。"""
+               extra_notes: list[str] | None = None,
+               overflow_exempt: str = "") -> Step:
+        """拍一张、盘一次控件、算一次裁切，落成一步。
+
+        ``overflow_exempt`` 非空 = **这扇窗按设计就是滚动页**，理由写在值里
+        （例：工具台六张独立的卡）。这不是"放过它"：同时会量它到底能不能
+        滚到末尾，量不到就在报告里记一条真缺陷 —— 见 ``_scroll_reach``。
+        """
         self._settle(0.2)
         if not _alive(win):                            # 窗口已被关：退到门厅，别抛
             win = self._app.hub
@@ -484,6 +538,22 @@ class Walker:
         widgets = _inventory(win)
         clipped = _clipped(win, widgets)
         ov, ovw = self._overflow(win)
+        reach = -1.0
+        # 豁免一写就得取证，**不跟 ov 绑在一起**：`ov` 本身就是"滚动页溢出量"，
+        # 窗口里压根没有 ScrollPage 时它必然是 0 —— 若把取证塞进 `ov > 20` 里，
+        # 「没有滚动容器」这个分支就永远进不去，"自称滚动页"变成一句无法证伪的话。
+        # 反过来，真有滚动页但内容装得下时 `yview()` 自然是 (0, 1)，判据不会误伤。
+        if overflow_exempt:
+            reach = self._scroll_reach(win)
+            if reach < 0.999:
+                self.add_defect(
+                    severity="裁切/错位", where=f"{window} · {title}",
+                    what=("自称是滚动页，但滚到底还有一截看不见"
+                          f"（yview 终点 {reach:.2f} < 1.00）—— 最后一屏是死区"
+                          if reach >= 0 else
+                          "自称是滚动页，但窗口里根本没有滚动容器（ScrollPage）"),
+                    how="打开这扇窗，把滚动条拖到最底",
+                    evidence=f"内容比视口高 {ov} px，yview 终点 {reach:.2f}")
         st = _status_text(win)
         step = Step(seq=self._seq, window=window, title=title, action=action,
                     shot=shot, shot_mode=mode,
@@ -492,6 +562,7 @@ class Walker:
                     n_buttons=sum(1 for w in widgets if w["role"] == "button"),
                     widgets=widgets, clipped=clipped,
                     overflow_px=max(0, ov), overflow_w_px=max(0, ovw),
+                    overflow_exempt=overflow_exempt, scroll_reach=reach,
                     status=st, notes=list(extra_notes or []))
         self.steps.append(step)
         if self.limit and self._seq >= self.limit:
@@ -644,13 +715,61 @@ class Walker:
             step.notes.append("输入后状态条没变（若界面有解释就靠页面文案）")
         return step
 
+    def _camera_dialog(self, window: str) -> None:
+        """「换相机…」现在开的是 GUI 内对话框，走完要拍一张并关掉。
+
+        以前那个按钮只起一个控制台子进程，走查里点完就没事了；换成 Tk
+        对话框之后如果留着不关，后面每一步的"屏幕上有几扇窗"都会多一扇，
+        `_ui_signature` 会把别人的窗口算进来（这是上一轮刚修过的同型坑）。
+        """
+        dlg = _find_toplevel(self._app, "相机管理")
+        if dlg is None:
+            self.add_defect(
+                severity="静默无反馈", where=f"{window} · 换相机…",
+                what="点了「换相机…」却没有出现相机管理对话框",
+                how="打开这扇窗，点①里的「换相机…」",
+                evidence="窗口树里找不到标题含「相机管理」的 Toplevel")
+            return
+        self.record(dlg, window, "相机管理对话框（设备列表 + 预览）", action="观察")
+        # 2026-11-07 AGENTS.md §7.3：**真的点按钮**，不能只"观察"。
+        # 这一步就是当初漏掉的：Treeview 默认没选中行，点「预览这台」什么都不会
+        # 发生，而"观察一下"看不出来。点完要能看到预览卡片出现。
+        preview = _button_in(dlg, "预览这台")
+        if preview is None:
+            self.add_defect(
+                severity="静默无反馈", where=f"{window} · 相机管理",
+                what="相机管理里找不到「预览这台」按钮",
+                how="打开相机管理，检查按钮排",
+                evidence="按钮文字匹配不到")
+        else:
+            self.click(dlg, window, preview, "相机管理 · 点「预览这台」")
+            cards = len(getattr(dlg, "_previews", {}) or {})
+            if cards <= 0:
+                self.add_defect(
+                    severity="静默无反馈", where=f"{window} · 相机管理 · 预览这台",
+                    what="点了「预览这台」，却没有出现预览卡片（按钮没真正执行）",
+                    how="打开相机管理，直接点「预览这台」（不要先手动选行）",
+                    evidence="invoke 之后 dlg._previews 仍为空")
+            self.record(dlg, window, "相机管理 · 预览已启动", action="观察")
+            stop = _button_in(dlg, "停止全部预览")
+            if stop is not None:
+                self.click(dlg, window, stop, "相机管理 · 点「停止全部预览」")
+        try:
+            dlg._close()                 # 会同时停掉后台预览线程，不能只 destroy
+        except tk.TclError:
+            pass
+
     def toggle(self, win, window: str, section, label: str) -> Step:
         """展开/收起折叠区（双目第②步的「高级」）。"""
         section.header_button.invoke()
         self._settle(0.3)
         state = "展开" if section.expanded else "收起"
-        return self.record(win, window, f"折叠区「{label}」→ {state}",
-                           action="折叠")
+        return self.record(
+            win, window, f"折叠区「{label}」→ {state}", action="折叠",
+            # 展开这一屏**不是首屏**：用户自己按了「高级」要求多看几行，
+            # 多出来的高度本来就该由滚动页接住。收起那一屏照旧按首屏算。
+            overflow_exempt=("用户主动展开折叠区：这一屏不是首屏，"
+                             "多出来的行由滚动页接住" if section.expanded else ""))
 
     def add_defect(self, *, severity: str, where: str, what: str,
                    how: str, evidence: str) -> None:
@@ -671,7 +790,16 @@ class Walker:
         for key, card_title in (("parallel", "平行双目"), ("angled", "大角度双目")):
             card = _card(hub, card_title)
             btn = _button_in(card, "进入")
+            # 2026-11-08：门厅按**当前装置档案的模式**禁用不适用那张卡的「进入」。
+            # 禁用是设计、不是崩溃；走查要判的是"卡片有没有写清为什么不能点"，
+            # 而不是把"没开窗口"当成缺陷（之前 active=大角度档案时误报过）。
+            state = str(btn.state()) if btn is not None else ""
             self.click(hub, "hub", btn, f"{card_title} · 进入")
+            if "disabled" in state:
+                self.record(hub, "hub",
+                            f"{card_title} 按装置档案门控正确禁用（不是崩溃）",
+                            action="未点击：按钮禁用（设计如此）")
+                continue
             win = app._windows.get(f"stereo_{key}")
             if win is None:
                 self.add_defect(
@@ -699,12 +827,27 @@ class Walker:
         # 纯本地动作
         self.click(hub, "hub", _button_in(_card(hub, "工具"), "重新读取标定"),
                    "工具 · 重新读取标定")
-        # 过渡入口：先弹一句说明，再起经典界面 —— 两件事都必须发生
-        self.click(hub, "hub", _button_in(_card(hub, "工具"), "经典界面（过渡）"),
-                   "工具 · 经典界面（过渡）")
+        # 废止入口（2026-11-20）：按钮保留，点击**只弹一句说明**；
+        # 绝不能再起经典界面 —— 所以这里连任务都不该出现。
+        self.click(hub, "hub", _button_in(_card(hub, "工具"), "经典界面（已废止）"),
+                   "工具 · 经典界面（已废止）")
         # 工作台入口：门厅这条路径必须能进（另一条入口在双目第④步）
         self.click(hub, "hub", _button_in(_card(hub, "工具"), "会话工作台"),
                    "工具 · 会话工作台")
+        # 六条「跑一次、隔很久再跑」的离线流程（2026-11-07 补进界面）。
+        # **只点开、不点里面**：每张卡的主按钮都会起子进程（训练一条十几分钟），
+        # 真点会把走查变成"跑一遍全流程"。这里要判的是"入口可达 + 打开不炸"。
+        self.click(hub, "hub",
+                   _button_in(_card(hub, "工具"), "标定与训练", prefix=True),
+                   "工具 · 标定与训练（六条离线流程）")
+        dlg = getattr(hub, "_tools_window", None)
+        if dlg is not None and _alive(dlg):
+            dlg.deiconify()
+            dlg.lift()
+            self.record(dlg, "tools", "标定与训练工具台：六张卡 + 各自的主按钮",
+                        overflow_exempt="工具台按滚动页设计：六条互相独立的"
+                                        "离线流程各占一张卡，一屏装不下是刻意的")
+            dlg.destroy()
 
         # 控制台 / 工作台放到各自的段里走（它们是单例，先开过就会影响后面的判断）
         app.open_console()
@@ -744,7 +887,11 @@ class Walker:
         # "不开相机，所以是毫秒级"。而用户对这台机器的抱怨正是"相机打不开"——
         # 界面在这种情况下给的是"left = …，索引 0"，一个字的警告都没有。
         cams = str(win.lbl_cams.cget("text"))
-        if cams and "不在线" not in cams:
+        # 界面自己写了"未开相机验证 / 设备还没枚举到"就不算误导：它已经
+        # 明确区分了"身份对上"和"能出图"。只有**什么都不说**才记缺陷。
+        if (cams and "不在线" not in cams
+                and "未开相机验证" not in cams
+                and "设备还没枚举到" not in cams):
             self.add_defect(
                 severity="文案误导", where="mono · ① 相机",
                 what="「相机：…」这行只表示「角色/端口对得上」，不代表这台相机能开出图"
@@ -760,6 +907,7 @@ class Walker:
                    "① 标定内参")
         self.click(win, "mono", _button_in(_card(win, "① 标定内参"), "换相机…"),
                    "① 换相机…")
+        self._camera_dialog("mono")
         self.click(win, "mono", _button_in(_card(win, "① 标定内参"), "打开标定图文件夹"),
                    "① 打开标定图文件夹")
         self.click(win, "mono", _button_in(_card(win, "① 标定内参"),
@@ -792,9 +940,12 @@ class Walker:
         # ③ 先走"没有会话"的分支：这时点「开始识别」会弹文件选择框
         self._mono_offline_cancel(win)
 
-        # ③ 再走"历史会话"（只读），把一段真实会话选上
-        self.click(win, "mono", _button_in(_card(win, "③ 录制与识别"), "历史会话…"),
-                   "③ 历史会话…")
+        # ③ 再走"选历史会话"（只读），把一段真实会话选上。
+        # 注意：单目窗的按钮叫「选择…」；「历史会话…」是 2026-10-30 因按钮预算
+        # 被撤掉的旧入口（第③步现在只剩 5 个按钮）。走查器如果还找旧名字，
+        # 会记一条"点了没反应"——那是工具陈旧，不是界面缺陷。
+        self.click(win, "mono", _button_in(_card(win, "③ 录制与识别"), "选择…"),
+                   "③ 选择…（历史会话）")
         picker = _find_toplevel(app, "历史会话")
         if picker is not None:
             self.record(picker, "mono", "历史会话列表（单目）", action="观察")
@@ -811,13 +962,13 @@ class Walker:
                 self.add_defect(
                     severity="静默无反馈", where="mono · 历史会话",
                     what=f"列表里找不到已有的单目会话 {self.args.mono_session}",
-                    how="点「历史会话…」看列表",
+                    how="点「选择…」看列表",
                     evidence="列表为空或该会话被判成坏目录")
                 picker.destroy()
         else:
-            self.add_defect(severity="静默无反馈", where="mono · 历史会话…",
-                            what="点了「历史会话…」没有出现会话列表窗口",
-                            how="点击「③ 历史会话…」", evidence="没有找到新 Toplevel")
+            self.add_defect(severity="静默无反馈", where="mono · 选择…",
+                            what="点了「选择…」没有出现会话列表窗口",
+                            how="点击「③ 选择…」", evidence="没有找到新 Toplevel")
 
         # 会话选上之后再更新一次界面（③ 的摘要与「点选球心」「看 3D」的可用性）
         self.record(win, "mono", "选中会话后的第③步（摘要 / 按钮可用性）",
@@ -898,6 +1049,7 @@ class Walker:
                    "① 重新读取标定")
         self.click(win, name, _button_in(_card(win, "① 装置检查"), "换相机…"),
                    "① 换相机…")
+        self._camera_dialog(name)
 
         # ② 标定：高级折叠区展开 → 收起
         adv = _collapsible(win)
@@ -935,12 +1087,18 @@ class Walker:
                    "② 开始标定")
 
         # ③ 采集：平行窗标定就绪时它会真起录制，大角度窗会先被拦
-        step = self.click(win, name, _button_in(_card(win, "③ 采集"), "开始录制"),
-                         "③ 开始录制")
+        # 「开始录制」在标定不匹配时会把原因写进按钮文字
+        # （「开始录制（先解决标定）」），而且整颗按钮是 disabled 的。
+        # 精确相等会找不到它、让 step 变 None 后在下面崩掉 —— 那只是走查器的
+        # 假缺陷，不是产品缺陷。用前缀匹配找到它，click() 会按既有约定把
+        # disabled 按钮只记录、不点击。
+        step = self.click(win, name,
+                          _button_in(_card(win, "③ 采集"), "开始录制", prefix=True),
+                          "③ 开始录制")
         # 录到哪里，决定了第④步能不能看见它：会话列表只扫 stereo_roots()。
         # 这条判据不做成"看代码"，而是拿按钮实际生成的 --out 去比对扫描根 ——
         # 落点不在扫描范围里，就成了"录完找不着"（用户只会说"录了但列表里没有"）。
-        for task in step.tasks:
+        for task in (step.tasks if step is not None else []):
             cmd = task["cmd"]
             if "--out" in cmd:
                 out = Path(cmd[cmd.index("--out") + 1])
@@ -1025,7 +1183,7 @@ class Walker:
                      "双目第④步「历史会话…」两个入口都进不去",
                 how="门厅 > 工具 > 会话工作台（或双目第④步 历史会话…）",
                 evidence=_tb_brief(tb))
-            orphan = next((w for w in _descendants(app)
+            orphan = next((w for w in _windows(app)
                            if isinstance(w, tk.Toplevel) and w.winfo_exists()
                            and str(w.title()) in ("", "tk")), None)
             if orphan is not None:
@@ -1424,7 +1582,14 @@ class Walker:
             if s.clipped:
                 flags.append(f"{len(s.clipped)} 个越界")
             if s.overflow_px > 4:
-                flags.append(f"需滚 {s.overflow_px}px")
+                if s.overflow_exempt:
+                    # 豁免要**写在表里**：报告读者看到"需滚 1152px"才不会以为是漏项，
+                    # 后面那个数字是实测的 yview 终点（1.00 = 真能滚到末尾）。
+                    reach = (f"，滚到底 {s.scroll_reach:.2f}"
+                             if s.scroll_reach >= 0 else "")
+                    flags.append(f"需滚 {s.overflow_px}px（设计如此{reach}）")
+                else:
+                    flags.append(f"需滚 {s.overflow_px}px")
             if s.errors:
                 flags.append("异常")
             L.append(f"| {s.seq} | {s.size[0]}x{s.size[1]} | {s.n_widgets} "
@@ -1677,17 +1842,44 @@ def _alive(win) -> bool:
         return False
 
 
-def _descendants(root) -> list:
-    """按创建顺序的深度优先展开（顺序稳定，报告才好比对）。"""
+def _descendants(root, *, cross_toplevel: bool = False) -> list:
+    """按创建顺序的深度优先展开（顺序稳定，报告才好比对）。
+
+    **默认不穿过 Toplevel**：Tk 里子窗口的控件路径挂在父控件下面
+    （``.hub.bench.picker``），所以 ``winfo_children()`` 会把**另一扇窗**的
+    控件一起交出来。2026-11-07 的报告里「bench · 换会话… clipped=2」就是
+    这么来的：被"切掉"的其实是会话选择器里的卡片与表格 —— 它们的坐标是
+    相对选择器算的，挪进 bench 的坐标系自然越界。于是同一次走查夸了一条
+    单跑 bench 永远量不出来的假缺陷（夸的是走查工具自己）。
+
+    "这扇窗里有哪些控件"和"屏幕上有几扇窗"是两个问题：后者用
+    ``cross_toplevel=True``（``_windows``）。
+    """
     out, stack = [], [root]
     while stack:
         w = stack.pop(0)
         out.append(w)
         try:
-            stack[0:0] = list(w.winfo_children())
+            kids = list(w.winfo_children())
         except tk.TclError:
-            pass
+            kids = []
+        if not cross_toplevel:
+            # 用 isinstance，不是比类名：`tk.Toplevel(master, class_="Xxx")` 的
+            # `winfo_class()` 会变成 "Xxx"，比字符串的写法那时就悄悄开始穿透了
+            # （假裁切会原样回来），而 isinstance 不受 `class_=` 影响。
+            kids = [c for c in kids if not isinstance(c, tk.Toplevel)]
+        stack[0:0] = kids
     return out
+
+
+def _windows(root) -> list:
+    """``root`` 这棵树里的全部窗口，含挂在别的窗口下面的子窗。
+
+    会话选择器是 ``SessionPicker(self, ...)`` —— 挂在点它的那扇窗下面，
+    不是 App 的直接子节点。找窗口、数窗口都得穿过去，否则"点了没反应"
+    会变成假缺陷。
+    """
+    return _descendants(root, cross_toplevel=True)
 
 
 def _text_of(w) -> str:
@@ -1824,10 +2016,17 @@ def _clipped(win, widgets: list[dict]) -> list[str]:
 
 
 def _status_text(win) -> str:
+    """读窗口的状态条文字。
+
+    主窗口的 `Status` 封装里是 `_label`；对话框（相机管理/工具台…）直接是
+    一个 `ttk.Label`。以前只认 `_label`，于是对对话框永远读到空字符串，
+    点按钮就被判成"状态条没变 → 静默无反馈"（2026-11-07 走查报了 6 条假缺陷，
+    因为按钮其实把对话框状态条改了，只是读的地方不对）。
+    """
     st = getattr(win, "status", None)
-    lab = getattr(st, "_label", None)
-    if lab is None:
+    if st is None:
         return ""
+    lab = getattr(st, "_label", st)
     try:
         return str(lab.cget("text"))
     except tk.TclError:
@@ -1846,14 +2045,17 @@ def _card(win, prefix: str):
     return None
 
 
-def _button_in(parent, text: str):
+def _button_in(parent, text: str, *, prefix: bool = False):
+    """按文字找按钮。``prefix=True`` 时还接受「文字+补充原因」这类变体
+    （例：「开始录制（先解决标定）」），默认仍要求完全相等。"""
     if parent is None:
         return None
     for w in _descendants(parent):
         if _role(w) != "button":
             continue
         try:
-            if str(w.cget("text")) == text:
+            label = str(w.cget("text"))
+            if label == text or (prefix and label.startswith(text)):
                 return w
         except tk.TclError:
             continue
@@ -1913,7 +2115,7 @@ def _find_toplevel(app, title_part: str):
     不是 App 的直接子节点 —— 只翻 ``app.winfo_children()`` 会漏掉它们，
     于是"点了没反应"变成一个假缺陷。这里整棵树都翻。
     """
-    for w in _descendants(app):
+    for w in _windows(app):
         if not isinstance(w, tk.Toplevel):
             continue
         try:
@@ -1931,7 +2133,7 @@ def _ui_signature(app, win) -> tuple:
     只盯状态条会把它三个按钮全判成"点了没反应"。
     """
     tops = 0
-    for w in _descendants(app):
+    for w in _windows(app):
         if isinstance(w, tk.Toplevel):
             try:
                 if w.winfo_exists():
@@ -2368,6 +2570,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         md_snapshot.append("config/*.json 未变（GUI 没写配置）")
 
+    # 走查点过「拍标定图」会新建空会话（没真采集），收尾清掉，别留误导性指针
+    _empty_sessions = _drop_empty_calib_sessions()
+    md_snapshot.append(f"空标定会话已清理（{_empty_sessions} 个；有图的会话不动）")
+
     gui_after = _gui_fingerprint()
     if gui_after != gui_before:
         diff_keys = [k for k in set(gui_before) | set(gui_after)
@@ -2440,6 +2646,9 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+# B-151：本函数体受 tests/selftest_window_mode.py 的 AST 判据守护 ——
+# 与那边那份 _gui_fingerprint() 必须逐结构一致，改逻辑请两处同步，否则那条
+# 判据会直接红（而不是半年后悄悄漂移）。
 def _gui_fingerprint() -> dict[str, str]:
     """记下这次走查**跑的是哪一版 GUI**。
 
@@ -2449,7 +2658,12 @@ def _gui_fingerprint() -> dict[str, str]:
     """
     import hashlib
     out: dict[str, str] = {}
-    for p in sorted((ROOT / "apps").glob("_gui_*.py")):
+    # `_gui_*.py` + `*_dialog.py`：对话框也是界面，改一版排版也可能让
+    # "这一步会不会被裁"的结论失效。2026-11-07 加 `tools_dialog.py` 时发现
+    # 它落在指纹之外 —— "新窗口不在版本锁里"正是本节最该防的空洞。
+    gui_files = sorted((ROOT / "apps").glob("_gui_*.py")) + \
+        sorted((ROOT / "apps").glob("*_dialog.py"))
+    for p in gui_files:
         try:
             out[p.name] = hashlib.md5(p.read_bytes()).hexdigest()[:10]
         except OSError:
@@ -2500,6 +2714,15 @@ def _resolve_session(arg: str, kind: str) -> str:
     cand = p if p.is_absolute() else (ROOT / p)
     if cand.is_dir():
         return str(cand)
+    if kind == "stereo":
+        # 2026-11-04 起双目会话按装置分区（data/stereo/parallel/<id>），
+        # 不能再只试 `data/stereo/<id>` —— 那会找不到旧会话，报告里就会
+        # 出现"选择器列表找不到 <空>"这种**工具造成的**假缺陷。
+        from apps._stereo_layout import candidate_session_dirs
+
+        for d in candidate_session_dirs():
+            if d.name == p.name and d.is_dir():
+                return str(d)
     bases = (MONO_ROOT,) if kind == "mono" else stereo_roots()
     for base in bases:
         hit = base / p.name
@@ -2515,7 +2738,8 @@ def _gui_ready() -> tuple[bool, str]:
     "文件存了一半"会得到 `IndentationError`，而报告会把这记成"GUI 崩溃"——
     那是假的，而且会误导别人去修一个不存在的 bug。宁可开跑前就拒绝。
     """
-    for p in sorted((ROOT / "apps").glob("_gui_*.py")):
+    for p in (sorted((ROOT / "apps").glob("_gui_*.py"))
+              + sorted((ROOT / "apps").glob("*_dialog.py"))):
         tmp = Path(tempfile.gettempdir()) / f"_wk_{p.stem}.pyc"
         try:
             py_compile.compile(str(p), cfile=str(tmp), doraise=True)
@@ -2538,6 +2762,57 @@ def _backup_config() -> None:
             shutil.copy2(p, dst / p.name)
         except OSError:
             pass
+
+
+def _drop_empty_calib_sessions() -> int:
+    """走查点过「拍标定图 / 采集标定板图」会**新建会话却不采图**，收尾清掉。
+
+    2026-11-09：标定图改成「一次采集 = 一个会话子目录」后，走查器第 94 步
+    会在 `outputs/mono_calib_frames/` 留下一个只有 session.json 的空会话和
+    `_current.json` 指针。留着会让用户下次打开 GUI 以为"有当前会话"，
+    所以这里删掉**没有任何图片**的会话，并在指针指向已删目录时删指针。
+    只删空会话，绝不动有图的真采集。
+    """
+    import json
+
+    repo = Path(__file__).resolve()
+    while not (repo / "sphere_tracker").is_dir():
+        repo = repo.parent
+    removed = 0
+    for name in ("chain_frames", "mono_calib_frames"):
+        root = repo / "outputs" / name
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            imgs = [p for p in d.rglob("*") if p.is_file()
+                    and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp")]
+            if imgs:
+                continue
+            for p in sorted(d.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+                try:
+                    p.unlink() if p.is_file() else p.rmdir()
+                except OSError:
+                    pass
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+            removed += 1
+        cur = root / "_current.json"
+        if not cur.exists():
+            continue
+        try:
+            sess = str(json.loads(cur.read_text(encoding="utf-8")).get("session") or "")
+        except (OSError, ValueError):
+            sess = ""
+        if not sess or not (root / sess).is_dir():
+            try:
+                cur.unlink()
+            except OSError:
+                pass
+    return removed
 
 
 def _restore_config() -> None:

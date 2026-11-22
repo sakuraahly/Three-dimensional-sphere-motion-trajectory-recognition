@@ -29,6 +29,10 @@ title 球形物体三维运动轨迹识别 · 启动器
 set "MODE=%~1"
 if "%MODE%"=="" set "MODE=gui"
 
+rem 环境安装器单独路由：此刻可能连 Python 都还没配好，不能走下面的探测。
+rem 根目录不新增第四个脚本（AGENTS.md 规则 5）——"只做某一步"就给 bat 加参数。
+if /i "%MODE%"=="install" goto :do_install
+
 rem 打印出来的棋盘格量到多少就改成多少（毫米）
 set "SQUARE=25"
 
@@ -41,6 +45,26 @@ echo   球形物体三维运动轨迹识别 · 启动器
 echo ============================================================
 echo.
 echo [1/3] 检查 Python 环境 ...
+
+rem ---------- 0) 安装器登记过的环境优先 ----------
+rem config\python_env.txt 是纯文本 key=value（bat / Go / Python 三方都能读），
+rem 项目内写相对路径。命中后仍要真跑一次 import 才算数：.venv 被删了、
+rem 或整个仓库搬到别的机器，指针可能只剩一个空壳。
+if exist "config\python_env.txt" (
+    for /f "usebackq tokens=1,* delims==" %%A in ("config\python_env.txt") do (
+        if "%%A"=="python" set "PY=%%B"
+    )
+)
+if defined PY set "PY=%PY:/=\%"
+if defined PY if exist "%PY%" (
+    "%PY%" -c "import cv2,numpy" >nul 2>nul
+    if not errorlevel 1 (
+        echo       找到：%PY%（安装器登记的环境）
+        echo.
+        goto :launch
+    )
+)
+set "PY="
 
 rem ---------- 1) 找一台真的能 import cv2 的 Python ----------
 rem 光看路径不算数：msys64 那个 python 在 PATH 里但没装 opencv，
@@ -65,6 +89,7 @@ goto :launch
 rem ---------- 2) 没找到就装依赖 ----------
 :need_install
 echo       没有找到装好 opencv / numpy 的 Python。
+echo       推荐改用一键安装器：run.bat install（建隔离环境，不污染全局 Python）
 echo.
 echo [2/3] 安装依赖 ...
 echo.
@@ -151,8 +176,9 @@ if errorlevel 1 (
     echo       这台机器没有 tkinter，自动改用命令行界面。
     goto :ui_cli
 )
-rem 自动定位界面脚本（根目录里 import tkinter 的那个），不写死中文文件名
-"%PY%" -c "import glob,runpy; f=[p for p in glob.glob('*.py') if 'tkinter' in open(p,encoding='utf-8').read()][0]; runpy.run_path(f,run_name='__main__')"
+rem 界面脚本固定在 apps/ 下（英文名）。以前靠 glob 扫根目录里"含 tkinter 的 .py"
+rem 来猜哪个是 GUI —— 两个启动脚本搬进 apps/ 之后根目录没有 .py 了，那条路必然失效。
+"%PY%" apps\gui_main.py
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
@@ -162,22 +188,16 @@ if not "%RC%"=="0" (
 exit /b %RC%
 
 :ui_legacy
-rem 经典单窗口界面（过渡期保留）：新界面是默认，这里显式退回旧界面。
-rem 与 :ui_gui 同样"不写死中文文件名"——靠 tkinter 特征定位脚本，
-rem 再用 sys.argv 把 --legacy 传给它。
-echo [3/3] 启动经典界面（过渡）...
-"%PY%" -c "import glob,runpy,sys; f=[p for p in glob.glob('*.py') if 'tkinter' in open(p,encoding='utf-8').read()][0]; sys.argv=[f,'--legacy']; runpy.run_path(f,run_name='__main__')"
-set "RC=%ERRORLEVEL%"
-if not "%RC%"=="0" (
-    echo.
-    echo       启动器异常退出（返回码 %RC%）。请看上面的报错。
-    pause
-)
-exit /b %RC%
+rem 经典单窗口界面已于 2026-11-20 废止（决策见 docs/决策记录.md）。
+rem 保留这个参数只为给老用户一句明确解释，**不再启动任何程序**。
+echo.
+echo [已废止] 经典界面不再提供。
+echo       新界面是唯一入口：直接运行 run.bat（它打开门厅 + 三个模式窗）。
+exit /b 0
 
 :ui_cli
 echo [3/3] 启动命令行界面 ...
-"%PY%" -c "import glob,runpy; f=[p for p in glob.glob('*.py') if 'tkinter' not in open(p,encoding='utf-8').read()][0]; runpy.run_path(f,run_name='__main__')"
+"%PY%" apps\cli_main.py
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
@@ -226,7 +246,7 @@ goto :direct
 rem 回归测试统一走 apps\run_tests.py（项目里**唯一**跑全套测试的地方）。
 rem   默认 fast：跳过"已知慢的"测试，只跑其余（名单来自 timings.json 的实测中位数，不写死）。
 rem   当前跳过了哪些、各耗时多少：跑一次 apps\run_tests.py --list 看，别在这里写死数字。
-rem   要全套：启动程序.bat test full
+rem   要全套：run.bat test full
 rem 分层依据是 outputs\test_results\timings.json 里的**实测中位数**，不写死名单。
 set "TIER=%~2"
 if "%TIER%"=="" set "TIER=fast"
@@ -279,6 +299,62 @@ if "%RC%"=="0" (
 ) else (
     echo 结束（返回码 %RC%）。上面有原因。
 )
+pause
+exit /b %RC%
+
+rem ---------- 环境安装器（run.bat install / launcher.exe install）----------
+:do_install
+echo ============================================================
+echo   一键环境安装器
+echo ============================================================
+echo.
+echo   建隔离环境 / 复用现成环境，装齐依赖，并登记给所有启动入口。
+echo   详细日志： logs\misc\
+echo.
+set "BOOT="
+rem 引导解释器：已登记的 > PATH 里的 python > py launcher。
+rem 它只要能跑标准库即可；真正装依赖的是它建出来的那个 .venv。
+if exist "config\python_env.txt" (
+    for /f "usebackq tokens=1,* delims==" %%A in ("config\python_env.txt") do (
+        if "%%A"=="python" set "BOOT=%%B"
+    )
+)
+if defined BOOT set "BOOT=%BOOT:/=\%"
+if defined BOOT if not exist "%BOOT%" set "BOOT="
+if not defined BOOT for /f "delims=" %%I in ('where python 2^>nul') do if not defined BOOT set "BOOT=%%I"
+rem py launcher 可能指向很老的 Python（连本文件都解析不了），候选先验版本再收。
+if not defined BOOT for /f "delims=" %%I in ('where py 2^>nul') do if not defined BOOT (
+    "%%I" -c "import sys; assert sys.version_info>=(3,9)" >nul 2>nul
+    if not errorlevel 1 set "BOOT=%%I"
+)
+if not defined BOOT (
+    echo   [失败] 这台机器连一个能运行的 Python 都没有。
+    echo          先装 Python 3.10+ ： https://www.python.org/downloads/
+    echo.
+    pause
+    exit /b 1
+)
+echo   引导解释器：%BOOT%
+echo.
+rem install 之后的参数要**原样**转给 setup_env.py：install.bat 用 call 转来时引号还在，
+rem 旧写法会把引号剥掉（带空格路径被拆成多个参数），而且只取前 4 个会静默丢参数。
+rem 这里逐个 shift + 重新包引号：带空格路径不拆、参数数量不限、开关型参数也能过。
+set "INSTALL_ARGS="
+:collect_arg
+shift
+if "%~1"=="" goto :collect_done
+set "INSTALL_ARGS=%INSTALL_ARGS% "%~1""
+goto :collect_arg
+:collect_done
+"%BOOT%" apps\setup_env.py %INSTALL_ARGS%
+set "RC=%ERRORLEVEL%"
+echo.
+if "%RC%"=="0" (
+    echo   环境已就绪。双击 run.bat，或 install.bat 所在目录的启动入口即可。
+) else (
+    echo   安装未完成（返回码 %RC%）。请看上面的报错与 logs\misc\
+)
+echo.
 pause
 exit /b %RC%
 

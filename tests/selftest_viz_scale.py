@@ -690,9 +690,16 @@ def test_mono_visualization_contract() -> bool:
     1. 单目**本来就有**三维（``Z=f·D/(2r)``），导出的文件要能被查看器读；
     2. 那个文件**不能冒充双目** —— schema 必须不同名（尺度来源不同：
        先验 vs 视差），把 `mode` 读成 mono；
-    3. 0 检出不写空文件、且退出码非 0；低检出警告但仍 exit 0。
+    3. **2026-11-14 新原则**：质量差也要能出结果、不中止程序，只有错误才紧急。
+       0 检出（``hits==0``）→ 退出码 **0**、三份产物**照常写**，但每份带显眼
+       degraded 标记 + stdout 醒目诊断；``total==0``（一帧没读到）才是真错误 → 退出码 2。
+       低检出仍是一行警告 + exit 0（已符合新原则的范例，保持不动）。
 
-    全部用 `tempfile`：判据不许依赖这台机器录过什么。
+    当年"0 检出不写空文件"是为防"看起来成功"那个坑；现在不靠不写文件，
+    而靠"写了、但一眼看得出是空的"（vis-json 顶层 ``quality.degraded``）。
+
+    全部用 `tempfile`：判据不许依赖这台机器录过什么；端到端判据用
+    ``tempfile.mkdtemp()`` + ``finally: shutil.rmtree`` 造一段无球图片序列真跑。
     """
     print("----- 9. 单目可视化：schema / 扫描 / 检出判据 -----")
     import json
@@ -765,31 +772,69 @@ def test_mono_visualization_contract() -> bool:
         except ValueError as exc:
             ck("错 schema 抛错（没有被当成双目放过）", True, str(exc)[:40])
 
+        # ---- 2b. 空结果 = 降级视图（不抛错、也不是"读进来 0 点当成功"）----
+        # 查看器侧 2026-11-11 已修好：load_view 对「空 visualization.json /
+        # 空 traj3d.json / 目录里只有 left.mkv」都返回 degraded=True +
+        # degraded_reason，不抛异常。这组钉住"质量差也出结果"在查看器那头成立。
         empty = Path(tmp) / "empty" / "derived"
         empty.mkdir(parents=True)
         (empty / "visualization.json").write_text(
             json.dumps({"schema": MONO_SCHEMA, "version": 1, "mode": "mono",
                         "trajectory": []}), encoding="utf-8")
-        try:
-            load_view(empty / "visualization.json")
-            ck("空轨迹抛错（空文件不许被当成「有结果」）", False)
-        except ValueError:
-            ck("空轨迹抛错（空文件不许被当成「有结果」）", True)
+        d1 = load_view(empty / "visualization.json")
+        ck("空 visualization.json → 降级视图（degraded=True + 原因非空，不抛错）",
+           d1.get("degraded") is True and bool(d1.get("degraded_reason")),
+           str(d1.get("degraded_reason"))[:40])
+
+        empty2 = Path(tmp) / "empty2" / "derived"
+        empty2.mkdir(parents=True)
+        (empty2 / "traj3d.json").write_text(
+            json.dumps({"schema": "sphere-stereo-visualization", "version": 1,
+                        "trajectory": []}), encoding="utf-8")
+        d2 = load_view(empty2 / "traj3d.json")
+        ck("空 traj3d.json → 降级视图（degraded=True + 原因非空）",
+           d2.get("degraded") is True and bool(d2.get("degraded_reason")),
+           str(d2.get("degraded_reason"))[:40])
+
+        only_mkv = Path(tmp) / "only_mkv"
+        only_mkv.mkdir(parents=True)
+        (only_mkv / "left.mkv").write_bytes(b"")
+        d3 = load_view(only_mkv)
+        ck("目录里只有 left.mkv、没有三维 JSON → 降级视图（不抛错）",
+           d3.get("degraded") is True and bool(d3.get("degraded_reason")),
+           str(d3.get("degraded_reason"))[:40])
 
     # ---- 3. 生产侧的判据：0 检出 / 低检出 / 正常 ----
-    ck("0 检出 → build_vis 返回 None（不写空文件）",
-       build_vis([{"frame": 0, "t": 0.0, "coasting": ""}],
+    empty_vis = build_vis([{"frame": 0, "t": 0.0, "coasting": ""}],
+                          session="s", source="c.mkv", ball_diameter_mm=21.6,
+                          fx=1000.0)
+    ck("0 检出 → build_vis 返回 dict（不是 None，照常写文件）",
+       isinstance(empty_vis, dict))
+    ck("0 检出 → quality.degraded is True / n_points==0 / trajectory 为空",
+       empty_vis["quality"]["degraded"] is True
+       and empty_vis["n_points"] == 0 and empty_vis["trajectory"] == [],
+       f"quality={empty_vis['quality']}")
+    ck("0 检出 → quality 带 verdict=zero_hit / grade=degraded / warnings 非空",
+       empty_vis["quality"]["verdict"] == "zero_hit"
+       and empty_vis["quality"]["grade"] == "degraded"
+       and bool(empty_vis["quality"]["warnings"]),
+       str(empty_vis["quality"]["verdict"]))
+    ck("有三维点 → quality.degraded is False（正常结果不许被误标降级）",
+       build_vis([{"frame": 0, "t": 0.0, "coasting": 0,
+                   "X_m": 0.1, "Y_m": 0.2, "Z_m": 0.8}],
                  session="s", source="c.mkv", ball_diameter_mm=21.6,
-                 fx=1000.0) is None)
+                 fx=1000.0)["quality"]["degraded"] is False)
 
     code, lines = hit_report(0, 40, "color")
     txt = "\n".join(lines)
-    ck("0 检出 → 退出码 2（不是 0）", code == 2, f"EXIT={code}")
+    ck("0 检出 → 退出码 0（质量差不中止程序，不是 2）", code == 0, f"EXIT={code}")
     ck("0 检出的诊断里写了当前检测器 + 该改试哪个",
        "color" in txt and "--method hough" in txt and "--method fusion" in txt,
        txt.splitlines()[1].strip() if len(lines) > 1 else "")
-    ck("0 检出的诊断说清了「为什么不静默」（提到「看起来成功」）",
-       "看起来成功" in txt)
+    ck("0 检出的诊断不静默（[降级] + degraded 标记 + 「看起来成功」）",
+       "[降级]" in txt and "degraded" in txt and "看起来成功" in txt)
+    ck("total==0（一帧没读到，真错误）→ 退出码仍是 2",
+       hit_report(0, 0, "color")[0] == 2)
 
     code_w, lines_w = hit_report(3, 40, "motion")
     ck(f"低检出（7.5% < {LOW_HIT_RATE:.0%}）→ 退出码仍是 0（有数据不假装失败）",
@@ -798,6 +843,57 @@ def test_mono_visualization_contract() -> bool:
 
     code_ok, lines_ok = hit_report(38, 40, "hough")
     ck("正常检出 → 退出码 0 且不告警", code_ok == 0 and not lines_ok)
+
+    # ---- 4. 端到端：0 检出真跑 run_video.py → 三产物都在 + degraded 标记 ----
+    # 纯色无球图片序列（hough 的 Canny 找不到圆 ⇒ 稳定 0 检出）。
+    # tempfile.mkdtemp() + finally: shutil.rmtree，绝不写项目里的 data/ 等目录。
+    import os
+    import shutil
+    import subprocess
+
+    e2e_dir = tempfile.mkdtemp(prefix="mono_zero_hit_")
+    try:
+        root_e = Path(e2e_dir)
+        frames_dir = root_e / "frames"
+        frames_dir.mkdir()
+        for i in range(4):
+            cv2.imwrite(str(frames_dir / f"f_{i:03d}.png"),
+                        np.full((64, 96, 3), 60, np.uint8))
+        out_dir = root_e / "out"
+        out_dir.mkdir()
+        csv_p = out_dir / "traj.csv"
+        vis_p = out_dir / "visualization.json"
+        vid_p = out_dir / "annotated.mp4"
+        cmd = [sys.executable, str(ROOT / "apps" / "run_video.py"),
+               str(frames_dir), "--no-show", "--method", "hough",
+               "--ball-diameter", "0.025",
+               "--csv", str(csv_p), "--vis-json", str(vis_p), "--out", str(vid_p)]
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(ROOT),
+                              encoding="utf-8", errors="replace", env=env)
+        stdout = proc.stdout + proc.stderr
+        ck("0 检出真跑 → 退出码 0（质量差不中止程序）",
+           proc.returncode == 0, f"EXIT={proc.returncode}")
+        ck("0 检出真跑 → CSV / vis-json / 标注视频三产物都在",
+           csv_p.is_file() and vis_p.is_file() and vid_p.is_file(),
+           f"csv={csv_p.is_file()} vis={vis_p.is_file()} vid={vid_p.is_file()} "
+           f"sizes={[p.stat().st_size for p in (csv_p, vis_p, vid_p) if p.is_file()]}")
+        ck("0 检出真跑 → 临时 .tmp.mp4 已原子改名（不残留）",
+           not (out_dir / "annotated.tmp.mp4").exists())
+        vis_data = (json.loads(vis_p.read_text(encoding="utf-8"))
+                    if vis_p.is_file() else {})
+        q = vis_data.get("quality", {})
+        ck("0 检出真跑 → vis_json.quality.degraded is True",
+           q.get("degraded") is True, f"quality={q}")
+        ck("0 检出真跑 → n_points==0 且 trajectory 为空",
+           vis_data.get("n_points") == 0 and vis_data.get("trajectory") == [])
+        ck("0 检出真跑 → stdout 有醒目诊断（[降级] + degraded）",
+           "[降级]" in stdout and "degraded" in stdout)
+        ck("0 检出真跑 → stdout 带统一质量标记 [质量] verdict=zero_hit（GUI/CLI 可解析）",
+           "[质量] verdict=zero_hit" in stdout
+           and "结果仅供参考" in stdout)
+    finally:
+        shutil.rmtree(e2e_dir, ignore_errors=True)
 
     print(f"  共 {len(checks)} 项：" + ("全部通过" if all(k for _l, k in checks)
                                       else "有不达标项"))
@@ -831,7 +927,8 @@ def test_valid_frame_gate_contract() -> bool:
     4. 四段报告的拆项**加得起来**（无检测 + 半径不一致 = 总数 − 有效帧），
        且没有种子时必须明说"半径未经确认、绝对深度不可信"；
     5. 丢失按连续段报，不逐帧一行；
-    6. 退出码仍然以有效帧为准（0 有效 → 2），且诊断里给 `--seed` 这条出路。
+    6. 退出码按新原则（2026-11-14）：0 有效帧但帧读到了 → 0（质量差不中止，
+       照常出结果 + 降级诊断）；total==0 才是真错误 → 2。诊断里仍给 `--seed` 出路。
 
     ⚠️ **本节不声称能验证**"有效帧就是那颗球"。实测：给了**错误**种子
     （书架上的 `300,200,20`）时，CSRT 老实跟住那块纹理，细化每帧都在它周围
@@ -965,10 +1062,13 @@ def test_valid_frame_gate_contract() -> bool:
     ck("段之间断开不合并",
        loss_segments([1, 2, 3, 7, 8]) == [(1, 3), (7, 8)])
 
-    # ---- 6. 退出码以**有效帧**为准 ----
+    # ---- 6. 退出码按新原则：质量差出结果、真错误才 2 ----
     code, lines0 = hit_report(0, 60, "hough", detector_error="跟丢")
     txt0 = "\n".join(lines0)
-    ck("0 有效帧 → 退出码 2", code == 2, f"EXIT={code}")
+    ck("0 有效帧 → 退出码 0（质量差不中止，不是 2）", code == 0, f"EXIT={code}")
+    ck("0 有效帧的诊断不静默（[降级] + degraded 标记）",
+       "[降级]" in txt0 and "degraded" in txt0)
+    ck("total==0（真错误）→ 退出码仍是 2", hit_report(0, 0, "hough")[0] == 2)
     ck("0 有效帧的诊断给出 --seed 这条出路（金属球只能人工点一下）",
        "--seed" in txt0 and "金属" in txt0)
     ck("0 有效帧的诊断带上检测器自述原因（不然只能靠猜）", "跟丢" in txt0)
@@ -1130,6 +1230,255 @@ def test_viewer_inset_smoothing() -> bool:
     return all(k for _l, k in checks)
 
 
+def test_viewer_tick_step_scales_trajectory() -> bool:
+    """第 12 节：分度值 = 「每格多少米」，改它图线必须跟着缩放（2026-11-15 增）。
+
+    ## 为什么这一节存在
+
+    用户原话：「3D数据查看的时候，修改分度值，确实坐标轴会变，但是图线不会
+    自动的匹配放大和缩小。」
+
+    根因：旧实现只设 locator/formatter，**从不碰 `lims`** ——
+    视图跨度一动不动，网格线与刻度变了、曲线却原地不动。而且
+    `span / step > 20` 时静默退回 `MaxNLocator(4)`，用户填 0.0001 既不缩放
+    也没有任何提示（一次静默的无视）。
+
+    新语义照示波器的「V/格」：格子数固定 `TICK_GRID_CELLS`（8），每格代表
+    多少米由分度值决定 → 每格变细就是放大，每格变粗就是缩小。
+
+    ## 判据（每条都打印实测数值）
+
+    1. 填 `S/4` → 目标 8 格 = 2S 超过数据跨度 → 被夹回「数据范围 + 12% 留白」，
+       且窗口左边界是 step 的整数倍（刻度对齐）；
+    2. 填 `S/20` → 跨度 = 0.4S，**真的比数据范围小**（证明是放大不是画着玩），
+       且 `ax.get_xlim()` 与 `self.lims` 一致（范围真的写进了 ax）；
+    3. 分度值比数据跨度还大（`10*S`）→ 夹成数据范围，不炸、不出空白窗口；
+    4. 三个格子清空 → 回到数据范围（与第 1 条之前完全一致）；
+    5. 网格条数有上界：极小分度值 + 把范围放大 1000 倍后，刻度条数
+       ≤ `TICK_MAX_GRID + 2`（「按整数倍变粗」，不是退回自动档）；
+    6. 非等比例提示：跨度过分悬殊且未勾「等比例坐标」时，已有的
+       `plane_note` 里必须写出放大倍数；勾上后这句话消失。
+
+    ## 反向自证（实测，2026-11-15）
+
+    把 `_on_tick_edit` 里 `changed = self._apply_tick_span()` 一行注掉（换成
+    `changed = False`）→ **第 2 条的两项变红**（跨度停在 0.5952，不是 0.192；
+    `lo/step = -0.48` 也不再是整数）。
+
+    ⚠️ 如实写明：第 1 / 3 / 4 条**不能**抓到这个变异 —— 它们的期望值就是
+    「数据范围」，而初始范围本来就是数据范围，范围一动不动时它们照样绿。
+    真正有鉴别力的只有第 2 条（跨度**变小**）。第 4 条守的是另一件事：
+    清空格子后必须回到自动，而不是停在某个分度值窗口。
+
+    字节级还原后 `sha256` 与改前一致（`7b3445739f28…`）。
+    """
+    print("----- 12. 3D 查看器：分度值 = 每格多少米（图线跟着缩放）-----")
+    import json
+    import tempfile
+    import tkinter as tk
+
+    from apps.view_3d import (TICK_GRID_CELLS, TICK_MAX_GRID, Viewer3D,
+                              load_view)
+
+    checks: list[tuple[str, bool]] = []
+
+    def ck(label: str, ok: bool, detail: str = "") -> None:
+        print(f"  [{'通过' if ok else '不达标'}] {label}"
+              + (f"（{detail}）" if detail else ""))
+        checks.append((label, ok))
+
+    # 造一段只有自己能看到的合成轨迹（**不读 data/ 里用户的真实录制**）。
+    # 跨度照用户那次的实际数据来：X 0.48 m、Y 0.065 m（X/Y ≈ 7.4，加留白后
+    # 不比 Y 更短的 Z 是 0.30 m，所以最短轴确实是 Y）—— 正好触发第 6 条的
+    # 「非等比例」提示。**Z 必须比 Y 长**，否则最短轴会变成 Z，提示写的是
+    # "Z 轴"，而那跟用户那次的情形不是一回事。
+    S = 0.48
+    pts = [{"frame": i, "t": round(i / 40.0, 5),
+            "xyz": [S * i / 40.0, 0.065 * i / 40.0, 1.20 + 0.30 * i / 40.0]}
+           for i in range(41)]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp) / "20260101-000000" / "derived"
+        d.mkdir(parents=True)
+        (d / "visualization.json").write_text(json.dumps({
+            "schema": "sphere-stereo-visualization", "version": 1,
+            "session": "20260101-000000", "trajectory": pts,
+            "coordinate_system": "left_camera", "unit": "m",
+            "stereo_mode": "parallel"}, ensure_ascii=False), encoding="utf-8")
+        root = tk.Tk()
+        root.withdraw()
+        v = None
+        try:
+            v = Viewer3D(root, load_view(d / "visualization.json"))
+            base_lo, base_hi = v._current_lims()
+            base = [list(base_lo), list(base_hi)]
+            span_data = base_hi[0] - base_lo[0]     # 已含 12% 留白
+
+            # ① 8 格 = 2S，超过数据跨度 → 夹回数据范围，且左边对齐到 step
+            v.tick_vars["x"].set(str(S / 4))
+            v._on_tick_edit()
+            lo, hi = v._current_lims()
+            span1 = hi[0] - lo[0]
+            k1 = lo[0] / (S / 4)
+            # 2026-11-17 改成**全局无限坐标布**：窗口只按 step×8 走，
+            # 不再夹回数据包围盒。旧判据（夹回数据范围）随需求作废。
+            ck(f"分度值 S/4 -> 8 格 = 2S，坐标布无限延伸（跨度 {span1:.6f}，"
+               f"数据范围 {span_data:.6f}）",
+               abs(span1 - 2 * S) < 1e-9 and span1 > span_data)
+            ck(f"窗口左边界对齐到分度值整数倍（lo/step = {k1:.9f}）",
+               abs(k1 - round(k1)) < 1e-6)
+
+            # ② S/20 → 8 格 × S/20 = 0.4S，**比数据范围小**（真的放大）
+            v.tick_vars["x"].set(str(S / 20))
+            v._on_tick_edit()
+            lo, hi = v._current_lims()
+            span2 = hi[0] - lo[0]
+            ax_lo, ax_hi = v.ax.get_xlim()
+            ck(f"分度值 S/20 → 跨度 {span2:.6f} ≈ 0.4S（S=0.48 → 0.192），"
+               f"比数据范围 {span_data:.6f} 小 = 真的放大了",
+               abs(span2 - 0.4 * S) < 1e-9 and span2 < span_data)
+            ck(f"ax.get_xlim() 与 self.lims 一致"
+               f"（[{ax_lo:.6f},{ax_hi:.6f}] vs [{lo[0]:.6f},{hi[0]:.6f}]）",
+               abs(ax_lo - lo[0]) < 1e-12 and abs(ax_hi - hi[0]) < 1e-12)
+
+            # ③ 分度值比数据跨度还大 → 夹成数据范围，不炸
+            v.tick_vars["x"].set(str(10 * S))
+            v._on_tick_edit()
+            lo, hi = v._current_lims()
+            span3 = hi[0] - lo[0]
+            ck(f"分度值 10S → 跨度 80S（{span3:.6f}），全局坐标布不钳制"
+               f"（数据范围 {span_data:.6f}）",
+               abs(span3 - 80 * S) < 1e-9
+               and all(float(x) == float(x) for x in (lo[0], hi[0])))
+
+            # ③b 极小分度值：窗口远小于数据跨度，视外轨迹必须被断开。
+            # mplot3d 的 Line3D 不理 clip_on，线段会从轴盒两侧漏出去
+            # （2026-11-17 用户截图"分度值很小依旧溢出"）。
+            v.tick_vars["x"].set(str(S / 200))
+            v._on_tick_edit()
+            v._redraw()
+            c_lo, c_hi = v._current_lims()
+            # **逐条**检查：只要有一条线把视外的有限点画出来，就算溢出。
+            # 早先写成"任意一条满足"—— 变异只去掉一条线的裁剪时照样绿，是假判据。
+            checked, has_nan, no_leak = 0, False, True
+            for ln in v.ax.lines:
+                xd = np.asarray(ln.get_xdata(), dtype=float)
+                if not len(xd):
+                    continue
+                finite = np.isfinite(xd)
+                if not finite.any():
+                    continue
+                checked += 1
+                has_nan = has_nan or bool((~finite).any())
+                if not np.all((xd[finite] >= c_lo[0] - 1e-12)
+                              & (xd[finite] <= c_hi[0] + 1e-12)):
+                    no_leak = False
+            ck(f"极小分度值（窗口 {c_hi[0]-c_lo[0]:.6f} << 数据 {span_data:.6f}）"
+               f"时每条线都在窗口内（{checked} 条，有 NaN={has_nan}）",
+               checked >= 1 and has_nan and no_leak)
+
+            # ④ 三个格子清空 → 回到「自动」（与 ① 之前完全一致）
+            #    两个坑，2026-11-15 实测各踩过一次：
+            #    (a) 必须先把视图真的推离数据范围再清空。③ 结束时 ax 已经停在数据
+            #        范围上，直接清空会白拿一个绿。
+            #    (b) 必须量 **ax**，不能量 `_current_lims()`：后者见到 `lims is None`
+            #        会自己按数据算回来，等于替被测代码把活干了 —— 真实现场是
+            #        `_apply_lims()` 见到 None 直接 return，暂停时 ax 一动不动。
+            v.tick_vars["x"].set(str(S / 20))
+            v._on_tick_edit()
+            z_lo, z_hi = v.ax.get_xlim()
+            zoomed = abs((z_hi - z_lo) - (base[1][0] - base[0][0])) > 1e-3
+            for _k in ("x", "y", "z"):
+                v.tick_vars[_k].set("")
+            v._on_tick_edit()
+            ax_lo, ax_hi = v.ax.get_xlim()
+            ck(f"三个格子清空 → ax 立刻回到数据范围（清空前跨度 "
+               f"{z_hi - z_lo:.6f} 确实离开了数据范围：{zoomed}）",
+               zoomed
+               and abs(ax_lo - base[0][0]) < 1e-9
+               and abs(ax_hi - base[1][0]) < 1e-9,
+               f"ax=[{ax_lo:.6f},{ax_hi:.6f}] vs "
+               f"[{base[0][0]:.6f},{base[1][0]:.6f}]")
+
+            # ⑤ 网格条数上界：极小分度值 + 范围放大 1000 倍 → 间隔按整数倍变粗
+            v.tick_vars["x"].set("0.001")
+            v._on_tick_edit()
+            lo, hi = v._current_lims()
+            cx = (lo[0] + hi[0]) / 2.0
+            cy = (lo[1] + hi[1]) / 2.0
+            cz = (lo[2] + hi[2]) / 2.0
+            v._zoom_around(1000.0, cx, cy, cz)     # 跨度 ×1000，step 还是 0.001
+            v._apply_tick_locators()
+            n_ticks = len(v.ax.get_xticks())
+            ck(f"范围放大 1000 倍后网格间隔按整数倍变粗，不退回自动档"
+               f"（X 刻度 {n_ticks} 条 ≤ {TICK_MAX_GRID + 2}）",
+               n_ticks <= TICK_MAX_GRID + 2 and n_ticks >= 2)
+
+            # ⑥ 非等比例提示：跨度过分悬殊时必须说出来（这次用户就是被它误导）
+            v._redraw()
+            note = v.plane_note.cget("text")
+            ratio = ((base[1][0] - base[0][0]) / (base[1][1] - base[0][1]))
+            ck(f"未勾等比例且跨度过分悬殊（X/Y ≈ {ratio:.1f}）→ 已有提示标签"
+               f"写明放大倍数",
+               "非等比例" in note and "Y 轴" in note)
+            v.equal_axes.set(True)
+            v._redraw()
+            ck("勾上「等比例坐标」后这句提示消失（形状不再是假的）",
+               "非等比例" not in v.plane_note.cget("text"))
+            v.equal_axes.set(False)
+
+            # ⑦ 正视 2D 方格纸：改分度值图线必须跟着缩放（2026-11-18 用户报）。
+            # 根因：`_on_tick_edit` 改完 lims 只写 3D 的 ax，可见的 ax2d 没动，
+            # 于是网格变了画面却不动。这条钉 ax2d 的实际跨度 = step×8。
+            v.view_box.set("前视（相机看到的）")
+            v._on_view_preset()
+            for _step in ("0.01", "0.005", "0.001"):
+                v.tick_vars["x"].set(_step)
+                v._on_tick_edit()
+                _lo, _hi = v.ax2d.get_xlim()
+                _span = float(_hi - _lo)
+                ck(f"正视2D 分度值 {_step} → 图线跨度 {_span:.6f} = 8 格",
+                   abs(_span - float(_step) * TICK_GRID_CELLS) < 1e-9)
+
+            # ⑧ 正视 2D 右键上下拖动方向：内容跟手（2026-11-18 用户报反了）。
+            # 反转轴（ylim=(hi,lo)）的 y 位移符号与非反转轴相反，早先共用同一个
+            # 减号 → 鼠标上拖内容反而下移。用 matplotlib 屏幕坐标量位移。
+            import types as _types
+            v.tick_vars["x"].set("0.005")
+            v._on_tick_edit()
+            _P = v.P_raw
+            _h, _vv = v._ax2d_pair
+            _yl = v.ax2d.get_ylim()
+            _inside = (_P[:, _vv] >= min(_yl)) & (_P[:, _vv] <= max(_yl))
+            _j = int(np.where(_inside)[0][0]) if _inside.any() else 0
+            _yd = float(_P[_j, _vv])
+
+            def _screen_y(_viewer):
+                _l = _viewer.ax2d.get_ylim()
+                _bb = _viewer.ax2d.bbox
+                return ((_yd - _l[0]) / (_l[1] - _l[0]) * _bb.height
+                        + _bb.y0)
+
+            _ev = lambda _x, _y: _types.SimpleNamespace(
+                x=_x, y=_y, button=3, key=None, inaxes=v.ax2d)
+            for _label, _dy in (("上", 100), ("下", -100)):
+                _before = _screen_y(v)
+                v._on_press(_ev(250, 150))
+                v._on_motion(_ev(250, 150 + _dy))
+                v._on_release(_ev(250, 150 + _dy))
+                _after = _screen_y(v)
+                ck(f"正视2D（反转轴）鼠标{_label}拖100px → 内容同向移 "
+                   f"{_after - _before:+.1f}px",
+                   (_after > _before) if _dy > 0 else (_after < _before))
+        finally:
+            if v is not None:
+                v.close()            # 释放视频句柄再 destroy，Windows 才删得掉临时目录
+
+    print(f"  共 {len(checks)} 项：" + ("全部通过" if all(k for _l, k in checks)
+                                      else "有不达标项"))
+    return all(k for _l, k in checks)
+
+
 def main() -> int:
     print("=" * 70)
     print("叠加层缩放自测（viz.scale：整张图所有元素一起缩放）")
@@ -1148,7 +1497,8 @@ def main() -> int:
                test_hud_text_is_immune_to_display_width,
                test_mono_visualization_contract,
                test_valid_frame_gate_contract,
-               test_viewer_inset_smoothing):
+               test_viewer_inset_smoothing,
+               test_viewer_tick_step_scales_trajectory):
         results.append(fn())
         print()
     ok = all(results)

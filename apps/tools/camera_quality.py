@@ -105,8 +105,14 @@ def measure(index: int, *, seconds: float = 2.0, width: int = 1920,
     q = Quality(index=index, name=(devices.get(index).name if index in devices else ""),
                 req_w=width, req_h=height)
     try:
+        # 首帧等待显式给 30 s，不能沿用库默认 3.0（sources.py:388 那是给快设备的）。
+        # 本机 aoni 相机首帧约 23 s（AGENTS.md:386-391）；相机链路的实测下限是
+        # apps/tools/cameras.py:431 的 PREVIEW_FIRST_FRAME_S = 30.0，
+        # apps/record_stereo.py:156、sphere_tracker/camera_registry.py:491 也都显式传 30。
+        # 画质诊断工具若沿用 3.0，`--indices N` 单台试开会把慢相机误判成「打不开」。
         src = CameraSource(index=index, width=width, height=height, fps=fps,
-                           backend=_backend_const(backend))
+                           backend=_backend_const(backend),
+                           first_frame_timeout_s=30.0)
     except RuntimeError as exc:
         q.error = (str(exc).splitlines() or [type(exc).__name__])[0]
         return q

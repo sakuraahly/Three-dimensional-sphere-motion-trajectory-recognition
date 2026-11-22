@@ -66,13 +66,15 @@ import numpy as np  # noqa: E402
 
 from _common import log_environment, setup_logging  # noqa: E402
 from apps._window import DEFAULT_WINDOW_SIZE, WindowManager  # noqa: E402
-from calib.board import BoardObservation, BoardSpec, detect_board  # noqa: E402
+from calib.board import (  # noqa: E402
+    BoardObservation, BoardSpec, detect_board, detect_two_boards)
 from calib.board_coverage import (  # noqa: E402
     MIN_PER_REGION, REF_STILL_PX, REGIONS_TOTAL, coverage_level,
     coverage_ok, coverage_ok_counts, green_regions, reference_shift, region_of)
 from calib.capture import CaptureConfig, focus_gate  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
 from sphere_tracker.sources import open_source  # noqa: E402
+from sphere_tracker.video_profiles import fps_type  # noqa: E402
 
 log = logging.getLogger("capture_board")
 
@@ -82,6 +84,13 @@ _FOCUS_DEFAULTS = CaptureConfig()
 
 # 粗检用的宽度：960 宽在 1440p 上约 30~50 ms，够实时对准；精确复核仍用全分辨率。
 GATE_WORK_WIDTH = 960
+
+# 同框图（`--pair`）取景窗的实时双板 HUD：缩到这个宽度跑 `detect_two_boards`
+# （与 `detect_two_boards` 在 960 宽 5/5 BOTH 的实测口径一致），每 0.4 s 一次。
+# HUD **只显示**，不参与保存判定 —— 能不能用由 `check_chain_inputs.check_pairs`
+# （全分辨率）说了算。
+PAIR_HUD_WIDTH = 960
+PAIR_HUD_EVERY_S = 0.4
 
 # 采集边车文件名。**每个保存目录各写一份自包含的**（双路模式 out_left /
 # out_right 两个目录各一份，不写父目录单文件）—— 目录被单独复制/移动后，
@@ -104,18 +113,47 @@ def _tool_version() -> str:
     return "unknown"
 
 
-def _camera_identity(want: str | None) -> dict:
-    """沿用一个老名字：实现已搬到 `sphere_tracker.camera_registry.describe_identity`。
+def _opened_index(want: str | None) -> int | None:
+    """这次采集**实际用**的采集编号（解析不出就 None，不猜）。"""
+    try:
+        return cr.resolve_camera_arg(want, interactive=False)
+    except Exception:                                        # noqa: BLE001
+        return None
 
-    搬家的理由：单目录像（`apps/record_mono.py`）也要写同一份身份，
-    两处各写一份迟早漂移成"一处记 name、一处只记 index"。
+
+def _camera_identity(want: str | None, index: int | None = None) -> dict:
+    """这次采集**实际打开**的那台设备的四件套（2026-11-11 修，含 Critic 复核）。
+
+    原实现只认「角色绑定」（`cr.describe_identity(camera)`）：用户手动选的那路
+    会被记成角色绑定的另一台（实测把 aoni 记成 "Integrated IR Camera"）。
+    现在优先按**实际采集编号**回查 PnP 表：`#N` 来自 PnP 枚举，MSMF 下实测与
+    PnP 位次一致（AGENTS.md §9，**实测口径**）。
+
+    ⚠ 给了编号却查不到时**留空**，绝不回退角色绑定（2026-11-11 Critic 实测：
+    `_camera_identity("left", 99)` 曾返回 aoni left + camera_index=0 —— 把一台
+    无关设备的身份贴在 99 号上，比没有元数据更危险）。编号也只在命中时写。
     """
+    if index is not None:
+        try:
+            for d in cr.list_devices():
+                if int(getattr(d, "order", -1)) == int(index):
+                    return {"camera_name": str(getattr(d, "name", "") or ""),
+                            "camera_identity": str(getattr(d, "identity", "") or ""),
+                            "camera_port": str(getattr(d, "port", "") or ""),
+                            "camera_index": int(index)}
+        except Exception:                                    # noqa: BLE001
+            pass
+        return {"camera_name": "", "camera_identity": "",
+                "camera_port": "", "camera_index": None}
+    # 没有编号（调用方没给 / 解析不出来）才退回角色绑定那套；这是"没信息"
+    # 不是"有错编号"，两者必须分开处理。
     return cr.describe_identity(want)
 
 
 def write_capture_sidecar(out_dir: Path, spec: BoardSpec, *, camera: str,
                           width: int, height: int, fps: float,
-                          backend: str, count: int) -> Path:
+                          backend: str, count: int,
+                          camera_index: int | None = None) -> Path:
     """把采集元数据写成 ``<out_dir>/_capture.json``，返回边车路径。
 
     为什么必须有（2026-10-27 计划书 §3.1 ②）：此前采集只写日志不落盘，
@@ -133,7 +171,7 @@ def write_capture_sidecar(out_dir: Path, spec: BoardSpec, *, camera: str,
         "camera": camera,
         # 角色名之外再记**设备身份**（四件套）。原有的 "camera" 键保留不动：
         # 已经有边车文件与读它的代码按它走，改名等于制造第二份真相。
-        **_camera_identity(camera),
+        **_camera_identity(camera, camera_index),
         "width": int(width),
         "height": int(height),
         "fps": float(fps),
@@ -564,7 +602,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="相机后端（默认 auto，由 CameraSource 成对挑）")
     ap.add_argument("--width", type=int, default=2560, help="采集宽度（默认 2560）")
     ap.add_argument("--height", type=int, default=1440, help="采集高度（默认 1440）")
-    ap.add_argument("--fps", type=int, default=30, help="采集帧率（默认 30）")
+    ap.add_argument("--fps", type=fps_type, default=30,
+                    help="采集帧率（默认 30，可填小数，如 29.97）")
     ap.add_argument("--cols", type=int, default=8, help="标定板内角点列数（默认 8）")
     ap.add_argument("--rows", type=int, default=5, help="标定板内角点行数（默认 5）")
     ap.add_argument("--square", type=float, default=25.0, help="方格边长 mm（默认 25）")
@@ -665,16 +704,66 @@ def _make_dir(path: str | None) -> Path | None:
     return p
 
 
+def _pair_box(corners) -> tuple[int, int, int, int]:          # noqa: ANN001
+    """四个角点的外接矩形 (x0, y0, x1, y1)，整数像素。"""
+    pts = np.asarray(corners, np.float32).reshape(-1, 2)
+    return (int(pts[:, 0].min()), int(pts[:, 1].min()),
+            int(pts[:, 0].max()), int(pts[:, 1].max()))
+
+
+def _pair_hud_state(frame, spec: BoardSpec):                 # noqa: ANN001
+    """同框图取景窗的**检测状态**：两块 / 一块 / 没有。
+
+    纯函数（不碰相机、不写文件），便于用已保存的真图验证。返回
+    ``(status, color_bgr, boxes)``，``boxes`` 是**原图坐标**的
+    ``(x0, y0, x1, y1)`` 列表（960 宽下检测完再按比例换算回去）。
+
+    为什么只当 HUD 用、不当门禁：同框图能不能用，最终由
+    `check_chain_inputs.check_pairs`（全分辨率）说了算；UI 只负责把
+    "现在检出了几块"实时摆到用户眼前（此前 `--pair` 窗口**完全不检测**，
+    用户看不出对面那两块板到底检没检出）。
+    """
+    h, w = frame.shape[:2]
+    scale = (PAIR_HUD_WIDTH / float(w)) if w > PAIR_HUD_WIDTH else 1.0
+    small = frame
+    if scale != 1.0:
+        small = cv2.resize(
+            frame, (PAIR_HUD_WIDTH, max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
+    inv = 1.0 / scale
+
+    def _full(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        x0, y0, x1, y1 = box
+        return (max(0, min(w - 1, int(round(x0 * inv)))),
+                max(0, min(h - 1, int(round(y0 * inv)))),
+                max(0, min(w - 1, int(round(x1 * inv)))),
+                max(0, min(h - 1, int(round(y1 * inv)))))
+
+    both = detect_two_boards(gray, spec)
+    if both is not None:
+        return ("✅ 两块板都检出", (80, 220, 120),
+                [_full(_pair_box(o.corners)) for o in both])
+    one = detect_board(gray, spec, exhaustive=True)
+    if one.found and one.corners is not None:
+        return ("⚠️ 只检出 1 块（另一块可能被裁边/太斜）", (60, 180, 255),
+                [_full(_pair_box(one.corners))])
+    return ("❌ 未检出（把两块板都放进画面）", (60, 60, 220), [])
+
+
 def _run_pair(args, out_dir: Path, show: bool, auto: bool,
-             gap: float) -> int:
-    """双板链式的**同框图**采集：单相机、**不做单板检测**、按空格/定时存一帧。
+              gap: float, spec: BoardSpec) -> int:
+    """双板链式的**同框图**采集：单相机、按空格/定时存一帧，**带实时双板 HUD**。
 
     为什么单独立一个函数而不是塞进 `_run_single`：同框图里**两块板同时入画**，
     单板检测器（`detect_board`）必然失败，`gate_frame` 那套"检板→判稳→判糊"
     完全用不上。硬塞进去只会让"pair 特例"污染正常的标定图采集循环。
 
     存图只靠人按空格（或 --auto 定时）：同框图的正确性由**人当场判断**
-    （两块板都完整、清晰、不糊），机器在这件事上帮不上忙。
+    （两块板都完整、清晰、不糊）。2026-11-11 起取景窗会实时跑
+    `detect_two_boards`（缩到 960 宽、每 0.4 s 一次），把"检出了几块"画在画面
+    和 footer 上 —— 但 **HUD 只显示、不拦保存**：最终由
+    `check_chain_inputs.check_pairs` 的全分辨率自检说了算。
     """
     # 窗口助手在第一次用之前建好（`selftest_window_mode` 的"先建后用"约定）
     wins = WindowManager()
@@ -689,6 +778,10 @@ def _run_pair(args, out_dir: Path, show: bool, auto: bool,
 
     saved = 0
     last_save_ts: float | None = None
+    # HUD 状态：只影响**显示与日志**，不改保存/自检语义
+    hud_status, hud_color, hud_boxes = ("❌ 未检出（把两块板都放进画面）",
+                                        (60, 60, 220), [])
+    last_hud = 0.0
     t0 = time.perf_counter()
     try:
         while True:
@@ -702,13 +795,37 @@ def _run_pair(args, out_dir: Path, show: bool, auto: bool,
 
             pressed = -1
             if show:
-                footer = (f"{saved}/{args.target} 张   同框图：两块板都完整、清晰再存   "
+                # 实时双板 HUD（每 0.4 s）：只显示"现在检出了几块"，
+                # **不参与保存判定** —— 同框图能不能用由 `check_chain_inputs`
+                # 的全分辨率自检说了算。
+                now = time.perf_counter()
+                if now - last_hud >= PAIR_HUD_EVERY_S:
+                    hud_status, hud_color, hud_boxes = _pair_hud_state(frame, spec)
+                    last_hud = now
+                # 标注只画在**副本**上：保存走的仍是原始 `frame`（HUD 不进文件）。
+                view = frame.copy()
+                for (bx0, by0, bx1, by1) in hud_boxes:
+                    cv2.rectangle(view, (bx0, by0), (bx1, by1), hud_color, 3,
+                                  cv2.LINE_AA)
+                fs_hud = max(0.6, view.shape[0] / 900.0)
+                (tw, th), _ = cv2.getTextSize(hud_status,
+                                              cv2.FONT_HERSHEY_SIMPLEX, fs_hud, 2)
+                tx = max(12, (view.shape[1] - tw) // 2)
+                ty = int(40 * fs_hud)
+                pad = int(10 * fs_hud)
+                cv2.rectangle(view, (tx - pad, ty - th - pad), (tx + tw + pad, ty + pad),
+                              (26, 26, 26), -1)
+                cv2.putText(view, hud_status, (tx, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, fs_hud, hud_color, 2,
+                            cv2.LINE_AA)
+                footer = (f"{saved}/{args.target} 张   {hud_status}   "
+                          f"HUD 只报检出，存完仍要自检   "
                           f"空格 保存   q 退出   {wins.fullscreen_hint()}")
                 # obs 用空观测（found=False）而不是 None：`_paint_lane` 会读
-                # obs.found，传 None 直接 AttributeError。同框图不检板，所以
-                # 引导框/角点都不该出现，只画原图 + 底部提示。
+                # obs.found，传 None 直接 AttributeError。同框图不走单板检测，
+                # 引导框/角点都不该出现，只画（已标注的）画面 + 底部提示。
                 canvas = _compose(
-                    [{"title": f"{args.side or '相机'}", "frame": frame,
+                    [{"title": f"{args.side or '相机'}", "frame": view,
                       "obs": BoardObservation(), "ok": True, "reason": "",
                       "spec": None}],
                     _canvas_size(VIEW_SINGLE), footer, True)
@@ -727,6 +844,11 @@ def _run_pair(args, out_dir: Path, show: bool, auto: bool,
             if not (manual or auto_fire):
                 continue
 
+            # HUD 不是门禁：不拦保存，只把"这一张检出了几块"写进日志，
+            # 谁对谁错留给全分辨率自检（check_chain_inputs）判。
+            if show and not hud_status.startswith("✅"):
+                log.info("保存时只检出 %d 块（HUD：%s）；能否标定以 check_chain_inputs 为准",
+                         len(hud_boxes), hud_status)
             name = f"pair_{saved + 1:02d}_{int(time.time() * 1000)}.png"
             path = out_dir / name
             if not cv2.imwrite(str(path), frame):
@@ -760,7 +882,7 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
     wins = WindowManager()
 
     if args.pair:
-        return _run_pair(args, out_dir, show, auto, gap)
+        return _run_pair(args, out_dir, show, auto, gap, spec)
 
     try:
         src = _open_source(args.source, args.camera, args, side=args.side)
@@ -952,7 +1074,8 @@ def _run_single(args, spec: BoardSpec, out_dir: Path) -> int:
         sidecar = write_capture_sidecar(
             out_dir, spec, camera=args.camera or args.side or "",
             width=src.info.width, height=src.info.height, fps=src.info.fps,
-            backend=src.info.backend, count=len(saved))
+            backend=src.info.backend, count=len(saved),
+            camera_index=_opened_index(args.camera or args.side or ""))
     except OSError as exc:
         print(f"[错误] 元数据边车写不进：{out_dir / SIDECAR_NAME}（{exc}）")
         return 1
@@ -1150,7 +1273,7 @@ def _run_both(args, spec: BoardSpec, out_left: Path, out_right: Path) -> int:
             sidecar = write_capture_sidecar(
                 out_dir, spec, camera=camera, width=info.width,
                 height=info.height, fps=info.fps, backend=info.backend,
-                count=saved)
+                count=saved, camera_index=_opened_index(camera))
         except OSError as exc:
             print(f"[错误] 元数据边车写不进：{out_dir / SIDECAR_NAME}（{exc}）")
             return 1

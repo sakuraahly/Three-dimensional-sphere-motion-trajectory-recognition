@@ -11,7 +11,7 @@
 
 | 谁 | 负责 |
 | -- | ---- |
-| `apps/tools/check_standards.py` | **权威实现**：路径引用 / 规范来源 / 派生事实 三类检查；`启动程序.bat standards` 调它 |
+| `apps/tools/check_standards.py` | **权威实现**：路径引用 / 规范来源 / 派生事实 三类检查；`run.bat standards` 调它 |
 | `apps/tools/sync_facts.py` | **计数的权威实现**（被上面那个委托） |
 | 本文件 | **测试外壳**：钉住"清单与登记不退化"，并验证权威实现真的能抓到新漂移 |
 
@@ -87,12 +87,27 @@ SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 #             **用户签字在案**：计划书 §9 第 3 条"测试 24→25/26"，见 §9 末段裁决）
 #       → 26（2026-10-28 加 `selftest_mono_calib.py`：合成棋盘回收内参 +
 #             判定反向自证。同一份签字里的"26"）。
+#       → 27（2026-11-09 加 `selftest_session_index.py`：数据管理的组织层 ——
+#             虚拟集合树 / 递归枚举 / 派生索引。**依据是用户这一轮的原始要求**：
+#             "数据打包在一起按照目录管理，不能只按时间管理……做成类似文件资源管理器的
+#             模式……你要组织团队来做，先审计想想有没有更好的方案再开始执行"，
+#             计划书 `docs/planbooks/2026-11-09_目录化数据管理.md` §7 的 9 条验收判据。
+#             这次不是"顺手扩一格"：它守的是一整层新代码（`apps/_session_index.py`），
+#             42 个检查点全部对着"静默丢会话"这类失效，不写测试等于没有护栏）。
+#       → 28（2026-11-09 加 `selftest_highspeed.py` 之前的最后一次；此后的 +1 见下）
+#       → 29（2026-11-18 加 `selftest_highspeed.py`：高帧率/高分辨率档位扩容的
+#             不变量。**用户这一轮的原始要求**是"以后用 ≥500 fps、4K 以上的相机，
+#             升级程序能处理的档次，**不要影响现有的挡位功能**"。这一格不是"顺手扩"：
+#             扩档位时踩过一次真坑 —— 在 `PROFILES` 顶部加 8K/5K 会让
+#             `DEFAULT = PROFILES[1]` 从 2560x1440 **静默漂成** 5120x2880，
+#             而默认档漂移不报错，只让所有录制/标定悄悄换分辨率。所以这个测试守的
+#             正是"加档不许改变现有行为"，并带 4 次反向自证（改坏 → 红 → 还原 → 绿）。
 #
-# **27 没有加**（2026-10-28）：`view_3d` 换会话的 9 条判据写进了
-# `selftest_launcher_params.py` 第 8d 节，没有新建 `selftest_view_3d.py`。
-# 原因是签字额度只到 26（计划书 §9 第 3 条"测试 24→25/26"），而这条守的是
-# 既有功能的一个 bug 修复 —— 不该顺手把测试预算扩一格。要扩得先有人签。
-REAL_TEST_COUNT = 26
+# **关于"27 没有加"（2026-10-28 的裁决，现已作废，留档）**：`view_3d` 换会话的
+# 9 条判据当时写进了 `selftest_launcher_params.py` 第 8d 节，没有新建
+# `selftest_view_3d.py` —— 理由是那只是既有功能的一个 bug 修复，不该顺手把测试
+# 预算扩一格。这条理由**对本次不成立**：本次是新增一层模块，不是修 bug。
+REAL_TEST_COUNT = 29
 # 测试命名规范（AGENTS.md §4）
 TEST_NAME_RE = re.compile(r"^selftest_[a-z0-9_]+\.py$")
 # 临时探针用的假路径（造一处新漂移用；用完即删）
@@ -425,9 +440,9 @@ def test_handover_section_13_claims() -> bool:
     FACTS = [
         ("标定默认 40 / 20", "apps/calibrate_stereo.py",
          ["default=40", "default=20"]),
-        ("GUI 把 --display-width 传下去", "启动程序.py", ["--display-width"]),
-        ("GUI 用 resolve_roles（两个角色不撞车）", "启动程序.py", ["resolve_roles"]),
-        ("GUI 有任务管理器且杀进程树", "启动程序.py", ["def stop_task", "taskkill"]),
+        ("GUI 把 --display-width 传下去", "apps/gui_main.py", ["--display-width"]),
+        ("GUI 用 resolve_roles（两个角色不撞车）", "apps/gui_main.py", ["resolve_roles"]),
+        ("GUI 有任务管理器且杀进程树", "apps/gui_main.py", ["def stop_task", "taskkill"]),
         ("同名相机歧义会被拦下", "sphere_tracker/camera_registry.py",
          ["class AmbiguousMatch", "def resolve_roles"]),
         ("「打开了但没帧」报错且不自动换后端", "sphere_tracker/sources.py",
@@ -461,14 +476,14 @@ def test_handover_section_13_claims() -> bool:
         checks.append((label, ok))
 
     # GUI 标定面板的默认值：断言**值**，不断言"源码里有这几个字符串"（2026-10-26）。
-    # 旧写法要求 启动程序.py 里出现 '"40"'/'"20"'/'"24"' —— 一旦控件换成 IntVar/Spinbox，
+    # 旧写法要求 apps/gui_main.py 里出现 '"40"'/'"20"'/'"24"' —— 一旦控件换成 IntVar/Spinbox，
     # 行为完全正确也会红。现在默认值提成模块常量，直接读常量值。
     try:
-        import 启动程序 as _gui
+        from apps import gui_main as _gui
         got = (_gui.CALIB_TARGET_PAIRS, _gui.CALIB_MIN_PAIRS, _gui.CALIB_FPS_DEFAULT)
     except Exception as exc:                      # noqa: BLE001 - 导入失败本身就是问题
         got, err = None, f"{type(exc).__name__}: {exc}"
-        print(f"    导入 启动程序 失败：{err}")
+        print(f"    导入 apps.gui_main 失败：{err}")
     checks.append(("GUI 标定面板默认 40 / 20 / 24（按常量值断言，不靠源码字面量）",
                    got == (40, 20, "24")))
 
@@ -611,7 +626,7 @@ def main() -> int:
     # （`apps/run_tests.py`）失败时只回显**最后几行** —— 于是"哪一节红的"
     # 恰好被截掉，只剩一个孤零零的 `有不达标项`。
     # 2026-10-14 就撞上过一次：整套里红、单独跑连跑 8 次全绿、
-    # `check_standards.py` 连跑 8 次退出码全 0、`启动程序.py` 的相关串也都在，
+    # `check_standards.py` 连跑 8 次退出码全 0、`apps/gui_main.py` 的相关串也都在，
     # **根因没能定位**（疑为并发改文件时检查器扫到中间态）。
     # 那次之所以难查，一半原因就是**输出被截断**。
     # 所以把结论行放在最后、并且逐节重述 —— 下次至少能一眼看出该查哪一节。

@@ -109,7 +109,7 @@ MUST_RUN = (
 # 没有实测耗时的测试会被塞进 fast 里跑掉（见 `classify` 的文档串），
 # 而 `selftest_mutation_guards.py` **会临时改写源码文件**（改完靠 SHA256 校验还原）。
 # 让它在 `fast` 档里跑有两个后果：
-#   ① `启动程序.bat test` 的耗时成倍增加 —— 快速自检就此失去意义；
+#   ① `run.bat test` 的耗时成倍增加 —— 快速自检就此失去意义；
 #   ② 它在运行期把某个源码文件改成"缺陷版"，**同进程/同仓的任何并发观察者
 #      都会看到坏代码**（当前运行器是串行的 [已核实]，但把这种前提交给
 #      "千万别改成并行"来维持，太脆）。
@@ -252,7 +252,7 @@ def run_one(name: str, timeout: float, *,
     passed = (PASS_MARKER in out) and proc.returncode == 0
     res.status = "pass" if passed else "fail"
     if not passed:
-        res.tail = _tail(out)
+        res.tail = _digest(out)
         if res.exit_code not in (0, None):
             res.note = f"退出码 {res.exit_code}"
         elif PASS_MARKER not in out:
@@ -263,6 +263,34 @@ def run_one(name: str, timeout: float, *,
 def _tail(text: str, n: int = 6) -> list[str]:
     lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
     return lines[-n:]
+
+
+#: 失败时值得单独捞出来的行。用**具体**标记，不用"不达标"三个字 ——
+#: 收尾的"不达标 2 项："和"判定结果：有不达标项"也含它，捞进来只是噪声。
+_FAIL_MARKS = ("[不达标]", "Traceback", "AssertionError", "Exception",
+               "Error:", "error:", "异常：", "异常:", "FAIL:")
+
+
+def _digest(text: str, n: int = 6) -> list[str]:
+    """失败时的定位信息：**先捞判据行，再补末尾几行**。
+
+    只留最后 n 行是不够的。一个测试打几十行，`[不达标] …` 通常在十几行之前，
+    末尾只剩 Tk 的 `invalid command name "…_poll_ui"` 这类 stderr 噪声 ——
+    于是"哪一条红的"被截掉，只剩一个孤零零的"有不达标项"。
+    2026-10-14（`selftest_doc_facts` 并发红）和 2026-11-07（本仓库 Critic 复评
+    报 `selftest_launcher_params` 红、实际根因是 i18n 漏译）都栽在这上面：
+    真正的原因被尾部噪声盖住，人都去找错方向了。
+    """
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    picked: list[str] = []
+    for ln in lines:
+        if any(m in ln for m in _FAIL_MARKS) and ln not in picked:
+            picked.append(ln)
+    picked = picked[-n:]
+    for ln in lines[-n:]:
+        if ln not in picked:
+            picked.append(ln)
+    return picked
 
 
 def _print_result(idx: int, total: int, r: TestResult) -> None:
@@ -450,9 +478,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("分层依据：还没有实测耗时 —— 这一次会跑全套，跑完就记住了")
     print(f"保底名单（无论计时如何都跑）：{', '.join(MUST_RUN)}")
-    if slow:
+    # B-156：`slow` 是按耗时算出来的"慢测试清单"，与**本档实际跳过什么**不是一回事 ——
+    # full 档会把它们全部跑掉，旧版却照着 `slow` 打印「本档跳过」，列出的其实都跑了。
+    # 改成按 `all_names - selected` 求真实跳过集；没有真跳过就整段不打印。
+    actually_skipped = [n for n in all_names if n not in set(selected)]
+    if actually_skipped:
         print("本档跳过：")
-        for n in slow:
+        for n in actually_skipped:
             # ⚠️ `NEVER_FAST` 的测试**可能完全没有计时数据**（第一次就是被排除了），
             # 所以这里不能直接 `timings[n]` —— 那会在第一次引入时就 KeyError 崩掉
             # （2026-10-15 实测：引入 selftest_mutation_guards 后 `test full` 直接崩）。

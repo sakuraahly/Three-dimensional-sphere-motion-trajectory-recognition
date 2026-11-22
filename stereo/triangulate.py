@@ -340,6 +340,63 @@ def geometry_verdict(dy_samples, quality=None,
                            epipolar_max=worst, suspect=bool(suspect))
 
 
+def classify_guard(v: GeometryVerdict | None, sig: dict) -> str:
+    """把几何守卫判出的 ``suspect`` 再分流：是「检出质量差」还是「真几何不一致」。
+
+    只在 ``v.suspect is True`` 时调用，返回三者之一：
+    ``"ok"``（不可疑/没判出）、``"detection_quality"``、``"geometry_mismatch"``。
+
+    **为什么必须保守**：``geometry_verdict()`` 的 suspect 判据（有自报值时
+    ``med/rms>=4 且 med>=3``，没有时 ``med>=3``）是识别「录像与标定不一致」的
+    唯一能力，判据本身**不许改**。而能把 dy 中位抬高的近因不止一种：换了检测器
+    后形状门/分数门拒掉大量候选、圆心退回框中心、遮挡/预热期两路同时检出少，
+    这些都会让 dy 偏大，却与「装置被碰动」修法相反 —— 该换检测器/预设/点选球心，
+    不该去重新标定。但遮挡、预热期与**真几何不一致**的 dy 信号会重叠：若允许
+    这些弱证据单独把结论降级为「检出质量差」，那么装置真被碰动、恰好又有遮挡的
+    会话就会被漏报，不再提示重新标定。因此这里**保守优先**：
+
+    1. 形状门/分数门拒绝占比 ``(circ+fill+radial+score)/candidates > 0.5``，或
+       ``biggest.gate ∈ {circ,fill,radial,score}`` 的帧占比 > 0.5 → 最硬证据；
+    2. ``center_box_share > 0.5`` → 沿用 :meth:`geometry_failure_message` 里
+       那条「先排除圆心没钉到轮廓」的既有门槛；
+
+    只有命中 1/2 这类**强证据**才降级为 ``detection_quality``。判据 3
+    （``both_detected_rate < 0.5``）与判据 4（``seed_anchor_share > 0.3``）只作
+    补充：它们已由主循环汇总进 ``sig``，写进 payload / 结构化标记供诊断，
+    **绝不单独把 geometry_mismatch 降级**。强证据都不命中时一律返回
+    ``geometry_mismatch``（保守兜底），保证真几何不一致仍被识别、文案仍给
+    「重新标定」。
+
+    ``sig`` 的键（全部可选，缺省按保守处理）：``gates``（各门累计拒绝数）、
+    ``candidates``（总候选数；不给时用各门拒绝数之和兜底）、
+    ``biggest_gate_share``、``center_box_share``、``both_detected_rate``、
+    ``seed_anchor_share``。
+    """
+    if v is None or not v.suspect:
+        return "ok"
+    gates = dict(sig.get("gates") or {})
+    # 只数形状门 / 分数门：尺寸门（radius）被单独排除，尺寸问题多半是缩放/球径
+    # 档位，不足以说明「这一侧圆心没钉准」。
+    shape_score_rejects = sum(float(gates.get(k, 0))
+                              for k in ("circ", "fill", "radial", "score"))
+    candidates = sig.get("candidates")
+    if candidates is None:                    # 没显式给总候选数：用被门拒的候选数兜底
+        candidates = sum(float(x) for x in gates.values())
+    gate_reject_share = shape_score_rejects / max(float(candidates), 1.0)
+    biggest_gate_share = float(sig.get("biggest_gate_share", 0.0))
+    center_box_share = float(sig.get("center_box_share") or 0.0)
+
+    # 判据 1 + 判据 2：强证据，命中即降级。
+    if (gate_reject_share > 0.5 or biggest_gate_share > 0.5
+            or center_box_share > 0.5):
+        return "detection_quality"
+    # 判据 3/4 是弱证据，只作补充、不许单独降级（见 docstring）。它们已由主循环
+    # 汇总进 sig，供 payload / 结构化标记说明，不改变这里的保守结论：
+    #   both_detected_rate = float(sig.get("both_detected_rate", 1.0)) < 0.5
+    #   seed_anchor_share  = float(sig.get("seed_anchor_share", 0.0)) > 0.3
+    return "geometry_mismatch"
+
+
 @dataclass(frozen=True)
 class RadiusAnchor:
     """一次人工点选（左右各点一次球心）定出的「可信半径比」。
@@ -498,6 +555,11 @@ class StereoReconstructor:
     #: 只测量、不参与配对，用来在低配对率时说清"是几何对不上，还是检测丢了"。
     dy_samples: list[float] = field(default_factory=list)
 
+    #: 离线重建入口按新原则「质量差也照常出结果」：设 True 时 0 配对**不抛**
+    #: RuntimeError，由入口自己打印诊断 + 写 quality 标记。库层默认 False ——
+    #: mono_vs_stereo / profile_stages 等其它调用方仍受「静默失效」防呆保护。
+    allow_zero_match: bool = False
+
     def __post_init__(self) -> None:
         # ---- 使用点护栏：none_raw（链式/未校正）不能走 parallel 重建 ----
         # 为什么必须在这里拦、而不是只靠入口写对 meta：
@@ -577,8 +639,11 @@ class StereoReconstructor:
         effective = self.n_frames - max(0, int(self.warmup_frames))
         if effective < SILENT_FAILURE_MIN_FRAMES:
             return
-        if self.n_matched == 0:
+        if self.n_matched == 0 and not self.allow_zero_match:
             raise RuntimeError(self._zero_match_message())
+        # 注意：上面只放行「0 配对抛错」，下面这段**低配对率 warning 必须保留** ——
+        # 新原则是「不中止」，不是「不告警」。allow_zero_match=True 时 0 配对也会
+        # 走到这里（rate=0 < LOW_MATCH_RATE），照样把警告留在 rec.warnings 里。
         rate = self.n_matched / effective
         if rate < LOW_MATCH_RATE and not self._low_rate_warned:
             self._low_rate_warned = True
@@ -732,7 +797,9 @@ class StereoReconstructor:
         return "" if not lines else "\n" + "\n".join(lines)
 
     def geometry_failure_message(self, v: GeometryVerdict | None = None,
-                                 center_box_share: float | None = None) -> str:
+                                 center_box_share: float | None = None,
+                                 cause: str | None = None,
+                                 sig: dict | None = None) -> str:
         """"录像与标定对不上"的报错文案（**判据不在这里**，判在 :func:`geometry_verdict`）。
 
         为什么要单独有这句话：`B-131`（2026-10-30 实测）那段会话 dy 中位
@@ -753,6 +820,33 @@ class StereoReconstructor:
             return ""
         ref = (f"标定自报 极线误差 {v.epipolar_rms:.2f} px，相差 {v.ratio:.0f} 倍"
                if v.has_ref else "标定没给自报极线误差，按绝对值判（中位 ≥ 3 px 即可疑）")
+        # cause="detection_quality"：dy 偏大更可能是**这一侧检出质量差**（形状门/
+        # 分数门拒了大量候选、圆心没钉准），不是装置被碰动。走一套分开的报文案：
+        # 不出现「重新标定」、也不拼 _geometry_suffix()（那半句会带「建议重新标定」）。
+        # cause 为 None 或 "geometry_mismatch" 时，下面原文案一字不动。
+        if cause == "detection_quality":
+            s = sig or {}
+            g = s.get("gates") or {}
+            gates_txt = "、".join(
+                f"{k}={int(n)}" for k, n in g.items()
+                if isinstance(n, (int, float)) and int(n) > 0) or "未汇总到拒绝计数"
+            bdr = s.get("both_detected_rate")
+            bdr_txt = (f"{float(bdr):.0%}" if isinstance(bdr, (int, float))
+                       else "偏低")
+            return (
+                f"parallel 模式：左右圆心（校正后）y 差实测中位 {v.med:.1f} px"
+                f"（p95 {v.p95:.1f}，n={v.n}），{ref}；"
+                f"当前配对 {self.n_matched}/{self.n_frames}。\n"
+                "  但**这更可能是这一侧的检出质量差，不是装置被碰动**："
+                f"形状门 / 分数门拒绝的候选（{gates_txt}）偏多、"
+                f"两路同时检出率 {bdr_txt}，大量候选过不了圆度 / 填充率 / 分数门，"
+                "圆心就没钉准，y 差自然偏大 —— 与『几何坏掉』长得一样，修法却相反。\n"
+                "  **标定本身没问题，别把时间花在标定上**：装置没动、标定没换，"
+                "这次多半只是换了检测器 / 预设。\n"
+                "  下一步：换检测器或预设（--method specular / 换 --preset 档位）、"
+                "点选球心给种子、检查掩膜与曝光 / 对焦；重跑后 dy 回落即说明是"
+                "检出质量，不是几何问题。\n"
+                "  结果照常输出、仅供参考（只想要几何数值可加 --geometry-guard 0）。")
         # 只有"多数帧都没钉到轮廓"才提这条：少数帧失败不足以解释整段的中位偏差。
         caveat = ""
         if center_box_share is not None and center_box_share > 0.5:
@@ -774,7 +868,7 @@ class StereoReconstructor:
             + caveat
             + "  第 1 步 确认装置没被碰动：相机是否挪过、改过对焦、左/右是否接反"
             "（接反时画面完全正常、标定也能过）。\n"
-            "  第 2 步 重新标定（启动程序.bat calibrate）后再重录这一段。\n"
+            "  第 2 步 重新标定（run.bat calibrate）后再重录这一段。\n"
             "  第 3 步 只想看几何差多少、不要它拦：加 --geometry-guard 0。"
             + self._geometry_suffix())
 

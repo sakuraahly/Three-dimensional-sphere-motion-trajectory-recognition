@@ -15,6 +15,7 @@ from ..config import DetectorConfig
 from ..plugins import register
 from .base import BaseDetector
 from .color import ColorBlobDetector
+from .generic import GenericBallDetector
 from .hough import HoughDetector
 from .motion import MotionDetector
 from .neural import YoloDetector, YoloSamDetector
@@ -48,3 +49,7 @@ register("detector", "yolo", YoloDetector,
 register("detector", "yolo_sam", YoloSamDetector,
          summary="YOLO 出框 + SAM 分割（精度最高、最吃算力；需 ultralytics）",
          needs=("ultralytics",))
+# 不依赖颜色的可选路径：边缘 + 圆度 + 径向一致性，识别近圆水果等任意球体。
+# 追加在末尾 —— 既有登记项的顺序与默认项（color）一字不动（R4/R7）。
+register("detector", "generic", GenericBallDetector,
+         summary="几何优先（边缘+圆度+径向一致性），不依赖颜色；近圆水果等任意球体可选")

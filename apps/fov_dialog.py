@@ -22,10 +22,18 @@
 2. **参数是像素量纲的**：换分辨率/换相机后旧值失效。所以记录里存了测量时的
    两路分辨率，后端发现不一致会直接报错，而不是沿用。
 3. **只改档案，不动标定**：这里不生成标定文件；标定仍由双目窗第②步做。
+
+装置级「应用」开关（2026-11-15）
+--------------------------------
+「启用」= **把这份 FOV 应用到当前装置的两路相机画面上**，是装置级事实，不是
+两个流程开关：标定与录制都服从它。本对话框的勾选框与双目窗第②步那个是**同一个
+开关**（都读写档案的 ``fov_apply``），由 :func:`stereo.fov_policy.resolve_fov_apply`
+统一判定后果。默认关；没有 FOV 记录时勾选框禁用。
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 import tkinter as tk
@@ -42,10 +50,10 @@ if str(ROOT) not in sys.path:
 from apps import _fov_store                                 # noqa: E402
 from apps._gui_widgets import BG, MUTED, WARN               # noqa: E402
 from sphere_tracker.paths import STEREO_ROOT                # noqa: E402
+from sphere_tracker.video_files import (                    # noqa: E402
+    pick_left_video, pick_right_video,
+)
 from stereo import profiles                                 # noqa: E402
-
-#: 会话里认作"两路视频"的名字（与 `record_stereo` 的产物一致）。
-_VIDEO_NAMES = ("left.mkv", "left.mp4", "left.avi")
 
 
 def _session_has_fov_record(sess: Path) -> bool:
@@ -75,12 +83,18 @@ class FovDialog(tk.Toplevel):
     def __init__(self, parent, app, on_changed=None) -> None:
         super().__init__(parent)
         self.app = app
+        # 这个对话框不经过 App.open_window（没有统一打标），自己登记归属键，
+        # 让起任务时的 owner=self.task_owner 与模式窗口径一致。
+        self.task_owner = "fov"
+        # 不经 App.open_window，没有 close_window 代劳：自己接 WM_DELETE_WINDOW，
+        # 按 X 时先停本窗起的任务，再销毁 —— 否则测量进程留在后台继续跑。
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.on_changed = on_changed
         self.title("FOV 管理器 · 两路固有视场差")
         self.configure(bg=BG)
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
+        # 标准窗口：最小化 / 最大化 / 关闭（AGENTS.md §7.1）。
+        # 不用 transient()（Windows 上变工具窗口、只剩 ×）、不锁尺寸、不全局 grab。
+        self.resizable(True, True)
 
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
@@ -120,6 +134,16 @@ class FovDialog(tk.Toplevel):
         self.status = ttk.Label(body, text="", foreground=MUTED, wraplength=560)
         self.status.pack(anchor="w", pady=(6, 8))
 
+        # 装置级「应用」开关：与双目窗第②步读写同一个档案字段 fov_apply。
+        # 没有 FOV 记录时禁用（启用一个不存在的记录没有意义，_load 里控制）。
+        self.var_apply = tk.BooleanVar(value=False)
+        self.chk_apply = ttk.Checkbutton(
+            body,
+            text="把这份 FOV 应用到当前装置的左右相机（标定与录制都服从）",
+            variable=self.var_apply, command=self._on_toggle_apply,
+            state="disabled")
+        self.chk_apply.pack(anchor="w", pady=(0, 8))
+
         bar = ttk.Frame(body)
         bar.pack(fill="x")
         ttk.Button(bar, text="刷新", command=self._load).pack(side="left")
@@ -154,6 +178,8 @@ class FovDialog(tk.Toplevel):
                      "FOV 记录是跟着装置走的。")
             for lbl in self._rows.values():
                 lbl.configure(text="—")
+            self.var_apply.set(False)
+            self.chk_apply.configure(state="disabled")
             self.status.configure(text="", foreground=MUTED)
             return
         mode = ("大角度（angled）" if getattr(prof, "stereo_mode", "") == "angled"
@@ -161,12 +187,16 @@ class FovDialog(tk.Toplevel):
         self.lbl_rig.configure(text=f"当前装置：{name}　模式：{mode}")
 
         fov = getattr(prof, "fov", None)
+        applied = bool(getattr(prof, "fov_apply", False))
+        # 管理器不需要标定文件：轻量逻辑直接读档案的 fov_apply 即可。
+        self.var_apply.set(applied and bool(fov))
+        self.chk_apply.configure(state="normal" if fov else "disabled")
         if not fov:
             for lbl in self._rows.values():
                 lbl.configure(text="—")
             self.status.configure(
-                text="这条档案还没有 FOV 记录。点「从会话量一次…」选一段双目录像，"
-                     "或标定一次（标定成功会自动记进来）。",
+                text="这条档案还没有 FOV 记录。点「从会话量一次…」选一段双目录像；"
+                     "标定带 FOV 时会自动记进来（不带 FOV 的标定不会写记录）。",
                 foreground=WARN)
             return
 
@@ -198,10 +228,16 @@ class FovDialog(tk.Toplevel):
                   if isinstance(q, (int, float)) else "—"))
         self._rows["seen"].configure(text=fov.get("measured_at") or "—")
         self._rows["source"].configure(text=fov.get("source") or "—")
-        self.status.configure(
-            text="平行标定会复用它（不用每次重新估）；90° 装置不裁剪，"
-                 "只拿它当「两路差多少」的事实。",
-            foreground=MUTED)
+        if applied:
+            self.status.configure(
+                text="已应用到当前装置的左右相机：平行标定复用这份参数、"
+                     "录制按它裁剪两路；90° 装置仍不裁剪。",
+                foreground=MUTED)
+        else:
+            self.status.configure(
+                text="记录已存，但未应用：标定按原始画面（--skip-fov）、"
+                     "录制不裁剪。要应用请勾上面的开关。",
+                foreground=MUTED)
 
     # -- 三个动作 ----------------------------------------------------------
     def _import_from_calibration(self) -> None:
@@ -256,15 +292,18 @@ class FovDialog(tk.Toplevel):
         if not picked:
             return
         sess = Path(picked)
-        left = next((sess / n for n in _VIDEO_NAMES if (sess / n).is_file()), None)
+        # 左/右各自独立查找（唯一产地 video_files）：不能按 left 的后缀推 right ——
+        # 左 .mkv + 右 .avi 的混合格式会话是合法的，那种写法会误报"找不到 right.mkv"。
+        left = pick_left_video(sess)
         if left is None:
             self.status.configure(
-                text=f"{sess.name} 里没有 left.mkv —— 这里要的是双目会话目录"
-                     f"（data/stereo/<时间戳>）", foreground=WARN)
+                text=f"{sess.name} 里没有左路视频（left.mkv/.mp4/.avi）—— "
+                     f"这里要的是双目会话目录（data/stereo/<时间戳>）", foreground=WARN)
             return
-        right = sess / ("right" + left.suffix)
-        if not right.is_file():
-            self.status.configure(text=f"找不到配对的 {right.name}", foreground=WARN)
+        right = pick_right_video(sess)
+        if right is None:
+            self.status.configure(text=f"{sess.name} 里没有右路视频（right.mkv/.mp4/.avi）",
+                                  foreground=WARN)
             return
 
         tool = ROOT / "apps" / "tools" / "measure_fov.py"
@@ -281,7 +320,8 @@ class FovDialog(tk.Toplevel):
                     f"（若这段录像已裁剪，会被拒绝而不是给假值）")
         self.status.configure(text=note, foreground=MUTED)
         self.app.tasks.start(cmd, f"取 FOV（{sess.name}）",
-                             on_done=self._on_measured)
+                             on_done=self._on_measured,
+                             owner=self.task_owner)
 
     def _on_measured(self, task) -> None:
         if not self._alive():
@@ -306,21 +346,45 @@ class FovDialog(tk.Toplevel):
             self.status.configure(text="先选一个装置档案", foreground=WARN)
             return
         try:
-            profiles.upsert(_replace_fov(prof, None), replace_existing=True)
+            # 清了记录就不能还开着应用开关：一起置 False。
+            profiles.upsert(dataclasses.replace(prof, fov=None, fov_apply=False),
+                            replace_existing=True)
         except profiles.ProfileError as exc:
             self.status.configure(text=f"清除失败：{exc}", foreground=WARN)
             return
         self.app.state.reload()
         self._load()
-        self.status.configure(text="已清除（下次标定会回到现场估计）", foreground=MUTED)
+        self.status.configure(text="已清除；应用开关已一并关闭", foreground=MUTED)
         if self.on_changed:
             self.on_changed()
 
+    def _on_toggle_apply(self) -> None:
+        """勾选/取消 = 改装置档案里那个装置级「是否应用」的开关。
 
-def _replace_fov(profile, fov):
-    import dataclasses
+        写档成功后重读 state、重绘本窗、通知门厅/窗口；写失败只动状态栏，
+        并把勾选框回滚到档案里的实际值，**不抛**。
+        """
+        prof = self._profile()
+        if prof is None or not self._profile_name():
+            self.var_apply.set(False)
+            return
+        want = bool(self.var_apply.get())
+        try:
+            profiles.upsert(dataclasses.replace(prof, fov_apply=want),
+                            replace_existing=True)
+        except profiles.ProfileError as exc:
+            self._load()                       # 把勾选框回滚到档案实际值
+            self.status.configure(text=f"写应用开关失败：{exc}", foreground=WARN)
+            return
+        self.app.state.reload()
+        self._load()
+        if self.on_changed:
+            self.on_changed()
 
-    return dataclasses.replace(profile, fov=fov)
+    def _on_close(self) -> None:
+        """按 X：先停本窗起的任务，再销毁（不经 App.close_window）。"""
+        self.app.tasks.stop_by_owner(self.task_owner)
+        self.destroy()
 
 
 def main() -> int:

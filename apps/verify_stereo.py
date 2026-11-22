@@ -32,6 +32,7 @@ import numpy as np
 from apps._common import (
     add_stereo_source_args,
     calib_capture_size,
+    current_calibration,
     open_pair_source,
 )
 from calib import BoardSpec, StereoRig
@@ -88,8 +89,9 @@ def _check_normalized_input(left, right, *, assume_normalized: bool) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="复检双目标定（装置是否被碰动）")
-    ap.add_argument("--calib", default="config/stereo_calibration",
-                    help="标定文件前缀（不带扩展名）")
+    # 默认跟当前装置档案的标定（2026-11-10 裁决 B5：不许再写死顶层路径）
+    ap.add_argument("--calib", default=str(current_calibration(need_existing=False)[0]),
+                    help="标定文件前缀（不带扩展名，默认 = 当前装置档案的标定）")
     add_stereo_source_args(ap)
     ap.add_argument("--cols", type=int, default=8)
     ap.add_argument("--rows", type=int, default=5)

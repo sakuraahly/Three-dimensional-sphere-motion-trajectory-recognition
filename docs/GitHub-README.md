@@ -51,7 +51,7 @@
 | 轨迹平滑 | Savitzky–Golay（等间隔重采样） | `stereo/motion.py` |
 | 轨迹预测 | 自适应窗口二次拟合 + 已知重力约束 / 卡尔曼外推 | `sphere_tracker/predict.py`、`stereo/predict3d.py` |
 | 可视化 | 视频叠加、3D 轨迹查看器、坐标极值、采样点拾取 | `apps/view_3d.py` |
-| 图形界面 | 门厅 → 相机管理 / 录制 / 标定 / 数据管理 / 3D 查看 | `启动程序.py`、内置「操作说明」窗口 |
+| 图形界面 | 门厅 → 相机管理 / 录制 / 标定 / 数据管理 / 3D 查看 | `apps/gui_main.py`、内置「操作说明」窗口 |
 
 **不需要训练数据**：默认 `color` 后端是纯图像处理，装完依赖即可跑。AI 后端（YOLO 球检测器）需要用项目自己的数据自举训练，属于可选路径。
 
@@ -59,28 +59,40 @@
 
 ## 运行环境与硬件
 
-- **操作系统**：Windows 10/11 为主（相机设备枚举、MSMF 后端、`启动程序.bat` 针对 Windows）；核心算法为平台无关的 Python。
+- **操作系统**：Windows 10/11 为主（相机设备枚举、MSMF 后端、`run.bat` 针对 Windows）；核心算法为平台无关的 Python。
 - **Python**：3.10+（项目在 3.14 环境开发验证）。
 - **依赖**：`opencv-contrib-python`、`numpy`、`scipy`、`matplotlib`、`Pillow`、可选 `python-pptx`。完整列表见 [`requirements.txt`](requirements.txt)；AI 后端另见 [`requirements-ai.txt`](requirements-ai.txt)。
 - **相机**：两台 USB 摄像头，建议同型号、固定在同一刚性支架上。**分辨率与帧率必须一致**，实测 1920×1080@30 可稳定双开。
 - **标定板**：打印 [`assets/boards/`](assets/boards/) 里的棋盘图（提供 A4 竖版 20 mm 与横版 25 mm 两种，PDF 与 PNG 各一份）。打印后务必用尺子核对实际方格边长，填错会整体缩放三维结果。
 - **球体**：建议纯色哑光球，避免高光和透明材质；标定颜色阈值的方法见 [`docs/纯色球检测方案.md`](docs/纯色球检测方案.md)。
 
-> 首次运行 `启动程序.bat` 会自动寻找能 `import cv2` 的 Python、检查并安装依赖，然后打开图形界面。
+> **第 0 步：先装一个能运行的 Python 3.10+**（[python.org](https://www.python.org/downloads/)
+> 或 Miniforge）—— 安装器要靠它自举，完全空白的机器装不了。
+> **首次使用双击 `install.bat`** 建好环境（转发 `run.bat install`），之后双击 `run.bat` 启动图形界面。
+
+| 根目录入口 | 一句话用途 |
+| --- | --- |
+| `run.bat` | 主入口：双击启动图形界面；加参数做某一步，也是参数路由的唯一产地 |
+| `install.bat` | 首次安装：建/复用环境、装依赖并登记给所有入口 |
+| `uninstall.bat` | 卸载：把整个安装目录送进 Windows 回收站，拒绝开发仓库目录、需二次确认 |
+| `launcher.exe` | 可选无黑框启动器（编译产物，纯净分发包**不含**，需用 Go 自行重建） |
+
+安装器参数（加在 `install.bat` 后，或 `run.bat install` 后）：`--verify` 只体检不改动；
+`--isolate` 强制新建项目内 `.venv`；`--ai` 额外装 YOLO/SAM（需 CUDA，默认不装）。
 
 ---
 
 ## 五分钟快速开始
 
 ```bat
-:: 1) 安装依赖（或双击 启动程序.bat 让它自动装）
+:: 1) 安装依赖（或双击 run.bat 让它自动装）
 python -m pip install -r requirements.txt
 
 :: 2) 确认环境与代码正常（约 1 分钟，不需要摄像头）
 python apps\run_tests.py fast -j auto
 
 :: 3) 启动图形界面
-python 启动程序.py
+python apps/gui_main.py
 ```
 
 图形界面里按「三步走」引导操作；界面右下角有 **「? 操作说明」**，内置分区目录与搜索，覆盖每个窗口的每个按钮。
@@ -161,7 +173,7 @@ python apps\view_3d.py
 ## 项目结构
 
 ```
-启动程序.bat / 启动程序.py / 启动程序_命令行.py   三个启动入口（双击即用 / GUI / CLI）
+run.bat / apps/gui_main.py / apps/cli_main.py   运行 / 安装 / 卸载入口与 GUI / CLI 主程序
 sphere_tracker/     单目核心：检测 → 跟踪 → 预测 → 可视化
 calib/              双目标定（离线、一次）：内参、外参、质量判定、世界系
 stereo/             双目逐帧：同步 → 配对 → 三角测量 → 轨迹 → 导出
@@ -182,20 +194,20 @@ docs/               说明文档（见下节导航）
 
 | 目的 | 命令 |
 | --- | --- |
-| 启动 GUI / CLI | `启动程序.bat` / `启动程序.bat cli` |
+| 启动 GUI / CLI | `run.bat` / `run.bat cli` |
 | 列出相机设备 | `python apps\tools\cameras.py list` |
 | 绑定左右角色 | `python apps\tools\cameras.py identify` |
-| 检查相机漂移 | `启动程序.bat check` |
+| 检查相机漂移 | `run.bat check` |
 | 相机体检（真开相机） | `python apps\tools\cameras.py doctor` |
 | 双目标定 | `python apps\calibrate_stereo.py --method joint ...` |
 | 链式标定（90° 装置） | `python apps\calibrate_stereo.py --method chain --same-board ...` |
-| 标定复检 | `启动程序.bat verify` |
+| 标定复检 | `run.bat verify` |
 | 录制双目 | `python apps\record_stereo.py --left left --right right --duration 10` |
 | 离线三维重建 | `python apps\run_stereo_video.py <会话目录>` |
 | 3D 查看器 | `python apps\view_3d.py [会话目录]` |
 | 运动量导出 | `python apps\tools\export_motion.py ...` |
 | 回归测试 | `python apps\run_tests.py fast -j auto` |
-| 规范自查 | `启动程序.bat standards` |
+| 规范自查 | `run.bat standards` |
 
 完整参数表与故障排查见 [`docs/用户手册.md`](docs/用户手册.md)。
 
@@ -263,7 +275,7 @@ python apps\run_tests.py fast -j auto
 
 `fast` 档 24 个回归测试覆盖：合成真值下的检测/跟踪/测深精度、双目标定与三角测量、数据格式、GUI 参数接线、文档事实一致性。全部不需要摄像头。
 
-`启动程序.bat gate` 会同时跑规范自查与 fast 档，适合提交前执行。
+`run.bat gate` 会同时跑规范自查与 fast 档，适合提交前执行。
 
 ---
 

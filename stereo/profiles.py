@@ -1,15 +1,19 @@
-"""装置档案：把"一套双目装置 = 一组参数 + 一份标定 + 几何预期"固化下来。
+"""装置档案：把"一套双目装置 = 一组参数 + 一份标定"固化下来。
 
 ## 为什么需要这一层
 
 同一台机器上要维护**多套**双目装置（现在的近平行装置、将来的 90° 装置），但：
 
-- GUI 里的分辨率 / 帧率**重开就回到硬编码默认**（`启动程序.py` 里没有落盘）；
-- 标定只有一份 ``config/stereo_calibration.json``，没有"这套参数配这份标定"的概念；
-- 90° 装置的期望基线、工作距离只存在于人的脑子里。
+- GUI 里的分辨率 / 帧率**重开就回到硬编码默认**（`apps/gui_main.py` 里没有落盘）；
+- 标定只有一份 ``config/stereo_calibration.json``，没有"这套参数配这份标定"的概念。
 
-装置档案把这三件事写进同一个记录，供 GUI / CLI 读取，从而能回答
-"现在用的是哪套装置、它该有多少基线、它配的是哪份标定"。
+装置档案把这两件事写进同一个记录，供 GUI / CLI 读取，从而能回答
+"现在用的是哪套装置、它配的是哪份标定"。
+
+**不存几何预期**（2026-11-07 用户要求删）：期望基线 / 工作距离是卷尺量不准、
+又会被人当成"标定结果"的猜测值。真实基线与夹角一律由标定 ``R``/``T`` 算出，
+档案只存实测或配置值。标定时的物理核对另走 CLI ``--baseline-mm``，那是**这一次
+测量**的锚，不是装置属性。
 
 ## 放在 ``stereo/`` 而不是 ``sphere_tracker/``
 
@@ -23,9 +27,9 @@
    :func:`stereo.stereo_mode.normalize_mode`（``auto`` 会被它拒绝）。
    别名（``90`` / ``orthogonal`` …）在入口层才允许；档案是**存储层**，
    写别名等于给未来的自己埋歧义，所以这里一律拒绝，只存 canonical 名。
-2. **不存手填的 ``angle_deg``**：``docs/数据标准.md`` 规定角度由标定 ``R``
-   计算。档案只存 ``expected_baseline_mm`` / ``working_distance_m``，
-   需要角度时由 :func:`geometry_hint` **估算并标注"非标定值"**。
+2. **不存手填的 ``angle_deg``，也不存几何预期**：``docs/数据标准.md`` 规定角度
+   由标定 ``R`` 计算；基线由标定 ``T`` 计算。档案不再存
+   ``expected_baseline_mm`` / ``working_distance_m``，也不再由它们估角度。
 3. **``calibration_path`` 必须是仓库内相对路径**：拒绝绝对路径与 ``..``
    逃逸，与清理功能的路径口径保持一致（防御性，不是功能需求）。
 
@@ -50,15 +54,14 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, NamedTuple
 
-from .stereo_mode import geometry_advice, mode_label, normalize_mode
+from .stereo_mode import mode_label, normalize_mode
 
 __all__ = [
     "RigProfile",
@@ -78,8 +81,20 @@ __all__ = [
     "active_name",
     "resolve_calibration_base",
     "validate_profile",
-    "geometry_hint",
     "mode_label",
+    "calibration_files_exist",
+    "CalibrationStatus",
+    "profile_calibration_status",
+    "CALIB_STATUS_CALIBRATED",
+    "CALIB_STATUS_UNCALIBRATED",
+    "CALIB_STATUS_PATH_MISMATCH",
+    "CALIB_STATUS_MODE_CONFLICT",
+    "CALIBRATION_STATUS_LABELS",
+    "calibration_identity",
+    "IdentityStatus",
+    "IDENTITY_MATCHED",
+    "IDENTITY_MISMATCH",
+    "IDENTITY_UNREGISTERED",
 ]
 
 STORE_SCHEMA = "sphere-rig-profiles"
@@ -135,21 +150,6 @@ def _strict_mode(value: Any) -> str:
             f"（会归一化成 {canonical!r}，请直接写 canonical 名）"
         )
     return canonical
-
-
-def _opt_positive_float(value: Any, field_name: str) -> float | None:
-    """``None`` 或有限正数；其余（bool / 0 / 负数 / NaN / inf）一律拒绝。"""
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        raise ProfileError(f"{field_name} 必须是正数，不能是布尔值")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ProfileError(f"{field_name} 必须是正数，收到 {value!r}") from exc
-    if not math.isfinite(number) or number <= 0.0:
-        raise ProfileError(f"{field_name} 必须是有限正数，收到 {value!r}")
-    return number
 
 
 def _opt_positive_int(value: Any, field_name: str) -> int | None:
@@ -259,16 +259,14 @@ def _check_fov(value: Any) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 @dataclass
 class RigProfile:
-    """一套装置档案。
+    """一套装置档案：只有 ``name`` 与 ``stereo_mode`` 是必填。
 
-    只有 ``name`` 与 ``stereo_mode`` 是必填；几何预期（基线 / 工作距离）
-    可以为空 —— 为空时 :func:`geometry_hint` 会明说"无法估算"，而不是猜。
+    几何量（基线 / 夹角）**不在这里**：它们由标定结果算出，手填的预期值
+    2026-11-07 起已从档案里删除（见模块头）。
     """
 
     name: str
     stereo_mode: str = "parallel"
-    expected_baseline_mm: float | None = None
-    working_distance_m: float | None = None
     width: int | None = None
     height: int | None = None
     fps: int | None = None
@@ -287,6 +285,12 @@ class RigProfile:
     #: 档案里存它，是为了记录"这台机器的两路视场差"这个事实本身，
     #: 以及给单目提供参考——不是让 90° 也去裁剪。
     fov: dict[str, Any] | None = None
+    #: 是否把 ``fov`` **应用到当前装置的两路相机画面**（装置级事实，默认关）。
+    #: 「启用」= 应用：标定（复用这份参数、不传 --skip-fov）与录制（按它裁剪两路）
+    #: 都服从它，而不是两个流程开关。关 = 两路按原始画面。90° 装置两路几乎不共视，
+    #: 即使启用也不裁剪（由 :func:`stereo.fov_policy.resolve_fov_apply` 统一判定）。
+    #: 旧档案缺这个字段一律回落 False（见 ``from_dict`` 的白名单清洗）。
+    fov_apply: bool = False
 
     # -- 序列化 ------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -294,8 +298,6 @@ class RigProfile:
         return {
             "name": self.name,
             "stereo_mode": self.stereo_mode,
-            "expected_baseline_mm": self.expected_baseline_mm,
-            "working_distance_m": self.working_distance_m,
             "width": self.width,
             "height": self.height,
             "fps": self.fps,
@@ -303,6 +305,7 @@ class RigProfile:
             "notes": self.notes,
             "created": self.created,
             "fov": self.fov,
+            "fov_apply": self.fov_apply,
         }
 
     @classmethod
@@ -311,11 +314,19 @@ class RigProfile:
         if not isinstance(data, Mapping):
             raise ProfileError(f"档案记录必须是对象，收到 {type(data).__name__}")
         known = {
-            "name", "stereo_mode", "expected_baseline_mm", "working_distance_m",
+            "name", "stereo_mode",
             "width", "height", "fps", "calibration_path", "notes", "created",
-            "fov",
+            "fov", "fov_apply",
         }
+        # 旧档案里可能还留着 expected_baseline_mm / working_distance_m：
+        # 不在 known 里就会被忽略（向前兼容，不因旧字段报错）。
         kwargs = {k: v for k, v in data.items() if k in known}
+        # fov_apply 只允许 bool：字符串 "false" / 数字 1 一律回落 False
+        # （bool("false") == True 是个静默陷阱，旧文件缺字段也回落 False）。
+        # 注意 fov_apply=True 但 fov 为空时**不**在这里改值：存储层不拒旧档案，
+        # 「没有记录，无法应用」由 resolve_fov_apply() 给出。
+        raw_apply = kwargs.get("fov_apply", False)
+        kwargs["fov_apply"] = raw_apply if isinstance(raw_apply, bool) else False
         return cls(**kwargs)
 
 
@@ -360,10 +371,6 @@ def validate_profile(
         profile,
         name=name,
         stereo_mode=_strict_mode(profile.stereo_mode),
-        expected_baseline_mm=_opt_positive_float(
-            profile.expected_baseline_mm, "expected_baseline_mm"),
-        working_distance_m=_opt_positive_float(
-            profile.working_distance_m, "working_distance_m"),
         width=width,
         height=height,
         fps=_opt_positive_int(profile.fps, "fps"),
@@ -371,62 +378,21 @@ def validate_profile(
         notes=notes,
         created=created,
         fov=_check_fov(profile.fov),
+        # 任何路径落盘都保证 fov_apply 是 bool（from_dict 已清洗，这里是第二道）：
+        # 直接 new 一个 RigProfile(fov_apply="false") 再 upsert 也不写脏值。
+        fov_apply=(profile.fov_apply
+                   if isinstance(profile.fov_apply, bool) else False),
     )
 
 
 # ---------------------------------------------------------------------------
-# 几何提示（纯函数，角度只是**估算**）
+# 几何提示：已删除（2026-11-07）
 # ---------------------------------------------------------------------------
-def geometry_hint(profile: RigProfile) -> str:
-    """按期望基线与工作距离给出**参考**提示（单行，可直接 print）。
-
-    ## 语气：一律是"参考估算"，不是判定（2026-10-24 改）
-
-    用户原话："我不能精确确定摄像头的位置，所以这个不该设置成强相关固定，
-    相反，应该以标定计算得到结果为主。"
-
-    所以这里的话术必须让读者一眼看出两件事：
-
-    1. 括号里的角度是**由 B/D 粗估**的，不是标定值；
-    2. 真实夹角**以标定 ``R`` 计算为准**（``docs/数据标准.md``：``angle_deg``
-       不是手填的 90.0）。
-
-    因此本函数**不返回任何"错误/不支持"的判定语义** —— 它只是字符串。
-    估算偏离 90° 只说明"档案里填的 B/D 与 90° 装置对不上"，而不是"这个组合非法"：
-    用户的 B/D 本来就是估计值，错的是数字，不是装置。
-    """
-    baseline = profile.expected_baseline_mm
-    distance = profile.working_distance_m
-    if baseline is None or distance is None:
-        missing = "、".join(
-            name for name, value in (
-                ("expected_baseline_mm", baseline),
-                ("working_distance_m", distance),
-            ) if value is None
-        )
-        return (f"参考估算：档案未填 {missing}（两项都是可选的，不影响判定）；"
-                "实际夹角以标定结果为准")
-
-    angle = float(geometry_advice(baseline, distance)["angle_deg"])
-    parts = [
-        f"参考估算：B={baseline:.0f} mm / D={distance:.2f} m ≈ {angle:.1f}°"
-        f"（由 B/D 粗估，非标定值；实际夹角以标定 R 计算为准）"
-    ]
-    if profile.stereo_mode == "angled":
-        if abs(angle - 90.0) > 10.0:
-            need = 2.0 * distance * 1000.0
-            parts.append(
-                f"按此布置看不到 90° 所需的共同视场（对称 90° 需 B≈2·D≈{need:.0f} mm）"
-                f"—— 若装置是 90°，说明档案里的 B/D（当前 {baseline:.0f} mm）与实际不符，"
-                "请按标定结果更新"
-            )
-        else:
-            parts.append("与本档案估算的 90° 相符（±10° 内，仅作参考）")
-    elif angle >= 15.0:
-        parts.append("若实际装置是大角度/近似直角，请把 stereo_mode 设为 angled（估算仅作参考）")
-    else:
-        parts.append("与平行/近平行装置的参考估算相符")
-    return "；".join(parts)
+# 原 geometry_hint() 拿档案里的"期望基线 / 工作距离"粗估夹角。用户要求档案不再
+# 存这两个猜测值，函数随之删除：真实基线由标定 T 算、真实夹角由标定 R 算，
+# 界面与检查脚本都不再打印"参考估算"那一行。
+# 需要**这一次**的物理核对时走 CLI `--baseline-mm`（CalibConfig 的锚），
+# 它不是装置属性，不进档案。
 
 
 # ---------------------------------------------------------------------------
@@ -582,10 +548,322 @@ def set_active(name: str | None,
     return get_active(path)
 
 
+# ---------------------------------------------------------------------------
+# 标定状态判定（2026-11-10 修复 B1 / C2）
+# ---------------------------------------------------------------------------
+# 以前「档案 ↔ 标定文件存在性」有三份判定：resolve_calibration_base（本文件）、
+# apps/_gui_app.py::_stereo_calib_path / _read_rig、apps/tools/check_stereo_setup.py。
+# 口径不一致，尤其 check_stereo_setup 只判无扩展名基名，对配了 calibration_path
+# 的档案**必然误报**「标定文件不存在」。这里收敛成唯一入口：
+#   - calibration_files_exist(base) 判 .npz / .json / 基名三者任一；
+#   - profile_calibration_status(profile) 给四态（档案列表 / 状态条用）；
+#   - calibration_identity(meta, active_name) 给三态（读取侧自检用，C2）。
+# 全是纯文件 I/O + 纯计算，不 print / 不读 argv / 不起 GUI。
+
+#: 装置档案标定状态四态。
+CALIB_STATUS_CALIBRATED = "calibrated"
+CALIB_STATUS_UNCALIBRATED = "uncalibrated"
+CALIB_STATUS_PATH_MISMATCH = "path_mismatch"
+CALIB_STATUS_MODE_CONFLICT = "mode_conflict"
+
+#: 四态的中文短标签（档案列表「标定」列用；路径另放，别在 GUI 里重写判定）。
+CALIBRATION_STATUS_LABELS = {
+    CALIB_STATUS_CALIBRATED: "已标定",
+    CALIB_STATUS_UNCALIBRATED: "未标定",
+    CALIB_STATUS_PATH_MISMATCH: "路径不符",
+    CALIB_STATUS_MODE_CONFLICT: "模式冲突",
+}
+
+#: 标定 meta.profile 与当前激活档案的对照三态（C2）。
+IDENTITY_MATCHED = "matched"
+IDENTITY_MISMATCH = "mismatch"
+IDENTITY_UNREGISTERED = "unregistered"
+
+
+class CalibrationStatus(NamedTuple):
+    """``profile_calibration_status`` 的返回：状态 + 一句给人看的原因。"""
+
+    state: str
+    reason: str
+
+
+class IdentityStatus(NamedTuple):
+    """``calibration_identity`` 的返回：三态 + 一句给人看的话（matched 时为空）。"""
+
+    state: str
+    message: str
+
+
+def calibration_files_exist(base: str | os.PathLike[str] | Path) -> bool:
+    """标定基名对应的 ``.npz`` / ``.json`` / 无扩展名基名**三者任一**存在。
+
+    这是「档案 ↔ 标定文件存在性」的**唯一判定**（2026-11-10 修复 B1）。
+    ``StereoRig.load`` 收的是无扩展名基名、自己补 .json/.npz，所以只判
+    ``base.exists()`` 会漏掉所有把产物写成 ``<base>.npz`` / ``<base>.json``
+    的情形 —— ``check_stereo_setup.py:198`` 的必然误报就是这么来的。
+    """
+    p = Path(base)
+    return (p.exists()
+            or p.with_suffix(".npz").exists()
+            or p.with_suffix(".json").exists())
+
+
+def _read_calibration_meta(base: Path) -> dict[str, Any] | None:
+    """读 ``<base>.json`` 的 meta（平铺 dict）。坏 JSON / 非对象返回 ``None``；
+    没有 .json（只有 .npz / 基名）返回 ``{}`` —— 那种老产物没有可比对的身份/模式，
+    仍算已标定，不误报。"""
+    j = base.with_suffix(".json")
+    if not j.exists():
+        return {}
+    try:
+        data = json.loads(j.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class CalibrationSpecs(NamedTuple):
+    """标定实测的**结构化摘要**（给人看的一组数，不含判定逻辑）。
+
+    ``state`` 与 :class:`CalibrationStatus` 的 ``state`` 同源。其余字段缺就是
+    ``None`` / 空串 —— **不编默认值**：老标定没有 ``capture_size``、``fov`` 可能是
+    ``null``，显示成 0 或 1920 都是在撒谎（2026-11-11 用户任务 B-189 的底线）。
+    """
+
+    state: str
+    path: Path | None
+    baseline_mm: float | None = None
+    angle_deg: float | None = None
+    rms_px: float | None = None
+    epipolar_rms_px: float | None = None
+    epipolar_max_px: float | None = None
+    n_pairs_used: int | None = None
+    n_pairs_in: int | None = None
+    grade: str = ""
+    created: str = ""
+    capture_size: tuple[int, int] | None = None
+    depth_sigma_mm_0_6m: float | None = None
+    bound_profile: str = ""
+    board: str = ""
+
+
+def _as_float(v: object) -> float | None:
+    """收成 float；``bool`` 不算（``True`` 当 1.0 是错的）。"""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v)
+
+
+def _as_int(v: object) -> int | None:
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    return v
+
+
+def calibration_specs(profile: RigProfile) -> CalibrationSpecs:
+    """把一套装置档案的标定 meta 收成 :class:`CalibrationSpecs`。
+
+    这是**数值展示的唯一产地**（2026-11-11 用户任务 B-189：装置档案要能看到
+    标定后的具体信息）。GUI / CLI 都不许自己 ``json.loads`` 那份 meta 再挑字段。
+
+    只读 ``<base>.json`` 的 meta（标定时写的人读副本），**不读 ``.npz``**：
+    后者要 numpy + 二进制解析，只为显示几个数不值得，而且 meta 的字段名更稳定。
+
+    没有 ``.json``（只有 ``.npz`` 的老产物）时 meta 是 ``{}`` —— 此时各数值字段
+    全为 ``None``，调用方显示"已标定，但这份产物没有详情文件"，**不是**"未标定"。
+    这两件事不能混：前者能用、只是不知道参数，后者根本不能用。
+    """
+    st = profile_calibration_status(profile)
+    try:
+        base: Path | None = _calibration_base_of(profile)
+    except ProfileError:
+        base = None
+    meta = (_read_calibration_meta(base) if base is not None else None) or {}
+    q = meta.get("quality")
+    q = q if isinstance(q, dict) else {}
+    cap = meta.get("capture_size")
+    cap_size: tuple[int, int] | None = None
+    if isinstance(cap, (list, tuple)) and len(cap) == 2:
+        cw, ch = _as_int(cap[0]), _as_int(cap[1])
+        if cw is not None and ch is not None:
+            cap_size = (cw, ch)
+    return CalibrationSpecs(
+        state=st.state,
+        path=base,
+        baseline_mm=_as_float(meta.get("baseline_mm")),
+        angle_deg=_as_float(meta.get("angle_deg")),
+        rms_px=_as_float(q.get("rms")),
+        epipolar_rms_px=_as_float(q.get("epipolar_rms")),
+        epipolar_max_px=_as_float(q.get("epipolar_max")),
+        n_pairs_used=_as_int(q.get("n_pairs_used")),
+        n_pairs_in=_as_int(q.get("n_pairs_in")),
+        grade=str(q.get("grade") or ""),
+        created=str(meta.get("created") or ""),
+        capture_size=cap_size,
+        depth_sigma_mm_0_6m=_as_float(q.get("depth_sigma_mm_at_0_6m")),
+        bound_profile=str(meta.get("profile") or ""),
+        board=str(meta.get("board") or ""),
+    )
+
+
+def format_specs_inline(s: CalibrationSpecs) -> str:
+    """一行极简版（给列表列用）：``68.8 mm / 0.7° / 0.71 px``。
+
+    只放**最关键的三个数**（基线 / 夹角 / 极线 RMS）——列宽有限，完整指标走
+    :func:`format_specs_tooltip`。缺一个就少一段；已标定但一个数都没有时
+    明说"无详情"，不显示成"未标定"。
+    """
+    if s.state != CALIB_STATUS_CALIBRATED:
+        return "—"
+    parts: list[str] = []
+    if s.baseline_mm is not None:
+        parts.append(f"{s.baseline_mm:.1f} mm")
+    if s.angle_deg is not None:
+        parts.append(f"{s.angle_deg:.1f}°")
+    if s.epipolar_rms_px is not None:
+        parts.append(f"{s.epipolar_rms_px:.2f} px")
+    return " / ".join(parts) if parts else "已标定（无详情）"
+
+
+def format_specs_tooltip(s: CalibrationSpecs, *, include_path: bool = True) -> str:
+    """多行详情（给悬停提示用）。**缺的项不出现**，不写"未知"占位。
+
+    ``include_path=False``：调用方自己已经在别处显示了标定文件（装置档案对话框
+    首行就是"状态 · 路径"），别在末尾再贴一遍绝对路径。
+    """
+    if s.state != CALIB_STATUS_CALIBRATED:
+        return ""
+    lines: list[str] = []
+    if s.baseline_mm is not None:
+        lines.append(f"基线：{s.baseline_mm:.2f} mm")
+    if s.angle_deg is not None:
+        lines.append(f"光轴夹角：{s.angle_deg:.3f}°")
+    if s.epipolar_rms_px is not None:
+        extra = (f"（最大 {s.epipolar_max_px:.2f} px）"
+                 if s.epipolar_max_px is not None else "")
+        lines.append(f"极线 RMS：{s.epipolar_rms_px:.3f} px{extra}")
+    if s.rms_px is not None:
+        lines.append(f"整体 RMS：{s.rms_px:.3f} px")
+    if s.n_pairs_used is not None:
+        tot = f"/{s.n_pairs_in}" if s.n_pairs_in is not None else ""
+        lines.append(f"配对：{s.n_pairs_used}{tot} 对")
+    if s.depth_sigma_mm_0_6m is not None:
+        lines.append(f"深度不确定度 @0.6 m：{s.depth_sigma_mm_0_6m:.2f} mm")
+    if s.capture_size is not None:
+        lines.append(f"采集档：{s.capture_size[0]}x{s.capture_size[1]}")
+    if s.board:
+        lines.append(f"标定板：{s.board}")
+    if s.created:
+        lines.append(f"标定时间：{s.created}")
+    if s.grade:
+        lines.append(f"判定：{s.grade}")
+    lines.append(f"登记装置：{s.bound_profile}" if s.bound_profile
+                 else "登记装置：（未登记来源 —— 这份标定早于该字段）")
+    if include_path and s.path is not None:
+        lines.append(f"文件：{s.path}")
+    return "\n".join(lines)
+
+
+def calibration_identity(meta: Mapping[str, Any] | None,
+                         active_name: str | None) -> IdentityStatus:
+    """标定 meta 的 ``profile`` 与当前激活档案名对照（C2，严格三态）。
+
+    - ``matched``：meta 有 ``profile`` 且 == 当前档案名 → 正常，``message=""``；
+    - ``mismatch``：meta 有 ``profile`` 但 != 当前档案名（或当前未设档案）
+      → 明确警告「这份标定属于档案 X，当前是 Y」；
+    - ``unregistered``：meta **没有** ``profile``（所有老标定文件）→ 状态
+      「未登记来源」，给一句**说明**，绝不误报成「属于别套装置」，也不阻断使用。
+
+    这是纯计算：调用方（``apps/_gui_app.py`` 的 ``AppState``）自行决定把哪态
+    写进 warn 级 notes、哪态写进 info 级 infos。老文件一律 unregistered，
+    保证升级后门厅不会冒出一堆假警告。
+    """
+    bound = str((meta or {}).get("profile") or "").strip()
+    cur = str(active_name or "").strip()
+    if not bound:
+        return IdentityStatus(
+            IDENTITY_UNREGISTERED,
+            "标定未登记来源装置（老文件），不校验档案身份")
+    if cur and bound == cur:
+        return IdentityStatus(IDENTITY_MATCHED, "")
+    if not cur:
+        return IdentityStatus(
+            IDENTITY_MISMATCH,
+            f"这份标定登记属于装置档案「{bound}」，但当前未设置装置档案")
+    return IdentityStatus(
+        IDENTITY_MISMATCH,
+        f"这份标定属于装置档案「{bound}」，当前是「{cur}」—— "
+        "请确认用对了标定，或给当前装置重新标定")
+
+
+def _calibration_base_of(profile: RigProfile) -> Path:
+    """这套档案该用的标定基名（无扩展名）；``calibration_path`` 非法时抛 ``ProfileError``。
+
+    "档案指向哪份标定"**只有这一份实现**：``profile_calibration_status``（判状态）、
+    ``calibration_specs``（取数值）共用。两处各拼一遍的话，一处改了路径校验、
+    另一处不改，就会出现"状态说已标定、详情却读另一份文件"这种对不上的情况。
+
+    档案没配路径 → 回落顶层 ``config/stereo_calibration``（与
+    ``resolve_calibration_base`` 的 fallback 同一语义）。
+    """
+    raw = profile.calibration_path
+    if raw is None:
+        return ROOT / "config" / "stereo_calibration"
+    return ROOT / _check_calibration_path(raw)
+
+
+def profile_calibration_status(profile: RigProfile) -> CalibrationStatus:
+    """一套装置档案的标定状态（B1 纯函数），返回 :class:`CalibrationStatus`。
+
+    四态语义（按顺序判定，先命中先返回）：
+
+    - ``path_mismatch``「路径指向别处或配置文件非法」：``calibration_path``
+      不是仓库内合法相对路径（绝对 / 含 ``..`` / 越界），或 ``<base>.json``
+      存在但内容坏 / 非对象，或标定 meta 登记的 ``profile`` 指向**另一套档案**
+      （C1 起新标定会写这个字段；老文件没有，不触发）。
+    - ``uncalibrated``「未标定」：``.npz`` / ``.json`` / 无扩展名基名**三者都不存在**。
+      注意「档案名对得上、但文件还没标」属于这一类，不是 path_mismatch ——
+      当前激活档案「实验性质平行装置1」就是这种，必须返回 uncalibrated。
+    - ``mode_conflict``「模式冲突」：标定 meta 的 ``stereo_mode`` 与档案
+      ``stereo_mode`` 不一致（与 ``AppState.mode_conflict()`` 同口径）。
+    - ``calibrated``「已标定」：文件存在、可读、身份与模式都对得上。
+
+    与 :func:`resolve_calibration_base` 同源，共用 :func:`calibration_files_exist`
+    这一份存在性判定；不 print / 不读 argv / 不起 GUI，可被 GUI / CLI / 测试直接调。
+    """
+    if not isinstance(profile, RigProfile):
+        return CalibrationStatus(CALIB_STATUS_PATH_MISMATCH, "档案对象非法")
+    try:
+        base = _calibration_base_of(profile)
+    except ProfileError as exc:
+        return CalibrationStatus(CALIB_STATUS_PATH_MISMATCH,
+                                 f"标定路径非法：{exc}")
+    if not calibration_files_exist(base):
+        return CalibrationStatus(
+            CALIB_STATUS_UNCALIBRATED,
+            f"未标定：{base} 的 .npz / .json / 无扩展名基名都不存在")
+    meta = _read_calibration_meta(base)
+    if meta is None:
+        return CalibrationStatus(
+            CALIB_STATUS_PATH_MISMATCH,
+            f"标定配置非法：{base.with_suffix('.json')} 读不成对象")
+    ident = calibration_identity(meta, profile.name)
+    if ident.state == IDENTITY_MISMATCH:
+        return CalibrationStatus(CALIB_STATUS_PATH_MISMATCH, ident.message)
+    cm = str(meta.get("stereo_mode") or "").strip()
+    pm = str(profile.stereo_mode or "").strip()
+    if cm and pm and cm != pm:
+        return CalibrationStatus(
+            CALIB_STATUS_MODE_CONFLICT,
+            f"档案声明「{pm}」，标定文件却记为「{cm}」—— 很可能是别套装置的标定")
+    return CalibrationStatus(CALIB_STATUS_CALIBRATED, "已标定")
+
+
 def resolve_calibration_base(
     path: str | os.PathLike[str] | None = None,
     *,
     fallback: str | os.PathLike[str] | None = None,
+    strict: bool = True,
 ) -> Path:
     """解析"当前该用哪份标定"：激活档案配了 ``calibration_path`` 就用它，否则回落。
 
@@ -598,14 +876,29 @@ def resolve_calibration_base(
 
     1. 激活档案配了 ``calibration_path``，**且它对应的 ``.npz`` 确实存在** →
        解析成绝对路径（不带扩展名的前缀，``.npz``/``.json`` 由调用方补）。
-    2. 档案配了但文件不存在、档案没配、或 ``profiles.json`` 缺失/损坏 →
-       回落 ``fallback``（默认顶层 ``config/stereo_calibration``）。
-       **"配了但不存在"必须回落**：半成品档案的典型状态就是路径指向一个
-       从没标定过的 ``config/calib/<装置>``（2026-11-04 现场：切到"90度装置"
-       后路径指向不存在的文件，若无条件跟随，录制会直接报"找不到标定"，
-       而顶层那份真实标定被白白忽略）。
+    2. 档案配了、但标定文件不存在 → **默认直接报错**（2026-11-08 改）。
+       以前这里静默回落顶层，理由是"半成品档案也能录制"；代价是切了装置却
+       拿别套装置的基线/夹角在跑，界面还显示"已标定"。用户实测 20px 极线
+       残差才把这件事翻出来。宁可让人先标定，也不许冒充。
+    3. 档案没配路径、没有激活档案、或档案文件损坏 → 回落 ``fallback``。
 
-    调用方若需要区分"跟随了档案"还是"回落了"，看返回路径是否等于 fallback。
+    **谁该调它**：``apps/`` 下的 GUI / CLI / 工具**不要直接调**，走
+    ``apps._common.current_calibration`` —— 它把"抛 ``ProfileError``"翻译成
+    ``(基名, 人话原因)``，调用点只判一个 ``why`` 就够，不必各写一份 try/except
+    与提示文案（2026-11-10 用户裁决 B5 之后，GUI/CLI/工具链共十几处都要用同一份
+    口径，各写一遍必然漂）。本函数留给 ``stereo`` 包内与需要区分
+    "跟随了档案 / 回落了"的调用方。
+
+    ``strict=False`` 的语义是"**不报错 ≠ 换几何**"：仍返回档案自己的 ``cand``
+    （文件可以还不存在），绝不悄悄换成顶层那套装置的几何。它只给
+    **本来就不需要现存标定**的调用方 —— 目前是
+    ``apps/calibrate_stereo.py`` 不带 ``--out`` 时决定新标定写到哪
+    （输出路径不要求文件已存在，但必须落在档案指定的位置），以及
+    ``current_calibration(need_existing=False)`` / 它的 except 分支
+    （要拿"该写到哪"的候选路径给人看）。
+
+    调用方若需要区分"跟随了档案"还是"回落了"，看返回路径是否等于 fallback
+    （``strict=False`` 跟随档案时返回 ``cand``，同样 ``!= fallback``）。
     """
     fb = Path(fallback) if fallback is not None else ROOT / "config" / "stereo_calibration"
     try:
@@ -614,10 +907,15 @@ def resolve_calibration_base(
         active = None
     if active is not None and active.calibration_path:
         cand = ROOT / active.calibration_path
-        if cand.with_suffix(".npz").exists():
+        if calibration_files_exist(cand):
             return cand
-        # 档案路径是空壳：回落到顶层那份真实存在的标定
-        return fb
+        if strict:
+            raise ProfileError(
+                f"装置档案「{active.name}」指定的标定文件不存在：{cand}"
+                "（.npz / .json 都没有）。拒绝回落到顶层 "
+                "config/stereo_calibration —— 那是别套装置的几何。"
+                "请先给这套装置做标定，或在装置档案里清空标定路径。")
+        return cand
     return fb
 
 

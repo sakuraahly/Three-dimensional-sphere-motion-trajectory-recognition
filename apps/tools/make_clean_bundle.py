@@ -47,11 +47,12 @@ ROOT = _repo_root()
 # ── 白名单：和 .gitignore 的 `!` 规则一一对应，改一处必须改两处 ──────────
 #: 源码目录，只收 .py（含子目录）
 PY_DIRS = ("apps", "sphere_tracker", "stereo", "calib", "tests")
-#: 根目录必需文件：依赖清单 + 三个启动入口 + 最小说明
+#: 根目录必需文件：依赖清单 + 运行/安装/卸载入口 + 最小说明
+#: 两个启动脚本已搬进 apps/（英文名），由 PY_DIRS 的 rglob 收集，不用在这里重复列。
 ROOT_FILES = (
     ".gitignore", ".gitattributes", "README.md",
     "requirements.txt", "requirements-ai.txt", "environment.yml",
-    "启动程序.py", "启动程序_命令行.py", "启动程序.bat",
+    "run.bat", "install.bat", "uninstall.bat",
 )
 #: 其余运行必需物：标定板（拍标定图要打印）+ 空目录占位 / 放置说明
 EXTRA_GLOBS = (

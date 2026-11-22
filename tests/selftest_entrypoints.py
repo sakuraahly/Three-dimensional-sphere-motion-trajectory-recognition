@@ -6,9 +6,9 @@
 
 | 入口 | 谁在用 |
 | ---- | ------ |
-| `启动程序.bat test` | 双击 / 命令行 |
-| `启动程序.py` 的按钮   | 图形界面 |
-| `启动程序_命令行.py` 的菜单 | 无 tkinter 时 |
+| `run.bat test` | 双击 / 命令行 |
+| `apps/gui_main.py` 的按钮   | 图形界面 |
+| `apps/cli_main.py` 的菜单 | 无 tkinter 时 |
 
 它们的**实际缺陷是同一个**：全部硬编码只跑 `selftest_synthetic.py` 一个，
 而 `AGENTS.md` §7 要求跑 15 个。这个缺陷在 `交接文档.md` §10.7 第 5 条里
@@ -59,9 +59,9 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-BAT = ROOT / "启动程序.bat"
-GUI = ROOT / "启动程序.py"
-CLI = ROOT / "启动程序_命令行.py"
+BAT = ROOT / "run.bat"
+GUI = ROOT / "apps/gui_main.py"
+CLI = ROOT / "apps/cli_main.py"
 RUNNER = ROOT / "apps" / "run_tests.py"
 RUN_ALL = ROOT / "apps" / "run_all.py"
 STANDARDS = ROOT / "apps" / "tools" / "check_standards.py"
@@ -87,9 +87,56 @@ def test_runner_and_checker_exist() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_runner_failure_digest() -> bool:
+    """第 1b 节：运行器在失败时要能定位到"哪一条红了"。
+
+    2026-11-07 实测：`full` 里 `selftest_launcher_params` 红，回显的 6 行全是
+    Tk 的 `invalid command name "…_poll_ui"` 噪声，真正的 `[不达标] 资源覆盖…`
+    被截掉了 —— 人只能看到"有不达标项"，不知道红在哪。根因是运行器只留输出
+    末尾 6 行。这里用一段**仿造输出**把两个函数钉住：判据行在前面、噪声在后面。
+    """
+    print("----- 1b. 运行器失败摘要 -----")
+    sys.path.insert(0, str(ROOT))
+    from apps.run_tests import _digest, _tail       # noqa: E402
+
+    sample = "\n".join(
+        ["----- 8k. GUI 多语言 -----",
+         "  [通过] 中英文两种语言已注册",
+         "  [不达标] 资源覆盖全部扫描到的界面文案（556 条）",
+         "  [通过] 中文模式是恒等映射",
+         "  [不达标] 提取器 --check 与源码一致"]
+        + [f"  [通过] 凑数第 {i} 条" for i in range(20)]
+        + ['    invoked from within',
+           '        "ttk::ThemeChanged"',
+           '    invalid command name "1571628390976_poll_ui"',
+           '        while executing',
+           '        "1571628390976_poll_ui"',
+           '        ("after" script)'])
+    old_lines = _tail(sample)
+    new_lines = _digest(sample)
+    src = _read(RUNNER)
+    checks = [
+        ("旧 `_tail` 确实会丢掉判据行（证明问题存在）",
+         not any("[不达标]" in ln for ln in old_lines)),
+        ("`_digest` 保住两条判据行",
+         sum(1 for ln in new_lines if "[不达标]" in ln) == 2),
+        ("`_digest` 仍带末尾行（异常现场不丢）",
+         any("_poll_ui" in ln for ln in new_lines)),
+        ("`run_one` 失败分支走的是 `_digest`（不是又改回 `_tail`）",
+         "res.tail = _digest(out)" in src),
+        ("超时分支仍留 `_tail`（超时本来就没有判据行可捞）",
+         "res.tail = _tail((exc.stdout or \"\")" in src),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    print(f"    旧：{old_lines[0].strip()[:50]} …")
+    print(f"    新：{new_lines[0].strip()[:70]}")
+    return all(ok for _n, ok in checks)
+
+
 def test_bat_uses_runner() -> bool:
     """第 2 节：`.bat` 的 test / standards 都走公共设施，且不再硬编码。"""
-    print("----- 2. 启动程序.bat -----")
+    print("----- 2. run.bat -----")
     text = _read(BAT)
     body = "\n".join(ln for ln in text.splitlines()
                      if not ln.strip().lower().startswith("rem"))
@@ -119,7 +166,7 @@ def test_bat_uses_runner() -> bool:
 
 def test_gui_uses_runner() -> bool:
     """第 3 节：图形界面的测试/自查按钮走公共设施。"""
-    print("----- 3. 启动程序.py（图形界面） -----")
+    print("----- 3. apps/gui_main.py（图形界面） -----")
     text = _read(GUI)
     has_fast = '"run_tests.py"), "fast"' in text or "'run_tests.py'), 'fast'" in text
     has_full = '"run_tests.py"), "full"' in text or "'run_tests.py'), 'full'" in text
@@ -147,7 +194,7 @@ def test_gui_uses_runner() -> bool:
 
 def test_cli_uses_runner() -> bool:
     """第 4 节：命令行界面的菜单项走公共设施。"""
-    print("----- 4. 启动程序_命令行.py -----")
+    print("----- 4. apps/cli_main.py -----")
     text = _read(CLI)
     has_fast = '"run_tests.py"), "fast"' in text or "'run_tests.py'), 'fast'" in text
     has_full = '"run_tests.py"), "full"' in text or "'run_tests.py'), 'full'" in text
@@ -196,9 +243,9 @@ def test_agreement_across_entrypoints() -> bool:
     """第 5 节：三个入口引用的**运行器路径字符串完全一致**（不许各写一份）。"""
     print("----- 5. 三个入口对运行器的引用是否一致 -----")
     variants = {
-        "启动程序.bat": "run_tests.py",
-        "启动程序.py": "run_tests.py",
-        "启动程序_命令行.py": "run_tests.py",
+        "run.bat": "run_tests.py",
+        "apps/gui_main.py": "run_tests.py",
+        "apps/cli_main.py": "run_tests.py",
     }
     found: dict[str, str] = {}
     for rel in variants:
@@ -255,7 +302,8 @@ def test_run_all_orchestrator() -> bool:
         root = Path(tmp)
         sess = _fake_session(root)
         # ⚠️ 6.1 **必须自带标定 fixture**（2026-10-27）：原来直接跑 CLI 的 dry-run，
-        # 而 CLI 用默认的 `config/stereo_calibration.*` 判断 check 步能不能跑。
+        # 而 CLI 用**当前装置档案**的标定路径（`_default_calib_files()`）判断
+        # check 步能不能跑。
         # 干净 checkout 里 `config/` 被 gitignore → check 步被 skipped、`cmd=[]`
         # →「三步都转到现有脚本」当场假红（实测：干净副本 4 红之一）。
         # 判据的本意是"命令拼装对不对"，与"这台机器标定过没有"无关，
@@ -291,11 +339,16 @@ def test_run_all_orchestrator() -> bool:
         print(f"  --stereo-mode angled 出现 {out.count('--stereo-mode angled')} 次（tri/export 各一次）")
 
         # 6.2 缺标定 -> check 被 skipped，且原因点名具体文件
+        #     2026-11-10：文案改成**当前装置档案**的标定基名（`_calib_label()`），
+        #     不再写死顶层 `config/stereo_calibration.json`。断言跟实现同源，
+        #     避免下次再换个写法就假红；"点名了哪个文件"这件事仍然被验。
         plan = RA.plan_steps(sess, calib_files=[])
         check = next(s for s in plan if s["name"] == "check")
+        label = RA._calib_label()
         print(f"  缺标定：check={check['status']}；原因={check['reason']}")
         no_calib = (check["status"] == "skipped"
-                    and "config/stereo_calibration.json" in check["reason"]
+                    and "缺标定文件" in check["reason"]
+                    and label in check["reason"]
                     and check["cmd"] == [])
 
         # 6.3 缺 traj3d.csv -> export 被 skipped
@@ -341,18 +394,86 @@ def test_run_all_orchestrator() -> bool:
                     and all(name in src for name in forwarded.values()))
         print(f"  正文不含算法/库 import、只 subprocess 调脚本: {no_logic}")
 
+        # 6.8 `_default_calib_files(root)` 的两条语义（2026-11-10 之后的**回退风险点**）
+        # (a) root != ROOT：按传入 root 拼，**不许**走档案解析 ——
+        #     否则测试传临时目录时会拿到真实仓库的标定路径，夹具悄悄变成"测真实环境"，
+        #     断言看着绿、实际测的根本不是夹具。
+        # (b) 不传 root：跟随**当前装置档案**（不再是写死的顶层 config/stereo_calibration）。
+        with tempfile.TemporaryDirectory() as td:
+            other_root = Path(td)
+            far_empty = RA._default_calib_files(other_root)      # 临时根里没有 config/
+            (other_root / "config").mkdir()
+            (other_root / "config" / "stereo_calibration.npz").write_bytes(b"")
+            far_hit = RA._default_calib_files(other_root)        # 临时根里放一份顶层标定
+            far_ok = (far_empty == []
+                      and far_hit == [other_root / "config" / "stereo_calibration.npz"])
+
+        from stereo.profiles import get_active
+
+        here = RA._default_calib_files()                         # 不传 = ROOT，跟随档案
+        rig = get_active()
+        if rig is not None and rig.calibration_path:
+            want_dir = (RA.ROOT / rig.calibration_path).parent
+            # 空列表也算"跟对了"：当前档案「实验性质平行装置1」还没标定。
+            here_ok = all(p.parent == want_dir for p in here)
+            here_desc = f"档案「{rig.name}」目录下 {want_dir}（当前未标定 → 空）"
+        else:
+            here_ok = True                                       # 无档案 = 回落顶层，本条不表态
+            here_desc = "无装置档案，回落顶层（本条不表态）"
+        print(f"  临时根（空）：{far_empty}；临时根（有顶层 npz）：{far_hit}")
+        print(f"  不传 root（跟随档案）：{here}  ← {here_desc}")
+
+        # 6.8b GUI 编排入口（计划书 M8）：一条命令跑完整系统的 argv 与接线。
+        # `_actions.run_all` 是 argv 的唯一产地；工作台只负责把当前会话交给它。
+        from apps import _actions as _act
+        act_plain = _act.run_all(sess)
+        act_full = _act.run_all(sess, stereo_mode="angled", detector="color")
+        act_text = " ".join(act_plain).replace("\\", "/")
+        act_full_text = " ".join(act_full)
+        bench_src = (ROOT / "apps" / "_gui_bench.py").read_text(encoding="utf-8")
+        gui_all = ("apps/run_all.py" in act_text
+                   and "--session" in act_text
+                   and "--stereo-mode" not in act_text
+                   and "--stereo-mode angled" in act_full_text
+                   and "--detector color" in act_full_text
+                   and "_actions.run_all(s.path)" in bench_src
+                   and "一键跑全流程" in bench_src)
+        print(f"  GUI 一键全流程：run_all.py={'apps/run_all.py' in act_text}；"
+              f"工作台接线={'_actions.run_all(s.path)' in bench_src}")
+
+        # 6.9 `_calib_label()` 的**独立**性质断言（6.2 用 `_calib_label()` 自己算期望，
+        # 同源自证：它自己坏了 6.2 照样绿）。这里期望从 `rig.calibration_path` 推导，
+        # 不经过 `_calib_label()`，所以"改回写死顶层名"会当场红。
+        # 三条性质一起：含 calib 路径段 + 不以 stereo_calibration.json 结尾
+        # + 不以 stereo_calibration 结尾（后两条才是真正在钉"不等于顶层"）。
+        if rig is not None and rig.calibration_path:
+            lab_raw = RA._calib_label()
+            lab = lab_raw.replace("\\", "/")
+            lab_ok = ("calib" in lab
+                      and not lab.endswith("stereo_calibration.json")
+                      and not lab.endswith("stereo_calibration"))
+            print(f"  _calib_label() = {lab_raw}；档案路径 = {rig.calibration_path}；"
+                  f"性质成立={lab_ok}")
+        else:
+            lab_ok = True          # 无档案 = 回落顶层，本条不表态
+            print("  _calib_label()：无装置档案，回落顶层（本条不表态）")
+
     checks = [
         ("CLI dry-run 退出 0 且打印三步（通路没断）", cli_ok),
         ("三步都转到现有脚本（check_dataset / run_stereo_video / export_visualization）",
          all(rel in out for rel in forwarded.values())),
         ("每步参数透传正确（--strict / --method / --stereo-mode / --plot）",
          strict and method and angled and plot),
-        ("缺标定时 check=skipped，原因点名 config/stereo_calibration.json", no_calib),
+        ("缺标定时 check=skipped，原因点名当前装置档案的标定文件", no_calib),
         ("缺 traj3d.csv 时 export=skipped", no_traj),
         ("全 skipped 的退出码是 3（不是 0）", all_skip3),
         ("显式点名却跑不了的退出码是 1", failed1),
         ("--json 能 json.loads，字段齐全，ok 与退出码一致", bool(payload) and shape and json_consistent),
         ("不自带算法：只 subprocess 调用现有脚本", no_logic),
+        ("root != ROOT 时按传入 root 拼（不读真实档案）", far_ok),
+        ("不传 root 时跟随当前装置档案（不是写死顶层）", here_ok),
+        ("`_calib_label()` 指向档案目录、不等于顶层文件名", lab_ok),
+        ("GUI 一键全流程：_actions.run_all 拼对命令且工作台真的接上", gui_all),
     ]
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
@@ -926,7 +1047,7 @@ def test_shared_arg_blocks() -> bool:
     presets = set(ColorConfig.preset_names())
     scanned = sorted((ROOT / "apps").glob("*.py")) \
         + sorted((ROOT / "apps" / "tools").glob("*.py")) \
-        + [GUI, ROOT / "启动程序_命令行.py"]
+        + [GUI, ROOT / "apps/cli_main.py"]
     offenders: list[str] = []
     for path in scanned:
         if not path.is_file():
@@ -1258,6 +1379,14 @@ def _make_stereo_session(data: Path, sid: str, *, legacy_rows: bool = False) -> 
     sess = data / "stereo" / sid
     _tiny_video(sess / "left.mkv")
     _fake_calib(sess / "calib" / "stereo_calibration.npz")
+    # 会话契约：标定文件名跟随装置档案动态生成，导出工具从 session.json 读
+    # calibration.path，不再写死 calib/stereo_calibration.npz。真实会话必有
+    # session.json（实测 data/stereo 下 15/15 可导出会话都有），夹具补齐它；
+    # 否则导出按"没标定"降级到种子半径，"双目半径走几何式"这条就测不到了。
+    (sess / "session.json").write_text(json.dumps({
+        "schema": "sphere-stereo-session", "version": 1, "id": sid,
+        "calibration": {"path": "calib/stereo_calibration.npz"},
+    }, ensure_ascii=False), encoding="utf-8")
     (sess / "derived").mkdir(parents=True, exist_ok=True)
     (sess / "derived" / "seeds.json").write_text(json.dumps({
         "schema": "sphere-stereo-seeds", "version": 1, "session": sid,
@@ -1645,12 +1774,15 @@ def test_export_ball_dataset() -> bool:
         restored_leaks = _leaks(out_restored)
 
         print(f"  改成正向（按会话）：泄漏 {restored_leaks or '无'}")
+        # 标签必须与断言同向：`bad_leaks` 非空 = 反向自证**成功**（检查器抓到了泄漏）。
+        # 原来这一支先打「[不达标]」再打「[通过]」，同一分支自相矛盾，
+        # 汇总不红但跑测试的人会被那行骗一次（2026-11-10）。
         if bad_leaks:
-            print(f"    [不达标] 改成'按帧随机切'后，同一会话出现在两个 split：{bad_leaks}")
-            print(f"    [通过] 反向自证有效：泄漏检查能抓住按帧切")
+            print(f"    [通过] 预期内泄漏（按帧切）：{bad_leaks} —— 反向自证有效")
         else:
             print("    [不达标] 改成按帧切居然没泄漏 —— 说明检查器是空转的")
-        print(f"    [通过] 还原后泄漏 {restored_leaks or '无'}，恢复正常")
+        print(f"    [{'通过' if not restored_leaks else '不达标'}] "
+              f"还原后泄漏 {restored_leaks or '无'}")
         checks.append(("反向自证：改成按帧切 → 泄漏检查报红", bool(bad_leaks)))
         checks.append(("还原成按会话切 → 泄漏消失（检查不是空转）", not restored_leaks))
 
@@ -1682,6 +1814,7 @@ def main() -> int:
     print("=" * 70)
     results = []
     for fn in (test_runner_and_checker_exist,
+               test_runner_failure_digest,
                test_bat_uses_runner,
                test_gui_uses_runner,
                test_cli_uses_runner,

@@ -54,6 +54,18 @@ CHAIN_TRANS_OK_MM = 5.0
 _CROSS_TRANS_WARN_MM = 5.0
 _CROSS_ROT_WARN_DEG = 1.5
 
+# ---- B1：以链乘为初值的跨路残差最小二乘（2026-11-18）----
+# 改动幅度护栏：优化结果相对链乘初值的旋转/平移超过这两个数，说明初值本身
+# 不可信（极可能是同框图棋盘角点倒序造成的 180° 错解）—— 宁可判不可用，
+# 也不把"从错解收敛到另一个错解"当成改进采用。依据 docs/标定算法对比.md H1 判据②。
+CROSS_PATH_MAX_ROT_DEG = 0.2
+CROSS_PATH_MAX_TRANS_MM = 2.0
+# 角点级残差下限：优化后仍大于它，说明同框图角点/外参根本对不上，同样不采用。
+CROSS_PATH_MAX_RESID_PX = 2.0
+# 最低数据量：同框图要同时检出 A、B 两板，且每板至少这么多角点才有 6 维可解性。
+MIN_CROSS_PATH_PAIR_FRAMES = 1
+MIN_CROSS_PATH_CORNERS_PER_BOARD = 12
+
 
 @dataclass
 class CalibConfig:
@@ -200,6 +212,11 @@ class StereoCalibrationResult:
     # 形状：`{"median_mm","p95_mm","rot_deg","n"}`；拿不到位姿时为 None；
     # 计算抛异常时为 `{"error": "..."}`（**不填 0**）。
     cross_check: dict | None = None
+    # B1（2026-11-18）：以链乘为初值的跨路残差精化诊断。
+    # 形状：{"n_frames","n_corners","rms_before","rms_after","delta_rot_deg",
+    #        "delta_trans_mm","applied","reason"}；未执行/跳过为 None 或
+    # {"skipped": 原因}；异常为 {"error": ...}（**不填 0**）。
+    cross_path_refine: dict | None = None
     # 外参不确定度（`calib.uncertainty.extrinsic_sigma` 的原样输出，含 `error` 键）。
     # **只对 joint 有意义**：它需要"同一批板同时被两路看到"的同名角点。
     extrinsic_sigma: dict | None = None
@@ -396,6 +413,10 @@ class StereoCalibrationResult:
             f"左目重投影 RMS: {self.err_left:.4f} px",
             f"右目重投影 RMS: {self.err_right:.4f} px",
             f"基线 ||T||    : {self.baseline_mm:.2f} mm",
+            *( [f"板占画面      : {self.board_area * 100:.1f}%"
+                f"（左路 A 板 {self.board_area_l * 100:.1f}% / "
+                f"右路 B 板 {self.board_area_r * 100:.1f}%；建议 10%~30%）"]
+              if np.isfinite(self.board_area) else [] ),
             f"T_AB 重复性   : n={c.get('n', 0)}  "
             f"旋转最大偏离 {c.get('rot_max_deg', float('nan')):.3f}°  "
             f"平移最大偏离 {c.get('trans_max_mm', float('nan')):.3f} mm",
@@ -690,6 +711,190 @@ def _essential_fundamental(K1, K2, R, T) -> tuple[np.ndarray, np.ndarray]:
     return E, F
 
 
+def _board_area_fraction(points: Sequence[np.ndarray], image_size: tuple[int, int]) -> float:
+    """角点凸包面积 / 画面面积（多帧取中位数）—— joint 与 chain **共用同一口径**。
+
+    为什么要凸包：角点数组是**行序网格**（第 1 行从左到右、然后第 2 行…），
+    而 `cv2.contourArea` 把点当作**多边形顶点按顺序**连起来。
+    网格顺序连出来的路径会自己折回去，面积**恒为 0**（实测确认）。
+    必须先用 `convexHull` 求外轮廓 —— 标定板是凸的，凸包就是它的真实轮廓。
+
+    抽到模块级不是为了"复用好看"，而是因为 chain 以前**从不设置**
+    `board_area_l/r`，导致真实大角度 JSON 里这个字段恒为 NaN，
+    "板太小最高只判可用"那道闸对 chain 完全失效（A3）。两边必须同一口径，
+    否则同一块板换个方法就得到两个面积，判据没法互相对照。
+    """
+    w, h = image_size
+    if not points or w <= 0 or h <= 0:
+        return float("nan")
+    areas = []
+    for pts in points:
+        p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        if p.shape[0] < 3:
+            continue
+        hull = cv2.convexHull(p.astype(np.float32))
+        areas.append(float(cv2.contourArea(hull)))
+    if not areas:
+        return float("nan")
+    return float(np.median(areas)) / float(w * h)
+
+
+def _refine_chain_cross_path(
+    objp,
+    pair_boards: Sequence[tuple[np.ndarray, np.ndarray]],
+    K1: np.ndarray, D1: np.ndarray,
+    T_camL_A: np.ndarray, T_camR_B: np.ndarray,
+    R_init: np.ndarray, T_init: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """以链乘外参为初值的 6 维跨路残差最小二乘（B1；内参冻结）。
+
+    同框图由 pair camera（左 / ④）拍摄，一帧里同时看到刚性支架上的 A、B 两板。
+    残差 = 两板角点在**左相机像素系**的重投影误差：
+
+      * A 板：用 `T_camL_A`（冻结）把物点投到左相机，与 corners_A 比。
+        这一项与待优化的 R/T 无关，是噪声底锚点（保留它是为 Faithful 到
+        docs/标定算法对比.md H1 的"A、B 两板重投影到同一相机"）。
+      * B 板：先用候选外参把右相机对 B 的位姿搬到左相机
+            `T_{C_L←B} = inv(T_{C_R←C_L}) · T_{C_R←B}`，
+        再把物点投到左相机，与 corners_B 比。
+        **只有这一项约束 R/T** —— 它才是我要的"跨路残差"：
+        左边（A + 参考对）与右边（B + 参考对）两条路在同框图上闭合的误差。
+
+    参数向量 `p = [Δr(3), Δt(3)]`，`R = exp(Δr)·R_init`、`T = T_init + Δt`，
+    所以 `p=0` 精确回到链乘初值。返回 `(R_opt, T_opt, diag)`；
+    `diag` 含改前/改后 RMS、相对初值的旋转/平移改动量，供调用方做护栏判定。
+
+    ⚠️ 本函数**不做护栏**：改不改由 `_calibrate_chain` 决定。这样自测可以
+    单独考察"最小二乘本身是否收敛到真值"，而不被护栏的拒绝逻辑遮住。
+    """
+    from scipy.optimize import least_squares                 # 延迟导入，缺失也只降级本段
+
+    obj = np.asarray(objp, dtype=np.float64).reshape(-1, 3)
+    frames = [(np.asarray(a, dtype=np.float64).reshape(-1, 2),
+               np.asarray(b, dtype=np.float64).reshape(-1, 2))
+              for a, b in pair_boards]
+
+    # A 板残差：左相机位姿冻结 -> 整段是常数，预计算一次即可。
+    rvec_a = cv2.Rodrigues(np.asarray(T_camL_A)[:3, :3])[0]
+    tvec_a = np.asarray(T_camL_A)[:3, 3]
+    proj_a = cv2.projectPoints(obj, rvec_a, tvec_a, K1, D1)[0].reshape(-1, 2)
+    res_a = [(proj_a - ca).ravel() for ca, _cb in frames]
+
+    R0 = np.asarray(R_init, dtype=np.float64).reshape(3, 3)
+    t0 = np.asarray(T_init, dtype=np.float64).reshape(3)
+
+    def _residual(p: np.ndarray) -> np.ndarray:
+        dR = cv2.Rodrigues(np.asarray(p[:3], dtype=np.float64).reshape(3, 1))[0]
+        R = dR @ R0
+        T = t0 + np.asarray(p[3:], dtype=np.float64)
+        T_cr_cl = relative_pose.rt_to_T(R, T)
+        # 用候选外参把右相机看到的 B 搬到左相机系（跨路这一步是 R/T 唯一的入口）。
+        T_cl_b = relative_pose.invert(T_cr_cl) @ np.asarray(T_camR_B, dtype=np.float64)
+        proj_b = cv2.projectPoints(obj, cv2.Rodrigues(T_cl_b[:3, :3])[0],
+                                   T_cl_b[:3, 3], K1, D1)[0].reshape(-1, 2)
+        return np.concatenate(res_a + [(proj_b - cb).ravel() for _ca, cb in frames])
+
+    x0 = np.zeros(6)
+    r_before = _residual(x0)
+    sol = least_squares(_residual, x0, max_nfev=200)
+    p = np.asarray(sol.x, dtype=np.float64)
+    R_opt = cv2.Rodrigues(p[:3].reshape(3, 1))[0] @ R0
+    T_opt = (t0 + p[3:]).reshape(3, 1)
+    diag = {
+        "n_frames": int(len(frames)),
+        "n_corners": int(sum(len(cb) for _ca, cb in frames)),
+        "rms_before": float(np.sqrt(np.mean(r_before ** 2))) if r_before.size else float("nan"),
+        "rms_after": float(np.sqrt(np.mean(sol.fun ** 2))) if sol.fun.size else float("nan"),
+        "delta_rot_deg": relative_pose.rotation_angle_deg(R_opt, R0),
+        "delta_trans_mm": float(np.linalg.norm(T_opt.ravel() - t0)) * 1000.0,
+        "success": bool(sol.success),
+        "message": str(sol.message),
+    }
+    return R_opt, T_opt, diag
+
+
+def _apply_chain_verdict(res, cfg, c, *, same_board_TAB: bool):
+    """chain 的 grade / ok / verdict 判定（**唯一实现**，供自测直接构造假结果调用）。
+
+    判定逻辑一字不动：``bad_mono`` / ``bad_rep`` / ``no_rep`` 的布尔定义、三条
+    门限常量、``优秀`` / ``可用`` 两个分支、``res.grade`` / ``res.ok`` 的取值，
+    都与历史逐字一致（含缩进）。这里**只改「怎么说」**：
+
+    * 原 ``why`` 是 ``if/elif`` 单项式 —— ``bad_mono`` 抢先，把同时命中的
+      ``bad_rep``（尤其是绕板法线 180° 等价解造成的 ~180° 旋转偏离）完全藏住，
+      用户看到「不可用」却不知道为什么转了 180°。现在把所有命中原因收成
+      list、用「；」并列出来，原三条短句措辞保持原样。
+    * ``bad_rep`` 且旋转接近 180° / 平移远超门限时，追加一句带**实测数值**
+      （取自 ``c``，不硬编码）的机制提示，点名「同框图 / A-B 指派 / 重拍」，
+      让用户一眼知道该重拍第 ④ 步，而不是去调单目精度。
+
+    抽成独立模块级函数是为了让 ``tests/selftest_stereo_calib.py`` 能对
+    "改回单项式 / 删掉 180° 提示"做反向自证 —— 测试调用的就是生产代码本身。
+    """
+    bad_mono = (not np.isfinite(res.err_left) or not np.isfinite(res.err_right)
+                or res.err_left > cfg.ok_rms or res.err_right > cfg.ok_rms)
+    bad_rep = (c["n"] >= 2 and
+               (c["rot_max_deg"] > CHAIN_ROT_OK_DEG or c["trans_max_mm"] > CHAIN_TRANS_OK_MM))
+    # 双板模式（T_AB 不是单位阵）只测了 1 次同框图时，「A/B 是否真的刚性
+    # 固连」和角点精度**一点证据都没有**。以前这里只 warns、res.ok 仍是
+    # True —— 等于把"没验过"当成"验过了"，一份没根据的外参会被写进装置档案。
+    # 零共视链路唯一能自查的证据就是 T_AB 的重复性，n<2 就该拒绝出数。
+    # 单板模式不受影响：T_AB=I 是定义、不是测量，参考图只有 1 张也能出数。
+    no_rep = (not same_board_TAB and c["n"] < 2)
+
+    # ---- 板占画面比例：与 joint 同一道闸（A3，2026-11-18）----
+    # chain 以前从不设置 board_area_l/r，真实大角度 JSON 里恒为 NaN，
+    # 于是下面这句"优秀还要板够大"的硬条件对 chain **完全失效**。
+    # 双板 chain 的 board_area_l 是左路 A 板占左画面、board_area_r 是右路 B 板
+    # 占右画面（两路看的是两块不同的板），board_area 仍取较小者。
+    # `getattr` 兜底是因为自测会拿 SimpleNamespace 只填一半字段直接调本函数。
+    area = getattr(res, "board_area", float("nan"))
+    area_big_enough = (not np.isfinite(area) or area >= cfg.min_board_area_for_good)
+    would_be_good = (res.err_left <= cfg.good_rms and res.err_right <= cfg.good_rms
+                     and c["n"] >= 2 and c["rot_max_deg"] <= CHAIN_ROT_GOOD_DEG
+                     and c["trans_max_mm"] <= CHAIN_TRANS_GOOD_MM)
+    if would_be_good and not area_big_enough:
+        _warns = getattr(res, "warnings", None)
+        if _warns is not None:
+            _warns.append(
+                f"精度指标已达「优秀」档，但板只占画面 {area * 100:.1f}%"
+                f"（< {cfg.min_board_area_for_good * 100:.0f}%）—— 因此**最高只判「可用」**。"
+                f"板小会让焦距/主点与畸变强耦合，深度误差被放大而 RMS 看不出来。")
+
+    if bad_mono or bad_rep or no_rep:
+        res.grade = "不可用"
+        reasons = []
+        if bad_mono:
+            reasons.append("单目重投影超门限")
+        if bad_rep:
+            reasons.append("T_AB 重复性超门限")
+        if no_rep:
+            reasons.append("同框图只有 1 张：A/B 刚性固连与角点精度没有任何重复性证据")
+        why = "；".join(reasons)
+        res.verdict = f"不可用 —— {why}；chain 链上的误差会被直接放大到外参"
+        # 180° 专项：rot 接近 180° 或平移远超门限，几乎一定是第 ④ 步同框图
+        # 棋盘角点顺序整体倒序（solvePnP 的绕板法线 180° 等价解）或 A/B 指派
+        # 帧间翻转给出的反向 T_AB —— 不是单目精度问题，必须重拍第 ④ 步。
+        if bad_rep and (c["rot_max_deg"] >= 150.0
+                        or c["trans_max_mm"] >= 10.0 * CHAIN_TRANS_OK_MM):
+            res.verdict += (
+                f"；关键真因：T_AB 旋转偏离 {c['rot_max_deg']:.2f}°"
+                f"（平移 {c['trans_max_mm']:.2f} mm），极可能是第 ④ 步同框图棋盘角点"
+                f"顺序整体倒序 / A-B 指派帧间翻转给出的绕板法线 180° 反向外参，"
+                f"不是单目精度问题；请重拍第 ④ 步同框图并完整重跑 chain 标定")
+        res.ok = False
+    elif would_be_good and area_big_enough:
+        res.grade = "优秀"
+        res.verdict = "优秀 —— 链式外参 + 可复现的 T_AB 重复性证据"
+        res.ok = True
+    else:
+        res.grade = "可用"
+        res.verdict = ("可用 —— 链式外参已解出；T_AB 重复性或单目精度只到「可用」档，"
+                       "报告里有具体数字")
+        res.ok = True
+    return res
+
+
 def _calibrate_chain(
     objp,
     imgpoints1: list[np.ndarray],
@@ -705,6 +910,7 @@ def _calibrate_chain(
     T_camR_B: np.ndarray | None,
     T_AB_samples: Sequence[np.ndarray] | None,
     cross_poses: Sequence[tuple[np.ndarray, np.ndarray]] | None = None,
+    pair_board_corners: Sequence[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> StereoCalibrationResult:
     """chain 分支：独立单目 + 刚性双板公共参考。
 
@@ -715,6 +921,19 @@ def _calibrate_chain(
     `T_{B←A}`（`T_AB`）**必须由调用方实测提供**：它是"两块板刚性固定在同一支架"
     这一物理事实的唯一来源。缺它时整条链不可解 —— 这里直接报错，
     **绝不猜一个值、也不回退到 joint**（静默的错数比明确失败更贵）。
+
+    ## 同摆放前提（2026-11-09 方案 A）
+
+    `T_camL_A` 与 `T_camR_B` 还必须描述**同一个支架摆放**。设两次拍摄时支架
+    摆放为 `G_X` / `G_Y`，链实际等于 `inv(C_R)·G_Y·inv(G_X)·C_L`，
+    只有 `G_X = G_Y` 才等于真值。合成真值实测：摆放差 10°/2 cm 就让外参
+    错 10° / 28 mm，而且没有任何报错。
+
+    所以 CLI 的双板模式（`apps/calibrate_stereo.py::_run_chain`）只从
+    「组合装置摆好别动、两路同时各拍一张」的**参考对**求这两个位姿，
+    缺参考对直接拒绝出数。本函数无法从位姿矩阵反推摆放是否相同 ——
+    那是物理事实，不是数学可检的量。下面的 `None` 兜底只留给合成判据等
+    **显式构造位姿**的调用方，实际标定链路不会走到。
     """
     if T_AB is None:
         raise ValueError(
@@ -762,6 +981,17 @@ def _calibrate_chain(
     res.err_left, res.err_right = left["rms"], right["rms"]
     res.std1, res.std2 = left["std"], right["std"]
 
+    # ---- 板占画面比例（A3，2026-11-18）----
+    # joint 在 `calibrate_stereo` 收尾处算这个字段；chain 走 `method.run` 提前
+    # return，**从来没算过** -> 真实大角度 JSON 里 board_area=NaN，
+    # "板太小最高只判可用"那道闸对 chain 形同虚设。这里补上与 joint 完全相同的
+    # 口径（凸包面积/画面面积、多帧取中位数）。
+    # ⚠️ 口径语义：双板 chain 的 imgpoints1 是**左路看到的 A 板**、
+    #    imgpoints2 是**右路看到的 B 板** —— 两路看的是两块不同的板，
+    #    所以 board_area_l = 左路 A 板占左画面；board_area_r = 右路 B 板占右画面。
+    res.board_area_l = _board_area_fraction(imgpoints1, image_size)
+    res.board_area_r = _board_area_fraction(imgpoints2, image_size)
+
     # 若调用方没显式给两路板位姿，就用同一批角点 solvePnP 求（同一份观测，
     # 不引入新假设）；挑**重投影最小**的那一帧 —— 链上的位姿只该用最可信的一帧。
     if T_camL_A is None:
@@ -774,6 +1004,64 @@ def _calibrate_chain(
             cv2.Rodrigues(right["rvecs"][j])[0], right["tvecs"][j])
 
     R, T, T_camR_camL = relative_pose.relative_extrinsics(T_camL_A, T_AB, T_camR_B)
+    res.R, res.T = R, T
+
+    # ---- B1：以链乘为初值的 6 维跨路残差最小二乘（2026-11-18）----
+    # 整段 try/except：这是**实现失败**，降级保持链乘结果、照常出结果，
+    # 不因为这个新机制把一份本来能算的标定弄崩（质量差也出结果，只有错误才紧急）。
+    # 但"护栏命中"不是实现失败 —— 那是明确证据说初值不可信，必须改判不可用。
+    chain_R, chain_T = R.copy(), T.copy()
+    b1_reject_reason = ""
+    try:
+        frames = []
+        for a, b in (pair_board_corners or []):
+            aa = np.asarray(a, dtype=np.float64).reshape(-1, 2)
+            bb = np.asarray(b, dtype=np.float64).reshape(-1, 2)
+            if (np.all(np.isfinite(aa)) and np.all(np.isfinite(bb))
+                    and len(aa) >= MIN_CROSS_PATH_CORNERS_PER_BOARD
+                    and len(bb) >= MIN_CROSS_PATH_CORNERS_PER_BOARD):
+                frames.append((aa, bb))
+        if len(frames) < MIN_CROSS_PATH_PAIR_FRAMES:
+            why = ("未提供同框图 A/B 双板角点" if not pair_board_corners else
+                   f"有效同框图只有 {len(frames)} 帧（需 ≥{MIN_CROSS_PATH_PAIR_FRAMES}，"
+                   f"每板 ≥{MIN_CROSS_PATH_CORNERS_PER_BOARD} 个有限角点）")
+            res.cross_path_refine = {"skipped": why}
+            print(f"[chain/B1] 跳过跨路精化：{why}；保持链乘外参。")
+        else:
+            r_opt, t_opt, diag = _refine_chain_cross_path(
+                objp, frames, res.K1, res.D1, T_camL_A, T_camR_B, chain_R, chain_T)
+            applied, reason = False, ""
+            if not diag["success"]:
+                reason = f"最小二乘未收敛（{diag['message'][:80]}）"
+            elif (diag["delta_rot_deg"] > CROSS_PATH_MAX_ROT_DEG
+                  or diag["delta_trans_mm"] > CROSS_PATH_MAX_TRANS_MM):
+                reason = (f"改动幅度超护栏：旋转 {diag['delta_rot_deg']:.3f}°"
+                          f"（>{CROSS_PATH_MAX_ROT_DEG}°）/ 平移 {diag['delta_trans_mm']:.2f} mm"
+                          f"（>{CROSS_PATH_MAX_TRANS_MM} mm）—— 链乘初值不可信"
+                          f"（可能是同框图角点倒序的 180° 错解）")
+            elif diag["rms_after"] > CROSS_PATH_MAX_RESID_PX:
+                reason = (f"优化后角点残差仍达 {diag['rms_after']:.2f} px"
+                          f"（>{CROSS_PATH_MAX_RESID_PX} px）—— 同框图角点与外参对不上")
+            else:
+                applied = True
+                R, T = r_opt, t_opt
+                T_camR_camL = relative_pose.rt_to_T(R, T)   # cross_check 也用精化后的外参
+            diag["applied"] = applied
+            diag["reason"] = reason
+            res.cross_path_refine = diag
+            print(f"[chain/B1] 同框 {diag['n_frames']} 帧 / {diag['n_corners']} 角点："
+                  f"重投影 RMS {diag['rms_before']:.4f} -> {diag['rms_after']:.4f} px，"
+                  f"相对链乘初值旋转 {diag['delta_rot_deg']:.4f}° / "
+                  f"平移 {diag['delta_trans_mm']:.3f} mm，"
+                  f"{'已采用' if applied else '未采用（' + reason + '）'}")
+            if not applied:
+                b1_reject_reason = reason
+    except Exception as exc:                              # noqa: BLE001 - 原文要保留
+        res.cross_path_refine = {"error": f"{type(exc).__name__}: {exc}"}
+        print(f"[chain/B1] 跨路精化抛异常，保持链乘结果照常出数："
+              f"{type(exc).__name__}: {exc}")
+
+    # 采用时把精化后的外参写回结果（未采用时 R/T 仍是链乘原值）。
     res.R, res.T = R, T
     res.E, res.F = _essential_fundamental(res.K1, res.K2, R, T)
     # ---- 未校正投影矩阵（2026-10-24）----
@@ -904,30 +1192,21 @@ def _calibrate_chain(
             warns.append(f"T_AB 重复性一般：旋转 {c['rot_max_deg']:.2f}° / "
                          f"平移 {c['trans_max_mm']:.2f} mm")
 
-    bad_mono = (not np.isfinite(res.err_left) or not np.isfinite(res.err_right)
-                or res.err_left > cfg.ok_rms or res.err_right > cfg.ok_rms)
-    bad_rep = (c["n"] >= 2 and
-               (c["rot_max_deg"] > CHAIN_ROT_OK_DEG or c["trans_max_mm"] > CHAIN_TRANS_OK_MM))
-    if bad_mono or bad_rep:
+    # 先挂 warnings：`_apply_chain_verdict` 可能再追加"板太小封顶"那条，
+    # 挂晚会被这里整表覆盖掉（A3）。
+    res.warnings = warns
+    _apply_chain_verdict(res, cfg, c, same_board_TAB=same_board_TAB)
+    if b1_reject_reason:
+        # 护栏命中 = 明确证据说链乘初值不可信，**不是**"质量差"，所以必须改判
+        # 不可用，且绝不采用优化出来的那个"看起来收敛"的错解（docs H1 风险）。
+        warns.append(f"跨路精化被拒：{b1_reject_reason}；已保持链乘原值并判不可用。")
         res.grade = "不可用"
-        why = ("单目重投影超门限" if bad_mono else "T_AB 重复性超门限")
-        res.verdict = f"不可用 —— {why}；chain 链上的误差会被直接放大到外参"
+        res.verdict = ("不可用 —— 跨路残差精化触发护栏：" + b1_reject_reason
+                       + "；请重拍第 ④ 步同框图（确认 A/B 指派与角点顺序）后完整重跑 chain")
         res.ok = False
-    elif (res.err_left <= cfg.good_rms and res.err_right <= cfg.good_rms
-          and c["n"] >= 2 and c["rot_max_deg"] <= CHAIN_ROT_GOOD_DEG
-          and c["trans_max_mm"] <= CHAIN_TRANS_GOOD_MM):
-        res.grade = "优秀"
-        res.verdict = "优秀 —— 链式外参 + 可复现的 T_AB 重复性证据"
-        res.ok = True
-    else:
-        res.grade = "可用"
-        res.verdict = ("可用 —— 链式外参已解出；T_AB 重复性或单目精度只到「可用」档，"
-                       "报告里有具体数字")
-        res.ok = True
     if stereo_mode == "angled" and res.ok:
         sugg.append("这组 P1/P2 是 none_raw（未做极线校正）；三角测量可直接用，"
                     "但任何依赖极线水平对齐/视差的方法都不适用。")
-    res.warnings = warns
     res.suggestions = sugg
     return res
 
@@ -946,6 +1225,7 @@ def calibrate_stereo(
     T_camR_B: np.ndarray | None = None,
     T_AB_samples: Sequence[np.ndarray] | None = None,
     cross_poses: Sequence[tuple[np.ndarray, np.ndarray]] | None = None,
+    pair_board_corners: Sequence[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> StereoCalibrationResult:
     """从已配对的角点做完整双目标定（含离群剔除与质量判定）。
 
@@ -992,6 +1272,7 @@ def calibrate_stereo(
             objp, list(imgpoints1), list(imgpoints2), image_size, cfg, spec, res,
             stereo_mode=stereo_mode, T_camL_A=T_camL_A, T_AB=T_AB,
             T_camR_B=T_camR_B, T_AB_samples=T_AB_samples, cross_poses=cross_poses,
+            pair_board_corners=pair_board_corners,
         )
 
     if len(imgpoints1) < 4 or len(imgpoints1) != len(imgpoints2):
@@ -1075,19 +1356,7 @@ def calibrate_stereo(
     # 网格顺序连出来的路径会自己折回去，面积**恒为 0**（实测确认）。
     # 必须先用 `convexHull` 求外轮廓 —— 标定板是凸的，凸包就是它的真实轮廓。
     def _area(points: Sequence[np.ndarray]) -> float:
-        w, h = image_size
-        if not points or w <= 0 or h <= 0:
-            return float("nan")
-        areas = []
-        for pts in points:
-            p = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
-            if p.shape[0] < 3:
-                continue
-            hull = cv2.convexHull(p.astype(np.float32))
-            areas.append(float(cv2.contourArea(hull)))
-        if not areas:
-            return float("nan")
-        return float(np.median(areas)) / float(w * h)
+        return _board_area_fraction(points, image_size)
 
     res.board_area_l = _area([imgpoints1[i] for i in b["idx"] if i < len(imgpoints1)])
     res.board_area_r = _area([imgpoints2[i] for i in b["idx"] if i < len(imgpoints2)])

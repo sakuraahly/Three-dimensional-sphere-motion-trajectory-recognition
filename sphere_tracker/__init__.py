@@ -11,6 +11,7 @@
     viz.py       可视化：拖尾、圆、预测虚线、HUD
     sources.py   视频源：摄像头 / 视频文件 / 图片
     pipeline.py  单帧总流程编排
+    discovery.py 会话目录枚举（全仓库唯一口径；纯 stdlib，不拉 cv2/scipy）
 """
 
 from .config import AppConfig, load_config, save_config

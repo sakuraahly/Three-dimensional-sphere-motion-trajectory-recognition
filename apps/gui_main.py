@@ -1,5 +1,14 @@
 """球形物体三维运动轨迹识别 —— 图形化启动器（人类友好型）。
 
+⚠️ **经典界面已于 2026-11-20 废止。**
+   本文件现在只是**入口壳**：不带参数运行时启动新界面
+   （`apps/_gui_app.py` 的门厅 + 单目 / 平行双目 / 大角度双目窗口）；
+   ``--legacy`` 只打印废止说明并返回 2，``run.bat legacy`` 同样只提示。
+   `Launcher` 及其全部旧实现**保留但不再可达** —— 多个回归测试
+   （入口一致性 / 启动器参数 / 任务管理器 / 变异自证）仍按文本与导入
+   引用它。保留实现 ≠ 可以重新打开；要恢复入口必须先改
+   `docs/决策记录.md` 的 2026-11-20 决策并补独立 Critic 判据。
+
 给不熟悉命令行的使用者一个双击即可用的入口，按"三步走"引导：
     第 1 步  要不要做相机标定（可跳过，已标定过就选跳过）
     第 2 步  选参数（摄像头、球直径、检测方法、颜色预设、预测视野）
@@ -14,8 +23,8 @@
     left / right 即可 —— 角色按**设备身份**（不是编号）绑定，换 USB 口也不会用错。
 
 运行：
-    %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe 启动程序.py
-    （或直接双击 启动程序.bat）
+    %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe apps/gui_main.py
+    （或直接双击 run.bat）
 """
 
 from __future__ import annotations
@@ -51,7 +60,8 @@ BG = "#eef2f8"
 # 现在加一个检测器只改注册表一处，界面与命令行不可能再对不上。
 # 顺序 = 注册顺序；默认值 = 注册表声明的默认（= `DetectorConfig.method`），
 # 不再靠"列表首项"这种隐式约定 —— 展示顺序与默认值是两件独立的事。
-from sphere_tracker.paths import log_dir as _paths_log_dir  # noqa: E402
+from sphere_tracker.paths import (LEGACY_STEREO_ROOT,  # noqa: E402
+                                  log_dir as _paths_log_dir)
 from sphere_tracker.config import ColorConfig as _ColorConfig  # noqa: E402
 from sphere_tracker.detectors import registry as _detector_registry  # noqa: E402,F401  （import 即注册）
 from sphere_tracker.plugins import default as _plugin_default  # noqa: E402
@@ -100,8 +110,8 @@ CALIB_FPS_DEFAULT = str(DEFAULT_VIDEO_FPS)   # 唯一来源：video_profiles.DEF
 CALIB_TARGET_PAIRS = 40
 CALIB_MIN_PAIRS = 20
 
-# 标定结果：**几何的权威来源**（档案里的 B/D 只是参考估算，见 _refresh_profile_line）。
-CALIB_PATH = ROOT / "config" / "stereo_calibration"
+# 标定路径不再写死顶层 config/stereo_calibration：标定现在落在 config/calib/<档案名>.npz。
+from apps._common import current_calibration  # noqa: E402  （要等 ROOT 进 sys.path）
 
 
 def calibration_measure() -> tuple[float, float] | None:
@@ -111,11 +121,17 @@ def calibration_measure() -> tuple[float, float] | None:
     ``T`` / ``R`` 算出（``angle_deg`` 不是手填的 90.0），``StereoRig`` 已经把这两件事
     做对了，GUI 里再写第二份解析就会与 ``apps/tools/check_stereo_setup.py`` 的口径分叉。
     读不到（没标定过 / 文件坏了）**不是错误**：顶部状态条写"尚无标定"即可。
+
+    标定基名取自**当前装置档案**（``current_calibration``），不再写死顶层 ——
+    写死顶层的后果是标定明明在 ``config/calib/<档案名>.npz``，复检却报"还没有标定结果"。
     """
     try:
         from calib.params import StereoRig
 
-        rig = StereoRig.load(CALIB_PATH)
+        base, why = current_calibration()
+        if why:                       # 没有可用标定（原因文案由调用方原样展示）
+            return None
+        rig = StereoRig.load(base)
     except (OSError, ValueError, KeyError):
         return None
     return float(rig.baseline_mm), float(rig.angle_deg)
@@ -420,6 +436,12 @@ def _child_pids(pid: int) -> list[int]:
 
 
 class Launcher(tk.Tk):
+    """经典单窗口界面 —— **已废止（2026-11-20）**，保留仅供回归测试引用。
+
+    入口已关闭：``apps/gui_main.py --legacy`` 只打印废止说明并返回 2，
+    ``run.bat legacy`` 同样只提示。新界面是唯一可用 GUI。
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self.title("球形物体三维运动轨迹识别 · 启动器")
@@ -460,6 +482,8 @@ class Launcher(tk.Tk):
         self._wb_auto_after: str | None = None
         self._record_before: set[str] = set()
         self.stereo_mode_var = tk.StringVar(value="auto")
+        # 录制容器（mkv/avi）：随录制命令下传 --container；默认 mkv。
+        self.record_container = tk.StringVar(value="mkv")
 
         self._init_style()
         self._build_header()
@@ -725,38 +749,34 @@ class Launcher(tk.Tk):
                      " · 点右上『装置档案』新建，可保存平行 / 90° 两套参数")
             return
 
-        ref_bits = []
-        if profile.expected_baseline_mm is not None:
-            ref_bits.append(f"B={profile.expected_baseline_mm:.0f} mm")
-        if profile.working_distance_m is not None:
-            ref_bits.append(f"D={profile.working_distance_m:.2f} m")
-        ref = f" · 参考 {' / '.join(ref_bits)}（仅作参考）" if ref_bits else ""
+        # 几何预期字段已删（2026-11-07）：这里只报"当前是哪套装置"，
+        # 真实基线/夹角由标定结果给出，不再把人填的估计值摆成"参考"。
         self._profile_line.configure(
-            text=f"当前装置：{profile.name} · {mode_label(profile.stereo_mode)} · {actual}{ref}")
+            text=f"当前装置：{profile.name} · {mode_label(profile.stereo_mode)} · {actual}")
 
     def _open_profiles(self) -> None:
         """『装置档案』：新建 / 覆盖一套装置参数并设为当前（P0-1 的入口）。
 
-        只做一件最小可用的事：名称 + 模式（**这两项就够**），B/D 可选。
+        只做一件最小可用的事：名称 + 模式（**这两项就够**）。
         故意**不做**"批量管理"—— 多档案的增删已经在 `stereo/profiles.py`
         里，界面先保证"能建、能切换、能看见"，而不是造一套平行实现。
 
-        B/D 的默认值从 600 / 0.30 改成了**空**：预填具体数字等于暗示"这里必须填准"，
-        而用户明确说过"我不能精确确定摄像头的位置"—— 判定看标定，不看这两个框。
+        2026-11-07 起 B/D 两个输入框整块删掉：几何量以标定结果为准，
+        档案不再存"期望基线 / 工作距离"这种猜测值。
         """
         from stereo import profiles as rig_profiles
         dlg = tk.Toplevel(self)
         dlg.title("装置档案")
         dlg.configure(bg=BG)
-        dlg.transient(self)
+        # 标准窗口：最小化 / 最大化 / 关闭（AGENTS.md §7.1）。
+        # 不用 transient()（Windows 上变工具窗口、只剩 ×）、不锁尺寸、不全局 grab。
+        dlg.resizable(True, True)
         body = ttk.Frame(dlg, padding=12)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="当前活动档案："
                   + (rig_profiles.active_name() or "未设置")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        rows = (("名称", "rig1"), ("模式（parallel / angled）", "angled"),
-                ("期望基线 B（mm，可选，仅作参考）", ""),
-                ("工作距离 D（米，可选，仅作参考）", ""))
+        rows = (("名称", "rig1"), ("模式（parallel / angled）", "angled"))
         vars_: list[tk.StringVar] = []
         for i, (label, default) in enumerate(rows, start=1):
             ttk.Label(body, text=label).grid(row=i, column=0, sticky="e", pady=3)
@@ -764,28 +784,24 @@ class Launcher(tk.Tk):
             ttk.Entry(body, textvariable=var, width=24).grid(
                 row=i, column=1, sticky="w", padx=(6, 0), pady=3)
             vars_.append(var)
-        ttk.Label(body, text="只填名称 + 模式即可保存。B / D 可留空 —— 它们是装置的"
-                             "粗略估计，几何判定以 config/stereo_calibration 的"
-                             "实测基线 / 夹角为准；填了也只作参考。\n"
+        ttk.Label(body, text="只填名称 + 模式即可保存。几何判定以 "
+                             "本档案的标定实测基线 / 夹角为准（档案没配标定路径时回落顶层默认）。\n"
                              "保存会覆盖同名档案；不合格的值会被拒绝并说明原因。",
                   style="Hint.TLabel", wraplength=380).grid(
             row=len(rows) + 1, column=0, columnspan=2, sticky="w", pady=(8, 6))
 
         def save() -> None:
-            name, mode, baseline, distance = (v.get().strip() for v in vars_)
+            name, mode = (v.get().strip() for v in vars_)
             try:
                 profile = rig_profiles.RigProfile(
-                    name=name, stereo_mode=mode,
-                    expected_baseline_mm=float(baseline) if baseline else None,
-                    working_distance_m=float(distance) if distance else None)
+                    name=name, stereo_mode=mode)
                 rig_profiles.upsert(profile, replace_existing=True)
                 rig_profiles.set_active(profile.name)
             except Exception as exc:                        # noqa: BLE001
                 messagebox.showwarning("装置档案", f"没保存：{exc}", parent=dlg)
                 return
             self._refresh_profile_line()
-            self._append(f"[装置] 已保存并设为当前：{profile.name}"
-                         f"（{mode}）；{rig_profiles.geometry_hint(profile)}")
+            self._append(f"[装置] 已保存并设为当前：{profile.name}（{mode}）")
             dlg.destroy()
 
         ttk.Button(body, text="保存并设为当前", command=save).grid(
@@ -1400,7 +1416,7 @@ class Launcher(tk.Tk):
         self._refresh_profile_line()
         measure = calibration_measure()
         detail = (f"基线 {measure[0]:.1f} mm / 夹角 {measure[1]:.1f}°"
-                  if measure is not None else "读不到 config/stereo_calibration.json")
+                  if measure is not None else "读不到当前装置的标定文件")
         self._append(f"[链式标定] 完成：{detail}。")
         messagebox.showinfo(
             "已更新标定",
@@ -1498,6 +1514,11 @@ class Launcher(tk.Tk):
                    command=self._start_video).grid(row=1, column=1, padx=(0, 12), pady=4)
         ttk.Button(box, text="录制双目（无损）", command=self._start_record).grid(
             row=2, column=0, padx=(0, 12), pady=4)
+        # 录制容器下拉（row2 原本空着的 col3/col4）：mkv（默认）/ avi。
+        # mp4 不在此列 —— HFYU/FFV1 进 mp4 会被 FFmpeg 静默换成有损 h264。
+        ttk.Label(box, text="录制格式").grid(row=2, column=3, sticky="e", padx=(4, 2), pady=4)
+        ttk.Combobox(box, textvariable=self.record_container, values=("mkv", "avi"),
+                     width=6, state="readonly").grid(row=2, column=4, sticky="w", pady=4)
         # 离线双目 / 点选球**只在「双目工作台」有一处入口**（P1-1）。
         # 原来这两个按钮在工作台（②③）和第 3 步各有一份，两处行为一致但
         # 一个带会话选择器、一个不带 —— 用户不知道点哪个才是"正确路径"。
@@ -1580,7 +1601,7 @@ class Launcher(tk.Tk):
     def _wb_browse(self) -> None:
         path = filedialog.askdirectory(
             parent=self, title="选择任意双目会话目录",
-            initialdir=str(ROOT / "data" / "sessions"))
+            initialdir=str(LEGACY_STEREO_ROOT))
         if not path:
             return
         self._wb_add_custom(Path(path))
@@ -1620,7 +1641,7 @@ class Launcher(tk.Tk):
     def _wb_refresh(self, select_latest: bool = False) -> None:
         from apps._workbench import scan_sessions, summarize_session
         try:
-            scanned = scan_sessions(ROOT / "data" / "sessions", limit=200)
+            scanned = scan_sessions(LEGACY_STEREO_ROOT, limit=200)
         except Exception as exc:                            # noqa: BLE001
             # 只说"失败：<异常>"等于让用户自己猜。现象 + 可能原因 + 下一步。
             self.wb_info.configure(
@@ -1697,7 +1718,7 @@ class Launcher(tk.Tk):
             self._wb_refresh()
             return
         from apps._workbench import scan_sessions
-        now = scan_sessions(ROOT / "data" / "sessions", limit=50)
+        now = scan_sessions(LEGACY_STEREO_ROOT, limit=50)
         new = [s for s in now if s.path.name not in self._record_before]
         if not new:
             self._append("[工作台] 录制结束但没有发现新会话目录；跳过自动校验。")
@@ -1758,13 +1779,16 @@ class Launcher(tk.Tk):
                   f"轨迹 {traj}{z}{res}{problems}"))
         next_step = {
             "bad": "先按上面的问题重录/修数据；坏数据不要进三维。",
+            "empty": "这段会话没录成（相机没给到帧），重录即可。",
             "recorded": ("校验未通过，按问题重录。" if checked is False
                          else "下一步：① 校验数据。" if checked is None
                          else "下一步：② 点选球心。"),
             "seeded": "下一步：③ 跑离线双目。",
+            "traj_thin": "匹配点太少：检查球心 / 换方法重跑 ③；④ 仍可打开查看器看散点。",
             "traj": "下一步：④ 打开 3D 查看器；⑤ 可重新导出标准 JSON。",
         }.get(s.status, "")
-        if s.sync_method == "none" and s.status != "bad":
+        # 空壳会话（0 帧）的 sync 一定也是 none，别让"未同步"盖掉"重录即可"
+        if s.sync_method == "none" and s.status not in ("bad", "empty"):
             next_step = "未同步：优先重录并闪光；三维结果只作参考。"
         self.wb_hint.configure(text=next_step)
 
@@ -2031,6 +2055,7 @@ class Launcher(tk.Tk):
             "--width", width, "--height", height,
             "--fps", (self.calib_fps.get().strip() or CALIB_FPS_DEFAULT),
             "--duration", str(duration),
+            "--container", self.record_container.get(),
             "--label", (label or "gui_record").strip(),
             "--stereo-mode", self.stereo_mode_var.get(),
             "--preview", "--notes", "GUI 录制",
@@ -2052,7 +2077,11 @@ class Launcher(tk.Tk):
         from stereo.record_plan import plan_record
         try:
             width, height = (int(v) for v in self.calib_res.get().split("x"))
-            rig = StereoRig.load(ROOT / "config" / "stereo_calibration")
+            # 模式校验要用**本套装置**的几何，不再拿顶层的别套装置标定去判"模式选错"。
+            base, why = current_calibration()
+            if why:
+                return None
+            rig = StereoRig.load(base)
         except Exception:                                   # noqa: BLE001
             return None
         return plan_record(rig, mode_choice=self.stereo_mode_var.get(),
@@ -2112,7 +2141,7 @@ class Launcher(tk.Tk):
         cmd = self._record_args(str(duration), label)
         self._append(f"录制：{duration} 秒；开始后闪一次光，结束前再闪一次。")
         from apps._workbench import scan_sessions
-        self._record_before = {s.path.name for s in scan_sessions(ROOT / "data" / "sessions", limit=50)}
+        self._record_before = {s.path.name for s in scan_sessions(LEGACY_STEREO_ROOT, limit=50)}
         self._run(cmd, f"录制双目（{duration} 秒）",
                   on_done=self._after_record_task)
 
@@ -2144,20 +2173,25 @@ class Launcher(tk.Tk):
                           method: str | None = None) -> bool:
         """打开点选窗口；保存成功返回 True。
 
-        ``method``：点选完成后「现在运行？」那一步用的检测方法覆盖（有 seed 的
-        会话必须 specular），**不改第 2 步的下拉框**（B-98）。
+        ``method``：点选完成后「现在运行？」那一步用的检测方法覆盖
+        （**沿用当前球种类的方法**；镜面球用 specular、纯色球用 color），
+        **不改第 2 步的下拉框**（B-98）。
         """
         if session_dir is None:
             session_dir = filedialog.askdirectory(
                 title="选择双目会话目录（含 session.json）",
-                initialdir=str(ROOT / "data" / "sessions"))
+                initialdir=str(LEGACY_STEREO_ROOT))
         if not session_dir:
             return False
         if not (Path(session_dir) / "session.json").exists():
             messagebox.showwarning("不是会话目录", "这个目录里没有 session.json。")
             return False
         from apps.seed_picker import SeedPicker
-        picker = SeedPicker(self, session_dir)
+        # 经典界面没有「球种类」下拉，只有检测方法：由方法反推 ball_kind，
+        # 写进 seeds.json（跑三维时据此决定 specular / color）。
+        _m = str(self.method.get() or "")
+        _kind = "metal" if _m == "specular" else ("plastic" if _m == "color" else "")
+        picker = SeedPicker(self, session_dir, ball_kind=_kind)
         self.wait_window(picker)
         if picker.result is None:
             return False
@@ -2194,6 +2228,7 @@ class Launcher(tk.Tk):
             self._append(f"[提示] 跳过内置/红外检查：{exc}")
             return True
         by_order = {d.order: d for d in devices}
+        reg = cr.load_registry()
         roles = [r for r in (_cam_arg(left), _cam_arg(right)) if r in ("left", "right")]
 
         try:
@@ -2223,7 +2258,7 @@ class Launcher(tk.Tk):
                 where = f"{name or '未知名'}（PnP #{entry.order}；采集 #{r.index}）"
             else:
                 where = f"{name or '未知名'}（编号 {r.index}）"
-            if cr.is_avoided(name):
+            if cr.is_avoided(name, reg.settings):
                 return messagebox.askyesno(
                     "确认用内置 / 红外相机？",
                     f"{role}相机 {where}看起来是笔记本内置或红外相机，"
@@ -2242,7 +2277,7 @@ class Launcher(tk.Tk):
             messagebox.showerror(
                 "左右指向了同一台相机",
                 f"左 -> #{sizes.get('left', ('?', '?'))[1]}，右 -> #{sizes.get('right', ('?', '?'))[1]}\n\n"
-                "标定需要两台不同的相机。请跑 `启动程序.bat setup` 重新确认。")
+                "标定需要两台不同的相机。请跑 `run.bat setup` 重新确认。")
             return False
         return True
 
@@ -2421,10 +2456,10 @@ class Launcher(tk.Tk):
                 note += "；⚠ 未填预期基线，基线核对将是关着的"
             self._run(cmd, f"双目标定（左{left} / 右{right}，{note}）")
         else:
-            calib = ROOT / "config" / "stereo_calibration"
-            if not calib.with_suffix(".npz").exists():
-                messagebox.showwarning("找不到标定文件",
-                                       "还没有标定结果，请先执行一次双目标定。")
+            # 复检要查的是**当前档案**的标定（.npz/.json 任一），不再只看顶层那一个 .npz。
+            calib, why = current_calibration()
+            if why:
+                messagebox.showwarning("找不到标定文件", why)
                 return
             cmd = [PY, str(ROOT / "apps" / "verify_stereo.py"),
                    "--calib", str(calib), "--left", left, "--right", right,
@@ -2586,7 +2621,7 @@ class Launcher(tk.Tk):
                   "清空「无关」清单（全部恢复可被自动挑选）")
 
     def _run_tests_fast(self) -> None:
-        """快测：走 apps/run_tests.py fast（与 `启动程序.bat test` 同一个运行器）。
+        """快测：走 apps/run_tests.py fast（与 `run.bat test` 同一个运行器）。
 
         ⚠️ 这里**不自己拼测试清单**。以前这个按钮硬编码只跑
         `selftest_synthetic.py` 一个，而 `AGENTS.md` §7 要求跑 15 个 ——
@@ -2638,12 +2673,18 @@ class Launcher(tk.Tk):
         所以：**只在用户本来就贴着底时才自动滚**。这条约定在终端、日志查看器里
         是通用的；用户一旦往上翻，就说明他在读历史，不该被打断。
         """
-        at_bottom = self.log.yview()[1] >= 0.999
-        self.log.configure(state="normal")
-        self.log.insert("end", text + "\n")
-        if at_bottom:
-            self.log.see("end")
-        self.log.configure(state="disabled")
+        try:
+            at_bottom = self.log.yview()[1] >= 0.999
+            self.log.configure(state="normal")
+            self.log.insert("end", text + "\n")
+            if at_bottom:
+                self.log.see("end")
+            self.log.configure(state="disabled")
+        except tk.TclError:
+            # 窗口已销毁（关窗 / 并行测试收尾）：日志控件不在了。
+            # 后台 reader 线程的回调可能比 destroy 晚一步，这里静默丢掉这一行，
+            # 不能让一个已经关掉的窗口把任务收尾打断（B-167 的根因）。
+            return
 
     def _clear_log(self) -> None:
         self.log.configure(state="normal")
@@ -2993,6 +3034,15 @@ class Launcher(tk.Tk):
                 status = t.stop_reason
             else:
                 status = f"已结束(码 {t.exit_code})"
+                # 质量差也返回 0、也照常出结果：状态里带一句「仅供参考」。
+                # 延迟 import：不为这一个后缀给旧启动器引入顶层依赖；
+                # 解析函数与 run_all / ConsoleWindow 共用唯一实现。
+                if t.exit_code == 0:
+                    try:
+                        from apps.run_all import quality_note_of_task
+                        status += quality_note_of_task(t)
+                    except Exception:                    # noqa: BLE001
+                        pass
             tree.insert("", "end", iid=str(t.tid),
                         values=(t.tid, t.title, t.proc.pid,
                                 f"{t.elapsed():.1f}s", status))
@@ -3147,26 +3197,28 @@ class Launcher(tk.Tk):
 
 
 def main(argv: list[str] | None = None) -> int:
-    """入口：默认新界面（门厅 + 三个模式窗）；``--legacy`` 走经典单窗口。
+    """入口：**只启动新界面**；``--legacy`` 已废止，只打印说明并返回 2。
 
-    为什么两个入口并存（2026-10-28）：分窗在逐窗落地（单目窗、双目窗已建，
-    收集图/工作台的若干动作仍指向经典界面的等价入口）。**旧代码一行没删** ——
-    删它要同步改 ``selftest_launcher_params`` / ``selftest_entrypoints`` 的判据，
-    而按全局 §15.2，改测试判据必须由**非实现者** Critic 签 PASS；
-    限流期间没有可用 Critic，所以这一步留给 B-102，由独立 Critic 验收。
+    2026-11-20 用户裁决：新界面已覆盖完整流程，经典单窗口界面废止。
+    门厅按钮改成只弹提示，``_actions.legacy_gui()`` 已删除，这里再拒绝一次
+    ``--legacy`` —— 三个入口同时关闭，避免"命令行还能绕回去"。
 
-    过渡期两条硬约束（写在这里，免得后来者以为是遗漏）：
-
-    1. 经典界面只能从门厅的「经典界面（过渡）」或 ``--legacy`` 进入，
-       不提供"两个都是主入口"的错觉；
-    2. 新界面是**默认** —— 否则用户看不到变化，重做就没有意义。
+    为什么保留 `Launcher` 的 3000+ 行实现：多个回归测试按文本与导入引用它
+    （``selftest_entrypoints`` / ``selftest_launcher_params`` /
+    ``selftest_task_manager`` / ``selftest_mutation_guards``）。按全局 §15.2，
+    改测试判据必须由非实现者 Critic 签 PASS；B-102（删旧 Launcher）仍是
+    ``wontfix``。**废止入口 ≠ 删除代码**，也 ≠ 可以重新接回入口。
     """
     args = list(sys.argv[1:] if argv is None else argv)
-    if "--legacy" not in args:
-        from apps._gui_app import run as _run_new_gui
-        return _run_new_gui()
-    Launcher().mainloop()
-    return 0
+    if "--legacy" in args:
+        print(
+            "[已废止] 经典界面自 2026-11-20 起不再提供。\n"
+            "         新界面是唯一入口：直接运行 apps/gui_main.py（或双击 run.bat），\n"
+            "         它就是门厅 + 单目 / 平行双目 / 大角度双目窗口。",
+            file=sys.stderr)
+        return 2
+    from apps._gui_app import run as _run_new_gui
+    return _run_new_gui()
 
 
 if __name__ == "__main__":

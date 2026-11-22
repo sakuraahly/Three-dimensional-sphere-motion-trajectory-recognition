@@ -25,7 +25,7 @@ v2.0-dev.1  -> 77f4f10  （1440p 自动 FOV 开发快照，未验收）
 2. 不在 `main` 上直接改代码；`main` 只做发布合并。
 3. 每个功能/修复一个分支，提交信息用英文 `type: summary`。
 4. 合并前必须：
-   - 全量 `启动程序.bat test full` 26/26；
+   - 全量 `run.bat test full` 26/26；
    - `check_standards.py` 通过；
    - 独立 Critic 复核；
    - 涉及真机的部分要有真机证据；

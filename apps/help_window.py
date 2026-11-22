@@ -23,6 +23,7 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from apps import i18n
 from apps.help_content import SECTIONS, iter_items, search
 
 try:                                    # 与主界面同一套字体，缺了也能跑
@@ -32,8 +33,27 @@ except Exception:                       # noqa: BLE001
 
 #: 正文区字号。比界面常规大一号：说明是要"读"的，不是扫一眼的按钮标签。
 BODY_FONT = (FONT_FAMILY, 10)
+#: 正文里的 `**…**`。跟 BODY_FONT 同字号，只多一个 bold —— 混排时行高不变。
+BOLD_FONT = (FONT_FAMILY, BODY_FONT[1], "bold")
+#: 正文里反引号包住的路径/命令用等宽显示，比常规字体好认。
+#: 候选按顺序试，一个都没装就退回正文字体 —— 说明窗口不该因为缺字体打不开。
+#: 能不能用要等 Tk root 建好才知道，所以由 `_mono_font()` 在构建时解析。
+MONO_CANDIDATES = ("Consolas", "Cascadia Mono", "Courier New")
 TITLE_FONT = (FONT_FAMILY, 12, "bold")
 MUTED = "#64748b"
+
+
+def _mono_font() -> tuple[str, int]:
+    """正文等宽字体；本机没有等宽字体时回落到正文字体（同字号）。"""
+    try:
+        from tkinter import font as tkfont
+        families = set(tkfont.families())
+    except Exception:                        # noqa: BLE001
+        return (FONT_FAMILY, BODY_FONT[1])
+    for name in MONO_CANDIDATES:
+        if name in families:
+            return (name, BODY_FONT[1])
+    return (FONT_FAMILY, BODY_FONT[1])
 
 
 class HelpWindow(tk.Toplevel):
@@ -142,6 +162,13 @@ class HelpWindow(tk.Toplevel):
         self.text.tag_configure("section", font=(FONT_FAMILY, 9),
                                 foreground=MUTED, spacing3=4)
         self.text.tag_configure("body", font=BODY_FONT)
+        # 顺序有意义：后配的对同一段文字优先。`**` 里再套反引号（``**`x`**``）
+        # 两个 tag 会同时命中，这里让 bold 赢 —— 外界语义是"强调"，不是"等宽"。
+        self.text.tag_configure("mono", font=_mono_font())
+        self.text.tag_configure("bold", font=BOLD_FONT)
+        # Text 带富文本 tag，i18n.apply 不能整段替换正文；约定一个回调，
+        # 切换语言时由窗口自己按当前语言重绘（见 apps/i18n.py 的 apply）。
+        self.text._i18n_refresh = lambda: self._on_select()   # type: ignore[attr-defined]
         body.add(right, weight=3)
 
         self.search_entry.focus_set()
@@ -159,7 +186,7 @@ class HelpWindow(tk.Toplevel):
                 self.tree.insert("", "end", iid=iid, text=f"{title}",
                                  open=False)
                 self._items[iid] = (f"{stitle}", title, body)
-            self.count_lab.configure(text=f"搜到 {len(hits)} 条")
+            self._set_count(f"搜到 {len(hits)} 条")
             if hits:
                 self.tree.selection_set("r0")
                 self._on_select()          # 直接渲染，见下
@@ -176,7 +203,7 @@ class HelpWindow(tk.Toplevel):
                 self.tree.insert(parent, "end", iid=iid, text=title)
                 self._items[iid] = (stitle, title, body)
                 n += 1
-        self.count_lab.configure(text=f"共 {n} 条说明")
+        self._set_count(f"共 {n} 条说明")
         first = self.tree.get_children()
         if first:
             kids = self.tree.get_children(first[0])
@@ -187,12 +214,30 @@ class HelpWindow(tk.Toplevel):
                 # 直接调一次渲染，别依赖事件时序。
                 self._on_select()
 
+    def _set_count(self, text: str) -> None:
+        self.count_lab.configure(text=text)
+        i18n.apply(self.count_lab)
+
+    def _search(self, keyword: str) -> list[tuple[str, str, str, str]]:
+        """英文模式下按**译文**搜，但返回原文 —— 切回中文时还能原样重绘。"""
+        if i18n.language() == "zh-CN":
+            return search(keyword)
+        words = [w for w in keyword.lower().split() if w]
+        if not words:
+            return []
+        hits = []
+        for sid, stitle, title, body in iter_items():
+            hay = (i18n.t(title) + "\n" + i18n.t(body)).lower()
+            if all(w in hay for w in words):
+                hits.append((sid, stitle, title, body))
+        return hits
+
     def _on_search(self) -> None:
         q = self._query.get().strip()
         if not q:
             self._fill_tree()
             return
-        self._fill_tree(search(q))
+        self._fill_tree(self._search(q))
 
     def _clear_search(self, _event=None) -> None:
         self._query.set("")          # trace 会触发 _on_search -> 重建全量
@@ -222,14 +267,62 @@ class HelpWindow(tk.Toplevel):
             return
 
     def _show(self, title: str, body: str, section: str) -> None:
+        """入参一律是中文原文，渲染时才按当前语言翻译。"""
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         if section:
-            self.text.insert("end", section + "\n", "section")
-        self.text.insert("end", title + "\n", "title")
-        self.text.insert("end", body, "body")
+            self.text.insert("end", i18n.t(section) + "\n", "section")
+        self.text.insert("end", i18n.t(title) + "\n", "title")
+        self._insert_body(i18n.t(body))
         self.text.configure(state="disabled")
         self.text.yview_moveto(0.0)
+
+    def _insert_body(self, text: str) -> None:
+        """写正文：`**粗体**` 变粗体、反引号包住的变等宽，其余逐字原样。
+
+        为什么是**一趟扫描**、不是先 `split("**")` 再 split 反引号：两个标记会
+        互相穿插（``**`x`**``），两趟各自判奇偶会打架，嵌套那段还会被第一趟
+        吃掉。这里两个标记各管一个开关，一次扫完。
+
+        任一标记落单（个数是奇数）就整段按原样写 —— 宁可少一处样式，也不要把
+        后半篇全染粗 / 全染等宽。`str.count` 数的是非重叠出现，奇数就是没配上对。
+
+        写出去的纯文本严格等于「原文去掉所有 `**` 与反引号」：标记只改样式，
+        不改一个字 —— 复制、搜索、判据都依赖这条。
+        """
+        if text.count("**") % 2 or text.count("`") % 2:
+            self.text.insert("end", text, "body")
+            return
+
+        buf: list[str] = []
+        bold_on = mono_on = False
+
+        def flush() -> None:
+            if not buf:
+                return
+            tags = "body"
+            if bold_on:
+                tags += " bold"
+            if mono_on:
+                tags += " mono"
+            self.text.insert("end", "".join(buf), tags)
+            buf.clear()
+
+        i = 0
+        while i < len(text):
+            if text.startswith("**", i):
+                flush()
+                bold_on = not bold_on
+                i += 2
+                continue
+            if text[i] == "`":
+                flush()
+                mono_on = not mono_on
+                i += 1
+                continue
+            buf.append(text[i])
+            i += 1
+        flush()
 
 
 def open_help(master, section: str = "") -> HelpWindow:

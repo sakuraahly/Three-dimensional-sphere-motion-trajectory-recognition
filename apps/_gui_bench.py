@@ -39,7 +39,7 @@ from apps._gui_stereo import (SessionPicker, detector_methods, pick_seeds,
                               preset_choices)
 from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, METHOD_METAL, BG,
                                BallSettings, ScrollPage, StatusBar, Surface,
-                               fit_to_content)
+                               fit_to_content, kind_key)
 from apps._collapsible import CollapsibleSection
 from apps import _actions
 from apps._workbench import SessionSummary, scan_sessions, summarize_session
@@ -103,7 +103,10 @@ def _st_run(s: SessionSummary) -> tuple[bool, str]:
 
 
 def _st_view(s: SessionSummary) -> tuple[bool, str]:
-    return s.has_visualization, "还没有 visualization.json —— 先做第 ③ 步"
+    # 2026-11-11：**没有三维结果也允许打开** —— 查看器会降级成"空场景 + 会话
+    # 信息 + 为什么没有结果"，用户至少能确认这段会话是什么、视频有没有。
+    # 只有坏数据（帧数不一致 / 没有帧）才拦：那时连会话本身都读不出来。
+    return _data_ok(s), _blocked(s)
 
 
 def _st_video(s: SessionSummary) -> tuple[bool, str]:
@@ -126,8 +129,8 @@ STEP_SPECS: tuple[_Step, ...] = (
     _Step("run", "③ 跑离线三维",
           "读两路视频，按标定解出三维轨迹，写出 traj3d.json 与 visualization.json。"
           "「球种类」决定检测方法：镜面金属球 = specular，必须先做第 ② 步点选球心；"
-          "纯色塑料球 = color + 颜色预设，球色要和背景分得开。"
-          "有点选球心时自动用 specular 解算。",
+          "纯色塑料球 = color + 取色方式（auto / 颜色预设），球色要和背景分得开。"
+          "点选球心会交给当前方法：specular 用它跟踪，color 用它取色并锚定半径。",
           (_Button("run", "跑离线三维", "_run_offline", "primary", _st_run),)),
     _Step("view", "④ 看三维",
           "3D 查看器读的是这段会话的 visualization.json；标注视频用系统播放器打开，"
@@ -157,27 +160,36 @@ def visualization_path(session: Path) -> Path | None:
 
 
 def offline_cmd(s: SessionSummary, *, method: str = "", preset: str = "",
-                min_radius: str = "", max_radius: str = "") -> list[str]:
+                min_radius: str = "", max_radius: str = "",
+                radius_auto: bool = True) -> list[str]:
     """第 ③ 步的命令行。
 
     2026-11-03 改：``--method`` **不再写死在函数里**。以前这里是一句
     ``cmd += ["--method", "specular", "--seed-json", …]``，于是"球种类"
     在工作台上根本改不动 —— 同一段命令行有两个产地（这里 + `_actions`）。
-    现在方法/预设/半径都由「球种类与检测参数」那一块给，本函数只做一件
-    判断：**有 seeds.json 就必须 specular**（``--seed-json`` 只有它读，
-    换个方法等于把用户点的球心静默丢掉）。
+    现在方法/预设/半径都由「球种类与检测参数」那一块给。
 
-    不传参数 = 老行为（有 seeds → specular+seed-json；没有 → 脚本默认 color）。
+    2026-11-06 再改：**种子不再把方法改成 specular**。旧规则"有 seeds.json
+    就必须 specular"只对镜面球成立；纯色塑料球点选之后反而应该继续用 color，
+    让它拿种子去取色/锚半径（`run_stereo_video._pick_detector` 会读
+    ``seeds.json`` 的 ``ball_kind`` 再确认一次）。这里的规则简化成：
+
+    - 用户给了方法 → **照用**，种子照样传（支持种子的方法会读）；
+    - 没给方法且有种子 → specular（兼容旧会话/旧种子）；
+    - 没给方法也没种子 → 不传 ``--method``，脚本用注册表默认（color）。
 
     不传 ``--stereo-mode``：默认 auto 会读 session/标定，而 ``SessionSummary``
     把"未记录模式"折成了 parallel，照它传会把老会话按错的几何解算。
     """
     seed = s.path / "derived" / "seeds.json"
-    use_seed = bool(s.has_seeds and seed.is_file())
-    used = METHOD_METAL if use_seed else str(method or "").strip()
+    has_seed = bool(s.has_seeds and seed.is_file())
+    used = str(method or "").strip()
+    if not used and has_seed:
+        used = METHOD_METAL
     return _actions.offline_stereo(
-        s.path, method=used, seed_json=(seed if use_seed else ""),
-        preset=preset, min_radius=min_radius, max_radius=max_radius)
+        s.path, method=used, seed_json=(seed if has_seed else ""),
+        preset=preset, min_radius=min_radius, max_radius=max_radius,
+        radius_auto=radius_auto)
 
 
 def step_states(s: SessionSummary | None) -> dict[str, tuple[bool, str]]:
@@ -232,10 +244,15 @@ def next_step_text(s: SessionSummary | None) -> str:
                 "回来这里就有历史会话可选。")
     if s.status == "bad":
         return "这段会话的数据有问题，先按上面的问题修（重录或修 session.json），别进三维。"
+    if s.status == "empty":
+        return "这段会话没录成（左右两路都是 0 帧），直接重录即可，不用修数据。"
     if s.status == "recorded":
         return "下一步：① 校验数据；金属球（specular）要在 ② 点选球心后才能跑第 ③ 步。"
     if s.status == "seeded":
         return "下一步：③ 跑离线三维。"
+    if s.status == "traj_thin":
+        return ("三维跑出来了但匹配点太少（画不出轨迹）。下一步：确认 ② 的球心选对、"
+                "换检测方法重跑 ③；④ 仍可打开查看器看那些散点落在哪。")
     if s.status == "traj":
         return "下一步：④ 看三维；⑤ 可重新导出标准 JSON。"
     return ""
@@ -304,6 +321,13 @@ class BenchWindow(tk.Toplevel):
         self._lbl_name.pack(side="left")
         ttk.Button(line, text="换会话…", command=self._pick_session).pack(
             side="left", padx=(12, 0))
+        # 计划书 M8 的「一条命令跑完整系统」：GUI 此前只有 ①–⑤ 分步按钮，
+        # `apps/run_all.py` 的编排队列没有入口。它属于"当前会话"，所以放这里，
+        # 不进 ①–⑤ 的步骤表（不是第六步，三步都有各自的按钮）。
+        self.btn_all = ttk.Button(
+            line, text="一键跑全流程（校验→三维→导出）",
+            command=self._run_all_pipeline)
+        self.btn_all.pack(side="left", padx=(12, 0))
         # 摘要用正文样式而不是 Hint：帧数/帧率是要读的数字，灰字看不清
         self._lbl_facts = self.surface.hint(box, "…", style="TLabel")
         self._lbl_next = self.surface.hint(box, "")
@@ -384,6 +408,9 @@ class BenchWindow(tk.Toplevel):
         self._lbl_facts.configure(text=summary_text(s))
         self._lbl_next.configure(text=next_step_text(s))
         self._apply_states()
+        # 表外按钮（不属于 ①–⑤）：只有选了会话才能跑整条编排。
+        if hasattr(self, "btn_all"):
+            self.btn_all.configure(state="normal" if s is not None else "disabled")
 
     def _apply_states(self) -> None:
         """按 ``STEP_SPECS`` 的**同一张表**写按钮状态与原因。
@@ -423,6 +450,23 @@ class BenchWindow(tk.Toplevel):
     def _on_picked(self, path: str, _why: str = "") -> None:
         self.select_session(path)
 
+    def _run_all_pipeline(self) -> None:
+        """一键跑 ①→③→⑤ 的编排（校验 → 三维 → 导出），不在这里重写三步。"""
+        s = self._summary
+        if s is None:
+            self.status.set_status("先选一段会话，再跑全流程", "warn")
+            return
+        self.app.tasks.start(
+            _actions.run_all(s.path), f"一键全流程 {s.id}",
+            on_done=self._on_done(
+                "一键全流程",
+                "校验 → 三维 → 导出已跑完（有跳过的步骤看运行日志）",
+                "全流程没跑完或全部被跳过（看运行日志里哪一步、为什么）"),
+            owner=self.task_owner)
+        self.status.set_status(
+            "已启动：校验 → 离线三维 → 标准 JSON 导出；"
+            "三步共用这一条任务，完整输出在运行日志", "info")
+
     def _run_check(self) -> None:
         s = self._summary
         if s is None:
@@ -431,7 +475,8 @@ class BenchWindow(tk.Toplevel):
             _actions.check_dataset(s.path),
             f"校验数据 {s.id}",
             on_done=self._on_done("校验", "这段会话通过了数据校验（--strict），可以进第 ③ 步",
-                                  "数据校验没通过：看运行日志里它列的每一项问题"))
+                                  "数据校验失败（没通过）：看运行日志里它列的每一项问题"),
+            owner=self.task_owner)
         self.status.set_status("正在校验这段会话，逐项结果会写到运行日志", "info")
 
     def _on_done(self, what: str, ok_text: str, bad_text: str):
@@ -460,7 +505,7 @@ class BenchWindow(tk.Toplevel):
         s = self._summary
         if s is None:
             return
-        saved = pick_seeds(self, s.path)
+        saved = pick_seeds(self, s.path, ball_kind=kind_key(self.ball.kind()))
         if saved is None:
             self.status.set_status("没有保存球心（窗口被关掉或左右没点完）", "warn")
             return
@@ -497,12 +542,14 @@ class BenchWindow(tk.Toplevel):
         self.app.tasks.start(
             offline_cmd(s, method=self.ball.method(), preset=self.ball.preset(),
                         min_radius=self.ball.min_radius(),
-                        max_radius=self.ball.max_radius()),
+                        max_radius=self.ball.max_radius(),
+                        radius_auto=self.ball.radius_auto()),
             f"离线三维 {s.id}",
             on_done=self._on_done(
                 "离线三维",
                 f"{s.id} 解算完了；④ 的两个按钮现在可用了",
-                "离线三维没跑成：看运行日志里它的报错"))
+                "离线三维没跑成：看运行日志里它的报错"),
+            owner=self.task_owner)
         self.status.set_status(
             f"正在解算 {s.id}（检测方法 {self.ball.method()}）；"
             f"跑完 ④ 的按钮会自动亮起", "info")
@@ -520,7 +567,7 @@ class BenchWindow(tk.Toplevel):
             return
         self.app.tasks.start(
             _actions.view_3d(src),
-            f"3D 查看器 {s.id}")
+            f"3D 查看器 {s.id}", owner=self.task_owner)
         self.status.set_status(f"正在打开 3D 查看器：{s.id}", "info")
 
     def _open_video(self) -> None:
@@ -547,12 +594,22 @@ class BenchWindow(tk.Toplevel):
             _actions.export_visualization(s.path),
             f"导出标准数据 {s.id}",
             on_done=self._on_done("导出", "导出完成：visualization.json / CSV / 示意图都写好了",
-                                  "导出失败：看运行日志里它的报错"))
+                                  "导出失败：看运行日志里它的报错"),
+            owner=self.task_owner)
         self.status.set_status("正在导出 visualization.json / CSV / 示意图", "info")
 
+    def on_close(self) -> None:
+        """关窗收尾：任务由 ``App.close_window`` 按 ``task_owner`` 统一停，
+        这里只做本窗自己的清理（目前没有需要退订的订阅/回调）。"""
+        return
+
     def _stop_my_tasks(self) -> None:
-        ok = self.app.tasks.stop_all(graceful=True)
-        self.status.set_status(f"已确认停掉 {ok} 个任务", "ok" if ok else "warn")
+        # 按归属停，不再全局 stop_all：本窗的"停止"按钮不该杀掉别的窗口
+        # 在后台跑的离线重建/标定。
+        n = self.app.tasks.stop_by_owner(self.task_owner)
+        self.status.set_status(
+            f"已停掉本窗口的 {n} 个任务" if n else "本窗口没有在跑的任务",
+            "ok" if n else "warn")
 
 
 def _latest_session() -> Path | None:

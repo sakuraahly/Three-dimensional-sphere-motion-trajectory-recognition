@@ -259,6 +259,7 @@ def detect_board(
 
     corners = None
     detector = ""
+    note = ""
     if use_sb and hasattr(cv2, "findChessboardCornersSB"):
         flags = cv2.CALIB_CB_NORMALIZE_IMAGE if normalize else 0
         if exhaustive:
@@ -267,6 +268,21 @@ def detect_board(
         if ok:
             corners = np.asarray(c, np.float32)
             detector = "sb"
+        elif exhaustive and normalize:
+            # 2026-11-11 真机实测（根因，不是构图问题）：这组大板 / 白底图在
+            # `CALIB_CB_NORMALIZE_IMAGE` 下 SB **5 张全 0 检出**；只把这个标志
+            # 去掉（仍 EXHAUSTIVE|ACCURACY）就 **5/5** 同时检出两块板。
+            # 所以这里是"同一检测器的第二个参数组合"兜底，不是换检测器：
+            # `detector` 仍是 `"sb"`，角点顺序不变（混用检测器才会破 R/T）。
+            # 只在 exhaustive=True 的精确路径上、且第一遍确实失败时才多花这一次；
+            # 每帧粗筛（exhaustive=False）与默认 normalize 语义都不受影响。
+            flags2 = flags & ~cv2.CALIB_CB_NORMALIZE_IMAGE
+            ok2, c2 = cv2.findChessboardCornersSB(gray, spec.pattern_size,
+                                                  flags=flags2)
+            if ok2:
+                corners = np.asarray(c2, np.float32)
+                detector = "sb"
+                note = "normalize=True 未检出，normalize=False 重试成功"
 
     # 经典回退：**必须显式允许**。理由见上面的文档串 —— 它与 SB 的角点顺序整体反序，
     # 混进双目标定会静默产出垃圾解。不做成"SB 失败就自动试"。
@@ -285,6 +301,8 @@ def detect_board(
     if corners is None:
         obs.note = "未检测到棋盘"
         return obs
+    if note:
+        obs.note = note        # 排障用：说明这一帧是靠关掉 normalize 才检出的
     if scale != 1.0:
         corners = corners / scale          # 换算回全分辨率坐标
     # 指标要在全分辨率图上算（清晰度、亮度才可比）

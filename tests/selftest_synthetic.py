@@ -653,6 +653,314 @@ def run_motion_checks() -> bool:
     return all(results)
 
 
+# --------------------------------------------------------------------------
+# 通用球（近圆水果）合成场景：不依赖颜色的几何路径 + Q3 数值证伪
+# --------------------------------------------------------------------------
+# 为什么单独一个渲染分支：既有 render_frame():349 把球画成**纯白实心圆**，
+# clean/realistic/panning 的真值、达标门限（:446/:723/:761）全钉在这个着色上。
+# 改它一个像素就会动那三套数字。所以水果另起一套渲染：真值独立、门限独立，
+# 只新增、不碰既有场景；也不新增 selftest_*.py 文件（26 个的计数判据）。
+#
+# Q3 的正确方向（§2/P11、§11.7，Leader 用真实代码预检后修正）：**不是**
+# 「去掉新路径会退化」的消融，也**不是**「单球上高置信却偏心」——形状门会把
+# 碎掩膜直接拦掉，那种场景不存在。真正的证伪是「沿用旧颜色范式给出好看却
+# 无意义的数」：带斑水果 + **同色纯圆干扰物**同框，旧 HSV 把纯色干扰物排到
+# detections[0]，自报高置信、last_error 为空，心却离真值 200 px 以上。
+FRUIT_W, FRUIT_H = 640, 480
+FRUIT_BG = 205                          # 灰底（BGR 205，S≈0，不进橙预设）
+FRUIT_COLOR = (30, 110, 210)            # 水果与干扰物同色（orange_ball 预设内）
+FRUIT_SPOT_COLOR = (150, 60, 60)        # 异色斑（蓝，不进橙预设 -> 挖洞）
+FRUIT_DISTRACTOR = (150.0, 130.0, 30.0)   # 纯色完美圆（cx, cy, r）
+FRUIT_N_FRAMES = 8
+FRUIT_GATE_PX = 3.0             # 达标门限：圆心/半径误差 ≤3 px
+FRUIT_Q3_SCORE_MIN = 0.80       # 旧路径「好看」：自报置信下限
+FRUIT_Q3_MIN_ERR_PX = 100.0     # 「无意义」的错靶线，远高于 3 px 门限
+
+
+def fruit_ground_truth() -> list[tuple[float, float, float]]:
+    """N 帧真值 (cx, cy, r)。
+
+    第 0 帧就是 Leader 预检的构造坐标 (320, 240)、等效半径 42；后续小幅平移
+    （≤20 px）以形成可算 RMSE 的多帧序列。干扰物固定在 (150,130)，不动。
+    seed 只取第 0 帧一次，不是逐帧喂真值。
+    """
+    out = []
+    for i in range(FRUIT_N_FRAMES):
+        t = i / (FRUIT_N_FRAMES - 1)
+        out.append((320.0 + 18.0 * t, 240.0 + 8.0 * t, 42.0))
+    return out
+
+
+def render_fruit_frame(cx: float, cy: float, r: float,
+                       rng: np.random.Generator) -> np.ndarray:
+    """一帧：纯色圆干扰物 + 带 22 个异色斑的**同色**椭圆水果（Q3 构造）。
+
+    * 干扰物与水果同为 BGR(30,110,210)，都落进 orange_ball 的 HSV 区间；
+      干扰物是纯色完美圆、掩膜最完整，旧 color 因此把它排到 detections[0]。
+    * 水果是近圆椭圆（长短轴 43:41，比值 0.953），球面 22 个异色斑
+      (150,60,60) 在橙掩膜上挖洞；斑点全限制在 0.72 半径内，**不破坏闭合
+      外轮廓**，几何路径仍能测到真实球缘（合成图的诚实约束，不是喂真值）。
+    * 灰底 205（S≈0）与蓝色斑点都不进橙预设，只在水果掩膜里留洞。
+    """
+    img = np.full((FRUIT_H, FRUIT_W, 3), FRUIT_BG, np.uint8)
+    dx, dy, dr = FRUIT_DISTRACTOR
+    cv2.circle(img, (int(round(dx)), int(round(dy))), int(round(dr)),
+               FRUIT_COLOR, -1)
+    ax, ay = r * 43.0 / 42.0, r * 41.0 / 42.0    # 长短轴比 0.953
+    cv2.ellipse(img, (int(round(cx)), int(round(cy))),
+                (int(round(ax)), int(round(ay))), 0, 0, 360,
+                FRUIT_COLOR, -1, cv2.LINE_AA)
+    for _ in range(22):
+        rr = int(rng.integers(4, 10))
+        ang = rng.uniform(0.0, 2.0 * math.pi)
+        rad = 0.72 * math.sqrt(rng.uniform(0.0, 1.0))
+        px = int(round(cx + ax * rad * math.cos(ang)))
+        py = int(round(cy + ay * rad * math.sin(ang)))
+        cv2.circle(img, (px, py), rr, FRUIT_SPOT_COLOR, -1)
+    return img
+
+
+def render_fruit_frame_broken(cx: float, cy: float, r: float,
+                              rng: np.random.Generator) -> np.ndarray:
+    """「斑点啃到轮廓」的水果 + 同色纯圆干扰物 —— 种子门的 P0 现场。
+
+    与 ``render_fruit_frame`` 只差**斑点参数**（Leader 扫参扫出来的，不是随手挑
+    的）：斑点半径 5~13 px、半径占比放到 1.02，于是部分斑点压在外缘上，把 Canny
+    的闭合外轮廓啃断 —— ``generic`` 对水果本体 **0 候选**，而旁边那个纯色干扰物
+    照样检出（score≈0.96）。这正是 2026-11-07 Critic 75b 抓出的 P0 现场：
+    门内空、门外有货，旧代码会默默把干扰物当结果返回。
+
+    诚实约束：这里改的只是「果子表面有多脏」，真值圆心/半径仍是
+    ``fruit_ground_truth()``，没有动真值去迁就检测器；判据里另有一条
+    ``meta_ok`` 在验「门内确实空、门外确实有」，防止这道检查变成碰巧过。
+    """
+    img = np.full((FRUIT_H, FRUIT_W, 3), FRUIT_BG, np.uint8)
+    dx, dy, dr = FRUIT_DISTRACTOR
+    cv2.circle(img, (int(round(dx)), int(round(dy))), int(round(dr)),
+               FRUIT_COLOR, -1)
+    ax, ay = r * 43.0 / 42.0, r * 41.0 / 42.0
+    cv2.ellipse(img, (int(round(cx)), int(round(cy))),
+                (int(round(ax)), int(round(ay))), 0, 0, 360,
+                FRUIT_COLOR, -1, cv2.LINE_AA)
+    for _ in range(22):
+        rr = int(rng.integers(5, 14))
+        ang = rng.uniform(0.0, 2.0 * math.pi)
+        rad = 1.02 * math.sqrt(rng.uniform(0.0, 1.0))
+        px = int(round(cx + ax * rad * math.cos(ang)))
+        py = int(round(cy + ay * rad * math.sin(ang)))
+        cv2.circle(img, (px, py), rr, (0, 0, 0), -1)
+    return img
+
+
+def run_fruit_checks() -> bool:
+    """水果场景：真值 RMSE + Q3 数值证伪 + 圆形干扰物不误检（同一场景）。"""
+    from sphere_tracker.config import ColorConfig, DetectorConfig
+    from sphere_tracker.detectors import build_single_detector
+    from sphere_tracker.detectors.color import ColorBlobDetector
+
+    print("===== 场景：fruit（带斑水果 + 同色纯圆干扰物）=====")
+    rng = np.random.default_rng(20261106)
+    gts = fruit_ground_truth()
+    # 只点选第 0 帧一次；后续帧水果平移 ≤20 px，仍在空间门（gate=2*r=84）内，
+    # 不是逐帧把真值喂给检测器。
+    cfg = DetectorConfig(color=ColorConfig.preset("orange_ball"))
+    geom_plain = build_single_detector("generic", cfg)     # 无 seed：诚实多候选
+    geom_seeded = build_single_detector("generic", cfg)
+    geom_seeded.seed(*gts[0])
+
+    e_c: list[float] = []
+    e_g: list[float] = []
+    er_c: list[float] = []
+    er_g: list[float] = []
+    scores_c: list[float] = []
+    last_errors: list[str] = []
+    first_frame: np.ndarray | None = None
+    for i, (cx, cy, r) in enumerate(gts):
+        frame = render_fruit_frame(cx, cy, r, rng)
+        if i == 0:
+            first_frame = frame
+        # 每帧新建 color：Q3 是「范式」的单帧行为，不让 _rank 的帧间重排
+        # 把干扰物 / 水果的先后顺序搅成另一套结论。
+        color_det = ColorBlobDetector(cfg)
+        dc = color_det.detect(frame)
+        dg = geom_seeded.detect(frame)
+        if not dc or not dg:
+            print(f"  [不达标] 帧({cx:.0f},{cy:.0f}) 检出缺失："
+                  f"color={len(dc)} generic={len(dg)}")
+            return False
+        top_c = dc[0]                     # 下游默认消费方式：取第一个
+        top_g = dg[0]
+        scores_c.append(top_c.score)
+        last_errors.append(str(getattr(color_det, "last_error", "")))
+        e_c.append(math.hypot(top_c.x - cx, top_c.y - cy))
+        e_g.append(math.hypot(top_g.x - cx, top_g.y - cy))
+        er_c.append(abs(top_c.radius - r))
+        er_g.append(abs(top_g.radius - r))
+
+    def rmse(xs: list[float]) -> float:
+        return float(np.sqrt(np.mean(np.square(xs))))
+
+    c_rmse, g_rmse = rmse(e_c), rmse(e_g)
+    cr_rmse, gr_rmse = rmse(er_c), rmse(er_g)
+    min_score_c = min(scores_c)
+    diag_empty = all(s == "" for s in last_errors)
+    dx, dy, dr = FRUIT_DISTRACTOR
+    print(f"  真值 {len(gts)} 帧（圆心 (320→338, 240→248)，等效半径 42 px）；"
+          f"干扰物纯橙圆 ({dx:.0f},{dy:.0f}) r={dr:.0f}")
+    print(f"  旧 HSV(color, orange_ball)：score 最小 {min_score_c:.3f}（门 ≥0.8）、"
+          f"last_error 全空={diag_empty}、圆心 RMSE {c_rmse:.2f}px、"
+          f"半径 RMSE {cr_rmse:.2f}px")
+    print(f"        └ 第 0 帧：detections[0] 落在干扰物，score {scores_c[0]:.3f}、"
+          f"距真值 {e_c[0]:.1f}px（门 {FRUIT_GATE_PX:.0f}px）")
+    print(f"  新几何(generic, 一次 seed)：圆心 RMSE {g_rmse:.2f}px、"
+          f"半径 RMSE {gr_rmse:.2f}px")
+    # Q3：沿用旧颜色范式 -> 高置信 + 空诊断 + 远超门限的错靶；新几何路径在
+    # 同一张图上命中真值。方向不是「去掉新路径会退化」的消融（§2/P11）。
+    q3 = (min_score_c >= FRUIT_Q3_SCORE_MIN
+          and diag_empty
+          and c_rmse > FRUIT_GATE_PX
+          and c_rmse > FRUIT_Q3_MIN_ERR_PX
+          and g_rmse <= FRUIT_GATE_PX
+          and gr_rmse <= FRUIT_GATE_PX)
+    print(f"  [{'通过' if q3 else '不达标'}] Q3 数值证伪：旧 HSV 自报高置信、"
+          f"诊断为空，却错靶 {c_rmse:.1f}px；几何路径误差达标")
+
+    # ---- 同一场景的「圆形干扰物不误检」+ 判据（第 6 条与 Q3 合并）----
+    cx, cy, r = gts[0]
+    assert first_frame is not None
+    ds = geom_seeded.detect(first_frame)
+    dp = geom_plain.detect(first_frame)
+    near_ball = sum(1 for d in ds
+                    if math.hypot(d.x - cx, d.y - cy) <= FRUIT_GATE_PX)
+    # (a) 给了 seed：全部候选都在真球上，干扰物不占 detections[0]，也不标歧义
+    seeded_ok = (len(ds) >= 1 and len(ds) == near_ball
+                 and all(not d.extra.get("geometry_ambiguous") for d in ds))
+    # (b) 不给 seed：如实输出多个候选并给判据，绝不默默只给一个答案
+    plain_ok = (len(dp) >= 2
+                and all(d.extra.get("geometry_ambiguous") for d in dp)
+                and all(d.extra.get("geometry_n_candidates") == len(dp) for d in dp))
+    print("  圆形干扰物判据（不给 seed 时全部候选的几何量，纯几何下两者都合格、不可区分）：")
+    for d in dp:
+        p = d.parts
+        tag = "水果" if math.hypot(d.x - cx, d.y - cy) <= FRUIT_GATE_PX else "干扰物"
+        print(f"    {tag} c=({d.x:.0f},{d.y:.0f}) r={d.radius:.1f} "
+              f"圆度={p['circularity']:.2f} 径向={p['radial']:.2f} "
+              f"梯度支持={p['gradient_support']:.2f} 符号一致={p['sign_consistency']:.2f} "
+              f"边缘支持={p['edge_support']:.2f}")
+    print(f"  [{'通过' if (seeded_ok and plain_ok) else '不达标'}] 不误检："
+          f"seed 后 {len(ds)} 个候选中 {near_ball} 个在真球；"
+          f"无 seed 时 {len(dp)} 个候选全部标注 geometry_ambiguous（判据随候选给出）")
+
+    # ---- (c) 种子门内**一个候选都没有**时，必须给锚点，绝不回落门外候选 ----
+    # 2026-11-07 Critic 抓出的真实缺陷：原版 `if near: out = near`，
+    # near 为空时保留 `out`（门外候选）照常返回 —— 同色圆干扰物会**默默占住
+    # detections[0]**，而 last_error 还是空。现在要求：返回 1 个 seed_anchor，
+    # 位置等于种子本身，且 last_error 说清原因。
+    #
+    # Critic 75b 复评指出第一版不合格：它用画面左上角 (5,5) 的**假种子**，
+    # 那是「画面里压根没有候选」的角落退化场景，不是原始复现。真正的复现必须
+    # 同时成立两条 —— 门内（水果本体）0 候选、门外（同色干扰物）**有**候选。
+    # 下面 meta_ok 就是在证这两条，防止这道检查退化成碰巧过。
+    broken = render_fruit_frame_broken(gts[0][0], gts[0][1], gts[0][2],
+                                       np.random.default_rng(77))
+    probe = build_single_detector("generic", geom_seeded.cfg)
+    probe_out = probe.detect(broken)
+    in_gate = [d for d in probe_out
+               if math.hypot(d.x - gts[0][0], d.y - gts[0][1]) <= FRUIT_GATE_PX]
+    out_gate = [d for d in probe_out
+                if math.hypot(d.x - FRUIT_DISTRACTOR[0],
+                              d.y - FRUIT_DISTRACTOR[1]) <= 6.0]
+    meta_ok = (not in_gate) and bool(out_gate)
+    anchor = build_single_detector("generic", geom_seeded.cfg)
+    anchor.seed(*gts[0])
+    dc = anchor.detect(broken)
+    anchor_ok = (len(dc) == 1
+                 and dc[0].extra.get("seed_anchor") is True
+                 and math.hypot(dc[0].x - gts[0][0], dc[0].y - gts[0][1]) < 1e-6
+                 and bool(getattr(anchor, "last_error", "")))
+    print(f"  [{'通过' if (meta_ok and anchor_ok) else '不达标'}] "
+          f"seed 门内无候选 -> 返回点选锚点"
+          f"（门内 {len(in_gate)} 个 / 门外干扰物 {len(out_gate)} 个候选，"
+          f"现场成立={meta_ok}；返回 {len(dc)} 个，"
+          f"seed_anchor={dc[0].extra.get('seed_anchor') if dc else None}，"
+          f"离种子 {min((math.hypot(d.x - gts[0][0], d.y - gts[0][1]) for d in dc), default=float('nan')):.2f}px）"
+          f"；last_error 非空={bool(getattr(anchor, 'last_error', ''))}")
+
+    # ---- (d) 0 检出不静默：全空场景必须给出可执行的 last_error ----
+    blank = build_single_detector("generic", geom_seeded.cfg)
+    db = blank.detect(np.full_like(first_frame, 205, dtype=np.uint8))
+    blank_ok = (not db) and bool(getattr(blank, "last_error", ""))
+    print(f"  [{'通过' if blank_ok else '不达标'}] 纯色空场景 0 检出但 last_error 非空"
+          f"（静默失效检查）：{str(getattr(blank, 'last_error', ''))[:60]}…")
+
+    # ---- (e) last_error 必须**逐帧清空**：上一帧的原因不许带到这一帧 ----
+    # Critic 75b 的 exp4：把 detect() 开头那行 `self.last_error = ""` 删掉，
+    # 第二帧明明有检出却仍带着第一帧的原因。而 (d) 用**新** detector 实例，
+    # 删掉那行照样绿 —— 那行等于没人守。这里用**同一个实例**连打两帧。
+    seq = build_single_detector("generic", geom_seeded.cfg)
+    d1 = seq.detect(np.full_like(first_frame, 205, dtype=np.uint8))
+    err1 = str(getattr(seq, "last_error", ""))
+    d2 = seq.detect(first_frame)
+    err2 = str(getattr(seq, "last_error", ""))
+    reset_ok = (not d1) and bool(err1) and bool(d2) and err2 == ""
+    print(f"  [{'通过' if reset_ok else '不达标'}] last_error 逐帧清空："
+          f"第 1 帧 0 检出且给了原因={bool(err1)}，"
+          f"第 2 帧检出 {len(d2)} 个、原因已清空={err2 == ''}")
+
+    # ---- (f) 锚点诊断必须走到**消费端**，且**四个检测器**都要走得通 ----
+    # 75b 抓的是 pipeline 只在 `best is None` 时读 last_error；(f) 当时只测了
+    # generic，结果 75c 复评抓出另外三路各写各的：
+    #   · color   —— 有 `seed_anchor` 但 `_anchor_detection` **不写** last_error；
+    #   · fusion  —— 透传成员的 extra（含 seed_anchor），却在成功分支把 last_error 清空；
+    #   · specular—— 兜底只写 `state="seed-anchor"`，**根本没有** `seed_anchor` 键。
+    # 后两条都让 pipeline 连分支都进不去。现在 pipeline 在「是锚点却没给原因」时
+    # 自己补一句，所以判据钉两条：① 四路都带 `extra["seed_anchor"]`；
+    # ② pipeline 对四路都给出非空 `detector_note`。
+    from sphere_tracker.pipeline import SpherePipeline
+
+    blank_scene = np.full((300, 400, 3), 128, dtype=np.uint8)
+    # specular 用的亮暗相间球：故意让 CSRT 起不来，逼它走锚点兜底
+    spec_img = np.full((300, 400, 3), 90, dtype=np.uint8)
+    _yy, _xx = np.ogrid[:300, :400]
+    _inside = (_xx - 200) ** 2 + (_yy - 150) ** 2 <= 20 ** 2
+    spec_img[_inside & (((_xx // 4 + _yy // 4) % 2) == 0)] = (190, 190, 190)
+
+    def _anchor_case(name: str, frame: np.ndarray, seed: tuple[float, float, float]):
+        """让某个检测器走一遍锚点兜底，返回 (检测器, 帧)。"""
+        d = build_single_detector(name, DetectorConfig(
+            color=ColorConfig.preset("red_ball")))
+        d.seed(*seed)
+        if name == "specular":
+            d._make_tracker = lambda: None      # type: ignore[assignment]
+        return d, frame
+
+    cases = [
+        ("generic", broken, gts[0]),
+        ("color", blank_scene, (200.0, 150.0, 30.0)),
+        ("specular", spec_img, (200.0, 150.0, 20.0)),
+        ("fusion", blank_scene, (200.0, 150.0, 30.0)),
+    ]
+    per_det: dict[str, tuple[bool, bool]] = {}
+    for name, frame, seed in cases:
+        d, fr = _anchor_case(name, frame, seed)
+        pipe = SpherePipeline(AppConfig(), detector=d)
+        res = pipe.process(fr, 0.0)
+        marked = bool(res.detection is not None
+                      and (res.detection.extra or {}).get("seed_anchor") is True)
+        spoken = bool(res.detector_note)
+        per_det[name] = (marked, spoken)
+        print(f"    {name:<9} 标记={marked}  诊断非空={spoken}"
+              f"  ← {str(res.detector_note)[:44]}…")
+    note_ok = all(m and s for m, s in per_det.values())
+    print(f"  [{'通过' if note_ok else '不达标'}] 锚点诊断到达消费端（四路）："
+          f"{sum(1 for m, s in per_det.values() if m and s)}/4 路"
+          f"「有标记 + 有话说」")
+
+    print()
+    return bool(q3 and seeded_ok and plain_ok and anchor_ok and blank_ok
+                and reset_ok and note_ok)
+
+
 def check_ai() -> None:
     print("\n=== AI 依赖检查 ===")
     for mod in ("torch", "ultralytics", "onnxruntime"):
@@ -680,8 +988,8 @@ def main() -> int:
     p.add_argument("--write-video", action="store_true")
     p.add_argument("--check-ai", action="store_true")
     p.add_argument("--scenario", default="all",
-                   choices=["clean", "realistic", "panning", "all"],
-                   help="panning = 相机匀速横移（检验相机不固定时是否还成立）")
+                   choices=["clean", "realistic", "panning", "fruit", "all"],
+                   help="panning = 相机匀速横移；fruit = 近圆水果（Q3 数值证伪 + 圆形干扰物）")
     p.add_argument("--gate", default="color,fusion", help="必须达标的方法（逗号分隔）")
     p.add_argument("--motion", action="store_true",
                    help="只跑运动学判据（stereo/motion.py），不跑合成视频流水线（秒级）")
@@ -697,12 +1005,16 @@ def main() -> int:
         print("判定结果：" + ("全部通过" if motion_ok else "有不达标项"))
         return 0 if motion_ok else 1
 
-    scenarios = ["clean", "realistic", "panning"] if args.scenario == "all" else [args.scenario]
-    # 平移场景额外加一个"不补偿"的对照组，直接看出补偿值不值
+    scenarios = (["clean", "realistic", "panning", "fruit"]
+                 if args.scenario == "all" else [args.scenario])
+    # 平移场景额外加一个"不补偿"的对照组，直接看出补偿值不值。
+    # fruit 走独立渲染 + 独立真值/门限（run_fruit_checks），不进 run_case 的循环：
+    # 它的着色与既有纯白圆不同，混进同一套 limits/gate 会污染既有三场景的基线。
     methods_by_scenario = {
         "clean": ["color", "hough", "motion", "fusion"],
         "realistic": ["color", "hough", "motion", "fusion"],
         "panning": ["color", "motion_raw", "motion", "fusion"],
+        "fruit": ["color", "generic"],
     }
     def methods_for(scenario: str) -> list[str]:
         if args.method:
@@ -737,6 +1049,9 @@ def main() -> int:
 
     ok = motion_ok
     for scenario in scenarios:
+        if scenario == "fruit":
+            ok = bool(ok and run_fruit_checks())
+            continue
         print(f"===== 场景：{scenario} =====")
         print(f"{'方法':<9}{'检出率':>8}{'检测RMSE':>10}{'跟踪中位':>10}{'半径RMSE':>10}"
               f"{'三维RMSE':>10}{'深度误差':>9}"

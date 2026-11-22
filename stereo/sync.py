@@ -40,6 +40,24 @@ class SyncConfig:
     flash_min_jump: float = 2.0  # 最大亮度跳变低于这个，不认成"闪光"（防弱光/噪声误判）
 
 
+def config_for_fps(fps: float, **overrides) -> SyncConfig:
+    """按帧率派生 ``SyncConfig`` 的搜索窗与最小重叠（两者的语义是**时长**，不是帧数）。
+
+    ``max_offset`` = 6 秒、``min_overlap`` = 1 秒，各自设 180 / 30 帧的下限 ——
+    这两个下限恰好就是 30 fps 下的旧常量，所以 24 与 30 fps 得到的结果与旧的
+    硬编码 ``SyncConfig(max_offset=180, min_overlap=30)`` **完全一致**（24 fps 时
+    180 帧=7.5 秒、30 帧=1.25 秒，仍在同量级，不改变现有相机行为）。
+    """
+    f = max(float(fps), 1e-9)
+    cfg = SyncConfig(
+        max_offset=max(180, int(round(6.0 * f))),
+        min_overlap=max(30, int(round(1.0 * f))),
+    )
+    for name, value in overrides.items():
+        setattr(cfg, name, value)
+    return cfg
+
+
 @dataclass
 class SyncResult:
     offset: int                  # left[i] 对应 right[i + offset]

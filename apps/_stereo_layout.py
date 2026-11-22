@@ -18,7 +18,7 @@
 这个模块只回答三件事，都**不碰 session.json 的内容**（那是 `_gui_stereo`
 的扫描与 `_stereo_sessions` 的编辑各自的事）：
 
-- 有哪些目录**可能**是会话（`candidate_session_dirs`）；
+- 有哪些目录**是**会话（`candidate_session_dirs`：包装 `sphere_tracker.discovery` 的多根入口）；
 - 这段会话**记录**的模式是什么（`session_mode_of`，可能 None）；
 - 这段会话**摆在哪**（`layout_mode_of`，按目录结构推断）。
 
@@ -48,6 +48,10 @@ from sphere_tracker.paths import (
     stereo_mode_root,
 )
 from sphere_tracker.paths import stereo_roots as _stereo_roots
+# 会话枚举的**唯一实现**在 ``sphere_tracker/discovery.py``（分层最底层：
+# sphere_tracker → calib → stereo → apps，谁都能 import 它而不被反拖）。
+# 本模块只做多根包装。
+from sphere_tracker.discovery import discover_session_dirs
 
 __all__ = [
     "MODE_LABELS", "candidate_session_dirs", "effective_mode", "ensure_mode_root",
@@ -90,53 +94,47 @@ def looks_like_session(path: Path) -> bool:
 def candidate_session_dirs(
     roots: tuple[Path, ...] | list[Path] | None = None,
 ) -> list[Path]:
-    """列出**所有可能**是会话的目录，新布局在前、各自按目录名倒序。
+    """列出给定根（默认 ``stereo_roots()``）下的**会话目录**，新的在前。
 
-    规则（只认结构，不读内容）：
+    规则：**只认结构，不读内容**。
+    ``(p / "session.json").is_file()`` 就是这里的全部判据 —— 不看视频、不看
+    ``derived/``、不解析 JSON 的任何字段（哪些是会话、哪些是空目录由
+    ``sphere_tracker/discovery.py`` 一处决定，这里不再有第二套）。
 
-    - 根的直接子目录里，名字是 ``parallel``/``angled`` 的 → 当作**分区**，
-      再往里看一层（那才是会话）；
-    - 其余直接子目录 → 当作旧扁平布局的会话。
+    **2026-11-09 起它不再是独立扫描器**，只是
+    ``sphere_tracker.discovery.discover_session_dirs(..., recursive=True, strict=True)``
+    的**多根包装**（按 resolved 路径跨根去重，维持"新布局在前"的顺序）。
 
-    返回的目录**不保证**都有 ``session.json``：调用方要自己 ``looks_like_session``
-    或解析元数据 —— 有些扫描要"把坏目录也列出来给人看"（数据管理的口径），
-    有些只要好会话（会话列表的口径）。在这里过滤掉就等于替调用方做了决定。
+    为什么改：以前这里是"只认两层"的独立实现（根的直接子目录叫
+    ``parallel``/``angled`` 就再往里看一层，否则把子目录本身当会话），
+    而且**不检查有没有 session.json**。两个后果都真实发生过：
+
+    - 用户建 ``data/stereo/实验1/<时间戳>`` 之后，那段会话在会话列表、
+      标定入口、``view_3d`` 默认打开里**静默消失**（数据管理却看得见）；
+    - 同一份磁盘，数据管理数出 44 段、会话列表数出 29 段。
+
+    所以返回的目录**现在保证都是会话目录**（都有 ``session.json``）。旧版
+    docstring 写的是"不保证，调用方自己过滤" —— 那条约定让每个调用方各写一遍
+    过滤，漏一个就是上面那种"看得见用不了"。需要"半成品也列出来"的数据管理
+    走 ``discover_session_dirs(strict=False)``，那是**另一档判据**，不是这里的事。
+
+    ``looks_like_session``（同模块，只认 ``session.json`` 的那个布尔判断）
+    保留不动：它回答的是"这一个目录是不是会话"，这里回答的是"一个根下面
+    有哪些会话"，语义不同，不合并。
     """
+    src = tuple(roots) if roots is not None else _stereo_roots()
     out: list[Path] = []
     seen: set[Path] = set()
-
-    def push(p: Path) -> None:
-        try:
-            resolved = p.resolve()
-        except OSError:
-            return
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        out.append(p)
-
-    src = tuple(roots) if roots is not None else _stereo_roots()
-    # 先走分区（新布局），再走扁平（旧布局）：调用方按顺序去重时"新的那份优先"。
     for root in src:
-        base = Path(root)
-        if not base.is_dir():
-            continue
-        try:
-            subs = sorted((d for d in base.iterdir() if d.is_dir()),
-                          key=lambda d: d.name, reverse=True)
-        except OSError:
-            continue
-        for d in subs:
-            if d.name.lower() in STEREO_MODES:
-                try:
-                    inner = sorted((x for x in d.iterdir() if x.is_dir()),
-                                   key=lambda x: x.name, reverse=True)
-                except OSError:
-                    continue
-                for x in inner:
-                    push(x)
-            else:
-                push(d)
+        for d in discover_session_dirs(root, recursive=True, strict=True):
+            try:
+                key = d.resolve()
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(d)
     return out
 
 
@@ -177,7 +175,8 @@ def is_mode_root(path: str | Path) -> bool:
     为什么必须单独判（真实缺口，2026-11-04）：分区根是 ``data/stereo`` 的
     **直接子目录**，长得和旧扁平层的会话一模一样。清理逻辑只认"直接子目录"
     时会把它当成一段会话 —— 于是一删就把整个分区的会话全递归移走。
-    数据管理的列表不会列出它（`candidate_session_dirs` 往里多走了一层），
+    数据管理的列表不会列出它（枚举递归往里走，而分区根没有 ``session.json``，
+    不满足会话判据），
     但会话管理器的入参来自用户选中项，多一道显式检查才安全。
 
     判据是「**名字是模式名，而且自己不是会话（没有 session.json）**」，

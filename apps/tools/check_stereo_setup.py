@@ -39,7 +39,6 @@ import numpy as np
 
 from apps._common import (
     add_stereo_source_args,
-    calib_capture_size,
     open_pair_source,
 )
 from apps._window import WindowManager
@@ -50,12 +49,22 @@ WINDOW = "stereo setup check"
 PREVIEW_W = 620          # 单路预览宽度
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CALIBRATION_PATH = REPO_ROOT / "config" / "stereo_calibration.json"
+# 2026-11-10：不再写死顶层标定，改按当前装置档案解析（见 _calib_base）。
+# 这个名字留作**可覆盖哨兵**：tests/selftest_config_wiring.py 会注入临时 json，
+# 删掉它那条"标定实测排在参考之前"的测试会直接红。
+CALIBRATION_PATH: Path | None = None
 
-# 档案里的"期望基线" vs 标定实测基线的偏差，**只用来写提示**：
-# 用户明确说过"我不能精确确定摄像头的位置"，所以档案里的 B/D 只能是**参考估算**，
-# 偏差再大也不能让 precheck 失败 —— 判定以标定结果为准（2026-10-24 改）。
-BASELINE_NOTE_RATIO = 0.10   # 超过这个比例才值得提一句（仅提示）
+
+def _calib_base() -> Path:
+    """标定基名（无扩展名）：注入优先，否则跟随当前装置档案。"""
+    if CALIBRATION_PATH is not None:
+        return CALIBRATION_PATH.with_suffix("")
+    from apps._common import current_calibration
+    return current_calibration(need_existing=False)[0]
+
+
+# 2026-11-07：档案里的"期望基线"已删，连同原来那段"实测 vs 期望"的提示常量。
+# 判定只认标定结果；要核对单次测量请走 CLI `--baseline-mm`。
 
 
 # --------------------------------------------------------------------------
@@ -129,7 +138,7 @@ def _calibration_measured(path: Path | None = None) -> tuple[float | None, float
     直接复用它可以避免在这个检查工具里维护第二套矩阵/JSON 读法。
     只有 ``.json`` 没有 ``.npz`` 的历史目录退回读 json 的基线（角度留空）。
     """
-    target = Path(path) if path is not None else CALIBRATION_PATH.with_suffix("")
+    target = Path(path) if path is not None else _calib_base()
     try:
         from calib.params import StereoRig
 
@@ -161,13 +170,14 @@ def _print_profile_section() -> tuple[list[str], list[str]]:
 
     # --- 1) 标定实测（权威），永远排在最前面 ---
     actual_baseline, actual_angle = _calibration_measured()
+    _calib_name = _calib_base().with_suffix(".json").name
     if actual_baseline is None:
-        print("  标定实测          : 读不到（config/stereo_calibration.json 缺失"
+        print(f"  标定实测          : 读不到（{_calib_name} 缺失"
               "或没有 baseline_mm）")
     else:
         angle_txt = f"、光轴夹角 {actual_angle:.1f}°" if actual_angle is not None else ""
         print(f"  标定实测          : 基线 {actual_baseline:.1f} mm{angle_txt}"
-              "（来自 config/stereo_calibration.json，权威）")
+              f"（来自 {_calib_name}，权威）")
 
     # --- 2) 档案（参考） ---
     try:
@@ -191,29 +201,17 @@ def _print_profile_section() -> tuple[list[str], list[str]]:
         fps = f"@{active.fps}" if active.fps else ""
         print(f"  分辨率 / 帧率     : {active.width}x{active.height}{fps}")
 
-    # --- 3) 档案的 B/D 一律"参考"语气；没填就安静跳过 ---
-    if active.expected_baseline_mm is not None or active.working_distance_m is not None:
-        bits = []
-        if active.expected_baseline_mm is not None:
-            bits.append(f"基线 {active.expected_baseline_mm:.1f} mm")
-        if active.working_distance_m is not None:
-            bits.append(f"工作距离 {active.working_distance_m:.2f} m")
-        print(f"  档案参考值        : {' / '.join(bits)}（估算，仅作参考，不参与判定）")
-
-    if (active.expected_baseline_mm is not None and actual_baseline is not None
-            and actual_baseline > 0):
-        ratio = abs(active.expected_baseline_mm - actual_baseline) / actual_baseline
-        if ratio > BASELINE_NOTE_RATIO:
-            notes.append(
-                f"参考：档案期望基线 {active.expected_baseline_mm:.1f} mm，"
-                f"标定实测 {actual_baseline:.1f} mm（差 {100 * ratio:.0f}%）。"
-                "标定结果为准 —— 若这不是同一套装置，请更新档案或换档案。")
-
-    print(f"  几何提示          : {rig_profiles.geometry_hint(active)}")
+    # --- 3) 2026-11-07 起档案不再存 B/D 预期值，此处也不再打印"参考估算" ---
+    # 真实基线/夹角只认标定结果（上面 actual_baseline 那一行就是它）；
+    # 想核对物理一致性，走标定时的 CLI `--baseline-mm`，那是单次测量的锚。
 
     if active.calibration_path:
         print(f"  配套标定          : {active.calibration_path}")
-        if not (REPO_ROOT / active.calibration_path).exists():
+        # B1：原来只判无扩展名基名 (REPO_ROOT/path).exists()，对配了
+        # calibration_path 的档案**必然误报** —— 标定产物是 <path>.json/.npz，
+        # 无扩展名基名通常并不存在。这里收敛到 profiles 的唯一三文件判定。
+        if not rig_profiles.calibration_files_exist(
+                REPO_ROOT / active.calibration_path):
             warnings.append(
                 f"档案指向的标定文件不存在：{active.calibration_path}"
                 "（可能已被清理；标定后请重新设置档案）")
@@ -252,18 +250,15 @@ def main() -> int:
         print("=" * 62)
         return 1 if errors else 0
 
-    # ---- 采集档：未显式给 --width/--height 时，**优先用标定记下的采集档** ----
-    # 前置检查若在已有标定的机器上跑，应按**标定同一档**取帧（这样查出来的
-    # "两路是否一致 / 都看到棋盘"才对外呼的标定有意义）。没有标定记录就交给
-    # 相机自适应（首次标定前的正常情况）。
+    # ---- 采集档：未显式给 --width/--height 时，按**装置档案**取（不是标定记录）----
+    # 采集档是装置档案的属性（RigProfile.width/height）；档案没填就落到 1080 安全档，
+    # 避免双路同开 2560x1440 让一路 MSMF 会话持久失效（见 capture_size_from_profile）。
     if args.width <= 0 or args.height <= 0:
-        _cs = calib_capture_size(CALIBRATION_PATH)
-        if _cs is not None:
-            args.width, args.height = _cs
-            print(f"[采集档] 采用标定记录的采集档 {_cs[0]}x{_cs[1]}"
-                  f"（{CALIBRATION_PATH.name} 的 capture_size）")
-        else:
-            print("[采集档] 没有标定采集档记录，按相机自适应逐档探测")
+        from apps._common import capture_size_from_profile
+        from stereo.profiles import get_active
+        _w, _h, _note = capture_size_from_profile(get_active())
+        args.width, args.height = _w, _h
+        print(f"[采集档] {_note}")
 
     spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
     print(f"标定板：{spec.describe()}")

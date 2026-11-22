@@ -33,6 +33,22 @@
 1920x1080 / 1280x720 仍是**合法可选档**：旧 1080 标定、旧会话、离线数据都能照常读，
 显式 1080 档也仍能解析（相机实际给不给 1080 由硬件决定，不由本模块改）。
 4K 仍不默认 —— 带宽/存储都还没验证。以后要改默认值，必须同步 GUI/CLI/录制与测试。
+
+## 超高档：8K / 5K（2026-11-18）
+
+``PROFILES`` 顶部新增 7680x4320（8K）与 5120x2880（5K）两档，供 ≥500 fps 的
+高帧率相机**显式选用**（本机没有那种相机，所以只做档位表与解析，不做采集后端）。
+为「加档不影响现有挡位」，三件事刻意没跟着变：
+
+- ``DEFAULT`` / ``RECORD_DEFAULT`` 仍指向 2560x1440 的**同一个对象**，且改成
+  按对象引用而不是 ``PROFILES[1]``（下标会随加档漂移，2026-11-18 已踩过）；
+- ``probe_order(None)``（自动协商）上限仍是 4K（``PROBE_CEILING``）：每多试一档
+  就多一次相机打开尝试，个别后端单次 20 s+，从 8K 起试会拖慢所有现有相机；
+- ``high_res`` 阈值仍是 2560 宽（5K / 8K 自然为 True）。
+
+``FPS_TIERS`` / ``parse_fps`` 是**帧率建议档与解析的唯一产地**：``FPS_TIERS`` 只给
+GUI/CLI 下拉做建议值，**不限制输入**；``parse_fps`` 保留小数（``29.97`` 不许被
+截成 29），超范围返回 ``None``，由调用方决定回退还是报错。
 """
 
 from __future__ import annotations
@@ -62,6 +78,9 @@ if __name__ == "__main__":
     # 只修"直接自测"这一条路径；正常 import 时不动 sys.path。
     _drop_script_dir_from_path()
 
+import argparse  # noqa: E402  （必须放在清遮蔽之后：本文件直接自测时 sys.path[0]
+                 # 是 sphere_tracker/，argparse 间接导入的模块同样可能撞上它）
+import math  # noqa: E402
 import re  # noqa: E402  （必须先清掉遮蔽，见上）
 from dataclasses import dataclass  # noqa: E402
 
@@ -89,17 +108,25 @@ class VideoProfile:
         return self.width >= 2560
 
 
+# 每档先各自命名，再组表：默认值**按对象引用**取，不再按下标取。
+# ⚠️ 2026-11-18：在顶部加 8K/5K 时，``PROFILES[1]`` 从 1440 静默漂成了 5K ——
+# 下标会随加档漂移，已踩过；以后加档只改这张表，别碰下面的对象引用。
+P8K: VideoProfile = VideoProfile(7680, 4320)     # 8K UHD：显式可选，不进自动协商
+P5K: VideoProfile = VideoProfile(5120, 2880)     # 5K：显式可选，不进自动协商
+P4K: VideoProfile = VideoProfile(3840, 2160)     # 4K：可选、不默认；自动协商的上限
+P1440: VideoProfile = VideoProfile(2560, 1440)   # 默认（真机恒给这一档；主循环 24fps 稳定）
+P1080: VideoProfile = VideoProfile(1920, 1080)   # 旧默认；仍合法、旧标定/旧会话可读
+P720: VideoProfile = VideoProfile(1280, 720)
+P540: VideoProfile = VideoProfile(960, 540)
+P480: VideoProfile = VideoProfile(640, 480)
+
+# 顺序即像素降序：GUI 下拉 / CLI choices 的顺序就是它。
 PROFILES: tuple[VideoProfile, ...] = (
-    VideoProfile(3840, 2160),   # 4K，可选、不默认
-    VideoProfile(2560, 1440),   # 默认（真机恒给这一档；主循环 24fps 稳定）
-    VideoProfile(1920, 1080),   # 旧默认；仍合法、旧标定/旧会话可读
-    VideoProfile(1280, 720),
-    VideoProfile(960, 540),
-    VideoProfile(640, 480),
+    P8K, P5K, P4K, P1440, P1080, P720, P540, P480,
 )
 
-# 默认档直接引用 PROFILES 里的同一个对象，避免出现"两个 2560x1440"。
-DEFAULT: VideoProfile = PROFILES[1]
+# 默认档直接引用上面那个对象，避免出现"两个 2560x1440"。
+DEFAULT: VideoProfile = P1440
 
 # 默认帧率。**全项目只此一处**（2026-10-26）：此前 GUI 的 CALIB_FPS_DEFAULT、
 # `apps/_common.py` 的 `fps: int = 24`、`apps/record_stereo.py` 的 `--fps default=24`、
@@ -107,10 +134,24 @@ DEFAULT: VideoProfile = PROFILES[1]
 # 而用户看到的是"同一个程序，两个入口默认帧率不同"。
 DEFAULT_FPS = 24
 
-# 录制默认档：**独立于 DEFAULT**。当前两者都指向 1440，但名字保留独立，
-# 免得以后改 DEFAULT 时录制静默跟过去（录制还受吞吐/存储约束）。
-# 两个名字都指向 PROFILES 里的同一对象，不存在第二份字面量。
-RECORD_DEFAULT: VideoProfile = PROFILES[1]
+# 帧率建议档：**只作 GUI/CLI 下拉的建议值，不限制输入**。
+# 高帧率相机（≥500 fps）的档位常年是这些整数；需要 29.97 这类值就直接填，
+# 由 `parse_fps` 负责校验（它不会把小数截掉）。
+FPS_TIERS: tuple[int, ...] = (24, 30, 60, 120, 240, 500, 1000)
+
+# 帧率的合法边界（供调用方复用，别在别处再写一遍）。
+FPS_MAX = 1000.0
+FPS_MIN = 0.1
+
+# 录制默认档：**独立于 DEFAULT**。当前两者都指向 1440 的**同一对象**
+# （对象引用，不是下标；下标会随加档漂移），名字保留独立，免得以后改 DEFAULT
+# 时录制静默跟过去（录制还受吞吐/存储约束）。
+RECORD_DEFAULT: VideoProfile = P1440
+
+# 自动协商（`probe_order(None)`）的上限：4K。
+# 5K/8K 只在用户显式选时才会进候选 —— 自动协商每多试一档就多一次相机打开
+# 尝试（个别后端单次 20 s+），从 8K 起试会拖慢所有现有相机。
+PROBE_CEILING: VideoProfile = P4K
 
 # 接受 "1920x1080" / "1920 X 1080" / " 1920 x 1080 "。
 # 文档里常写 "1920×1080"，顺手也认这个乘号，避免用户从手册复制后解析失败。
@@ -133,6 +174,50 @@ def parse(text: str, default: VideoProfile = DEFAULT) -> VideoProfile:
     if width <= 0 or height <= 0:
         return default
     return get(width, height)
+
+
+def parse_fps(text: str | int | float | None) -> float | None:
+    """解析帧率文本，**保留小数**；非法 / 超范围返回 ``None``。
+
+    合法：``"24"`` / ``"29.97"`` / ``" 500 "`` / ``"500.0"``（也接受 int/float）。
+    非法：非数字、``<= 0``、``> FPS_MAX``（1000）、``nan`` / ``inf``、``None``。
+
+    **不做静默截断**：``"29.97"`` 必须回 ``29.97``，不能像
+    ``stereo/pair_source.py`` 曾用 ``int(fps)`` 那样被截成 29 —— 29.97 与 30
+    差的那 0.03 会以"录 1 分钟少 1.8 帧"的形式累积。合法区间取 ``(0, FPS_MAX]``，
+    ``FPS_MIN`` 是留给调用方的建议下限，本函数不拿它判非法（避免把 0.5 fps 这类
+    合法慢速采集堵死）。
+    """
+    if isinstance(text, bool):
+        return None
+    if isinstance(text, (int, float)):
+        value = float(text)
+    elif isinstance(text, str):
+        try:
+            value = float(text.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(value):
+        return None
+    if value <= 0 or value > FPS_MAX:
+        return None
+    return value
+
+
+def fps_type(text: str) -> float:
+    """``argparse`` 的 ``type=``：合法返回 float，非法抛 ``ArgumentTypeError``。
+
+    与 ``parse_fps`` 的分工：``parse_fps`` 是纯解析（非法返回 ``None``，适合代码里
+    判空），本函数只负责把"非法"翻译成 argparse 认识的异常，让命令行报用法错误
+    而不是抛裸 ``ValueError`` 或静默取默认值。
+    """
+    value = parse_fps(text)
+    if value is None:
+        raise argparse.ArgumentTypeError(
+            f"帧率需为 0 < fps <= {FPS_MAX:g} 的数字，收到 {text!r}")
+    return value
 
 
 def options() -> list[str]:
@@ -171,14 +256,21 @@ def get(width: int, height: int) -> VideoProfile:
 NATIVE: tuple[int, int] = (0, 0)
 
 
-def probe_order(start: VideoProfile | None = None) -> list[tuple[int, int]]:
+def probe_order(start: VideoProfile | None = None,
+                ceiling: VideoProfile = PROBE_CEILING) -> list[tuple[int, int]]:
     """自适应候选分辨率，**按像素降序**，末尾恒为原生档 ``NATIVE``。
 
-    - ``start=None``：不设上限，从 ``PROFILES`` 最高档（4K）一路降到原生档 ——
-      "不被一个写死的默认档限制死"；
+    - ``start=None``：**自动协商**，只试 ``ceiling`` 及以下的档（默认
+      ``PROBE_CEILING`` = 4K）一路降到原生档。5K/8K **刻意不进自动协商**：
+      每多试一档就多一次相机打开尝试（个别后端单次 20 s+），从 8K 起试会
+      拖慢所有现有相机；用户显式选 8K/5K 时才用（见下一条）；
     - ``start=某档``：**从该档开始往下**（显式档**不越级往上**，保持可控），
-      末尾同样跟 ``NATIVE``。``start`` **不在** ``PROFILES`` 里也照样含它自身
+      末尾同样跟 ``NATIVE``。``start`` 是 8K/5K 时以它自身开头，**不受**
+      ``ceiling`` 限制。``start`` **不在** ``PROFILES`` 里也照样含它自身
       （如 ``1024x768``），再跟 ``PROFILES`` 中像素更小的档。
+
+    ``ceiling`` 只约束 ``start=None`` 这条自动协商路径，供调用方临时抬/降上限；
+    日常调用不要传，保持"自动协商上限 4K"这一条不变。
 
     这是"分辨率降档梯子"的**唯一来源**：``sources.CameraSource`` 的
     ``res_candidates`` 与 ``CANDIDATE_MODES`` 都从这里取，不再各写一份手写清单。
@@ -196,7 +288,8 @@ def probe_order(start: VideoProfile | None = None) -> list[tuple[int, int]]:
 
     if start is None:
         for profile in PROFILES:
-            _add(profile.width, profile.height)
+            if profile.pixels <= ceiling.pixels:
+                _add(profile.width, profile.height)
     else:
         _add(start.width, start.height)
         for profile in PROFILES:
@@ -257,21 +350,27 @@ def _expect_value_error(fn, label: str) -> None:
 
 
 def _selftest() -> int:
-    p4k, p1440, p1080, p720, p540, p480 = PROFILES
+    p8k, p5k, p4k, p1440, p1080, p720, p540, p480 = PROFILES
     expected_labels = [
-        "3840x2160", "2560x1440", "1920x1080",
-        "1280x720", "960x540", "640x480",
+        "7680x4320", "5120x2880", "3840x2160", "2560x1440",
+        "1920x1080", "1280x720", "960x540", "640x480",
     ]
 
     # ---- 档位 / properties ----
+    assert len(PROFILES) == 8
     assert DEFAULT == VideoProfile(2560, 1440)
+    # 加档不漂移默认值：两个名字仍是表里同一个对象，label 仍是 2560x1440。
     assert DEFAULT is p1440 and RECORD_DEFAULT is p1440
+    assert DEFAULT is RECORD_DEFAULT and DEFAULT.label == "2560x1440"
     assert p1080 in PROFILES and parse("1920x1080") is p1080   # 旧 1080 档仍可读
+    assert p8k.label == "7680x4320" and p8k.pixels == 7680 * 4320
+    assert p5k.label == "5120x2880" and p5k.pixels == 5120 * 2880
+    assert p8k.pixels > p5k.pixels > p4k.pixels > p1440.pixels
     assert p4k.label == "3840x2160" and p4k.pixels == 3840 * 2160
-    assert p4k.high_res and p1440.high_res
+    assert p8k.high_res and p5k.high_res and p4k.high_res and p1440.high_res
     assert not p1080.high_res and not p720.high_res
     assert p1080.pixels == 1920 * 1080
-    print("PASS profiles: 6 档有序，DEFAULT=RECORD_DEFAULT=2560x1440，旧 1080 仍可读")
+    print("PASS profiles: 8 档有序（8K/5K 在顶部），DEFAULT=RECORD_DEFAULT=2560x1440，旧 1080 仍可读")
 
     # ---- options / labels ----
     assert options() == expected_labels
@@ -338,11 +437,50 @@ def _selftest() -> int:
     _expect_value_error(lambda: detection_width(3840, target=-1), "target=-1")
     print("PASS detection_width: 只缩不放，target<=0 抛 ValueError")
 
+    # ---- 帧率档位 / parse_fps（唯一产地；不许静默截断小数） ----
+    assert FPS_TIERS == (24, 30, 60, 120, 240, 500, 1000)
+    assert DEFAULT_FPS == 24 and FPS_MIN == 0.1 and FPS_MAX == 1000.0
+    assert parse_fps("24") == 24.0
+    assert parse_fps("29.97") == 29.97            # 关键：不被 int() 截成 29
+    assert parse_fps(" 500 ") == 500.0
+    assert parse_fps("500.0") == 500.0
+    assert parse_fps("1000") == 1000.0
+    assert isinstance(parse_fps("24"), float)
+    for bad in ("0", "-1", "abc", "1500", "", "nan", "inf", None):
+        assert parse_fps(bad) is None, f"parse_fps({bad!r}) 应返回 None"
+    print("PASS parse_fps/FPS_TIERS: 29.97 不截断，0/-1/abc/1500 返回 None")
+
+    # ---- fps_type：argparse 的 type= —— 合法给 float，非法变用法错误（不静默取默认） ----
+    assert fps_type("29.97") == 29.97            # 关键：29.97 而不是 29
+    assert fps_type("500") == 500.0
+    assert isinstance(fps_type("24"), float)
+    for bad in ("abc", "1001", "0", "-1", ""):
+        try:
+            fps_type(bad)
+        except argparse.ArgumentTypeError as exc:
+            assert bad in str(exc), (bad, str(exc))
+        else:
+            raise AssertionError(f"fps_type({bad!r}) 应当抛 ArgumentTypeError")
+    print("PASS fps_type: 29.97 保留小数；abc/1001/0/-1 抛 ArgumentTypeError 且带收到的原文")
+
     # ---- probe_order：自适应降档梯子（唯一来源；本机修复点是必须含 1080） ----
     assert NATIVE == (0, 0)
+    # 自动协商（start=None）**不受 8K/5K 影响**：仍从 4K 起、仍只这 7 项。
+    assert PROBE_CEILING is p4k
     assert probe_order(None) == [
         (3840, 2160), (2560, 1440), (1920, 1080),
         (1280, 720), (960, 540), (640, 480), NATIVE,
+    ]
+    assert (7680, 4320) not in probe_order(None)
+    assert (5120, 2880) not in probe_order(None)
+    # 显式选 8K：以它自身开头，照样往下含 4K / 1080p。
+    order_8k = probe_order(parse("7680x4320"))
+    assert parse("7680x4320") is p8k
+    assert order_8k[0] == (7680, 4320)
+    assert (3840, 2160) in order_8k and (1920, 1080) in order_8k
+    assert order_8k == [
+        (7680, 4320), (5120, 2880), (3840, 2160), (2560, 1440),
+        (1920, 1080), (1280, 720), (960, 540), (640, 480), NATIVE,
     ]
     assert probe_order(p1080) == [
         (1920, 1080), (1280, 720), (960, 540), (640, 480), NATIVE,
@@ -356,11 +494,14 @@ def _selftest() -> int:
     assert probe_order(parse("1024x768")) == [
         (1024, 768), (960, 540), (640, 480), NATIVE,
     ]
+    # 「自动协商不含 8K/5K」与「显式 8K 以自身开头」互不影响
+    assert order_8k[0] != probe_order(None)[0]
     # 无重复项 + 末尾恒为原生档
-    for order in (probe_order(None), probe_order(p1080), probe_order(parse("1024x768"))):
+    for order in (probe_order(None), probe_order(p1080),
+                  probe_order(parse("1024x768")), order_8k):
         assert len(order) == len(set(order)), order
         assert order[-1] == NATIVE
-    print("PASS probe_order: 降档梯子按像素降序、含 1920x1080、显式档不越级往上、末尾原生档")
+    print("PASS probe_order: 自动协商仍 4K 起 7 项（不含 5K/8K）；显式 8K 以自身开头；末尾原生档")
 
     print("PASS 全部自测通过（video_profiles）")
     return 0

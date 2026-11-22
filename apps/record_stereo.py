@@ -84,9 +84,11 @@ from stereo.fov_align import (                              # noqa: E402
 from stereo.stereo_mode import (                             # noqa: E402
     optical_axes_angle_deg, resolve_auto,
 )
-from stereo.profiles import resolve_calibration_base        # noqa: E402
+from stereo.profiles import ProfileError, resolve_calibration_base  # noqa: E402
+from stereo import fov_policy                               # noqa: E402
 from stereo.record_plan import output_size, plan_record     # noqa: E402
 from sphere_tracker.camera_registry import (                 # noqa: E402
+    list_devices,
     load_registry,
     resolve_camera_arg,
 )
@@ -95,7 +97,11 @@ from sphere_tracker.sources import (                         # noqa: E402
     CameraSource,
 )
 from sphere_tracker.paths import STEREO_ROOT                 # noqa: E402
-from sphere_tracker.video_profiles import DEFAULT_FPS, RECORD_DEFAULT      # noqa: E402
+from sphere_tracker.video_profiles import (                  # noqa: E402
+    DEFAULT_FPS,
+    RECORD_DEFAULT,
+    fps_type,
+)
 from stereo.sessions import (                                # noqa: E402
     CalibrationInfo,
     CameraInfo,
@@ -109,6 +115,7 @@ from stereo.sessions import (                                # noqa: E402
 from stereo.sync import (                                   # noqa: E402
     SyncConfig,
     brightness_jumps,
+    config_for_fps,
     find_offset,
     timestamp_offset,
 )
@@ -116,8 +123,24 @@ from stereo.sync import (                                   # noqa: E402
 LOG = logging.getLogger("record")
 # 1080p30 × 2 的实测吞吐（本机）：HFYU ≈ 34 fps/路；FFV1 ≈ 8 fps/路。
 # 所以默认 HFYU（无损、能跟上相机），FFV1 留给"不赶时间"的归档。
-CODECS = {"hfyuv": ("HFYU", "HuffYUV（无损，默认）"),
-          "ffv1": ("FFV1", "FFV1（无损，但本机 2×1080p 只有约 8 fps/路）")}
+# 三元组：(fourcc, 默认扩展名, 说明) —— 仿 record_mono.CODECS 的形状。
+# 默认容器只有 mkv；avi 通过 --container 显式选。mp4 **绝不在选项里**：
+# HFYU/FFV1 进 mp4 会被 FFmpeg 静默换成 h264（有损），且 isOpened() 假成功。
+CODECS = {"hfyuv": ("HFYU", ".mkv", "HuffYUV（无损，默认）"),
+          "ffv1": ("FFV1", ".mkv", "FFV1（无损，但本机 2×1080p 只有约 8 fps/路）")}
+
+
+def _container_of(args) -> str:
+    """实际容器名（不含点）：显式 ``--container`` 优先，否则跟随 codec 默认扩展名。
+
+    返回值只可能是 ``mkv`` / ``avi``（``--container`` 的 choices 里没有 mp4，
+    理由见 :data:`CODECS` 注释）。所有写盘路径、``session.container``、
+    ``CameraInfo.video`` 都必须用它动态拼，不许写死 ``mkv``。
+    """
+    want = getattr(args, "container", None)
+    if want:
+        return want
+    return CODECS[args.codec][1].lstrip(".")
 
 
 def _backend_of(args) -> int:
@@ -143,18 +166,29 @@ def _role_spec(reg, value: str):
 
 def _open_one(side: str, value: str, args, api: int, out: dict) -> None:
     try:
-        idx = resolve_camera_arg(value, reg=load_registry(), interactive=False)
+        reg = load_registry()
+        idx = resolve_camera_arg(value, reg=reg, interactive=False)
         if idx is None:
             raise RuntimeError(f"{side} 没有解析出相机编号")
-        src = CameraSource(
-            index=idx,
-            width=args.width,
-            height=args.height,
-            fps=args.fps,
-            backend=api,
-            optimize=False,
-            first_frame_timeout_s=30.0,
-        )
+        spec = _role_spec(reg, value)
+        if args.capture_api in ("auto", "mf") and spec is not None \
+                and (spec.identity or spec.port):
+            from sphere_tracker.sources import open_camera_source
+            src = open_camera_source(
+                index=idx, identity=spec.identity, port=spec.port,
+                width=args.width, height=args.height, fps=args.fps,
+                backend=api, optimize=False, first_frame_timeout_s=30.0,
+                capture_api=args.capture_api)
+        else:
+            src = CameraSource(
+                index=idx,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                backend=api,
+                optimize=False,
+                first_frame_timeout_s=30.0,
+            )
         out[side] = (idx, src)
     except BaseException as exc:                            # noqa: BLE001
         out[side] = exc
@@ -170,7 +204,8 @@ def _open_pair(args) -> tuple[dict, int]:
 
     api = _backend_of(args)
     print(f"[后端] {('MSMF' if api == cv2.CAP_MSMF else 'DSHOW')}；"
-          f"请求 {args.width}x{args.height}@{args.fps} fps")
+          f"请求 {args.width}x{args.height}@{args.fps:g} fps；"
+          f"采集 API={args.capture_api}")
     print("[打开] 并行打开两路（首次可能要 20 秒以上，请等）…")
     out: dict = {}
     threads = [
@@ -213,15 +248,20 @@ def _open_pair(args) -> tuple[dict, int]:
     return cams, 0
 
 
-def _lossless_selfcheck(width: int, height: int, fps: int, tag: str) -> tuple[bool, str]:
-    """写两帧 -> 读回 -> 逐位比较；编码器不可用就提前失败，别录完才发现。"""
+def _lossless_selfcheck(width: int, height: int, fps: float, tag: str,
+                        container: str = "mkv") -> tuple[bool, str]:
+    """写两帧 -> 读回 -> 逐位比较；编码器不可用就提前失败，别录完才发现。
+
+    ``container`` 决定自检文件的扩展名（mkv/avi）—— 真正录制用什么容器，
+    自检就得用什么容器验，不能拿 mkv 的自检结果给 avi 录制背书。
+    """
     try:
         fourcc = cv2.VideoWriter_fourcc(*tag)
         with tempfile.TemporaryDirectory(prefix="lossless_check_") as td:
-            path = Path(td) / "check.mkv"
+            path = Path(td) / f"check.{container}"
             vw = cv2.VideoWriter(str(path), fourcc, float(fps), (width, height))
             if not vw.isOpened():
-                return False, f"VideoWriter 打不开 {tag}/MKV"
+                return False, f"VideoWriter 打不开 {tag}/{container.upper()}"
             rng = np.random.default_rng(12345)
             frames = [
                 rng.integers(0, 256, (height, width, 3), dtype=np.uint8),
@@ -316,6 +356,23 @@ def _container_fps(info_fps: float, requested: float) -> float:
     if not math.isfinite(v) or v < 1.0:
         v = float(requested)
     return round(v, 3)
+
+
+#: 单条 USB3 链路的**有效**带宽上限（GB/s）：5 Gbps 扣掉协议/编码开销后的现实值。
+#: 判的是**单路**不是两路之和 —— 两台相机通常各占一个口、各吃自己的链路；
+#: 按两路求和会把本机已实测跑通的 2560x1440@24（单路 0.265）也报成告警。
+USB3_EFFECTIVE_GBPS = 0.5
+
+
+def stream_bandwidth(width: int, height: int, fps: float) -> tuple[float, float, float]:
+    """两路 BGR24 裸流估算：``(单帧 MB, 单路 GB/s, 两路合计 GB/s)``。
+
+    纯函数（不读日志、不碰相机），判据直接调它；日志只是它的消费者。
+    未压缩估算 —— 实际码流/带宽以驱动给到的为准（很多相机内部就是 MJPG）。
+    """
+    frame_mb = width * height * 3 / 1e6
+    per_cam_gbps = width * height * float(fps) * 3 / 1e9
+    return frame_mb, per_cam_gbps, per_cam_gbps * 2.0
 
 
 def _make_writer(path: Path, width: int, height: int, fps: float, tag: str):
@@ -437,21 +494,74 @@ def _load_calib_fov(raw: object) -> FovAlignment | None:
     return FovAlignment.from_dict(raw)                      # type: ignore[arg-type]
 
 
-def _camera_info(side: str, idx: int, src: CameraSource, args, role_spec,
+def decide_record_fov(mode: str, calib_fov, profile):
+    """录制侧把装置级 ``fov_apply`` 落到「这一路要不要裁剪」的唯一决策点。
+
+    纯函数：不读文件、不碰相机；``profile`` 由调用方（``main`` 用
+    :func:`stereo.profiles.get_active` 读当前装置档案）给，``calib_fov`` 是
+    标定 JSON 顶层的 ``fov``（``dict | None``）。测试能用临时 fixture 直接调它
+    而不用起相机（见 ``tests/selftest_stereo_branch.py`` 的判据 8）。
+
+    后果由 :func:`stereo.fov_policy.resolve_fov_apply` 统一判定，这里只转发——
+    标定与录制服从的是**同一个装置级开关**，不是两套流程逻辑。
+    """
+    return fov_policy.resolve_fov_apply(profile, mode=mode, calib_fov=calib_fov)
+
+
+def angled_ignore_message(fov) -> str:
+    """angled 下忽略标定里的 FOV 对齐记录时，给用户看的一句警告（纯函数）。
+
+    90° 装置两路几乎不共视，录制按原始画面写盘；若标定 meta 里却带着真裁剪
+    参数，必须明确告知「忽略了它」，否则用户以为录的是归一化画面。
+
+    ``fov=None`` 或 ``fov.active=False``（两路视场本就一致、没有真裁剪）时
+    返回空串 —— 没有可忽略的东西就不打扰。判据用 ``SimpleNamespace`` 直接调
+    这个函数（真跑，不用源码字符串匹配）。
+    """
+    if fov is None or not getattr(fov, "active", False):
+        return ""
+    return "[FOV] 标定记录里带裁剪/缩放参数，但模式为 angled：忽略它。"
+
+
+def _actual_device(idx: int, devices) -> tuple[str, str, str]:
+    """本次**实际打开**的那台设备的 ``(name, identity, port)``。
+
+    ⚠ 记录口径（2026-11-11 修）：以前这里写的是**角色绑定**的名字
+    （`_role_spec(reg, args.left)`）。用户手动选的左路因此被记成
+    "Integrated IR Camera" —— 而算法用的是另一个编号。**名字不能冒充设备**：
+    角色名留在 `role` 字段，设备名按实际打开用的 capture index 回查 PnP 表。
+
+    口径同 `AGENTS.md` §9：`#N` 来自 PnP 枚举，MSMF 下实测与 PnP 位次一致
+    （这条是**实测**，不是证明）；查不到就留空，不编造一个名字。
+    """
+    for d in devices:
+        if int(getattr(d, "order", -1)) == int(idx):
+            return (str(getattr(d, "name", "") or ""),
+                    str(getattr(d, "identity", "") or ""),
+                    str(getattr(d, "port", "") or ""))
+    return ("", "", "")
+
+
+def _camera_info(side: str, idx: int, src: CameraSource, args,
+                 device: tuple[str, str, str],
                  out_width: int, out_height: int) -> CameraInfo:
-    """会话 left/right 记录的是**写盘分辨率**（FOV 生效时 = fov.target_size）。"""
+    """会话 left/right 记录的是**写盘分辨率**（FOV 生效时 = fov.target_size）。
+
+    ``device`` 是**实际打开设备**的 ``(name, identity, port)``，不是角色绑定。
+    """
+    name, identity, port = device
     return CameraInfo(
         role=side,
-        video=f"{side}.mkv",
+        video=f"{side}.{_container_of(args)}",
         width=int(out_width),
         height=int(out_height),
         frame_count=0,
         fps_requested=float(args.fps),
         fps_measured=0.0,
         backend=str(src.info.backend or ""),
-        identity=(role_spec.identity if role_spec else ""),
-        name=(role_spec.name if role_spec else ""),
-        port=(role_spec.port if role_spec else ""),
+        identity=identity,
+        name=name,
+        port=port,
     )
 
 
@@ -460,6 +570,12 @@ def main() -> int:
     ap.add_argument("--left", default="left", help="左路：角色名 / 编号 / name:...")
     ap.add_argument("--right", default="right", help="右路：角色名 / 编号 / name:...")
     ap.add_argument("--backend", choices=("auto", "msmf", "dshow"), default="auto")
+    ap.add_argument(
+        "--capture-api", choices=("auto", "mf", "opencv"), default="opencv",
+        help="采集后端：opencv=默认，原有编号路径；"
+             "mf=按设备 symlink 打开（必须绑定角色）；"
+             "auto=角色有 identity/port 时先 MF、失败回退 OpenCV。"
+             "显式数字编号只能用 opencv。")
     ap.add_argument("--width", type=int, default=None,
                     help=f"录制采集宽度。**默认不填 = 采用标定记录的采集档 "
                          f"(capture_size)**；标定没记（旧标定）则退回 {RECORD_DEFAULT.label}。"
@@ -467,12 +583,18 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=None,
                     help=f"录制采集高度。默认不填 = 采用标定记录的采集档；"
                          f"标定没记则退回 {RECORD_DEFAULT.label}（说明见 --width）")
-    ap.add_argument("--fps", type=int, default=DEFAULT_FPS,
-                    help="请求相机的帧率（提示值），**不是**容器标称帧率；容器帧率"
-                         "取相机协商值（取不到才退回本值）。默认 24")
+    ap.add_argument("--fps", type=fps_type, default=DEFAULT_FPS,
+                    help="请求相机的帧率（提示值，可填小数，如 29.97），**不是**容器"
+                         "标称帧率；容器帧率取相机协商值（取不到才退回本值）。默认 24")
     ap.add_argument("--codec", choices=tuple(CODECS), default="hfyuv",
                     help="无损编码器：hfyuv（默认，FOV 对齐后 1718x972@30 稳定）/ "
                          "ffv1（更通用但很慢）")
+    ap.add_argument("--container", choices=("mkv", "avi"), default=None,
+                    help="录制容器：mkv（默认，跟随编码器）/ avi。默认 None = 跟随 "
+                         "--codec 的默认扩展名（两种编码器默认都是 mkv）。"
+                         "**不支持 mp4**：HFYU/FFV1 在 mp4 里会被 FFmpeg 静默换成 "
+                         "h264（有损），isOpened() 还会假成功，等于偷偷破坏无损承诺。"
+                         "AVI 有经典单文件 2 GiB 上限，长录制建议用 mkv")
     ap.add_argument("--duration", type=float, default=10.0, help="录制秒数")
     ap.add_argument("--countdown", type=float, default=3.0)
     # 新会话一律写到 `data/stereo/`（这是**写**路径，所以只认新根，不扫旧位置）
@@ -480,6 +602,10 @@ def main() -> int:
     ap.add_argument("--calib", default=None,
                     help="标定文件前缀；缺省从激活装置档案解析，再回落 "
                          "config/stereo_calibration")
+    ap.add_argument("--allow-forced", action="store_true",
+                    help="⚠ 仅链路测试（默认拒绝）：允许用「强制保存的不可用标定」"
+                         "（quality.forced_unusable）录制。录出来的 session.json "
+                         "会标「仅测试」，不得用于数据结论")
     ap.add_argument("--baseline-mm", type=float, default=None,
                     help="物理基线（只作核对；不填则会话里不记）")
     ap.add_argument("--label", default="")
@@ -501,8 +627,24 @@ def main() -> int:
     # 2026-11-04 前这里硬编码顶层，档案"切换装置"是假动作。
     # **必须在这里（最早处）解析**：下面的"采集档"分支用 args.calib 读
     # capture_size，若这里不先把 None 换成真实路径，--self-check-only 也会
-    # 在 Path(None) 上崩掉（2026-11-04 实测）。
-    calib_base = Path(args.calib) if args.calib else resolve_calibration_base()
+    # 在 Path(None) 上崩掉（2026-11-04 实测）。档案缺标定必须**显式报错**：
+    # 不能拿顶层那份（别套装置的几何）冒充，否则录出来也没法三维重建。
+    if args.calib:
+        calib_base = Path(args.calib)
+    else:
+        try:
+            calib_base = resolve_calibration_base()
+        except ProfileError as exc:
+            raise SystemExit(f"[错误] {exc}") from exc
+
+    # 实际容器名（不含点）：显式 --container 优先，否则跟随 codec 默认（mkv）。
+    # 所有写盘路径都从它派生，绝不写死扩展名。
+    container = _container_of(args)
+    if container == "avi":
+        # 只提示、不阻断：AVI 经典单文件 2 GiB 上限，本机 1080p/10s 单路中位约
+        # 758 MB（两路 ~1.5 GB/10s）。OpenDML 是否生效未实测，不当成已验证。
+        print("[警告] AVI 有经典单文件 2 GiB 上限（本机 1080p/10s 单路中位约 758 MB）；"
+              "长录制建议改用 mkv（OpenDML 是否生效未实测，不当成已验证）。")
 
     # `--wait-key space` 没有预览窗口就收不到按键 —— 这是**参数层的矛盾**，
     # 必须在开相机之前判死：等两台相机都打开、两个 writer 都建好再说"没法等按键"，
@@ -551,19 +693,41 @@ def main() -> int:
     log_path = setup_logging("record")
     print(f"本次日志：{log_path}")
     LOG.info("=== 双路录制开始 ===")
-    LOG.info("参数：left=%s right=%s backend=%s %dx%d@%d duration=%.1f",
+    LOG.info("参数：left=%s right=%s backend=%s %dx%d@%g duration=%.1f",
              args.left, args.right, args.backend, args.width, args.height,
              args.fps, args.duration)
 
     if args.self_check_only:
-        tag, label = CODECS[args.codec]
-        ok, msg = _lossless_selfcheck(args.width, args.height, args.fps, tag)
+        tag, _ext, label = CODECS[args.codec]
+        ok, msg = _lossless_selfcheck(args.width, args.height, args.fps, tag, container)
         print(f"[自检] {label}：{msg}")
-        LOG.info("%s 自检（仅自检）：%s（%s）", tag, "PASS" if ok else "FAIL", msg)
+        LOG.info("%s/%s 自检（仅自检）：%s（%s）", tag, container,
+                 "PASS" if ok else "FAIL", msg)
         return 0 if ok else 1
 
-    tag, label = CODECS[args.codec]
-    print(f"[编码] {label}")
+    tag, _ext, label = CODECS[args.codec]
+    print(f"[编码] {label} → {container.upper()}")
+
+    # ---- 带宽可行性：**只提示，不拦截** ----------------------------------
+    # 高分辨率 × 高帧率下单路 BGR24 裸流就可能超过一条 USB3 链路的有效带宽。
+    # 那种情况下的表现不是报错，而是**相机悄悄降帧**（驱动层丢帧，程序侧
+    # 看到的只是 fps 变低）。不说一句，用户会以为"程序没跑到 500 fps"。
+    # 注意：这里不改变任何判定、不阻塞、不影响退出码 —— 实际可用帧率只有
+    # 相机自己知道，真要量得用 camera_quality.py。
+    # 判**单路**：两台相机通常各占一个 USB 口；按两路求和会把正常配置也报成告警。
+    _frame_mb, _per_cam_gbps, _total_gbps = stream_bandwidth(
+        args.width, args.height, args.fps)
+    LOG.info("两路 %dx%d@%g BGR24 裸流：单帧 %.1f MB，单路 %.2f GB/s，"
+             "两路合计 %.2f GB/s（未压缩；实际以驱动给到的为准）",
+             args.width, args.height, args.fps, _frame_mb,
+             _per_cam_gbps, _total_gbps)
+    if _per_cam_gbps > USB3_EFFECTIVE_GBPS:
+        LOG.warning("单路 %.2f GB/s 已超出常见 USB3 相机链路约 %.1f GB/s 的有效带宽，"
+                    "实际帧率会被硬件截断到更低值；程序侧不会因此报错。"
+                    "请用 --fps 降到实测可行值（可先跑 apps/tools/camera_quality.py "
+                    "量真实吞吐）。两路若共用同一个 USB 控制器还会更早触顶。",
+                    _per_cam_gbps, USB3_EFFECTIVE_GBPS)
+
     if not calib_base.with_suffix(".npz").exists():
         print(f"[错误] 找不到标定：{calib_base.with_suffix('.npz')}")
         return 1
@@ -579,9 +743,16 @@ def main() -> int:
     try:
         _pre = plan_record(StereoRig.load(calib_base),
                            mode_choice=args.stereo_mode,
-                           width=args.width, height=args.height)
+                           width=args.width, height=args.height,
+                           allow_forced=bool(getattr(args, "allow_forced", False)))
     except Exception:                                       # noqa: BLE001
         _pre = None
+    if _pre is not None and _pre.ok and getattr(_pre, "forced", False):
+        print("\n" + "!" * 66)
+        print("⚠ 仅测试：本次录制使用「强制保存的不可用标定」（forced_unusable）")
+        print("  录出来的会话只能做链路测试，不得用于数据结论；session.json 会标「仅测试」。")
+        print("!" * 66 + "\n")
+        LOG.warning("仅测试录制：--allow-forced，标定被标为 forced_unusable")
     if _pre is not None and not _pre.ok:
         print(f"[错误] {_pre.headline}")
         for _line in _pre.detail:
@@ -598,9 +769,10 @@ def main() -> int:
     right_idx, right_src = cams["right"]
 
     try:
-        ok, msg = _lossless_selfcheck(args.width, args.height, args.fps, tag)
+        ok, msg = _lossless_selfcheck(args.width, args.height, args.fps, tag, container)
         print(f"[自检] {msg}")
-        LOG.info("%s 自检：%s（%s）", tag, "PASS" if ok else "FAIL", msg)
+        LOG.info("%s/%s 自检：%s（%s）", tag, container,
+                 "PASS" if ok else "FAIL", msg)
         if not ok:
             return 1
 
@@ -610,6 +782,11 @@ def main() -> int:
             suffix = (f"backend={args.backend} left_index={left_idx} "
                       f"right_index={right_idx}（显式编号；编号映射已由使用者确认）")
             session.notes = f"{session.notes}；{suffix}" if session.notes else suffix
+        if _pre is not None and getattr(_pre, "forced", False):
+            # session.json 必须**自己**能证明"这次只是链路测试"。
+            mark = ("⚠ 仅测试：使用强制保存的不可用标定（forced_unusable），"
+                    "只能做链路测试，不得用于数据结论")
+            session.notes = f"{session.notes}；{mark}" if session.notes else mark
         print(f"[会话] {session_dir}")
         LOG.info("会话目录：%s", session_dir)
 
@@ -636,12 +813,56 @@ def main() -> int:
                   "请重新标定后再录。")
             LOG.error("标定 meta.fov 解析失败，拒绝录制：%s", exc)
             return 2
+
+        # ---- 装置级 fov_apply：录制是否把这份 FOV 应用到两路画面（2026-11-15）----
+        # 「启用」= 应用到当前摄像头，是装置级事实，标定与录制都服从它。
+        # 这是唯一判定点 resolve_fov_apply 在录制侧的落法：
+        #   - error         -> 明确拒绝（return 2），**不静默回退**；
+        #   - legacy_follow -> 开关关但标定自带 FOV：沿用标定裁剪 + 醒目提示
+        #                      （内参本就是裁剪帧上算的，跟着裁才自洽；旧流程行为不变）；
+        #   - 不应用        -> fov=None（标定也没 fov 时按原始画面写盘）；
+        #   - 应用          -> 继续用标定 JSON 那份（第 6 条已保证它与档案一致）。
+        # 为什么 error 不静默回退成「照旧录制」：FOV 改变的是喂给标定的像素；
+        # 用「关 FOV 标出来的内参」去解「开 FOV 录出来的画面」，深度会系统性错，
+        # 且屏幕上完全看不出来 —— 这是本项目最贵的那类静默错配，宁可拒绝录制，
+        # 也不冒充成功（回退只会让内参与画面口径不一致，错得更隐蔽）。
+        try:
+            from stereo.profiles import get_active
+            _active_prof = get_active()
+        except Exception:                                   # noqa: BLE001
+            _active_prof = None
+        _dec = decide_record_fov(mode, raw_fov, _active_prof)
+        if _dec["error"]:
+            print(f"[FOV] {_dec['error']}")
+            LOG.error("FOV 应用判定拒绝录制：%s", _dec["error"])
+            return 2
+        if _dec.get("legacy_follow"):
+            # 开关关、但标定 JSON 自带 FOV：那次标定的内参是在裁剪帧上算的，
+            # 录制必须跟着裁才几何自洽 —— 沿用标定自带的 FOV（旧流程行为不变），
+            # 只给一句醒目提示。**不置 fov=None**：fov 保持从标定 JSON 读出来的
+            # 原值，照旧裁剪/缩放，否则内参与画面口径错配、且屏幕上完全看不出来。
+            print(f"[FOV] {_dec['warning']}")
+            LOG.warning("FOV 开关未启用，沿用标定自带的 FOV：%s", _dec["warning"])
+        elif not _dec["apply"]:
+            if mode != "angled":
+                # 关掉开关且标定也没 fov：按原始画面写盘。
+                fov = None
+                print(f"[FOV] {_dec['reason']}")
+                LOG.info("FOV 未应用：%s", _dec["reason"])
+            # angled：保持 fov 原值，交给下面原有的 angled 分支自己提示并置 None。
+            # 决策块一行都不打，避免与那句「忽略」警告重复；若在这里提前把 fov
+            # 置成 None，angled 分支的 `if fov is not None and fov.active` 永远为假，
+            # 用户拿带裁剪参数的标定去录 90° 就再也收不到「我忽略了它」的提示。
+        else:
+            print("[FOV] 已应用装置档案的 FOV 对齐：录制按它裁剪/缩放两路。")
+            LOG.info("FOV 已应用：%s", _dec["fov"])
         # angled：两路光轴近乎垂直、视场几乎不重叠，单应裁剪没有物理意义。
         # 写盘就是两路各自的原始画面（坐标系仍是 left_camera），所以不用
         # fov.target_size，也不再拿它去核对 image_size。
         if mode == "angled":
-            if fov is not None and fov.active:
-                print("[FOV] 标定记录里带裁剪/缩放参数，但模式为 angled：忽略它。")
+            _ignore_msg = angled_ignore_message(fov)
+            if _ignore_msg:
+                print(_ignore_msg)
                 LOG.warning("angled 模式忽略标定 meta.fov=%s", fov.to_dict())
             fov = None
         # 写盘尺寸只由 `stereo.record_plan.output_size` 决定：体检与录制必须先
@@ -652,10 +873,10 @@ def main() -> int:
         # （2026-10-24：301 帧/10.002s）。只有写盘像素数真的很大时才提示。
         if out_w * out_h > 2_500_000 and args.fps > 24:
             print(f"[警告] 写盘 {out_w}x{out_h}（{out_w * out_h / 1e6:.2f}MP）"
-                  f"请求 {args.fps}fps：这是按 1440p 全尺寸（3.68MP）历史实测"
+                  f"请求 {args.fps:g}fps：这是按 1440p 全尺寸（3.68MP）历史实测"
                   "（约 24.07fps，242/300 帧·10 秒·HFYU）推断的风险，"
                   "当前尺寸未实测；建议先短录确认不丢帧。")
-            LOG.warning("写盘 %sx%s（%.2fMP）请求 %dfps：依据 1440p 全尺寸的历史"
+            LOG.warning("写盘 %sx%s（%.2fMP）请求 %gfps：依据 1440p 全尺寸的历史"
                         "实测（约 24.07fps）提示可能丢帧；当前尺寸未实测",
                         out_w, out_h, out_w * out_h / 1e6, args.fps)
         try:
@@ -765,11 +986,11 @@ def main() -> int:
                   "请确认这份标定确实对应当前机械装置。")
             LOG.warning("会话 stereo_mode=%s，标定 meta=%s", mode, rig.stereo_mode)
         session.codec = tag
-        session.container = "mkv"
+        session.container = container
         session.lossless = True
 
-        left_path = session_dir / "left.mkv"
-        right_path = session_dir / "right.mkv"
+        left_path = session_dir / f"left.{container}"
+        right_path = session_dir / f"right.{container}"
         # 容器标称帧率取相机协商值（`--fps` 只是请求提示）。两路容器头必须一致，
         # 所以取两路协商值里较小的那个；都不合法才退回请求值。
         negotiated = [float(left_src.info.fps), float(right_src.info.fps)]
@@ -778,8 +999,8 @@ def main() -> int:
         fps_src = (f"相机协商 L/R={negotiated[0]:.1f}/{negotiated[1]:.1f}"
                    if usable else "相机未报出有效帧率")
         print(f"[容器] 标称帧率 {container_fps:g} fps（{fps_src}；请求 --fps "
-              f"{args.fps}）")
-        LOG.info("容器标称帧率 %.3f fps（%s；请求 %d fps）",
+              f"{args.fps:g}）")
+        LOG.info("容器标称帧率 %.3f fps（%s；请求 %g fps）",
                  container_fps, fps_src, args.fps)
         try:
             left_writer = _make_writer(left_path, out_w, out_h, container_fps, tag)
@@ -943,11 +1164,11 @@ def main() -> int:
         right_fps = right_rec.frame_count / elapsed
 
         session.left = _camera_info("left", left_idx, left_src, args,
-                                    _role_spec(load_registry(), args.left),
+                                    _actual_device(left_idx, list_devices()),
                                     out_w, out_h)
         session.right = _camera_info("right", right_idx, right_src, args,
-                                     _role_spec(load_registry(), args.right),
-                                     out_w, out_h)
+                                      _actual_device(right_idx, list_devices()),
+                                      out_w, out_h)
         session.left.frame_count = left_rec.frame_count
         session.right.frame_count = right_rec.frame_count
         session.left.fps_measured = left_fps
@@ -980,7 +1201,9 @@ def main() -> int:
             except Exception as exc:                        # noqa: BLE001
                 print(f"[警告] 同步诊断图画不出来：{exc}")
 
-            cfg_sync = SyncConfig(max_offset=180, min_overlap=30)
+            # 搜索窗与最小重叠的语义是**时长**（6 s / 1 s），不是固定 180/30 帧：
+            # 500 fps 下 180 帧只有 0.36 s，闪光事件几乎必然落在窗外。
+            cfg_sync = config_for_fps(left_fps)
             res = find_offset(lb, rb, cfg_sync)
             if res.usable:
                 session.sync = SyncInfo(method="flash", offset=int(res.offset),
@@ -1029,6 +1252,9 @@ def main() -> int:
         ]
         if min(mean_l, mean_r) < 20.0:
             session.checks.append("画面几乎全黑（<20）：检查镜头盖/灯光/曝光")
+        if _pre is not None and getattr(_pre, "forced", False):
+            session.checks.append("⚠ 仅测试：使用强制保存的不可用标定"
+                                  "（forced_unusable），结果不得用于数据结论")
         if sync_note:
             session.checks.append(f"同步：{sync_note}")
         save_session(session, session_dir)

@@ -32,14 +32,14 @@
 | **双目自动标定**                                      | ✅ 完成       | 合成真值验证：基线误差 0.006%、端到端三维误差 3.4 mm，见第十二节                                        |
 | 双目标定复检（装置是否被碰动）                        | ✅ 完成       | 未动 0.08 px / 碰动 2° 后 27.9 px，可明确判定                                                           |
 | 多相机/换相机适配                                     | ✅ 完成       | `apps/tools/list_cameras.py` 探测后端/分辨率/帧率；`cameras.py` 按**设备身份/端口**固定角色，免索引漂移；可把不用的相机标为**「无关」**（自动挑相机时跳过） |
-| 一键启动（双击即用，不用敲 Python）                    | ✅ 完成       | 根目录唯一入口 `启动程序.bat`：找 Python（真试一次 `import cv2`）→ 缺依赖自动装 → 启动界面；`启动程序.bat cli/setup/check/precheck/calibrate/verify/run/test` 可直接做某一步 |
+| 一键启动（双击即用，不用敲 Python）                    | ✅ 完成       | 主入口 `run.bat`：找 Python（真试一次 `import cv2`）→ 缺依赖自动装 → 启动界面；`run.bat cli/setup/check/precheck/calibrate/verify/run/test` 可直接做某一步 |
 | AI 分支环境（YOLO / SAM 后端）                        | ⚙️ 环境就绪   | torch 2.11.0+cu128、ultralytics 8.4.159、CUDA 可用（sm_120）                                            |
 | **两路视频同步**                                      | ✅ 完成       | 合成真值验证：人为平移 0 / ±8 / -11 / +37 帧全部找回，置信度 1.000                                      |
 | **成对取帧（PairSource）**                            | ✅ 完成       | 按同步偏移取到"同一时刻"的左右帧，帧索引语义有回归测试                                                  |
 | **极线配对 + 三角测量**                               | ✅ 完成       | 合成真值：配对率 **100%**，三维误差 **1.3 mm**                                                          |
 | **双目整条链路**（真渲染 + 两路真检测）               | ✅ 完成       | clean 配对率 100% / 三维 RMSE **15.6 mm**（折算 1 m 处 **1.13 mm**）；realistic 99.4% / 31.6 mm         |
-| **真机标定**                                         | ⚠️ **真机跑通，结果待提高** | 已有可用结果（**以 `config/stereo_calibration.json` 为准**，不要抄文档里的数字）；最近一次极线约 0.9 px、判定"勉强可用"，离 0.3 px 目标还差一倍。见 `docs/交接文档.md` §13.2 |
-| **数据采集会话层**                                   | ✅ 完成（2026-10-19） | `data/` + `stereo/sessions.py` + `check_dataset.py`；双路录制器 `apps/record_stereo.py` 已完成（HFYU 1080p 实测 30.1 fps） |
+| **真机标定**                                         | ⚠️ **真机跑通，结果待提高** | 2026-11-10 起标定按**装置档案**落盘（`config/calib/<档案名>.npz` 给程序读 + 同名 `.json` 人读报告），**数值以当前激活档案指向的那份 `.json` 为准**，不要抄文档里的数字。现有两份实测：平行装置极线 0.713 px、实验性质平行装置1 1.135 px，都判定"勉强可用"，离 0.3 px 目标还差一倍多。见 `docs/交接文档.md` §13.2 与 §105 |
+| **数据采集会话层**                                   | ✅ 完成（2026-10-19） | `data/` + `stereo/sessions.py` + `check_dataset.py`；双路录制器 `apps/record_stereo.py` 已完成（HFYU 1080p 实测 30.1 fps）；录制容器可选 mkv / avi（默认 mkv；mp4 因 HFYU/FFV1 静默降级 h264 有损而排除） |
 | **金属球检测（specular）**                            | ✅ 原型可用（2026-10-19） | 人工 seed + CSRT（BGR）；24 帧人工标签 **86.4% @15 px / 100% @20 px**；自动初始化不可靠 |
 | **标准数据（seeds/traj3d/visualization）**             | ✅ 完成（2026-10-19） | `stereo/visualization.py` + `apps/export_visualization.py`；schema/坐标/单位见 `docs/数据标准.md` |
 | **GUI 点选球心 seed + 双目工作台**                    | ✅ 完成（2026-10-19/20） | 第 3 步『点选球（双目 seed）』写 `seeds.json`；工作台显示全部会话，支持『浏览会话…』任意目录、校验/点选/跑双目/看 3D/导出；设置区可折叠、窗口自适应工作区、快速跳转 |
@@ -48,7 +48,9 @@
 | **时间戳配对（金丝雀转正）**                          | ✅ 默认（2026-10-21） | `PairSource(pairing="canary")` 默认；覆盖率 <75% 或 sidecar 缺失时回退 `index`；A 会话 299 对 / 295 匹配 |
 | **大角度双目（近似直角，实验）**                      | ⚙️ 模块可用（2026-10-21） | `angled` 模式：F 极线匹配 + 原始射线交会；旧 parallel 不变；实际夹角由标定 R 计算，不写死 90°；需真机验证 |
 | **金属球双目轨迹（221550）**                          | ✅ 单条会话可用 | seed 左 `(1260,830,65)` / 右 `(920,830,65)`；293/301 = **97.3%** 匹配；Z 0.235–0.348 m；尚无独立三维真值 |
-| **纯色哑光塑料球（color + 预设）**                    | ✅ 开箱即用 | `--method color --preset <颜色>`（white/orange/green/blue/red/yellow）；直径 20–200 px 稳定命中，边界见 `docs/纯色球检测方案.md` |
+| **纯色哑光塑料球（color + 预设）**                    | ✅ 开箱即用 | `--method color --preset <颜色>`（white/orange/green/blue/red/yellow）；不知道球色用 `--preset auto`（按画面估主色，**不用点选**）；直径 20–200 px 稳定命中，边界见 `docs/纯色球检测方案.md` §9 |
+| **通用球体（近圆水果等）**                            | ⚙️ 可选（2026-11-06） | `--method generic` 纯几何路径（边缘 + 圆度 + 径向一致性 + 梯度符号一致性），不依赖颜色；带斑水果合成圆心 RMSE 0.44 px，**真机未验证**；同色同形多个圆纯几何不可区分，需半径带/时序裁决；出厂默认仍是 `color`（`docs/交接文档.md` §75） |
+| **界面补齐：标定与训练工具台**                        | ✅ 完成（2026-11-07） | 门厅「工具 · 标定与训练…」六条离线流程原先**只能在命令行里走**：生成可打印标定板 / 点选取色（HSV）/ 世界坐标系 `T_world_cam` / 导出标定参数 / 导出 YOLO 数据集 / 训练球检测器。界面只拼参数、不复制算法（argv 仍只有 `apps/_actions.py` 一个产地）；真机未验证（`docs/交接文档.md` §76） |
 | **球径无默认值**                                      | ✅ 已改 | 测试球尺寸跨度大，`AppConfig.ball_diameter_m` 不再预设；单目没给球径就**拒跑**（`docs/交接文档.md` §59） |
 | **轨迹平滑 + 查看器俯视小图**                         | ✅ 完成 | `stereo/motion.py` 逐段 S-G（窗口 0.20 s 实测）；`apps/view_3d.py` 右下角 X–Z 俯视小图 + 「平滑」开关 |
 | **运动数据交付（速度/加速度）**                       | ✅ 完成 | `apps/tools/export_motion.py` → `motion.csv`+meta；口径见 `docs/运动数据交付说明.md` |
@@ -59,6 +61,12 @@
 | **3D 查看器 · 数据读数**（2026-11-05）                | ✅ 完成 | 曲线上画**真实采样点**（单击看 frame/t/X/Y/Z）、常驻三轴极值、可调三轴分度值、「最佳视角」按数据自动算角度与缩放、帧步进 ±1/±10、视频帧数不足时给出可行动的诊断 |
 | **操作说明 / 帮助系统**（2026-11-05）                 | ✅ 完成 | `apps/help_content.py`（7 分区 27 条）+ `apps/help_window.py`（目录树 + 实时全文搜索）；主界面与五个子窗口都有入口，各自跳到对应分区；标准窗口可最大化/最小化/F11 全屏 |
 | **清理器 · 实验数据保护**（2026-11-05）               | ✅ 完成 | 逐项校验 53 个候选后给 `apps/_junk.py` 加语义判据：含人工文档、标定结果、成组实验帧的目录一律降为「谨慎」不默认勾选。默认勾选从 29 项 / 332 MiB 收敛到 11 项 / 39.9 MiB，实验采集数据一个不删 |
+| **高帧率 / 高分辨率档位**（2026-11-18）               | ✅ 完成 | `sphere_tracker/video_profiles.py` 统一 8 档（P8K→P480，默认 P1440）；自动协商上限 P4K，帧率档 24/30/60/120/240/500/1000 只作建议不限制，保留 29.97 这类小数；带宽按单路 0.5 GB/s 提示。合成自验，真机未验证 |
+| **两种新标定方式**（2026-11-19）                      | ✅ 完成 | `apps/calibrate_axial.py`（轴向大板：板正对相机 + 已知 ΔZ 推进，D=0 不标畸变）+ `apps/calibrate_device90.py`（中轴 90°：板绕中轴转 90°、只拍①②、须给预期基线）；合成自验，真机未验证，见 §12.x 与 `docs/用户手册.md` §12.8 |
+| **AVI 录制容器**（2026-11-15）                        | ✅ 完成 | `apps/record_stereo.py` 加 `--container mkv\|avi`（默认 mkv，mp4 因静默有损剔除）；消费侧 `sphere_tracker/video_files.py` 含 .avi，优先级 mkv>mp4>avi |
+| **质量差也照常出结果**（2026-11-19）                  | ✅ 完成 | verdict / `traj3d.json` 的 quality 记录判定，几何守卫把"检出质量差"与"几何不一致"分开报且照常出结果；默认旁路保存，`--force-save` 才写正式路径 |
+| **任务管理器**（2026-11-19）                          | ✅ 完成 | 跨进程注册表 + 实时运行任务面板，关窗按 owner 停任务 |
+| **数据管理 · 分组目录树**（2026-11-19）               | ✅ 完成 | `collections.json` 分组目录树 + 状态符号 ✓/◑/○/—（按产物判，◑=三维点过少） |
 
 一句话：**单路视频的"检测 → 跟踪 → 单目三维 → 预测 → 可视化"整条链路已经跑通并量化；
 双目也已经在真机上跑通"录制 → 闪光同步 → 极线配对 → 三角测量"，
@@ -67,7 +75,8 @@
 
 > ⚠️ **不要混用合成指标与真机指标**：单目/双目合成测试的 15 mm 级数字来自
 > 不同的合成场景；真机 `221550` 的 97.3% 是**匹配率**，不是三维绝对精度。
-> 标定已到"可用"档（极线 ~0.584 px），绝对精度仍受它限制。
+> 标定已到"可用"档（现有两份实测的极线误差分别是 **0.713 px** 与 **1.135 px**），
+> 绝对精度仍受它限制；具体数值以当前装置档案指向的那份标定 `.json` 为准。
 
 > 📖 两个 15 mm 不要混：本节上表"单目三维 RMSE **15.1 mm**"来自
 > `tests/selftest_synthetic.py`（球径 22 cm、距离 3.7–4.4 m 的单目场景）；
@@ -75,14 +84,37 @@
 > 两者基准不同，**不可直接比较大小**。
 
 > ✅ **2026-10-19 复核**：fast 档 20/20 通过（`outputs/test_results/20261019_225111.json`）；
-> 全套仍为 **23 个**测试（本轮新增的标准数据用例并入 `selftest_stereo_pipeline.py`，
-> 没有增加测试数量）。真机标定、相机、同步、金属球、GUI 的现状以 `docs/交接文档.md` 为准。
+> 当时全套 23 个测试（本轮新增的标准数据用例并入 `selftest_stereo_pipeline.py`，没有增加测试数量）。
+> **2026-11-11 现状：全套 29 个测试，fast 档 26 个**（数据管理、打包层、帮助与文档判据的用例陆续加入；高帧率档位扩容新增 `selftest_highspeed`）。
+> 真机标定、相机、同步、金属球、GUI 的现状以 `docs/交接文档.md` 为准。
+
+> 📁 **东西都存在哪**：录像在 `data/stereo/`（支持嵌套分组）与 `data/mono/`；标定在
+> `config/calib/<装置档案名>.npz` + 同名 `.json`（顶层 `config/stereo_calibration.*` 只是档案
+> 没配路径时的回落）；标定板照片在 `outputs/chain_frames/` 与 `outputs/mono_calib_frames/`
+> （**不在 data 里**）；回收站 `data/_trash/`。
+> 哪些能删、哪些删了就得重拍/重标、换电脑怎么搬 → `docs/用户手册.md` §15「数据与文件都在哪」。
+
+### 首次使用（换一台干净机器）
+
+> **第 0 步：先装一个能运行的 Python 3.10+**（[python.org](https://www.python.org/downloads/)
+> 或 Miniforge）—— 安装器要靠它自举，**完全空白的机器装不了**。
+> 装好后**双击 `install.bat`** 建环境，再**双击 `run.bat`** 启动界面。
+> 安装器可加参数：`--isolate`（强制项目内 `.venv`）、`--ai`（额外装 YOLO/SAM，默认不装）、
+> `--verify`（只体检不改动）。开发机上若已自行编译 `launcher.exe`，也可用 `launcher.exe install`；
+> 纯净分发包内没有该 exe，请直接用 `install.bat`。
+
+| 根目录入口 | 一句话用途 |
+| --- | --- |
+| `run.bat` | 主入口：双击启动；参数路由的唯一产地（`cli` / `setup` / `install` / …） |
+| `install.bat` | 首次安装：转发 `run.bat install`，建/复用环境并登记给所有入口 |
+| `uninstall.bat` | 卸载：整个安装目录送进 Windows 回收站，拒绝开发仓库、需二次确认 |
+| `launcher.exe` | 可选无黑框启动器（编译产物，纯净包内**不含**，需用 Go 自行重建） |
 
 ### 三步开始使用
 
-> 💡 **不想敲命令？双击根目录的 `启动程序.bat` 就行**（唯一的双击入口）：
+> 💡 **不想敲命令？双击根目录的 `run.bat` 就行**（主双击入口）：
 > 它会自动找一台真的装了 opencv 的 Python、缺依赖就问一句然后自动装、
-> 然后启动图形界面。只想重做某一步就加参数，例如 `启动程序.bat calibrate`。
+> 然后启动图形界面。只想重做某一步就加参数，例如 `run.bat calibrate`。
 > 详见 `docs/用户手册.md` §2.2。
 
 ```powershell
@@ -111,10 +143,11 @@ python apps/tools/cameras.py identify      # 窗口里 l=左 r=右 n=无关 m=�
 # 1) 双目标定（需要两台相机 + 打印好的棋盘格，见 assets/boards/）
 python apps/calibrate_stereo.py --left left --right right --cols 8 --rows 5 --square 25
 #    也接受具体编号（--left 0 --right 1）或 --auto-cameras（自动挑两台）；
-#    结果落在 config/stereo_calibration.*（默认被 gitignore，要存档请手动拷贝）
+#    结果落在**当前装置档案**的标定路径（config/calib/<档案名>.npz 给程序读 + 同名 .json 人读报告）
+#    没配档案才回落到 config/stereo_calibration.*；config/ 整目录被 gitignore，要存档请手动拷贝
 
 # 2) 每次拍摄前复检装置是否被碰动（未动通过、碰动不通过）
-python apps/verify_stereo.py --calib config/stereo_calibration --left left --right right
+python apps/verify_stereo.py --left left --right right   # --calib 缺省跟随当前装置档案，不用手写
 
 # 3) 双目整条链路的回归测试（合成真值，不需要相机）
 python tests/selftest_stereo_branch.py
@@ -162,6 +195,10 @@ python apps/tools/cameras.py unignore 3        # 取消某台；--all 清空整�
 
 # 每次拍摄/重插相机前：比对配置与当前设备，有没有漂移 / 被别的设备占用
 python apps/tools/cameras.py check             # 有 [危险] 项时退出码为 2
+
+# 逐档真开：报实际分辨率 / 实测帧率（只报告，不写配置与 camera_modes.json）
+python apps/tools/cameras.py modes
+python apps/tools/cameras.py modes --left left --right right --modes 1920x1080 --json
 ```
 
 **「无关」是什么**：`identify` 的画面里，一台相机有四种去处 ——
@@ -176,7 +213,7 @@ python apps/tools/cameras.py check             # 有 [危险] 项时退出码为
 『相机设备管理（识别/固定/标无关）』『相机探测』『「无关」相机清单』
 『清空「无关」标记』等按钮；
 命令行版主菜单的『相机设备管理』子菜单（[5] 标无关 / [6] 查看与清除）；
-以及根目录的 `启动程序.bat setup` / `启动程序.bat check`（双击入口加参数，不用敲 python）。
+以及根目录的 `run.bat setup` / `run.bat check`（双击入口加参数，不用敲 python）。
 
 **配置与实物对不上时的行为**（刻意设计）：不会替你猜。已 `identify` 确认过（`verified=true`）
 的角色若身份消失，直接**报错并附当前设备清单**，让你重新确认；未确认过的角色才会退回旧索引
@@ -614,11 +651,11 @@ python tests/selftest_synthetic.py --check-ai     # 检查依赖和 GPU 是否�
 > **规则**（放置 / 命名 / 依赖方向）见 **[AGENTS.md](AGENTS.md)**；**目录逐项说明**见 **[docs/文件结构.md](docs/文件结构.md)**。
 
 ```text
-启动程序.bat             ★ 根目录唯一入口：双击即可（找Python→查依赖→启动）
+run.bat             ★ 主入口：双击即可（找Python→查依赖→启动）
                            加参数可直接做某一步：cli/setup/check/precheck/
                            calibrate/verify/run/test
-启动程序.py              图形界面（被 .bat 调用）
-启动程序_命令行.py        命令行界面（被 .bat 调用；无 tkinter 时自动改用）
+apps/gui_main.py              图形界面（被 .bat 调用）
+apps/cli_main.py        命令行界面（被 .bat 调用；无 tkinter 时自动改用）
 
 sphere_tracker/          单目核心库（可被任意脚本 import）
   config.py              所有可调参数（dataclass，可存取 JSON）
@@ -631,6 +668,9 @@ sphere_tracker/          单目核心库（可被任意脚本 import）
   sources.py             摄像头 / 视频文件 / 图片序列（含相机模式自动探测、线程化采集）
   camera_registry.py     摄像头设备管理：枚举身份/端口、固定角色、标「无关」、解析索引、探测与自动挑优
   pipeline.py            单帧总流程编排
+  video_profiles.py      视频分辨率档位：项目里 1920/1080/720 这些数字的**唯一来源**（8 档 + 帧率建议档）
+  video_files.py         原始左右录像文件名的**唯一产地**：left/right.mkv|mp4（含 .avi）
+  discovery.py           会话目录的**唯一**枚举口径：一个根下面到底有哪些会话
   detectors/             检测后端，按"线索来源"分文件
     base.py              基类 + 轮廓打分等公共工具
     factory.py           按名字造单个检测器（避开循环导入）
@@ -645,6 +685,8 @@ calib/                   双目标定（离线、一次）
   capture.py             自动挑帧（含位姿多样性与画面覆盖控制）
   stereo_calib.py        标定核心（离群剔除 + 整体精化 + 质量判定）
   params.py              StereoRig：保存/加载/校正/三角测量/极线误差
+  axial_calib.py         模式 A：轴向标定（平行双目，板正对相机 + 已知沿光轴推进量 + 已知方格边长）
+  device90_calib.py      模式 B：中轴 90° 装置约束标定（同一块板绕自身中轴转 90°，分别正对互成 90° 的两相机）
 
 stereo/                  双目（逐帧把两路合成三维）
   sync.py                双路视频同步（闪光/拍手对齐），算出帧偏移
@@ -656,6 +698,8 @@ apps/                    可直接运行的程序
   run_video.py           离线处理视频/图片，导出 CSV
   calibrate_stereo.py    自动双目标定（相机 / 两段视频 / 两个图片文件夹）
   verify_stereo.py       复检标定：装置是否被碰动
+  calibrate_axial.py     轴向标定 CLI（模式 A）：平行双目 + 大板正对 + 已知沿光轴推进量
+  calibrate_device90.py  中轴 90° 装置标定 CLI（模式 B）：只吃 A/B 板正对图 + 已知内参
   tools/                 一次性设置与诊断工具
     cameras.py             摄像头设备管理（list / identify / pin / ignore / unignore / ignored / check）
     list_cameras.py        逐个索引试开，报分辨率/帧率/画面是否全黑
@@ -663,7 +707,7 @@ apps/                    可直接运行的程序
     calibrate_color.py     HSV 阈值交互标定
     calibrate_focal.py     单点焦距标定（三维必需）
 
-tests/                   回归测试（改动代码后必跑，共 26 个）
+tests/                   回归测试（改动代码后必跑，共 29 个）
   selftest_synthetic.py        单目全链路（clean / realistic / panning）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量
@@ -678,12 +722,18 @@ tests/                   回归测试（改动代码后必跑，共 26 个）
 
 docs/                    文档
   项目总纲.md            ★ 入口：项目是什么 + 文档怎么读
-  文件结构.md            目录职责与放置规则
-  交接文档.md            现状 / 代码地图 / 踩坑记录
-  计划书.md              目标 / 里程碑 / 风险
-  API.md                 库 API 参考
+  用户手册.md            面向使用者的操作手册（§15 = 数据/标定/照片都在哪）
+  文件结构.md            目录职责与放置规则（data/ 与 config/ 逐项说明）
+  数据标准.md            会话目录与 derived/ 的数据契约
+  运动数据交付说明.md    拿到 CSV 之后怎么用（列语义/滤波约束）
+  交接文档.md            现状 / 代码地图 / 踩坑记录（含每轮改动的一手记录）
+  待办清单.md            未完成事项与卡点
   开发指南.md            环境 / 约定 / 怎么加东西 / 方法论
-  用户手册.md            面向使用者的操作手册
+  真机标定操作清单.md    照着走就能标完的清单
+  3D查看器.md            查看器操作与坐标轴语义
+  API.md                 库 API 参考
+  计划书.md              目标 / 里程碑 / 风险
+  算法解析.md            原理与推导
   PPT生成流程.md         开题报告 PPT 怎么生成 / 校验 / 预览
   开题报告_PPT逐页文稿.md
   refs/                  两篇参考文献 PDF
@@ -909,7 +959,7 @@ python tests/selftest_synthetic.py --scenario panning --method motion_raw   # �
 （重投影误差看着正常，三维却系统性偏）。所以这一节的东西都是围绕
 "自动挑好数据 + 自动验证质量"来做的。
 
-### 12.1 三步就能用
+### 12.1 三种输入源就能用
 
 ```powershell
 # 1) 两台实时相机：边看进度边挥板，收够自动标定
@@ -927,11 +977,34 @@ python apps/calibrate_stereo.py --left-dir imgs/left --right-dir imgs/right
 `--square` 是方格实际边长（毫米）—— **这个值填错，基线就会等比例错**，
 程序会用 `--baseline-mm` 帮你核对。
 
+### 12.x 另两种标定方式（轴向大板 / 中轴90°）
+
+上面 §12.1 的三种输入源都是 **joint 标定**：板要同时在两路里停稳。若装置受限
+（两路无公共视野、或相机成 90°），还有两条**不需要两路共视**的路子，均已在合成
+数据上自验、**真机精度未验证**：
+
+| 方式 | 适用条件 | 入口 |
+| --- | --- | --- |
+| **轴向大板（前后推）** | 两相机**平行**，板正对相机、沿光轴前后推已知 ΔZ；**不标畸变**（D 恒 0），`--assume-parallel` 可在机械保证平行时强制 R=I | `apps/calibrate_axial.py` |
+| **中轴 90° 装置** | 两相机**互成 90°**，同一块板绕自身中轴转 90°，只拍 A/B 正对图；**必须给预期基线**（`--expected-baseline-mm`），否则抓不到装反 | `apps/calibrate_device90.py` |
+
+```powershell
+# 轴向大板：深度子目录按名字/单位自动解析 ΔZ（z000mm/z010mm/...），显式给基线做装反自检
+python apps/calibrate_axial.py --root sessions/axial_run --cols 8 --rows 5 --square 25 --expected-baseline-mm 100
+
+# 中轴 90°：只拍 A/B 板正对图，内参来自上一步或现有标定，必须给预期基线
+python apps/calibrate_device90.py --left-dir sessions/d90/a_board --right-dir sessions/d90/b_board --intrinsics config/calib/axial_rig --rot-axis y --rot-angle 90 --expected-baseline-mm 707
+```
+
+GUI 下拉按窗口过滤：平行双目窗只有 joint + 轴向大板，大角度窗只有 chain +
+chain_dual + 中轴90°。拍摄步骤、目录约定与诚实边界见 `docs/用户手册.md` §12.8。
+
 ### 12.2 关键认识：标定不需要左右同步
 
-程序只收"**板在两路里都停稳**"的帧。静止目标在任意时刻看起来都一样，
-所以左右视频的时间偏移**不影响标定**。
+对 joint 标定而言，程序只收"**板在两路里都停稳**"的帧。静止目标在任意时刻
+看起来都一样，所以左右视频的时间偏移**不影响标定**。
 （真正需要同步的是后续拍运动的小球，那是另一回事。）
+新方式（轴向大板 / 中轴90°）不需要两路共视，见 §12.x。
 
 这个判据还顺带把"人手持板走一段、停一下"的节奏变成了自动挑帧逻辑：
 移动中的帧自动丢掉，停稳的帧自动收下。
@@ -940,7 +1013,7 @@ python apps/calibrate_stereo.py --left-dir imgs/left --right-dir imgs/right
 
 | 门限                     | 作用                       | 默认                  |
 | ------------------------ | -------------------------- | --------------------- |
-| 两路都检测到             | 基本前提                   | —                     |
+| 两路都检测到（joint）    | joint 的基本前提；新方式不需两路共视 | —                     |
 | 清晰度（Laplacian 方差） | 挡掉运动模糊 / 失焦        | ≥ 55                  |
 | 棋盘面积占比             | 别太远也别贴脸             | 1.2% – 90%            |
 | 贴边距离                 | 边缘畸变大，角点不可靠     | ≥ 10 px               |
@@ -959,6 +1032,12 @@ python apps/calibrate_stereo.py --left-dir imgs/left --right-dir imgs/right
 4. **离群剔除 + 重算**：用"逐对视差误差"挑坏数据，丢掉后重算，最多 4 轮
 5. 立体校正 → `R1,R2,P1,P2,Q`
 6. 质量判定 → 重投影 RMS、极线误差、基线长度
+
+**质量差也照常出结果**：几何守卫把"检出质量差"与"几何不一致"分开报，但两者都
+不中止流程、照常产出三维结果与 `traj3d.json`；判定写进该文件的 quality 块
+（`quality.verdict`）。产物默认走**旁路保存**，只有显式加 `--force-save` 才写
+正式路径（写前先备份旧标定）。这样"想先看结果"和"别把坏标定当成正式产物"
+两件事可以同时成立。
 
 第 4 步是拉开差距的地方：少数模糊或贴边的图会把整体误差抬高一个量级，
 而它们在几百个角点里"看不出来"。
@@ -988,7 +1067,7 @@ python apps/calibrate_stereo.py --left-dir imgs/left --right-dir imgs/right
 云台转动、支架被撞、相机取下再装回，都会让 `R,T` 失效，但表面看不出异常。
 
 ```powershell
-python apps/verify_stereo.py --calib config/stereo_calibration --left 0 --right 2
+python apps/verify_stereo.py --left left --right right   # 用角色名，别背编号；--calib 缺省跟随装置档案
 ```
 
 拿同一块板拍几帧，重算极线误差并与标定时记录的值比较。实测：
@@ -1004,7 +1083,7 @@ python apps/verify_stereo.py --calib config/stereo_calibration --left 0 --right 
 
 | 现象               | 原因                           | 对策                                                      |
 | ------------------ | ------------------------------ | --------------------------------------------------------- |
-| 收不到几对         | 板太小 / 太模糊 / 只在单路可见 | 打印更大的板、加照明、把板举到两路公共视野中间            |
+| 收不到几对         | 板太小 / 太模糊 / 只在单路可见 | 打印更大的板、加照明；对 joint 标定把板举到两路公共视野中间（新方式不需共视，见 §12.x） |
 | 老是"棋盘还在移动" | 板一直在动                     | 每个姿势**停稳约 1 秒**；或改用 `--left-dir` 独立静帧模式 |
 | "该区域已收够"     | 一直举在同一个位置             | 按提示换位置，覆盖画面四个角和中心                        |
 | 极线误差偏大       | 数据差 / 板不平 / 相机被碰     | 看剔除统计重拍；确认标定板平整；确认支架锁死              |

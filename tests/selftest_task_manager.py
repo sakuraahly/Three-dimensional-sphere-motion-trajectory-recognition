@@ -79,7 +79,7 @@ try:
 except ImportError:                                        # pragma: no cover
     psutil = None
 
-LAUNCHER = ROOT / "启动程序.py"
+LAUNCHER = ROOT / "apps/gui_main.py"
 # 父进程 + 一个长命子进程：专门验证"子树"会不会被一起杀
 PARENT_WITH_CHILD = (
     "import subprocess,sys,time;"
@@ -98,7 +98,7 @@ def _load_launcher():
     直接 `exec_module` 而不注册会抛
     `AttributeError: 'NoneType' object has no attribute '__dict__'`。
     """
-    sys.argv = ["启动程序.py"]
+    sys.argv = ["apps/gui_main.py"]
     spec = importlib.util.spec_from_file_location("launcher_tasks", LAUNCHER)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["launcher_tasks"] = mod
@@ -107,6 +107,17 @@ def _load_launcher():
 
 
 def main() -> int:
+    # 全程把跨进程账本指到临时目录：第 9 节起的 runner 任务会写 registry，
+    # 不注入就会在真实 logs/tasks/ 下攒一堆"自测-*"记录。第 12 节还会再
+    # 注入一次自己的临时路径，两处都是进程内有效，互不干扰。
+    import tempfile
+
+    import apps._task_registry as _reg_all
+
+    _td_reg_all = tempfile.mkdtemp(prefix="task_registry_all_")
+    _real_reg_all = _reg_all.REGISTRY_PATH
+    _reg_all.REGISTRY_PATH = Path(_td_reg_all) / "_registry.jsonl"
+
     print("=" * 70)
     print("任务管理器自测（起 / 中断 / 子进程树 / 退出收尾）")
     print("=" * 70)
@@ -257,6 +268,14 @@ def main() -> int:
             alive = [p for p in [t3.proc.pid, *kids3] if psutil.pid_exists(p)]
         print(f"  退出后残留={alive}（子进程 {kids3}）")
         ck("退出后父进程与子进程都没了（相机不会被一直占着）", not alive)
+        # B-167：窗口销毁后，后台 reader 线程可能还晚一步回调 _append。
+        # 原来它会碰已销毁的 Text 控件 → TclError → stop_all 判据假红。
+        try:
+            app._append("窗口销毁后不该崩")       # app 已在 _on_close 里 destroy
+            append_ok = True
+        except Exception:                        # noqa: BLE001
+            append_ok = False
+        ck("窗口销毁后 _append 不再抛 TclError（B-167）", append_ok)
         app = None                                   # 已 destroy，后面不要再碰
     finally:
         if app is not None:
@@ -350,7 +369,7 @@ def main() -> int:
     # ------------------------------------------------------------------ #
     #
     # 为什么单独一段测**新**的任务运行器：上面 1–8 节测的是旧启动器
-    # （``启动程序.py``，它自带一套 ``start_task``/``stop_task``）。新界面
+    # （``apps/gui_main.py``，它自带一套 ``start_task``/``stop_task``）。新界面
     # 用的是 ``apps/_task_runner.py``，而"按钮点完就再无下文"正是它缺的东西：
     # 每个按钮各自传 ``on_done``，漏传一个（拍标定图 / 焦距估计 / 实时识别
     # 全都漏了）就永远停在"已开始…"；**失败只写日志，状态条一个字都不说**。
@@ -364,15 +383,30 @@ def main() -> int:
 
     import apps._task_runner as tr
 
-    with tempfile.TemporaryDirectory(prefix="task_runner_") as td:
+    # ignore_cleanup_errors=True：本节的短命子进程/读线程在 Windows 上可能
+    # 还占着日志文件句柄，TemporaryDirectory 退出时删目录会偶发 WinError
+    # 145「目录不是空的」，把整份测试染红（与判据无关）。残留目录只在系统
+    # 临时目录，不进仓库；判据本身一个字没改。
+    with tempfile.TemporaryDirectory(prefix="task_runner_",
+                                     ignore_cleanup_errors=True) as td:
         runner = tr.TaskRunner(root=None, on_log=lambda _s: None,
                                log_dir=Path(td))
         finished: list = []
         runner.add_finish_listener(finished.append)
 
-        def pump_until(tasks, seconds: float = 30.0) -> None:
+        def pump_until(tasks, seconds: float = 30.0, want: int = 0) -> None:
+            """等任务结束**并且**结束回调都排空。
+
+            2026-11-09：`t.running` 变 False 与 `_done_queue` 把完成事件入队
+            之间有一个窗口。并行档（`-j auto`）下系统忙时，只等 `running`
+            会在回调还没被 `pump_once()` 取到时就退出循环 —— 判据假红，
+            而单独跑这个测试永远绿（11-09 连续两次 fast 档都栽在这两条）。
+            `want` 让"要等几个回调"成为显式条件：**等的是判据真正要验的事**，
+            产品若真没发回调，等满 seconds 后判据照旧变红，不会被掩盖。
+            """
             end = time.monotonic() + seconds
-            while any(t.running for t in tasks) and time.monotonic() < end:
+            while (any(t.running for t in tasks) or len(finished) < want) \
+                    and time.monotonic() < end:
                 runner.pump_once()
                 time.sleep(0.05)
             runner.pump_once()
@@ -387,7 +421,7 @@ def main() -> int:
             "自测-失败")
         t_ok.owner = "mono"
         t_bad.owner = "mono"
-        pump_until([t_ok, t_bad])
+        pump_until([t_ok, t_bad], want=2)
         got = {t.tid for t in finished}
         ck("成功与失败的任务**都**调了结束回调（各一次）",
            got == {t_ok.tid, t_bad.tid} and len(finished) == 2)
@@ -442,8 +476,541 @@ def main() -> int:
            and any("readlen 0" in line for line in t_read.tail),
            f"返回码 {t_read.exit_code}，尾巴 {t_read.tail}")
 
+    # ------------------------------------------------------------------ #
+    # 10. 质量差也出结果，但质量状态必须记录并显示（2026-11-14 增）
+    # ------------------------------------------------------------------ #
+    #
+    # 用户新原则：「凡是质量差，也要能出结果而不是自己中止程序，只有错误才是
+    # 紧急的」+「质量状态等要记录显示」。底层 run_stereo_video.py 质量差时
+    # 返回码 0、照常出产物，并打一行 [质量] verdict=... 标记。若 GUI 把
+    # exit_code==0 一律显示成纯「完成」，用户就看不到质量状态 —— 这一节守的
+    # 就是「完成」后面那句「仅供参考」不能丢，且不能反过来把「通过」推翻。
+    #
+    # 反向自证（字节级改坏→跑→还原）：
+    #   把 run_all.quality_verdict 改成永远 return ""       -> ①③④⑥⑧⑩⑫ 红
+    #   把 ok_with_warning 误当成 failed（failed 列表加它） -> ⑪ 红，exit=1
+    print("----- 10. 质量差也出结果，但状态要看得见 -----")
+    import io
+    import json
+    import shutil
+    from collections import deque
+    from contextlib import redirect_stderr, redirect_stdout
+    from types import SimpleNamespace
+
+    import apps._gui_console as gc
+    from apps import run_all as ra
+
+    td10 = tempfile.mkdtemp(prefix="quality_status_")
+    try:
+        mark = ('[质量] verdict=detection_quality dy_med=6.80 ratio=12.1 '
+                '结果仅供参考（详见 traj3d.json["quality"]）')
+
+        # 真跑 ConsoleWindow.refresh()：用替身当 self，验证「任务表那一行」
+        # 真的被改了，而不是只测 helper 再手工拼一句「完成」。这样把 GUI
+        # 接线去掉（永远显示「完成」）时，下面①②⑤⑥⑦会当场变红。
+        class _Tree:
+            def __init__(self):
+                self.rows = []
+
+            def get_children(self):
+                return []
+
+            def delete(self, *a):
+                pass
+
+            def insert(self, parent, index, iid=None, values=()):
+                self.rows.append((iid, values))
+
+            def exists(self, iid):
+                return any(r[0] == iid for r in self.rows)
+
+            def selection(self):
+                return ()
+
+            def selection_set(self, *a):
+                pass
+
+        class _Tasks:
+            def __init__(self, items):
+                self._items = items
+
+            def tasks(self):
+                return self._items
+
+        class _App:
+            def __init__(self, items):
+                self.tasks = _Tasks(items)
+
+        class _Proc:
+            pid = 4321
+
+        class _Task:
+            def __init__(self, log_path, tail):
+                self.tid = 1
+                self.title = "离线双目"
+                self.proc = _Proc()
+                self.log_path = log_path
+                self.tail = tail
+                self.running = False
+                self.exit_code = 0
+                self.kill_note = ""
+
+            def elapsed(self):
+                return 1.0
+
+        def _render(task):
+            tree = _Tree()
+            win = SimpleNamespace(tree=tree, app=_App([task]),
+                                  _selected_tid=lambda: None)
+            gc.ConsoleWindow.refresh(win)          # 未绑定方法：替身当 self
+            return tree.rows[0][1][4]              # status 列
+
+        # 判据 1：带标记的完整日志 -> 状态不再是纯「完成」、含「仅供参考」
+        log_q = Path(td10) / "task_quality.log"
+        log_q.write_text("处理：120 对\n" + mark + "\n[几何守卫] 已判读：done\n",
+                         encoding="utf-8")
+        state_q = _render(_Task(log_q, []))
+        ck("① 带质量标记：任务表状态不再是纯「完成」", state_q != "完成")
+        ck("② 带质量标记：状态含「质量差 / 仅供参考」语义",
+           "仅供参考" in state_q and ("质量差" in state_q or "检出" in state_q),
+           f"实际={state_q!r}")
+        ck("③ verdict 被解析成 detection_quality",
+           ra.quality_verdict(log_q.read_text(encoding="utf-8")) == "detection_quality")
+        ck("④ GUI 控制台与 run_all 共用同一个质量后缀 helper（零重复）",
+           hasattr(gc, "quality_note_of_task")
+           and gc.quality_note_of_task is ra.quality_note_of_task)
+
+        # 判据 2：不带标记 -> 仍是「完成」（正常路径一字不回归）
+        log_plain = Path(td10) / "task_plain.log"
+        log_plain.write_text("处理：120 对\n匹配：120/120（100.0%）\n", encoding="utf-8")
+        ck("⑤ 不带标记：任务表状态仍是纯「完成」（正常路径不回归）",
+           _render(_Task(log_plain, [])) == "完成")
+
+        # 判据 4：ANSI / 编码噪声 / 多行 / 非法 UTF-8 -> 不抛异常、状态表照常渲染
+        esc = chr(27)
+        noisy_lines = [
+            esc + "[31m" + mark + esc + "[0m",
+            '[质量] verdict=geometry_mismatch dy_med=12.40 ratio=22.1 '
+            '结果仅供参考（详见 traj3d.json["quality"]）',
+            chr(0xFFFD) * 2 + " 乱码行",
+        ]
+        try:
+            state_noisy = _render(_Task(None, noisy_lines))
+            noisy_ok = (isinstance(state_noisy, str)
+                        and state_noisy.startswith("完成")
+                        and "仅供参考" in state_noisy)
+        except Exception as exc:                       # noqa: BLE001
+            state_noisy, noisy_ok = f"抛异常 {exc}", False
+        ck("⑥ ANSI/编码噪声/多行：解析不抛异常、状态表照常渲染", noisy_ok,
+           f"实际={state_noisy!r}")
+        log_bad = Path(td10) / "task_badenc.log"
+        log_bad.write_bytes(b"\xff\xfe\x00"
+                            + "[质量] verdict=zero_match garbage\n".encode("utf-8"))
+        try:
+            bad_ok = isinstance(_render(_Task(log_bad, [])), str)
+        except Exception:                              # noqa: BLE001
+            bad_ok = False
+        ck("⑦ 日志文件编码异常：不抛异常、状态仍是字符串", bad_ok)
+        labels = {"detection_quality": "检出质量差",
+                  "geometry_mismatch": "几何不一致",
+                  "zero_match": "0 匹配",
+                  "zero_hit": "0 检出"}
+        ck("⑧ 四种 verdict 都显示成人话（检出/几何/0 匹配/0 检出）",
+           all(kw in ra.quality_note(f"[质量] verdict={v} 结果仅供参考")
+               for v, kw in labels.items()))
+        ck("⑨ 旧 Launcher 任务表也接上了同一个 helper",
+           "quality_note_of_task" in (ROOT / "apps" / "gui_main.py").read_text(
+               encoding="utf-8"))
+
+        # 判据 3：真跑 run_all.main() —— ok_with_warning 不推翻整体 ok
+        sess = Path(td10) / "sess"
+        sess.mkdir()
+        (sess / "session.json").write_text(
+            json.dumps({"left": {"video": "left.mp4"},
+                        "right": {"video": "right.mp4"}}), encoding="utf-8")
+        (sess / "left.mp4").write_bytes(b"")
+        (sess / "right.mp4").write_bytes(b"")
+        real_run = ra._run
+        real_calib = ra._default_calib_files
+        ra._default_calib_files = lambda root=ra.ROOT: []
+        ra._run = lambda cmd, *, echo, metric_prefix: (
+            0, deque(["处理：120 对", mark]), [])
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        rc = -1
+        try:
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                rc = ra.main(["--session", str(sess), "--steps", "tri", "--json"])
+        finally:
+            ra._run = real_run
+            ra._default_calib_files = real_calib
+        try:
+            payload = json.loads(buf_out.getvalue().strip().splitlines()[-1])
+        except Exception:                              # noqa: BLE001
+            payload = {}
+        tri = next((s for s in payload.get("steps", []) if s["name"] == "tri"), {})
+        ck("⑩ run_all：tri 步记成 ok_with_warning + quality=verdict",
+           tri.get("status") == "ok_with_warning"
+           and tri.get("quality") == "detection_quality")
+        ck("⑪ run_all：ok_with_warning 不推翻整体 ok（exit=0、ok=True、3=跳过未动）",
+           rc == 0 and payload.get("ok") is True,
+           f"rc={rc} ok={payload.get('ok')!r}")
+        ck("⑫ run_all：结论/步骤日志里带「仅供参考」提示",
+           "仅供参考" in buf_err.getvalue())
+    finally:
+        shutil.rmtree(td10, ignore_errors=True)
+
+    # ------------------------------------------------------------------ #
+    # 11. 单目标定 / 离线重建 / 录制：质量状态必须写进状态栏（2026-11-15 增）
+    # ------------------------------------------------------------------ #
+    #
+    # 第 10 节守的是「任务表那一行」；这一节守的是**状态栏**（用户眼睛停留的地方）。
+    # 三处的共同病根：底层质量差也返回 0、照常出产物，而界面只看退出码 ——
+    # 于是「结果仅供参考」在屏幕上完全不出现。
+    #
+    # A（`visualization.json` 也带 quality）的判据在
+    # `tests/selftest_stereo_branch.py` 的端到端用例里（那边有真跑 main() 的
+    # harness，这里再抄一份 mocks 只会变成第二份真相）。本节守 B / C / D。
+    #
+    # 反向自证（字节级改坏→跑→还原）：
+    #   `_mono_calib_quality_note` 永远 return ""        -> ①② 红
+    #   `_on_offline_done` 把 zero_match 当 ok 显示      -> ④ 红
+    print("----- 11. 标定 / 重建 / 录制：质量状态要写进状态栏 -----")
+
+    import os
+
+    import apps._gui_mono as mono_gui
+    import apps._gui_stereo as stereo_gui
+
+    class _Status:
+        def __init__(self):
+            self.text, self.level = "", ""
+
+        def set_status(self, text, level="info"):
+            self.text, self.level = text, level
+
+    td11 = tempfile.mkdtemp(prefix="quality_gui_")
+    real_mono_json = mono_gui.MONO_CALIB_JSON
+    try:
+        # ---------------- B：单目内参标定完成 ----------------
+        cfg = Path(td11) / "config"
+        cfg.mkdir()
+        mono_json = cfg / "mono_calibration.json"
+        bypass = cfg / "mono_calibration_unusable_20260101-101010_123.json"
+        mono_gui.MONO_CALIB_JSON = mono_json
+
+        class _MonoSelf:
+            """`_on_calibrated` 的外部依赖只留状态条 + reload（其余都是空实现）。"""
+
+            def __init__(self):
+                self.status = _Status()
+                self.app = SimpleNamespace(
+                    state=SimpleNamespace(reload=lambda: None))
+
+            def _alive(self):
+                return True
+
+            def _refresh_state(self):
+                pass
+
+            def _mono_calib_quality_note(self, path=None):
+                return mono_gui.MonoWindow._mono_calib_quality_note(self, path)
+
+        def _mono_done():
+            me = _MonoSelf()
+            mono_gui.MonoWindow._on_calibrated(
+                me, SimpleNamespace(ok=True, exit_code=0,
+                                    tail_text=lambda n: ""))
+            return me.status
+
+        # 质量差：calibrate_mono **不覆盖**正式路径，只写旁路诊断（usable=false）。
+        # 正式文件判成"上一次成功"，只靠 mtime 才可能被排除 —— 这里故意给它
+        # 更早的 mtime，证明取的是「最新那份产物」而不是「正式那一份」。
+        mono_json.write_text(json.dumps(
+            {"usable": True, "fx": 900.0, "quality": {"rms_px_max": 0.8}}),
+            encoding="utf-8")
+        bypass.write_text(json.dumps({
+            "usable": False,
+            "quality": {"grade": "不可用", "forced_unusable": True,
+                        "verdict": "焦距抖动 12% 【仅链路测试，不得用于数据结论】"}}),
+            encoding="utf-8")
+        os.utime(mono_json, (1000.0, 1000.0))
+        os.utime(bypass, (2000.0, 2000.0))
+        mono_bad = _mono_done()
+        ck("① 单目质量差：状态栏带「质量 / 不可用」，不再是纯成功",
+           "质量" in mono_bad.text and "不可用" in mono_bad.text
+           and mono_bad.level == "warn", mono_bad.text[-48:])
+        ck("② 单目质量差：说清「仅测试 / 不得用于数据结论」",
+           "仅测试" in mono_bad.text and "不得用于数据结论" in mono_bad.text)
+
+        # 质量正常：正式产物比旁路新 -> 必须回到原来那句（不回归、不唠叨）
+        mono_json.write_text(json.dumps(
+            {"usable": True, "fx": 900.0, "quality": {"rms_px_max": 0.8}}),
+            encoding="utf-8")
+        os.utime(mono_json, (3000.0, 3000.0))
+        mono_ok = _mono_done()
+        ck("③ 单目质量正常：仍是原来那句、且不带质量字样（正常路径不回归）",
+           mono_ok.text == "内参标定完成，已重新读取标定值（第①步那行会跟着变）"
+           and mono_ok.level == "ok", mono_ok.text)
+        mono_gui.MONO_CALIB_JSON = real_mono_json
+
+        # ---------------- C：第④步离线三维重建完成 ----------------
+        class _StereoSelf:
+            def __init__(self):
+                self.status = _Status()
+
+            def _offline_quality(self, session):
+                return stereo_gui.StereoWindow._offline_quality(self, session)
+
+        def _offline_done(session, exit_code=0):
+            me = _StereoSelf()
+            stereo_gui.StereoWindow._on_offline_done(
+                me, SimpleNamespace(exit_code=exit_code, ok=exit_code == 0),
+                str(session))
+            return me.status
+
+        def _write_traj(sub: str, verdict: str) -> Path:
+            s = Path(td11) / "sessions" / sub
+            (s / "derived").mkdir(parents=True, exist_ok=True)
+            (s / "derived" / "traj3d.json").write_text(
+                json.dumps({"quality": {"verdict": verdict, "grade": "degraded"}}),
+                encoding="utf-8")
+            return s
+
+        for verdict, human in (("detection_quality", "检出质量差"),
+                               ("geometry_mismatch", "几何不一致"),
+                               ("zero_match", "0 匹配")):
+            st = _offline_done(_write_traj(verdict, verdict))
+            # 人话必须来自 run_all 那**唯一一份**词表：拼回它认的标记行再解析。
+            want_text = "重建完成" + ra.quality_note(f"[质量] verdict={verdict}")
+            ck(f"④ 重建 verdict={verdict}：说人话（{human}）+ 仅供参考，且零重复实现",
+               st.text == want_text and human in st.text
+               and "仅供参考" in st.text and st.level == "warn", st.text)
+
+        st_ok = _offline_done(_write_traj("ok", "ok"))
+        ck("⑤ 重建 verdict=ok：只说完成，不带「仅供参考」",
+           "重建完成" in st_ok.text and "仅供参考" not in st_ok.text
+           and st_ok.level == "ok", st_ok.text)
+
+        empty_sess = Path(td11) / "sessions" / "empty"
+        empty_sess.mkdir()
+        st_empty = _offline_done(empty_sess)
+        st_fail = _offline_done(Path(td11) / "sessions" / "ok", exit_code=1)
+        ck("⑥ 读不到 traj3d.json / 退出码非 0：一个字都不写（不许把真错误说成「仅供参考」）",
+           st_empty.text == "" and st_fail.text == "",
+           f"缺文件={st_empty.text!r} 失败={st_fail.text!r}")
+
+        # 接线判据：回调没接上，上面 ④–⑥ 就变成在验一段没人调的代码
+        src_stereo = (ROOT / "apps" / "_gui_stereo.py").read_text(encoding="utf-8")
+
+        def _body(name: str) -> str:
+            head = src_stereo.index(f"def {name}(")
+            tail = src_stereo.find("\n    def ", head)
+            return src_stereo[head:tail if tail != -1 else len(src_stereo)]
+
+        ck("⑦ _start_offline / _start_record 都真接上了 on_done",
+           "_on_offline_done" in _body("_start_offline")
+           and "_on_record_done" in _body("_start_record"))
+
+        # ---------------- D：录制（放行强制保存的不可用标定）----------------
+        st_rec = _Status()
+        stereo_gui.StereoWindow._on_record_done(
+            SimpleNamespace(status=st_rec),
+            SimpleNamespace(exit_code=0), True)
+        ck("⑧ 仅测试录制结束：状态栏留「仅测试录制 + 不得用于数据结论」",
+           "仅测试" in st_rec.text and "不得用于数据结论" in st_rec.text,
+           st_rec.text)
+        st_rec2 = _Status()
+        stereo_gui.StereoWindow._on_record_done(
+            SimpleNamespace(status=st_rec2),
+            SimpleNamespace(exit_code=0), False)
+        ck("⑨ 正常录制：不动状态条（不无端加一句警告）", st_rec2.text == "")
+    finally:
+        mono_gui.MONO_CALIB_JSON = real_mono_json
+        shutil.rmtree(td11, ignore_errors=True)
+
+    # ------------------------------------------------------------------ #
+    # 12. 跨进程任务注册表 + 控制台「正在运行」独立列表（2026-11-18 增）
+    # ------------------------------------------------------------------ #
+    # 用户报"很多任务在执行的时候没有进入任务管理器……还要单独展示现在正在
+    # 运行的任务列表"。根因是 data_manager 是独立进程：它内部的导出、以及
+    # 它 Popen 的查看器，父进程的 TaskRunner 一概不知道。本节的判据守的是
+    # "账本能跨进程登记 / 坏行不炸面板 / 死 PID 自动消失 / 控制台真有两张表"。
+    #
+    # 反向自证（字节级改坏→跑→还原）：
+    #   _task_registry.register_end 改成 no-op            -> ② 红
+    #   _task_registry.pid_alive 改成恒 return True       -> ③ 红
+    print("----- 12. 跨进程注册表与实时运行列表 -----")
+    import ast
+    import json as _json
+    import time as _time
+    from types import SimpleNamespace
+
+    import apps._task_registry as reg
+
+    td12 = tempfile.mkdtemp(prefix="task_registry_")
+    real_registry_path = reg.REGISTRY_PATH
+    reg.REGISTRY_PATH = Path(td12) / "_registry.jsonl"
+
+    def _fake_task(pid: int, tid: int, title: str = "外部任务",
+                   owner: str = "") -> SimpleNamespace:
+        return SimpleNamespace(
+            proc=SimpleNamespace(pid=pid), tid=tid, title=title, owner=owner,
+            started=_time.time(), ended=None, exit_code=None, stop_reason="")
+
+    try:
+        live_key = f"{os.getpid()}-1001"
+        reg.register_start(_fake_task(os.getpid(), 1001, "数据管理导出",
+                                      "data_manager"), source="data_manager")
+        got = reg.external_running()
+        ck("① registry 写 start 后 external_running() 能看到，key 含 PID",
+           any(r.get("key") == live_key
+               and r.get("title") == "数据管理导出" for r in got),
+           f"实际 keys={[r.get('key') for r in got]}")
+
+        reg.register_end(_fake_task(os.getpid(), 1001, "数据管理导出",
+                                    "data_manager"), source="data_manager")
+        got = reg.external_running()
+        ck("② 写 end 后不再出现在 external_running()",
+           all(r.get("key") != live_key for r in got))
+
+        dead_key = "999999-1002"
+        reg.register_start(_fake_task(999999, 1002, "死掉的进程"),
+                           source="data_manager")
+        got = reg.external_running()
+        ck("③ 死 PID(999999) 写的 start 不出现（PID 探活生效）",
+           all(r.get("key") != dead_key for r in got),
+           f"实际 keys={[r.get('key') for r in got]}")
+
+        # 坏 JSON 行夹在有效记录之间：不能抛异常，也不能吞掉好记录
+        good_key = f"{os.getpid()}-1003"
+        reg.register_start(_fake_task(os.getpid(), 1003, "好记录"),
+                           source="data_manager")
+        with reg.REGISTRY_PATH.open("a", encoding="utf-8") as fh:
+            fh.write("{这不是合法 JSON\n")
+            fh.flush()
+        try:
+            got = reg.external_running()
+            bad_ok = any(r.get("key") == good_key for r in got)
+        except Exception as exc:                           # noqa: BLE001
+            bad_ok, got = False, [f"抛异常 {exc}"]
+        ck("④ 一行坏 JSON 不让 external_running() 抛异常、好记录照旧可见",
+           bad_ok, f"实际 keys={[r.get('key') for r in got]}")
+
+        # 真起一个 runner 任务：start 必须同步写进账本，且带 owner
+        runner12 = tr.TaskRunner(root=None, on_log=lambda _s: None,
+                                 log_dir=Path(td12) / "runner_logs")
+        t12 = runner12.start([py, "-c", "print('registry')"],
+                             "注册表自测", owner="x")
+        rows12 = []
+        # 第④条故意留了一行坏 JSON —— 这里也必须逐行容错，不能让一条脏
+        # 记录把第⑤条判据连累成"假红"。
+        for line in reg.REGISTRY_PATH.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows12.append(_json.loads(line))
+            except ValueError:
+                continue
+        ck("⑤ TaskRunner.start(owner='x') 在 registry 里留下 start 记录",
+           any(r.get("op") == "start" and r.get("owner") == "x"
+               and r.get("source") == "runner" for r in rows12))
+        deadline = time.monotonic() + 15
+        while t12.running and time.monotonic() < deadline:
+            runner12.pump_once()
+            time.sleep(0.03)
+        runner12.pump_once()
+
+        # AST：控制台确实有独立的「正在运行」Treeview，且 refresh 真去读账本
+        console_src = (ROOT / "apps" / "_gui_console.py").read_text(
+            encoding="utf-8")
+        c_tree = ast.parse(console_src)
+        c_cls = next(n for n in c_tree.body
+                     if isinstance(n, ast.ClassDef) and n.name == "ConsoleWindow")
+        c_init = next(n for n in c_cls.body
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and n.name == "__init__")
+        c_refresh = next(n for n in c_cls.body
+                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                         and n.name == "refresh")
+        run_heights = []
+        for node in ast.walk(c_init):
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Attribute) and t.attr == "run_tree"
+                            for t in node.targets)
+                    and isinstance(node.value, ast.Call)):
+                for kw in node.value.keywords:
+                    if (kw.arg == "height" and isinstance(kw.value, ast.Constant)
+                            and isinstance(kw.value.value, int)):
+                        run_heights.append(kw.value.value)
+        ck("⑥a 控制台有独立的「正在运行」Treeview（height=4）",
+           run_heights == [4], f"实际 heights={run_heights}")
+        ext_calls = [n for n in ast.walk(c_refresh)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "external_running"]
+        ck("⑥b ConsoleWindow.refresh() 调用了 external_running()",
+           bool(ext_calls))
+        lf_texts = []
+        for node in ast.walk(c_init):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "LabelFrame"):
+                for kw in node.keywords:
+                    if (kw.arg == "text" and isinstance(kw.value, ast.Constant)
+                            and isinstance(kw.value.value, str)):
+                        lf_texts.append(kw.value.value)
+        ck("⑥c 「正在运行」+「全部任务」两区都在，旧全表没被替换掉",
+           any("正在运行" in t for t in lf_texts)
+           and "全部任务" in lf_texts, f"实际={lf_texts}")
+        ck("⑥d 窗口 1100x780 / minsize(760,520) 不变、日志 14→10",
+           'self.geometry("1100x780")' in console_src
+           and "self.minsize(760, 520)" in console_src
+           and "tk.Text(logbox, height=10" in console_src)
+
+        # AST：data_manager 两处导出都成对称的 start/end 对（finally 也算）
+        dm_src = (ROOT / "apps" / "data_manager.py").read_text(encoding="utf-8")
+        dm_tree = ast.parse(dm_src)
+        dm_cls = next(n for n in dm_tree.body
+                      if isinstance(n, ast.ClassDef) and n.name == "DataManager")
+        for fn_name in ("start_export", "_export_motion_pair"):
+            fn = next(n for n in dm_cls.body
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and n.name == fn_name)
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            ck(f"⑦ {fn_name} 体内有 register_start + register_end",
+               "register_start" in names and "register_end" in names,
+               f"实际命中={sorted(names & {'register_start', 'register_end'})}")
+
+        # ⑧ end 去重：真实事故是 stop() 确认停掉写一次 end、读线程发现
+        # 进程退出又写一次 —— 同一个 key 两条 end，账本无限膨胀且"被停
+        # 两次"是假语义。第④条留了坏 JSON，这里同样逐行容错。
+        dup_key = f"{os.getpid()}-1004"
+        dup = _fake_task(os.getpid(), 1004, "end 去重")
+        reg.register_start(dup, source="data_manager")
+        reg.register_end(dup, source="data_manager")
+        reg.register_end(dup, source="data_manager")
+        end_rows = []
+        for line in reg.REGISTRY_PATH.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = _json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(row, dict) and row.get("key") == dup_key
+                    and row.get("op") == "end"):
+                end_rows.append(row)
+        ck("⑧ 同一 key 连续两次 register_end 只留一条 end（账本不膨胀）",
+           len(end_rows) == 1, f"实际 {len(end_rows)} 条 end")
+    finally:
+        reg.REGISTRY_PATH = real_registry_path
+        shutil.rmtree(td12, ignore_errors=True)
+
     ok = all(v for _n, v in results)
     bad = [n for n, v in results if not v]
+    # 还原全局账本路径，删掉本次测试的临时账本（不留任何 logs/ 下的痕迹）
+    _reg_all.REGISTRY_PATH = _real_reg_all
+    shutil.rmtree(_td_reg_all, ignore_errors=True)
     if bad:
         print(f"\n不达标 {len(bad)} 项：")
         for n in bad:

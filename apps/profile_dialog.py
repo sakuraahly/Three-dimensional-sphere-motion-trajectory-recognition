@@ -30,8 +30,8 @@ from stereo import profiles  # noqa: E402
 
 #: 预置的两条默认装置档案（用户第一次打开时自动建，避免空列表"没用"）。
 DEFAULT_PROFILES = (
-    ("平行装置", "parallel", 124.0, 0.3),
-    ("90度装置", "angled", None, 0.3),
+    ("平行装置", "parallel"),
+    ("90度装置", "angled"),
 )
 
 
@@ -43,43 +43,59 @@ def ensure_default_profiles() -> int:
     """
     created = 0
     existing = {p.name for p in profiles.list_profiles()}
-    for name, mode, base, dist in DEFAULT_PROFILES:
+    for name, mode in DEFAULT_PROFILES:
         if name in existing:
             continue
         profiles.upsert(profiles.RigProfile(
             name=name, stereo_mode=mode,
-            expected_baseline_mm=base, working_distance_m=dist,
             calibration_path=f"config/calib/{name}"))
         created += 1
     return created
 
 
 class ProfileDialog(tk.Toplevel):
-    """装置档案管理对话框（模态）：列出 / 切换 / 新建。"""
+    """装置档案管理对话框：列出 / 切换 / 新建。
+
+    2026-11-07 起是标准非模态窗口（AGENTS.md §7.1）：不再 `transient` /
+    `grab_set`，能最小化/最大化/关闭。
+    """
 
     def __init__(self, app, on_changed=None) -> None:
         super().__init__(app)
         self.on_changed = on_changed
         self.title("装置档案 · 管理当前装置")
         self.configure(bg=BG)
-        self.resizable(False, False)
-        self.transient(app)
-        self.grab_set()
+        # 标准窗口：最小化 / 最大化 / 关闭（AGENTS.md §7.1）。
+        # 不用 transient()（Windows 上变工具窗口、只剩 ×）、不锁尺寸、不全局 grab。
+        self.resizable(True, True)
 
         body = ttk.Frame(self, padding=14)
         body.pack(fill="both", expand=True)
 
-        ttk.Label(body, text="每套装置配一份标定。切换后，标定/录制/分析都按新装置走。",
-                  foreground=MUTED, wraplength=430).pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, text="每套装置配一份标定。切换后，标定/录制/分析都按新装置走。"
+                             "「标定实测」列是这份标定测出来的基线/夹角/极线误差，"
+                             "悬停看全部指标。",
+                  foreground=MUTED, wraplength=460).pack(anchor="w", pady=(0, 8))
 
-        cols = ("name", "mode", "baseline", "distance", "capture", "calib")
-        heads = ("装置", "模式", "期望基线", "工作距离", "采集档", "标定")
+        # 2026-11-07：档案不再存"期望基线 / 工作距离"，列表里那两列一并删掉
+        # 2026-11-11（B-189）：加「标定实测」列 —— 用户要求"装置档案要能看到标定后
+        # 的具体信息"，不该靠悬停或去翻 json 才知道基线是多少。
+        cols = ("name", "mode", "capture", "calib", "specs")
+        heads = ("装置", "模式", "采集档", "标定", "标定实测")
         self.tree = ttk.Treeview(body, columns=cols, show="headings", height=8)
-        for c, h, w in zip(cols, heads, (128, 62, 66, 66, 104, 190)):
+        for c, h, w in zip(cols, heads, (120, 54, 100, 96, 164)):
             self.tree.heading(c, text=h)
-            self.tree.column(c, width=w, anchor="w", stretch=(c == "calib"))
+            self.tree.column(c, width=w, anchor="w", stretch=(c == "specs"))
         self.tree.pack(fill="both", expand=True, pady=(0, 8))
         self.tree.bind("<Double-1>", lambda _e: self._apply())
+        # 标定列只放**状态**（旧版还拼了文件名，与本表「装置」列几乎逐字重复，
+        # 190px 都在重复自己）；完整路径、四态原因、实测指标全在悬停提示里。
+        # 存在性/模式判定只走 profiles.profile_calibration_status()，
+        # 数值只走 profiles.calibration_specs()，GUI 不重写任何一条。
+        self._calib_tips: dict[str, str] = {}
+        self._tip_win = None
+        self.tree.bind("<Motion>", self._on_calib_motion)
+        self.tree.bind("<Leave>", self._hide_calib_tip)
 
         self.status = ttk.Label(body, text="", foreground=MUTED, wraplength=430)
         self.status.pack(anchor="w", pady=(0, 8))
@@ -99,19 +115,30 @@ class ProfileDialog(tk.Toplevel):
         if ensure_default_profiles():
             self.status.configure(text="已预置默认档案：平行装置、90度装置")
         self.tree.delete(*self.tree.get_children())
+        self._calib_tips.clear()
         active = profiles.active_name()
         items = profiles.list_profiles()
         for p in items:
             mode = "大角度" if p.stereo_mode == "angled" else "平行"
-            base = f"{p.expected_baseline_mm:.0f}" if p.expected_baseline_mm else "—"
-            dist = f"{p.working_distance_m:.2f}" if p.working_distance_m else "—"
-            calib = p.calibration_path or "（默认 config/stereo_calibration）"
+            # B2：标定列从「只有路径」改成「状态 + 路径」。四态判定与三文件
+            # 存在性全部复用 profiles 的纯函数，这里只负责显示。
+            # B-189：数值列只调 profiles.calibration_specs()，不自己 json.loads。
+            path = p.calibration_path or "（默认 config/stereo_calibration）"
+            status = profiles.profile_calibration_status(p)
+            label = profiles.CALIBRATION_STATUS_LABELS[status.state]
+            specs = profiles.calibration_specs(p)
+            # 没配标定路径 = 回退顶层那份，这个区别必须留在行里（否则"已标定"
+            # 看不出是哪份）；路径本身放悬停提示，列里只留短标记。
+            calib = label if p.calibration_path else f"{label} · 顶层"
+            self._calib_tips[p.name] = self._calib_tip_text(
+                label, path, status, specs)
             if p.width and p.height:
                 cap = f"{p.width}x{p.height}" + (f"@{p.fps}" if p.fps else "")
             else:
                 cap = "—（按标定）"
             self.tree.insert("", "end", iid=p.name,
-                             values=(p.name, mode, base, dist, cap, calib),
+                             values=(p.name, mode, cap, calib,
+                                     profiles.format_specs_inline(specs)),
                              tags=("active",) if p.name == active else ())
         self.tree.tag_configure("active", background="#dbeafe")
         if active:
@@ -120,6 +147,52 @@ class ProfileDialog(tk.Toplevel):
         else:
             self.status.configure(text="还没有装置档案 —— 点「新建装置…」建一条"
                                        "（如「平行装置」「90度装置」），各配一份标定")
+
+    # ---------- 标定列悬停提示（状态 · 路径 + 实测数值 + 四态原因） ----------
+    @staticmethod
+    def _calib_tip_text(label: str, path: str,
+                        status: profiles.CalibrationStatus,
+                        specs: profiles.CalibrationSpecs) -> str:
+        """悬停提示正文。四段：状态·路径 / 实测数值 / 一句原因 / 文件。
+
+        数值段整体来自 ``profiles.format_specs_tooltip()``（唯一产地，缺的项
+        它自己会跳过）；``include_path=False`` 是因为首行已经写了路径，
+        别在末尾再贴一遍绝对路径。
+        """
+        parts = [f"{label} · {path}"]
+        specs_txt = profiles.format_specs_tooltip(specs, include_path=False)
+        if specs_txt:
+            parts.append(specs_txt)
+        # 原因只在非已标定时有意义（已标定的 reason 就是"已标定"，与首行重复）。
+        if status.state != profiles.CALIB_STATUS_CALIBRATED and status.reason:
+            parts.append(status.reason)
+        return "\n".join(parts)
+
+    def _on_calib_motion(self, event) -> None:
+        """在「标定」或「标定实测」列（#4 / #5）悬停时弹详情。"""
+        iid = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        text = (self._calib_tips.get(iid)
+                if col in ("#4", "#5") else None)
+        if not text:
+            self._hide_calib_tip()
+            return
+        if self._tip_win is None or not self._tip_win.winfo_exists():
+            self._tip_win = tk.Toplevel(self)
+            self._tip_win.wm_overrideredirect(True)
+            self._tip_lab = tk.Label(
+                self._tip_win, text=text, justify="left",
+                background="#ffffe0", relief="solid", borderwidth=1,
+                wraplength=380)
+            self._tip_lab.pack()
+        else:
+            self._tip_lab.configure(text=text)
+        self._tip_win.wm_geometry(f"+{event.x_root + 14}+{event.y_root + 14}")
+
+    def _hide_calib_tip(self, _event=None) -> None:
+        if self._tip_win is not None and self._tip_win.winfo_exists():
+            self._tip_win.destroy()
+        self._tip_win = None
 
     def _selected(self) -> str | None:
         sel = self.tree.selection()
@@ -181,8 +254,9 @@ class ProfileDialog(tk.Toplevel):
         dlg = tk.Toplevel(self)
         dlg.title("编辑装置档案" if editing else "新建装置档案")
         dlg.configure(bg=BG)
-        dlg.resizable(False, False)
-        dlg.transient(self)
+        # 标准窗口：最小化 / 最大化 / 关闭（AGENTS.md §7.1）。
+        # 不用 transient()（Windows 上变工具窗口、只剩 ×）、不锁尺寸、不全局 grab。
+        dlg.resizable(True, True)
         body = ttk.Frame(dlg, padding=14)
         body.pack(fill="both", expand=True)
 
@@ -190,12 +264,6 @@ class ProfileDialog(tk.Toplevel):
         mode_var = tk.StringVar(
             value="angled（大角度）" if (cur and cur.stereo_mode == "angled")
             else "parallel（平行）")
-        base_var = tk.StringVar(
-            value=f"{cur.expected_baseline_mm:g}"
-            if (cur and cur.expected_baseline_mm) else "")
-        dist_var = tk.StringVar(
-            value=f"{cur.working_distance_m:g}"
-            if (cur and cur.working_distance_m) else "")
         w_var = tk.StringVar(value=str(cur.width) if (cur and cur.width) else "")
         h_var = tk.StringVar(value=str(cur.height) if (cur and cur.height) else "")
         fps_var = tk.StringVar(value=str(cur.fps) if (cur and cur.fps) else "")
@@ -211,11 +279,6 @@ class ProfileDialog(tk.Toplevel):
         ttk.Combobox(body, textvariable=mode_var, state="readonly", width=20,
                      values=("parallel（平行）", "angled（大角度）")).pack(
             anchor="w", pady=(2, 8))
-
-        ttk.Label(body, text="期望基线 mm（可留空，参考值）").pack(anchor="w")
-        ttk.Entry(body, textvariable=base_var, width=32).pack(fill="x", pady=(2, 8))
-        ttk.Label(body, text="工作距离 m（可留空，参考值）").pack(anchor="w")
-        ttk.Entry(body, textvariable=dist_var, width=32).pack(fill="x", pady=(2, 8))
 
         ttk.Label(body, text="采集档 宽 × 高 @ fps（拍标定图与录制共用）").pack(anchor="w")
         cap_row = ttk.Frame(body)
@@ -244,12 +307,6 @@ class ProfileDialog(tk.Toplevel):
                 err.configure(text="名称不能为空")
                 return
             mode = "angled" if "angled" in mode_var.get() else "parallel"
-            try:
-                base = float(base_var.get()) if base_var.get().strip() else None
-                dist = float(dist_var.get()) if dist_var.get().strip() else None
-            except ValueError:
-                err.configure(text="基线/工作距离要填数字（或留空）")
-                return
 
             # 采集档：宽高必须成对 —— 只填一个会得到"宽 × 相机默认高"这种组合
             w_txt, h_txt = w_var.get().strip(), h_var.get().strip()
@@ -283,7 +340,6 @@ class ProfileDialog(tk.Toplevel):
             try:
                 prof = profiles.RigProfile(
                     name=nm, stereo_mode=mode,
-                    expected_baseline_mm=base, working_distance_m=dist,
                     width=width, height=height, fps=fps,
                     calibration_path=(
                         cur.calibration_path if editing and cur.calibration_path
@@ -310,4 +366,3 @@ class ProfileDialog(tk.Toplevel):
         ttk.Button(bar, text="确定", command=save).pack(side="right")
         ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=(0, 6))
 
-        dlg.grab_set()

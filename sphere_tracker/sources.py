@@ -278,7 +278,7 @@ class LatestFrameCamera:
     处理得完就一帧不落，处理不完就自动丢掉旧帧 —— 永远看最新画面。
     """
 
-    def __init__(self, source: CameraSource) -> None:
+    def __init__(self, source: VideoSource) -> None:
         self.source = source
         self._lock = threading.Lock()
         self._frame = None
@@ -379,13 +379,14 @@ class CameraSource(VideoSource):
         index: int = 0,
         width: int = 1280,
         height: int = 720,
-        fps: int = 60,
+        fps: float = 60.0,
         fourcc: str = "MJPG",
         backend: int | None = None,
         optimize: bool = True,
         target_fps: float = 25.0,
         search_budget_s: float = 60.0,
         first_frame_timeout_s: float = 3.0,
+        strict_mode: bool = False,
     ) -> None:
         self.cap = None
         self.backend_name = ""
@@ -422,6 +423,11 @@ class CameraSource(VideoSource):
         else:
             res_candidates = video_profiles.probe_order(
                 video_profiles.get(width, height))
+        # `strict_mode=True`：**只试这一档**，失败就失败，绝不拿下一档顶替。
+        # `cameras.py modes` 要回答"这个请求档实际给什么"；普通打开仍保留
+        # "先试用户要的、失败再降级"的老行为。
+        if strict_mode and width > 0 and height > 0:
+            res_candidates = [(int(width), int(height))]
 
         self._cached_hit = False
         # 先看缓存：上次探测出的"后端 + 分辨率"直接拿来打开，
@@ -1042,6 +1048,56 @@ class FileSource(VideoSource):
 
     def release(self) -> None:
         self.cap.release()
+
+
+def open_camera_source(
+    *,
+    index: int | None = None,
+    identity: str = "",
+    port: str = "",
+    symbolic_link: str = "",
+    width: int = 1280,
+    height: int = 720,
+    fps: float = 30.0,
+    backend: int | None = None,
+    optimize: bool = False,
+    first_frame_timeout_s: float = 3.0,
+    capture_api: str = "auto",
+) -> VideoSource:
+    """按 `capture_api` 打开相机：MF（按 symlink）或 OpenCV（按编号）。
+
+    - ``opencv``：原 `CameraSource`，行为不变；
+    - ``mf``：必须给 identity/port/symbolic_link；不给就报错，不猜编号；
+    - ``auto``：有 identity/port 先走 MF；MF 枚举/匹配失败时打印警告并回退
+      OpenCV（仅当给了 index）。**不按名字找设备**。
+
+    显式数字索引（例如 `--left 0`）没有设备身份，调用方应传 ``opencv``；
+    ``mf`` 对数字索引直接报错，避免又把编号当设备身份。
+    """
+    api = (capture_api or "auto").strip().lower()
+    if api not in ("auto", "mf", "opencv"):
+        raise ValueError(f"capture_api 只能是 auto/mf/opencv，收到 {capture_api!r}")
+    if api in ("auto", "mf") and (identity or port or symbolic_link):
+        try:
+            from .mf_camera import MFCameraSource  # 惰性：不用 MF 就不加载 COM
+            return MFCameraSource(
+                identity=identity, port=port, symbolic_link=symbolic_link,
+                width=width, height=height, fps=fps)
+        except Exception as exc:                         # noqa: BLE001
+            if api == "mf":
+                raise
+            print(f"[采集] MF 不可用，回退 OpenCV：{exc}", flush=True)
+    elif api == "mf":
+        raise RuntimeError(
+            "capture_api=mf 需要 identity/port/symbolic_link；"
+            "显式数字编号没有设备身份，请用 capture_api=opencv")
+    if index is None:
+        raise RuntimeError(
+            "capture_api=opencv 需要相机编号；按角色/设备打开请给 identity/port")
+    return CameraSource(
+        index=int(index), width=width, height=height, fps=fps,
+        backend=backend, optimize=optimize,
+        first_frame_timeout_s=first_frame_timeout_s)
 
 
 class ImageSource(VideoSource):

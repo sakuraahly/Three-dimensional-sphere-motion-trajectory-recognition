@@ -22,11 +22,14 @@
 from __future__ import annotations
 
 from sphere_tracker.paths import LOGS_ROOT, new_log_path
-from sphere_tracker.video_profiles import DEFAULT_FPS
+from sphere_tracker.video_profiles import DEFAULT_FPS, fps_type
 
 import argparse
 import json
 import logging
+import os
+import re
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +56,10 @@ LOG_TAGS = {
     "capture_board": "calib",
     "record": "capture",
     "realtime": "realtime",
+    # 一键环境安装器是**零依赖独立入口**（跑它时可能还没装 cv2/numpy），
+    # 不走 setup_logger，自己拼路径；来源仍在这里登记，排障时不用猜。
+    # 形状由 selftest_launcher_params 与 paths.log_dir("misc") 对账。
+    "setup_env": "misc",
 }
 
 
@@ -153,7 +160,7 @@ def add_stereo_source_args(
     *,
     width: int = 0,
     height: int = 0,
-    fps: int = DEFAULT_FPS,
+    fps: float = DEFAULT_FPS,
 ) -> argparse.ArgumentParser:
     """补上双目取帧参数 —— 字段名与 ``stereo.from_args()`` 读的一一对应。
 
@@ -192,9 +199,16 @@ def add_stereo_source_args(
                          "（逐档探测，清晰度优先 + 帧率下限）；给具体值则按该档打开")
     ap.add_argument("--height", type=int, default=height,
                     help="相机采集高度（两路一致）。**默认 0 = 自适应**（说明见 --width）")
-    ap.add_argument("--fps", type=int, default=fps,
-                    help=f"相机采集帧率（默认 {fps}）。1440p 全尺寸写盘约 24fps；"
+    ap.add_argument("--fps", type=fps_type, default=fps,
+                    help=f"相机采集帧率（默认 {fps}，可填小数，如 29.97）。"
+                         "1440p 全尺寸写盘约 24fps；"
                          "FOV 对齐后写盘 1718x972 时 30fps 实测稳定")
+    ap.add_argument(
+        "--capture-api", choices=("auto", "mf", "opencv"), default="opencv",
+        help="相机采集后端：opencv=默认，原有编号路径；"
+             "mf=按设备 symlink 打开（必须绑定角色）；"
+             "auto=角色有 identity/port 时先 MF、失败回退 OpenCV。"
+             "显式数字编号只能用 opencv。")
     return ap
 
 
@@ -224,6 +238,84 @@ def calib_capture_size(calib_base) -> tuple[int, int] | None:
         if w > 0 and h > 0:
             return (w, h)
     return None
+
+
+def capture_size_from_profile(profile: object | None = None) -> tuple[int, int, str]:
+    """采集档 ``(宽, 高, 来源说明)``：**装置档案优先**，没填就用 1080 安全档。
+
+    采集档是**装置档案的属性**（``RigProfile.width/height``），不是标定文件
+    ``calib/xxx.json`` 里 ``capture_size`` 的属性。以前从标定读：档案配了
+    ``calibration_path`` 但还没标定时，标定 json 尚不存在 →
+    ``calib_capture_size`` 返回 ``None`` → 调用方回落到
+    ``video_profiles.DEFAULT`` = 2560x1440。而本机实测**双路同时开 2560 会让
+    一路 MSMF 会话持久失效、必须物理拔插**（见 ``apps/tools/cameras.py``
+    doctor 段与 ``apps/_gui_stereo.py::_capture_chain_frames`` 的注释），
+    1920x1080 才稳。于是"从标定读采集档"会把一个未标定的新装置直接送进
+    这个硬件坑。
+
+    所以这里**不读标定**：档案填了宽高就用档案值；没填（或没有激活档案、
+    档案读不了）就显式给 1080 安全档，并在返回的说明里写清来源 ——
+    不许谎称"标定记录的采集档 / 与录制同档 / 相机最高档"。
+
+    安全档取 ``sphere_tracker.video_profiles`` 的 1080 档对象：1920/1080
+    这些数字的**唯一来源**在那个模块，不在这里写第二份字面量。
+    """
+    from sphere_tracker import video_profiles
+
+    w = getattr(profile, "width", None)
+    h = getattr(profile, "height", None)
+    if isinstance(w, int) and w > 0 and isinstance(h, int) and h > 0:
+        return w, h, f"装置档案采集档 {w}x{h}"
+    safe = video_profiles.parse("1920x1080")
+    return safe.width, safe.height, (
+        f"装置档案未填采集档，用安全档 {safe.label}"
+        f"（双路同时开 {video_profiles.DEFAULT.label} 会让一路 MSMF 会话"
+        "持久失效、需物理拔插）")
+
+
+def current_calibration(*, need_existing: bool = True) -> tuple[Path, str]:
+    """当前装置档案该用的**标定基名**（无扩展名）+ 问题说明（空串 = 可以直接用）。
+
+    2026-11-10 用户裁决 B5：CLI / GUI / 工具链**一律按当前运行档案判定**，
+    不再出现"GUI 按档案、CLI 按顶层"两套口径。以前各调用点自己拼
+    ``ROOT / "config" / "stereo_calibration"``，后果是：标定已经写进
+    ``config/calib/<档案名>.npz``，复检按钮却去顶层找 → 报"还没有标定结果"；
+    更糟的是录制前的模式校验用顶层几何去判"模式选错"。
+
+    ``need_existing`` 分两类（语义与 ``stereo.profiles.resolve_calibration_base``
+    的 ``strict`` 一致，这里只是把"抛异常"翻译成"人话原因"，免得每个调用点
+    各写一份 try/except 与提示文案）：
+
+    - ``True``（复检 / 录制前校验 / 前置检查）：**必须有现存标定**。
+      "档案指定了但文件不在"与"档案没指定、顶层也没有"都返回非空说明。
+    - ``False``（决定新标定往哪写）：允许文件还不存在。
+
+    为什么在函数内 import：``apps/_common.py`` 被 GUI/CLI 大量 import，
+    顶层 import ``stereo.profiles`` 会把 ``stereo/__init__`` 的 cv2 + scipy
+    拖进冷启动（2026-11-10 已经踩过一次：``import apps.data_manager``
+    从 0.06s 涨到 1.56s）。
+    """
+    from stereo.profiles import (
+        ProfileError,
+        calibration_files_exist,
+        resolve_calibration_base,
+    )
+
+    if not need_existing:
+        return resolve_calibration_base(strict=False), ""
+    try:
+        base = resolve_calibration_base(strict=True)
+    except ProfileError as exc:
+        # 档案配了标定路径但文件不在。resolve 的报错已经写清是哪套装置、
+        # 期望哪个文件、为什么拒绝回落顶层 —— 原样往上给，不在这里改写第二份。
+        # strict=False 不会再抛，拿到的是档案自己的 cand（"该写到哪"也有用）。
+        return resolve_calibration_base(strict=False), str(exc)
+    if calibration_files_exist(base):
+        return base, ""
+    # 走到这里只剩一种情况：档案没配路径 → 回落顶层 → 顶层也没有标定。
+    return base, (
+        f"找不到标定文件：{base}（.npz / .json 都不在）—— "
+        "请先给当前装置做一次双目标定。")
 
 
 def apply_mono_calibration(cfg, args) -> str:
@@ -321,9 +413,10 @@ def add_mono_pipeline_args(ap: argparse.ArgumentParser) -> argparse.ArgumentPars
             "；".join(f"{d['name']}={d['summary']}" for d in describe("detector"))),
     )
     ap.add_argument(
-        "--preset", default=None, choices=ColorConfig.preset_names(),
-        help="颜色预设（球色），不传则用配置里的颜色。可选：%s" % (
-            " / ".join(ColorConfig.preset_names())),
+        "--preset", default=None, choices=ColorConfig.preset_choices(),
+        help="颜色取色方式：auto=按画面自动估主色（不需要知道球色），其余是固定预设；"
+             "不传则用配置里的颜色。可选：%s" % (
+                 " / ".join(ColorConfig.preset_choices())),
     )
     ap.add_argument("--ball-diameter", type=float, default=None,
                     help="球直径，单位米（用于三维测距）")
@@ -363,13 +456,143 @@ def open_pair_source(args, *, exit_code: int = 1):
         return None
 
 
+# --------------------------------------------------------------------------- #
+# 备份 + 原子写：AGENTS.md §4 第 7 条「备份文件命名」的全仓库唯一实现
+# --------------------------------------------------------------------------- #
+#: 默认保留份数（集合配置）。会话元数据的回滚点是**显式策略差异**：写时不裁剪，
+#: 由 `apps/_junk.py` 在清理阶段按 SESSION_KEEP_BACKUPS 统一保留 —— 不抹平。
+DEFAULT_KEEP_BACKUPS = 5
+SESSION_KEEP_BACKUPS = 3
+
+#: 格式串只在这里出现一次；四处调用方不再各存一份。
+_STAMP_FMT = "%Y%m%d-%H%M%S"
+_BACKUP_FMT = "{name}.bak-{stamp}"
+_BACKUP_COLLISION_FMT = "{name}.bak-{stamp}-{n}"
+_TMP_FMT = "{name}.tmp-{pid}"
+
+#: 从备份名解析 ``(时间戳, 撞车序号)``；基础名没有序号（按 0 算）。
+_BACKUP_NAME_RE = re.compile(r"^.+\.bak-(\d{8}-\d{6})(?:-(\d+))?$")
+
+
+def _backup_sort_key(path: str | Path) -> tuple[str, int]:
+    """备份的**真实创建顺序**键：``(stamp, n)``，``n`` 按数值比、缺省 0。
+
+    基础名 = n=0、``-2`` = n=2、``-10`` = n=10 —— 只有按数值才不会把 ``-10``
+    排到 ``-2`` 前面（文件名字典序会）。``stamp`` 是零填充定长（``YYYYmmdd-HHMMSS``），
+    字典序天然等于时间序。
+
+    解析不出来的名字（历史手工备份之类）排最后、当作最新：宁可多留一份，
+    也别把看不懂的东西误删。
+    """
+    m = _BACKUP_NAME_RE.match(Path(path).name)
+    if m is None:
+        return ("\uffff", 0)
+    return (m.group(1), int(m.group(2) or 0))
+
+
+def backup_glob(path: str | Path) -> str:
+    """``<原名>.bak-*``：查找 / 清理备份时用的 glob，与写备份同源。"""
+    return f"{Path(path).name}.bak-*"
+
+
+def tmp_name(path: str | Path) -> str:
+    """``<原名>.tmp-<pid>``：同目录临时文件名，写完 `os.replace` 原子替换。"""
+    return _TMP_FMT.format(name=Path(path).name, pid=os.getpid())
+
+
+def atomic_write_with_backup(path: str | Path, data, *,
+                             keep_backups: int | None = DEFAULT_KEEP_BACKUPS) -> Path | None:
+    """备份 → 同目录临时文件 → ``os.replace``；返回备份路径（没备份则 None）。
+
+    这是 ``AGENTS.md`` §4 第 7 条的**唯一实现**：格式串、同秒撞车、保留份数、
+    临时文件 + ``os.replace`` 都只写在这里。四处调用方
+    （``_session_index.save_collections`` / ``data_manager.update_session_meta`` /
+    ``_stereo_sessions._rewrite_json`` / ``_junk`` 的清理策略）不再各留一份格式串。
+
+    ``data`` 是 JSON 可序列化对象，按四处原先一致的写法落 UTF-8 文本：
+    ``json.dump(..., ensure_ascii=False, indent=2, allow_nan=False)`` + 末尾换行 +
+    ``fsync``。备份是**原文件的逐字节副本**（``shutil.copy2``），不重新序列化 ——
+    改坏了能按原样退回。
+
+    ``keep_backups``：``>0`` 时只留**真实创建顺序**里最近的 N 份；``None`` 表示
+    **写时不裁剪**（``session.json`` 的回滚点由 ``apps/_junk.py`` 在清理阶段统一裁剪
+    —— 写时立刻删会改变既有行为）。
+
+    排序为什么不能按文件名字典序（2026-11-10 实测抓到的真 bug）
+    ------------------------------------------------------------
+    基础名 ``<name>.bak-<stamp>`` 是 ``<name>.bak-<stamp>-2`` 的前缀，字典序排最前。
+    若按 ``q.name`` 排序再删 ``olds[:-N]``，**每次裁剪都先删基础名**；基础名一没，
+    下一次 ``while bak.exists()`` 就判为不撞车、又用基础名新建 —— 于是「刚创建的
+    备份被自己这次的裁剪立刻删掉」形成死循环，磁盘永远停在最早两次写的旧内容，
+    ``AGENTS.md`` §4 第 7 条写的「保留最近 N 份」变成「保留最旧 N 份」。
+    同源的第二个坑：``-10`` 字典序排在 ``-2`` 前面，同秒第 10 次写也会排错。
+
+    所以这里用 ``_backup_sort_key`` 解析成 ``(stamp, n)``（``n`` 按数值、缺省 0），
+    **并且显式保护刚创建的 backup 不参与删除** —— 两道独立护栏，排序键以后再被
+    改坏也不会复发。
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+
+    if p.is_file():
+        stamp = datetime.now().strftime(_STAMP_FMT)
+        bak = p.with_name(_BACKUP_FMT.format(name=p.name, stamp=stamp))
+        n = 2
+        while bak.exists():
+            bak = p.with_name(
+                _BACKUP_COLLISION_FMT.format(name=p.name, stamp=stamp, n=n))
+            n += 1
+        try:
+            shutil.copy2(p, bak)
+        except OSError as exc:
+            raise OSError(f"备份失败，原文件未改动：{bak}（{exc}）") from exc
+        backup = bak
+        if keep_backups is not None and keep_backups > 0:
+            # 按 (stamp, n) 数值序排，不按文件名字典序（原因见上面的 docstring）。
+            olds = sorted(p.parent.glob(backup_glob(p)), key=_backup_sort_key)
+            # 刚创建的备份**绝不参与删除**：哪怕排序键以后被改坏，这也是一道
+            # 独立护栏 —— 否则新备份会被自己这次的裁剪立刻删掉（死循环）。
+            removable = [q for q in olds if q != backup]
+            excess = max(0, len(olds) - keep_backups)
+            for old in removable[:excess]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+
+    tmp = p.with_name(tmp_name(p))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, allow_nan=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, p)
+    except (OSError, ValueError) as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        suffix = f"；原文件还在，备份在 {backup}" if backup else ""
+        raise type(exc)(f"写入 {p} 失败：{exc}{suffix}") from exc
+    return backup
+
+
 __all__ = [
     "ROOT",
     "LOG_DIR",
+    "DEFAULT_KEEP_BACKUPS",
+    "SESSION_KEEP_BACKUPS",
     "add_mono_pipeline_args",
     "add_stereo_source_args",
+    "atomic_write_with_backup",
+    "backup_glob",
     "calib_capture_size",
+    "capture_size_from_profile",
     "open_pair_source",
     "setup_logging",
     "log_environment",
+    "tmp_name",
 ]

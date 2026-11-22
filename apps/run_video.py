@@ -7,20 +7,32 @@
     python apps/run_video.py assets/images/ --frames-dir          # 整个文件夹当序列
     python apps/run_video.py clip.mkv --method hough --vis-json outputs/vis.json
 
-## 为什么"0 检出"必须失败（2026-10-29）
+## "0 检出"的处置史：从"不写产物"到"写产物 + 显眼降级标记"
 
-现场：一段 288 帧的单目录像，默认 ``color`` 检测器 40 帧里检出 **0 帧**，
-而进程照样 exit 0、照样写出 CSV 与"标注视频"。用户看到的是"跑完了"，
-拿到手的是一个 x/y 全空的表格 —— 这就是"这个功能有什么用"的答案。
+**2026-10-29**：一段 288 帧的单目录像，默认 ``color`` 检测器 40 帧里检出
+**0 帧**，而进程照样 exit 0、照样写出 CSV 与"标注视频"。用户看到的是
+"跑完了"，拿到手的是一个 x/y 全空的表格。当时的对策是把"什么都没测到"
+和"测到了一点"分成两种结局，``hits == 0`` 就**不写**三份产物、退出码 2 ——
+理由一句话：**本项目最贵的一类 bug 是"看起来成功"**。
 
-所以这里把"什么都没测到"和"测到了一点"分成两种结局：
+**2026-11-14（新原则）**：用户要求"质量差也要能出结果，而不是自己中止程序，
+只有错误才是紧急的"，举的例子正是"之前的 3D 查看就不该因为质量差而不生成"。
+所以这里把**防假结果的手段换掉、不是删掉**：
 
-- ``hits == 0``        → 打印诊断（当前检测器 + 该换哪个）+ **退出码 2**，
-  并且**不写** CSV / visualization.json / 标注视频（写了也全是空值）；
+- ``hits == 0``（0 检出、但帧读到了）→ 退出码 **0**（不是错误、不中止），
+  三份产物**照常写**，但每份都带显眼的降级语义：
+    · visualization.json 顶层 ``quality``（``degraded=True`` /
+      ``grade="degraded"`` / ``verdict="zero_hit"`` / ``degraded_reason`` /
+      ``warnings``），查看器按降级视图打开；
+    · CSV 是 x/y 全空的空表、标注视频没有任何标注 —— 每写一份都在 stdout
+      用 ``[降级]`` 醒目说明"结果照常输出，但这段没有可用的三维点/检出数为 0"；
+    · ``hit_report`` 打印诊断（当前检测器 + 该换哪个），**不静默**。
 - ``0 < hits/total < 10%`` → 一行警告，但仍 exit 0：确实有数据，
   不该假装失败，可这么低的比率不足以当测量用。
+- ``total == 0``（一帧都没读到）/ 没给球径 → **退出码 2**，不写产物：
+  这两类是参数/文件的真错误，不是"质量差"。
 
-理由一句话：本项目最贵的一类 bug 是"看起来成功"。
+让"有结果"和"这结果空"**同时成立**，而不是把文件藏起来让人以为没跑。
 
 ## "有输出"不等于"量到了球"（2026-10-30）
 
@@ -162,9 +174,13 @@ def hit_report(hits: int, total: int, method: str,
     这里的 ``hits`` 是过了半径一致性门的帧数，不是"检测器给了东西"的帧数 ——
     这一改动的现场见模块 docstring（hough 96.7% 有输出、1.4% 在球上）。
 
-    - 0 有效帧 → 2 + 诊断。**必须是非 0**：退出码是脚本唯一的"结论"，
-      0 意味着"成功"，而这里恰恰什么都没测到。
+    - 一帧都没读到（``total == 0``）→ 2 + 诊断：这是文件/参数的**真错误**，
+      退出码必须非 0，也不写任何产物。
+    - 0 有效帧但帧读到了（``hits == 0``）→ **0 + 降级诊断**：质量差不是错误，
+      照常出结果（产物都带 degraded 标记，见模块 docstring），但绝不静默。
     - 低有效帧 → 0 + 一行警告。有数据就不该假装失败，但也不能装作够用。
+
+    ``code`` 只有 ``main()`` 消费：``code != 0`` 现在**只剩真错误**那一条路。
     """
     rate = hits / total if total else 0.0
     if total == 0:
@@ -174,24 +190,34 @@ def hit_report(hits: int, total: int, method: str,
         ]
     if hits == 0:
         lines = [
-            f"[失败] {total} 帧里没有一帧通过一致性门 —— 这次什么都没测到，结果不可用"
-            "（后面不会写出 CSV / 三维可视化：写了也只是一张空表）。",
+            f"[降级] {total} 帧里没有一帧通过一致性门 —— 这段没有可用的三维点"
+            "（检出数为 0），结果为空，请勿当作有效测量用。",
+            "       结果**照常输出**（CSV / 三维可视化 / 标注视频都写），"
+            "但每份都带显眼的降级语义，让「有结果」和「这结果空」同时成立：",
+            "       · 三维可视化顶层 quality.degraded=True / grade=degraded / "
+            "verdict=zero_hit，查看器按降级视图打开；",
+            "       · CSV 是 x/y 全空的空表、标注视频没有任何标注；"
+            "下面每写一份都会再打一行 [降级]。",
+            "       退出码 0：质量差不是错误、不中止程序；但「看起来成功」仍是"
+            "本项目最贵的 bug —— 现在用显眼标记 + 醒目日志把空结果说清，"
+            "而不是靠不写文件把它藏起来。",
             f"       当前检测器：{method}",
-            "       退出码 2（不是 0）：本项目最贵的一类 bug 是「看起来成功」——",
-            "       「跑完了」和「什么都没测到」在屏幕上长得一样，只能靠退出码分开。",
         ]
         if detector_error:
             lines.append(f"       检测器自述原因：{detector_error}")
         lines.append("       换个检测器再跑（按可能性排序，命令行加 --method <名字>）：")
         lines += [f"         --method {name:<9} {why}" for name, why in METHOD_HINTS]
         lines.append("       命令里补上「就这颗球」的信息（像素坐标与半径）：")
-        lines.append("         --seed x,y,r    金属/镜面球**必须**给：自动检测分不出"
-                     "「半径自洽的圆」与「球」，它只会给你一个自洽的错答案。")
-        return 2, lines
+        lines.append("         --seed x,y,r    点选球心：镜面球（specular）用它跟住；"
+                     "纯色球（--method color）用它取色并锚定半径")
+        lines.append("       不知道球色时先试 --preset auto（按画面自动估主色），"
+                     "不用点选也能起步。")
+        return 0, lines
     if rate < LOW_HIT_RATE:
         return 0, [
             f"[警告] 有效帧只有 {rate * 100:.1f}%（{hits}/{total} 帧），"
-            f"结果多半不可用；试试 --method hough / fusion，金属球加 --seed",
+            f"结果多半不可用；试试 --method hough / fusion，"
+            f"球色/预设不确定时加 --preset auto，金属球加 --seed",
             "       仍然按退出码 0 结束：确实有数据，不该假装失败。"
             "但这么低的比率不足以当测量用。",
         ]
@@ -280,8 +306,15 @@ def build_vis(rows: list[dict], *, session: str, source: str,
               created: str | None = None,
               seed: tuple[float, float, float] | None = None,
               accepted_frames: int | None = None,
-              rejected_frames: int | None = None) -> dict | None:
-    """把逐帧结果整理成单目可视化文件；没有三维点就返回 ``None``（不写空文件）。
+              rejected_frames: int | None = None) -> dict:
+    """把逐帧结果整理成单目可视化文件；**0 个三维点也返回完整 payload**。
+
+    2026-11-14 新原则：0 检出时 ``--vis-json`` 照常写文件（以前这里返回
+    ``None``，等于"因为质量差而不生成"，正是用户举的 3D 查看那个坑）。
+    点数为 0 时 ``trajectory`` 留空，但顶层挂 ``quality.degraded=True`` 的
+    同构对象 + ``warnings``，让查看器按降级视图打开 —— 防假结果靠显眼标记，
+    不靠不写文件。字段与双目 ``traj3d.json`` 的 ``payload["quality"]`` 同构：
+    ``verdict`` / ``grade`` / ``degraded`` / ``degraded_reason`` / ``warnings`` / ``note``。
 
     单目**本来就有三维**：``Z = f·D/(2r)``（``CameraModel.depth_from_radius``），
     只是以前从来没落盘 —— 于是"主界面只能看双目"看起来像"单目没有 3D"。
@@ -306,9 +339,10 @@ def build_vis(rows: list[dict], *, session: str, source: str,
             # coasting = 这一帧没有检测，位置是跟踪器外推的
             "confident": not bool(row.get("coasting")),
         })
-    if not pts:
-        return None
-    return {
+    # 0 个三维点**不再 return None**：照常构造完整 payload，只把 trajectory
+    # 留空并挂上顶层 quality.degraded 标记。这样 --vis-json 一定能写出文件、
+    # 查看器能按降级视图打开；「防假结果」靠标记而非不写文件（见模块 docstring）。
+    payload = {
         "schema": MONO_VIS_SCHEMA,
         "version": MONO_VIS_VERSION,
         "session": session,
@@ -330,6 +364,32 @@ def build_vis(rows: list[dict], *, session: str, source: str,
         "notes": ("深度由球径先验 Z=f·D/(2r) 得到，尺度依赖 D；"
                   "不是视差测量，误差约 2%（见交接文档 §35.2）"),
     }
+    if pts:
+        payload["quality"] = {
+            "verdict": "ok",
+            "grade": "ok",
+            "degraded": False,
+            "degraded_reason": "",
+            "warnings": [],
+            "note": "",
+        }
+    else:
+        reason = (f"0 个三维点：{len(rows)} 行里没有一行有 position_3d —— "
+                  "这段没有可用的三维位置，检出数为 0")
+        payload["quality"] = {
+            "verdict": "zero_hit",
+            "grade": "degraded",
+            "degraded": True,
+            "degraded_reason": reason,
+            "warnings": [
+                reason,
+                "结果照常输出，但 trajectory 为空：请勿当作有效测量使用",
+                "换个检测器 / 补 --seed x,y,r / --preset auto 后重跑",
+            ],
+            "note": ("与双目 traj3d.json 顶层 quality 同构；查看器识别 "
+                     "degraded=True 后按降级视图打开（空场景 + 原因）"),
+        }
+    return payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,8 +410,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--seed", default=None, metavar="X,Y,R",
         help="人工种子：球心像素坐标与像素半径，如 --seed 895,718,88。"
-             "给了它就会自动切到 specular（只有它对镜面球有效）；"
-             "没有它，脚本只能报「半径自洽的圆」，不能保证那是球")
+             "没显式给 --method 时自动切到 specular（镜面球语义）；"
+             "显式给 --method color 时，种子用于从点击处取 HSV 并锚定半径")
     p.add_argument(
         "--weights", default=None, metavar="PATH",
         help="YOLO 权重路径，覆盖配置里的 yolo_weights（只对 --method yolo / yolo_sam 生效）。"
@@ -459,6 +519,45 @@ def parse_classes(text: str) -> list[int]:
     return out
 
 
+def _consume_session_camera(video_path) -> None:
+    """B-124：单目会话边车记的相机身份**必须被消费**，不能是装饰字段。
+
+    record_mono 把相机角色/索引/设备身份写进 ``<clip>.json``；_mono_sessions
+    又把角色折进 ``session.json`` 的 ``camera``。旧版 run_video 一个字都不读 ——
+    标定 fx 来自「当时叫 left」的那台相机，事后换了相机根本查不出来。
+    这里做**只读消费**：把会话记的角色与 config/cameras.json 当前绑定对一次，
+    对不上就给可执行提示；不拦截检测（离线视频不依赖相机在线）。
+    """
+    import json
+    from pathlib import Path
+    sess = Path(video_path).resolve().parent / "session.json"
+    if not sess.is_file():
+        return
+    try:
+        raw = json.loads(sess.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(raw, dict):
+        return
+    role = str(raw.get("camera") or "").strip()
+    if not role:
+        print("[会话相机] session.json 没记相机身份（camera 为空）；"
+              "这段若做过单目标定，fx 是否对应同一台相机无法核对。", flush=True)
+        return
+    try:
+        from sphere_tracker import camera_registry as cr
+        known = role in cr.load_registry().roles
+    except Exception:                                       # noqa: BLE001
+        return                      # 读不到注册表：不猜、不拦
+    if not role.startswith("#") and not known:
+        print(f"[会话相机] 这段录在角色 {role!r} 上，但 config/cameras.json 现在"
+              "没有这个角色 —— 标定 fx 可能来自另一台相机。先跑 "
+              "python apps/tools/cameras.py identify 重新 pin 再取 Z。", flush=True)
+    else:
+        print(f"[会话相机] {role!r} 与当前配置对得上（身份已消费）；"
+              "单目 Z 依赖的 fx 须仍对应这台相机。", flush=True)
+
+
 def main() -> int:
     args = parse_args()
     seed = parse_seed(args.seed) if args.seed else None
@@ -485,15 +584,24 @@ def main() -> int:
             # 太小不是"更快"，是"球只有几个像素"，只会得到 0 检出。
             raise SystemExit(f"[错误] --imgsz 至少 64，收到 {args.imgsz}")
         cfg.detector.yolo_imgsz = args.imgsz
-    # 给了种子就等于说"我指的就是这颗球，跟住它"。而 color/hough 不接受种子，
-    # 会继续在整幅画面里找自己那一票 —— 本仓库那段录像上它锁定的是书架上的小圆
-    # （r≈11~13 px，而球约 91 px）。所以自动切到唯一吃种子的 specular，并说明原因：
-    # 静默切换会让"我明明 --method hough"的自我怀疑无处安放。
-    if seed is not None and cfg.detector.method != "specular":
-        print(f"[说明] 给了 --seed，检测器从 {cfg.detector.method} 切到 specular："
-              "人工种子的语义是「就这颗球」，而 specular 是唯一接受种子的检测器"
-              "（color/hough 会继续在背景里锁自己的圆）")
-        cfg.detector.method = "specular"
+    # 种子的语义是"我指的就是这颗球，跟住它"。哪些检测器**接受**种子：
+    # specular 用它初始化 CSRT，color 用它取色 + 锚定半径（2026-11-06）。
+    #
+    # 判据必须是"用户有没有显式给 --method"，不能用"值等于默认值"：
+    # `add_mono_pipeline_args` 里 default=None，所以 `args.method is None`
+    # 才是"什么也没说"。旧版只要给了 --seed 就切 specular —— 那对金属球是对的，
+    # 对纯色塑料球是反的（它能被 color 稳定检出，切成 specular 反而丢掉轮廓精度）。
+    if seed is not None:
+        explicit = args.method is not None
+        current = str(cfg.detector.method or "")
+        if not explicit and current != "specular":
+            print(f"[说明] 给了 --seed 且没显式 --method，检测器从 {current} 切到 specular："
+                  "没点选信息时只有 specular 能可靠地跟住人工指定的那颗球"
+                  "（镜面球语义）。纯色球请显式 --method color，种子会用于取色")
+            cfg.detector.method = "specular"
+        elif explicit and current not in ("specular", "color"):
+            print(f"[注意] {current} 不接受种子；--seed 本次会被忽略。"
+                  "要跟住这颗球请用 --method color（纯色球）或 specular（镜面球）")
     if args.preset:
         cfg.detector.color = ColorConfig.preset(args.preset)
     if args.ball_diameter:
@@ -516,6 +624,8 @@ def main() -> int:
     if args.gravity_fit:
         cfg.predict.use_gravity = True
 
+    # B-124：启动即只读消费会话边车记的相机身份（不是装饰字段）
+    _consume_session_camera(args.path)
     src = open_source(args.path)
     src_fps = float(src.info.fps or 0.0)
     print(f"输入：{src.info.kind} {src.info.width}x{src.info.height} @ {src.info.fps:.1f} fps")
@@ -707,25 +817,29 @@ def main() -> int:
     for line in lines:
         print(line)
 
+    # 0 有效帧（hits==0）按新原则判 code=0，照常走下面的产物写出；这里用
+    # degraded 把"结果为空"贯穿到 CSV / 视频 / vis-json 三处的醒目日志。
+    # code != 0 现在只可能是 total==0 的真错误，那条路在下面提前 return、
+    # 不写产物也清掉临时文件。
+    degraded = hits == 0 and code == 0
+
     if code != 0:
-        # 0 有效帧的产物**一律不写**：一张 x/y 全空的 CSV + 一段没有标注的视频
-        # 正是用户报的那个坑（"看起来跑完了"）。写之前先想清楚这份文件
-        # 会不会让人以为有结果 —— 会，就不写。
+        # 这里现在**只剩真错误**：total == 0（一帧都没读到）。hits == 0（0 检出）
+        # 已按新原则改判 code=0，照常走下面的产物写出（带 degraded 标记）——
+        # 上面那段「0 有效帧的产物一律不写」的判断没有删，而是换成了
+        # 「照常写，但每份带显眼降级标记 + stdout 醒目日志」，见模块 docstring。
+        # 真错误不写任何产物，也清掉临时文件：绝不留一个"存在但打不开"的
+        # .tmp.mp4 冒充正式视频（这是 .tmp + os.replace 原子改名的另一半语义）。
         if args.csv:
-            print(f"[跳过] 没有一帧通过一致性门，不写 CSV：{args.csv}"
-                  "（写了也是一张空表，只会让人以为有结果）")
+            print(f"[错误] 一帧都没读到，不写 CSV：{args.csv}")
         if args.vis_json:
-            print(f"[跳过] 没有一帧通过一致性门，不写三维可视化：{args.vis_json}"
-                  "（没有三维点，写了也打不开）")
-        # 没通过门：清掉临时文件（正式名不该被这次的坏结果覆盖，更不能留一个
-        # "存在但打不开"的 .partial 当正式视频用）。
+            print(f"[错误] 一帧都没读到，不写三维可视化：{args.vis_json}")
         if out_partial is not None and out_partial.exists():
             try:
                 out_partial.unlink()
-                print(f"[跳过] 标注视频临时文件已删：{out_partial}"
-                      "（一帧有效帧都没有，留着等于包装了一个假结果）")
+                print(f"[清理] 真错误，临时视频已删：{out_partial}")
             except OSError as exc:
-                print(f"[警告] 临时视频没删掉（{exc}），但它是没有标注的：{out_partial}")
+                print(f"[警告] 临时视频没删掉（{exc}）：{out_partial}")
         return code
 
     if args.csv and rows:
@@ -742,13 +856,23 @@ def main() -> int:
             w.writeheader()
             w.writerows(rows)
         print(f"轨迹已导出：{args.csv}")
+        if degraded:
+            # 不加列（表头有硬校验）：空结果这件事靠 stdout 醒目日志 +
+            # 同趟的 visualization.json 顶层 quality.degraded 来标记。
+            print(f"[降级] 这份 CSV 是空结果（{total} 帧里 0 帧过门，x/y 全空）—— "
+                  "结果照常输出，但请勿当作有效测量用；"
+                  "对应的 visualization.json 里带 quality.degraded=True。")
     if args.out:
-        # release 已把 moov atom 写进 .partial，现在原子改名成正式名。这一步
-        # 只会在"跑完 + 有有效帧"后发生，所以 annotated.mp4 要么完整、要么不存在，
-        # 不会再出现"存在但 moov 缺失"的坏文件。
+        # release 已把 moov atom 写进 .tmp.mp4，现在原子改名成正式名。这一步
+        # 只会在"跑完（含 0 有效帧的降级结果）"后发生，所以 annotated.mp4
+        # 要么完整、要么不存在，不会再出现"存在但 moov 缺失"的坏文件。
+        # 真错误（code!=0）在上面已提前 return 并清掉临时文件，不会走到这里。
         if out_partial is not None and out_partial.exists():
             os.replace(out_partial, args.out)
         print(f"标注视频已保存：{args.out}")
+        if degraded:
+            print("[降级] 这段标注视频没有任何检测/三维标注，是空结果 —— "
+                  "文件照常输出（原子改名已发生），但请勿当作有效测量用。")
 
     if args.vis_json:
         # 球径与 fx 从**实际生效的**配置取（不是字面量）：它们直接乘进 Z，
@@ -760,18 +884,33 @@ def main() -> int:
                         ball_diameter_mm=diameter_mm, fx=fx,
                         seed=seed, accepted_frames=hits,
                         rejected_frames=max(0, total - hits))
-        if vis is None:
-            print(f"[跳过] 没有三维点（position_3d 全为空），不写 {args.vis_json}；"
-                  "空文件比没有文件更糟 —— 它会让查看器以为这个会话有结果。")
+        # build_vis 现在永不返回 None：0 个三维点也返回完整 payload（带
+        # quality.degraded）。写文件这一步无条件发生 —— 这是"质量差也出结果"
+        # 的落点；下面按 quality 分开打印，避免对空 trajectory 求 min/max。
+        out = Path(args.vis_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(vis, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        quality = vis["quality"]
+        if quality["degraded"]:
+            print(f"[降级] 三维可视化已导出但结果为空：{out}"
+                  f"（{quality['degraded_reason']}）—— "
+                  "文件顶层带 quality.degraded=True，查看器按降级视图打开，"
+                  "请勿当作有效测量用。")
+            for warn in quality["warnings"]:
+                print(f"  · {warn}")
         else:
-            out = Path(args.vis_json)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(vis, ensure_ascii=False, indent=2) + "\n",
-                           encoding="utf-8")
             zs = [p["xyz"][2] for p in vis["trajectory"]]
             print(f"三维可视化已导出：{out}"
                   f"（{vis['n_points']} 点，Z {min(zs):.3f}~{max(zs):.3f} m，"
                   f"D={vis['ball_diameter_mm']:g} mm，fx={vis['fx']:g} px）")
+    if degraded:
+        # 与双目 run_stereo_video.py / run_all.py 的 quality_verdict 同一行格式：
+        # 固定前缀 [质量] + 键 verdict=<非 ok>，GUI/CLI 侧自动识别并显示状态，
+        # 无需各自改解析（run_all.py 由别的 worker 维护，这里不碰）。
+        # zero_hit = 单目 0 检出专用值，与 vis-json 顶层 quality.verdict 同值。
+        print('[质量] verdict=zero_hit 0 检出 / 没有可用的三维点：结果照常输出，'
+              '但为空，结果仅供参考（详见 visualization.json["quality"]）')
     return 0
 
 

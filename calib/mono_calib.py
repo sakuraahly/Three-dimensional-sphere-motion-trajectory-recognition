@@ -167,6 +167,11 @@ class MonoCalib:
     #: ``unknown`` = 连角色名都没有。
     #: 中文说明只进报告、不进配置 —— 配置存事实，报告讲人话。
     camera_source: str = "unknown"
+    #: 设备的**稳定身份**（USB instance id，来自边车 `camera_identity` 或
+    #: `config/cameras.json` 的 roles）。2026-11-08 加：只有 `camera="left"` 时，
+    #: 换一台相机到 left 角色会静默沿用旧 fx（实测 15% 偏差无从归因）。
+    #: 空串 = 老标定没绑定；读取方必须据此显式提示"请重标"，不许当合格。
+    device_identity: str = ""
     created_at: str = ""
     source_dir: str = ""
 
@@ -210,6 +215,7 @@ class MonoCalib:
             "fx_spread_mode": self.fx_spread_mode,
             "camera": self.camera,
             "camera_source": self.camera_source,
+            "device_identity": self.device_identity,
             "created_at": self.created_at,
             "source_dir": self.source_dir,
             "quality": dict(QUALITY),
@@ -252,6 +258,7 @@ class MonoCalib:
             camera_source=(str(raw.get("camera_source") or "unknown")
                            if raw.get("camera_source") in CAMERA_SOURCES
                            else "unknown"),
+            device_identity=str(raw.get("device_identity") or ""),
             created_at=str(raw.get("created_at") or ""),
             source_dir=str(raw.get("source_dir") or ""),
         )
@@ -275,19 +282,24 @@ def _object_points(spec: BoardSpec) -> np.ndarray:
 
 
 def _region_index(cx: float, cy: float, w: int, h: int) -> int:
-    """板中心落在 5 个区域里的哪一个（0..4；都不沾边返回 -1）。
+    """板中心落到 5 个区域里的哪一个（0..4；无角点/尺寸非法才返回 -1）。
 
-    取 3×3 网格的**四角 + 中央**：那 5 个位置能覆盖"畸变可辨"所需的姿态多样性。
+    2026-11-08 改：**3×3 九个格子全部有归属**。原来只认四角 + 正中央，
+    四个「边中点」格子返回 -1 被静默丢弃；真机 `outputs/chain_frames/left`
+    前 60 张里 **38 张（63%）** 落在边中点 —— 板每张都检出了，HUD 却
+    一个格子都不亮。用户说的「中间拍不到」其实是「程序没给这一张算区域」。
+
+    现在按板中心到五个区域锚点的**归一化欧氏距离**取最近的一个：
+    0/1/2/3 锚在四角格中心，4 锚在正中央。五区编号、每区需几张、
+    至少几区、HUD 五格这些口径一个都不改，只是不再有"白拍"的格子。
     """
     if w <= 0 or h <= 0:
         return -1
-    third_x, third_y = w / 3.0, h / 3.0
-    col = 0 if cx < third_x else (2 if cx >= 2 * third_x else 1)
-    row = 0 if cy < third_y else (2 if cy >= 2 * third_y else 1)
-    if (row, col) == (1, 1):
-        return 4                                   # 中央
-    return {(0, 0): 0, (0, 2): 1, (2, 0): 2,
-            (2, 2): 3}.get((row, col), -1)         # 只有四角算数；四边中点不算
+    # 4 放在第一个：极少数"到三个锚点完全等距"的点归中央，避免偏袒 0 号角。
+    anchors = ((4, 0.5, 0.5), (0, 1 / 6, 1 / 6), (1, 5 / 6, 1 / 6),
+               (2, 1 / 6, 5 / 6), (3, 5 / 6, 5 / 6))
+    x, y = float(cx) / w, float(cy) / h
+    return min(anchors, key=lambda a: (x - a[1]) ** 2 + (y - a[2]) ** 2)[0]
 
 
 # --------------------------------------------------------------------------- #

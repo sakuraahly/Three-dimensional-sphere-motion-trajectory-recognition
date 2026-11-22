@@ -1,5 +1,8 @@
 # 传统方法（默认路径）只需要这三个，环境里已经有了：
 numpy>=1.24
+# scipy：3D 轨迹平滑（Savitzky-Golay）与双目标定外参精化（least_squares）用；
+# 缺失不会崩，但会静默降级为滑动平均 / 跳过外参精化，精度悄悄变差。
+scipy>=1.10
 opencv-contrib-python>=4.8
 matplotlib>=3.7
 Pillow>=9.0        # GUI 点选球心（apps/seed_picker.py）用 ImageTk 显示视频帧

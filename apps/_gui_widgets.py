@@ -30,7 +30,9 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
+from apps import i18n                 # 模块导入即挂接"新窗口自动翻译 / 消息框翻译"
 from apps._gui_geometry import fit_height
+from sphere_tracker.config import AUTO_PRESET
 
 __all__ = [
     "BG", "ACCENT", "INK", "MUTED", "WARN", "OK", "FONT_FAMILY",
@@ -38,7 +40,8 @@ __all__ = [
     "init_style", "Surface", "ScrollPage", "StatusBar", "fit_to_content",
     "BALL_METAL", "BALL_PLASTIC", "BALL_CUSTOM", "BALL_KINDS", "BALL_HINTS",
     "METHOD_METAL", "METHOD_PLASTIC", "PRESET_NONE",
-    "method_for_kind", "kind_for_method", "kind_default_for", "BallSettings",
+    "method_for_kind", "kind_for_method", "kind_default_for", "kind_key",
+    "BallSettings",
     "preset_label", "preset_options", "detector_needs_note",
 ]
 
@@ -298,6 +301,18 @@ BALL_KINDS = (BALL_METAL, BALL_PLASTIC, BALL_CUSTOM)
 METHOD_METAL = "specular"
 METHOD_PLASTIC = "color"
 _BALL_KIND_METHOD = {BALL_METAL: METHOD_METAL, BALL_PLASTIC: METHOD_PLASTIC}
+#: 球种类 → 写进 `seeds.json` 的 `ball_kind`（英文键，给命令行读）。
+#: 用它而不是把中文界面文字写进数据文件：数据契约要能跨语言/跨版本读。
+_BALL_KIND_KEY = {BALL_METAL: "metal", BALL_PLASTIC: "plastic"}
+
+
+def kind_key(kind: str) -> str:
+    """界面上的球种类 → ``seeds.json`` 的 ``ball_kind``（``metal`` / ``plastic``）。
+
+    「自定义」返回空串：那一档本来就不知道该用哪个检测器，写一个猜的值
+    比不写更糟 —— 读取方会把"没记录"当旧文件兼容处理。
+    """
+    return _BALL_KIND_KEY.get(str(kind or "").strip(), "")
 
 #: 预设下拉里的「不用」哨兵。沿用经典界面的同一个词 —— 换一个说法等于
 #: 让两套界面在同一个概念上各讲一套话。
@@ -310,7 +325,8 @@ BALL_HINTS = {
     BALL_METAL: "镜面金属球只有高光能定位：先「点选球心」人工点一次球心再识别，"
                 "否则自动检测找不到球（实测 288 帧里 color 落在球上 0 帧）。",
     BALL_PLASTIC: "纯色塑料球靠颜色分割：球的颜色要和背景分得开（同色背景会把"
-                  "整片区域当成球），并选一个贴合的「颜色预设」。",
+                  "整片区域当成球）。颜色预设选「自动取色」（按画面估主色，"
+                  "不用知道球色）或选一个贴合的球色；不选则用配置里的白球预设。",
     BALL_CUSTOM: "自定义：检测方法直接取注册表里的实现；换一种球就换一个方法。",
 }
 
@@ -359,7 +375,7 @@ _PRESET_SUFFIX = "_ball"
 
 
 def preset_label(name: str) -> str:
-    """``red_ball`` → ``红球``；不认识的名字退回**去掉后缀的原名**。
+    """``red_ball`` → ``红球``；``auto`` → ``自动取色``；不认识的退回原名。
 
     为什么允许退回英文：能退不能藏。让一个新预设显示成 ``purple`` 只是不好看，
     而把它从下拉里悄悄丢掉，用户会以为"程序不支持这个颜色"。
@@ -367,6 +383,9 @@ def preset_label(name: str) -> str:
     text = str(name or "").strip()
     if not text or text == PRESET_NONE:
         return PRESET_NONE
+    if text == "auto":
+        # 它不是一种颜色（见 `ColorConfig.preset_choices`），单独给个人话名字。
+        return "自动取色"
     stem = text[:-len(_PRESET_SUFFIX)] if text.endswith(_PRESET_SUFFIX) else text
     cn = _PRESET_INITIAL.get(stem[:1].lower())
     return f"{cn}球" if cn else (stem or text)
@@ -458,6 +477,9 @@ class BallSettings:
                  diameter_var: tk.StringVar | None = None,
                  diameter_label: str = "球直径（mm）", diameter_width: int = 8,
                  on_diameter_key=None, radius_vars: tuple | None = None,
+                 radius_auto_var: tk.BooleanVar | None = None,
+                 anchor_diameter_var: tk.StringVar | None = None,
+                 anchor_var: tk.BooleanVar | None = None,
                  on_change=None) -> None:
         self.surface = surface
         self.methods = [str(m) for m in methods]
@@ -476,6 +498,12 @@ class BallSettings:
         self.var_kind = tk.StringVar()
         self.var_diameter = diameter_var
         self.radius_vars = radius_vars
+        self.radius_auto_var = radius_auto_var
+        # 双目专用：物理球直径（mm，接 --anchor-diameter-mm）与半径锚点门开关。
+        # 独立存，绝不与单目 diameter_var（--ball-diameter，单位米）串。
+        self.anchor_diameter_var = anchor_diameter_var
+        self.anchor_var = anchor_var
+        self._anchor_diameter_entry = None
         self._on_change = on_change
         self._busy = False                  # 防止"改值 → 回调 → 再改值"打转
         self._kind = (kind if kind in BALL_KINDS
@@ -486,6 +514,14 @@ class BallSettings:
         picked = method_for_kind(self._kind)
         if picked and not str(self.var_method.get() or "").strip():
             self.var_method.set(picked)
+        # 纯色球从零开始时默认「自动取色」：不点选、也不知道球色，auto 会从画面
+        # 主色估区间 —— 这比默认 white_ball（红球必然 0 检出）安全。
+        # 只改**新建**控件的默认：调用方传了 preset_var（保存过的偏好）就一律不动，
+        # 用户明确选过「不使用」也要保留。
+        if (preset_var is None and self._kind == BALL_PLASTIC
+                and str(self.var_preset.get() or "").strip() in ("", PRESET_NONE)
+                and AUTO_PRESET in self.presets):
+            self.var_preset.set(AUTO_PRESET)
         # 预设值可能来自旧配置文件：认不出的名字当"不用"（别把不存在的预设
         # 带进命令行 —— --preset 有 choices，会直接 argparse 退出）
         if str(self.var_preset.get() or "").strip() not in [PRESET_NONE, *self.presets]:
@@ -519,11 +555,62 @@ class BallSettings:
                 # 与旧控件同一条绑定：改数字时误差预算要跟着重算
                 ent.bind("<KeyRelease>", lambda _e: on_diameter_key())
         if self.radius_vars is not None:
+            # 2026-11-14：像素门限只是「筛候选」的进阶参数，不是首屏该问用户的事；
+            # 物理球直径（mm）也只在勾了半径锚点门时才有意义。两者连同说明一起
+            # 收进「高级」折叠区，并**嵌进上面这一行的末尾、不新增 grid 行** ——
+            # ④ 卡片首屏已贴到窗口下沿（selftest_window_mode 逐卡量下沿，实测
+            # 797/797、866/866），新增一行就会把按钮裁掉。
+            from apps._collapsible import CollapsibleSection
+            adv = CollapsibleSection(
+                row, "高级：半径与直径", expanded=False,
+                summary="像素门限留空=自动阶梯")
+            # 收起态的标题按钮不能比同一行的 Entry/Combobox 高：④ 卡片首屏已
+            # 贴到视口下沿，row 多几 px 就把按钮裁掉（selftest_window_mode 实测
+            # angled ④ 会差 +7 px）。给这一个按钮单独配紧凑 padding，不碰全局
+            # TButton 样式，也不改动首屏任何一行的 pady。
+            _adv_style = ttk.Style()
+            _adv_style.configure("BallAdv.TButton", padding=(1, 0))
+            adv.header_button.configure(style="BallAdv.TButton")
+            adv.pack(side="left", padx=(10, 0))
+            inner = adv.content
             lo, hi = self.radius_vars
-            ttk.Label(row, text="半径 px").pack(side="left", padx=(14, 0))
-            ttk.Entry(row, textvariable=lo, width=5).pack(side="left", padx=(6, 2))
-            ttk.Label(row, text="–").pack(side="left")
-            ttk.Entry(row, textvariable=hi, width=5).pack(side="left", padx=(2, 0))
+            px_line = ttk.Frame(inner)
+            px_line.pack(anchor="w", pady=(4, 2))
+            ttk.Label(px_line, text="像素半径门限（留空=自动阶梯）").pack(side="left")
+            ttk.Entry(px_line, textvariable=lo, width=5).pack(side="left", padx=(6, 2))
+            ttk.Label(px_line, text="–").pack(side="left")
+            ttk.Entry(px_line, textvariable=hi, width=5).pack(side="left", padx=(2, 6))
+            # 「尺寸门自动阶梯」勾选框已移除（2026-11-14 用户裁决）：阶梯是默认
+            # 且唯一的路径，一个能把它关掉的勾选框反而违背意图；GUI 恒走阶梯
+            # （radius_auto() 恒 True），--no-radius-auto 的 CLI 能力在
+            # _actions.offline_stereo 里保留给命令行用户。
+            if self.anchor_diameter_var is not None:
+                mm_line = ttk.Frame(inner)
+                mm_line.pack(anchor="w", pady=(2, 2))
+                ttk.Label(mm_line, text="球直径（mm）").pack(side="left")
+                ent = ttk.Entry(mm_line, textvariable=self.anchor_diameter_var,
+                                width=8)
+                ent.pack(side="left", padx=(6, 8))
+                ttk.Label(mm_line,
+                          text="用于按物理尺寸校验球的视半径；不勾锚点门不生效",
+                          style="Hint.TLabel").pack(side="left")
+                self._anchor_diameter_entry = ent
+                if self.anchor_var is not None:
+                    def _sync_anchor_diameter(*_args):
+                        ent.configure(state=("normal"
+                                             if bool(self.anchor_var.get())
+                                             else "disabled"))
+                    self.anchor_var.trace_add("write", _sync_anchor_diameter)
+                    _sync_anchor_diameter()
+            # 三句短说明常驻在折叠区里（不只进状态条）：把三类尺寸分开说清，
+            # 免得「点球边的像素圆半径 / 像素门限 / 物理球直径」被混成一回事。
+            for note in (
+                "半径 = 点选球边得到的像素圆半径（seeds.json），和下面两个门限都不是一回事。",
+                "半径锚定门：用左右点选球心 + 物理球直径校验视半径，须先勾「半径锚点门」且点过球心。",
+                "尺寸门自动阶梯：按 4 档上限逐档试探找最大候选；留空像素门限就走它，物理直径不控制尺寸门。",
+            ):
+                ttk.Label(inner, text=note, style="Hint.TLabel",
+                          wraplength=PARAM_HINT_WRAP).pack(anchor="w")
         # ⚠ **不再单起一行放说明**（2026-11-03 实测）：三个窗口的首屏高度都已
         # 顶到预算边缘（双目第④步装下时恰好 869 px），多加一行说明就整段出屏 ——
         # 而"控件被裁到窗口下沿"在本项目是比"少一句解释"严重得多的故障
@@ -582,6 +669,16 @@ class BallSettings:
     def max_radius(self) -> str:
         return str(self.radius_vars[1].get() or "").strip() if self.radius_vars else ""
 
+    def radius_auto(self) -> bool:
+        """尺寸门自动阶梯**恒开**（2026-11-14 用户裁决）。
+
+        GUI 不再提供「取消勾选」入口 —— 用户明确要求阶梯是默认且唯一的路径，
+        一个能把它关掉的勾选框反而违背意图。``--no-radius-auto`` 的 CLI 能力
+        保留在 ``_actions.offline_stereo``（命令行用户显式给 ``radius_auto=False``
+        仍可关），界面只是不再下传这个开关。
+        """
+        return True
+
     def problem(self) -> str:
         """这个区块里"填错了"的地方，一句话；空串 = 没问题。
 
@@ -617,11 +714,17 @@ class BallSettings:
         """
         parts = [BALL_HINTS.get(self.kind(), ""), detector_needs_note(self.method())]
         if self.radius_vars is not None:
-            # 这两个框最容易被误读成"球有多大"。它不是：它是**画面里的像素半径门限**，
-            # 只负责把明显过大/过小的候选筛掉（噪点、远处反光、整块同色背景）。
-            # 同一颗球在近处可能 90 px、远处 30 px，所以它和球的毫米直径没有换算关系。
-            parts.append("「半径 px」是像素门限（筛掉过大/过小的候选，不是球的直径），"
-                         "留空 = 用检测器默认 8~200")
+            # 三类尺寸各一句短说明（切档那一刻写进状态条；常驻的完整版在操作
+            # 说明「尺寸与半径」分区，控件旁另有一句短标签）：
+            #   ① 半径 = 点球边得到的像素圆半径（seeds.json.radius）；
+            #   ② 半径锚定门 = 球直径 + 左右点选球心校视半径，须先勾锚点门；
+            #   ③ 尺寸门自动阶梯 = 留空像素门限就走 4 档试探，GUI 恒开。
+            # 三者互不换算：物理球直径**不控制尺寸门**。
+            parts.append(
+                "半径 = 点选球边得到的像素圆半径（seeds.json），不是门限；"
+                "「球直径（mm）」只喂半径锚定门校验视半径、须先勾锚点门且点过球心，"
+                "不控制尺寸门；像素半径门限留空就走尺寸门自动阶梯（4 档试探），"
+                "和球的毫米直径没有换算关系")
         return "；".join(p for p in parts if p)
 
     # ---------- 联动 ----------
@@ -675,6 +778,15 @@ class BallSettings:
                 state="disabled" if kind in (BALL_METAL, BALL_PLASTIC) else "readonly")
             self.cb_preset.configure(
                 state="disabled" if kind == BALL_METAL else "readonly")
+            # 镜面球不传 --preset（`resolve` 已经如此），但下拉**显示**不能还停在
+            # "红球"：用户会以为红色正在生效。显示成「不使用」，底层值保留 ——
+            # 切回纯色球时还能恢复他原来选的颜色（`_label_by_preset` 查得到）。
+            if kind == BALL_METAL:
+                self._var_preset_label.set(PRESET_NONE)
+            else:
+                name = str(self.var_preset.get() or "").strip()
+                self._var_preset_label.set(
+                    self._label_by_preset.get(name, PRESET_NONE))
         finally:
             self._busy = False
         if not first and callable(self._on_change):
@@ -748,7 +860,11 @@ class StatusBar(ttk.Frame):
                  help_section: str | None = None) -> None:
         super().__init__(master)
         self._label = ttk.Label(self, text="就绪", style="Hint.TLabel")
-        self._label.pack(side="left", padx=(16, 8), pady=6)
+        # ⚠️ 先 pack 右侧按钮、最后 pack 左侧状态文本。
+        # pack 是"先到先得"：文本先 pack 时，一条长状态（例如"正在按 parallel 解算
+        # 20261024-173619 …"）会按自己的请求宽度占满，右侧三个按钮就被挤出窗口
+        # （2026-11-06 走查截图 46：任务日志/中断/操作说明全被切）。
+        # 反过来先给按钮固定位置，文本拿剩下的空间（太长就裁文本，不裁按钮）。
         # 「? 操作说明」放状态条：**每个窗口都有、位置固定**。散落在各页面里
         # 的按钮用户找不到，而说明又刚把长段落从界面搬走（2026-11-05）。
         if help_section is not None:
@@ -756,16 +872,21 @@ class StatusBar(ttk.Frame):
                 from apps.help_window import open_help
                 open_help(self, section=help_section)
 
+            # 右侧三个按钮在 880 px 的单目窗里会顶到边缘：把间距从 12 收到 4，
+            # 省 24 px，最右的「? 操作说明」就不会被切掉一截。
             ttk.Button(self, text="? 操作说明", command=_jump).pack(
-                side="right", padx=(0, 12))
+                side="right", padx=(0, 4))
         if on_stop is not None:
             ttk.Button(self, text="中断", command=on_stop).pack(side="right",
-                                                                padx=(0, 12))
+                                                                padx=(0, 4))
         if on_log is not None:
             # 文案用完整名字：用户明确要求「查看日志」改成这个。
             # 它在每个窗底部常驻，是进入任务表与日志的唯一入口。
             ttk.Button(self, text="任务管理器和运行日志", command=on_log).pack(
-                side="right", padx=(0, 6))
+                side="right", padx=(0, 4))
+        # 文本最后 pack，拿剩余空间；`anchor="w"` 保证从左边开始显示。
+        self._label.pack(side="left", fill="x", expand=True,
+                         padx=(16, 8), pady=6, anchor="w")
 
     def set_status(self, text: str, level: str = "info") -> None:
         """level ∈ info/ok/warn —— 只换颜色，话术由调用方保证"说人话"。"""
@@ -773,6 +894,9 @@ class StatusBar(ttk.Frame):
             level, "Hint.TLabel")
         try:
             self._label.configure(text=text, style=style)
+            # 动态状态文本也要跟着语言走。只刷新这一个控件：apply 会记住
+            # 原文再翻译，切回中文时能还原，而不是把译文再翻一遍。
+            i18n.apply(self._label)
         except tk.TclError:
             pass
 

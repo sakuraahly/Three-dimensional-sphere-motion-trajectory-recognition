@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -31,9 +32,9 @@ from pathlib import Path
 from tkinter import ttk
 
 from apps._collapsible import CollapsibleSection
-from apps._gui_widgets import (BALL_METAL, PRESET_NONE, BG, INK, MUTED, OK,
-                               PARAM_HINT_WRAP, WARN, BallSettings, ScrollPage,
-                               StatusBar, Surface)
+from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, PRESET_NONE, BG, INK,
+                               MUTED, OK, PARAM_HINT_WRAP, WARN, BallSettings,
+                               ScrollPage, StatusBar, Surface, kind_key)
 from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
                                  MonoSession, create_mono_session,
                                  delete_mono_session, find_clip,
@@ -41,8 +42,7 @@ from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
 from apps._task_runner import ROOT
 from apps import _actions
 from apps._actions import CALIBRATE_MONO as MONO_CALIB_APP
-from apps._task_runner import Task
-from sphere_tracker.config import ColorConfig
+from sphere_tracker.config import AUTO_PRESET, ColorConfig
 from sphere_tracker.plugins import names as plugin_names      # noqa: E402
 
 __all__ = ["MonoWindow", "MonoSessionPicker", "preset_choices"]
@@ -51,6 +51,37 @@ __all__ = ["MonoWindow", "MonoSessionPicker", "preset_choices"]
 MONO_CALIB_JSON = ROOT / "config" / "mono_calibration.json"
 
 CALIB_FRAME_DIR = ROOT / "outputs" / "mono_calib_frames"
+
+
+def _restore_session_root(text: str) -> Path:
+    """把 prefs 里的会话根还原成**绝对**路径（进程 cwd 不一定是仓库根）。
+
+    2026-11-05：以前这一项无条件写 ``str(Path)``，于是连项目内的默认
+    ``data/mono`` 也被固化成 ``D:/.../data/mono``。整个仓库拷到别的盘、
+    或发给别人后，这条残留状态仍指向旧机器，界面会静默列出一个空目录。
+
+    现在项目内的目录一律存相对路径（见 ``_store_session_root``）。历史里
+    的绝对路径照常兼容，只在「已经不存在」且「末两级确实是 data/mono」时
+    退回默认值 —— 用户自己选的仓库外目录必须保留：那可能只是移动硬盘
+    这次没插，替他改掉才是破坏。
+    """
+    if not text:
+        return MONO_SESSIONS_ROOT
+    p = Path(text)
+    if not p.is_absolute():
+        return ROOT / p
+    if p.exists() or p.parts[-2:] != MONO_SESSIONS_ROOT.parts[-2:]:
+        return p
+    return MONO_SESSIONS_ROOT
+
+
+def _store_session_root(p: Path) -> str:
+    """仓库内的目录存相对路径，仓库外的目录保留绝对路径。"""
+    try:
+        return p.resolve().relative_to(ROOT.resolve()).as_posix()
+    except (ValueError, OSError):
+        return str(p)
+
 
 # 误差预算的假设（写在界面上，不许藏起来）
 ASSUMED = {"dr_px": 0.2, "dD_mm": 0.2, "df_rel": 0.01}
@@ -95,7 +126,7 @@ _DEVICE_CACHE: dict = {"at": 0.0, "devices": [], "note": ""}
 #: 那个 30.8 s 是**采集会话失效**的拖尾，不是相机的正常速度——2026-11-05 实测
 #: 健康时 1.0–1.6 s 出图，拔插坏的这台也立刻恢复到同一水平。
 #: 不写这一句，用户会把这行当成"相机可用"，打不开时只会以为是自己点错了。
-CAMERA_HINT_BASE = ("「#编号」是此刻插着的设备，直接用；角色对上不代表能出图"
+CAMERA_HINT_BASE = ("「#编号」只用实测采集索引；角色对上不代表能出图"
                     "（没开过相机），要确认点「换相机…」。")
 
 
@@ -166,14 +197,14 @@ def detector_choices() -> tuple[str, ...]:
 
 
 def preset_choices() -> tuple[str, ...]:
-    """颜色预设候选：**唯一来源**是 ``ColorConfig.preset_names()``。
+    """取色候选：**唯一来源**是 ``ColorConfig.preset_choices()``（含 auto）。
 
     为什么不在界面里手抄"红/绿/蓝/黄/白"：那份清单在预设表里已经有一份，
     抄一份的下场和检测器清单一样 —— 加一种球色要改三处，漏一处就表现为
     "下拉里根本没有这个颜色"。判据（``tests/selftest_gui_budget.py``）
-    断言的就是"下拉项 == 预设表"，不是"有没有这五个字"。
+    断言的就是"下拉项 == 预设表"，不是"有没有这几个字"。
     """
-    return tuple(ColorConfig.preset_names())
+    return tuple(ColorConfig.preset_choices())
 
 #: 界面文案（不许只写在注释里）：用户是在"要不要换检测器"的那一刻需要它。
 DETECTOR_HINT = ("球颜色不突出时 color 会 0 检出（本机实测 0/40 帧），改 hough（95%）"
@@ -186,10 +217,10 @@ SOURCE_REALTIME = "实时（相机）"
 SOURCE_OFFLINE = "离线（当前会话）"
 SOURCE_CHOICES = (SOURCE_OFFLINE, SOURCE_REALTIME)
 
-#: 有种子时**强制**用的检测器名（必须是注册表里的名字，见 `detector_choices()`）。
-#: 为什么强制：``--seed`` 只有 specular 认（它按点给的圆心/半径做局部跟踪），
-#: 别的检测器收到种子会直接忽略 —— 命令里带着 ``--seed 100,50,91`` 却仍在
-#: 全图找圆，是"看起来用了种子、实际没有"的静默失效。
+#: 镜面球用种子时**强制**用的检测器名（必须是注册表里的名字，见 `detector_choices()`）。
+#: 2026-11-06 起 ``--seed`` 不再只有 specular 认：``color`` 也会用它取色并锚定半径。
+#: 所以这里只是"**镜面球**的选择"，不再代表"有种子就一律切它"——
+#: 纯色球点选后仍应留在 color（见 ``_seed_detector_for_current``）。
 SEED_DETECTOR = "specular"
 
 #: 种子文件在会话里的位置（与其它派生结果同处 ``derived/``）。
@@ -280,6 +311,33 @@ def diameter_text_mm(text: str) -> str:
     """
     mm = diameter_mm_or_none(text)
     return "" if mm is None else f"{mm:g}"
+
+
+def role_online(role: str, devices=None) -> bool | None:
+    """共享：角色/相机当前能不能用（**静态匹配，不开相机、不枚举设备**）。
+
+    B-149：单目窗与双目窗**共用这一份判定**，不再各写一套。
+    - 给了 ``devices``（单目窗启动时枚举好的缓存表）→ 用 ``resolve_role`` 做
+      身份/端口精确匹配；落到 ``index-fallback`` 视为不在线。
+    - ``devices=None``（双目窗没有设备表）→ 只读 ``config/cameras.json`` 的
+      角色表判「这个角色配置过没有」；配了但设备在不在线**判断不了**就返回
+      ``None``，绝不装作知道（也不误报「不在线」）。
+    """
+    try:
+        from sphere_tracker import camera_registry as cr
+        if devices is not None:
+            # `require_capture_index=False`：这里问的是"这台设备在不在清单里"
+            # （界面上的在线灯），**不是**"拿哪个号去开它"。采集索引未实测时
+            # `resolve_role()` 默认会抛 `CaptureIndexNotVerified`；那条异常属于
+            # 标定/录制路径（它们**必须**拒绝猜），不该把这里的在线状态判成"不在线"。
+            resolved = cr.resolve_role(role, devices=devices, interactive=False,
+                                      require_capture_index=False)
+            return resolved.how != "index-fallback"
+        reg = cr.load_registry()
+        spec = reg.roles.get(str(role))
+        return False if spec is None else None
+    except Exception:                                       # noqa: BLE001
+        return False if devices else None
 
 
 def diameter_problem(text: str) -> str:
@@ -570,6 +628,12 @@ class MonoWindow(tk.Toplevel):
         self._enum_queue: queue.Queue = queue.Queue()
         #: 用户还没自己动过相机下拉 → 设备枚举回来后可以替他换成更靠谱的默认值。
         self._autopick = True
+        #: 原始保存值（可能是角色名）。自动回退到在线设备是**派生结果**，
+        #: 不能当成用户输入写回去 —— 否则保存的 `left` 会在关窗时被永久
+        #: 改成 `#0 设备名`（2026-11-20 GUI 走查抓到的既有缺陷）。
+        self._camera_saved_raw = prefs.get_str("mono.camera", "").strip()
+        #: 用户是否亲自动过相机下拉；只有动过才允许把当前值持久化。
+        self._camera_touched = False
         _values = self._camera_values()
         # 存过的值可能已失效（角色改名、换端口导致名字变）：先整体匹配，
         # 再按 `#N` 认编号 —— 认不出才用默认值，别把失效的串带进命令行。
@@ -612,18 +676,23 @@ class MonoWindow(tk.Toplevel):
         # 存过的值可能已经不在预设表里（改过名/删掉了）：交给 BallSettings 折成
         # 「不使用」—— `--preset` 有 choices，带一个不存在的名字会直接 argparse 退出。
         self.var_preset = tk.StringVar(
-            value=prefs.get_str("mono.preset", PRESET_NONE) or PRESET_NONE)
+            value=prefs.get_str("mono.preset", AUTO_PRESET) or PRESET_NONE)
         self.var_source = tk.StringVar(
             value=(prefs.get_str("mono.source", "") or SOURCE_OFFLINE)
             if prefs.get_str("mono.source", "") in SOURCE_CHOICES else SOURCE_OFFLINE)
         # auto 链路的状态：只有 auto 才在 0 检出后自动换 hough 重跑一次
         self._auto_retry_pending = False
+        #: auto 重试时**本次命令行**的检测器（None = 没有重试）。
+        #: 为什么不写进 ``var_detector``：那是用户的持久化偏好，``_on_close``
+        #: 会落盘成 ``mono.detector``，写回等于把用户选的 auto 永久改成 hough
+        #: （B-150 第三处，2026-11-07 Critic 75b 抓出）。
+        self._retry_method_override: str | None = None
 
         # 会话：**只记用户显式换过的根目录**（默认 data/mono）。
         # 不记"上次选中的会话"—— 那是磁盘现状，属于派生值，抄进界面状态就又多
         # 一份会和磁盘分叉的真相（GuiPrefs 的 FORBIDDEN 清单守的就是这条）。
         _root_txt = prefs.get_str("mono.session_root", "")
-        self._session_root = Path(_root_txt) if _root_txt else MONO_SESSIONS_ROOT
+        self._session_root = _restore_session_root(_root_txt)
         self._session: MonoSession | None = None
         #: 第③步「会话目录」输入框里显示的文字（只读，回填自磁盘现状，不是输入）。
         self.var_session_dir = tk.StringVar(value="")
@@ -631,6 +700,11 @@ class MonoWindow(tk.Toplevel):
         #: **每次刷新都从磁盘重取**：它不是输入，是派生事实；缓存久了就会
         #: 与磁盘分叉（用户删了 seed.json，界面还在说"会用种子"）。
         self._seed_json: Path | None = None
+        #: 已经按 seed.json 的 ball_kind 调过球种类的会话（避免每次刷新重设）
+        self._seed_kind_for: Path | None = None
+        #: 无种子的会话被选中时，把「球种类已复位」这句**追加到最终那条状态文本**；
+        #: 由 _on_session_picked 消费一次（_apply_seed_kind 里直接写会被它覆盖）。
+        self._kind_reset_note = False
 
         # 先占底部：pack 从容器边缘往里分配，先 pack 的优先拿到空间。
         # 反过来（先 pack 主内容区、再 pack 状态条）状态条会**盖住内容** ——
@@ -717,8 +791,7 @@ class MonoWindow(tk.Toplevel):
         self.cb_camera.pack(side="left", padx=(8, 0))
         # 用户自己动过下拉，就再也不许"替他把默认值升级成在线设备" ——
         # 那等于把他刚选的那台悄悄换掉。
-        self.cb_camera.bind("<<ComboboxSelected>>",
-                            lambda _e: setattr(self, "_autopick", False))
+        self.cb_camera.bind("<<ComboboxSelected>>", self._on_camera_selected)
         self.lbl_devices = self.surface.hint(box,
                                              camera_hint_text(self._device_note))
 
@@ -734,8 +807,12 @@ class MonoWindow(tk.Toplevel):
             self.btn_calibrate.state(["disabled"])
         self.surface.secondary(actions, "换相机…", self._open_cameras)
         self.surface.secondary(actions, "打开标定图文件夹", self._open_frames_dir)
-        self.btn_estimate = self.surface.secondary(
-            actions, "替代：单点焦距估计", self._start_focal_estimate)
+        # 「试开这台相机」是用户当下要的，放首屏；「替代：单点焦距估计」是替代
+        # 方案（说明文字本来就在下面折叠区里），把按钮挪进去与解释放在一起。
+        # 必须用 secondary：第①步已有唯一 primary（拍标定图），再造一个会让
+        # selftest_gui_budget 的 primary≤1 判据变红。文案不写秒数 —— 本机一台
+        # aoni 首帧约 23 s，写「3 秒」会把好相机判成坏相机（项目宪法 §9）。
+        self.surface.secondary(actions, "试开这台相机", self._probe_camera)
 
         # 为什么要折叠（2026-10-31 走查第 8 条）：首屏内容比视口高 382 px，
         # 第③步整块（含「开始识别」）在屏幕外 —— 用户的第一反应是"按钮怎么找不到"。
@@ -758,6 +835,12 @@ class MonoWindow(tk.Toplevel):
             side="left", padx=(8, 0))
         self._hint_pack(adv.content, "内角点 = 棋盘格内部交叉点个数，不是格子数。"
                                      "手上那张纸写着 8×5 就填 8 和 5；方格边长按实际量。")
+        # 替代方案的按钮跟它的说明在一起（原来按钮在首屏、说明却折叠着）。
+        # 折叠区内部只用 pack，所以按钮先落进一个 pack 的横排 frame。
+        est_line = ttk.Frame(adv.content)
+        est_line.pack(anchor="w", pady=(0, 4))
+        self.btn_estimate = self.surface.secondary(
+            est_line, "替代：单点焦距估计", self._start_focal_estimate)
         # 这句话必须写在按钮旁边，不能只放在点下去之后的状态条里：
         # 用户是在"要不要用这个替代方案"的那一刻需要它。
         # 旧文案（"球径误差会算进 fx、再正算深度时乘第二次"）是错的 ——
@@ -968,7 +1051,13 @@ class MonoWindow(tk.Toplevel):
             # 会话里记**下拉显示的那一串**（角色名或 "#0 设备名"）：一周后
             # 看到 "left" / "#0 aoni webcam A25 left" 才知道这段是谁录的，
             # 记 "--camera 0" 这种命令参数则要再翻一遍配置才认得出来。
-            sess_dir = create_mono_session(self._session_root, camera=cam_label)
+            # B-114：把已知球径写进会话元数据；缺值留 null（不许写 0，
+            # 0 会被下游当成「量过的有效球径」）。
+            _dtext = (self.var_diameter.get() or "").strip()
+            known_d = (float(_dtext) if _dtext and not diameter_problem(_dtext)
+                       else None)
+            sess_dir = create_mono_session(self._session_root, camera=cam_label,
+                                           ball_diameter_mm=known_d)
         except OSError as exc:
             self.status.set_status(
                 f"建不了会话目录（{self._short(self._session_root)}）：{exc}", "warn")
@@ -1077,6 +1166,47 @@ class MonoWindow(tk.Toplevel):
             except OSError:
                 pass          # 写不进去也不影响看视频，note 会继续显示
         self._session = row
+        self._apply_seed_kind(sess_dir)
+
+    def _apply_seed_kind(self, sess_dir: Path) -> None:
+        """按会话里的 ``seed.json`` 恢复球种类（只在该会话第一次选中时做）。
+
+        为什么需要：单目窗默认是「纯色塑料球 / color」。镜面球的旧会话只留下
+        ``seed.json``，没有别的字段说明它是什么球 —— 不恢复的话，用户打开旧
+        会话、点「开始识别」会用 color 跑镜面球，得到 0 检出，看起来像"种子丢了"。
+
+        三种情况：
+        - ``ball_kind=metal`` → 镜面金属球（specular）；
+        - ``ball_kind=plastic`` → 纯色塑料球（color + 种子取色）；
+        - **旧文件没有该字段** → 按 metal 兼容（历史上单目种子只用于镜面球）。
+
+        只做一次（``_seed_kind_for``）：用户在第②步手动改过球种类之后，
+        刷新/重选同一段会话不许再把它改回去。
+        """
+        path = Path(sess_dir)
+        if self._seed_kind_for == path:
+            return
+        self._seed_kind_for = path
+        self._kind_reset_note = False   # 新会话：先清掉上一段残留的标志
+        seed = path / "derived" / SEED_NAME
+        if not seed.is_file():
+            # 没有种子 = 新的一段会话。球种类是"这段那颗球的属性"，不是跨会话
+            # 的用户偏好：回到默认纯色球，避免沿用上一段镜面球设置导致静默 0
+            # 检出。说明不在这里写状态条（会被选中会话最终那条覆盖），记成标志。
+            self.ball.set_kind(BALL_PLASTIC)
+            self._kind_reset_note = True
+            return
+        try:
+            data = json.loads(seed.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        kind = str(data.get("ball_kind") or "")
+        if kind == "plastic":
+            self.ball.set_kind(BALL_PLASTIC)
+        elif kind == "metal" or "ball_kind" not in data:
+            self.ball.set_kind(BALL_METAL)
 
     def _reload_session(self) -> MonoSession | None:
         """重读当前会话：录完/跑完检测后状态变了，缓存会一直显示旧的。"""
@@ -1189,7 +1319,7 @@ class MonoWindow(tk.Toplevel):
             pass
 
     def _pick_seed(self) -> None:
-        """进程内打开单目点选窗，存了种子就把检测器切成 specular。
+        """进程内打开单目点选窗，存了种子后按**球种类**选检测器。
 
         为什么是进程内（照 `apps/_gui_stereo.pick_seeds`）：``seed_picker.py``
         只有类、没有 ``__main__``，``python apps/seed_picker.py`` 会立刻以 0
@@ -1208,7 +1338,8 @@ class MonoWindow(tk.Toplevel):
         # 那一行 Z 估计会离谱到没人信。所以取框里的原值再解析。
         diameter = diameter_mm_or_none(self.var_diameter.get())
         picker = MonoSeedPicker(self, clip.parent, fx=self._current_fx(),
-                                diameter_mm=diameter)
+                                diameter_mm=diameter,
+                                ball_kind=kind_key(self.ball.kind()))
         self.wait_window(picker)
         if not self._alive():
             return
@@ -1222,11 +1353,21 @@ class MonoWindow(tk.Toplevel):
         if not value:
             self.status.set_status(f"种子存了但用不上：{note}", "warn")
             return
-        self.var_detector.set(SEED_DETECTOR)
+        det = self._seed_detector_for_current()
+        # B-150 同型（2026-11-07 Critic 抓出：上一轮只修了 `_start_video` 里那一处
+        # 写回下拉框的语句，漏了这里）。**不写回 `var_detector`** ——
+        # 那是用户的持久化偏好，`on_close` 会 `prefs.save()`；存一次种子就把
+        # 偏好永久改掉，正是 B-150 要根治的静默改写。本次跟踪用哪个检测器由
+        # `_start_video` 自己再算（`_seed_detector_for_current()`），不 set 也不会跑错。
+        # 注：判据按字面量扫全文，所以上面这段注释**不能**写出那行完整语句。
+        pref = self.var_detector.get()
+        pref_note = ("" if pref == det
+                     else f"；你的偏好 {pref} 不变，下次打开仍按偏好")
+        how = ("种子用于初始化 CSRT" if det == "specular"
+               else "种子用于从点击处取色并锚定半径")
         self.status.set_status(
             f"种子已存：{self._short(Path(picker.result))}（球心 x,y 半径 = {value}）。"
-            f"点「开始识别」就按它跟踪，检测器已切成 {SEED_DETECTOR}"
-            f"（这颗球自动检测只能认到 1.4%，别再让它自己找）", "ok")
+            f"点「开始识别」就按它跟踪，本次用检测器 {det}（{how}）{pref_note}", "ok")
 
     def _image_size(self) -> tuple[int, int] | None:
         """当前会话的宽高（用来核对种子坐标是不是同一套画布）。读不到 → None。"""
@@ -1268,16 +1409,22 @@ class MonoWindow(tk.Toplevel):
         self._select_session(Path(path))
         self._refresh_session()
         cur = self._session
+        # _apply_seed_kind 里不能写状态条（会被下面这条覆盖）：把"无种子 → 已
+        # 复位纯色球"记成标志，在这里追加到最终那条状态文本，用完即清，别串到下次。
+        note = ""
+        if self._kind_reset_note:
+            note = "；这段会话没有点选球心，球种类已复位为纯色塑料球"
+            self._kind_reset_note = False
         if cur is None:
             self.status.set_status(
                 "选中的会话读不出来（目录可能刚被移走），点「选择…」刷新一下",
                 "warn")
         elif cur.error:
-            self.status.set_status(f"当前会话有问题：{cur.error}", "warn")
+            self.status.set_status(f"当前会话有问题：{cur.error}{note}", "warn")
         else:
             self.status.set_status(
                 f"当前会话换成 {cur.id}（{cur.state}）；"
-                f"「开始识别」（来源「离线」）会直接处理它", "info")
+                f"「开始识别」（来源「离线」）会直接处理它{note}", "info")
 
     def _on_root_changed(self, new_root: Path) -> None:
         """点选窗里换了存放目录：当前会话作废，只记住新根。
@@ -1297,17 +1444,17 @@ class MonoWindow(tk.Toplevel):
     # 状态
     # ------------------------------------------------------------------ #
     def _open_cameras(self) -> None:
-        """打开相机设备管理（复用 apps/tools/cameras.py）。
+        """打开相机管理对话框（GUI 内，2026-11-07 改）。
 
-        状态条必须写清"每台最多等 30 秒"：慢相机（aoni + MSMF）实测要 ~24 s
-        才给第一帧，不说这句用户会以为卡死、把窗口关掉。
+        和双目/门厅同一个对话框：不再起控制台子进程逐台开相机，
+        预览只开选中的一台，绑角色按设备身份直接落盘。
         """
-        self._start(
-            _actions.cameras(), "相机设备管理")
+        from apps.cameras_dialog import open_cameras
+
+        open_cameras(self, on_changed=self._refresh_state)
         self.status.set_status(
-            "已打开相机设备管理：每台最多等 30 秒（慢相机实测 ~24 秒），"
-            "日志里会逐台报进度，别关窗口。只想绑左右可直接用 pin"
-            "（不开相机，秒级）", "info")
+            "相机管理已打开：选一台点「预览这台」看画面；"
+            "或直接「设为左 / 设为右」按身份绑定，关掉对话框即生效", "info")
 
     def _refresh_state(self) -> None:
         st = self.app.state
@@ -1320,7 +1467,7 @@ class MonoWindow(tk.Toplevel):
         if not MONO_CALIB_APP.exists():
             self.status.set_status(
                 "标定入口 apps/calibrate_mono.py 还没落地（计划书 P0c/P1b）；"
-                "现在可以先拍图，标定请用「替代：单点焦距估计」或经典界面",
+                "现在可以先拍图，标定请用「替代：单点焦距估计」",
                 "warn")
         else:
             self.status.set_status("就绪", "ok")
@@ -1452,7 +1599,15 @@ class MonoWindow(tk.Toplevel):
         online = sum(1 for d in self._devices if getattr(d, "present", True))
         self.status.set_status(
             f"相机枚举完成：{online} 台在线" + (f"（{note}）" if note else "")
-            + "；「#编号」可以直接用，不必管角色绑定", "info")
+            + "；「#编号」只在采集索引实测后出现，没实测先跑 cameras.py identify", "info")
+
+    def _on_camera_selected(self, _event=None) -> None:
+        """用户亲自换了相机：从现在起当前值就是他的输入，可以持久化。
+
+        `_autopick` 也必须关掉：设备枚举回来后不许再替他换成别的设备。
+        """
+        self._autopick = False
+        self._camera_touched = True
 
     def _camera_values(self) -> list[str]:
         """下拉候选：角色在前、在线设备在后（``#N 名字``）。
@@ -1461,10 +1616,16 @@ class MonoWindow(tk.Toplevel):
         只读下拉里插不了分隔行，而"值本身就能直接传给 ``--camera``"更重要。
         """
         values: list[str] = [str(r) for r in self.app.state.camera_roles().keys()]
-        for dev in self._devices:
-            if not getattr(dev, "present", True):
+        # 只列**实测过采集索引**的角色。`dev.order` 是 PnP 位次，不能当
+        # `--camera N` 用；原来把 `#order 名字` 塞进下拉，选中就等于拿位次
+        # 开相机（"显示的相机 ≠ 真实相机"的入口之一）。
+        for role, info in self.app.state.camera_roles().items():
+            if not isinstance(info, dict):
                 continue
-            label = f"#{dev.order} {getattr(dev, 'name', '') or '未命名设备'}"
+            cap = info.get("capture_index")
+            if not isinstance(cap, int):
+                continue
+            label = f"#{cap} {info.get('name') or role}"
             if label not in values:
                 values.append(label)
         return values
@@ -1518,16 +1679,10 @@ class MonoWindow(tk.Toplevel):
     def _role_online(self, role: str) -> bool | None:
         """角色指向的那台现在在不在线；``None`` = 判断不了（别当成离线）。
 
-        用 ``resolve_role(devices=已枚举的表)``：它只做身份/端口的静态匹配，
-        **不开相机**，所以是毫秒级。``how == "index-fallback"`` 说明身份没对上、
-        只是蒙了个旧编号 —— 按"不在线"报比让用户以为选对了强。
+        B-149：判定逻辑收敛到模块级 ``role_online()``，双目窗复用同一份，
+        不再两处各写一套。这里只负责把本窗缓存的设备表传进去。
         """
-        try:
-            from sphere_tracker import camera_registry as cr
-            resolved = cr.resolve_role(role, devices=self._devices, interactive=False)
-        except Exception:                                   # noqa: BLE001
-            return False if self._devices else None
-        return resolved.how != "index-fallback"
+        return role_online(role, self._devices)
 
     def _camera_text(self) -> str:
         """第 ① 步那行"相机：…"——**要能看出选中的这台开不开得出来**。"""
@@ -1535,7 +1690,9 @@ class MonoWindow(tk.Toplevel):
         if not cam:
             return "自动挑（优先外接）"
         if cam.startswith("#"):
-            return f"{cam}（按索引，不依赖角色绑定）"
+            # 按索引选的那一档最容易让人误会：它只证明"这个编号存在"，
+            # 没试开过。2026-11-06 走查里用户原话是"界面照样显示得像是可用"。
+            return f"{cam}（按实测采集索引，不依赖角色绑定）｜未开相机验证"
         try:
             base = self.app.state.camera_role_text(cam)
         except Exception:                                   # noqa: BLE001
@@ -1560,16 +1717,12 @@ class MonoWindow(tk.Toplevel):
         失败也只写进日志。现在按钮只管拼命令，**结局**由 ``_on_task_finished``
         统一写；以后加按钮不可能再漏接回调。
 
-        归属是起完之后**填在任务上**的（``Task.owner``），不是 ``start()`` 的
-        参数：走查工具与 gui_budget 都会用自己的桩替换 ``start`` 并保持老签名
-        （``start(cmd, title, on_done)``），多一个关键字参数会让它们当场
-        ``TypeError`` —— 那是"修好了界面、打死了验证工具"。桩返回的不是
-        ``Task``，所以这里按类型判定，不硬塞属性。
+        归属在 ``start(owner=...)`` 时就写上：``TaskRunner.start`` 的 ``owner``
+        参数默认是空串，所以走查工具与 gui_budget 的桩（``start(cmd, title,
+        on_done=None, **kw)``）仍照常工作；这里显式传 ``OWNER`` 才算真的
+        登记了归属，关单目窗时 ``close_window`` 才能只停本窗的任务。
         """
-        task = self.app.tasks.start(cmd, title, on_done=on_done)
-        if isinstance(task, Task):
-            task.owner = OWNER
-        return task
+        return self.app.tasks.start(cmd, title, on_done=on_done, owner=OWNER)
 
     def _log_hint(self, task) -> str:
         """任务日志的**短**路径：状态条只有窗口那么宽，绝对路径会把原因挤没。
@@ -1617,9 +1770,16 @@ class MonoWindow(tk.Toplevel):
         return ["--camera", cam or "0"]
 
     def _start_capture(self) -> None:
-        CALIB_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+        # 一次拍图 = 一个会话目录（2026-11-09）。以前全部追加到
+        # outputs/mono_calib_frames 根层，60 张里混了 10-28 / 10-29 两批；
+        # 相机一动，旧图就是负面资产。现在每次单独存，标定只读当前会话。
+        d = _actions.new_mono_session(
+            camera=self.var_camera.get().strip(),
+            board={"cols": self.var_cols.get().strip() or "8",
+                   "rows": self.var_rows.get().strip() or "5",
+                   "square": self.var_square.get().strip() or "25"})
         cmd = _actions.capture_board(
-            out=CALIB_FRAME_DIR,
+            out=d,
             cols=self.var_cols.get().strip() or "8",
             rows=self.var_rows.get().strip() or "5",
             square=self.var_square.get().strip() or "25",
@@ -1627,9 +1787,8 @@ class MonoWindow(tk.Toplevel):
             extra=self._common_camera_args())
         self._start(cmd, "拍单目标定图")
         self.status.set_status(
-            f"已开始拍图：板在每个姿态停稳约 1 秒就会自动存；"
-            f"存够 {self.var_target.get() or '15'} 张自动结束。图在 "
-            f"{CALIB_FRAME_DIR.name}\\", "info")
+            f"已开始拍图：板停稳会自动存，存够 {self.var_target.get() or '15'} 张结束。"
+            f"本次图单独存 {d.name}\\", "info")
 
     def _start_calibrate(self) -> None:
         if not MONO_CALIB_APP.exists():
@@ -1637,8 +1796,13 @@ class MonoWindow(tk.Toplevel):
                 "标定脚本还没落地：现在可以用「替代：单点焦距估计」，"
                 "但它假设主点在画面中心、不产生畸变系数，球径误差会并入 fx", "warn")
             return
+        d = _actions.current_mono_dir()
+        if d is None:
+            self.status.set_status(
+                "还没有标定会话：先点「拍标定图」，每次拍图单独存一个文件夹", "warn")
+            return
         cmd = _actions.calibrate_mono(
-            frames_dir=CALIB_FRAME_DIR,
+            frames_dir=d,
             cols=self.var_cols.get().strip() or "8",
             rows=self.var_rows.get().strip() or "5",
             square=self.var_square.get().strip() or "25")
@@ -1662,7 +1826,86 @@ class MonoWindow(tk.Toplevel):
             return
         self.app.state.reload()
         self._refresh_state()          # 这一步会把状态条写回"就绪"，所以随后立刻覆盖
-        self.status.set_status("内参标定完成，已重新读取标定值（第①步那行会跟着变）", "ok")
+        # 质量状态只记录并显示，不阻断（2026-11-15）：单目标定质量差时
+        # `calibrate_mono.py` 不再抛错退出，而是**旁路保存**诊断 JSON 并返回 0 ——
+        # 只看返回码就会把这句写成纯成功，用户看不出"这次标定不可用"。
+        note = self._mono_calib_quality_note()
+        if note:
+            self.status.set_status(
+                f"内参标定完成，已重新读取标定值（第①步那行会跟着变）；{note}",
+                "warn")
+        else:
+            self.status.set_status("内参标定完成，已重新读取标定值（第①步那行会跟着变）", "ok")
+
+    def _mono_calib_quality_note(self, path: str | Path | None = None) -> str:
+        """读单目标定产物的 ``usable`` / ``quality``，拼一句质量状态；读不到返回空串。
+
+        为什么不能只看正式路径 ``config/mono_calibration.json``：质量差时
+        ``calibrate_mono.py`` **不覆盖**正式文件（那是防呆），诊断另存为
+        ``mono_calibration_unusable_<时间戳>.json`` 旁路文件。所以取「正式产物 +
+        旁路诊断」里**最新**的那一份：成功一次会重写正式文件，mtime 自然更新，
+        不会被上一次的旁路文件顶掉。
+
+        纯记录/显示：文件不存在、旧格式、字段缺失一律降级为空串，绝不抛
+        （``_on_calibrated`` 后面的 ``reload`` 已经跑完，这里不许再出岔子）。
+        """
+        try:
+            base = Path(path) if path is not None else MONO_CALIB_JSON
+            cands = [base] if base.is_file() else []
+            cands += list(base.parent.glob(f"{base.stem}_unusable_*.json"))
+            if not cands:
+                return ""
+            data = json.loads(max(cands, key=lambda p: p.stat().st_mtime_ns)
+                              .read_text(encoding="utf-8"))
+            if data.get("usable") is not False:
+                return ""
+            quality = data.get("quality") or {}
+            grade = str(quality.get("grade") or "").strip() or "不可用"
+            note = f"质量状态：{grade}"
+            if bool(quality.get("forced_unusable")):
+                note += "（仅测试标定，不得用于数据结论）"
+            return note
+        except Exception:                                    # noqa: BLE001
+            return ""
+
+    def _probe_camera(self) -> None:
+        """「试开这台相机」：只对能解析成**纯数字编号**的那台起诊断任务。
+
+        角色名（main/left…）或 auto 都不是具体编号：诊断脚本只按 ``--indices N``
+        测，替用户猜一个编号等于偷偷换了一台（设备编号会漂移）。这种时候不启动，
+        给一句"先点『换相机…』确认编号"的可执行下一步，而不是瞎猜。
+        """
+        cam = self._camera_arg(self.var_camera.get())
+        if not cam.isdigit():
+            self.status.set_status(
+                "这台按角色名/自动绑定，没给出具体 #编号：先点「换相机…」"
+                "确认它是哪个编号，再试开（编号会漂移，不能替你猜）", "warn")
+            return
+        self._start(_actions.camera_probe(cam), "试开相机",
+                    on_done=self._on_camera_probed)
+        self.status.set_status(
+            "正在试开这台相机…（慢相机首帧可能要等一会儿，结论看日志尾）", "info")
+
+    def _on_camera_probed(self, task) -> None:
+        """试开结束：诊断脚本**打不开也 return 0**，成败不能看退出码。
+
+        它只把结论打进日志尾（「打不开：…」/「实测帧率 …」），所以从
+        ``task.tail_text(3)`` 读。这里不套 try/except：读不到就是真出了岔子，
+        该冒出来就冒出来，别把异常吞成一句"已完成"。
+        """
+        if not self._alive():
+            return
+        tail = task.tail_text(3)
+        if "打不开" in tail:
+            self.status.set_status(
+                f"试开结果：这台打不开 —— {tail[:110]} —— {self._log_hint(task)}",
+                "warn")
+        elif "实测帧率" in tail:
+            self.status.set_status(f"试开结果：{tail[:110]}", "ok")
+        else:
+            self.status.set_status(
+                f"试开结束，但日志尾既没「打不开」也没「实测帧率」："
+                f"{tail[:90]} —— 开日志看完整输出 {self._log_hint(task)}", "warn")
 
     def _start_focal_estimate(self) -> None:
         """单点焦距估计：**球径必须传框里那个值**，不能让它吃库里的默认值。
@@ -1685,9 +1928,12 @@ class MonoWindow(tk.Toplevel):
 
     def _open_frames_dir(self) -> None:
         try:
-            CALIB_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+            # 打开「当前会话」；还没有会话时打开根层让人看到它是空的。
+            # 这里回落根层只是**打开文件夹**，不涉及读图，不会把历史图混进标定。
+            d = _actions.current_mono_dir() or CALIB_FRAME_DIR
+            d.mkdir(parents=True, exist_ok=True)
             import os
-            os.startfile(str(CALIB_FRAME_DIR))           # noqa: S606
+            os.startfile(str(d))                        # noqa: S606
         except Exception as exc:                        # noqa: BLE001
             self.status.set_status(f"打不开文件夹：{exc}", "warn")
 
@@ -1737,6 +1983,28 @@ class MonoWindow(tk.Toplevel):
             # 存过的旧值/外部改坏：回落默认，但**不许静默**（下面会写进状态条）
             return "color"
         return "color" if name == SMART else name
+
+    def _seed_detector_for_current(self) -> str:
+        """点选球心之后该用哪个检测器 —— 按**球种类**，不按"有没有种子"。
+
+        2026-11-06 之前这里默认"有种子 = 镜面球"：只要存了 seed 就把检测器
+        强制改成 specular。对金属球是对的，对纯色塑料球是反的 —— color 本来
+        就能在整幅画面找到球，种子应该拿去做"取色 + 锚半径"，而不是换成
+        specular（那会丢掉轮廓精度，还可能因 CSRT 跟丢整段空）。
+
+        规则：
+        - 镜面金属球 → specular（种子初始化 CSRT）；
+        - 纯色塑料球 → color（种子取色 + 半径带）；
+        - 自定义 → 当前方法若接受种子（specular / color）就保留；
+          否则退回 specular，并保持界面上的方法下拉与命令行一致。
+        """
+        kind = self.ball.kind()
+        if kind == BALL_METAL:
+            return SEED_DETECTOR
+        if kind == BALL_PLASTIC:
+            return "color"
+        method = self._method_arg()
+        return method if method in ("specular", "color") else SEED_DETECTOR
 
     def _start_realtime(self) -> None:
         # 没有球径就不启动：`run_video` 会直接拒跑（Z = f·D/(2r) 对 D 1:1），
@@ -1789,22 +2057,42 @@ class MonoWindow(tk.Toplevel):
         并把检测器**强制**成 specular —— 那颗镜面球自动检测只能认到 1.4%，
         用户点了球还让它自己找，等于白点。
         """
+        # auto 重试只对**这一次**生效：取走就清空，否则下一次手动启动还带着
+        # hough，等于偷偷改了用户的选择（只是把落盘那一步换成了内存泄漏）。
+        #
+        # **必须放在最前面、任何提前 return 之前**：球径检查（下面几行）就可能
+        # 直接返回。放在它后面的话，「球径在跑的过程中被改坏 → 本次启动取消」
+        # 这条路径会把 hough 留在字段里，等改好球径再点启动就**静默用 hough**
+        # 且 `auto` 已被关掉（`and not retry_method`）——同族串味（Critic 75c P3）。
+        retry_method = self._retry_method_override
+        self._retry_method_override = None
         clip = find_clip(self._session.path) if self._session is not None else None
         # 与实时同理：没有球径就先把话说清，不要起一个注定要退出的进程。
         problem = diameter_problem(self.var_diameter.get())
         if problem:
             self.status.set_status(problem + " —— 已取消启动", "error")
             return
-        # 种子在**产生命令行之前**定：因为它会改写检测器（specular），
+        # 种子在**产生命令行之前**定：它会参与"该用哪个检测器"的选择，
         # 而 --method 跟着检测器走。放在后面拼，就是"带了种子却跑了别的检测器"。
         seed_value, seed_note = self._seed_for_command(clip)
+        method = retry_method or self._method_arg()
+        switch_note = ""
         if seed_value:
-            # 有种子 = 这颗球是镜面球（只有 specular 认 --seed）：球种类跟着走，
-            # 否则"球种类"那一栏还显示纯色球，与命令行矛盾。
-            self.ball.set_kind(BALL_METAL)
-            self.var_detector.set(SEED_DETECTOR)     # 下拉框同步显示，不留两套口径
-        method = self._method_arg()
-        auto = self.var_detector.get() == SMART
+            # 2026-11-06：不再"有种子就切 specular"。纯色球留在 color，
+            # 种子交给它取色/锚半径；镜面球才切 specular（见 helper 的注释）。
+            # B-150：本次命令行可以临时换检测器，但**不写回 var_detector** ——
+            # 那是用户的持久化偏好（on_close 会存 mono.detector），静默改会
+            # 让下次打开窗口仍是这个值。确需切换就在状态条写明原因。
+            chosen = self._seed_detector_for_current()
+            if chosen != method:
+                switch_note = (f"因球种需要，本次临时用检测器 {chosen} "
+                               f"（你的偏好 {method} 不变，下次打开仍按偏好）")
+                method = chosen
+        # 有种子时不许 auto 再换 hough：hough 不认种子，换过去等于把用户点的
+        # 那颗球丢了（这正是"看起来用了种子、实际没有"的静默失效）。
+        # 正在 auto 重试时也不许再 arm：`var_detector` 仍是 auto（**故意没写回**），
+        # 不排掉这里就会出现"hough 也 0 检出 → 再 arm 一次 → 无限重跑"。
+        auto = (self.var_detector.get() == SMART) and not seed_value and not retry_method
         fx, fx_note = self._focal_arg()
         preset = self.ball.preset()
         if clip is not None:
@@ -1828,17 +2116,26 @@ class MonoWindow(tk.Toplevel):
             metal_note = ("选了镜面金属球但这段还没有「点选球心」："
                           "specular 只在高光附近找，没有种子多半 0 检出"
                           if (self.ball.kind() == BALL_METAL and not seed_value) else "")
+            # 整句用**普通字符串**（不拆 f-string）：提取器按「一整个字符串常量」
+            # 登记文案，拆成 `f"…{x}…"` 会变成两段碎片分别翻译。用哪个检测器
+            # 上面那句"检测器 xxx"已经写了，这里不必再插值。
+            retry_note = ("本次是 auto 重试（color 零检出），临时改用备用检测器；"
+                          "你的偏好 auto 不变，下次打开仍按 auto"
+                          if retry_method else "")
             self.status.set_status(
                 f"已启动离线单目：{self._short(clip)}（检测器 {method}）；结果写进 "
                 f"{self._short(derived)}/（跑完摘要会变成「已检测」，"
                 f"那时才能点「看 3D」）"
                 + ("。auto：若一帧都没检出会自动换 hough 重跑" if auto else "")
                 + (f"。用你点的种子跟踪（{seed_value}），不再自动检测" if seed_value else "")
+                + (f"。注意：{switch_note}" if switch_note else "")
+                + (f"。注意：{retry_note}" if retry_note else "")
                 + (f"。注意：{fx_note}" if fx_note else "")
                 + (f"。注意：{d_note}" if d_note else "")
                 + (f"。注意：{seed_note}" if seed_note else "")
                 + (f"。注意：{metal_note}" if metal_note else ""),
-                "warn" if (fx_note or seed_note or d_note or metal_note) else "info")
+                "warn" if (switch_note or retry_note or fx_note or seed_note
+                           or d_note or metal_note) else "info")
             return
 
         # 兜底走文件选择框：run_video.py 的 path 是必填位置参数，它自己不会弹
@@ -1885,12 +2182,18 @@ class MonoWindow(tk.Toplevel):
             # auto 的全部意义就在这里：用户不知道"这颗球 color 看不见"，
             # 界面替他试一次 hough，而不是让他自己去读那段诊断。
             self._auto_retry_pending = False
-            self.var_detector.set("hough")
+            # **只影响本次命令行，不动 `var_detector`**（B-150 第三处：这里原来
+            # 直接写回下拉框，`_on_close` 再把 `mono.detector` 落盘 —— 用户选了
+            # auto，跑一次零检出之后偏好就被永久改成 hough，下次开窗都不再 auto）。
+            self._retry_method_override = "hough"
             self.status.set_status(
-                "color 一帧都没检出（退出码 2），auto 已自动换 hough 重跑一遍…", "warn")
+                "color 一帧都没检出（退出码 2），已用 hough 重试一遍"
+                "（你的偏好 auto 不变，下次打开仍按 auto）…", "warn")
             self._start_video()
             return
         self._auto_retry_pending = False
+        # 正常收尾时把一次性覆盖清掉：进程被中途停掉也不会把 hough 漏给下一次
+        self._retry_method_override = None
         self._refresh_session()
         cur = self._session
         if cur is not None and cur.has_result:
@@ -1922,7 +2225,13 @@ class MonoWindow(tk.Toplevel):
         # 但"该退订就退订"比"靠每个回调自己记得检查"可靠）。
         self.app.tasks.remove_finish_listener(self._on_task_finished)
         p = self.app.prefs
-        p.set("mono.camera", self.var_camera.get().strip())
+        # 只有用户亲自动过相机下拉，当前值才算"输入"；自动回退（保存的角色
+        # 当前离线 → 临时换在线设备）是派生结果，写回去会把 `left` 永久改成
+        # `#0 设备名`（2026-11-20 GUI 走查抓到的既有缺陷）。
+        _cam_now = self.var_camera.get().strip()
+        p.set("mono.camera",
+              _cam_now if (self._camera_touched or not self._camera_saved_raw)
+              else self._camera_saved_raw)
         p.set("board.cols", self.var_cols.get().strip())
         p.set("board.rows", self.var_rows.get().strip())
         p.set("board.square_mm", self.var_square.get().strip())
@@ -1935,10 +2244,15 @@ class MonoWindow(tk.Toplevel):
         p.set("mono.detector", self.var_detector.get().strip())
         p.set("mono.preset", self.var_preset.get().strip() or PRESET_NONE)
         p.set("mono.source", self.var_source.get().strip())
-        # 只存"用户换过的根目录"这个输入；当前选中的会话属于磁盘现状，不存
-        p.set("mono.session_root", str(self._session_root))
+        # 只存"用户换过的根目录"这个输入；当前选中的会话属于磁盘现状，不存。
+        # 项目内的路径写成相对的，仓库换盘符/换机器后不会指向旧位置。
+        p.set("mono.session_root", _store_session_root(self._session_root))
         p.save()
 
     def _stop_my_tasks(self) -> None:
-        ok = self.app.tasks.stop_all(graceful=True)
-        self.status.set_status(f"已确认停掉 {ok} 个任务", "ok" if ok else "warn")
+        # 按归属停，不再全局 stop_all：本窗的"停止"按钮不该杀掉别的窗口
+        # 在后台跑的离线重建/标定。task_owner 由 open_window 打标（= OWNER）。
+        n = self.app.tasks.stop_by_owner(self.task_owner)
+        self.status.set_status(
+            f"已停掉本窗口的 {n} 个任务" if n else "本窗口没有在跑的任务",
+            "ok" if n else "warn")

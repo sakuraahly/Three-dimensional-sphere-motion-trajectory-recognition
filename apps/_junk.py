@@ -36,10 +36,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from apps._common import SESSION_KEEP_BACKUPS, backup_glob
+
 __all__ = [
     "DANGER_GONE", "DANGER_SAFE", "DANGER_WARN",
-    "JunkFile", "JunkItem", "JunkPlan",
-    "clean_junk", "human_size", "looks_like_data",
+    "JunkFile", "JunkItem", "JunkPlan", "PROTECTED_OUTPUTS",
+    "clean_junk", "human_size", "is_protected_output", "looks_like_data",
     "looks_like_research_artifact", "scan_junk",
 ]
 
@@ -69,8 +71,64 @@ _KNOWN_SAFE = {
                     "注意 timings.json 是 fast 档的快/慢依据，删了下次 fast 会退化成全套",
 }
 
+#: 用户裁决（2026-11-10）**原地保留、不可再生**的 22 份交付物。
+#:
+#: 与 `docs/outputs保留清单.md` 一一对应。它们不迁 `docs/`：文档/报告里的引用
+#: 按 `outputs/` 路径写，迁移会断链；而本模块的清理白名单也按 `outputs/` 路径
+#: 点名，移走反而失去保护。这里**不另起一套判定**：`looks_like_research_artifact`
+#: 先认它们，`clean_junk` 再兜一道"即使被勾选也拒绝删除"。
+PROTECTED_OUTPUTS: frozenset[str] = frozenset({
+    "outputs/_handoff_read/A4_相机identify交接.md",
+    "outputs/_handoff_read/pit39.md",
+    "outputs/_handoff_read/pit40.md",
+    "outputs/agent_detector/report.md",
+    "outputs/agent_detector_design/DESIGN_specular_detector.md",
+    "outputs/agent_gui_audit/doc_evidence.md",
+    "outputs/agent_gui_audit/human_review.md",
+    "outputs/agent_gui_audit/mono_calib_gap.md",
+    "outputs/agent_gui_audit/structure.md",
+    "outputs/agent_gui_fix/critic/baseline.md",
+    "outputs/agent_gui_fix/critic/verdict.md",
+    "outputs/audit_critic_75b/report.md",
+    "outputs/audit_critic_75c/report.md",
+    "outputs/audit_critic_75d/report.md",
+    "outputs/cam/doctor_report.md",
+    "outputs/cam/focus_report.md",
+    "outputs/cam_diag/report.md",
+    "outputs/chain_diagnosis_2026-11-08.md",
+    "outputs/calib_cleanup_20261109.md",
+    "outputs/gui_audit/report.md",
+    "outputs/joint_refine/report.md",
+    "outputs/motion_export_20261103/README.md",
+})
+
 #: 每个会话的 `session.json.bak-*` 至少留几个（编辑元数据的回滚点）。
-KEEP_BAK_PER_SESSION = 3
+#: 与 `apps._common.SESSION_KEEP_BACKUPS` 同一份策略 —— 这里是**清理阶段**的
+#: 保留数，写备份时不立刻裁剪（见 `atomic_write_with_backup` 的 keep_backups=None）。
+KEEP_BAK_PER_SESSION = SESSION_KEEP_BACKUPS
+
+
+def is_protected_output(path: str | Path) -> bool:
+    """这份文件是不是用户裁决原地保留的交付物？
+
+    按**相对 `outputs/` 的路径**匹配，不认绝对路径：测试与其它机器上用临时仓库
+    造同样的目录结构也能被保护，不依赖仓库装在哪块盘。
+    """
+    parts = Path(path).parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "outputs":
+            key = "/".join(("outputs", *parts[i + 1:]))
+            return key in PROTECTED_OUTPUTS
+    return False
+
+
+def _protected_reason(files: list[JunkFile]) -> str | None:
+    """这批文件里含用户裁决的交付物？返回一句"不能删"的理由，否则 None。"""
+    keep = [f for f in files if is_protected_output(f.path)]
+    if not keep:
+        return None
+    return (f"含 {len(keep)} 份用户裁决原地保留的不可再生交付物"
+            f"（如 {keep[0].path.name}）—— 清单见 docs/outputs保留清单.md，不能删")
 
 #: "结果类"后缀：出现得多说明这个目录更像数据/素材，而不是调试输出。
 _DATA_SUFFIXES = frozenset({
@@ -247,6 +305,11 @@ def looks_like_research_artifact(files: list[JunkFile]) -> str | None:
     """
     if not files:
         return None
+    # 第一道：用户**明确点名**的 22 份交付物。按体积/后缀/文档数量去"猜"总会有
+    # 猜错的时候，而这里的裁决是确定的 —— 命中即"不能删"，不再往下判。
+    protected = _protected_reason(files)
+    if protected:
+        return protected
     docs = [f for f in files if f.path.suffix.lower() == ".md"]
     if docs:
         return f"含 {len(docs)} 份人工文档（.md，如 {docs[0].path.name}）"
@@ -317,6 +380,13 @@ def _outputs_dir_item(d: Path, skipped: list[str]) -> JunkItem | None:
             item.danger = DANGER_WARN
             item.note = f"{why} —— 已从「推荐」降为「谨慎」，要清请手动勾选"
             item.detail = item.note
+    elif danger == DANGER_WARN:
+        # 本来就是「谨慎」的目录也要把裁决写清楚：靠"用途不明先别删"含糊过去，
+        # 下一个人还是会把它当成可以勾的垃圾。
+        why = _protected_reason(item.files)
+        if why:
+            item.note = why
+            item.detail = why
     return item
 
 
@@ -334,8 +404,9 @@ def _session_bak_files(root: Path, skipped: list[str]) -> list[JunkFile]:
     for sj in data.rglob("session.json"):
         if sj.is_symlink():
             continue
+        # glob 格式取自 `apps._common.backup_glob`（与写备份同源），不在这里再拼一份。
         baks = sorted(
-            (p for p in sj.parent.glob("session.json.bak-*")
+            (p for p in sj.parent.glob(backup_glob(sj))
              if p.is_file() and not p.is_symlink()),
             key=lambda p: p.name, reverse=True)
         for p in baks[KEEP_BAK_PER_SESSION:]:
@@ -450,11 +521,16 @@ def scan_junk(root: str | Path, *, older_than_days: float | None = None,
                 continue
             stray.append(JunkFile(path=p, size=st.st_size, mtime=st.st_mtime))
         if stray:
+            # 22 份里有 2 份是散落在 outputs 根的 .md（诊断/清理清单快照），
+            # 它们不在任何子目录里，`_outputs_dir_item` 管不到，所以这里补一句。
+            keep_why = _protected_reason(stray)
             plan.items.append(JunkItem(
                 key="outputs/散落其他文件", label="outputs 根下的其他散落文件",
-                detail="截图 / 导出包 / 一次性脚本这类散落在 outputs 根的东西 —— "
+                detail=keep_why or
+                       "截图 / 导出包 / 一次性脚本这类散落在 outputs 根的东西 —— "
                        "不属于任何子目录，用途只有你知道，所以默认不勾",
-                danger=DANGER_WARN, files=stray))
+                danger=DANGER_WARN, files=stray,
+                note=keep_why or ""))
 
     # ---- ② 字节码缓存（全仓，含 apps/tests/sphere_tracker…）----
     pyc: list[JunkFile] = []
@@ -559,6 +635,12 @@ def clean_junk(plan: JunkPlan, root: str | Path) -> tuple[int, int, list[str]]:
     for item in plan.items:
         for f in item.files:
             p = f.path
+            # 用户裁决的 22 份交付物：即使被手动勾选也**拒绝删除**。这是第三道
+            # 安全边界（另两条是"只删计划里的路径"与"越界/符号链接拒绝"）——
+            # 「谨慎」档只保证默认不勾，真正"不能删"要在执行处兜住。
+            if is_protected_output(p):
+                failures.append(f"{p}（用户裁决：不可再生的交付物，拒绝删除）")
+                continue
             try:
                 if p in seen:
                     continue

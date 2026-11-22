@@ -2,7 +2,7 @@
 
 为什么单独一个模块（2026-10-27 计划书 §4 P2）
 --------------------------------------------
-这段逻辑原来在 ``启动程序.py`` 的 ``Launcher`` 里（约 560 行）。分窗之后有
+这段逻辑原来在 ``apps/gui_main.py`` 的 ``Launcher`` 里（约 560 行）。分窗之后有
 5 个窗口要看同一张任务表 —— 如果每窗各管一份子进程，本项目最贵的那个反模式
 （"同一件事 N 份实现"）会再犯一次。抽出来之后：
 
@@ -47,6 +47,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker.paths import log_dir as _log_dir  # noqa: E402
+from apps._task_registry import (  # noqa: E402
+    external_running as _external_running,
+    register_end,
+    register_start,
+)
 
 POLL_MS = 200
 
@@ -197,6 +202,10 @@ class TaskRunner:
         self._done_queue: queue.Queue = queue.Queue()
         self._finish_listeners: list[Callable[[Task], None]] = []
         self._stopping = False
+        #: 上一次发给任务表的状态签名（见 :meth:`_task_state_signature`）。
+        #: 只在签名变化时发 ``_on_change`` —— 否则 200ms 一次的全表重建会
+        #: 把任务表拖卡（原先"只要还有任务在跑就每帧发"就是这个毛病）。
+        self._last_state_signature: tuple | None = None
         if root is not None:
             root.after(poll_ms, self._poll)
 
@@ -237,6 +246,14 @@ class TaskRunner:
     def running(self) -> list[Task]:
         return [t for t in self._tasks if t.running]
 
+    def external_running(self) -> list[dict]:
+        """别的进程登记进来、且 PID 仍活着的任务（见 ``apps/_task_registry``）。
+
+        控制台把 ``running()`` 与这一份并成"正在运行"列表 —— 用户报的
+        "很多任务没进管理器"里，数据管理导出/查看器就是走这条路径。
+        """
+        return _external_running()
+
     @property
     def selected_tid(self) -> int | None:
         return self._sel_tid
@@ -269,15 +286,24 @@ class TaskRunner:
         return subprocess.Popen(cmd, **kw)
 
     def start(self, cmd: list[str], title: str,
-              on_done: Callable[[Task], None] | None = None) -> Task:
-        """起一个新任务并登记。**允许多个同时跑**（相机冲突由用户自己负责）。"""
+              on_done: Callable[[Task], None] | None = None,
+              owner: str = "") -> Task:
+        """起一个新任务并登记。**允许多个同时跑**（相机冲突由用户自己负责）。
+
+        ``owner`` 是起任务那个窗口的归属键（``"mono"`` / ``"stereo_parallel"`` …）。
+        默认值空串 = 不登记归属 —— 所有既有调用点都不传，行为逐字不变；
+        需要"关这个窗口就停它的任务"的调用点才显式传它（配 :meth:`stop_by_owner`）。
+        """
         self._tid += 1
         proc = self._spawn(cmd)
         log_path = self._task_log_path(self._tid, title)
         task = Task(tid=self._tid, title=title, cmd=list(cmd), proc=proc,
-                    log_path=log_path, on_done=on_done)
+                    log_path=log_path, on_done=on_done, owner=owner)
         self._tasks.append(task)
         self._sel_tid = task.tid
+        # 跨进程账本：控制台的"正在运行"也包含这里登记的任务。
+        # 必须在 _spawn 之后（要有 pid），失败也不许影响任务本身。
+        register_start(task, source="runner")
         self._emit(f"\n===== [{task.tid}] {title} =====\n> {task.cmdline()}")
         self._emit(f"[任务 {task.tid}] 已启动，PID {proc.pid}"
                    f"（可在「任务」里中断）")
@@ -362,6 +388,9 @@ class TaskRunner:
         并把原因写进 ``task.kill_note``。
         """
         if not task.running:
+            # 进程已经没了（读线程可能还没来得及写 end）——补一笔，
+            # 免得它一直挂在"正在运行"账本上靠 PID 探活兜底。
+            register_end(task, source="runner")
             return True
         pid = task.proc.pid
         task.stop_reason = "用户中断" + ("（优雅）" if graceful else "（强制）")
@@ -384,7 +413,10 @@ class TaskRunner:
                 task.proc.wait(timeout=3.0)
                 self._emit(f"[任务 {task.tid}] 已优雅退出")
                 self._kill_leftover(kids, task)
-                return self._confirm_dead(task, kids)
+                ok = self._confirm_dead(task, kids)
+                if ok:
+                    register_end(task, source="runner")
+                return ok
             except subprocess.TimeoutExpired:
                 self._emit(f"[任务 {task.tid}] 3 秒内没退出，改为强制结束")
 
@@ -396,7 +428,10 @@ class TaskRunner:
         else:
             self._emit(f"[任务 {task.tid}] 已强制结束整棵进程树")
         self._kill_leftover(kids, task)
-        return self._confirm_dead(task, kids)
+        ok = self._confirm_dead(task, kids)
+        if ok:
+            register_end(task, source="runner")
+        return ok
 
     def _confirm_dead(self, task: Task, kids: list[int],
                       wait: float = 2.0) -> bool:
@@ -448,6 +483,27 @@ class TaskRunner:
                        f"其余请看上面的失败原因")
         return ok
 
+    def stop_by_owner(self, owner: str, graceful: bool = True) -> int:
+        """只停 ``owner`` 属于这个窗口的任务；返回**确认停掉**的个数。
+
+        为什么不能复用 stop_all：关一个查看器会把别人的离线重建也杀掉。
+        三个窗口的 ``_stop_my_tasks`` 原来是全局停，用户的典型场景是
+        "单目窗开着、双目离线重建在后台跑"，关单目窗却把双目任务一起杀了。
+        归属必须精确 —— 所以这里按 :attr:`Task.owner` 逐个筛，再逐个 :meth:`stop`。
+
+        空 owner 直接返回 0：没登记归属的任务不属于任何窗口，绝不能被
+        "按归属停"误伤（例如控制台那条空 owner 的兜底路径）。
+        """
+        if not owner:
+            return 0
+        targets = [t for t in self.running()
+                   if getattr(t, "owner", "") == owner]
+        n = 0
+        for t in targets:
+            if self.stop(t, graceful=graceful):
+                n += 1
+        return n
+
     # ---------- 读输出与轮询 ----------
     def _reader(self, task: Task) -> None:
         proc = task.proc
@@ -463,6 +519,7 @@ class TaskRunner:
         proc.wait()
         task.ended = time.monotonic()
         task.exit_code = proc.returncode
+        register_end(task, source="runner")
         why = f"（{task.stop_reason}）" if task.stop_reason else ""
         tail = (f"[任务 {task.tid} 结束] 返回码 {proc.returncode}{why}，"
                 f"耗时 {task.elapsed():.1f}s")
@@ -493,8 +550,32 @@ class TaskRunner:
                 f"[任务 {task.tid}] 失败：返回码 {task.exit_code}；"
                 f"完整输出：{task.log_path or '（未落盘）'}")
 
+    def _task_state_signature(self) -> tuple:
+        """任务表真正关心的状态签名。
+
+        包含哪些在跑（``running``）与每个任务的结束/中断字段
+        （``ended`` / ``exit_code`` / ``stop_reason`` / ``kill_note``）。
+        ``stop()`` 是**同步**写好 ``stop_reason`` 的，而进程可能还要几秒才真正
+        退出 —— 签名把这些字段也纳入，用户点"中断"的那一刻任务表就刷新，
+        不必等进程死的那一刻（这正是"关窗停任务后状态不更新"的根因）。
+
+        还在跑的任务额外放秒级耗时 ``int(t.elapsed())``：用户要"观看实时任务栏"，
+        "已运行"列必须走秒。取秒而不是毫秒 —— 签名每变一次就会触发
+        console.refresh() 全表重建，按秒变化正好兼顾走秒与不卡。
+        已结束的任务 elapsed 不再变，不放入（避免无意义地反复比同一串值）。
+        """
+        return tuple(
+            (t.tid, t.running, t.ended, t.exit_code, t.stop_reason, t.kill_note,
+             int(t.elapsed()) if t.running else 0)
+            for t in self._tasks
+        )
+
     def pump_once(self) -> None:
         """把队列里的日志与完成事件排空一次（可手动驱动，供无界面测试）。"""
+        # 基线必须是**上一次 pump 结束时**的签名，不能在本帧开头重算：
+        # stop() 是被 Tk 回调在两次 pump 之间调用的，若本帧开头重算基线，
+        # stop_reason 的突变就已经"算进基线"了 → 刷新永远不发生。
+        before = self._last_state_signature
         while True:
             try:
                 line = self._log_queue.get_nowait()
@@ -520,7 +601,12 @@ class TaskRunner:
                     task.on_done(task)
                 except Exception as exc:                    # noqa: BLE001
                     self._emit(f"[任务 {task.tid}] 完成回调失败：{exc}")
-        if changed or self.running():
+        after = self._task_state_signature()
+        # 有完成事件、或状态签名变了才发一次。不再"只要还有任务在跑就每帧发"：
+        # 那会让 console.refresh() 在 200ms 的 after 里反复全表重建。
+        should_emit = changed or after != before
+        self._last_state_signature = after   # 无条件推进基线（含首帧）
+        if should_emit:
             self._on_change()
 
     def _poll(self) -> None:

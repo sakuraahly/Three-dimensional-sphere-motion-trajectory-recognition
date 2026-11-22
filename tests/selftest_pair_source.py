@@ -864,6 +864,7 @@ def test_auto_negotiate_helpers() -> bool:
         _measure_pair_fps,
         _pair_fps_sample,
         _profile_label,
+        resolve_min_pair_fps,
     )
 
     checks: list[tuple[str, bool]] = []
@@ -872,9 +873,20 @@ def test_auto_negotiate_helpers() -> bool:
     checks.append(("原生档标签", _profile_label(0, 0) == "原生"))
     checks.append(("普通档标签", _profile_label(1920, 1080) == "1920x1080"))
 
-    # 帧率下限 = DEFAULT_FPS * 0.6
+    # 帧率下限 = DEFAULT_FPS * 0.6（默认值；可被 settings / 显式参数覆盖）
     checks.append((f"帧率下限 = DEFAULT_FPS({DEFAULT_FPS}) * 0.6",
                    abs(AUTO_MIN_PAIR_FPS - DEFAULT_FPS * 0.6) < 1e-9))
+    checks.append(("resolve_min_pair_fps 默认 = 14.4",
+                   abs(resolve_min_pair_fps(settings={}) - AUTO_MIN_PAIR_FPS) < 1e-9))
+    checks.append(("resolve_min_pair_fps 读 settings",
+                   abs(resolve_min_pair_fps(settings={"min_pair_fps": 8.5}) - 8.5) < 1e-9))
+    checks.append(("resolve_min_pair_fps 显式参数优先",
+                   abs(resolve_min_pair_fps(5.0, {"min_pair_fps": 8.5}) - 5.0) < 1e-9))
+    checks.append(("resolve_min_pair_fps 非法/0 回默认",
+                   abs(resolve_min_pair_fps(settings={"min_pair_fps": "bad"})
+                       - AUTO_MIN_PAIR_FPS) < 1e-9
+                   and abs(resolve_min_pair_fps(settings={"min_pair_fps": 0})
+                           - AUTO_MIN_PAIR_FPS) < 1e-9))
 
     # 协商的档序来源：probe_order(None) 从最高档到原生档
     order = probe_order(None)

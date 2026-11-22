@@ -32,6 +32,13 @@ _EPS = 1e-12
 # Relative threshold on sin^2(theta) between the two rays.  This only
 # rejects numerically parallel rays; useful-angle policy belongs upstream.
 _PARALLEL_SIN2_EPS = 1e-12
+# 上层 angled.py 的默认交会角门限是 5°。几何核自己也拒绝小于该角度的射线，
+# 这样即使调用方绕过上层门禁，也不会拿到一个被近平行的病态解污染的点。
+_MIN_TRIANGULATION_ANGLE_DEG = 5.0
+#: 公开别名：上层（CLI/日志）要能说出"真正生效的下限是多少"。
+#: 这个 5° 是**数值下限**（低于它两条射线近乎平行，解会被 1/depth² 放大），
+#: 不是可调业务阈值；用户把 --min-angle-deg 调到更低时，实际生效的是它。
+MIN_TRIANGULATION_ANGLE_DEG = _MIN_TRIANGULATION_ANGLE_DEG
 _OPTICAL_AXIS = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
 
@@ -42,17 +49,26 @@ class AngledTriangulation:
     Attributes
     ----------
     xyz:
-        Midpoint of the closest points on the two rays, expressed in the
-        left camera frame, in metres, shape ``(3,)``.
+        Estimated 3D point in the left camera frame, in metres, shape ``(3,)``.
+        With per-view uncertainties this is the weighted least-squares (ML)
+        solution; with equal weights it reduces analytically to the midpoint
+        of the closest points on the two rays (the legacy behaviour).
     angle_deg:
         Angle between the left viewing ray and the right viewing ray
         after both are expressed in the left camera frame.
     residual_m:
         Half the distance between the two rays' closest points, in metres.
+        This is a property of the two (noisy) rays alone: it is deliberately
+        independent of the weighting used for ``xyz``, so the upstream gate
+        can keep using it with its original meaning.
     reproj_left_px:
         Euclidean reprojection error in the original left image.
     reproj_right_px:
         Euclidean reprojection error in the original right image.
+    weighted:
+        ``True`` when per-view detection uncertainties were supplied and the
+        weighted ML solution was used; ``False`` for the equal-weight
+        midpoint fallback.
     """
 
     xyz: np.ndarray
@@ -60,6 +76,7 @@ class AngledTriangulation:
     residual_m: float
     reproj_left_px: float
     reproj_right_px: float
+    weighted: bool = False
 
 
 def _as_K(K: np.ndarray, name: str) -> np.ndarray:
@@ -97,6 +114,34 @@ def _as_pixel(pixel: np.ndarray, name: str) -> np.ndarray:
 
 def _finite(*arrays: np.ndarray) -> bool:
     return all(bool(np.all(np.isfinite(arr))) for arr in arrays)
+
+
+def _sigma_covariance(
+    K: np.ndarray,
+    sigma: float | np.ndarray | None,
+    name: str,
+) -> np.ndarray | None:
+    """把一路的像素定位不确定度变成归一化像平面的 2x2 协方差。
+
+    ``sigma`` 以**像素**为单位：标量表示各向同性，长度 2 的序列表示
+    ``(sigma_x, sigma_y)`` 各向异性（模糊/拉长的球心在两轴上精度不同）。
+    权重是协方差的逆，因此噪声越大的轴自动越不被信任。
+
+    ``None`` 返回 ``None``，表示"没有可用不确定度"；调用方据此走两路
+    等权的保守回退，而不是凭空捏造一个权重。
+    """
+    if sigma is None:
+        return None
+    arr = np.asarray(sigma, dtype=np.float64).reshape(-1)
+    if arr.size == 1:
+        arr = np.repeat(arr, 2)
+    if arr.size != 2 or not np.all(np.isfinite(arr)) or np.any(arr <= 0.0):
+        raise ValueError(f"{name} must be a positive scalar or (sigma_x, sigma_y)")
+    f = np.array([K[0, 0], K[1, 1]], dtype=np.float64)
+    if not np.all(np.isfinite(f)) or np.any(f <= 0.0):
+        raise ValueError(f"{name}: camera focal lengths must be positive")
+    s = arr / f  # 像素 -> 归一化像平面
+    return np.diag(s * s)
 
 
 def _project_pixel(
@@ -189,16 +234,45 @@ def triangulate_pixels(
     T: np.ndarray,
     p_left: np.ndarray,
     p_right: np.ndarray,
+    *,
+    weight_left: float = 1.0,
+    weight_right: float = 1.0,
+    sigma_left: float | np.ndarray | None = None,
+    sigma_right: float | np.ndarray | None = None,
 ) -> AngledTriangulation | None:
     """Triangulate original left/right pixels without rectification.
 
     Both pixels are undistorted into normalized rays.  The right ray is
     expressed in the left camera frame with ``R.T``; its origin there is
-    ``-R.T @ T``.  The closest points on the two rays are found, and their
-    midpoint is returned in the left camera frame.
+    ``-R.T @ T``.  The closest points on the two rays are always computed:
+    their half-separation is ``residual_m`` (unchanged legacy semantics).
 
-    ``None`` is returned for parallel/degenerate rays, non-finite values,
-    or a solution that is not in front of both cameras.  It is a normal
+    The 3D point itself uses one of two closed-form solves:
+
+    * **Equal weights / no uncertainty available** (the default) -- the
+      midpoint of the two closest points.  This is exactly the old result,
+      so existing callers and the noiseless self-test are unaffected.
+    * **Per-view uncertainty supplied** -- a 3x3 weighted linear least
+      squares on the two rays' normalized reprojection residuals.  With
+      ``u, v`` the undistorted pixel and ``d`` the camera-space depth of
+      the closest point, the left residual is linearised as
+      ``r = [x - u*z, y - v*z] / d``; the right one is the same in the
+      right frame (``X2 = R @ X + T``).  Minimising
+      ``w1 * r1^T C1^-1 r1 + w2 * r2^T C2^-1 r2`` gives the normal
+      equations ``(B1^T W1 B1 + B2^T W2 B2) X = -B2^T W2 c2`` -- a plain
+      3x3 solve, no iterative optimiser and no extra dependency.  This is
+      the ML estimator for Gaussian, possibly anisotropic, pixel noise
+      and is strictly better than the midpoint when one view is noisier.
+
+    ``weight_left/right`` are scalar detection confidences (callers may
+    derive them from ball radius / score); ``sigma_left/right`` are pixel
+    uncertainties (scalar or ``(sx, sy)``).  Both default to equal, which
+    is an explicit, documented "no information" fallback rather than a
+    fake weight.
+
+    ``None`` is returned for parallel/degenerate rays (including angles
+    below :data:`_MIN_TRIANGULATION_ANGLE_DEG`), non-finite values, or a
+    solution that is not in front of both cameras.  It is a normal
     rejection, not an exception, so callers can use it per detection.
     """
     K1_arr = _as_K(K1, "K1")
@@ -235,6 +309,14 @@ def triangulate_pixels(
     if a <= _EPS or c <= _EPS:
         return None
 
+    # 交会角先算：上层有 5° 门，这里也拒一次，免得近平行的病态解走到
+    # 加权 solve 里被 1/depth^2 放大。0°/1° 在此明确返回 None，不抛异常。
+    cos_angle = b / float(np.sqrt(a * c))
+    cos_angle = float(np.clip(cos_angle, -1.0, 1.0))
+    angle_deg = float(np.degrees(np.arccos(cos_angle)))
+    if not np.isfinite(angle_deg) or angle_deg < _MIN_TRIANGULATION_ANGLE_DEG:
+        return None
+
     # sin^2(angle) * |d1|^2 * |d2|^2.  Reject both parallel and
     # anti-parallel rays, where the closest-point solve is singular.
     determinant = a * c - b * b
@@ -257,18 +339,52 @@ def triangulate_pixels(
 
     point_left = s * d1
     point_right = origin2 + t * d2
-    xyz = np.asarray(0.5 * (point_left + point_right), dtype=np.float64)
+    # residual_m 的语义固定为"两射线最近点间距的一半"，与权重无关：
+    # 另一 worker 拿它接门控，必须保持旧含义。
     residual = 0.5 * float(np.linalg.norm(point_left - point_right))
-    if not _finite(xyz) or not np.isfinite(residual):
+    if not np.isfinite(residual):
+        return None
+
+    C1 = _sigma_covariance(K1_arr, sigma_left, "sigma_left")
+    C2 = _sigma_covariance(K2_arr, sigma_right, "sigma_right")
+    has_uncertainty = (C1 is not None or C2 is not None
+                       or weight_left != weight_right)
+    if not has_uncertainty:
+        # 两路等权（无可用不确定度）=> 闭式退化为最近点中点，和旧实现逐位一致。
+        xyz = np.asarray(0.5 * (point_left + point_right), dtype=np.float64)
+        weighted = False
+    else:
+        # 加权最小二乘。左路残差 r1 = B1 @ X，右路 r2 = B2 @ X + c2，
+        # 其中 B 把 3D 点映射到各相机归一化像平面的像素残差（已除以最近点深度）。
+        # 归一化后 ray=[x,y,1]，故像平面坐标就是 ray[0], ray[1]。
+        try:
+            w1 = float(weight_left)
+            w2 = float(weight_right)
+            if (not np.isfinite(w1) or not np.isfinite(w2)
+                    or w1 <= 0.0 or w2 <= 0.0):
+                return None
+            C1_use = C1 if C1 is not None else np.eye(2, dtype=np.float64)
+            C2_use = C2 if C2 is not None else np.eye(2, dtype=np.float64)
+            B1 = np.array([[1.0, 0.0, -ray1[0]],
+                           [0.0, 1.0, -ray1[1]]], dtype=np.float64) / s
+            Br = np.array([[1.0, 0.0, -ray2[0]],
+                           [0.0, 1.0, -ray2[1]]], dtype=np.float64) / t
+            B2 = Br @ R_arr
+            c2 = Br @ T_arr
+            W1 = w1 * np.linalg.inv(C1_use)
+            W2 = w2 * np.linalg.inv(C2_use)
+            A = B1.T @ W1 @ B1 + B2.T @ W2 @ B2
+            rhs = -B2.T @ W2 @ c2
+            xyz = np.asarray(np.linalg.solve(A, rhs), dtype=np.float64)
+            weighted = True
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            return None
+    if not _finite(xyz):
         return None
 
     xyz_right = R_arr @ xyz + T_arr
     if xyz[2] <= 0.0 or xyz_right[2] <= 0.0:
         return None
-
-    cos_angle = b / float(np.sqrt(a * c))
-    cos_angle = float(np.clip(cos_angle, -1.0, 1.0))
-    angle_deg = float(np.degrees(np.arccos(cos_angle)))
 
     projected_left = _project_pixel(xyz, K1_arr, D1_arr)
     projected_right = _project_pixel(xyz_right, K2_arr, D2_arr)
@@ -284,6 +400,7 @@ def triangulate_pixels(
         residual_m=residual,
         reproj_left_px=reproj_left,
         reproj_right_px=reproj_right,
+        weighted=weighted,
     )
 
 

@@ -86,7 +86,7 @@ if str(ROOT) not in sys.path:
 MUTATIONS: list[dict[str, str]] = [
     {
         "key": "kill",
-        "target": "启动程序.py",
+        "target": "apps/gui_main.py",
         "test": "tests/selftest_task_manager.py",
         "why": "stop_task 用 capture_output 调 taskkill 却**不看返回码** —— "
                "「没杀掉」被报成「停好了」，界面显示已停、进程还在、相机仍被占着",
@@ -95,7 +95,7 @@ MUTATIONS: list[dict[str, str]] = [
     },
     {
         "key": "kill-lie",
-        "target": "启动程序.py",
+        "target": "apps/gui_main.py",
         "test": "tests/selftest_task_manager.py",
         "why": "stop_task 永远 return True —— 返回值失去意义（原来是「是否真的下手了」）",
         "old": "        self._kill_leftover(kids, task)\n"
@@ -115,7 +115,7 @@ MUTATIONS: list[dict[str, str]] = [
     },
     {
         "key": "launcher-method",
-        "target": "启动程序.py",
+        "target": "apps/gui_main.py",
         "test": "tests/selftest_launcher_params.py",
         "why": "界面默认后端/方法写死回旧值 —— 界面与命令行/文档脱节"
                "（当年界面默认 fusion，从界面走必然吃 265 ms/帧）",
@@ -130,7 +130,7 @@ MUTATIONS: list[dict[str, str]] = [
         # 2026-10-26 插件化后：`METHODS` 由注册表按注册顺序生成，"改列表顺序"已无处可改。
         # 语义等价的新锚点：把界面改回**手写清单**、且首项是 fusion ——
         # 正是插件化之前的缺陷（GUI 7 项 / 命令行 5 项各自漂移，首项还被埋在 fusion）。
-        "target": "启动程序.py",
+        "target": "apps/gui_main.py",
         "test": "tests/selftest_launcher_params.py",
         "why": "界面回到手写清单且首项是 fusion —— 清单与注册表漂移，"
                "下拉首项不再是不传参数时真正生效的那个",
@@ -140,7 +140,7 @@ MUTATIONS: list[dict[str, str]] = [
     },
     {
         "key": "backend-wiring",
-        "target": "启动程序.py",
+        "target": "apps/gui_main.py",
         "test": "tests/selftest_launcher_params.py",
         "why": "标定命令把 --backend 写死 —— 界面没有选择权，"
                "而本机 MSMF 打开两路 34.6 s、DSHOW 11.8 s",

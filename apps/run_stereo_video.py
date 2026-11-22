@@ -23,6 +23,10 @@
     derived/traj3d.csv        逐帧：matched, t, X/Y/Z, 左右像素, 极线/交会残差
     derived/annotated.mp4     左右并排 + 检测圈（--no-video 可关）
     derived/traj3d_world.csv  同上列名，坐标换成世界系（有 world_frame.json 时）
+    derived/traj3d.json       标准轨迹 JSON：没开世界系时 xyz 与 traj3d.csv 同系；
+                              有世界系时 `samples` / `bounds` 也换成世界系
+                              （`coordinate_system="world"`、`world_csv` 指回上面那份）
+                              —— JSON 里的坐标**永远**是 `coordinate_system` 说的那个系
     derived/predictions.csv   t_ref,horizon_s,x,y,z（弹道外推；--no-predict 可关）
 
 ⚠️ 默认检测器是 `color`，适合**哑光纯色球**。金属/高光球（例如摆锤）用
@@ -79,6 +83,7 @@ from stereo.triangulate import (  # noqa: E402
     build_radius_anchor,    # 一次人工点选 → 左右半径比期望值
     describe_anchor,
     epipolar_gate_px,       # `--max-epipolar auto`：按标定自报极线 RMS 定门限
+    classify_guard,         # 几何守卫：把「检出质量差」与「几何不一致」分开报
 )
 from stereo.visualization import (  # noqa: E402
     export_session_visualization,
@@ -86,7 +91,10 @@ from stereo.visualization import (  # noqa: E402
     write_seeds,
 )
 from stereo.sessions import (  # noqa: E402
-    load_session, save_session, validate_session,
+    load_session, save_session, session_calibration_file, validate_session,
+)
+from stereo.angled_geometry import (  # noqa: E402
+    MIN_TRIANGULATION_ANGLE_DEG,   # 几何核数值下限，CLI 文案要说它
 )
 
 
@@ -415,22 +423,21 @@ def _pick_detector(method: str, method_given: bool, seeds_path: Path,
                    detect_width: int, auto_seed: bool = False) -> tuple[str, str]:
     """决定这次用哪个检测器，返回 ``(方法, 要打印的一行说明)``。**纯函数**（只读种子文件）。
 
-    为什么"有种子就换 specular"必须做在这里、而且判据是"用户有没有显式给 --method"：
+    ## 2026-11-06 改：种子不再等于"必须用 specular"
 
-    - 镜面球在 `color` / `hough` 下恒为 0 检出（交接文档 §39.3：40 帧 0 检出），
-      而会话里就存着 GUI 点选过的 `derived/seeds.json`。不接管的话，用户得到的
-      结论是"0 配对 + 装置夹角可能太大" —— 方向完全是错的。
-    - 判据必须是"用户没给 `--method`"，不能写成"值等于默认值"：argparse 里两者
-      无法区分（`default="color"` 与显式 `--method color` 得到同一个值）。所以
-      参数定义用 `default=argparse.SUPPRESS`，让属性只在显式给定时才存在。
-      这比扫 `sys.argv` 可靠 —— argparse 允许前缀缩写（`--meth color`）与
-      `--method=color` 两种写法，手写扫描得自己补全，容易漏。
-    - 显式 `--method color` 时 **不换**：用户明确指定了就照做，悄悄换掉会让人
-      怀疑"我明明说了用 color"。
-    - `detect_width` 非 0 时不换：specular 的种子是原图坐标，缩放会错位，
-      换了只会一路撞到后面"specular 暂不支持 --detect-width"的报错。
-    - 种子文件坏了**不抛**：退回原方法并说明。一个坏 json 不该让整条链路崩掉，
-      而且此时用户需要的是"种子坏了"这句人话，不是一段 traceback。
+    旧规则是"会话里有 seeds.json → 强制 specular"，理由是镜面球在 color 下
+    恒为 0 检出。那条理由只对**镜面球**成立，对纯色塑料球是反的：color 本来
+    就能在整幅画面里找到它，硬换成 specular 反而把"半径来自种子"这个优势丢了。
+
+    现在按 ``seeds.json`` 里记的 ``ball_kind`` 决定：
+
+    - ``plastic`` → 保留 **color**，种子交给它取色/定半径；
+    - ``metal`` 或**旧文件没记种类** → specular（兼容旧会话）；
+    - 用户显式给了 ``--method`` → 一律照做（哪怕和 ball_kind 不一致，
+      只在说明里写一句"按你说的来"）。
+
+    `--auto-seed` 仍是"不用点选、用 YOLO 定位后交给 specular"的金属球路径；
+    纯色球不需要它（color 自己找得到）。
     """
     if auto_seed and not method_given and not detect_width:
         return "specular", ("[自动种子] --auto-seed → 用 specular + 自动定位的球心"
@@ -441,16 +448,48 @@ def _pick_detector(method: str, method_given: bool, seeds_path: Path,
         payload = load_seeds(seeds_path)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return method, f"[警告] {seeds_path} 读不出来（{exc}），继续用 {method} 检测器"
+
+    kind = str(payload.get("ball_kind") or "")
     # 半径出身要在**每次**接管时复述，不能只在 --auto-seed 那一次说（独立 Critic 指出）：
     # 自动种子把"半径来自 YOLO 框、不可信"写进了 seeds.json，但重跑时走的是这条
     # 分支、原先一个字都不提 —— 那是一次静默的告知退化，而"不可信半径"恰好是
     # 本项目最容易被当成"标定不准"的东西。
     shown = ""
-    if isinstance(payload, dict) and payload.get("source") == "auto-yolo":
+    if str(payload.get("source") or "") == "auto-yolo":
         shown = "；⚠ 这份种子是 --auto-seed 自动定位的，半径来自 YOLO 框、不可信"
+
+    if kind == "plastic":
+        return "color", (
+            "[种子] 会话里有纯色球的 derived/seeds.json → 保留 color，"
+            f"用种子取色并锚定半径{shown}")
+    if kind and kind != "metal":
+        return method, (f"[警告] seeds.json 的 ball_kind={kind!r} 不认识，"
+                        f"未自动接管；继续用 {method} 检测器")
+    if not kind:
+        # ball_kind 为空 = GUI 点选时没记球种类（也可能是 2026-11-06 前的旧会话）。
+        # 返回 specular 是**刻意保留的旧会话兼容**（见 docstring），不许粗暴改
+        # 成默认 color —— 那会让全部历史镜面球会话失效。但以前只返回一行
+        # `[种子]` 开头的说明，混在输出里等于静默：用户明明是纯色塑料球，
+        # 却完全没用上 color 而毫无察觉。这里升级成可见的 [警告]，把后果
+        # 和覆盖办法写明，兼容行为一字不动。
+        return "specular", (
+            "[警告] [种子] seeds.json 的 ball_kind 为空（未记录球种类）：按旧会话兼容"
+            "仍自动改用 specular + 该种子 —— 纯色塑料球会因此完全不走颜色检测。"
+            "若这是纯色球，请显式 --method color（或重新点选时在球种类里选"
+            f"『纯色塑料球』）；要覆盖请显式 --method{shown}")
     return "specular", (
         "[种子] 会话里有 derived/seeds.json → 自动改用 specular + 该种子"
         f"（镜面球用 color/hough 检不到；要覆盖请显式 --method）{shown}")
+
+
+def world_gravity_world(ground_axis: str) -> tuple[float, float, float]:
+    """世界系里的重力向量。
+
+    世界系的竖直轴是 **Z**，不是 Y。``ground_axis="z"`` 时 +Z 朝下
+    （板法向背离相机），重力沿 +Z；``"-z"`` 时 +Z 朝上，重力沿 -Z。
+    这个出口只回答"世界系里 g 是哪一向量"，换到相机系由调用方乘 R^T。
+    """
+    return (0.0, 0.0, 9.81 if str(ground_axis or "z") == "z" else -9.81)
 
 
 def _world_block(world: WorldFrame | None, arr, base_frame: str) -> tuple[np.ndarray | None, dict]:
@@ -490,6 +529,65 @@ def _world_block(world: WorldFrame | None, arr, base_frame: str) -> tuple[np.nda
         else:
             out[:, 0:3] = world.apply(a)
     return out, block
+
+
+def _apply_world_to_trajectory_payload(
+    payload: dict,
+    world_arr,
+    block: dict,
+    base_frame: str,
+    world_csv_name: str = "",
+) -> tuple[dict, str | None]:
+    """把**已经算好**的世界系坐标真的写进 `traj3d.json` 的 payload。
+
+    为什么需要（B-134，2026-11-15 修）：此前这里只写 `coordinate_system` /
+    `world_frame` 两个**标签**，`samples[*]["xyz"]` 仍是 `traj3d.csv` 的相机系坐标
+    —— 标签说 world、数据说 camera。下游按标签解释就得到错数，而且**看不出错**。
+    `world_arr` 在 `_world_block()` 里已经算好了（`(N,4)`，列 0 是 t、列 1-3 是 XYZ），
+    这里只是把这份坐标落到 payload，让标签说的话成为事实。
+
+    返回 ``(payload, 跳过原因或 None)``，三条分支：
+
+    - ``world_arr is None``：**主路径**（没开世界系）。如实写 `base_frame`、
+      `world_frame=None`，xyz 与 bounds 一字不动；
+    - 数量对得上：逐点换 matched 的 xyz、**重算 bounds**（口径同
+      `build_trajectory_payload()`）、宣称 `world`、附 `world_csv`；
+    - 数量对不上：**不宣称世界系**（宁可退成相机系并说明，也不产出标签与数据
+      不一致的文件），原因写进 `world_skipped` 交给调用方打印 —— 走到这一步
+      CSV / JSON / 视频都已落地，"少一次换系"不是错误，不许抛。
+
+    纯函数：不读文件、不写文件、不抛异常（只改传进来的 `payload`）。
+    """
+    samples = payload.get("samples") or []
+    if world_arr is None:
+        payload["coordinate_system"] = base_frame
+        payload["world_frame"] = None
+        return payload, None
+
+    idx = [i for i, s in enumerate(samples) if s.get("matched") and s.get("xyz")]
+    n_world = len(world_arr)
+    if len(idx) != n_world:
+        reason = (f"matched 样本数 {len(idx)} 与世界系行数 {n_world} 不一致，"
+                  "坐标未换系（世界系见 traj3d_world.csv）")
+        payload["coordinate_system"] = base_frame
+        payload["world_frame"] = None
+        payload["world_skipped"] = reason
+        return payload, reason
+
+    pts: list[list[float]] = []
+    for j, i in enumerate(idx):
+        row = world_arr[j]
+        samples[i]["xyz"] = [float(row[1]), float(row[2]), float(row[3])]
+        pts.append(samples[i]["xyz"])
+    payload["bounds"] = None if not pts else {
+        "min": [min(p[k] for p in pts) for k in range(3)],
+        "max": [max(p[k] for p in pts) for k in range(3)],
+    }
+    payload["coordinate_system"] = "world"
+    payload["world_frame"] = block.get("world_frame")
+    if world_csv_name:
+        payload["world_csv"] = world_csv_name
+    return payload, None
 
 
 def _predict_block(arr, cfg: PredictConfig) -> tuple[list[dict], dict]:
@@ -660,9 +758,10 @@ def main() -> int:
                         "；".join(f"{d['name']}={d['summary']}"
                                   for d in describe("detector"))))
     ap.add_argument("--preset", default=None,
-                    choices=ColorConfig.preset_names(),
-                    help="color 预设（球色）；不传=用配置里的颜色。可选：%s"
-                         % (" / ".join(ColorConfig.preset_names())))
+                    choices=ColorConfig.preset_choices(),
+                    help="color 取色方式：auto=按画面自动估主色（不需要知道球色），"
+                         "其余是固定颜色预设；不传=用配置里的颜色。可选：%s"
+                         % (" / ".join(ColorConfig.preset_choices())))
     ap.add_argument("--origin", default="0,0,0",
                     help="视频里标出的参照原点（parallel=校正左相机系，"
                          "angled=原始左相机系；x,y,z 米；默认相机光心投影）")
@@ -693,13 +792,25 @@ def main() -> int:
                          "免得每次覆盖上一次的结果")
     ap.add_argument("--detect-width", type=int, default=0,
                     help="检测缩到多宽（0=原图；真实纹理下 hough 建议 960）")
-    ap.add_argument("--min-radius", type=float, default=8.0)
-    ap.add_argument("--max-radius", type=float, default=200.0)
+    ap.add_argument("--min-radius", type=float, default=None,
+                    help="球的最小半径（px）。缺省=自动：下限 8px，上限走尺寸门阶梯")
+    ap.add_argument("--max-radius", type=float, default=None,
+                    help="球的最大半径（px）。给了它就**关掉**尺寸门自动阶梯（手工优先）")
+    ap.add_argument("--no-radius-auto", action="store_true",
+                    help="关掉尺寸门自动阶梯（与给 --max-radius 等价；用于复现老行为）")
     ap.add_argument("--hough-max-radius", type=float, default=80.0)
     ap.add_argument("--max-epipolar", default=None, metavar="PX|auto",
                     help="极线门限（px）；缺省平行 2.5 / angled 8，显式值不被覆盖。"
                          "auto=按标定自报极线 RMS×%g 自适应（见 stereo.triangulate."
                          "epipolar_gate_px）" % EPI_GATE_K)
+    ap.add_argument("--min-angle-deg", type=float, default=None, metavar="DEG",
+                    help="angled 专用：最小交会角（度），默认 5.0（见 "
+                         "stereo.angled.AngledMatchConfig）。按本次录像的交会角分布调门；"
+                         f"低于几何核数值下限 {MIN_TRIANGULATION_ANGLE_DEG:g}° 的部分不生效"
+                         "（近平行时三角化会被 1/深度² 放大，核层先拒）；parallel 下忽略")
+    ap.add_argument("--max-reproj-px", type=float, default=None, metavar="PX",
+                    help="angled 专用：最大重投影误差（px），默认 3.0（见 "
+                         "stereo.angled.AngledMatchConfig）。parallel 下忽略")
     ap.add_argument("--sync-offset", type=int, default=None,
                     help="覆盖 session 的同步偏移（默认用 session.sync.offset）")
     ap.add_argument("--pairing", choices=("index", "timestamp", "canary"),
@@ -713,9 +824,10 @@ def main() -> int:
                     help="auto=读 session/标定；angled=大角度（近似直角）")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--geometry-guard", type=int, default=30, metavar="N",
-                    help="跑满 N 对后先判一次『录像几何 vs 标定』：对不上就早停"
-                         "（不白跑整段，也不产出看似正常的错数字）；0=关。默认 30。"
-                         "判据见 stereo.triangulate.geometry_verdict")
+                    help="跑满 N 对后判一次『录像几何 vs 标定』：判出可疑时分开报"
+                         "『检出质量差』或『几何不一致』，但两种情况都**照常出结果、"
+                         "不中止**（质量只作标注，结论写进 traj3d.json 的 quality 块）；"
+                         "0=关。默认 30。判据见 stereo.triangulate.geometry_verdict")
     ap.add_argument("--joint-refine", choices=("off", "on"), default="off",
                     help="跨视图联合细化：两路共享极线 v、各自解 u，用来修"
                          "『两路独立细化出的圆心各偏一边』的问题"
@@ -814,10 +926,19 @@ def main() -> int:
         print("[错误] session 缺 left/right/calibration")
         return 1
 
-    calib_path = Path(s.calibration.path)
-    if not calib_path.is_absolute():
-        calib_path = session_dir / calib_path
+    calib_path = session_calibration_file(session_dir)
     rig = StereoRig.load(calib_path)
+    # A2（离线侧标记，不拦）：录制链用 is_forced_unusable() 拦下强制保存的坏标定，
+    # 但离线链以前完全没读这个字段 —— 2026-11-11 就是坏标定录制被拦、离线照跑。
+    # 这里只**标记**：写进 traj3d.json["quality"] + 打横幅，绝不 return/raise/改
+    # 退出码。用户原则「质量差也要出结果，只有错误才紧急」在这里同样成立。
+    from stereo.record_plan import is_forced_unusable
+    forced_unusable = bool(is_forced_unusable(rig))
+    if forced_unusable:
+        print("=" * 70)
+        print("[仅链路测试] 当前 rig 是强制保存的不可用标定：本次离线结果只能用于"
+              "链路测试，不得用于数据结论（不中止，产物照常输出）。")
+        print("=" * 70)
     if args.stereo_mode == "auto":
         # ---- 双目模式：入口层唯一解析点 ----
         # auto 只在这里由 resolve_auto() 落定（显式 > 标定 meta > 会话 > parallel），
@@ -921,8 +1042,25 @@ def main() -> int:
         # 8 px 也只放过 1/30 —— 那种情况是"录像和标定对不上"，不要靠继续往上调来救，
         # 去看程序打出的 [诊断] 几何一致性那几行，然后重标定。
         print("[specular] 极线门限 2.5px 对人工 seed/CSRT 太紧，默认放宽到 8px")
-    cfg.detector.min_radius = float(args.min_radius)
-    cfg.detector.max_radius = float(args.max_radius)
+    # 半径门（2026-11-08）：**手工优先**。显式给了 --min/--max-radius 就按老规矩写死；
+    # 都不给时下限仍是 8px（去噪与距离无关），上限交给 `SizeLadder` 逐档协商 ——
+    # 起因是梨子 r≈205px 被写死的 200 砍掉，而提示还说"球可能太小"。
+    ladder = None
+    if args.min_radius is not None:
+        cfg.detector.min_radius = float(args.min_radius)
+    if args.max_radius is not None:
+        cfg.detector.max_radius = float(args.max_radius)
+    if (args.min_radius is None and args.max_radius is None
+            and not args.no_radius_auto):
+        from sphere_tracker.detectors.size_ladder import PROBE_FRAMES, SizeLadder
+
+        ladder = SizeLadder(image_h=float(src.image_size[1]),
+                            min_radius=float(cfg.detector.min_radius),
+                            probe_frames=PROBE_FRAMES)
+        print(f"[半径门] 走自动阶梯：{len(ladder.steps)} 档 "
+              f"(k={', '.join(f'{k:.2f}' for k in ladder.steps)} × 画面高 "
+              f"{src.image_size[1]}px)，每档看 {PROBE_FRAMES} 帧；"
+              f"想写死就加 --max-radius")
     cfg.detector.hough_max_radius = float(args.hough_max_radius)
     cfg.predict.enable = False
     if args.preset:
@@ -930,7 +1068,13 @@ def main() -> int:
     pipe_l = _make_pipeline(cfg, rig, "left")
     pipe_r = _make_pipeline(cfg, rig, "right")
     seed_frame = 0        # 种子落在第几帧；后面要拿它给重建器设"预热期"
-    if method == "specular":
+    seed_l = seed_r = None
+    # 哪些方法**接受**种子：specular 用它做 CSRT 初始化；color 用它取色 + 定半径。
+    # 其余方法（hough/motion/fusion/yolo）没有种子的语义，传了只会被忽略。
+    takes_seed = method in ("specular", "color")
+    seed_asked = bool(args.seed or args.seed_right or args.seed_json
+                      or args.auto_seed or seeds_path.exists())
+    if takes_seed and seed_asked:
         def _seed_arg(text: str, what: str):
             try:
                 parts = [float(v) for v in text.split(",")]
@@ -941,28 +1085,47 @@ def main() -> int:
                 return None
             return tuple(parts)
 
-        if args.detect_width:
-            print("[错误] --method specular 暂不支持 --detect-width："
-                  "种子坐标是原图坐标，缩放会错位。")
+        if args.detect_width and (args.seed or args.seed_right):
+            print("[错误] 种子坐标是原图坐标，--detect-width 会让它错位："
+                  "给了 --seed/--seed-right 就不要再缩图。")
             return 2
-        if args.auto_seed and seeds_path.exists():
+        # 会话里的 seeds.json 也是原图坐标：specular 没种子跑不了 → 直接停；
+        # color 可以不用种子（按预设/auto 取色）→ 忽略文件并说明，别让用户
+        # 以为"种子生效了"而实际坐标错位。
+        ignore_file_seed = False
+        if args.detect_width and seeds_path.exists():
+            if method == "specular":
+                print("[错误] specular 的种子坐标是原图坐标，不能与 --detect-width 同用；"
+                      "去掉 --detect-width 再跑。")
+                return 2
+            print("[提示] --detect-width 生效时 seeds.json 的坐标会错位："
+                  "本次忽略种子，按 --preset / 自动取色检测")
+            ignore_file_seed = True
+        if args.auto_seed and method == "color":
+            # color 不需要种子 —— 它在整幅画面里按颜色找球。静默忽略会让用户以为
+            # "自动定位生效了"，所以明确说一句。
+            print("[自动种子] --method color 不需要 --auto-seed（颜色分割自己找得到球）；"
+                  "本次忽略它，球色用 --preset 或种子取色决定")
+        elif args.auto_seed and seeds_path.exists():
             # 用户的显式意图不能被静默忽略：已有种子更好（是人工点选的），所以照用它，
             # 但必须说一声"你给的 --auto-seed 这次没生效、原因是什么"。
             print("[自动种子] 会话里已有 derived/seeds.json → 直接用它"
                   "（--auto-seed 不再自动定位）；要强制重新定位请先删掉它，"
                   "或用 --seed/--seed-right 覆盖")
         seed_json = None
-        if seeds_path.exists():
+        if seeds_path.exists() and not ignore_file_seed:
             try:
                 seed_json = load_seeds(seeds_path)
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                # 走到这里说明用户是**显式**要 specular 的（自动接管那条路已在
-                # `_pick_detector` 里退回原检测器）。此时静默换回 color 只会得到
-                # "0 检出"这个更难查的现象，所以停下来说清楚是哪一步坏了。
-                print(f"[错误] 种子文件不可用：{seeds_path}（{exc}）")
-                print("  重开『② 点选球心』重新保存，或改用 --seed/--seed-right。")
-                return 2
-        elif args.seed_json:
+                # specular 没有种子就跑不了，必须停；color 没有种子仍能按颜色检测，
+                # 此时停掉等于把"能跑"变成"不能跑"，所以只警告并继续。
+                if method == "specular":
+                    print(f"[错误] 种子文件不可用：{seeds_path}（{exc}）")
+                    print("  重开『② 点选球心』重新保存，或改用 --seed/--seed-right。")
+                    return 2
+                print(f"[警告] 种子文件不可用：{seeds_path}（{exc}）；"
+                      "color 会继续按预设/自动取色检测，但半径没有种子锚")
+        elif args.seed_json and not seeds_path.exists():
             print(f"[错误] --seed-json 不存在：{seeds_path}")
             return 2
         if args.seed or args.seed_right:
@@ -977,8 +1140,9 @@ def main() -> int:
             try:
                 saved = write_seeds(session_dir, seed_l, seed_r, seed_frame=seed_frame,
                                     image_size=tuple(src.image_size), source="cli",
-                                    note="命令行 --seed/--seed-right")
-                print(f"[specular] 已写标准 seed：{saved}")
+                                    note="命令行 --seed/--seed-right",
+                                    ball_kind=("plastic" if method == "color" else "metal"))
+                print(f"[{method}] 已写标准 seed：{saved}")
             except Exception as exc:                        # noqa: BLE001
                 print(f"[警告] seed 写入失败（继续跑）：{exc}")
         elif seed_json is not None:
@@ -987,8 +1151,14 @@ def main() -> int:
             seed_r = (float(seed_json["right"]["x"]), float(seed_json["right"]["y"]),
                       float(seed_json["right"]["radius"]))
             seed_frame = int(seed_json.get("seed_frame", args.seed_frame))
-            print(f"[specular] 读标准 seed：{seeds_path}")
-        elif args.auto_seed:
+            kind = str(seed_json.get("ball_kind") or "")
+            print(f"[{method}] 读标准 seed：{seeds_path}"
+                  + (f"（ball_kind={kind}）" if kind
+                     else "（ball_kind 为空：未记录球种类）"))
+            if method == "color" and kind == "metal":
+                print("[提示] 这份种子记的是镜面金属球；color 仍会用它取色，"
+                      "但金属球建议 --method specular")
+        elif args.auto_seed and method == "specular":
             found = _auto_seed_pair(cfg, src)
             if found is None:
                 return 2
@@ -1002,26 +1172,38 @@ def main() -> int:
             try:
                 saved = write_seeds(session_dir, seed_l, seed_r, seed_frame=seed_frame,
                                     image_size=tuple(src.image_size), source="auto-yolo",
-                                    note=f"YOLO 在第 {hit_index} 对自动定位（--auto-seed）")
+                                    note=f"YOLO 在第 {hit_index} 对自动定位（--auto-seed）",
+                                    ball_kind="metal")
                 print(f"[自动种子] 已写标准 seed：{saved}")
             except Exception as exc:                        # noqa: BLE001
                 print(f"[警告] seed 写入失败（继续跑）：{exc}")
-        else:
+        elif method == "specular":
             print("[错误] --method specular 需要球心种子：")
             print("  GUI：第 3 步「点选球（双目 seed）」；")
             print("  或 CLI：--seed 左x,左y,左r --seed-right 右x,右y,右r")
             print("  也可用 --seed-json <seeds.json>；不点选就用 --auto-seed"
                   "（YOLO 自动定位，半径来自框、不可信）。")
             return 2
-        pipe_l.detector.seed(*seed_l, frame_index=seed_frame)
-        pipe_r.detector.seed(*seed_r, frame_index=seed_frame)
-        print(f"[specular] 左 seed={seed_l} 右 seed={seed_r} 初始化帧={seed_frame}")
-        if seed_frame > 0:
-            print(f"[提示] seed_frame={seed_frame}：前 {seed_frame} 对按设计不会初始化检测；"
-                  "除非第 0 帧看不清球，否则建议改成 0")
+
+        if seed_l is not None and seed_r is not None:
+            for label, pipe, sd in (("左", pipe_l, seed_l), ("右", pipe_r, seed_r)):
+                fn = getattr(pipe.detector, "seed", None)
+                if callable(fn):
+                    fn(*sd, frame_index=seed_frame)
+                else:                                       # 保险：注册表变了也不会静默
+                    print(f"[警告] {method} 不接受种子，本次忽略")
+                    break
+            print(f"[{method}] 左 seed={seed_l} 右 seed={seed_r} 初始化帧={seed_frame}")
+            if method == "color":
+                print("[color] 种子用途：从点击点周围取 HSV 区间、半径锚在 seed_r 上；"
+                      "种子帧若颜色分割无候选，直接按种子输出 Detection")
+            if seed_frame > 0:
+                print(f"[提示] seed_frame={seed_frame}：前 {seed_frame} 对按设计不会初始化检测；"
+                      "除非第 0 帧看不清球，否则建议改成 0")
 
     elif args.seed or args.seed_right:
-        print("[警告] 只有 --method specular 使用 --seed/--seed-right；已忽略。")
+        print(f"[警告] {method} 不接受 --seed/--seed-right"
+              "（只有 specular / color 用）；已忽略。")
     if args.detect_width:
         pipe_l.set_detect_width(args.detect_width)
         pipe_r.set_detect_width(args.detect_width)
@@ -1047,17 +1229,44 @@ def main() -> int:
         from stereo.angled import AngledMatchConfig, AngledReconstructor
         if args.max_epipolar is None:
             print("[angled] 极线门限默认放宽到 8px（大角度下候选像素偏差更大）")
-        rec = AngledReconstructor(rig, AngledMatchConfig(max_epipolar_px=epi))
+        # A5：两个新门限只在 angled 下生效；不传时取 AngledMatchConfig 的
+        # 5.0 / 3.0 默认值，老行为逐字不变。
+        _min_angle = (5.0 if args.min_angle_deg is None
+                      else float(args.min_angle_deg))
+        _max_reproj = (3.0 if args.max_reproj_px is None
+                       else float(args.max_reproj_px))
+        angled_cfg = AngledMatchConfig(max_epipolar_px=epi,
+                                       min_angle_deg=_min_angle,
+                                       max_reproj_px=_max_reproj)
+        rec = AngledReconstructor(rig, angled_cfg)
+        # 交会角的**实际**生效值 = max(用户设的, 几何核数值下限)。
+        # 不这么说清楚，用户把 --min-angle-deg 调到 3 会以为设置没生效
+        # （核层先按 5° 拒了）——2026-11-18 两个 worker 同时提出这个歧义。
+        _eff_min_angle = max(float(_min_angle), MIN_TRIANGULATION_ANGLE_DEG)
+        print(f"[门限] 实际生效三阈值（angled）：极线 {epi:g}px / "
+              f"交会角 {_eff_min_angle:g}° / 重投影 {_max_reproj:g}px")
+        if float(_min_angle) < MIN_TRIANGULATION_ANGLE_DEG:
+            print(f"       注意：交会角设的是 {_min_angle:g}°，但几何核数值下限是 "
+                  f"{MIN_TRIANGULATION_ANGLE_DEG:g}°，{_min_angle:g}~"
+                  f"{MIN_TRIANGULATION_ANGLE_DEG:g}° 的点仍会被拒")
     else:
+        if args.min_angle_deg is not None or args.max_reproj_px is not None:
+            print("[警告] --min-angle-deg / --max-reproj-px 只对 angled 生效；"
+                  "当前是 parallel，已忽略")
         # `source_hint` 只进"0 配对"的报错文案：那句话要能直接告诉用户
         # `--seed-json <会话>/derived/seeds.json` 长什么样，重建器自己不知道会话在哪。
         # 用 as_posix()：文案里再拼 "/derived/seeds.json"，混着反斜杠会像坏路径。
+        # 离线入口按新原则「凡是质量差也照常出结果」：显式放行 0 配对门禁，
+        # 由入口自己打印诊断 + 写 traj3d.json["quality"] 标记。库层默认仍抛，
+        # 保护 mono_vs_stereo / profile_stages 等其它调用方的静默失效防呆。
+        # 只给 parallel 分支加：angled 用 AngledReconstructor，没有这个门禁。
         rec = StereoReconstructor(
             rig,
             MatchConfig(max_epipolar_px=epi,
                         radius_ratio_expected=(anchor.radius_ratio if anchor else 0.0),
                         radius_ratio_band=(anchor.band if anchor else 0.25)),
-            source_hint=session_dir.as_posix())
+            source_hint=session_dir.as_posix(),
+            allow_zero_match=True)
     # 种子落在第 N 帧时，前 N 帧**按设计**不会有检测。不告诉重建器的话，它的
     # 零配对门禁会在第 20 帧判"检测器坏了"并抛错 —— 2026-11-01 真实踩到：
     # 用户在 GUI 第 80 帧点选球心，跑离线三维直接报错，看起来像"点选没用"。
@@ -1065,13 +1274,16 @@ def main() -> int:
         rec.warmup_frames = int(seed_frame)
         print(f"[提示] 前 {seed_frame} 帧记为预热期：零配对判据从第 "
               f"{seed_frame + 20} 帧之后才生效，配对率分母也扣掉这段")
-    # 录前几何守卫（`B-131`）：跑满 N 对就先判一次"录像几何 vs 标定"，对不上就早停。
-    # 放在这里而不是库层默认：`mono_vs_stereo` / `profile_stages` 会在同一批坏会话上
-    # 跑，默认拦下来会让它们从"出数"变成"崩"；那是入口层的决定，不该由库替它做。
+    # 录前几何守卫（`B-131`）：跑满 N 对判一次"录像几何 vs 标定"。2026-11-13 起
+    # 判出可疑**不再早停**：分开报「检出质量差 / 几何不一致」，两种都照常出结果
+    # （只有错误才紧急），在 stdout 打一条结构化标记，结论写进 traj3d.json["quality"]。
+    # 放在入口层而不是库层默认：`mono_vs_stereo` / `profile_stages` 会在同一批坏会话
+    # 上跑，默认拦下来会让它们从"出数"变成"崩"；那是入口层的决定，不该由库替它做。
     guard_at = args.geometry_guard if args.geometry_guard > 0 else 0
     guard_armed = bool(guard_at and mode == "parallel")
     if guard_armed:
-        print(f"[几何守卫] 跑满 {guard_at} 对后先判一次极线几何，与标定对不上就早停"
+        print(f"[几何守卫] 跑满 {guard_at} 对后判一次极线几何；与标定对不上时"
+              "分开报『检出质量差 / 几何不一致』，都照常出结果、不中止"
               "（--geometry-guard 0 可关）")
     # `--out` 让产物**不落在会话目录里**（2026-10-27 补）。
     #
@@ -1079,10 +1291,13 @@ def main() -> int:
     # 每次都覆盖 `<session>/derived/`，上一次的结果就没了 —— 要么手工 `cp` 到别处
     # （实测就是这么干的，完事还得记着删），要么反复跑同一份数据。
     # 现在的约定：**不给 `--out` 就还是老行为**（写回会话目录），给了就全写进去。
+    # B-161/172：CSV / 视频 / PNG / **标准 JSON** 全部从**同一个落点变量** out_dir
+    # 派生。旧版标准 JSON 由 export_session_visualization(session_dir, ...) 写死在
+    # session_dir/derived，--out 改不动它（见下方导出处的同一变量注释）。
     out_dir = Path(args.out) if args.out else (session_dir / "derived")
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.out:
-        print(f"[输出] 产物写到 {out_dir}（会话目录保持干净）")
+    print(f"[输出] 全部产物（含标准 JSON）写到 {out_dir}"
+          + ("（会话目录保持干净）" if args.out else "（会话目录内）"))
     # 部分帧试跑不要把正式的 traj3d.csv / annotated.mp4 覆盖成 0.17 s
     partial = f"_first{args.max_frames}" if args.max_frames else ""
     csv_path = out_dir / f"traj3d{partial}.csv"
@@ -1114,7 +1329,18 @@ def main() -> int:
     trail_l: list[tuple[float, float]] = []
     trail_r: list[tuple[float, float]] = []
     n_pairs = 0
-    center_src = {"contour": 0, "box": 0}   # 只看这两种；其它（非 specular）不计数
+    center_src = {"contour": 0, "box": 0, "seed": 0}   # 圆心口径来源（含种子锚点）
+    # 检出质量信号：逐帧累加。debug_snapshot() 每帧覆盖（color.py:712 返回
+    # dict(self._diag, ...)），不能收尾时取最后一帧。供守卫把「检出质量差」与
+    # 「几何不一致」分开报，结论也写进 traj3d.json["quality"]。
+    quality_sig = {
+        "gates": {"radius": 0, "circ": 0, "fill": 0, "radial": 0, "score": 0},
+        "candidates": 0,
+        "biggest_gate_frames": 0,
+        "seed_anchor_frames": 0,
+        "frames": 0,
+    }
+    guard_quality: dict | None = None   # 守卫判读结论（没判过 / 不可疑时保持 None）
     # 联合细化的计数与样本（off 时是一个没人读的空容器，不产生任何输出）。
     # 计数和样本分开：dv / 保留率会被 NaN 或"算不出来"过滤掉，计数不能因此少报。
     jr_stats = {
@@ -1134,10 +1360,33 @@ def main() -> int:
             if args.max_frames and n_pairs >= args.max_frames:
                 break
             t = n_pairs / fps
+            # 尺寸门阶梯（2026-11-08）：每帧前把当前档位的窗口写回 cfg（检测器读的是
+            # `self.cfg.min_radius/max_radius`，两路共用同一个 cfg 对象，所以一次就够）。
+            if ladder is not None and not ladder.done:
+                _lo, _hi = ladder.window
+                cfg.detector.min_radius, cfg.detector.max_radius = _lo, _hi
             res_l = pipe_l.process(left_frame, t)
             res_r = pipe_r.process(right_frame, t)
             det_l = _as_detection(res_l)
             det_r = _as_detection(res_r)
+            if ladder is not None and not ladder.done:
+                # `r_blocked` = 被**尺寸门单独**挡住的最大候选半径。只认它，
+                # 不认"被圆度挡掉"的候选 —— 放大窗口救不了形状。
+                _snap = getattr(pipe_l.detector, "debug_snapshot", dict)()
+                # 点选种子的兜底输出**不算检出**：那是"把点选位置原样返回"，
+                # 拿它当命中会让阶梯在第一档就锁死（梨子那次实测 12/12 假命中）。
+                # 注意要读 `res.detection` 而不是 `_as_detection()` 的返回值 ——
+                # 后者在跟踪生效时会**新建**一个 Detection，把 extra 丢了。
+                _raw = getattr(res_l, "detection", None)
+                _anchor = bool((getattr(_raw, "extra", None) or {}).get("seed_anchor"))
+                _real = _raw is not None and not _anchor
+                _st = ladder.observe(_real, _snap.get("r_blocked") or None)
+                if _st == "step":
+                    print(f"[半径门] {ladder.attempts[-2].line()} → 升档")
+                elif _st in ("hit", "no_candidate", "exhausted"):
+                    for _line in ladder.history_lines():
+                        print(f"[半径门] {_line}")
+                    print(f"[半径门] {ladder.describe()}")
             # 跨视图联合细化（B-166，默认 off）：只有两路都有检测时才成对做，
             # 单边缺检测没有任何"跨视图"可对齐。灰度**每帧每路只转一次**：cvtColor
             # 是这段里最容易被忘掉的重复开销（一帧转两遍等于白烧一遍）。
@@ -1182,6 +1431,39 @@ def main() -> int:
             pt = rec.update(t, det_l, [det_r] if det_r is not None else [])
             n_pairs += 1
 
+            # ---- 检出质量信号：逐帧累加（debug_snapshot 每帧覆盖，不能收尾取一次）----
+            # color.py:712 的 debug_snapshot() 返回 dict(self._diag, ...)，_diag 每帧
+            # 被 _diagnose 覆盖，所以这里必须自己累加 gates / biggest / anchor。
+            # 非 color 检测器用 getattr 兜底，缺方法 / 缺键都不许让主循环崩。
+            quality_sig["frames"] += 1
+            _frame_anchor = False
+            _frame_big_gate = False
+            for _res, _pipe in ((res_l, pipe_l), (res_r, pipe_r)):
+                _snap = getattr(getattr(_pipe, "detector", None),
+                                "debug_snapshot", lambda: {})()
+                if isinstance(_snap, dict):
+                    _g = _snap.get("gates") or {}
+                    if isinstance(_g, dict):
+                        for _k in quality_sig["gates"]:
+                            _v = _g.get(_k, 0)
+                            if isinstance(_v, (int, float)):
+                                quality_sig["gates"][_k] += int(_v)
+                                quality_sig["candidates"] += int(_v)
+                    _big = _snap.get("biggest") or {}
+                    if (isinstance(_big, dict)
+                            and _big.get("gate") in ("circ", "fill", "radial", "score")):
+                        _frame_big_gate = True
+                _det = getattr(_res, "detection", None)
+                _extra = getattr(_det, "extra", None) or {}
+                if _extra.get("seed_anchor"):
+                    _frame_anchor = True
+                elif _det is not None:
+                    quality_sig["candidates"] += 1     # 过门被采纳的候选
+            if _frame_anchor:
+                quality_sig["seed_anchor_frames"] += 1
+            if _frame_big_gate:
+                quality_sig["biggest_gate_frames"] += 1
+
             # 圆心口径的来源（S2a）：`center_source` 由**检测器**给，不随 `TrackState`
             # 往下传，所以只在这里从流水线结果里取。用途只有一个 —— 几何守卫判读前
             # 分清"几何坏了"还是"圆心没钉到轮廓上"（后者 y 差也会错开 ≈6 px）。
@@ -1196,17 +1478,54 @@ def main() -> int:
             # `geometry_verdict` 返回 None —— 那是"还没法判"，**不消耗这次机会**，
             # 下一帧接着看。原来写的是 `n_pairs == guard_at`（只判一次），丢帧多时会
             # 一次也没判成、然后永久放弃 —— 那是一条假阴性路径。
-            # 判出可疑就 `return 2`：**拒绝出数**。放宽门限能"跑通"，但那些点的
-            # 残差与交会角本来就是错的（`B-131`：dy 中位 12.4 px，残差 3.9~7.2 px）。
+            # 判出可疑**不再早停**：分开报「检出质量差 / 几何不一致」，两种都照常
+            # 出结果。放宽门限能"跑通"但那些点本来就是错的（B-131），所以结论照给、
+            # 只是不中止；只有错误才紧急。结构化标记行供 GUI 后续消费。
             if guard_armed and n_pairs >= guard_at:
                 guard_armed, v = _guard_step(guard_armed, guard_at, n_pairs,
                                              rec.dy_samples, getattr(rig, "quality", None))
                 if v is not None and v.suspect:
                     _tot = center_src["contour"] + center_src["box"]
                     _box = (center_src["box"] / _tot) if _tot else None
+                    _frames = max(quality_sig["frames"], 1)
+                    sig = {
+                        "gates": dict(quality_sig["gates"]),
+                        "candidates": quality_sig["candidates"],
+                        "biggest_gate_share": quality_sig["biggest_gate_frames"] / _frames,
+                        "center_box_share": _box,
+                        "both_detected_rate": len(rec.dy_samples) / max(n_pairs, 1),
+                        "seed_anchor_share": quality_sig["seed_anchor_frames"] / _frames,
+                    }
+                    verdict = classify_guard(v, sig)
                     print()
-                    print(rec.geometry_failure_message(v, _box))
-                    return 2
+                    if verdict == "detection_quality":
+                        # 检出质量差：新文案（不含「重新标定」，指向形状门/预设/检测器）
+                        print(rec.geometry_failure_message(
+                            v, _box, cause="detection_quality", sig=sig))
+                        _note = "检出质量差，结果仅供参考"
+                    else:
+                        # 几何不一致：原文案一字不动（含第 1/2/3 步与「重新标定」）
+                        print(rec.geometry_failure_message(v, _box))
+                        _note = "录像几何与标定不一致，结果仅供参考"
+                    guard_quality = {
+                        "verdict": verdict,
+                        "grade": "degraded",
+                        "degraded": True,
+                        "degraded_reason": _note,
+                        "warnings": list(getattr(rec, "warnings", [])),
+                        "dy_med_px": v.med,
+                        "epipolar_rms_px": v.epipolar_rms,
+                        "ratio": v.ratio,
+                        "match_rate": rec.match_rate,
+                        "both_detected_rate": sig["both_detected_rate"],
+                        "gate_rejects": dict(quality_sig["gates"]),
+                        "center_box_share": _box,
+                        "note": _note,
+                    }
+                    # 结构化、可被 GUI 消费的一行标记（GUI 状态通道统一接这里）。
+                    print(f"[质量] verdict={verdict} dy_med={v.med:.2f} "
+                          f"ratio={v.ratio:.1f} 结果仅供参考"
+                          "（详见 traj3d.json[\"quality\"]）")
 
             if pt is None:
                 # ⚠️ 这一行的字段数**必须**和 header 一样（15 个）。
@@ -1249,12 +1568,16 @@ def main() -> int:
         if writer is not None:
             writer.release()
 
-    # 守卫开着却没判成：说清是"没样本"，不是"没问题"。不说的话，这一段会**静默地
-    # 跳过**几何判读 —— 用户以为守过了，其实一次都没判。
+    # 守卫收尾：按最终分类分别说清「没样本 / 检出质量差 / 几何不一致」。
+    # guard_armed 仍为 True = 武装过但没判成（样本不足）；guard_quality 非 None
+    # = 判出可疑（已分开报、且照常出结果，没有中止）。两者都 False/None 时不插话。
     if guard_armed:
         print(f"[几何守卫] 没能判读：两路同时检出的帧只有 {len(rec.dy_samples)} 个，"
               f"不足 {GEOM_MIN_SAMPLES} 个。这是**没样本**，不是**没问题** —— "
               "别拿它当几何 OK 的证据。")
+    elif guard_quality is not None:
+        print(f"[几何守卫] 已判读：{guard_quality['verdict']} —— "
+              f"{guard_quality['note']}（结果已照常输出，未中止）")
 
     header = CSV_HEADER
     # 每一行都必须与表头等长：列错位不会报错，只会让下游读到错值。
@@ -1284,6 +1607,15 @@ def main() -> int:
     print(f"匹配：{rec.n_matched}/{n_pairs}（{rec.match_rate*100:.1f}%）  "
           f"无左={rec.n_no_left} 无右={rec.n_no_right} "
           f"拒绝={rec.n_rejected}（{reject_why}）")
+    # A1：一行可读的分项归因统计。口径直接取重建器的计数器与配置（与写进
+    # traj3d.json["quality"] 的值同源），不在入口重算一遍。
+    _q_cfg = getattr(rec, "cfg", None)
+    print(f"[归因] {mode_label(mode)} 分项：n_matched={rec.n_matched} "
+          f"n_no_left={rec.n_no_left} n_no_right={rec.n_no_right} "
+          f"n_rejected={rec.n_rejected}；F={getattr(rec, 'f_source', 'n/a')}；"
+          f"有效门限 极线={epi:g}px "
+          f"交会角={getattr(_q_cfg, 'min_angle_deg', 'n/a')}° "
+          f"重投影={getattr(_q_cfg, 'max_reproj_px', 'n/a')}px")
     # 联合细化只在 on 时打这一行：off 的 stdout 必须与改动前逐字一致，否则
     # "同一段输入、只有开关不同"的对照实验就没法直接 diff 了。
     if joint_refine_on:
@@ -1295,11 +1627,34 @@ def main() -> int:
             print(f"[联合细化] 一对都没采纳；首对：{describe_result(jr_first_result)}")
     # 配对率低时把"几何对不对"量出来：用户看到的 3.3% 背后常常是"这段录像和
     # 它的标定对不上"，不说出来，下一个人还会去调 --max-epipolar（而那不是原因）。
-    # 0 配对的情形走的是异常那条路，诊断已经拼在报错里。
+    # 0 配对现在**不再抛异常**（入口 allow_zero_match=True 放行），会走到这里；
+    # 下面这段分项诊断 + zero_match 质量标记就是「不中止但不静默」的落点。
     for line in rec.low_match_diagnostic():
         print(line)
     if n_pairs and rec.n_matched == 0:
-        print("[诊断] 0 匹配，先别继续调 pairing；按下面顺序查：")
+        # 库层默认 0 配对会抛 _zero_match_message()（其它调用方的防呆）；离线入口
+        # 放行了门禁，这里自己把「为什么 0 匹配 / 下一步查什么」说清楚，别把
+        # 「不中止」退化成「什么都不说」。A 守卫若已给出结论则沿用，不覆盖。
+        if guard_quality is None:
+            guard_quality = {
+                "verdict": "zero_match",
+                "grade": "degraded",
+                "degraded": True,
+                "degraded_reason": "零配对：整段没有配对成功的三维点",
+                "warnings": list(getattr(rec, "warnings", [])),
+                "dy_med_px": None,
+                "epipolar_rms_px": None,
+                "ratio": None,
+                "match_rate": rec.match_rate,
+                "both_detected_rate": len(rec.dy_samples) / max(n_pairs, 1),
+                "gate_rejects": dict(quality_sig["gates"]),
+                "center_box_share": None,
+                "note": "整段 0 配对，结果仅供参考（无可用三维点）",
+            }
+            print(f"[质量] verdict=zero_match match_rate={rec.match_rate:.2f} "
+                  "结果仅供参考（详见 traj3d.json[\"quality\"]）")
+        print("[诊断] 0 匹配：结果照常输出，但这段没有可用三维点；"
+              "先别继续调 pairing，按下面顺序查：")
         if method == "specular" and "seed_l" in locals() and "seed_r" in locals():
             print(f"  1) seed 半径：左 {seed_l[2]:.1f} / 右 {seed_r[2]:.1f}；"
                   "CSRT 框会按 1.8×半径放大，过大时框进衣服/背景")
@@ -1379,6 +1734,7 @@ def main() -> int:
             print(f"三维图：{plot_path}")
     # ---- 世界系：另写一份坐标，traj3d.csv 的左相机系语义不动 ----
     world_arr, world_block = _world_block(world, arr, base_frame)
+    world_csv: Path | None = None
     if world_arr is not None:
         # arr 与 rows 里的 matched 行同序（rec.as_array 逐点顺序 = 追加顺序）
         wrows = [list(r) for r in rows]
@@ -1401,8 +1757,12 @@ def main() -> int:
     g_cam = (0.0, 9.81, 0.0)
     if world is not None:
         R_wc = np.asarray(world.T_world_cam, dtype=np.float64)[:3, :3]
-        # p_cam = R^T·(p_world - t)，所以世界系重力换到相机系是 R^T·g_world
-        g_cam = tuple(float(v) for v in (R_wc.T @ np.array([0.0, -9.81, 0.0])))
+        # 世界系的竖直轴是 **Z**，不是 Y。ground_axis="z" 时 +Z 朝下（重力 +Z），
+        # "-z" 时 +Z 朝上（重力 -Z）。原来写死 (0,-9.81,0) 等价于"世界 Y 朝上"，
+        # 与本项目两种 ground_axis 都不符 —— 预测的重力项会整体指错。
+        g_cam = tuple(float(v) for v in (
+            R_wc.T @ np.asarray(
+                world_gravity_world(getattr(world, "ground_axis", "z")))))
     fit_arr = np.column_stack([arr[:, 0], smoothed]) if smoothed is not None else arr
     if args.no_predict:
         pred_rows: list[dict] = []
@@ -1431,22 +1791,77 @@ def main() -> int:
         vis_world_path = (world_path if world is not None
                           else world_path.with_name(world_path.name + ".disabled"))
         try:
+            # B-161/172：export 内部硬编码读写 `<第一参数>/derived`，为了让它与
+            # 其它产物落在**同一个 out_dir**：csv_name 传绝对路径（pathlib 的 `/`
+            # 遇绝对路径会覆盖前缀 → export 读到 out_dir 的新 csv，不会误读会话
+            # 里残留的旧 csv）；再把 export 写的两个 JSON 搬到 out_dir，会话目录
+            # 保持干净。不给 --out 时 out_dir == session_dir/derived，paths 已
+            # 指向 out_dir，下面整段等价于原地不动（向后兼容）。
             paths = export_session_visualization(
-                session_dir, csv_name=csv_path.name, stereo_mode=mode,
+                session_dir, csv_name=str(csv_path.resolve()), stereo_mode=mode,
                 world_frame_path=vis_world_path)
-            print(f"标准轨迹 JSON：{paths['trajectory']}")
-            print(f"可视化 JSON：{paths['visualization']}")
+            traj_path = out_dir / "traj3d.json"
+            vis_json_path = out_dir / "visualization.json"
+            if paths["trajectory"] != traj_path:
+                traj_path.write_text(paths["trajectory"].read_text(encoding="utf-8"),
+                                     encoding="utf-8")
+                vis_json_path.write_text(paths["visualization"].read_text(encoding="utf-8"),
+                                         encoding="utf-8")
+                paths["trajectory"].unlink(missing_ok=True)
+                paths["visualization"].unlink(missing_ok=True)
+            print(f"[输出] 标准轨迹 JSON：{traj_path}")
+            print(f"[输出] 可视化 JSON：{vis_json_path}")
             # 坐标系与预测块写进 traj3d.json：export 刚重建过它，必须在之后补
-            traj_path = paths["trajectory"]
             payload = json.loads(traj_path.read_text(encoding="utf-8"))
-            payload["coordinate_system"] = world_block["coordinate_system"]
-            payload["world_frame"] = world_block["world_frame"]
+            payload["source_csv"] = csv_path.name   # export 记的是绝对路径，改回会话相对名
+            # 世界系结论（B-134，2026-11-15）：以前这里只写 `coordinate_system` /
+            # `world_frame` 两个**标签**，samples 还是 traj3d.csv 的相机系坐标 ——
+            # 标签说 world、数据说 camera。`world_arr` 上一段早就算好了，现在把这份
+            # 坐标真的写进 payload（口径见 `_apply_world_to_trajectory_payload`）。
+            payload, world_skip = _apply_world_to_trajectory_payload(
+                payload, world_arr, world_block, base_frame,
+                world_csv_name=("" if world_csv is None else world_csv.name))
+            if world_skip:
+                print(f"[警告] {world_skip}")
             if pred_rows:
                 payload["predictions"] = {k: pred_block[k]
                                           for k in ("t_ref", "state", "points")}
             else:
                 payload["predictions"] = None
                 payload["predictions_skipped"] = pred_block.get("skipped", "原因未知")
+            # 几何守卫结论（2026-11-13）：分开报「检出质量差 / 几何不一致」，两者都
+            # 照常出结果，这里把结论写进标准 JSON 供 GUI / 下游消费。加一层不冲突：
+            # 现有键都是后补的，selftest_stereo_pipeline.py 只断言 unit/n_matched/samples。
+            if guard_quality is None:
+                payload["quality"] = {
+                    "verdict": "ok", "grade": "ok", "degraded": False,
+                    "degraded_reason": None, "warnings": list(getattr(rec, "warnings", [])),
+                    "dy_med_px": None, "epipolar_rms_px": None,
+                    "ratio": None, "match_rate": rec.match_rate,
+                    "both_detected_rate": None, "gate_rejects": {},
+                    "center_box_share": None,
+                    "note": "几何守卫未判出可疑（或未启用）",
+                }
+            else:
+                _q = dict(guard_quality)
+                # 没有标定自报值时 ratio / epipolar_rms 会是 nan：写成 null，免得
+                # 下游（非 Python 消费者）解析 NaN 失败。
+                for _kk in ("dy_med_px", "epipolar_rms_px", "ratio"):
+                    if isinstance(_q.get(_kk), float) and not math.isfinite(_q[_kk]):
+                        _q[_kk] = None
+                payload["quality"] = _q
+            # A1+A2：离线产物可归因。只从重建器 counter / cfg 与本次门限取值，
+            # 不在这里重算任何统计量。**只补键、不删键**（尤其 guard_quality 的
+            # verdict / degraded，以及另一路刚加的 round_trip 都在 payload 里）。
+            _q = payload["quality"]
+            _q["n_no_left"] = int(getattr(rec, "n_no_left", 0) or 0)
+            _q["n_no_right"] = int(getattr(rec, "n_no_right", 0) or 0)
+            _q["n_rejected"] = int(getattr(rec, "n_rejected", 0) or 0)
+            _q["f_source"] = str(getattr(rec, "f_source", "n/a"))
+            _q["max_epipolar_px"] = float(epi)
+            _q["min_angle_deg"] = getattr(_q_cfg, "min_angle_deg", None)
+            _q["max_reproj_px"] = getattr(_q_cfg, "max_reproj_px", None)
+            _q["calibration_forced_unusable"] = forced_unusable
             # 平滑块：**总是**写键（没开就写 null），这样"旧文件没这个键"与
             # "这次没开平滑"能分开；points 与 samples 同坐标系，不做世界系变换。
             payload["smoothing"] = smoothing_block
@@ -1454,9 +1869,48 @@ def main() -> int:
                 payload["smoothing_skipped"] = smoothing_skip
             traj_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
                                  encoding="utf-8")
+            # 往返一致性（2026-11-15）：`build_trajectory_payload()` 已经把它算进
+            # payload["round_trip"]（几何属性，每次导出重算，不靠 carried_over）。
+            # 这里只打**一行**结论；没有来回的数据（no_pairs）不刷噪音。
+            # 打印失败不影响主流程 —— 走到这里 CSV / 两个 JSON / 视频 都已落地。
+            try:
+                rt = payload.get("round_trip") or {}
+                rt_verdict = rt.get("verdict")
+                dy_mm, dz_mm = rt.get("dy_median_mm"), rt.get("dz_median_mm")
+                if (rt_verdict and rt_verdict != "no_pairs"
+                        and dy_mm is not None and dz_mm is not None):
+                    same = ("全部同号" if rt.get("sign_consistent")
+                            else "符号不一致")
+                    tail = {
+                        "ellipse": "轨迹是窄椭圆，不是噪声",
+                        "retrace": "去程与回程重合，属于原路返回",
+                        "scattered": "偏移方向不固定，更像检测抖动（详见 quality）",
+                    }.get(rt_verdict, str(rt.get("note") or ""))
+                    print(f"[往返] {int(rt.get('n_pairs') or 0)} 段："
+                          f"ΔY 中位 {dy_mm:+.1f} mm、ΔZ 中位 {dz_mm:+.1f} mm"
+                          f"（{same}）→ {tail}"
+                          f"（详见 traj3d.json[\"round_trip\"]）")
+            except Exception as rt_exc:                     # noqa: BLE001
+                print(f"[警告] 往返一致性摘要跳过：{rt_exc}")
+            # 2026-11-15：同一个 quality dict 也给 visualization.json 带一份（GUI /
+            # 3D 查看器只读这个文件，不该为了"这段结果可不可信"再去隔壁翻 traj3d）。
+            # **不另造 schema**：直接复用上面那个 payload["quality"]；只补顶层键，
+            # 原有字段一字不动。读不出来就跳过并留一行日志（不许抛 —— 走到这里
+            # CSV / traj3d.json / 视频 都已经落地了，"少一个标记"不是错误）。
+            try:
+                vis_payload = json.loads(vis_json_path.read_text(encoding="utf-8"))
+                vis_payload["quality"] = payload["quality"]
+                vis_json_path.write_text(
+                    json.dumps(vis_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+            except Exception as vis_exc:                    # noqa: BLE001
+                print(f"[警告] visualization.json 补写 quality 跳过：{vis_exc}")
         except Exception as exc:                            # noqa: BLE001
             print(f"[警告] 标准 JSON 导出失败：{exc}")
-    return 0 if rec.n_matched else 2
+    # 新原则「只有错误才紧急」：0 配对时 CSV / 两个 JSON / 正式 mp4 已全部写完，
+    # quality.verdict="zero_match" 标记齐全，返回 0 让 _gui_console / run_all 判完成；
+    # 返回 2 会被显示成失败，与「照常出结果」冲突。
+    return 0
 
 
 if __name__ == "__main__":

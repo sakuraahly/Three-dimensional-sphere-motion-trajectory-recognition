@@ -1,4 +1,4 @@
-"""标定事实自测：真机日志的口径 + "不可用不得保存" + 基线锚必须显式给。
+"""标定事实自测：真机日志口径 + "质量差也出结果但不覆盖正式档案" + 基线锚必须显式给。
 
 为什么需要它
 ------------
@@ -21,11 +21,18 @@
 极线 15978.5150 px（**远超门槛**）。本测试用一批**顺序错配**的合成配对
 把同一个签名造出来，断言"单目过、双目炸"。
 
-**3. 判定为不可用时，结果一定不会被保存**
+**3. 质量差也出结果，但绝不覆盖正式档案（双轨 + 防呆）**
 
-`calib/params.py:203-206` 的 `StereoRig.from_result()` 对 `res.ok=False` 直接抛
-`ValueError`；`apps/calibrate_stereo.py:397-400` 在那之前就 `return 1`。
-两道闸门都钉住 —— 因为"失败却留下一个能读的标定文件"比失败本身危险得多。
+新原则「凡是质量差，也要能出结果而不是自己中止程序，只有错误才是紧急的」：
+默认（无 `--force-save`）把不可用结果另存到 `*_unusable_<时间戳>.npz/.json`
+旁路文件供检查，**正式 `--out` 与激活装置档案逐字节不变**；只有显式
+`--force-save` 才写正式路径。两条轨道都带 `forced_unusable` / `grade=不可用` /
+verdict「仅链路测试，不得用于数据结论」标记。
+
+`calib/params.py` 的 `StereoRig.from_result()` 对 `allow_unusable=False` 仍抛
+`ValueError`（第二道闸门保留）；所有 `not res.ok` 的保存都必须显式传
+`allow_unusable=True`。下游 `stereo/record_plan.py` 按 `forced_unusable` 仍拒绝
+录制 —— 形成「能存、能看、但不能用」。本节钉 8 条判据（含两条源码级护栏）。
 
 **4. 基线锚（`expected_baseline_mm`）默认 `None`，于是基线核对形同虚设**
 
@@ -40,14 +47,16 @@
 
 反向自证（改了就会红）
 --------------------
-=================================  ============================================  ========
-改动                               注入方式                                      结果
-=================================  ============================================  ========
-谎报真机基线（199.67 -> 66）       `REAL_BASELINE_MM = 66.0`                     exit=1
-谎报拒收统计（1362 -> 1000）       `REAL_FRAMES_TOTAL = 1000`                    exit=1
-谎报单目 RMS（1.3784 -> 0.5）      `REAL_ERR_LEFT = 0.5`                         exit=1
-删掉 `params.py` 的拒绝闸门        `if not res.ok: raise ...` -> `pass`          exit=1（3 条）
-=================================  ============================================  ========
+=======================================  ==========================================  ========
+改动                                    注入方式                                    结果
+=======================================  ==========================================  ========
+谎报真机基线（199.67 -> 66）           `REAL_BASELINE_MM = 66.0`                   exit=1
+谎报拒收统计（1362 -> 1000）           `REAL_FRAMES_TOTAL = 1000`                  exit=1
+谎报单目 RMS（1.3784 -> 0.5）          `REAL_ERR_LEFT = 0.5`                        exit=1
+删掉 `params.py` 的拒绝闸门             `if not res.ok: raise ...` -> `pass`         exit=1（判据 2 + 源码级）
+旁路改回「直接 `rig.save(args.out)`」    `finalize_and_save` 去掉旁路改 out            exit=1（判据 3）
+去掉 `forced_unusable`/verdict 标记      `finalize_and_save` 去掉标记三行              exit=1（判据 4/5）
+=======================================  ==========================================  ========
 
 > 前两条里，**"谎报基线"这条是本测试写完后被变异测试抓出来的缺口**：
 > 最初只断言"倍数 > 2"，把 `REAL_BASELINE_MM` 改成 66（= 没被吹飞）**居然不会红**。
@@ -153,10 +162,20 @@ def _params_gate_present() -> bool:
     return bool(re.search(r"if\s+not\s+res\.ok\s*:\s*\n\s*raise\s+ValueError", src))
 
 
-def _app_refuses_on_unusable() -> bool:
-    """`apps/calibrate_stereo.py` 是否在判定不可用时提前返回（源码级断言）。"""
+def _app_bypasses_on_unusable() -> bool:
+    """`apps/calibrate_stereo.py` 是否把不可用结果**旁路保存**（源码级断言）。
+
+    新原则：质量差不再 `return 1`，而是默认把 `args.out` 改到旁路、显式
+    `--force-save` 才写正式路径。护栏换成「统一保存函数 + 默认旁路改 out +
+    不再有 `if not res.ok: return 1` 中止」三件事同时成立：删掉旁路、改回
+    `rig.save(args.out)`、或重新加回中止，这里都会红。
+    """
     src = (ROOT / "apps" / "calibrate_stereo.py").read_text(encoding="utf-8")
-    return bool(re.search(r"if\s+not\s+res\.ok\s*:[\s\S]{0,400}?return\s+1", src))
+    has_finalize = "def finalize_and_save(" in src
+    has_bypass = bool(re.search(r"args\.out\s*=\s*_bypass_calibration_out\(", src))
+    no_early_return = not re.search(
+        r"if\s+not\s+res\.ok\s*:[^\n]*\n(?:[^\n]*\n){0,6}?\s*return\s+1", src)
+    return has_finalize and has_bypass and no_early_return
 
 
 def parse_summary(text: str) -> dict:
@@ -369,37 +388,118 @@ def test_save_backs_up_previous() -> bool:
 
 
 def test_unusable_result_is_never_saved() -> bool:
-    """第 3 节：判定不可用时，结果一定不落盘（两道闸门）。"""
-    print("----- 3. 不可用 -> 一定不保存 -----")
+    """第 3 节：质量差也出结果，但绝不覆盖正式档案（双轨 + 第二道闸门 + 防呆）。
+
+    新原则「质量差也要出结果、只有错误才紧急」：默认（无 --force-save）把不可用
+    结果另存到旁路文件（.npz + .json）供检查，正式 args.out **逐字节不变**；只有
+    显式 --force-save 才写正式路径。两条轨道都带 forced_unusable / grade /
+    verdict 标记，下游 record_plan 据此仍拒绝录制 —— 形成「能存能看不能用」。
+    """
+    import logging
+    from types import SimpleNamespace
+
+    import apps.calibrate_stereo as cs
+    from stereo.record_plan import plan_record
+
+    print("----- 3. 质量差：默认旁路 / 显式提权 / 第二道闸门 / 录制防呆 -----")
     objp, img_l, img_r = broken_pair()
     res = calibrate_stereo(objp, img_l, img_r, (1280, 720), CalibConfig(), SPEC)
 
-    saved = False
+    # ---- 判据 2：第二道闸门（allow_unusable=False）仍抛 ValueError ----
+    built = False
     refusal = ""
     try:
         StereoRig.from_result(res, meta={"board": SPEC.describe(), "source": "camera"})
-        saved = True
+        built = True                      # 没抛 = 闸门被拆了
     except ValueError as exc:
         refusal = str(exc)
+    print(f"  res.ok = {res.ok}   grade = {res.grade}   判定 = {res.verdict}")
+    print(f"  StereoRig.from_result(allow_unusable=False) -> "
+          f"{'**竟然生成了**' if built else '拒绝：' + refusal}")
 
-    got = parse_summary(LOG_EXCERPT)
-    print(f"  res.ok = {res.ok}   判定 = {res.verdict}")
-    print(f"  StereoRig.from_result() -> {'保存了（**这不该发生**）' if saved else '拒绝：' + refusal}")
-    print(f"  日志原文也有「未保存」：{got.get('not_saved')}")
-
+    log = logging.getLogger("selftest_calib_facts")
+    meta = {"board": SPEC.describe(), "source": "camera"}
     checks = [
-        ("res.ok is False（第一道闸门：调用方不该走到保存）", res.ok is False),
-        ("StereoRig.from_result 抛 ValueError（第二道闸门）", saved is False),
-        ("拒绝原因里带着判定文字（可诊断，不是空异常）",
-         "不可用" in refusal or bool(refusal)),
-        ("日志原文也是「未保存」", got.get("not_saved") is True),
-        # ⚠️ 变异测试发现的缺口：上面两条只测"这次没保存"，测不到"那道闸门被删了"。
-        # 所以直接对源码断言 —— 闸门要是被拿掉，这里就红。
-        ("**源码级**：params.py 里确实有 `if not res.ok: raise` 这道闸门",
-         _params_gate_present()),
-        ("**源码级**：calibrate_stereo.py 在不可用时 `return 1`",
-         _app_refuses_on_unusable()),
+        # 判据 1：判定逻辑没被放宽
+        ("res.ok is False（判定逻辑一字未改）", res.ok is False),
+        # 判据 2：第二道闸门还在
+        ("StereoRig.from_result(allow_unusable=False) 仍抛 ValueError（第二道闸门）",
+         built is False and "不可用" in refusal),
     ]
+
+    with tempfile.TemporaryDirectory() as td:
+        # 先在正式路径放一份「好标定」哨兵，逐字节钉住，验证绝不覆盖。
+        formal = Path(td) / "stereo_calibration.npz"
+        formal_json = formal.with_suffix(".json")
+        sentinel = b"GOOD-CALIBRATION-DO-NOT-TOUCH"
+        formal.write_bytes(sentinel)
+        formal_json.write_text('{"good": true}', encoding="utf-8")
+
+        # ---- 判据 3/4：默认（无 --force-save）跑一次不可用标定 ----
+        rig_default = StereoRig.from_result(res, meta=dict(meta), allow_unusable=True)
+        args_default = SimpleNamespace(out=str(formal), force_save=False)
+        npz_b, js_b, bypassed = cs.finalize_and_save(
+            rig_default, args_default, unusable=True, log=log)
+
+        formal_unchanged = (formal.read_bytes() == sentinel
+                            and formal_json.read_text(encoding="utf-8") == '{"good": true}')
+        bypass_npz, bypass_js = Path(npz_b), Path(js_b)
+        bypass_pair = (bypass_npz.is_file() and bypass_js.is_file()
+                       and bypass_npz.name.startswith("stereo_calibration_unusable_")
+                       and bypass_js.name.startswith("stereo_calibration_unusable_")
+                       and bypass_js.suffix == ".json")
+        q_default = (json.loads(bypass_js.read_text(encoding="utf-8")).get("quality", {})
+                     if bypass_js.is_file() else {})
+        marks_default = (q_default.get("forced_unusable") is True
+                         and q_default.get("grade") == "不可用"
+                         and "仅链路测试" in str(q_default.get("verdict") or ""))
+        print(f"  默认：旁路 {bypass_npz.name} / {bypass_js.name}  "
+              f"bypassed={bypassed}  正式路径逐字节未改动={formal_unchanged}")
+        print(f"  旁路 quality：forced_unusable={q_default.get('forced_unusable')}  "
+              f"grade={q_default.get('grade')}  verdict={q_default.get('verdict')}")
+
+        checks += [
+            # 判据 3：正式 args.out 逐字节不变（最硬）
+            ("默认跑一次：正式 --out 路径内容**逐字节不变**（绝不覆盖好标定）",
+             formal_unchanged and bypassed),
+            # 判据 4：旁路 npz+json 双产物 + 标记齐全
+            ("默认产出旁路 .npz + .json，且 forced_unusable/grade(不可用)/verdict(仅链路测试) 齐全",
+             bypass_pair and marks_default),
+        ]
+
+        # ---- 判据 5：显式 --force-save 写正式路径且标记齐全 ----
+        formal2 = Path(td) / "forced_calibration.npz"
+        rig_force = StereoRig.from_result(res, meta=dict(meta), allow_unusable=True)
+        args_force = SimpleNamespace(out=str(formal2), force_save=True)
+        npz_f, js_f, bypassed_f = cs.finalize_and_save(
+            rig_force, args_force, unusable=True, log=log)
+        jf = Path(js_f)
+        q_force = (json.loads(jf.read_text(encoding="utf-8")).get("quality", {})
+                   if jf.is_file() else {})
+        force_wrote_formal = (Path(npz_f) == formal2.with_suffix(".npz")
+                              and Path(npz_f).is_file()
+                              and not bypassed_f)
+        marks_force = (q_force.get("forced_unusable") is True
+                       and q_force.get("grade") == "不可用"
+                       and "仅链路测试" in str(q_force.get("verdict") or ""))
+        print(f"  显式 --force-save：写正式路径={force_wrote_formal}  标记齐全={marks_force}")
+        checks.append(("显式 --force-save -> 写正式路径且标记齐全（仅链路测试）",
+                       force_wrote_formal and marks_force))
+
+        # ---- 判据 6：record_plan 对这份 forced_unusable 标定仍拒绝录制 ----
+        loaded = StereoRig.load(bypass_js)          # 读旁路产物
+        plan = plan_record(loaded, mode_choice="auto", width=1280, height=720)
+        print(f"  record_plan(allow_forced=False) -> ok={plan.ok}  forced={plan.forced}"
+              f"  结论：{plan.headline}")
+        checks.append(("stereo/record_plan.py 对这份 forced_unusable 标定仍拒绝录制（防呆没破）",
+                       plan.ok is False and plan.forced is True))
+
+    # ---- 判据 7：源码级护栏（:153 / :159 更新版）----
+    checks.append(("**源码级**：params.py 里仍有 `if not res.ok: raise` 第二道闸门",
+                   _params_gate_present()))
+    checks.append(("**源码级**：calibrate_stereo.py 走旁路保存、不再 `return 1`",
+                   _app_bypasses_on_unusable()))
+
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)
@@ -693,31 +793,68 @@ WORLD_T = np.array([[0.0, -1.0, 0.0, 1.0],
                     [0.0, 0.0, 0.0, 1.0]])
 
 
-def _write_world_json(path: Path, T) -> None:
-    path.write_text(json.dumps({"version": 1, "source": "manual", "units": "m",
-                                "note": "", "board_rmse_px": None,
-                                "created_at": "2026-01-01 00:00:00",
-                                "T_world_cam": np.asarray(T).tolist()},
-                               ensure_ascii=False), encoding="utf-8")
+def _write_world_json(path: Path, T, **extra) -> None:
+    payload = {"version": 1, "source": "manual", "units": "m",
+               "note": "", "board_rmse_px": None,
+               "created_at": "2026-01-01 00:00:00",
+               "T_world_cam": np.asarray(T).tolist()}
+    payload.update(extra)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 def test_world_frame_roundtrip() -> bool:
-    """落盘 -> 读回逐元素一致；三类坏矩阵都必须 ValueError 且指出原因。"""
+    """落盘 -> 读回逐元素一致；三类坏矩阵 + 坏 ground_axis 都必须被拒且指出原因。"""
     print("----- 6. 世界系：往返 + 坏文件必须被拒 -----")
     checks: list[tuple[str, bool]] = []
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "world_frame.json"
-        WorldFrame(WORLD_T, "manual", note="合成").save(p)
+        WorldFrame(WORLD_T, "manual", note="合成", ground_axis="-z").save(p)
         data = json.loads(p.read_text(encoding="utf-8"))
         checks.append(("JSON 含 version/T_world_cam/source/units/note/created_at",
                        all(k in data for k in ("version", "T_world_cam", "source",
                                                "units", "note", "board_rmse_px",
                                                "created_at"))))
+        # 符号必须落地：矩阵本身说不清 Z 朝上还是朝下。
+        checks.append(("JSON 含 ground_axis 且写的就是 -z",
+                       data.get("ground_axis") == "-z"))
         back = WorldFrame.load(p)
         checks.append(("往返后矩阵逐元素一致（< 1e-12）",
                        float(np.max(np.abs(back.T_world_cam - WORLD_T))) < 1e-12))
         checks.append(("source/note 一并带回",
                        back.source == "manual" and back.note == "合成"))
+        checks.append(("ground_axis 往返一致（-z 不会悄悄变回 z）",
+                       back.ground_axis == "-z"))
+
+        # 重力必须跟世界系的**Z 轴符号**走：原来预测段写死 (0,-9.81,0)
+        # 等于假设"世界 Y 朝上"，与本项目两种 ground_axis 都不符。
+        from apps.run_stereo_video import world_gravity_world
+        checks.append(("世界系重力：z -> +Z，-z -> -Z，空 -> z",
+                       world_gravity_world("z") == (0.0, 0.0, 9.81)
+                       and world_gravity_world("-z") == (0.0, 0.0, -9.81)
+                       and world_gravity_world("") == (0.0, 0.0, 9.81)))
+
+        # 老文件（没有 ground_axis 字段）按 z 读；写了个非法值必须拒。
+        _write_world_json(Path(td) / "old.json", WORLD_T)
+        old = WorldFrame.load(Path(td) / "old.json")
+        checks.append(("没有 ground_axis 的老文件按 z 读（那时唯一的默认符号）",
+                       old.ground_axis == "z"))
+        bad_axis = Path(td) / "bad_axis.json"
+        _write_world_json(bad_axis, WORLD_T, ground_axis="y")
+        message = ""
+        try:
+            WorldFrame.load(bad_axis)
+        except ValueError as exc:
+            message = str(exc)
+        checks.append(("坏 ground_axis（'y'）被拒且指出文件与允许值",
+                       "ground_axis" in message and str(bad_axis) in message
+                       and "-z" in message))
+        print(f"    ground_axis='y' -> {message or '（**没有报错**）'}")
+        try:
+            WorldFrame(WORLD_T, "manual", ground_axis="up")
+        except ValueError as exc:
+            checks.append(("构造 WorldFrame 时 ground_axis 只收 z/-z", "ground_axis" in str(exc)))
+        else:
+            checks.append(("构造 WorldFrame 时 ground_axis 只收 z/-z", False))
 
         bad_cases = [
             ("最后一行不是 [0,0,0,1]",
@@ -776,8 +913,13 @@ def test_world_frame_apply() -> bool:
     return all(ok for _n, ok in checks)
 
 
-def _write_board_photo(path: Path, spec: BoardSpec, K: np.ndarray) -> None:
-    """画一张**真的能被 `detect_board` 检出**的棋盘照片（透视投影 + 白边）。"""
+def _write_board_photo(path: Path, spec: BoardSpec, K: np.ndarray,
+                       size: tuple[int, int] = (1920, 1080)) -> None:
+    """画一张**真的能被 `detect_board` 检出**的棋盘照片（透视投影 + 白边）。
+
+    ``size`` 是画布尺寸：默认就是 ``K`` 对应的 1920x1080；传别的值可以造
+    "拍图分辨率与标定不一致"的样本（那种图不需要检得到板，尺寸校验先拦）。
+    """
     sq, pad = 60, 2
     flat = np.full(((spec.rows + 1 + 2 * pad) * sq, (spec.cols + 1 + 2 * pad) * sq),
                    255, np.uint8)
@@ -797,13 +939,18 @@ def _write_board_photo(path: Path, spec: BoardSpec, K: np.ndarray) -> None:
                     [(pad + spec.cols + 1) * sq, (pad + spec.rows + 1) * sq],
                     [pad * sq, (pad + spec.rows + 1) * sq]], np.float32)
     H = cv2.getPerspectiveTransform(src, dst.astype(np.float32))
-    photo = cv2.warpPerspective(flat, H, (1920, 1080), borderValue=128)
+    photo = cv2.warpPerspective(flat, H, size, borderValue=128)
     cv2.imwrite(str(path), photo)
 
 
 def test_world_frame_from_board_photo() -> bool:
-    """真图片路径：`from_board()` 能检出、rmse 过门槛、尺度与 Z 方向说得清。"""
-    print("----- 8. 世界系：真图片 from_board() -----")
+    """真图片路径：`from_board()` 能检出、rmse 过门槛、尺度与 Z 方向说得清。
+
+    另一条（2026-11-20 补的真实缺口）：**拍图分辨率必须与标定一致**。
+    在此之前 `from_board()` 从不看 `rig.image_size` —— 拿 1280x720 的图配
+    1920x1080 的内参，PnP 会给出错尺度的 `t`，而 `rmse` 依然很小。
+    """
+    print("----- 8. 世界系：真图片 from_board()（含分辨率校验 + 符号） -----")
     checks: list[tuple[str, bool]] = []
     K = np.array([[1400.0, 0.0, 960.0], [0.0, 1400.0, 540.0], [0.0, 0.0, 1.0]])
     rig = StereoRig(
@@ -812,17 +959,24 @@ def test_world_frame_from_board_photo() -> bool:
         image_size=(1920, 1080),
         meta={"stereo_mode": "angled", "rectification": "none_raw"},
     )
+    rig_name = "calib/rig_a"
     with tempfile.TemporaryDirectory() as td:
         photo = Path(td) / "board.png"
         _write_board_photo(photo, SPEC, K)
         checks.append(("照片真的写出来了", photo.is_file()))
 
-        wf = from_board(photo, SPEC, rig)
+        wf = from_board(photo, SPEC, rig, rig_path=rig_name)
         checks.append((f"rmse = {wf.board_rmse_px:.2f} px < 1.0",
                        wf.board_rmse_px is not None and wf.board_rmse_px < 1.0))
         checks.append(("source = board_pnp", wf.source == "board_pnp"))
         checks.append(("describe() 含来源与 rmse",
                        "board_pnp" in wf.describe() and "rmse=" in wf.describe()))
+        # ---- ground_axis 必须写进 describe（矩阵本身说不清符号）----
+        desc = wf.describe()
+        checks.append(("describe() 含 ground_axis 与它的符号说明",
+                       "ground_axis=z" in desc and "地面以下" in desc
+                       and "+Y" in desc))
+        checks.append(("WorldFrame 记住了 ground_axis=z", wf.ground_axis == "z"))
 
         # 相机到世界原点的距离应等于合成时的板距（~0.5 m）——尺度对了才叫世界系。
         cam = wf.apply(np.zeros((1, 3)))[0]        # 左相机光心在世界系里的位置
@@ -832,18 +986,65 @@ def test_world_frame_from_board_photo() -> bool:
         # 默认 +Z = 棋盘法向 = 背离相机的那一侧 -> 相机在负 Z。
         checks.append((f"默认 ground_axis=z 时相机在 Z<0 一侧（z={cam[2]:.3f}）",
                        cam[2] < 0.0))
-        wf_up = from_board(photo, SPEC, rig, ground_axis="-z")
+        wf_up = from_board(photo, SPEC, rig, ground_axis="-z", rig_path=rig_name)
         cam_up = wf_up.apply(np.zeros((1, 3)))[0]
         checks.append((f"ground_axis='-z' 时相机翻到 Z>0（z={cam_up[2]:.3f}）",
                        cam_up[2] > 0.0))
         checks.append(("两种 ground_axis 的 rmse 相同（只翻轴、不动拟合）",
                        abs(wf.board_rmse_px - wf_up.board_rmse_px) < 1e-12))
+        # 数值方向：-z 不是"再转一下"，而是**精确地** X 保持、Y 与 Z 同时取反。
+        probe = np.array([[0.12, -0.34, 0.56], [-0.2, 0.3, 0.9]])
+        base, flipped = wf.apply(probe), wf_up.apply(probe)
+        expect = base * np.array([1.0, -1.0, -1.0])
+        checks.append(("-z 的数值方向 = X 不变、Y 与 Z 同时取反（右手系代价）",
+                       float(np.max(np.abs(flipped - expect))) < 1e-12))
+        desc_up = wf_up.describe()
+        checks.append(("ground_axis=-z 的 describe() 说清 Y 也反向（不只是 Z）",
+                       "ground_axis=-z" in desc_up and "Y 同时反向" in desc_up
+                       and "天空" in desc_up))
 
-        blank = Path(td) / "blank.png"
-        cv2.imwrite(str(blank), np.full((720, 1280), 255, np.uint8))
+        # ---- 拍图分辨率 vs 标定分辨率 ----
+        bad_size = Path(td) / "board_720p.png"
+        _write_board_photo(bad_size, SPEC, K, size=(1280, 720))
         message = ""
         try:
-            from_board(blank, SPEC, rig)
+            from_board(bad_size, SPEC, rig, rig_path=rig_name)
+        except ValueError as exc:
+            message = str(exc)
+        checks.append(("分辨率不一致 -> ValueError，文案含两边尺寸 / 标定文件 / 下一步",
+                       "1280x720" in message and "1920x1080" in message
+                       # 路径分隔符随平台走（Windows 是 \），比较前先归一
+                       and f"{rig_name}.npz" in message.replace("\\", "/")
+                       and ("重拍" in message or "重标" in message)))
+        print(f"    1280x720 配 1920x1080 标定 -> {message or '（**没有报错**）'}")
+        checks.append(("尺寸一致时同一套参数能通过（不误报）",
+                       from_board(photo, SPEC, rig, rig_path=rig_name)
+                       .source == "board_pnp"))
+
+        # 标定里没有有效 image_size：**明确跳过**并写进 note，不许静默放行。
+        orig_size = rig.image_size
+        try:
+            for label, value in (("(0, 0)（老 npz 缺字段时的读法）", (0, 0)),
+                                 ("None", None)):
+                rig.image_size = value
+                wf_skip = from_board(photo, SPEC, rig, rig_path=rig_name)
+                note = wf_skip.note
+                checks.append((f"image_size={label} -> 跳过校验但写明原因",
+                               "跳过" in note and "image_size" in note
+                               and "分辨率" in note))
+            del rig.image_size                      # 连属性都没有的装置对象
+            wf_skip = from_board(photo, SPEC, rig, rig_path=rig_name)
+            checks.append(("image_size 属性缺失 -> 同样明确跳过（读不到就说明读不到）",
+                           "跳过" in wf_skip.note and "image_size" in wf_skip.note))
+        finally:
+            rig.image_size = orig_size
+
+        blank = Path(td) / "blank.png"
+        # 尺寸要跟标定一致：否则先被分辨率校验拦下，"检不到板"这条路径就没测到。
+        cv2.imwrite(str(blank), np.full((1080, 1920), 255, np.uint8))
+        message = ""
+        try:
+            from_board(blank, SPEC, rig, rig_path=rig_name)
         except ValueError as exc:
             message = str(exc)
         checks.append(("空图（检不到板）抛 ValueError 并说明怎么重拍",
@@ -852,11 +1053,29 @@ def test_world_frame_from_board_photo() -> bool:
 
         missing = Path(td) / "nope.png"
         try:
-            from_board(missing, SPEC, rig)
+            from_board(missing, SPEC, rig, rig_path=rig_name)
         except ValueError as exc:
             checks.append(("图打不开 -> ValueError 指出路径", str(missing) in str(exc)))
         else:
             checks.append(("图打不开 -> ValueError 指出路径", False))
+
+        # ---- CLI 真的能收下 `--ground-axis -z`（界面发的就是这两段）----
+        # argparse 会把单独的 `-z` 当成另一个选项，于是 `--ground-axis -z`
+        # 报 "expected one argument" 并退出 2 —— 界面里选「Z 轴朝上」就成了
+        # 一个退出码 2 的失败进程。脚本用 `_join_axis_value()` 把两段拼起来。
+        from apps.tools.set_world_frame import _join_axis_value, parse_args
+        checks.append(("`--ground-axis -z` 两段写法被拼成 `--ground-axis=-z`",
+                       _join_axis_value(["--image", "x", "--ground-axis", "-z"])
+                       == ["--image", "x", "--ground-axis=-z"]))
+        checks.append(("`--ground-axis z` 原样保留（不再多拼一层）",
+                       _join_axis_value(["--ground-axis", "z"]) == ["--ground-axis", "z"]))
+        try:
+            parsed = parse_args(["--image", "x.png", "--ground-axis", "-z"])
+        except SystemExit as exc:                       # argparse 退出 2 会走到这里
+            checks.append((f"CLI 解析 `--ground-axis -z`（argparse 退出 {exc.code}）", False))
+        else:
+            checks.append(("CLI 解析 `--ground-axis -z` 得到 ground_axis='-z'",
+                           parsed.ground_axis == "-z"))
 
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
@@ -1218,10 +1437,340 @@ def test_depth_sigma_includes_baseline() -> bool:
     return all(ok for _n, ok in checks)
 
 
+# --------------------------------------------------------------------------
+# A3 + B1：chain 的板占闸 + 以链乘为初值的跨路残差精化（2026-11-18）
+#
+# chain 走 `method.run` 提前 return，从不到达 joint 收尾处的
+# "板占画面比例 / 板太小最高只判可用"。这两节把新接上的闸与新的跨路残差
+# 用**已知真值的合成数据 + 真机只读**（后者可选）钉住。
+# --------------------------------------------------------------------------
+
+def _chain_synth(z_mm: float, *, n_views: int = 14, seed: int = 7,
+                 noise_px: float = 0.12, n_pair: int = 3,
+                 pair_noise_px: float = 0.12) -> dict:
+    """造一份"双板 L 形 + 90° 装置"的 chain 合成输入（真值全已知）。
+
+    A 板在左相机前 `z_mm`，B 板在右相机前 `z_mm`；B 板面绕 Y 转 45°，
+    这样左相机（同框图那一路）也能看见它，不会被当成一条线。
+    两块板刚性固连这台支架，参考对与同框图都是**同一摆放**。
+    """
+    import calib.relative_pose as rp
+
+    W, H = 1280, 720
+    K = np.array([[900.0, 0.0, W / 2], [0.0, 900.0, H / 2], [0, 0, 1.0]])
+    D = np.zeros(5)
+    objp = SPEC.object_points().astype(np.float64)
+    z = z_mm / 1000.0
+
+    # ---- 真值外参：右相机在 (0.5,0,0.5)，光轴沿 -X ----
+    R_true = cv2.Rodrigues(np.radians([0.0, 90.0, 0.0]))[0]
+    C = np.array([0.50, 0.0, 0.50])
+    T_true = (-R_true @ C).reshape(3, 1)
+    T_cr_cl = rp.rt_to_T(R_true, T_true)
+
+    # ---- 双板：A 正对左相机；B 在右相机系里转 45°（两相机都能看见）----
+    T_cl_A = rp.rt_to_T(np.eye(3), [0.0, 0.0, z])
+    T_cr_B = rp.rt_to_T(cv2.Rodrigues(np.radians([0.0, 45.0, 0.0]))[0], [0.0, 0.0, z])
+    Tab = rp.compose(rp.invert(T_cr_B), T_cr_cl, T_cl_A)   # T_{B←A}
+    T_cl_B = rp.compose(rp.invert(T_cr_cl), T_cr_B)        # 同框图里 B 在左相机系的位姿
+
+    rng = np.random.default_rng(seed)
+    img_l, img_r = [], []
+    for _ in range(n_views):
+        dR = cv2.Rodrigues(np.radians(rng.uniform(-7, 7, 3)))[0]
+        dt = rng.uniform(-0.012, 0.012, 3)
+        for base_T, out in ((T_cl_A, img_l), (T_cr_B, img_r)):
+            T = rp.rt_to_T(dR @ base_T[:3, :3], base_T[:3, 3] + dt)
+            p = cv2.projectPoints(objp, cv2.Rodrigues(T[:3, :3])[0], T[:3, 3], K, D)[0]
+            out.append((p + rng.normal(0, noise_px, p.shape)).astype(np.float32))
+
+    # ---- 同框图：左相机（pair camera ④）同时看到 A、B，支架不动 ----
+    pair_frames = []
+    for _ in range(n_pair):
+        pa = cv2.projectPoints(objp, np.zeros(3), T_cl_A[:3, 3], K, D)[0]
+        pb = cv2.projectPoints(objp, cv2.Rodrigues(T_cl_B[:3, :3])[0], T_cl_B[:3, 3], K, D)[0]
+        pa = (pa + rng.normal(0, pair_noise_px, pa.shape)).astype(np.float64).reshape(-1, 2)
+        pb = (pb + rng.normal(0, pair_noise_px, pb.shape)).astype(np.float64).reshape(-1, 2)
+        pair_frames.append((pa, pb))
+
+    return dict(objp=objp, img_l=img_l, img_r=img_r, K=K, D=D, size=(W, H),
+                Tab=Tab, R_true=R_true, T_true=T_true,
+                T_cl_A=T_cl_A, T_cr_B=T_cr_B, T_cl_B=T_cl_B, pair_frames=pair_frames)
+
+
+def _run_chain_synth(d: dict, *, Tab=None, pair_frames=None, cfg=None):
+    """用合成数据跑一次 chain；`Tab`/`pair_frames` 可替换以做反向实验。"""
+    from calib.stereo_calib import CalibConfig
+
+    cfg = cfg or CalibConfig(method="chain")
+    Tab = d["Tab"] if Tab is None else Tab
+    samples = [Tab, Tab.copy()]             # n=2 且一致 -> 不让"只测 1 次"掩盖 B1
+    return calibrate_stereo(
+        d["objp"], d["img_l"], d["img_r"], d["size"], cfg, SPEC, stereo_mode="angled",
+        T_camL_A=d["T_cl_A"], T_AB=Tab, T_camR_B=d["T_cr_B"],
+        T_AB_samples=samples, pair_board_corners=pair_frames)
+
+
+def test_chain_board_area_caps_verdict() -> bool:
+    """A3：chain 的 board_area 必须是实数，且板小把"优秀"封顶为"可用"。
+
+    反向自证锚点：把 `_calibrate_chain` 里那两行 board_area 赋值改空，
+    本节的"封顶"判据必须变红（NaN 会让 `area_big_enough=True`）。
+    """
+    print("\n----- A3：chain 接上板占画面闸 -----")
+    import calib.stereo_calib as sc
+
+    cfg = CalibConfig(method="chain")
+    small = _chain_synth(900.0)      # 板小（约 1.9% / 1.3%）
+    big = _chain_synth(340.0)        # 板大（约 11% / 8.6%）
+    r_small = _run_chain_synth(small, cfg=cfg)
+    r_big = _run_chain_synth(big, cfg=cfg)
+
+    print(f"  小板：board_area_l={r_small.board_area_l * 100:5.2f}%  "
+          f"board_area_r={r_small.board_area_r * 100:5.2f}%  "
+          f"min={r_small.board_area * 100:5.2f}%  "
+          f"RMS 左/右 {r_small.err_left:.3f}/{r_small.err_right:.3f}  "
+          f"判定 {r_small.grade}")
+    print(f"  大板：board_area_l={r_big.board_area_l * 100:5.2f}%  "
+          f"board_area_r={r_big.board_area_r * 100:5.2f}%  "
+          f"min={r_big.board_area * 100:5.2f}%  "
+          f"RMS 左/右 {r_big.err_left:.3f}/{r_big.err_right:.3f}  "
+          f"判定 {r_big.grade}")
+
+    checks = [
+        ("chain 的 board_area_l/r 是实数（不再是 NaN）",
+         np.isfinite(r_small.board_area_l) and np.isfinite(r_small.board_area_r)),
+        ("小板确实落在门限之下（测试前提成立）",
+         r_small.board_area < cfg.min_board_area_for_good),
+        ("大板确实落在门限之上（测试前提成立）",
+         r_big.board_area >= cfg.min_board_area_for_good),
+        ("板占 1.9% 时 verdict 被封顶为「可用」（不是「优秀」）",
+         r_small.grade == "可用" and r_small.ok),
+        ("板大时仍判「优秀」（没把这一档废掉）", r_big.grade == "优秀"),
+        ("封顶时给出原因（「最高只判」入 warnings）",
+         any("最高只判" in w for w in r_small.warnings)),
+        ("报告里出现板占画面（chain 也有出口了）",
+         "板占画面" in r_small.report()),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_chain_cross_path_least_squares() -> bool:
+    """B1 正证：链乘初值加 0.3°/1mm 扰动 -> 最小二降 RMS 且回到真值附近。
+
+    直接调生产函数 `_refine_chain_cross_path`（护栏由调用方做，不遮住优化本身）。
+    """
+    import calib.relative_pose as rp
+    import calib.stereo_calib as sc
+
+    d = _chain_synth(500.0)
+    # ---- 给链乘初值加 0.3° / 1mm 扰动：扰动进 T_AB，链乘结果随之偏 ----
+    delta = rp.rt_to_T(cv2.Rodrigues(np.radians([0.3, 0.0, 0.0]))[0], [0.001, 0.0, 0.0])
+    Tab_pert = rp.compose(delta, d["Tab"])
+    R_init, T_init, _ = rp.relative_extrinsics(d["T_cl_A"], Tab_pert, d["T_cr_B"])
+    init_rot = rp.rotation_angle_deg(R_init, d["R_true"])
+    init_tr = float(np.linalg.norm(T_init - d["T_true"])) * 1000.0
+
+    R_opt, T_opt, diag = sc._refine_chain_cross_path(
+        d["objp"], d["pair_frames"], d["K"], d["D"],
+        d["T_cl_A"], d["T_cr_B"], R_init, T_init)
+    opt_rot = rp.rotation_angle_deg(R_opt, d["R_true"])
+    opt_tr = float(np.linalg.norm(T_opt - d["T_true"])) * 1000.0
+    print(f"  初值真值误差：旋转 {init_rot:.4f}° / 平移 {init_tr:.3f} mm")
+    print(f"  优化后 RMS {diag['rms_before']:.4f} -> {diag['rms_after']:.4f} px  "
+          f"({diag['n_frames']} 帧 / {diag['n_corners']} 角点)")
+    print(f"  优化后真值误差：旋转 {opt_rot:.4f}° / 平移 {opt_tr:.3f} mm  "
+          f"改动量 {diag['delta_rot_deg']:.4f}° / {diag['delta_trans_mm']:.3f} mm")
+
+    # ---- 端到端：扰动小于护栏时应当**真被采用**（不是只算不算数）----
+    # 同框图角点必须与"被标出来的那组内参"同口径：先不带同框图跑一次拿估计
+    # K1/D1，再用它重渲染角点。否则 K 的估计误差会被优化器吸进外参，那不是
+    # B1 要测的东西（真机上同框图与内参段本来就是同一台相机）。
+    r_warm = _run_chain_synth(d, Tab=d["Tab"], pair_frames=None)
+    K_est, D_est = r_warm.K1, r_warm.D1
+    rng_e = np.random.default_rng(99)
+    pair_est = []
+    for _ in range(3):
+        pa = cv2.projectPoints(d["objp"], np.zeros(3),
+                               d["T_cl_A"][:3, 3], K_est, D_est)[0]
+        pb = cv2.projectPoints(d["objp"], cv2.Rodrigues(d["T_cl_B"][:3, :3])[0],
+                               d["T_cl_B"][:3, 3], K_est, D_est)[0]
+        pair_est.append((
+            (pa + rng_e.normal(0, 0.12, pa.shape)).astype(np.float64).reshape(-1, 2),
+            (pb + rng_e.normal(0, 0.12, pb.shape)).astype(np.float64).reshape(-1, 2)))
+    small_delta = rp.rt_to_T(cv2.Rodrigues(np.radians([0.08, 0.0, 0.0]))[0],
+                             [0.0003, 0.0, 0.0])
+    Tab_small = rp.compose(small_delta, d["Tab"])
+    r_end = _run_chain_synth(d, Tab=Tab_small, pair_frames=pair_est)
+    refine = r_end.cross_path_refine or {}
+    print(f"  端到端（0.08°/0.3mm）：applied={refine.get('applied')}  "
+          f"RMS {refine.get('rms_before', float('nan')):.4f} -> "
+          f"{refine.get('rms_after', float('nan')):.4f} px  "
+          f"旋转 {refine.get('delta_rot_deg', float('nan')):.4f}° / "
+          f"平移 {refine.get('delta_trans_mm', float('nan')):.3f} mm")
+
+    checks = [
+        ("初值扰动确实在 0.3°/1mm 量级（测试前提成立）",
+         0.15 < init_rot < 0.6 and 0.3 < init_tr < 3.0),
+        ("least_squares 把角点重投影 RMS 降下来",
+         diag["rms_after"] < diag["rms_before"]),
+        ("优化结果回到真值附近（<0.1°）", opt_rot < 0.1),
+        ("优化结果回到真值附近（<0.5mm）", opt_tr < 0.5),
+        ("端到端小扰动时优化结果**真被采用**",
+         refine.get("applied") is True and r_end.ok),
+        ("诊断字段有改前/改后数值（不是只写「通过」）",
+         np.isfinite(refine.get("rms_before", float("nan")))
+         and np.isfinite(refine.get("rms_after", float("nan")))),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_chain_cross_path_guardrail_rejects_180() -> bool:
+    """B1 护栏反向：初值翻转 179° -> 必须判不可用且不采用优化结果。
+
+    反向自证锚点：把 `_calibrate_chain` 里"改动幅度护栏"的 `if` 改空
+    （例如 `if False and (...)`），本节的"判不可用 / 未采用"两条必须变红。
+    """
+    import calib.relative_pose as rp
+    import calib.stereo_calib as sc
+
+    d = _chain_synth(500.0)
+    # 模拟同框图角点倒序造成的 180° 错解：T_AB 被翻 179°
+    flip = rp.rt_to_T(cv2.Rodrigues(np.radians([179.0, 0.0, 0.0]))[0], np.zeros(3))
+    Tab_flip = rp.compose(flip, d["Tab"])
+    chain_R, chain_T, _ = rp.relative_extrinsics(d["T_cl_A"], Tab_flip, d["T_cr_B"])
+    r = _run_chain_synth(d, Tab=Tab_flip, pair_frames=d["pair_frames"])
+    refine = r.cross_path_refine or {}
+
+    print(f"  179° 翻转：改前 RMS {refine.get('rms_before', float('nan')):.3f} -> "
+          f"改后 {refine.get('rms_after', float('nan')):.3f} px，"
+          f"改动 {refine.get('delta_rot_deg', float('nan')):.2f}° / "
+          f"{refine.get('delta_trans_mm', float('nan')):.2f} mm")
+    print(f"  verdict：{r.verdict.splitlines()[0][:120]}")
+    print(f"  最终 R/T 与链乘原值一致 = "
+          f"{np.allclose(r.R, chain_R) and np.allclose(r.T, chain_T)}")
+
+    checks = [
+        ("护栏被触发（applied=False 且 reason 点名护栏）",
+         refine.get("applied") is False and "护栏" in refine.get("reason", "")),
+        ("判不可用（不是悄悄产出看起来收敛的错解）",
+         r.grade == "不可用" and r.ok is False),
+        ("优化结果**未被采用**：R 保持链乘原值", np.allclose(r.R, chain_R)),
+        ("优化结果**未被采用**：T 保持链乘原值", np.allclose(r.T, chain_T)),
+        ("verdict 指向重拍第 ④ 步同框图",
+         "同框图" in r.verdict and "重拍" in r.verdict),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_chain_cross_path_real_frames_readonly() -> bool:
+    """B1 真机只读：拿 chain_frames 四段图跑一次，机制走通/不崩/不覆盖 config。
+
+    不要求标定变好（那份坏标定的真因是同框图角点倒序，B1 不修那个）。
+    任何产物只写 `tempfile.mkdtemp()`，跑完清理；对 outputs/ 只读、
+    config/ 绝不触碰。数据目录不存在时**跳过**（判据依然为真）。
+    """
+    import calib.relative_pose as rp
+    from calib import detect_board
+    from calib.stereo_calib import calibrate_mono_points
+
+    base = ROOT / "outputs" / "chain_frames" / "20261111-143925"
+    if not base.is_dir():
+        print("  [跳过] 本机没有 outputs/chain_frames/20261111-143925（只读数据不在）—— 非失败")
+        return True
+
+    from apps.calibrate_stereo import (
+        _detect_two_boards, _list_images, _pnp_reproj_rms, _ref_pair_poses)
+
+    def _corners(paths):
+        out, size = [], None
+        for p in paths:
+            g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if g is None:
+                continue
+            if size is None:
+                size = (g.shape[1], g.shape[0])
+            obs = detect_board(g, SPEC, exhaustive=True)
+            if obs.found and obs.corners is not None:
+                out.append(obs.corners.reshape(-1, 2).astype(np.float32))
+        return out, size
+
+    c_l, size_l = _corners(_list_images(base / "left"))
+    c_b, _ = _corners(_list_images(base / "board_b"))
+    if len(c_l) < 3 or len(c_b) < 3:
+        print(f"  [跳过] 真机角点不足（左 {len(c_l)} / 右 {len(c_b)}）—— 非失败")
+        return True
+    objp = SPEC.object_points()
+    mono_l = calibrate_mono_points(objp, c_l, size_l, CalibConfig())
+    mono_r = calibrate_mono_points(objp, c_b, size_l, CalibConfig())
+
+    Tab_p = _list_images(base / "ref_pair_left")
+    Tab_r = _list_images(base / "ref_pair_right")
+    T_cl_A, T_cr_B, _info = _ref_pair_poses(
+        Tab_p, Tab_r, SPEC, objp, mono_l["K"], mono_l["D"],
+        mono_r["K"], mono_r["D"], size_l, size_l)
+
+    pair_corners = []
+    for p in _list_images(base / "pair"):
+        gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            continue
+        found = _detect_two_boards(gray, SPEC)
+        if found is None:
+            continue
+        pair_corners.append((found[0].corners.reshape(-1, 2).astype(np.float64),
+                             found[1].corners.reshape(-1, 2).astype(np.float64)))
+    if pair_corners:
+        # T_AB 用同框图直接算（只需一张，作为链乘输入；B1 用全部角点做残差）。
+        T1, _ = _pnp_reproj_rms(objp, pair_corners[0][0], mono_l["K"], mono_l["D"])
+        T2, _ = _pnp_reproj_rms(objp, pair_corners[0][1], mono_l["K"], mono_l["D"])
+        Tab = rp.board_to_board_from_single_camera(T1, T2)
+    else:
+        Tab = np.eye(4)
+
+    # 产物只写临时目录，跑完删除；实际不落盘，这里只为守住"绝不覆盖 config"。
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td)
+        assert out.is_dir()
+        res = calibrate_stereo(
+            objp, c_l, c_b, size_l, CalibConfig(method="chain"), SPEC,
+            stereo_mode="angled", T_camL_A=T_cl_A, T_AB=Tab, T_camR_B=T_cr_B,
+            T_AB_samples=[Tab, Tab.copy()], pair_board_corners=pair_corners)
+
+    refine = res.cross_path_refine or {}
+    print(f"  真机角点：左 {len(c_l)} / 右 {len(c_b)} / 同框 {len(pair_corners)} 帧")
+    print(f"  chain 重投影 RMS（同框图角点级）："
+          f"{refine.get('rms_before', float('nan')):.4f} -> "
+          f"{refine.get('rms_after', float('nan')):.4f} px")
+    print(f"  护栏：{refine.get('applied', '跳过/异常')}  "
+          f"改动 {refine.get('delta_rot_deg', float('nan')):.3f}° / "
+          f"{refine.get('delta_trans_mm', float('nan')):.2f} mm  "
+          f"原因：{str(refine.get('reason', refine.get('skipped', refine.get('error', ''))))[:100]}")
+    print(f"  最终 verdict：{res.verdict.splitlines()[0][:120]}")
+
+    checks = [
+        ("机制走通：cross_path_refine 有诊断（不是没跑）", bool(refine)),
+        ("不崩：R/T 仍是实数矩阵", np.all(np.isfinite(res.R)) and np.all(np.isfinite(res.T))),
+        ("chain 的 board_area 也是实数（真机也接上 A3）",
+         np.isfinite(res.board_area_l) and np.isfinite(res.board_area_r)),
+        ("有明确结论（applied / skipped / error / 护栏原因至少占一样）",
+         any(k in refine for k in ("applied", "skipped", "error"))),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 70)
-    print("标定事实自测（真机日志口径 + 不可用不得保存 + 基线锚 + 分级判定 + 世界系"
-          " + 交叉验证 + 外参不确定度）")
+    print("标定事实自测（真机日志口径 + 质量差旁路保存/不覆盖正式档案 + 基线锚 + 分级判定"
+          " + 世界系 + 交叉验证 + 外参不确定度）")
     print("=" * 70)
     results = []
     for fn in (test_log_summary_is_self_consistent,
@@ -1237,7 +1786,11 @@ def main() -> int:
                test_visualization_world_frame,
                test_cross_validate_verdicts,
                test_extrinsic_sigma_vs_empirical,
-               test_depth_sigma_includes_baseline):
+               test_depth_sigma_includes_baseline,
+               test_chain_board_area_caps_verdict,
+               test_chain_cross_path_least_squares,
+               test_chain_cross_path_guardrail_rejects_180,
+               test_chain_cross_path_real_frames_readonly):
         results.append(fn())
         print()
     ok = all(results)

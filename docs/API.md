@@ -66,8 +66,11 @@ def _build(cfg): return MyDetector(cfg)
 ## 1. `sphere_tracker/config.py` —— 全部可调参数
 ```python
 COLOR_PRESETS: dict[str, dict]      # 预设名 -> HSV 参数；**全项目只此一处**
-class ColorConfig:  @staticmethod preset(name: str) -> "ColorConfig"
-                    @staticmethod preset_names() -> list[str]   # 定义顺序
+AUTO_PRESET = "auto"                # 取色策略（不是颜色），不进 COLOR_PRESETS
+class ColorConfig:  @staticmethod preset(name: str) -> "ColorConfig"   # "auto" -> mode="auto"
+                    @staticmethod preset_names() -> list[str]          # 六种真实颜色（定义顺序）
+                    @staticmethod preset_choices() -> list[str]        # ["auto", *preset_names()]
+    # mode="fixed"|"auto"；seed_* 见 `纯色球检测方案.md` §9.7
     # white_ball / orange_ball / green_ball / blue_ball / red_ball / yellow_ball
 class AppConfig:  detector / tracker / camera / predict / viz
     def to_dict(self) -> dict;  def save(self, path: str | Path) -> Path      # mkdir -p 后写 JSON
@@ -76,7 +79,7 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 ```
 | 组               | 关键默认值                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DetectorConfig` | `method="color"`、`fusion_members=["color","hough","motion"]`、`min_radius=8.0`、`max_radius=200.0`、`min_circularity=0.55`、`min_fill_ratio=0.72`、`min_radial_consistency=0.90`、`subpixel_refine=True`、`subpixel_rays=72`、`motion_compensation="auto"`、`camera_motion_threshold_px=0.8`、`motion_work_width=320`、`agree_px=6.0`、`agree_ratio=0.45`、`yolo_weights="models/yolo11n.pt"`、`sam_model="models/sam2.1_t.pt"`、`yolo_classes=[32]` |
+| `DetectorConfig` | `method="color"`、`fusion_members=["color","hough","motion"]`、`min_radius=8.0`、`max_radius=200.0`、`min_circularity=0.55`、`min_fill_ratio=0.72`、`min_radial_consistency=0.90`、`subpixel_refine=True`、`subpixel_rays=72`、`motion_compensation="auto"`、`camera_motion_threshold_px=0.8`、`motion_work_width=320`、`agree_px=6.0`、`agree_ratio=0.45`、`fusion_topk=3`、`yolo_weights="models/yolo11n.pt"`、`sam_model="models/sam2.1_t.pt"`、`yolo_classes=[32]` |
 | `TrackerConfig`  | `order=2`、`process_noise=1.5e2`、`measurement_noise=2.0`、`gate_chi2=9.21`、`maneuver_min_px_s=250.0`、`maneuver_ratio=1.6`、`max_coast_frames=12`、`init_hits=2`、`trail_length=240`、`trail_source="measurement"`                                                                                                                                                                                                                                  |
 | `CameraConfig`   | `fx=fy=0.0`（未标定）、`cx=cy=-1.0`（用图像中心）、`hfov_deg=60.0`、`ball_diameter_m=0.04`、`enable_3d=True`                                                                                                                                                                                                                                                                                                                                          |
 | `PredictConfig`  | `method="quadratic"`、`horizon_s=0.6`、`steps=30`、`min_points=6`、`use_gravity=False`、`use_pixel_gravity=True`、`window_s=0.45`、`min_window_s=0.12`、`residual_tol=2.5`、`smooth_window=1`                                                                                                                                                                                                                                                         |
@@ -109,7 +112,7 @@ def save_config(cfg: AppConfig, path: str | Path) -> Path          # == cfg.save
 | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `FrameContext` | `t=0.0, gray=None, motion=None, camera_moving=False`（`motion` 实际是 `MotionEstimate`，标注为 `Any`）                                         |
 | `TrailPoint`   | `t, x, y, z=None, radius=0.0, score=0.0`                                                                                                       |
-| `FrameResult`  | `t, frame_index, detection, track, trail, prediction, prediction_3d, position_3d, fps, detect_ms, camera_motion, camera_moving, camera_steady` |
+| `FrameResult`  | `t, frame_index, detection, track, trail, prediction, prediction_3d, position_3d, fps, detect_ms, camera_motion, camera_moving, camera_steady, detector_note` |
 
 `FrameResult` 的三个三维字段不同：`prediction` = **(N,2) 像素**（3D 预测也会投影回像素）、`prediction_3d` = **(N,3) 米**、`position_3d` = **(3,) 米**；`trail` 坐标始终是像素。
 
@@ -147,10 +150,16 @@ class BaseDetector:
 def build_single_detector(name: str, cfg) -> BaseDetector | None;  def build_detector(cfg: DetectorConfig) -> BaseDetector
     # 前者只认 color/hough/motion/specular（其它返回 None）；后者未知名字抛 ValueError，"sam"/"sam2" 等价 "yolo_sam"
 class ColorBlobDetector(BaseDetector):  # "color"；def build_mask(frame) -> np.ndarray；给 contour+mask
+    # def seed(x,y,r,frame_index=0)：从点击环取 HSV、半径带 [0.6,1.7]×r；
+    #   种子帧无候选时输出 seed_anchor，之后可用亚像素边缘跟随（extra 里可分辨）
 class HoughDetector(BaseDetector):  # "hough"；无 contour / 无 mask
 class MotionDetector(BaseDetector):  # "motion"；last_mode: "bg" | "compensated"
 class SpecularBallDetector(BaseDetector):  # "specular"；必须 seed(x,y,r,frame_index=0)；CSRT 返回 0/1
+    # 输出半径 = seed_r × (当前框半径 / 初始框半径)，夹在 [seed_scale_lo, hi]；
+    # 不是 max(w,h)/2（那是"框多大"，不是"球多大"）
 class FusionDetector(BaseDetector):  # "fusion"；返回 0 或 1 个，method="fusion:<子名>"
+    # 每个成员交 top-K（fusion_topk）候选 → 按中心聚类 → 按不同成员数投票；
+    # seed() 透传给支持种子的成员（color / specular）
 class YoloDetector / YoloSamDetector  # "yolo" / "yolo_sam"；def refine_circle_in_box(frame, det, cfg) -> Detection | None
 ```
 `_score_candidate` 的硬规则（所有检测器共用）：半径越界、`radial>0 且 <min_radial_consistency`、`fill>0 且 <min_fill_ratio` → **直接 0**；半径贴边（`<1.3*min` 或 `>0.8*max`）整分 ×0.8；只对"传进来 >0"的指标做加权平均。区分圆与方块主要靠 `radial`（方块顶点比边中点远 41%）。
@@ -247,6 +256,9 @@ class CameraSource(VideoSource):
 class FileSource(VideoSource):   def __init__(self, path: str | Path) -> None
 class ImageSource(VideoSource):  def __init__(self, paths: Sequence[str | Path], fps: float = 30.0) -> None
 def backend_name(api: int | None) -> str;  def open_source(path=None, camera=None, **kwargs) -> VideoSource
+def open_camera_source(*, index=None, identity="", port="", symbolic_link="",
+                       width=1280, height=720, fps=30, backend=None,
+                       optimize=False, capture_api="auto") -> VideoSource
 CANDIDATE_MODES: tuple[tuple[int, int], ...]     # 自动探测用的候选分辨率
 ```
 **调用顺序 / 前置条件**：app 里的标准用法是 `src = open_source(...)` → 循环 `ok, frame, t = src.read()` → `pipe.process(frame, t)` → 结束 `src.release()`；**`pipeline` 不 import `sources`**（取帧与编排分层）。`open_source` 分派：`path` 是目录 → `ImageSource`（按扩展名过滤 + 文件名排序）；`path` 是图片扩展名 → `ImageSource([单张])`；否则 → `FileSource`；都不给 → `CameraSource(index=camera or 0)`。要"永远处理最新画面"就用 `LatestFrameCamera(CameraSource(...))`（双目分支就是这么用的），循环里用 `latest()`。
@@ -257,6 +269,34 @@ CANDIDATE_MODES: tuple[tuple[int, int], ...]     # 自动探测用的候选分�
 ③ `info.fps` **尽量是实测值**：`CAP_PROP_FPS` 常返回"你请求的值"而不是真实帧率（实测请求 60、实际 29.8）；`fps_measured` 告诉你这个值是不是实测 —— 写录像帧率要用它；`resolution_fallback=True` = 请求的分辨率不支持、已降级（USB 摄像头常表现为"打开成功但每帧全黑"）。
 ④ 时间戳语义不同：`CameraSource` 用 `perf_counter()`，`FileSource`/`ImageSource` 用 `帧号/fps`，跨源不可比。
 ⑤ `open_source(path=...)` 时 `camera=` 被忽略；`**kwargs` 只在 camera/image 分支生效，走 `FileSource` 时**静默丢弃**；读尽后返回 `(False, None, t)`（`ImageSource` 读不出图片时同样 `ok=False`）。
+
+## 8b. `sphere_tracker/mf_camera.py` —— Media Foundation 按设备 symlink 采集
+
+```python
+@dataclass(frozen=True) MFDevice:  index; name; symbolic_link; identity; port; serial
+def list_devices() -> list[MFDevice]                     # 只枚举，不开相机
+def find_device(*, identity="", port="", symbolic_link="", devices=None) -> MFDevice
+@dataclass(frozen=True) MediaType: subtype; width; height; fps_num; fps_den
+def select_native_type(types, width, height, fps=0) -> MediaType
+def decode_frame(raw, subtype, width, height) -> np.ndarray   # NV12/MJPG/YUY2/RGB32 -> BGR
+class MFCameraSource(VideoSource):
+    def __init__(self, *, identity="", port="", symbolic_link="",
+                 width=1920, height=1080, fps=30.0) -> None   # 首次 read 才打开
+```
+
+**口径**：`symbolic_link` 来自 `MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK`，
+含 PnP 端口；`find_device` 只按 symlink/端口/identity 精确匹配，**不按 FriendlyName
+猜**。`MFCameraSource` 枚举 native media type，分辨率优先、fps 其次、subtype
+优先 MJPG；请求档不存在时取最近档并置 `resolution_fallback=True`。它**只**是
+新增后端：`open_camera_source(capture_api="opencv")` 仍是原 `CameraSource`，
+默认也不启用 MF。
+
+**坑**：① MF 的 `SetCurrentMediaType` 给一个“部分类型”可能被接受却落到
+640×480；必须用 native type 选档，不能只看请求宽高。② `ReadSample` 的
+buffer 可能是 NV12/MJPG/YUY2，按当前 subtype 解码，未知 subtype 抛
+`MFError`。③ 两台同型号相机若没有唯一序列号，symlink 仍主要靠 USB 端口；
+换口后要重新绑定，不自动按名字找回。
+
 ## 9. `sphere_tracker/camera_registry.py` —— 相机设备管理
 把"相机身份"从会漂移的 cv2 索引里解耦；配置在 `config/cameras.json`（不入库）。
 ```python
@@ -272,6 +312,9 @@ def read_windows_registry_instances() -> list[str];  def read_windows_pnputil() 
 def read_windows_pnp(*, runner=_run_powershell) -> list[dict];  def read_windows_devices_info() -> list[dict]   # pnputil 优先
 def windows_devices(*, registry_reader=..., pnp_reader=...) -> list[DeviceEntry];  def list_devices() -> list[DeviceEntry]   # 非 Windows -> []
 def probe_index(index, *, width=1280, height=720, fps=30, opener=None) -> ProbeResult   # 异常都收成 ok=False
+def probe_mode(index, width, height, *, fps=0, backend=None, sample_s=0.6,
+               first_frame_timeout_s=30, opener=None) -> ModeResult   # 只试这一档，真帧尺寸+数帧实测
+def probe_modes(index, modes=None, *, fps_list=(0.0,), backend=None, ...) -> list[ModeResult]
 def is_avoided(name: str, settings: dict | None = None) -> bool;  def rank_candidates(devices, *, reg=None, settings=None) -> list[DeviceEntry]
 def select_cameras(*, need=1, devices=None, probe=probe_index, reg=None, settings=None, indices: list[int] | None = None) -> list[ProbeResult]
 def load_registry(path=None) -> Registry;  def save_registry(reg, path=None) -> Path    # 坏文件 -> 空 Registry（不抛）；写不进去抛
@@ -286,7 +329,10 @@ def role_of_device(reg: Registry, d: DeviceEntry) -> str | None
 def mark_ignored(reg, *, entry=None, index=None, verified=False) -> RoleSpec   # 顺手把它从 roles 里摘掉
 def unmark_ignored(reg, *, entry=None, index=None) -> int      # 返回摘掉几条
 def clear_ignored(reg: Registry) -> int
-AUTO_TOKEN = "auto";  DEFAULT_SETTINGS = {...}   # prefer_external / min_width / min_height / min_fps / avoid_names / avoid_name_patterns / max_index
+AUTO_TOKEN = "auto";  DEFAULT_SETTINGS = {...}   # prefer_external / min_width / min_height / min_fps / min_pair_fps / avoid_names / avoid_name_patterns / max_index
+# min_fps 只在 ProbeResult.fps_measured=True 时参与 select_cameras 过滤；
+# min_pair_fps=None 沿用 AUTO_MIN_PAIR_FPS（14.4），可写绝对下限。
+def merged_settings(settings=None, reg=None) -> dict;  def setting_int/setting_float(...)   # settings 的唯一合成/容错读取点
 ```
 `resolve_camera_arg` 规则：`None`/`""` → `None`；`int` → 原样；`"0"` → `0`；`"port:xx"`/`"id:xx"`/`"name:xx"` → 匹配设备；**其它字符串当角色名**（查 `config/cameras.json`）。
 
@@ -517,20 +563,24 @@ MAX_BOARD_RMSE_PX = 2.0                      # 超过就不许当世界系
 @dataclass WorldFrame:
     T_world_cam: np.ndarray                  # 4x4，p_world = T @ p_left_camera
     source: str; units="m"; note=""; board_rmse_px: float|None; created_at: str
+    ground_axis: str = "z"                   # "z" / "-z"；随 save/load 往返
     def apply(self, points: (N,3) | None) -> (N,3) | None      # None 原样返回
-    def describe(self) -> str
+    def describe(self) -> str                # 两行：几何定义 + ground_axis 符号语义
     def save(self, path) -> Path                               # JSON，矩阵一行一个 4x4 行
     @classmethod load(cls, path) -> WorldFrame                 # 任何校验不过就 ValueError
     @classmethod from_camera_board(cls, T_cam_board, *, source="manual", units="m",
                                    note="", board_rmse_px=None, ground_axis="z") -> WorldFrame
-def from_board(image_path, board_spec: BoardSpec, rig: StereoRig, *, ground_axis="z") -> WorldFrame
+def from_board(image_path, board_spec: BoardSpec, rig: StereoRig, *,
+               ground_axis="z", rig_path=None) -> WorldFrame
 ```
-- `from_board`：`detect_board` → `solvePnP`（用左路 `K1/D1`）→ `T_cam_board` → 取逆。CLI 在 `apps/tools/set_world_frame.py`（`--image --board-cols/--board-rows/--board-square --rig --out --note --ground-axis {z,-z} --dry-run`）。
-- **校验规则**（`__post_init__`，全部抛 `ValueError` 并说明是哪一条）：4x4 / 全 `finite` / 最后一行必须是 `[0,0,0,1]` / 旋转块 `RᵀR−I` 最大偏差 ≤ 1e-6 / `det(R) > 0`（<0 是镜像不是旋转）。`load()` **绝不回退成单位矩阵**，文件缺失抛 `FileNotFoundError`。
+- `from_board`：读图 → **校验分辨率** → `detect_board` → `solvePnP`（用左路 `K1/D1`）→ `T_cam_board` → 取逆。CLI 在 `apps/tools/set_world_frame.py`（`--image --board-cols/--board-rows/--board-square --rig --out --note --ground-axis {z,-z} --dry-run`）。
+- **校验规则**（`__post_init__`，全部抛 `ValueError` 并说明是哪一条）：4x4 / 全 `finite` / 最后一行必须是 `[0,0,0,1]` / 旋转块 `RᵀR−I` 最大偏差 ≤ 1e-6 / `det(R) > 0`（<0 是镜像不是旋转）/ `ground_axis ∈ {"z","-z"}`（写别的值等于"轴符号说不清"）。`load()` **绝不回退成单位矩阵**，文件缺失抛 `FileNotFoundError`；老文件没有 `ground_axis` 键 → 按 `"z"` 读。
+- **`describe()` 必须含 `ground_axis`**：矩阵本身看不出 Z 朝上还是朝下，`-z` 还会把 Y 一起反向。所以它输出两行 —— 第一行几何（原点/XYZ/单位/rmse），第二行符号语义（`z` → Z 朝地下、Y 朝画面下；`-z` → Z 朝天空、Y 指向画面上方）。`--dry-run` 打印的就是它。
+- **拍图分辨率校验（2026-11-20 补）**：`from_board()` 读图后比 `(w,h)` 与 `rig.image_size`，不一致抛 `ValueError`（文案含**两边尺寸**、`rig_path` 对应的标定文件、下一步"用标定同分辨率重拍 / 重标"）；`image_size` 缺失或无效（老 npz 读成 `(0,0)` / `None`）时**跳过校验但不静默**：`print` 一行 `[世界系] 注意：…` 并写进 `WorldFrame.note`。`rig_path` 只用于报错文案。
 - **坑**：① 原点取画面**最"左下"的内角点**（按 `x−y` 最小），消掉 SB 与经典检测器之间 180° 的起点差；相机装歪 90° 时"左下"仍可算但已不等于物理左下角。
-  ② **`Z` 是棋盘法向，不是"重力反方向"**：板平放地面、图案朝上拍时默认 +Z 指向地面以下，要 Z 朝上必须传 `ground_axis="-z"`（Y 同时反向以保右手系）。符号只能靠人确认，程序不替你猜。
+  ② **`Z` 是棋盘法向，不是"重力反方向"**：板平放地面、图案朝上拍时默认 +Z 指向地面以下，要 Z 朝上必须传 `ground_axis="-z"`（Y 同时反向以保右手系）。符号只能靠人确认，程序不替你猜；两种取值的 rmse **完全相同**，看误差判断不了符号。
   ③ `board_rmse_px` **只反映 PnP 拟合好坏**，看不出来"板是不是真的平放在地上"——板没放平、相机与板不同侧，世界系都会歪而 rmse 依然漂亮。
-  ④ 内部计算一律 `left_camera`，只在**导出那一刻**转世界；没这个文件时导出必须写 `coordinate_system="left_camera"`，不许静默当世界系。
+  ④ 内部计算一律 `left_camera`，只在**导出那一刻**转世界；没这个文件时导出必须写 `coordinate_system="left_camera"`，不许静默当世界系。parallel 的校正系**不支持**世界系变换（差一个 `R1`），会拒绝并说明原因。
 
 ### 12.7 `calib/metric_check.py` —— 尺度自检（三种入口，只有一种是真的）
 ```python
@@ -626,6 +676,47 @@ def extrinsic_sigma(objp, imgpoints1, imgpoints2, K1, D1, K2, D2, R, T,
 ⑤ **不含 `σ_f`**（要 `calibrateCameraExtended` 的 `stdDeviationsIntrinsics`，见 `StereoCalibrationResult.fx_sigma()`）；两项都要时把平方相加。`T` 必须是**米**，`depth_sigma_mm_at(z)` 的 `z` 也是米、越界返回 `nan`。
 ⑥ `image_size` 参数**在函数体里没用**（`projectPoints` 不需要），保留只为与 `calibrate_stereo` 调用口径一致。
 
+### 12.10 `calib/axial_calib.py` / `calib/device90_calib.py` —— 两种独立标定求解器（2026-11-18，按源码抄写，未额外跑 inspect.signature）
+
+两个**独立入口**，不是 `calib_method` 插件（见 §0b 注册表仍只有 joint/chain）；产物都是 `StereoCalibrationResult`，能被 `StereoRig.from_result` 直接消费。
+
+```python
+# --- calib/axial_calib.py：模式 A 轴向标定（板正对相机 + 已知沿光轴推进量 ΔZ + 已知方格边长 L）---
+class AxialCalibError(ValueError)                     # 输入/物理前提不成立（非数值失败）
+@dataclass AxialIntrinsics:
+    fx, fy, cx, cy, Z0: float                         # 焦距/主点(px)、第一帧(ΔZ=0)板深度(m)
+    Z0_x, Z0_y: float                                 # 横/纵分别拟合的 Z0，差异大说明板没正对
+    distortion_calibrated: bool                       # 诚实标记：轴向恒 False
+    rms_px: float; n_frames: int; delta_z: np.ndarray
+    per_frame_rms: list[float] = []; notes: list[str] = []
+    def matrix_K_D(self) -> tuple[np.ndarray, np.ndarray]   # D = zeros(5)，恒全 0
+def solve_axial_intrinsics(corners_list, delta_z, spec: BoardSpec | None = None, *,
+                           min_frames: int = 3) -> AxialIntrinsics
+    # 1/p 对 ΔZ 线性拟合解 f/Z0，主点用网格对称性；帧数不足/ΔZ 极差≈0/斜率非正 -> AxialCalibError
+def solve_axial_stereo(corners_left, corners_right, delta_z, spec: BoardSpec | None = None,
+                       image_size: tuple[int, int] = (0, 0), cfg: CalibConfig | None = None, *,
+                       assume_parallel: bool = False) -> StereoCalibrationResult
+    # 两路各解内参 + 锁内参 stereoCalibrate 定外参（失败回退逐帧 solvePnP 链）
+    # assume_parallel=True 强制 R=I（机械保证两光轴平行时），rectification=none_raw
+
+# --- calib/device90_calib.py：模式 B 中轴 90°（同一块板绕中轴转 90°，分别正对互成 90° 的两相机）---
+class Device90CalibError(ValueError)
+@dataclass Device90Diagnostics:
+    Z_A=Z_B=nan; Q_A=Q_B=None; roll_A_deg=roll_B_deg=nan; rms_A_px=rms_B_px=nan; n_A=n_B=0; notes=[]
+def board_center(spec: BoardSpec | None = None) -> np.ndarray       # 板几何中心（米，BoardSpec 系）
+def R_AB_matrix(axis: str = "y", angle_deg: float = 90.0) -> np.ndarray   # 板 A→B 纯旋转
+def solve_device90(corners_A, corners_B, K1, D1, K2, D2,
+                   spec: BoardSpec | None = None, image_size: tuple[int, int] = (0, 0), *,
+                   axis: str = "y", angle_deg: float = 90.0,
+                   Z_A: float | None = None, Z_B: float | None = None,
+                   cfg: CalibConfig | None = None,
+                   diagnostics: Device90Diagnostics | None = None) -> StereoCalibrationResult
+    # 链式外参 T_{C_B<-C_A}=T_camB_B·T_AB·inv(T_camA_A)，无需共视/同框图；依赖内参 K/D 已知
+    # 产物 stereo_mode="angled"、rectification="none_raw"，可喂 angled_geometry.triangulate_pixels
+```
+
+**关键口径**：轴向模式只沿光轴推进，畸变不可观测 —— `distortion_calibrated=False`、`D` 全 0，**不得声称已标定畸变**（要畸变走常规多姿态标定）。中轴 90° 模式 `axis/angle` 必须与装置实际中轴/转向一致，装错会给出基线量级不对的"好看"解，务必传 `cfg.expected_baseline_mm` 并把 `baseline_tolerance` 设到 0.05 量级（默认 0.20 会漏掉装错）。两种模式的 meta 字段见 `数据标准.md` §1 的标定模式字段说明；元数据写入靠 CLI（`apps/calibrate_axial.py` / `apps/calibrate_device90.py`）。
+
 ## 13. `stereo/` —— 双目逐帧
 ### 13.1 `stereo/sync.py`
 ```python
@@ -671,6 +762,10 @@ CAMERA_WAIT_TIMEOUT = 5.0;  CAMERA_ALIGN_STEPS = 2;  CAMERA_POLL_INTERVAL = 0.00
 ③ `FrameReader.seek()` **不允许倒退**（`ValueError`，因为成对取帧只向前走）；`CameraPairReader.seek()` 直接 `NotImplementedError`。
 ④ `PairSource.image_size` 取**左路**尺寸（两路分辨率不同时不报错，只有 `CameraPairReader` 打印实测差异）。
 ⑤ `from_args(args)` 读的参数名与 `apps/_common.add_stereo_source_args()` 一一对应；`--left/--right` 可以是索引、**角色名**（查 `config/cameras.json`）或 `auto`；`--auto-cameras` 时两台由 `select_cameras` 挑。
+⑥ **默认值的两层，别混**：上面 `PairSource.__init__` / `CameraPairReader.__init__` 的 `width=1920, height=1080, fps=60`（`fps` 已是 **float**）是**库构造签名**的真实默认，没改过；
+  而共用 CLI 参数 `apps/_common.add_stereo_source_args()` 的默认已是 `--width/--height=0`（= 逐档自适应协商）、`--fps=DEFAULT_FPS=24`。
+  **分辨率档位与帧率建议档的唯一产地在 `sphere_tracker/video_profiles.py`**：8 档（P8K/P5K/P4K/P1440 默认/P1080/P720/P540/P480）、`DEFAULT=1440p`、`DEFAULT_FPS=24`、`FPS_TIERS=(24,30,60,120,240,500,1000)`；
+  `fps` 保留小数不截断。库签名的 1920/1080/60 只是显式档的历史默认，改档请先改 `video_profiles.py` 并同步调用方，不要在这份参考里硬改数字。
 ### 13.3 `stereo/triangulate.py`
 ```python
 @dataclass MatchConfig:
@@ -790,7 +885,7 @@ SCHEMA = "sphere-stereo-session"; VERSION = 1; SESSION_FILE = "session.json"
 @dataclass Session:
     id, created, label="", notes="", left=None, right=None, calibration=None,
     stereo_mode="parallel", rig={},               # 2026-10-21；旧文件缺省 parallel；rig["fov"] 仅对齐生效时写入
-    sync=SyncInfo(), codec="FFV1", container="mkv", lossless=True,
+    sync=SyncInfo(), codec="FFV1", container="mkv", lossless=True,   # container: mkv(默认)/avi；录制 --container 选，mp4 不支持
     environment={}, checks=[]
 def create_session(root, *, label="", notes="") -> tuple[Path, Session]
 def save_session(session, session_dir) -> Path
@@ -803,6 +898,8 @@ def list_sessions(root) -> list[Path];  def sha256_file(path) -> str
 （物理 vs 算法 >10% 警告、>20% 错误），**不抛异常**，坏会话一次列全。
 **基线**：`baseline_mm` 是算法结果（几何用它），`baseline_measured_mm` 只作交叉核对，不覆盖算法值。
 **路径**：视频/标定路径默认相对会话目录；也接受绝对路径。
+**容器**：`container` 记实际写盘容器，`mkv`（默认）/ `avi` 二选一（录制端 `apps/record_stereo.py --container` 指定）；
+原始视频扩展名与文件名清单的唯一产地是 `sphere_tracker/video_files.py`（`RAW_VIDEO_EXTENSIONS`、`LEFT/RIGHT_VIDEO_NAMES`，顺序 mkv>mp4>avi）。
 
 ### 13.5 `stereo/trajectory.py` + `stereo/depth_fusion.py`
 ```python
@@ -842,7 +939,7 @@ def export_session_visualization(session_dir, *, csv_name="traj3d.csv") -> dict[
 ### 13.7 `stereo/predict3d.py` —— 三维弹道外推 + 反弹检测（未接主流程）
 ```python
 @dataclass(frozen=True) PredictConfig:
-    g=(0.0,-9.81,0.0); horizons=(0.1,0.2,0.3,0.5); min_samples=5
+    g=(0.0,+9.81,0.0); horizons=(0.1,0.2,0.3,0.5); min_samples=5
     max_gap_s=0.25; residual_gate_m=0.05
 @dataclass(frozen=True) BallisticState:
     p0; v0; g; rms_m; n; t_ref; dropped=0        # p0 是 t_ref（最后一个有效样本）时刻的位置
@@ -852,8 +949,8 @@ def detect_bounce(times, points, cfg=None, reason=None) -> int | None
 ```
 - 模型 `p(t)=p0+v0·τ+0.5·g·τ²`，只解每轴 `(p0,v0)` 共 6 个未知数（线性最小二乘，**无迭代优化器**）；`g` 是**已知常向量** —— 三维里它不依赖焦距和深度，这正是三维比二维稳的原因。
 - **`fit_ballistic` 什么时候返回 `None`**（原因写进 `reason`，从不硬给一个解）：`n < min_samples` / 时间跨度 < 1 ms / 设计矩阵条件数 > 1e8 / 残差 `rms_m > residual_gate_m`（窗口里多半混进了反弹）。
-- **`detect_bounce` 的判据（两步缺一不可）**：先看整段残差，没超门限 → `None`（纯噪声仍是同一条抛物线，不许报反弹）；超标才逐切分点分段拟合，要求**两段各自合格**且明显优于整段（`worst ≤ 0.5·rms_all`），`v_y` 由负转正只作挑点的加分项。返回的是 `_prepare` 之后的数组下标（已排序、去重时与原始下标不同）。
-- **坑**：① **`g` 的方向由世界系定义**。默认 `(0,-9.81,0)` 只是"y 轴向上"的**约定，不是测量**；相机俯拍/侧装时必须用 `PredictConfig(g=...)` 换成世界系给出的重力方向，否则 0.3 s 外推能偏几十厘米。
+- **`detect_bounce` 的判据（两步缺一不可）**：先看整段残差，没超门限 → `None`（纯噪声仍是同一条抛物线，不许报反弹）；超标才逐切分点分段拟合，要求**两段各自合格**且明显优于整段（`worst ≤ 0.5·rms_all`），速度沿重力方向由同向变反向（`v·g` 由正变负）只作挑点的加分项。返回的是 `_prepare` 之后的数组下标（已排序、去重时与原始下标不同）。
+- **坑**：① **`g` 的方向由坐标系定义**。本项目相机/世界系约定 **Y 向下**，默认 `(0,+9.81,0)`；如果数据是"Y 向上"的数学系，必须显式传 `(0,-9.81,0)`。相机俯拍/侧装或换到世界系时必须用 `PredictConfig(g=...)` 换成该系的真实重力方向（世界系用 `run_stereo_video.world_gravity_world()`），否则 0.3 s 外推能偏几十厘米。
   ② `predict` 的 horizon 相对 `t_ref`（最新观测），不是第一个样本 —— "现在"永远是最新观测。
   ③ 重复/乱序时间戳在 `_prepare` 里排序去重，丢弃数记在 `dropped`；`residual_gate_m=0.05` 是"毫米级残差"的门限，混进反弹就会被拒，**别为了让它出结果而调大**。
 
@@ -881,6 +978,6 @@ def detect_bounce(times, points, cfg=None, reason=None) -> int | None
 ⑤ 本文按三个包**当前源码**写成；若与源码不符，**以源码为准**并顺手改这里。
 
 > **本文自身也是漂移源**（2026-10-14 复核）：§1 坑②与 §10 坑④ 两条"定义但无人读取 / 疑似不一致"在代码修好之后**继续留在正文里**，
-> 而 `启动程序.bat standards` 查的是**路径引用与计数**、`selftest_doc_facts` 查的是**测试清单** ——
+> 而 `run.bat standards` 查的是**路径引用与计数**、`selftest_doc_facts` 查的是**测试清单** ——
 > **两者都不检查"这段描述还成不成立"**，所以它一路绿灯。教训：**"读代码得出的结论"没有回归测试守着，就会随相邻代码一起过期**；
 > 写这类判断时必须同时写出**判据落在哪个测试里**，否则它迟早变成误导下一个人的正文。

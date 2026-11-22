@@ -459,8 +459,6 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         profile = rp.RigProfile(
             name="parallel-desk",
             stereo_mode="parallel",
-            expected_baseline_mm=124.0,
-            working_distance_m=0.30,
             width=2560,
             height=1440,
             fps=24,
@@ -480,31 +478,34 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
             rp.RigProfile(name="alias-rig", stereo_mode="orthogonal"), path=path))))
         checks.append(("calibration_path='../x.json' 被拒", rejects(lambda: rp.upsert(
             rp.RigProfile(name="escape", calibration_path="../x.json"), path=path))))
-        checks.append(("expected_baseline_mm=-1 被拒", rejects(lambda: rp.upsert(
-            rp.RigProfile(name="neg", expected_baseline_mm=-1.0), path=path))))
         checks.append(("被拒后 store 未被污染（仍只有 1 个档案）",
                        [p.name for p in rp.list_profiles(path)] == ["parallel-desk"]))
 
-        # 4) 几何提示：124/0.3 远小于 90°，600/0.3 ≈ 90°
-        small = rp.RigProfile(name="angled-124", stereo_mode="angled",
-                              expected_baseline_mm=124.0, working_distance_m=0.30)
-        good = rp.RigProfile(name="angled-600", stereo_mode="angled",
-                             expected_baseline_mm=600.0, working_distance_m=0.30)
-        hint_small = rp.geometry_hint(small)
-        hint_good = rp.geometry_hint(good)
-        print(f"  B=124 mm / D=0.30 m -> {hint_small}")
-        print(f"  B=600 mm / D=0.30 m -> {hint_good}")
-        # 2026-10-24：文案从"不支持 90°"（命令式判定）改成"参考估算 / 以标定为准"。
-        # 断言改成**语气**而不是字面句子：必须同时出现"标定"与"参考"，
-        # 且**不许**再出现"不支持"这类判定语义（估算错的是数字，不是装置）。
-        checks.append(("B=124/D=0.3 的提示含「标定」+「参考」（不是命令式判定）",
-                       "标定" in hint_small and "参考" in hint_small))
-        checks.append(("B=600/D=0.3 的提示同样含「标定」+「参考」",
-                       "标定" in hint_good and "参考" in hint_good))
-        checks.append(("两种提示都不含「不支持」这类判定语义",
-                       "不支持" not in hint_small and "不支持" not in hint_good))
-        checks.append(("两种提示都标注「非标定值」（不许把估算当标定）",
-                       "非标定值" in hint_small and "非标定值" in hint_good))
+        # 4) 2026-11-07：档案不再存几何预期，也不再由它估角度。
+        # 这里的判据换成"字段真的没了"，并验一份**旧档案**（还带那两个键）能被读、
+        # 旧键被忽略 —— 否则老机器升级后 load_store 会整份炸掉。
+        import json
+
+        legacy = Path(tmp) / "legacy.json"
+        legacy.write_text(json.dumps({
+            "schema": "sphere-rig-profiles", "version": 1, "active": "old-rig",
+            "profiles": {"old-rig": {
+                "name": "old-rig", "stereo_mode": "angled",
+                "expected_baseline_mm": 600.0, "working_distance_m": 0.30,
+                "notes": "", "created": "2026-10-24T00:00:00"}}},
+            ensure_ascii=False), encoding="utf-8")
+        old_back = rp.get_profile("old-rig", legacy)
+        checks.append(("RigProfile 不再有 expected_baseline_mm / working_distance_m",
+                       not hasattr(rp.RigProfile("x"), "expected_baseline_mm")
+                       and not hasattr(rp.RigProfile("x"), "working_distance_m")))
+        checks.append(("to_dict 里不再出现几何预期键",
+                       not ({"expected_baseline_mm", "working_distance_m"}
+                            & set(profile.to_dict()))))
+        checks.append(("geometry_hint 已删除（不许再拿猜测值估角度）",
+                       not hasattr(rp, "geometry_hint")))
+        checks.append(("旧档案带这两个键仍能读、且旧键被忽略",
+                       old_back is not None
+                       and "expected_baseline_mm" not in old_back.to_dict()))
 
         # 5) active 持久化（重开程序要能记住用哪套装置）
         rp.set_active("parallel-desk", path)
@@ -570,8 +571,10 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         #
         # 守的是什么：半成品档案的典型状态是"路径指向从没标定过的文件"，
         # 无条件跟随会让录制直接报"找不到标定"，而顶层那份真实标定被忽略。
-        # 三种情形必须分清：配了且存在 -> 跟随；配了但不存在 -> 回落；
-        # 没配 -> 回落。回落目标是 fallback（默认顶层）。
+        # 三种情形必须分清：配了且存在 -> 跟随；配了但不存在 -> **显式报错**
+        # （2026-11-08 改：以前静默回落顶层，结果切了装置却拿别套装置的几何在跑）；
+        # 没配 -> 回落。strict=False 只留给本来就不需要现存标定的调用方，
+        # 但仍跟随档案路径（不报错 ≠ 换几何，不许再回落顶层，2026-11-10 改）。
         import os
         fb = Path(tmp) / "top_level"          # 模拟顶层 stereo_calibration
         fb.with_suffix(".npz").write_bytes(b"x")
@@ -586,13 +589,22 @@ def test_rig_profiles_are_validated_and_persisted() -> bool:
         got_a = rp.resolve_calibration_base(path, fallback=fb)
         checks.append(("档案配了且 .npz 存在 -> 跟随档案（相对 ROOT）",
                        got_a == (rp.ROOT / "config" / "stereo_calibration")))
-        # 7b) 档案配了但文件不存在 -> 回落 fallback（半成品档案的关键情形）
+        # 7b) 档案配了但文件不存在 -> 显式报错（半成品档案的关键情形）
         rp.upsert(rp.RigProfile(name="rig-b", stereo_mode="parallel",
                                 calibration_path="sub/rig_b"), path=path)
         rp.set_active("rig-b", path)
-        got_b = rp.resolve_calibration_base(path, fallback=fb)
-        checks.append(("档案配了但 .npz 不存在 -> 回落 fallback（不报错）",
-                       got_b == fb))
+        try:
+            rp.resolve_calibration_base(path, fallback=fb)
+            raised = False
+        except rp.ProfileError as exc:
+            raised = "拒绝回落" in str(exc) and "rig-b" in str(exc)
+        checks.append(("档案配了但标定不存在 -> 显式报错，不再拿顶层几何顶替",
+                       raised))
+        got_b_loose = rp.resolve_calibration_base(path, fallback=fb,
+                                                  strict=False)
+        checks.append(("strict=False 不报错但必须跟随档案自己的路径（不回落顶层）",
+                       got_b_loose == (rp.ROOT / "sub" / "rig_b")
+                       and got_b_loose != fb))
         # 7c) 档案没配 calib_path -> 回落 fallback
         rp.upsert(rp.RigProfile(name="rig-c", stereo_mode="parallel"), path=path)
         rp.set_active("rig-c", path)
@@ -667,6 +679,8 @@ def test_baseline_in_profile_is_reference_only() -> bool:
         store = Path(tmp) / "profiles.json"
         store.write_text(json.dumps({
             "schema": "sphere-rig-profiles", "version": 1, "active": "ref-600",
+            # 故意留着两个"旧键"：2026-11-07 起档案不再存它们，检查脚本
+            # 必须能读这份旧档案、并且不再拿它写"参考基线"提示。
             "profiles": {"ref-600": {
                 "name": "ref-600", "stereo_mode": "angled",
                 "expected_baseline_mm": 600.0, "working_distance_m": 0.30,
@@ -702,31 +716,34 @@ def test_baseline_in_profile_is_reference_only() -> bool:
         out = proc.stdout or ""
         print("  --- 子进程输出（节选）---")
         for line in out.splitlines():
-            if "标定实测" in line or "档案" in line or "参考" in line or "几何提示" in line:
+            if "标定实测" in line or "档案" in line or "几何提示" in line:
                 print(f"  {line}")
-        print(f"  退出码 = {proc.returncode}（旧实现在差 >30% 时会是 1）")
+        print(f"  退出码 = {proc.returncode}")
 
-        checks.append(("期望 600 mm vs 标定 124 mm（差 384%）precheck 仍返回 0",
+        checks.append(("旧档案里残留的期望基线不影响 precheck（仍返回 0）",
                        proc.returncode == 0))
         pos_measured = out.find("标定实测")
-        pos_ref = out.find("参考：档案期望基线")
-        checks.append(("输出里「标定实测」排在「参考：档案期望基线」之前（权威在前）",
-                       pos_measured >= 0 and pos_ref >= 0 and pos_measured < pos_ref))
+        checks.append(("输出仍以标定实测为准（有那一行）", pos_measured >= 0))
+        # 2026-11-07：参考估算那一行整段删除，不能再出现。
+        checks.append(("输出不再出现「参考：档案期望基线」/「档案参考值」/「几何提示」",
+                       "参考：档案期望基线" not in out
+                       and "档案参考值" not in out
+                       and "几何提示" not in out))
 
-    # 3) 只给 name + stereo_mode 也能建档（B/D 是可选的）
+    # 3) 只给 name + stereo_mode 也能建档（几何量一律由标定给出）
     with tempfile.TemporaryDirectory() as tmp2:
         p = Path(tmp2) / "profiles.json"
         saved = rp.upsert(rp.RigProfile(name="minimal", stereo_mode="parallel"), path=p)
         back = rp.get_profile("minimal", p)
         print(f"  只给 name+stereo_mode -> upsert 返回 {saved.name!r}，"
-              f"B={saved.expected_baseline_mm}、D={saved.working_distance_m}")
-        print(f"  geometry_hint -> {rp.geometry_hint(saved)}")
-        checks.append(("只填 name+stereo_mode 的档案能 upsert 并读回（B/D 可空）",
+              f"字段 {sorted(saved.to_dict())}")
+        checks.append(("只填 name+stereo_mode 的档案能 upsert 并读回",
                        back is not None and back.name == "minimal"
-                       and back.expected_baseline_mm is None))
-        checks.append(("缺 B/D 时的几何提示仍含「标定」+「参考」（不装成缺项报错）",
-                       "标定" in rp.geometry_hint(saved)
-                       and "参考" in rp.geometry_hint(saved)))
+                       and back.to_dict() == saved.to_dict()))
+        checks.append(("最小档案里没有几何预期键，也没有 geometry_hint",
+                       not ({"expected_baseline_mm", "working_distance_m"}
+                            & set(back.to_dict()))
+                       and not hasattr(rp, "geometry_hint")))
 
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
@@ -753,6 +770,11 @@ def test_resolution_ladder_comes_from_video_profiles() -> bool:
     4. `sources.CANDIDATE_MODES` 从 `probe_order` 派生（原生档剔除）；
     5. `video_profiles` 仍**不** import cv2（可在无相机、无显示器环境自测）。
 
+    2026-11-18 加 8K/5K 档后补一条：**自动协商（`start=None`）仍只到 4K**，
+    5K/8K 只有显式选才出现 —— 自动协商每多试一档就多一次相机打开尝试
+    （个别后端单次 20 s+），从 8K 起试会拖慢所有现有相机；同时钉住
+    `DEFAULT`/`RECORD_DEFAULT` 不随加档漂移（仍是 2560x1440 的同一对象）。
+
     这是静态/纯逻辑检查，不开相机、不需要硬件，所以能进无人值守的回归。
     """
     print("----- 分辨率降档梯子：单一来源 + 必须含 1920x1080 -----")
@@ -762,9 +784,11 @@ def test_resolution_ladder_comes_from_video_profiles() -> bool:
     auto = vp.probe_order(None)
     explicit = vp.probe_order(vp.parse("1920x1080"))
     custom = vp.probe_order(vp.parse("1024x768"))
+    explicit_8k = vp.probe_order(vp.parse("7680x4320"))
     print(f"  probe_order(None)      = {auto}")
     print(f"  probe_order(1920x1080) = {explicit}")
     print(f"  probe_order(1024x768)  = {custom}")
+    print(f"  probe_order(7680x4320) = {explicit_8k}")
 
     vp_src = (ROOT / "sphere_tracker" / "video_profiles.py").read_text(encoding="utf-8")
     # 只看真正的 import 语句（模块 docstring 里"不 import cv2"那句话不算）
@@ -793,6 +817,17 @@ def test_resolution_ladder_comes_from_video_profiles() -> bool:
          and vp.NATIVE not in sources.CANDIDATE_MODES),
         ("sources.LOWRES_RETRY_MODE 仍是 (640,480)（补试最低带宽档语义不变）",
          sources.LOWRES_RETRY_MODE == (640, 480)),
+        ("自动协商不含 5K/8K（仍是 4K 起 7 项；加档不拖慢现有相机）",
+         len(auto) == 7
+         and (7680, 4320) not in auto and (5120, 2880) not in auto
+         and (3840, 2160) == auto[0]),
+        ("显式 8K 以自身开头，并仍往下含 5K/4K/1080p",
+         explicit_8k == [(7680, 4320), (5120, 2880), (3840, 2160), (2560, 1440),
+                         (1920, 1080), (1280, 720), (960, 540), (640, 480),
+                         vp.NATIVE]),
+        ("DEFAULT/RECORD_DEFAULT 不随加档漂移（仍是 2560x1440 的同一对象）",
+         vp.DEFAULT is vp.RECORD_DEFAULT
+         and vp.DEFAULT.label == "2560x1440"),
         ("video_profiles 仍不 import cv2（无相机环境可自测）",
          not vp_imports_cv2),
     ]
@@ -945,6 +980,761 @@ def test_fov_measure_roundtrip() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_session_calibration_file_is_dynamic() -> bool:
+    """会话标定文件路径只有一份产地，且跟着 session.json 动态走。
+
+    ## 守的是什么（2026-11-10，装置档案修复 A）
+
+    标定文件名是跟着激活装置档案**动态生成**的（录制时按档案的
+    ``calibration_path`` 拷进 ``calib/``）：老会话是
+    ``calib/stereo_calibration.npz``，新会话是 ``calib/<档案名>.npz``。
+    消费方若把文件名写死，新会话就断链。这条判据钉住 5 处收敛：
+    非默认名能解析、老式默认名照样解析（向后兼容）、绝对路径原样返回、
+    缺 ``calibration.path`` / 缺 ``session.json`` 抛明确 ``SessionError``
+    （不是裸 ``KeyError``、不静默返回 ``None``）。
+    """
+    print("----- 会话标定文件路径：动态解析（唯一产地）-----")
+    import json
+    import tempfile
+
+    from stereo.sessions import SessionError, session_calibration_file
+
+    checks: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp) / "20261110-120000"
+        d.mkdir()
+
+        def write_session(cal) -> None:
+            (d / "session.json").write_text(
+                json.dumps({"schema": "sphere-stereo-session", "version": 1,
+                            "calibration": cal}, ensure_ascii=False),
+                encoding="utf-8")
+
+        # 1) 新会话：非默认文件名，必须原样跟随（写死文件名就会断链）
+        write_session({"path": "calib/实验性质平行装置1.npz"})
+        checks.append(("新会话 calib/<档案名>.npz 动态跟随",
+                       session_calibration_file(d)
+                       == d / "calib" / "实验性质平行装置1.npz"))
+        # 2) 老会话：默认名照样解析（向后兼容，不许破坏）
+        write_session({"path": "calib/stereo_calibration.npz"})
+        checks.append(("老会话 calib/stereo_calibration.npz 向后兼容",
+                       session_calibration_file(d)
+                       == d / "calib" / "stereo_calibration.npz"))
+        # 3) 绝对路径原样返回
+        abs_path = (Path(tmp) / "abs.npz").absolute()
+        write_session({"path": str(abs_path)})
+        checks.append(("绝对路径原样返回",
+                       session_calibration_file(d) == abs_path))
+        # 4) 缺 calibration / path -> 明确 SessionError，不是 KeyError / None。
+        #    护栏（team-lead 要求）：连**异常类型**和**消息点名字段**都钉住 ——
+        #    否则将来有人把 helper 改回静默返回 None / 抛裸 KeyError，夹具会变成
+        #    "看似能跑、悄悄退回种子半径"，正是这个仓库最忌讳的形态。
+        for bad in (None, {}, {"path": ""}):
+            write_session(bad)
+            try:
+                session_calibration_file(d)
+                raised = False
+            except SessionError as exc:
+                raised = "calibration.path" in str(exc)
+            except Exception:               # noqa: BLE001 —— KeyError 之类算不达标
+                raised = False
+            checks.append((f"缺 calibration.path（{bad!r}）抛 SessionError 且点名字段",
+                           raised))
+        # 5) 没有 session.json 的目录 -> 明确报错（不硬套）
+        (d / "session.json").unlink()
+        try:
+            session_calibration_file(d)
+            raised = False
+        except SessionError as exc:
+            raised = "session.json" in str(exc)
+        except Exception:                   # noqa: BLE001
+            raised = False
+        checks.append(("没有 session.json 抛 SessionError 且点名字段", raised))
+
+        # 6) 唯一产地：两处解析（要路径就抛错的 / 要路径记 error 不抛的）共用
+        #    ``_session_relative``。钉的是**具体调用行**而不是"行为"——
+        #    反向自证过：把 helper 里的绝对路径分支删掉，三个测试**全都不红**，
+        #    因为 pathlib 的 ``/`` 运算符本来就丢左侧，删了结果不变。所以
+        #    "绝对路径原样"这条约定没有可红的行为判据，只能钉"只有一处写它"。
+        src = (ROOT / "stereo/sessions.py").read_text(encoding="utf-8")
+        pins = (
+            'cal_path = _session_relative(p.parent, str(cal["path"]))',
+            "cal_path = _session_relative(session_dir, cal.path)",
+        )
+        checks.append(("session_calibration_file 与 validate_session 共用同一份路径解析",
+                       all(code in src for code in pins)))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_calibration_follows_active_profile_everywhere() -> bool:
+    """全链路按**当前装置档案**判定标定 —— 不许再有第二处写死顶层。
+
+    ## 守的是什么（2026-11-10 用户裁决 B5）
+
+    以前是两套口径：GUI 的 ``AppState._stereo_calib_path()`` 按档案
+    ``calibration_path`` 解析，而 CLI / ``run_all`` / 四个工具各自写一份
+    ``ROOT / "config" / "stereo_calibration"``。用户把标定写进
+    ``config/calib/<档案名>.npz`` 之后：
+      - CLI 复检报「找不到标定文件」（标定就在档案路径下）
+      - 更坏：读到顶层那份**别套装置**的几何去复检、去判「模式选错」
+
+    判据两层，缺一不可：
+
+    1. **行为**：``apps._common.current_calibration()`` 的四种档案状态。
+       四种都要用**子进程**跑：``stereo.profiles.ROOT`` 与 ``DEFAULT_PATH``
+       在 import 时就绑定，必须在新进程里同时改 ``rp.ROOT``（``cand`` 靠它拼）
+       与 ``rp.DEFAULT_PATH``（档案库路径）才干净。
+    2. **源码**：活链路里不许再出现 ``ROOT / "config" / "stereo_calibration"``
+       这种**拼接表达式**，也不许 argparse 的 ``default="config/stereo_calibration"``。
+       ⚠️ ``stereo/profiles.py`` 例外：那是 fallback 的**唯一产地**
+       （``fb = ROOT / "config" / "stereo_calibration"``），不是第二套口径。
+
+    为什么不靠「跑一遍 GUI/CLI 看输出」：``action_verify`` 是交互式
+    ``input()``、GUI 要开窗口；判据得能无人值守跑。
+    """
+    print("----- 标定路径：全链路按当前装置档案（B5）-----")
+    import json
+    import subprocess
+    import tempfile
+
+    checks: list[tuple[str, bool]] = []
+    CALIB_REL = "config/calib/p1"
+
+    def _store(active: str, path: str | None) -> dict:
+        prof: dict = {"name": active, "stereo_mode": "parallel",
+                      "notes": "", "created": "2026-11-10T00:00:00"}
+        if path is not None:
+            prof["calibration_path"] = path
+        return {"schema": "sphere-rig-profiles", "version": 1, "active": active,
+                "profiles": {active: prof}}
+
+    def probe(store: dict, files: tuple[str, ...]) -> tuple[str, str]:
+        """造一份临时档案库 + 标定文件，在子进程里返回 (基名, 说明)。"""
+        with tempfile.TemporaryDirectory(prefix="cw_calib_") as tmp:
+            root = Path(tmp)
+            for rel in files:
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"x")           # 内容无关，只判存在性
+            sp = root / "profiles.json"
+            sp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+            code = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "from pathlib import Path\n"
+                "from stereo import profiles as rp\n"
+                f"rp.ROOT = Path({str(root)!r})\n"
+                f"rp.DEFAULT_PATH = Path({str(sp)!r})\n"
+                "from apps._common import current_calibration\n"
+                "b, w = current_calibration()\n"
+                "print(str(b))\n"
+                "print(w)\n"
+            )
+            proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace")
+            lines = (proc.stdout or "").splitlines()
+            if len(lines) < 2:
+                return "", f"<子进程失败 rc={proc.returncode}> {(proc.stderr or '')[:300]}"
+            return lines[0], lines[1]
+
+    # ① 档案配了路径 + 文件在 → 用档案路径，无说明
+    b1, w1 = probe(_store("p1", CALIB_REL), (f"{CALIB_REL}.npz",))
+    checks.append(("档案配了标定且文件在 → 返回档案路径、无告警",
+                   (b1.endswith(CALIB_REL.replace("/", "\\"))
+                    or b1.endswith(CALIB_REL)) and w1 == ""))
+    # ② 档案配了路径 + 文件不在 → **仍返回档案路径**，绝不回落顶层
+    b2, w2 = probe(_store("p1", CALIB_REL), ())
+    checks.append(("档案配了标定但文件不在 → 不回落顶层（返回档案路径）",
+                   (b2.endswith(CALIB_REL.replace("/", "\\"))
+                    or b2.endswith(CALIB_REL))
+                   and "指定的标定文件不存在" in w2))
+    # ③ 档案没配路径 + 顶层在 → 回落顶层，无说明
+    b3, w3 = probe(_store("p2", None), ("config/stereo_calibration.npz",))
+    checks.append(("档案没配标定 → 回落顶层（这是合法回落，不是第二套口径）",
+                   b3.endswith("stereo_calibration") and w3 == ""))
+    # ④ 档案没配 + 顶层也没有 → 顶层路径 + 明确说明
+    b4, w4 = probe(_store("p2", None), ())
+    checks.append(("档案没配且顶层也没有 → 明确说「找不到标定文件」",
+                   b4.endswith("stereo_calibration")
+                   and "找不到标定文件" in w4))
+
+    # ⑤ 源码：活链路不许再有第二份顶层标定硬编码
+    #    ⚠ `stereo/profiles.py` 不在扫描列表里 —— 它是 fallback 的**唯一产地**。
+    hardcodes = ('ROOT / "config" / "stereo_calibration"',
+                 "ROOT / 'config' / 'stereo_calibration'",
+                 'default="config/stereo_calibration"',
+                 "default='config/stereo_calibration'")
+    scan = ("apps/gui_main.py", "apps/cli_main.py", "apps/run_all.py",
+            "apps/_gui_app.py", "apps/_gui_stereo.py", "apps/verify_stereo.py",
+            "apps/tools/check_stereo_setup.py", "apps/tools/set_world_frame.py",
+            "apps/tools/export_calibration.py")
+    offenders: list[str] = []
+    for rel in scan:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        offenders += [f"{rel}: {lit}" for lit in hardcodes if lit in text]
+    checks.append(("九个活链路文件里不再有第二份顶层标定硬编码", not offenders))
+    if offenders:
+        print(f"    {offenders}")
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_capture_size_never_falls_back_to_2560() -> bool:
+    """采集档来源已解耦到装置档案，未标定 / 档案没填也不许落 2560x1440。
+
+    ## 守的是什么（2026-11-10，装置档案修复 A 的 blocking 配套）
+
+    采集档是**装置档案的属性**（``RigProfile.width/height``），不是标定 json 里
+    ``capture_size`` 的属性。改 ``return cand`` 后，未标定档案的标定 json 不存在
+    → ``calib_capture_size`` 返回 ``None`` → 旧写法会把 doctor / GUI 拍图回落到
+    ``video_profiles.DEFAULT``（2560x1440），而双路同时开 2560 会让一路 MSMF
+    会话**持久失效、必须物理拔插**（``apps/tools/cameras.py`` doctor 段与
+    ``apps/_gui_stereo.py::_capture_chain_frames`` 的注释都记着）。
+
+    这条判据钉住：helper 与真实消费方 ``cameras.py`` 在「档案 width/height 为
+    null + 未标定」的真实情形下都走 1080 安全档、不是 2560，且文案不谎称
+    「标定记录的采集档 / 与录制同档 / 相机最高档」。安全档取
+    ``video_profiles`` 的 1080 档对象，不写第二份 1920/1080 字面量。
+    """
+    print("----- 采集档：装置档案优先 + 1080 安全档（不许落 2560）-----")
+    import argparse
+
+    from apps._common import capture_size_from_profile
+    from apps.tools.cameras import build_parser
+    from sphere_tracker import video_profiles
+    from stereo.profiles import get_active
+
+    checks: list[tuple[str, bool]] = []
+    safe = video_profiles.parse("1920x1080")
+    default = video_profiles.DEFAULT
+    dishonest = ("标定记录", "与录制同档", "相机最高档")
+
+    # 1) helper：档案没填宽高（真实激活档案就是 null）→ 1080 安全档
+    class _EmptyProfile:
+        width = None
+        height = None
+        fps = None
+    w, h, note = capture_size_from_profile(_EmptyProfile())
+    checks.append(("档案没填宽高 -> 1080 安全档、不是 2560",
+                   (w, h) == (safe.width, safe.height)
+                   and (w, h) != (default.width, default.height)))
+    checks.append(("安全档文案不谎称标定记录 / 与录制同档 / 相机最高档",
+                   all(s not in note for s in dishonest)))
+    # 2) helper：档案填了宽高 -> 用档案值（装置档案优先，既有设计意图）
+    class _FilledProfile:
+        width = 1280
+        height = 720
+        fps = 30
+    w2, h2, _note2 = capture_size_from_profile(_FilledProfile())
+    checks.append(("档案填了宽高 -> 用档案值（装置档案优先）",
+                   (w2, h2) == (1280, 720)))
+    # 3) 真实消费方：cameras.py doctor 的默认宽高与 --help 文案。
+    #    期望值按「真实激活档案 + 同一 helper」算，不把 1080 写死到判据里：
+    #    档案以后填了宽高，doctor 就该跟着变，但**永远不许变成 2560**。
+    expect_w, expect_h, _ = capture_size_from_profile(get_active())
+    p = build_parser()
+    sub = next(a for a in p._actions
+               if isinstance(a, argparse._SubParsersAction))
+    doctor = sub.choices["doctor"]
+    dw = next(a for a in doctor._actions if a.dest == "width")
+    dh = next(a for a in doctor._actions if a.dest == "height")
+    checks.append(("doctor 默认档 = 装置档案/安全档解析结果（真实 config）",
+                   (dw.default, dh.default) == (expect_w, expect_h)))
+    checks.append(("doctor 默认档不是 2560x1440（不许静默回落最高档）",
+                   (dw.default, dh.default) != (default.width, default.height)))
+    help_text = (dw.help or "") + (dh.help or "")
+    checks.append(("doctor --width/--height 文案不谎称标定记录 / 与录制同档 / 相机最高档",
+                   all(s not in help_text for s in dishonest)))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_profile_calibration_status_four_states() -> bool:
+    """B1：profile_calibration_status 四态 + 三文件存在性唯一判定 + 收敛。
+
+    全部用临时目录 + monkeypatch ``profiles.ROOT``，不碰真实 ``config/calib``
+    任何文件。四态判据、三文件任一存在、老文件（无 profile）不误报，以及
+    ``check_stereo_setup.py`` 不再对「配了 calibration_path 且产物存在」误报。
+    """
+    print("----- B1：装置档案标定状态四态 / 三文件判定 -----")
+    import json
+    import subprocess
+    import tempfile
+
+    from stereo import profiles as rp
+
+    checks: list[tuple[str, bool]] = []
+    orig_root = rp.ROOT
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        calib = root / "calib"
+        calib.mkdir()
+        rp.ROOT = root                       # 纯函数相对临时根解析，finally 还原
+        try:
+            def write_json(name, meta):
+                (calib / f"{name}.json").write_text(
+                    json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+            # uncalibrated：路径合法、三者都不存在（实测要求 1 的形状）
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="A", stereo_mode="parallel", calibration_path="calib/A"))
+            checks.append(("文件都不存在 -> uncalibrated（不是 path_mismatch）",
+                           s.state == rp.CALIB_STATUS_UNCALIBRATED))
+
+            # calibrated：.json 存在、模式匹配、老文件无 profile
+            write_json("B", {"stereo_mode": "parallel"})
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="B", stereo_mode="parallel", calibration_path="calib/B"))
+            checks.append((".json + 模式匹配 + 无 profile（老文件）-> calibrated",
+                           s.state == rp.CALIB_STATUS_CALIBRATED))
+
+            # mode_conflict
+            write_json("C", {"stereo_mode": "angled"})
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="C", stereo_mode="parallel", calibration_path="calib/C"))
+            checks.append(("标定 stereo_mode 与档案不一致 -> mode_conflict",
+                           s.state == rp.CALIB_STATUS_MODE_CONFLICT))
+
+            # path_mismatch：meta.profile 指向别处 / 坏 JSON / 非法路径
+            write_json("D", {"stereo_mode": "parallel", "profile": "别的装置"})
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="D", stereo_mode="parallel", calibration_path="calib/D"))
+            checks.append(("meta.profile 指向别套档案 -> path_mismatch",
+                           s.state == rp.CALIB_STATUS_PATH_MISMATCH))
+            (calib / "E.json").write_text("{not json", encoding="utf-8")
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="E", stereo_mode="parallel", calibration_path="calib/E"))
+            checks.append(("标定 .json 损坏 -> path_mismatch",
+                           s.state == rp.CALIB_STATUS_PATH_MISMATCH))
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="F", stereo_mode="parallel", calibration_path="../escape"))
+            checks.append(("calibration_path 含 ..（越界）-> path_mismatch",
+                           s.state == rp.CALIB_STATUS_PATH_MISMATCH))
+
+            # 三文件存在性唯一判定：.npz / .json / 无扩展名基名 任一
+            (calib / "G.npz").write_bytes(b"x")
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="G", stereo_mode="parallel", calibration_path="calib/G"))
+            checks.append(("只有 .npz 也算存在（不误报未标定）",
+                           rp.calibration_files_exist(calib / "G")
+                           and s.state == rp.CALIB_STATUS_CALIBRATED))
+            (calib / "H").write_bytes(b"x")
+            checks.append(("无扩展名基名存在也算存在",
+                           rp.calibration_files_exist(calib / "H")))
+            checks.append(("三者都不存在时判 False",
+                           not rp.calibration_files_exist(calib / "NOPE")))
+
+            # C1 新文件（meta.profile == 档案名）不能误报
+            write_json("I", {"stereo_mode": "parallel", "profile": "I"})
+            s = rp.profile_calibration_status(rp.RigProfile(
+                name="I", stereo_mode="parallel", calibration_path="calib/I"))
+            checks.append(("meta.profile == 当前档案名 -> calibrated（不误报）",
+                           s.state == rp.CALIB_STATUS_CALIBRATED))
+            # 存在性是**唯一开关**：写出来就是 calibrated，删掉立刻退回 uncalibrated。
+            # 这一条是"文件不存在 -> uncalibrated"的真正守卫（旧判据把"用户当次
+            # 有没有标定"当成期望值，用户一标定它就红 —— 那是判据依赖了用户数据）。
+            write_json("J", {"stereo_mode": "parallel"})
+            s_have = rp.profile_calibration_status(rp.RigProfile(
+                name="J", stereo_mode="parallel", calibration_path="calib/J"))
+            (calib / "J.json").unlink()
+            s_gone = rp.profile_calibration_status(rp.RigProfile(
+                name="J", stereo_mode="parallel", calibration_path="calib/J"))
+            checks.append(("档案配了 calibration_path：文件在 -> calibrated，"
+                           "删掉文件 -> 立刻退回 uncalibrated（存在性是唯一开关）",
+                           s_have.state == rp.CALIB_STATUS_CALIBRATED
+                           and s_gone.state == rp.CALIB_STATUS_UNCALIBRATED))
+        finally:
+            rp.ROOT = orig_root
+
+    # 真实激活档案（只读 config/profiles.json，不改）：**只断言结构不变量**。
+    #
+    # 旧判据写死 `state == uncalibrated`，等于把"用户 2026-11-11 真机还没标定"
+    # 当成期望值；用户标定过之后标定文件就存在，`state` 变 calibrated，判据必然红。
+    # 测试不该依赖用户当前录了什么 —— 要守的是**状态与磁盘上的文件是否对得上**：
+    #   * 状态必须落在四态全集里（不出野值）；
+    #   * `uncalibrated` **当且仅当** 标定三文件确实不存在（当场用 Path 判断，
+    #     不写死任何一边）。这样"用户标没标定"都绿，而"状态与文件不符"这种真 bug
+    #     仍然会被抓住（两个方向都查）。
+    a = rp.get_active()
+    print(f"  真实激活档案 = {a.name if a else None!r}")
+    if a is None:
+        checks.append(("真实环境没有激活档案（无可断言，跳过而不判失败）", True))
+    else:
+        s = rp.profile_calibration_status(a)
+        try:
+            base = rp._calibration_base_of(a)     # 与 profile_calibration_status 同源
+        except rp.ProfileError:
+            base = None
+        files_exist = rp.calibration_files_exist(base) if base is not None else None
+        print(f"      标定基名 = {base}")
+        print(f"      -> state={s.state!r}  reason={s.reason!r}"
+              f"  磁盘三文件存在={files_exist}（当场判断，不写死）")
+        checks.append(("真实激活档案的标定状态落在四态全集里（没有野值）",
+                       s.state in {rp.CALIB_STATUS_CALIBRATED,
+                                   rp.CALIB_STATUS_UNCALIBRATED,
+                                   rp.CALIB_STATUS_PATH_MISMATCH,
+                                   rp.CALIB_STATUS_MODE_CONFLICT}))
+        if base is None:      # 路径非法：此时不该谈"文件在不在"
+            checks.append(("标定路径非法 <=> path_mismatch",
+                           s.state == rp.CALIB_STATUS_PATH_MISMATCH))
+        else:
+            checks.append(("标定三文件不存在 <=> uncalibrated（状态必须与磁盘一致，两个方向都查）",
+                           (s.state == rp.CALIB_STATUS_UNCALIBRATED) == (not files_exist)))
+
+    # check_stereo_setup.py：配了 calibration_path 且产物存在时不误报。
+    # 用临时 store 打补丁 DEFAULT_PATH，不改真实 config/profiles.json；
+    # REPO_ROOT 指向真实仓库，config/calib/平行装置.json/.npz 确实存在。
+    tool = ROOT / "apps" / "tools" / "check_stereo_setup.py"
+    with tempfile.TemporaryDirectory() as tmp2:
+        store = Path(tmp2) / "profiles.json"
+        store.write_text(json.dumps({
+            "schema": "sphere-rig-profiles", "version": 1, "active": "exists-rig",
+            "profiles": {"exists-rig": {
+                "name": "exists-rig", "stereo_mode": "parallel",
+                "calibration_path": "config/calib/平行装置"}}},
+            ensure_ascii=False), encoding="utf-8")
+        code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from pathlib import Path\n"
+            "from stereo import profiles as rp\n"
+            f"rp.DEFAULT_PATH = Path({str(store)!r})\n"
+            "import importlib.util\n"
+            f"spec = importlib.util.spec_from_file_location('chk', {str(tool)!r})\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "sys.argv = ['check_stereo_setup.py', '--profiles-only']\n"
+            "raise SystemExit(m.main())\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT),
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace")
+        out = proc.stdout or ""
+    checks.append(("check_stereo_setup 对产物存在的档案不再误报「标定文件不存在」",
+                   "档案指向的标定文件不存在" not in out and proc.returncode == 0))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_calibration_identity_three_states() -> bool:
+    """C2：meta.profile 三态（向后兼容老文件）+ GUI 侧分流 + 不阻断。"""
+    print("----- C2：标定身份三态（向后兼容老文件）-----")
+    import types
+
+    from stereo import profiles as rp
+    from apps._gui_app import AppState
+
+    checks: list[tuple[str, bool]] = []
+
+    matched = rp.calibration_identity({"profile": "甲"}, "甲")
+    mismatch = rp.calibration_identity({"profile": "甲"}, "乙")
+    unreg = rp.calibration_identity({}, "甲")
+    legacy = rp.calibration_identity({"stereo_mode": "parallel"}, "甲")
+    checks.append(("有 profile 且 == 当前档案 -> matched",
+                   matched.state == rp.IDENTITY_MATCHED and matched.message == ""))
+    checks.append(("有 profile 且 != 当前档案 -> mismatch（点名两个档案）",
+                   mismatch.state == rp.IDENTITY_MISMATCH
+                   and "甲" in mismatch.message and "乙" in mismatch.message))
+    checks.append(("meta 没有 profile（老文件）-> unregistered",
+                   unreg.state == rp.IDENTITY_UNREGISTERED
+                   and legacy.state == rp.IDENTITY_UNREGISTERED))
+    checks.append(("unregistered 不误报成「属于别套装置」",
+                   "属于装置档案「" not in unreg.message))
+
+    def make(meta):
+        s = AppState.__new__(AppState)
+        s.profile = types.SimpleNamespace(name="乙", stereo_mode="parallel")
+        s.rig = types.SimpleNamespace(meta=meta)
+        s.mono = None
+        s.notes = []
+        s.infos = []
+        return s
+
+    s_match = make({"profile": "乙", "stereo_mode": "parallel"})
+    s_mis = make({"profile": "甲", "stereo_mode": "parallel"})
+    s_unreg = make({"stereo_mode": "parallel"})
+    for s in (s_match, s_mis, s_unreg):
+        s._collect_identity()
+    checks.append(("matched：notes/infos 都不加、level=info",
+                   not s_match.notes and not s_match.infos
+                   and s_match.status_text()[1] == "info"))
+    checks.append(("mismatch：进 notes(warn)、mode_allowed 仍 True（不阻断）",
+                   len(s_mis.notes) == 1 and not s_mis.infos
+                   and s_mis.status_text()[1] == "warn"
+                   and s_mis.mode_allowed("parallel") is True))
+    checks.append(("unregistered：只进 infos 说明、level=info、不阻断",
+                   not s_unreg.notes and len(s_unreg.infos) == 1
+                   and s_unreg.status_text()[1] == "info"
+                   and s_unreg.mode_allowed("parallel") is True))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_reload_reuses_refresh_and_broadcasts() -> bool:
+    """B3/B4：_reload_state 不写死常量、状态条随档案变、广播到已开窗口。
+
+    静态判据（检查 ``_reload_state`` 源码）用于反向自证：把 :833-834 改回
+    写死常量，下面第 3 / 5 条会红，还原后复绿。
+    """
+    print("----- B3/B4：重新读取复用刷新结果 + 广播已开窗口 -----")
+    import ast
+    import types
+
+    from apps._gui_app import App, AppState
+
+    checks: list[tuple[str, bool]] = []
+    src = (ROOT / "apps" / "_gui_app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_reload_state"), None)
+    seg = ast.get_source_segment(src, fn) if fn is not None else ""
+
+    def _set_status_first_is_literal_cn(fnode) -> bool:
+        if fnode is None:
+            return False
+        for n in ast.walk(fnode):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "set_status" and n.args
+                    and isinstance(n.args[0], ast.Constant)
+                    and isinstance(n.args[0].value, str)
+                    and any("\u4e00" <= ch <= "\u9fff" for ch in n.args[0].value)):
+                return True
+        return False
+
+    def _calls(fnode, attr: str) -> bool:
+        if fnode is None:
+            return False
+        return any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == attr for n in ast.walk(fnode))
+
+    def _has_literal(fnode, literal: str) -> bool:
+        if fnode is None:
+            return False
+        return any(isinstance(n, ast.Constant) and n.value == literal
+                   for n in ast.walk(fnode))
+
+    # 用 AST 而非源码 substring：注释里提到那句写死常量不应算「还在用」。
+    # 反向自证改回 `ok, msg = True, "已重新读取装置与标定状态"` 时，它是真的
+    # ast.Constant，_has_literal 会命中 -> 下面第 3 条判据真的红。
+    checks.append(("apps/_gui_app.py 能找到 _reload_state", fn is not None))
+    checks.append(("_reload_state 调用 self._refresh()（复用刷新结果）",
+                   _calls(fn, "_refresh")))
+    checks.append(("_reload_state 不再写死「已重新读取装置与标定状态」常量",
+                   not _has_literal(fn, "已重新读取装置与标定状态")))
+    checks.append(("_reload_state 的 set_status 参数不是写死中文常量",
+                   not _set_status_first_is_literal_cn(fn)))
+    checks.append(("_reload_state 调用 broadcast_state_refresh()（B4）",
+                   _calls(fn, "broadcast_state_refresh")))
+
+    def make_state(name, meta):
+        s = AppState.__new__(AppState)
+        s.profile = types.SimpleNamespace(name=name, stereo_mode="parallel")
+        s.rig = types.SimpleNamespace(meta=meta)
+        s.mono = None
+        s.notes = []
+        s.infos = []
+        return s
+
+    t1 = make_state("甲", {"stereo_mode": "parallel"})
+    t2 = make_state("乙", {"stereo_mode": "angled"})
+    checks.append(("切换档案后 status_text() 文案不同且各含档案名",
+                   t1.status_text()[0] != t2.status_text()[0]
+                   and "甲" in t1.status_text()[0] and "乙" in t2.status_text()[0]))
+    t3 = make_state("甲", {})
+    t3.rig = None
+    checks.append(("有档案却没标定 -> level=warn（ok 反映真实状态）",
+                   t3.status_text()[1] == "warn"))
+
+    class W:
+        def __init__(self, exists=True):
+            self.calls = 0
+            self.exists = exists
+
+        def winfo_exists(self):
+            return self.exists
+
+        def _refresh_state(self):
+            self.calls += 1
+
+    w_mono, w_st, w_dead = W(), W(), W(exists=False)
+    no_refresh = types.SimpleNamespace(winfo_exists=lambda: True)
+    ns = types.SimpleNamespace(_windows={
+        "mono": w_mono, "stereo_parallel": w_st,
+        "stereo_angled": w_dead, "console": no_refresh})
+    App.broadcast_state_refresh(ns)
+    checks.append(("B4：mono/stereo 各重绘一次，已关闭 / 无 _refresh_state 的窗口不重绘",
+                   w_mono.calls == 1 and w_st.calls == 1 and w_dead.calls == 0))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
+def test_calibration_specs_display() -> bool:
+    """B-189：`calibration_specs()` 是标定数值展示的唯一产地，缺字段不许编造。
+
+    用户原话「装置档案要能看到标定后的具体信息」。这条判据钉的不是"能不能显示"，
+    而是**显示的数必须真的来自那份标定的 meta**：
+
+    - 全字段逐项对得上（防止字段名写错、嵌套取错层）；
+    - 缺字段一律 ``None`` / ``""``，**不许**补 0.0、补 0.00 px、补 1920；
+    - ``bool`` 不算数字（``True`` 当 1.0 是撒谎）；
+    - 只有 ``.npz`` 没有 ``.json`` 仍是"已标定（无详情）"，不是"未标定"；
+    - ``include_path=False`` 时别把绝对路径又贴一遍。
+
+    全部在临时目录里 monkeypatch ``profiles.ROOT``，不读也不写真实
+    ``config/profiles.json``（用户正在用 GUI 真机测试，``active`` 不能被动）。
+    """
+    print("----- B-189：装置档案显示标定实测（唯一产地 / 缺字段不编造）-----")
+    import json
+    import shutil
+    import tempfile
+
+    from stereo import profiles as rp
+
+    checks: list[tuple[str, bool]] = []
+    orig_root = rp.ROOT
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        calib = tmp / "calib"
+        calib.mkdir()
+        rp.ROOT = tmp                       # 相对路径按临时根解析，finally 还原
+
+        def write_json(name: str, meta: dict) -> None:
+            (calib / f"{name}.json").write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+        def make(path: str) -> rp.RigProfile:
+            # calibration_path 只接受仓库内相对路径，故不能指到 tmp 的绝对路径
+            return rp.RigProfile(name="测试装置", stereo_mode="parallel",
+                                 calibration_path=path)
+
+        # 1) 全字段解析：meta 里有什么就搬什么，一个不漏
+        write_json("full", {
+            "baseline_mm": 68.84, "angle_deg": 0.653,
+            "created": "2026-11-08 15:01:40", "capture_size": [1920, 1080],
+            "profile": "测试装置", "board": "棋盘格",
+            "quality": {"rms": 0.688, "epipolar_rms": 0.713,
+                        "epipolar_max": 1.326, "n_pairs_used": 33,
+                        "n_pairs_in": 40, "grade": "勉强可用",
+                        "depth_sigma_mm_at_0_6m": 5.06},
+        })
+        s = rp.calibration_specs(make("calib/full"))
+        checks.append((
+            "全字段解析：state/path/基线/夹角/三项 RMS/配对数/判定/时间/采集档/登记/标定板",
+            s.state == rp.CALIB_STATUS_CALIBRATED
+            and s.path == calib / "full"
+            and s.baseline_mm == 68.84
+            and s.angle_deg == 0.653
+            and s.rms_px == 0.688
+            and s.epipolar_rms_px == 0.713
+            and s.epipolar_max_px == 1.326
+            and s.n_pairs_used == 33
+            and s.n_pairs_in == 40
+            and s.grade == "勉强可用"
+            and s.created == "2026-11-08 15:01:40"
+            and s.capture_size == (1920, 1080)
+            and s.depth_sigma_mm_0_6m == 5.06
+            and s.bound_profile == "测试装置"
+            and s.board == "棋盘格"))
+        checks.append(("全字段：inline 只放基线/夹角/极线三个数（1 位 / 1 位 / 2 位）",
+                       rp.format_specs_inline(s)
+                       == "68.8 mm / 0.7° / 0.71 px"))
+
+        # 2) 缺字段不编造：只有基线，其余必须是 None / ""
+        write_json("sparse", {"baseline_mm": 70.0})
+        s = rp.calibration_specs(make("calib/sparse"))
+        checks.append((
+            "缺字段不编造：数值字段全 None、字符串字段全 \"\"、capture_size None",
+            s.baseline_mm == 70.0
+            and s.angle_deg is None and s.rms_px is None
+            and s.epipolar_rms_px is None and s.epipolar_max_px is None
+            and s.n_pairs_used is None and s.n_pairs_in is None
+            and s.depth_sigma_mm_0_6m is None and s.capture_size is None
+            and s.grade == "" and s.created == ""
+            and s.bound_profile == "" and s.board == ""))
+        checks.append(("缺字段：inline 只有一段「70.0 mm」（不补 0.00 px / 不补 0°）",
+                       rp.format_specs_inline(s) == "70.0 mm"))
+        tip = rp.format_specs_tooltip(s)
+        # 不查裸 "0.00"：基线自己就是 70.00 mm；要查的是**凭空补出来的**段
+        checks.append(("缺字段：tooltip 不出现 夹角 / 极线 / 未知 / 补充的 0.00 px / 1920",
+                       all(k not in tip for k in
+                           ("夹角", "极线", "未知", "0.00 px", "0.000°", "1920"))))
+        # 连基线都没有的空 meta：最容易被人手补成 0.0 的那种，必须还是 None
+        write_json("nobase", {})
+        s0 = rp.calibration_specs(make("calib/nobase"))
+        checks.append(("缺字段：meta 连基线都没有 -> baseline_mm 仍是 None（不补 0.0）",
+                       s0.baseline_mm is None and s0.angle_deg is None
+                       and rp.format_specs_inline(s0) == "已标定（无详情）"))
+
+        # 3) bool 不算数字：True 当 1.0 是撒谎
+        write_json("boolish", {"baseline_mm": True, "angle_deg": 1.0})
+        s = rp.calibration_specs(make("calib/boolish"))
+        checks.append(("bool 不算数字：baseline_mm=True -> None，angle_deg=1.0 保留",
+                       s.baseline_mm is None and s.angle_deg == 1.0))
+
+        # 4) 只有 .npz 没有 .json：仍算已标定，只是不知道参数
+        (calib / "onlynpz.npz").write_bytes(b"x")
+        s = rp.calibration_specs(make("calib/onlynpz"))
+        tip = rp.format_specs_tooltip(s)
+        checks.append(("只有 .npz 没有 .json -> state 仍是 calibrated（不误报未标定）",
+                       s.state == rp.CALIB_STATUS_CALIBRATED))
+        checks.append(("只有 .npz：inline 说「已标定（无详情）」，不是「—」",
+                       rp.format_specs_inline(s) == "已标定（无详情）"))
+        checks.append(("只有 .npz：tooltip 不写「基线」占位，但明说未登记来源",
+                       "基线" not in tip and "登记装置：（未登记来源" in tip))
+
+        # 5) 未标定：连标定文件都没有
+        s = rp.calibration_specs(make("calib/nothing"))
+        checks.append(("未标定 -> inline「—」、tooltip 空串（不显示任何数）",
+                       s.state == rp.CALIB_STATUS_UNCALIBRATED
+                       and rp.format_specs_inline(s) == "—"
+                       and rp.format_specs_tooltip(s) == ""))
+
+        # 6) include_path：调用方已经显示了路径就别再贴一遍
+        s = rp.calibration_specs(make("calib/full"))
+        with_path = rp.format_specs_tooltip(s)
+        no_path = rp.format_specs_tooltip(s, include_path=False)
+        checks.append((
+            "include_path=False 末行不是「文件：」；默认参数末行是它",
+            with_path.splitlines()[-1].startswith("文件：")
+            and "文件：" not in no_path
+            and not no_path.splitlines()[-1].startswith("文件：")))
+
+        # 7) 唯一产地：GUI 只许调 profiles 的格式化函数，不许自己解析 meta
+        src = (ROOT / "apps" / "profile_dialog.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        own_loads = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "loads"
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "json"
+            for n in ast.walk(tree))
+        calls = {n.func.attr for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        checks.append(("apps/profile_dialog.py 不自己 json.loads 标定 meta",
+                       not own_loads))
+        checks.append(("apps/profile_dialog.py 调用了 calibration_specs / format_specs_inline",
+                       {"calibration_specs", "format_specs_inline"} <= calls))
+    finally:
+        rp.ROOT = orig_root
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     print("=" * 62)
     print("配置接线自测（防止「死配置」：定义了却没人读）")
@@ -969,7 +1759,22 @@ def main() -> int:
     print()
     j = test_fov_measure_roundtrip()
     print()
-    ok = a and b and c and d and e and f and g and h and i and j
+    k = test_session_calibration_file_is_dynamic()
+    print()
+    l = test_capture_size_never_falls_back_to_2560()
+    print()
+    m = test_profile_calibration_status_four_states()
+    print()
+    n = test_calibration_identity_three_states()
+    print()
+    o = test_reload_reuses_refresh_and_broadcasts()
+    print()
+    p = test_calibration_follows_active_profile_everywhere()
+    print()
+    q = test_calibration_specs_display()
+    print()
+    ok = a and b and c and d and e and f and g and h and i and j and k and l \
+        and m and n and o and p and q
     print("判定结果：" + ("全部通过" if ok else "有不达标项"))
     return 0 if ok else 1
 

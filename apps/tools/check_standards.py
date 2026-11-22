@@ -24,7 +24,7 @@
 ----------------------------------------
 - **A 的权威实现在这里**；`tests/selftest_doc_facts.py` 改为调用本模块。
 - **B 委托给 `apps/tools/sync_facts.py`** —— 那是计数的权威实现，不在这里重写一遍。
-- `启动程序.bat standards` → 本模块。
+- `run.bat standards` → 本模块。
 
 边界
 ----
@@ -50,6 +50,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # 放置规则里的顶层目录：只有落在这些下面的反引号路径才算"仓库路径引用"
+#
+# ⚠️ `data` **故意不在这里**（2026-11-11 明确下来，以前是"碰巧不在"）：
+# `data/` 装的是用户自己录的实验数据，会话目录会被用户随时删/移/归档 ——
+# 把 `data/...` 当"文档对仓库的承诺"来校验，等于每删一段录像就打红一次。
+# 这与 `config/` / `outputs/` 归 `RUNTIME_REPRO_MARK` 是同一个道理：
+# **运行期产物不是文档承诺**。所以文档里写 `data/` 路径既不会被校验、也不会
+# 因此报错；真要保证数据目录结构，得靠 `sphere_tracker/discovery.py` 那类
+# 代码判据，不是靠文档字符串。
 KNOWN_TOP = {"sphere_tracker", "calib", "stereo", "apps", "tests", "docs", "assets",
              "config", "outputs", "models", "legacy", "STC"}
 PATH_RE = re.compile(
@@ -108,6 +116,12 @@ KNOWN_MENTIONS: dict[str, str] = {
         "§9.5 反向自证的**注入示例**，举例说明用的假文件名",
     "docs/planbooks/2026-10-10_架构接缝与缺失基础设施.md:New-Project.ps1":
         "§2.1 在陈述「`STC/scripts/` 里只有 New-Project.ps1」——是在讲仓库外有什么",
+    # ---- 2026-11-11 计划书「目录化数据管理」P2：**已落地，豁免随之删除** ----
+    # 曾经在这里的四条（`docs/planbooks/2026-11-09_目录化数据管理.md` 与
+    # `docs/交接文档.md` 各两条，分别指向 `apps/package_export.py` 与
+    # `package.json`）在 P2 打包层落地当天删掉了 —— 豁免的对象已经存在，
+    # 留着就是**永久豁免**（工具自带的 vanished 检测就是为逼这一步写的）。
+    # 这条注释是给后来者的说明，**不是豁免**，别照着它加回去。
     # ---- 2026-10-27 计划书：**按具体引用豁免**（同理，不整份放过） ----
     # 这些是本轮「单目主线与 GUI 分窗」计划 §2.5 / §3 / §5 列明要新建的文件，
     # 目前尚不存在 —— 计划的引用对象是"将要新建"，不是漂移。

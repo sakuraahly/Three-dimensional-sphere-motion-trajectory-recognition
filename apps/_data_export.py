@@ -15,6 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
+# 原始录像的文件名与收集次序**只有** `sphere_tracker/video_files.py` 一份：
+# 这里按它的顺序把文件收进 `videos/raw/`，不许再抄一遍元组。
+from sphere_tracker.video_files import ALL_RAW_VIDEO_NAMES
+
 from ._workbench import STATUS_SYMBOLS, summarize_session
 
 CATEGORIES: dict[str, str] = {
@@ -31,6 +35,22 @@ REDACT_KEYS_CAMERA = ("identity", "name", "port")
 REDACT_KEYS_TOP = ("label", "notes")
 
 
+class ItemList(list):
+    """``scan_items`` 的返回值：一个普通 list，外加**扫描时发现的异常**。
+
+    为什么不用另一个 dataclass 包一层：``export_zip`` / ``estimate_bytes`` /
+    调用方的 ``for it in items`` 全都按 list 用，换类型要改十几处。
+    继承 ``list`` 就零成本 —— 但异常**必须能被调用方看见**：sid 撞车时
+    自动加后缀是"修好了"，可用户得知道有两个会话本来同一个 id。
+    """
+
+    warnings: list[str]
+
+    def __init__(self, iterable=(), warnings: list[str] | None = None) -> None:
+        super().__init__(iterable)
+        self.warnings = list(warnings or [])
+
+
 @dataclass(frozen=True)
 class SessionItem:
     path: Path
@@ -41,21 +61,48 @@ class SessionItem:
     n_matched: int
     status: str
     size_bytes: int
+    #: 记录的模式；**空串 = 没记录**（不是 parallel）。老会话缺这个字段，
+    #: 默认成 parallel 会让 90° 装置录的会话看起来可用 —— 用错几何解算得到
+    #: 系统性错的深度，而且全程不报错。空串在界面显示为「未记录」。
     stereo_mode: str = "parallel"
     error: str = ""
+    #: 稳定身份（`_session_index.sid_of`）。搬目录不变，勾选/分组都靠它。
+    sid: str = ""
+    #: 相对数据根的路径（`parallel/20261104-140552`），用于去重与显示。
+    rel_path: str = ""
+    #: 逻辑分组路径（`实验1/梨子`），由 `_session_index.group_of` 唯一产出。
+    group: str = ""
+    #: `session.json` 的 label / notes —— 带上它们，界面就不必每次重绘都
+    #: 重新读一遍所有 session.json（原来每刷一次列表读 44 次文件）。
+    label: str = ""
+    notes: str = ""
+    #: 全部问题（不只是坏会话的）：帧数差、未同步、无 seeds 之类也要能显示。
+    problems: tuple[str, ...] = ()
+    #: `session.json` 的 `source`（2026-11-17 新增）。``"realtime"`` = 实时双目
+    #: 退出时自动落的会话：有 derived/ 三样产物，但**没有原始左右录像**，
+    #: 所以不能重跑离线三维。老会话没有这个键 → 空串（= 普通录制会话）。
+    #: 放在**最后一个字段**：位置参数是老调用方的顺序，插在中间会让它们错位。
+    source: str = ""
 
     @property
     def key(self) -> str:
-        """目录名唯一；session.json 的 id 不保证唯一，UI/选择必须用它。"""
-        return self.path.name
+        """列表/选择用的键：**相对路径**，全根唯一。
+
+        以前是目录名（``path.name``），而目录名不保证唯一：同一段时间戳
+        可能同时存在于 ``stereo/<ts>``（旧扁平层）和 ``stereo/parallel/<ts>``
+        （新分区）—— Treeview 的 iid 一撞，第二个会话直接插不进去，用户看到
+        的是"少了一段"，没有任何报错。
+        """
+        return self.rel_path or self.path.name
 
     @property
     def symbol(self) -> str:
         return STATUS_SYMBOLS.get(self.status, "?")
 
     @property
-    def label(self) -> str:
-        return f"{self.symbol} {self.id}  {self.created}  {self.frames_left}/{self.frames_right}帧"
+    def mode_label(self) -> str:
+        """给界面看的模式文案：平行 / 大角度 / **未记录**。"""
+        return {"parallel": "平行", "angled": "大角度"}.get(self.stereo_mode, "未记录")
 
 
 @dataclass(frozen=True)
@@ -101,20 +148,56 @@ def _dir_size(path: Path) -> int:
     return total
 
 
-def scan_items(root: str | Path) -> list[SessionItem]:
+def scan_items(root: str | Path, *, recursive: bool = True,
+               collections: dict | None = None,
+               progress: Callable[[int, int, str], None] | None = None) -> ItemList:
     """按会话时间倒序返回可导出的会话（坏会话也列出，但由 UI 提示）。
 
-    用 `apps/_stereo_layout.candidate_session_dirs` 而不是 ``root.iterdir()``：
-    会话现在按装置分区（``data/stereo/parallel/<时间戳>``），只扫一层会把
-    分区目录本身当成会话（``summarize_session`` 报 bad、导出一堆空目录），
-    而真正的会话一个都看不到。
+    枚举**只此一份**（``sphere_tracker.discovery.discover_session_dirs``；
+    ``apps/_session_index`` 只是转发，``apps/_stereo_layout.candidate_session_dirs``
+    只是多根包装）。以前数据管理、会话列表、``check_dataset``、
+    ``export_ball_dataset`` 各写一套扫描口径，结果就有两套口径**现状就漏了
+    15 个 parallel 会话**。
+
+    ``recursive=True``（默认）递归发现：用户自己建 ``data/stereo/实验1/<时间戳>``
+    也能看见，``parallel/<时间戳>`` / ``angled/<时间戳>`` 更不用说。
+    ``recursive=False`` 是**旧的两层口径**（根的直接子目录 + 分区下一层），
+    给"只想要那两层"的调用方留的开关，不是"行为一字不改"—— 两者都**只返回
+    命中判据的目录**（宽判据：有 ``session.json`` 或视频/derived/标定之类），
+    以前那个不过滤、连空目录都返回的实现已经删了，因为调用方各自再过滤一遍
+    就是"漏一个就看不见一段会话"的来源。
+
+    ``collections`` 传入虚拟集合配置时，每项带上 ``group``（逻辑分组路径）；
+    不传就全按磁盘层级推断。分组定义只有 ``_session_index.group_of`` 一个产地。
     """
-    from apps._stereo_layout import candidate_session_dirs
+    from apps._session_index import (
+        collection_map, discover_session_dirs, group_of, rel_key, sid_of)
 
     root = Path(root)
     if not root.is_dir():
-        return []
-    dirs = candidate_session_dirs([root])
+        return ItemList()
+    dirs = discover_session_dirs(root, recursive=recursive)
+    mapping = collection_map(collections) if collections else {}
+
+    # sid 撞车：按**相对路径**排序后先到先得，其余加 ~2/~3。
+    # 必须是确定性的 —— 否则同一份数据扫两次，第二个会话的 sid 可能不一样，
+    # 集合里存的分组就会突然指到别人身上。
+    ordered = sorted(dirs, key=lambda p: rel_key(root, p))
+    by_rel: dict[str, str] = {}        # rel_path -> 最终 sid（供下面回查）
+    taken: set[str] = set()            # 已被占用的 sid（撞车判据必须是它，不是 by_rel）
+    warnings: list[str] = []
+    for p in ordered:
+        rel = rel_key(root, p)
+        base = sid_of(p)
+        sid, n = base, 2
+        while sid in taken:
+            sid = f"{base}~{n}"
+            n += 1
+        if sid != base:
+            warnings.append(f"会话 id 撞车：{base}（{rel}）"
+                            f"已改用 {sid}；建议改 session.json 的 id")
+        taken.add(sid)
+        by_rel[rel] = sid
 
     def key(p: Path):
         m = re.match(r"(\d{8}-\d{6})", p.name)
@@ -123,21 +206,41 @@ def scan_items(root: str | Path) -> list[SessionItem]:
         except OSError:
             return (m.group(1) if m else "", 0.0)
 
-    dirs.sort(key=key, reverse=True)
+    dirs = sorted(dirs, key=key, reverse=True)
     items: list[SessionItem] = []
-    for p in dirs:
+    total = len(dirs)
+    for i, p in enumerate(dirs):
+        rel = rel_key(root, p)
+        sid = by_rel.get(rel) or sid_of(p)
         # 状态判定只保留一份：和工作台共用 summarize_session / STATUS_SYMBOLS
         summary = summarize_session(p)
+        meta = _read_session(p)
         error = "；".join(summary.problems) if summary.status == "bad" else ""
+        # 模式**只取 session.json 的记录**（含 rig 兜底），不默认 parallel。
+        from apps._stereo_layout import session_mode_of
+
         items.append(SessionItem(
             path=p, id=summary.id or p.name,
             created=summary.created,
             frames_left=summary.frames_left,
             frames_right=summary.frames_right,
             n_matched=summary.n_matched, status=summary.status,
-            size_bytes=_dir_size(p), stereo_mode=summary.stereo_mode,
-            error=error))
-    return items
+            size_bytes=_dir_size(p), stereo_mode=session_mode_of(p) or "",
+            error=error, sid=sid, rel_path=rel,
+            group=group_of(sid, mapping, rel),
+            label=_as_text(meta.get("label")), notes=_as_text(meta.get("notes")),
+            # 来源标记直接读 session.json（`stereo/sessions.py` 的 Session 没有
+            # 这个字段、load_session 会静默丢掉未知键，所以不能指望它）。
+            source=_as_text(meta.get("source")),
+            problems=tuple(summary.problems)))
+        if progress:
+            progress(i + 1, total, rel)
+    return ItemList(items, warnings)
+
+
+def _as_text(value: object) -> str:
+    """session.json 里的 label / notes 可能是数字/None/嵌套对象 —— 一律当文本。"""
+    return value if isinstance(value, str) else ("" if value is None else str(value))
 
 
 def redact_session(data: dict, options: ExportOptions) -> dict:
@@ -206,11 +309,21 @@ def _cat_files(session: Path, category: str) -> Iterable[tuple[Path, str]]:
             if p.is_file():
                 yield p, f"derived/plots/{p.name}"
     elif category == "annotated":
+        # 不能简单改成只认 `annotated.mp4`：合法的分段产物
+        # `annotated_first20.mp4` / `annotated_first120.mp4` 同样是交付内容，
+        # 写死就把它们丢了。反过来原先用 `annotated*.mp4` 又会把正在录制的
+        # 半成品 `annotated.tmp.mp4` 收进交付包。判据：stem 按 `.` 切开，
+        # 任一段（小写后）落在半成品关键字就跳过；隐藏文件也跳过。
+        partial = {"tmp", "part", "partial", "incomplete"}
         for p in sorted(derived.glob("annotated*.mp4")):
+            if p.name.startswith("."):
+                continue
+            if any(seg.lower() in partial for seg in p.stem.split(".")):
+                continue
             if p.is_file():
                 yield p, f"videos/{p.name}"
     elif category == "raw":
-        for name in ("left.mkv", "right.mkv", "left.mp4", "right.mp4"):
+        for name in ALL_RAW_VIDEO_NAMES:
             p = session / name
             if p.is_file():
                 yield p, f"videos/raw/{name}"
@@ -267,9 +380,15 @@ def _manifest(items: list[SessionItem], options: ExportOptions,
             "platform": bool(options.redact_platform),
         },
         "sessions": [
-            {"id": s.id, "folder": folders.get(s.key, s.key), "created": s.created,
+            {"id": s.id, "sid": s.sid, "folder": folders.get(s.key, s.key),
+             "group": s.group or None,
+             "created": s.created,
              "frames_left": s.frames_left, "frames_right": s.frames_right,
-             "stereo_mode": s.stereo_mode, "n_matched": s.n_matched}
+             # 没记录就写 null。**不写 "parallel"** —— 收包的人会把它当真值，
+            # 拿平行几何去解 90° 录的数据，深度系统性偏掉还不报错。
+             "stereo_mode": s.stereo_mode or None,
+             "mode_recorded": bool(s.stereo_mode),
+             "n_matched": s.n_matched}
             for s in items
         ],
         "files": files,
@@ -281,11 +400,20 @@ def _readme(items: list[SessionItem], options: ExportOptions) -> str:
     cats = "\n".join(f"- `{k}`：{CATEGORIES[k]}" for k in sorted(options.categories))
     meta = ("脱敏 session.json" if (options.redact_camera or options.redact_labels
                                      or options.redact_platform) else "session.json")
+    modes = sorted({s.stereo_mode for s in items if s.stereo_mode})
+    n_unrecorded = sum(1 for s in items if not s.stereo_mode)
+    mode_line = ", ".join(modes) or "-"
+    mode_note = ""
+    if n_unrecorded:
+        # 前面空一行：Markdown 里紧贴上一行的 `>` 会被当成续行，看着像排版坏了。
+        mode_note = (f"\n\n> ⚠️ 其中 {n_unrecorded} 段会话的 `stereo_mode` **没有记录**"
+                     f"（manifest 里是 `null`）。这些是 2026-11-04 分区改造之前录的，"
+                     f"导出时**不替它猜**；要用它们解算请先确认当时的装置几何。")
     return f"""# 球形双目轨迹数据包
 
 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 会话数：{len(items)}
-模式：{", ".join(sorted({s.stereo_mode for s in items})) or "-"}（parallel=平行，angled=大角度）
+模式：{mode_line}（parallel=平行，angled=大角度）{mode_note}
 
 ## 目录
 
@@ -362,11 +490,37 @@ VARIABLE_REFERENCE = """## 数据变量说明（简明）
 """
 
 
-def normalize_output(output: str | Path) -> Path:
-    """统一补 .zip；GUI 的 overwrite 检查必须和 export_zip 用同一条路径。"""
+def normalize_output(output: str | Path, *, directory: bool = False) -> Path:
+    """把用户填的输出路径收敛成**唯一的那个路径**。两种模式语义不同：
+
+    - ``directory=False``（默认，历史行为**一字不改**）：输出是一个 **zip 文件**，
+      所以统一补 ``.zip``；空串 / 结尾带分隔符 / 指向已存在目录的**一律拒绝**。
+    - ``directory=True``（P2 自包含交付包的目录形态）：输出是一个 **目录**。
+      去掉结尾的 ``/`` 或反斜杠；空串、``.``、``..`` 拒绝；**后缀是 ``.zip`` 直接
+      报错** —— 不悄悄改名、也不自动去后缀。选了目录输出却填 zip 名字，几乎
+      一定点错了模式，替它改名只会把错误藏起来；已存在且是目录**允许**
+      （要不要覆盖由 ``export_package`` 决定），已存在且是文件拒绝。
+
+    两种模式都保证同一件事：**GUI 的 overwrite 检查必须和导出用同一条路径** ——
+    调用方先拿本函数的返回值判 ``exists()``，导出层拿到的就是同一个路径，
+    不存在"检查 a、写 b"。
+    """
     raw = str(output).strip()
     if not raw:
         raise ValueError("输出路径为空")
+    if directory:
+        trimmed = raw.rstrip("/\\").strip()
+        if not trimmed:
+            raise ValueError(f"输出路径为空：{raw}")
+        out = Path(trimmed)
+        if out.name in ("", ".", ".."):
+            raise ValueError(f"输出路径不是目录名：{raw}")
+        if out.suffix.lower() == ".zip":
+            raise ValueError(
+                f"选了目录输出，却给了 .zip 路径：{raw}（目录包不要 .zip 后缀）")
+        if out.exists() and not out.is_dir():
+            raise ValueError(f"输出路径已存在且不是目录：{out}")
+        return out
     if raw.endswith(("/", "\\")):
         raise ValueError(f"输出路径是目录，不是 zip：{raw}")
     out = Path(raw)
@@ -375,6 +529,56 @@ def normalize_output(output: str | Path) -> Path:
     if out.exists() and out.is_dir():
         raise ValueError(f"输出路径是目录，不是 zip：{out}")
     return out.with_suffix(".zip") if out.suffix.lower() != ".zip" else out
+
+
+def _plan_files(items: Iterable[SessionItem], options: ExportOptions
+                ) -> list[tuple[SessionItem, list[tuple[Path, str]]]]:
+    """按会话列出 ``(源文件, 包内相对路径)``。
+
+    **zip 包与目录包共用这一份**。各写一份的后果不是"多几行代码"，而是两边
+    交出的内容会悄悄分叉（某天只给 zip 补了 ``derived/plots``，目录包就少一类
+    文件，还没有任何报错）。``options`` 必须已经 ``normalized()``。
+    """
+    planned: list[tuple[SessionItem, list[tuple[Path, str]]]] = []
+    for it in items:
+        rows: list[tuple[Path, str]] = []
+        if "metadata" in options.categories:
+            rows.append((it.path / "session.json", "metadata/session.json"))
+            for name in ("left_times.csv", "right_times.csv"):
+                p = it.path / name
+                if p.is_file():
+                    rows.append((p, f"metadata/{name}"))
+        for cat in options.categories:
+            if cat in {"metadata", "annotated", "raw"}:
+                continue
+            for p, rel in _cat_files(it.path, cat):
+                rows.append((p, rel))
+        for cat in ("annotated", "raw"):
+            if cat in options.categories:
+                for p, rel in _cat_files(it.path, cat):
+                    rows.append((p, rel))
+        planned.append((it, rows))
+    return planned
+
+
+def _unique_folders(items: Iterable[SessionItem]) -> dict[str, str]:
+    """会话 → 包内目录名：清洗非法字符 + 去重（zip 包与目录包共用）。
+
+    目录名可能相同（两个同名时间戳）或**清洗后**相同（中文被替换成 ``_``），
+    所以不能只依赖 ``id``：撞了就让后一个覆盖前一个，接收方少一段且没人报错。
+    """
+    folders: dict[str, str] = {}
+    used: set[str] = set()
+    for it in items:
+        base = re.sub(r"[^0-9A-Za-z._\-]+", "_", it.path.name) or "session"
+        name = base
+        n = 2
+        while name in used:
+            name = f"{base}_{n}"
+            n += 1
+        used.add(name)
+        folders[it.key] = name
+    return folders
 
 
 def export_zip(items: list[SessionItem], options: ExportOptions, output: str | Path,
@@ -395,39 +599,9 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
                 "这些会话缺/坏 session.json：" + "、".join(bad) +
                 "；取消 metadata 类别或先修好会话")
 
-    # 先按会话列出文件，便于进度与 manifest
-    planned: list[tuple[SessionItem, list[tuple[Path, str]]]] = []
-    for it in items:
-        rows: list[tuple[Path, str]] = []
-        if "metadata" in options.categories:
-            rows.append((it.path / "session.json", "metadata/session.json"))
-            for name in ("left_times.csv", "right_times.csv"):
-                p = it.path / name
-                if p.is_file():
-                    rows.append((p, f"metadata/{name}"))
-        for cat in options.categories:
-            if cat in {"metadata", "annotated", "raw"}:
-                continue
-            for p, rel in _cat_files(it.path, cat):
-                rows.append((p, rel))
-        for cat in ("annotated", "raw"):
-            if cat in options.categories:
-                for p, rel in _cat_files(it.path, cat):
-                    rows.append((p, rel))
-        planned.append((it, rows))
-
-    # 目录名可能相同/清洗后相同；保证 zip 内 folder 唯一，不能只依赖 id
-    folders: dict[str, str] = {}
-    used_folders: set[str] = set()
-    for it in items:
-        base = re.sub(r"[^0-9A-Za-z._\-]+", "_", it.path.name) or "session"
-        name = base
-        n = 2
-        while name in used_folders:
-            name = f"{base}_{n}"
-            n += 1
-        used_folders.add(name)
-        folders[it.key] = name
+    # 文件规划与目录名去重**与目录包共用**（_plan_files / _unique_folders）
+    planned = _plan_files(items, options)
+    folders = _unique_folders(items)
 
     file_count = sum(len(rows) for _it, rows in planned) + 2
     written = 0
@@ -472,7 +646,14 @@ def export_zip(items: list[SessionItem], options: ExportOptions, output: str | P
                     if not src.is_file():
                         continue
                     arc = f"{prefix}/{rel}"
-                    zf.write(src, arc)
+                    # 实测（HFYU 无损视频）：DEFLATE 压缩率 0.987–1.0003，
+                    # 单个 800 MB 文件要 ~20 秒却几乎不缩小；而 progress 只在
+                    # 整个文件写完后才回调，于是出现两次 20 秒级进度条冻结。
+                    # 视频改用 ZIP_STORED 纯存储，其它文件仍走 DEFLATED。
+                    video = src.suffix.lower() in {".mkv", ".mp4", ".avi", ".mov"}
+                    zf.write(src, arc,
+                             compress_type=zipfile.ZIP_STORED if video
+                             else zipfile.ZIP_DEFLATED)
                     size = src.stat().st_size
                     total += size
                     written += 1

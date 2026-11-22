@@ -74,6 +74,46 @@ class BaseDetector:
     def reset(self) -> None:
         """换视频源时调用（背景模型需要重置）。"""
 
+    # -- 点选锚点：跨检测器的**唯一**构造点 --------------------------------
+    def anchor_detection(self, x: float, y: float, radius: float, *,
+                         extra: dict | None = None, note: str = "") -> Detection:
+        """把「用户点选的位置」当作本帧输出。
+
+        为什么收在基类（2026-11-07，同一个毛病第三次之后）
+        --------------------------------------------------
+        `color` / `generic` / `specular` 原来各写一份构造，于是同一个概念
+        有三种说法：`method` 有的写 ``name:seed``、有的只写 ``name``；
+        `extra` 有的带 ``state``/``center_source``、有的只带 ``seed_anchor``；
+        `last_error` 有的写原因、有的不写。后果不是"风格不统一"，而是
+        `pipeline` 只认 ``extra["seed_anchor"]`` —— `specular` 那一路连键都
+        没有，锚点被当成真检测**静默**放过去了，直到第二轮 Critic 才抓出来。
+        B-150（偏好被写回）也是同型：同一件事有三处实现，改一处漏两处。
+
+        **加字段请加参数，不要各自 new 一个 `Detection`。**
+        判据：``tests/selftest_plugins.py::test_anchor_single_source``
+        （AST 扫全树，``extra`` 里出现 ``seed_anchor`` 的 `Detection` 构造只许有一个）。
+
+        ``note`` 是「为什么退回锚点」的一句话，会写进 ``self.last_error``。
+        检测器自己知道原因就传（`specular` 是锁定失败、`generic` 是门内无候选）；
+        说不出来就留空，`pipeline` 会用一句通用的话兜住 —— **不许静默**。
+
+        语义边界：`x/y/r` 全部来自用户点击，不是算法测量；`score=1.0` 表示
+        「这是人给的」，不表示「算法很确信」。
+        """
+        if note:
+            prev = str(getattr(self, "last_error", "") or "")
+            # 追加而不是覆盖：`specular` 在锁定前可能刚写过「seed 半径超出
+            # 建议范围」，那条也是真的，不该被锚点这句吃掉。
+            self.last_error = f"{prev}；{note}" if prev else str(note)
+        # 标记写成**构造点上的字面量**：`selftest_plugins` 用 AST 扫「谁在
+        # `extra` 里塞了 `seed_anchor`」，写成先组装 dict 再传会扫不到 ——
+        # 那样判据就变成永远判绿的空闸门。`seed_anchor` 放在 `**` 之后，
+        # 调用方传什么都覆盖不掉它。
+        return Detection(x=float(x), y=float(y), radius=float(radius),
+                         score=1.0, method=f"{self.name}:seed",
+                         parts={"seed_anchor": 1.0},
+                         extra={**(extra or {}), "seed_anchor": True})
+
     # -- 公共打分/筛选 -----------------------------------------------------
     def _score_candidate(
         self,

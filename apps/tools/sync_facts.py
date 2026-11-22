@@ -123,7 +123,7 @@ def expected_test_count_strings(n: int) -> list[tuple[tuple[str, ...], str]]:
     return [
         # ---- 交接文档：现在用命令而不是逐条路径 ----
         ((f"**{cn}个**回归测试", f"**{n} 个**回归测试"), "docs/交接文档.md"),
-        ((f"启动程序.bat test full         # 全套 {n} 个",), "docs/交接文档.md"),
+        ((f"run.bat test full         # 全套 {n} 个",), "docs/交接文档.md"),
         ((f"全套 {n} 个",), "docs/交接文档.md"),
         ((f"全套 {n} 个",), "docs/交接文档.md"),
         # ---- 项目总纲 ----
@@ -152,7 +152,7 @@ def expected_test_count_strings(n: int) -> list[tuple[tuple[str, ...], str]]:
         # 2026-10-26 补：扫全库时发现这三处同义说法一直没进表（都是"描述现状"，
         # 不是历史记录）—— 表覆盖不到的地方，就是漂移能长期躺着的地方。
         ((f"加 full 跑全套 {n} 个",), "docs/用户手册.md"),
-        ((f"启动程序.bat test full         # 全套 {n} 个（改代码后必跑）",), "docs/用户手册.md"),
+        ((f"run.bat test full         # 全套 {n} 个（改代码后必跑）",), "docs/用户手册.md"),
         ((f"{n} 个测试的 `main()`",), "docs/开发指南.md"),
         ((f"——{n} 个测试都不需要真相机",), "docs/交接文档.md"),
         # ---- 文件结构 ----
@@ -229,7 +229,7 @@ def _rewrite(pat: re.Pattern[str], text: str, n: int) -> tuple[str, int]:
     强行统一文体是一次无意义的大改（见上面"两种写法并存"的说明）。
 
     ⚠️ 替换的是**整个匹配**，所以要把数字之外的部分原样拼回去 ——
-    第一版直接 `return new + gap + "个"`，把模板前缀（"启动程序.bat test full # 全套"）
+    第一版直接 `return new + gap + "个"`，把模板前缀（"run.bat test full # 全套"）
     一起吞掉了，4 行命令只剩"24 个，约 6 分钟"。**改写必须是等长替换思维**：
     只动 token，其余字节逐字保留。
     """

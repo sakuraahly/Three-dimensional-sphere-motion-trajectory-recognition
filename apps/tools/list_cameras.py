@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker.sources import INDEX_BACKEND, CameraSource
+from sphere_tracker.video_profiles import fps_type
 
 
 def device_names_in_order() -> list[str]:
@@ -82,7 +83,8 @@ def main() -> int:
     p.add_argument("--max-index", type=int, default=5, help="最多探测到第几个索引")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
-    p.add_argument("--fps", type=int, default=60)
+    p.add_argument("--fps", type=fps_type, default=60,
+                   help="请求的采集帧率（默认 60，可填小数，如 29.97）")
     args = p.parse_args()
 
     names = device_names_in_order()

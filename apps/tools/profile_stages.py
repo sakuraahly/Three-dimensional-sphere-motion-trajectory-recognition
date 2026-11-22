@@ -73,7 +73,9 @@ from calib import StereoRig                                    # noqa: E402
 from sphere_tracker.config import AppConfig, ColorConfig       # noqa: E402
 from sphere_tracker.plugins import default as default_method   # noqa: E402,F401
 from stereo import MatchConfig, PairSource, StereoReconstructor  # noqa: E402
-from stereo.sessions import load_session, validate_session     # noqa: E402
+from stereo.sessions import (  # noqa: E402
+    load_session, session_calibration_file, validate_session,
+)
 from stereo.stereo_mode import mode_label, optical_axes_angle_deg, resolve_auto  # noqa: E402
 
 
@@ -539,7 +541,7 @@ def main() -> int:
                     help="每次运行丢弃前 N 帧（首帧含懒初始化，默认 2）")
     ap.add_argument("--method", default=default_method("detector"),
                     help="检测方法（默认与 run_stereo_video 一致）")
-    ap.add_argument("--preset", default=None, choices=ColorConfig.preset_names())
+    ap.add_argument("--preset", default=None, choices=ColorConfig.preset_choices())
     ap.add_argument("--detect-width", type=int, default=0)
     ap.add_argument("--min-radius", type=float, default=8.0)
     ap.add_argument("--max-radius", type=float, default=200.0)
@@ -583,9 +585,7 @@ def main() -> int:
         print("[错误] session 缺 left/right/calibration")
         return 1
 
-    calib_path = Path(s.calibration.path)
-    if not calib_path.is_absolute():
-        calib_path = session_dir / calib_path
+    calib_path = session_calibration_file(session_dir)
     rig = StereoRig.load(calib_path)
     mode = resolve_mode(args, session_dir, rig, rsv)
     if mode is None:

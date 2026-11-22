@@ -90,6 +90,9 @@ class RecordPlan:
     headline: str                   # 一句话结论
     detail: tuple[str, ...] = ()    # 为什么
     fixes: tuple[str, ...] = ()     # 可执行的一步
+    #: 这份标定被标成「强制保存的不可用测试标定」（`quality.forced_unusable`）。
+    #: 只在显式测试档（CLI `--allow-forced` / GUI 二次确认）下才 ok=True。
+    forced: bool = False
 
     @property
     def mode_conflict(self) -> bool:
@@ -103,38 +106,78 @@ class RecordPlan:
         if self.capture_size != self.save_size:
             lines.append(f"  · 相机按 {self.capture_size[0]}x{self.capture_size[1]} 采集，"
                          f"写盘 {self.save_size[0]}x{self.save_size[1]}")
+        if self.forced:
+            lines.append("  · ⚠ 仅测试：这是强制保存的不可用标定，"
+                         "录出来的会话只能用于链路测试，不得用于数据结论")
         if self.fixes:
             lines.append("可以这样改：")
             lines += [f"  {i}) {f}" for i, f in enumerate(self.fixes, 1)]
         return "\n".join(lines)
 
 
+def is_forced_unusable(rig: Any) -> bool:
+    """这份标定是不是「强制保存的不可用测试标定」。
+
+    两个来源任一成立即算：`quality.forced_unusable`（2026-11-11 起新文件都带），
+    或 verdict 里带「仅链路测试」标记（旧文件只留了 verdict 的情况）。
+    读不到就当**不是**（旧标定没有这个字段）。
+    """
+    quality = getattr(rig, "quality", None)
+    if not isinstance(quality, dict):
+        return False
+    if bool(quality.get("forced_unusable")):
+        return True
+    return "仅链路测试" in str(quality.get("verdict") or "")
+
+
 def _fail(mode: str, calib_mode: str, capture: tuple[int, int],
           save: tuple[int, int], calib_size: tuple[int, int],
-          headline: str, detail: list[str], fixes: list[str]) -> RecordPlan:
+          headline: str, detail: list[str], fixes: list[str],
+          *, forced: bool = False) -> RecordPlan:
     return RecordPlan(False, mode, calib_mode, capture, save, calib_size,
-                      headline, tuple(detail), tuple(fixes))
+                      headline, tuple(detail), tuple(fixes), forced)
 
 
 def plan_record(rig: "StereoRig | Any", *, mode_choice: str = "auto",
-                width: int, height: int) -> RecordPlan:
+                width: int, height: int,
+                allow_forced: bool = False) -> RecordPlan:
     """体检一次录制参数。只读标定对象，**不碰相机、不写盘**。
 
     ``mode_choice`` 是界面/命令行的原始值（可能是 ``"auto"``）；
     ``width/height`` 是要传给相机的采集尺寸（``--width/--height``），
     不是写盘尺寸 —— 写盘由 :func:`output_size` 决定。
+
+    ``allow_forced``：显式测试档。标定被标成 ``forced_unusable`` 时，
+    默认**拒绝录制**（那是几何与现场不符的测试标定，2026-11-11 的 15:00
+    会话就是拿它录的，299 帧 0 匹配）；只有显式给 `--allow-forced`
+    （或 GUI 二次确认）才放行，且结论里带「仅测试」。
     """
     width, height = int(width), int(height)
     capture = (width, height)
     calib_size = tuple(int(v) for v in (getattr(rig, "image_size", ()) or ()))
     calib_mode = str(getattr(rig, "stereo_mode", "parallel") or "parallel").lower()
     mode = resolve_auto(mode_choice, calibration=getattr(rig, "meta", None))
+    forced = is_forced_unusable(rig)
+
+    # ⓪ 强制保存的不可用标定：**先于**模式/尺寸判。几何本身无效时，
+    #    尺寸凑对也没意义 —— 录出来的米制尺度是错的，而且不会报错。
+    if forced and not allow_forced:
+        return _fail(
+            mode, calib_mode, capture, capture, calib_size,
+            "这份标定是强制保存的不可用测试标定（仅链路测试），不能直接录制",
+            ["它的 verdict 带着「用户强制保存：仅链路测试，不得用于数据结论」",
+             "用它对现场录制，结果的几何与现场不符（2026-11-11 的 15:00 会话"
+             "就是这样录的：299 帧 0 匹配）"],
+            ["先按现场重新标定一次（修正左图坏帧/重拍第 ③ 步参考对后再标）",
+             "只做链路测试：命令行加 --allow-forced（界面会二次确认），"
+             "录出来的会话会标「仅测试」"],
+            forced=True)
 
     if len(calib_size) != 2 or min(calib_size) <= 0:
         return _fail(mode, calib_mode, capture, capture, calib_size,
                      "这份标定没有 image_size，判断不了能不能按当前参数录",
                      ["没有 image_size 就没法核对写盘尺寸 —— 录出来的米制尺度会是错的。"],
-                     ["重新标定一次（标定会写入 image_size）"])
+                     ["重新标定一次（标定会写入 image_size）"], forced=forced)
 
     try:
         fov = fov_of(rig)
@@ -201,4 +244,4 @@ def plan_record(rig: "StereoRig | Any", *, mode_choice: str = "auto",
 
     return RecordPlan(True, mode, calib_mode, capture, save, calib_size,
                       f"可以录：{mode} 模式，写盘 {save[0]}x{save[1]}"
-                      f"（与标定内参一致）")
+                      f"（与标定内参一致）", (), (), forced)

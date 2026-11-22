@@ -467,31 +467,51 @@ class StereoRig:
         )
 
     @classmethod
-    def from_result(cls, res: StereoCalibrationResult, meta: dict | None = None) -> "StereoRig":
+    def from_result(cls, res: StereoCalibrationResult, meta: dict | None = None,
+                    *, allow_unusable: bool = False) -> "StereoRig":
+        """由标定结果造装置参数。
+
+        默认**拒绝不可用结果**（``not res.ok`` → ValueError）——这是数据门禁，
+        不许静默放宽。``allow_unusable=True`` 只给**显式测试档**用
+        （CLI 的 ``--force-save``）：仍然生成参数，但在 ``quality`` 里写死
+        ``forced_unusable=True``，让落盘文件自己就能证明"这份不可用"。
+        """
+        if not res.ok and allow_unusable:
+            # 显式测试档：先走这里，跳过下面的 raise；标记必须落盘。
+            return cls._build(res, meta, forced_unusable=True)
         if not res.ok:
             raise ValueError(f"标定结果不可用，拒绝生成装置参数：{res.verdict}")
+        return cls._build(res, meta, forced_unusable=False)
+
+    @classmethod
+    def _build(cls, res: StereoCalibrationResult, meta: dict | None,
+               *, forced_unusable: bool) -> "StereoRig":
+        """真正拼装置参数（`from_result` 的两条出口都走它，避免两份 quality）。"""
+        quality = {
+            "rms": res.rms, "err_left": res.err_left, "err_right": res.err_right,
+            "epipolar_rms": res.epipolar_rms, "epipolar_max": res.epipolar_max,
+            "n_pairs_used": res.n_pairs_used, "n_pairs_in": res.n_pairs_in,
+            "verdict": res.verdict,
+            # ---- 不确定度（2026-10-18 加，审查 A5）----
+            #
+            # 为什么存进 JSON：RMS 是"拟合得多好"，这两个数是"参数能信到什么
+            # 程度"。合成真值里**同一份 RMS** 可以对应 4 倍不同的深度精度，
+            # 所以只看 RMS 会误判。存下来，事后复盘才有依据。
+            "grade": res.grade,
+            "board_area": res.board_area,
+            # 落盘这一步必须带上：`none_raw` 与 `stereo_rectify` 的
+            # `epipolar_error()` 语义不同，丢了它下游就分不清口径。
+            "rectification": res.rectification,
+            "fx_sigma_px": res.fx_sigma(),
+            "depth_sigma_mm_at_0_6m": res.depth_sigma_mm(0.6),
+        }
+        if forced_unusable:
+            quality["forced_unusable"] = True
         return cls(
             K1=res.K1, D1=res.D1, K2=res.K2, D2=res.D2, R=res.R, T=res.T,
             E=res.E, F=res.F, R1=res.R1, R2=res.R2, P1=res.P1, P2=res.P2, Q=res.Q,
             image_size=res.image_size,
-            quality={
-                "rms": res.rms, "err_left": res.err_left, "err_right": res.err_right,
-                "epipolar_rms": res.epipolar_rms, "epipolar_max": res.epipolar_max,
-                "n_pairs_used": res.n_pairs_used, "n_pairs_in": res.n_pairs_in,
-                "verdict": res.verdict,
-                # ---- 不确定度（2026-10-18 加，审查 A5）----
-                #
-                # 为什么存进 JSON：RMS 是"拟合得多好"，这两个数是"参数能信到什么
-                # 程度"。合成真值里**同一份 RMS** 可以对应 4 倍不同的深度精度，
-                # 所以只看 RMS 会误判。存下来，事后复盘才有依据。
-                "grade": res.grade,
-                "board_area": res.board_area,
-                # 落盘这一步必须带上：`none_raw` 与 `stereo_rectify` 的
-                # `epipolar_error()` 语义不同，丢了它下游就分不清口径。
-                "rectification": res.rectification,
-                "fx_sigma_px": res.fx_sigma(),
-                "depth_sigma_mm_at_0_6m": res.depth_sigma_mm(0.6),
-            },
+            quality=quality,
             meta=meta or {},
         )
 

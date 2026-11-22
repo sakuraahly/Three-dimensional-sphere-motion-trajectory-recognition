@@ -61,6 +61,7 @@ Run ``python stereo/angled.py`` for a self-test (synthetic rig, no cameras).
 
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,7 +93,8 @@ if TYPE_CHECKING:
 
     from .triangulate import StereoPoint
 
-__all__ = ["AngledMatchConfig", "AngledPoint", "AngledReconstructor"]
+__all__ = ["AngledMatchConfig", "AngledPoint", "AngledReconstructor",
+           "refine_fundamental"]
 
 # Same "trust this measurement" threshold as ``StereoPoint.confident``.  A
 # data object cannot reach the reconstructor's config, so this is a fixed
@@ -250,15 +252,147 @@ def _epipolar_distance_or_none(
         return None
 
 
-def _resolve_fundamental(rig: object) -> tuple[np.ndarray, str]:
-    """Use ``rig.F`` when it is valid, otherwise rebuild it from the pose.
+def _hartley_normalize(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Hartley normalize 2D points: centroid at origin, mean distance sqrt(2).
+
+    Returns the normalized ``(N, 2)`` points and the ``(3, 3)`` transform ``T``
+    such that ``[x_n, y_n, 1] = T @ [x, y, 1]``.  A Fitted fundamental matrix
+    in normalized coordinates is brought back with ``T_right.T @ F_n @ T_left``.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    centroid = pts.mean(axis=0)
+    shifted = pts - centroid
+    mean_dist = float(np.linalg.norm(shifted, axis=1).mean())
+    scale = np.sqrt(2.0) / mean_dist if mean_dist > 1e-12 else 1.0
+    T = np.array(
+        [[scale, 0.0, -scale * float(centroid[0])],
+         [0.0, scale, -scale * float(centroid[1])],
+         [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    hom = np.column_stack([pts, np.ones(len(pts), dtype=np.float64)])
+    norm = (T @ hom.T).T[:, :2]
+    return norm, T
+
+
+def _fundamental_quality(
+    F: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+    inlier_px: float,
+) -> tuple[float, float]:
+    """Return ``(inlier_ratio, epipolar_median_px)`` for a candidate F.
+
+    The median is deliberately robust: a handful of wrong correspondences
+    must not decide whether one F is better than another.  Non-matchable
+    pairs (degenerate epipolar line) are simply dropped from the statistic.
+    """
+    dists: list[float] = []
+    for pl, pr in zip(left, right):
+        line = _epipolar_line_or_none(F, (float(pl[0]), float(pl[1])))
+        if line is None:
+            continue
+        dist = _epipolar_distance_or_none(line, (float(pr[0]), float(pr[1])))
+        if dist is not None and math.isfinite(dist):
+            dists.append(float(dist))
+    if not dists:
+        return 0.0, float("inf")
+    arr = np.asarray(dists, dtype=np.float64)
+    return float(np.mean(arr <= inlier_px)), float(np.median(arr))
+
+
+def refine_fundamental(
+    F_base: np.ndarray,
+    pts_left: np.ndarray,
+    pts_right: np.ndarray,
+    *,
+    inlier_px: float = 3.0,
+) -> tuple[np.ndarray, dict] | None:
+    """Re-estimate ``F`` from correspondences with Hartley + ``FM_RANSAC``.
+
+    ``pts_left`` / ``pts_right`` are corresponding original (distorted) pixel
+    pairs, each shaped ``(N, 2)``.  ``F_base`` is the calibrated/pipe F used as
+    the quality baseline.  Returns ``(F_refined, info)`` or ``None`` when the
+    input is too small, degenerate, or OpenCV fails.
+
+    ``info`` carries ``n_points``, ``inlier_ratio``, ``base_inlier_ratio``,
+    ``epipolar_median_px`` and ``base_epipolar_median_px`` so the caller can
+    decide whether to adopt the refined F.  ``cv2.findFundamentalMat`` uses an
+    internal RANSAC whose randomness is **not** controlled by
+    ``cv2.setRNGSeed`` (see ``tests/selftest_calib_facts.py``), so adoption is
+    judged on "not worse" rather than on exact reproduction.
+    """
+    try:
+        import cv2  # lazy: the matching-only path needs no cv2 at import time
+
+        left = np.asarray(pts_left, dtype=np.float64).reshape(-1, 2)
+        right = np.asarray(pts_right, dtype=np.float64).reshape(-1, 2)
+        if left.shape != right.shape or len(left) < 8:
+            return None
+        if not (np.all(np.isfinite(left)) and np.all(np.isfinite(right))):
+            return None
+
+        n_left, T_left = _hartley_normalize(left)
+        n_right, T_right = _hartley_normalize(right)
+        # 0.004 is in Hartley-normalised units (points ~sqrt(2) from origin),
+        # roughly 3 px on a typical ~800 px-wide sensor.
+        F_n, mask = cv2.findFundamentalMat(
+            n_left, n_right, cv2.FM_RANSAC, 0.004, 0.99,
+        )
+        if F_n is None or np.asarray(F_n).size != 9:
+            return None
+        F_n = np.asarray(F_n, dtype=np.float64).reshape(3, 3)
+        if not bool(np.all(np.isfinite(F_n))):
+            return None
+        # RANSAC 用最小集合估 F，对中位残差并非最优；在它的内点上再做一次
+        # 8 点最小二乘，既更稳也保证 refined 不会比 pose-F 在对应点上更差。
+        mask_arr = np.asarray(mask, dtype=np.uint8).reshape(-1)
+        if mask_arr.size == len(n_left) and int(mask_arr.sum()) >= 8:
+            F_fit, _ = cv2.findFundamentalMat(
+                n_left[mask_arr == 1], n_right[mask_arr == 1], cv2.FM_8POINT,
+            )
+            if F_fit is not None and np.asarray(F_fit).size == 9:
+                F_fit = np.asarray(F_fit, dtype=np.float64).reshape(3, 3)
+                if bool(np.all(np.isfinite(F_fit))):
+                    F_n = F_fit
+        F_refined = _as_fundamental(T_right.T @ F_n @ T_left)
+        if F_refined is None:
+            return None
+
+        ratio_r, median_r = _fundamental_quality(F_refined, left, right, inlier_px)
+        ratio_b, median_b = _fundamental_quality(F_base, left, right, inlier_px)
+        info = {
+            "n_points": int(len(left)),
+            "inlier_ratio": ratio_r,
+            "base_inlier_ratio": ratio_b,
+            "epipolar_median_px": median_r,
+            "base_epipolar_median_px": median_b,
+        }
+        return F_refined, info
+    except Exception:  # noqa: BLE001 -- refinement is strictly best-effort
+        return None
+
+
+def _resolve_fundamental(
+    rig: object,
+    *,
+    f_source: str = "auto",
+    correspondences: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, str]:
+    """Use ``rig.F`` when valid, otherwise rebuild it from the pose.
 
     The rig object is never mutated (``rig.F`` is left exactly as supplied);
     the matrix actually used is returned together with its provenance
     (``"rig"`` or ``"pose"``).
+
+    With ``f_source="refined"`` a third path is available: re-estimate ``F``
+    from ``correspondences`` (left/right original pixel arrays) via Hartley
+    normalization + ``cv2.FM_RANSAC``, and adopt it **only** when it is not
+    worse than the calibrated/pipe F on both inlier ratio and epipolar median.
+    The default ``"auto"`` keeps the historical behaviour byte-for-byte.
     """
     given = _as_fundamental(getattr(rig, "F", None))
-    if given is not None:
+    if given is not None and f_source != "refined":
         return given, "rig"
 
     try:
@@ -275,7 +409,47 @@ def _resolve_fundamental(rig: object) -> tuple[np.ndarray, str]:
             "rig.F 不可用，且由 K1/D1/K2/D2/R/T 构造出的 F 不是有效的 rank-2 矩阵"
             "（检查 T 是否为零、K/R 是否有效）"
         )
-    return resolved, "pose"
+    base, base_source = (
+        (given, "rig") if given is not None else (resolved, "pose")
+    )
+    if f_source != "refined":
+        return base, base_source
+
+    # ---- B4: refined F，默认不启用；任何失败都静默回退，不碰产物/退出码 ----
+    if correspondences is None:
+        print("[refined-F] 未给对应点，继续使用 " + base_source + "-F")
+        return base, base_source
+    try:
+        result = refine_fundamental(base, correspondences[0], correspondences[1])
+        if result is None:
+            print("[refined-F] 对应点不足/RANSAC 失败，继续使用 " + base_source + "-F")
+            return base, base_source
+        F_refined, info = result
+        adopt = (
+            info["inlier_ratio"] >= info["base_inlier_ratio"] - 1e-9
+            and info["epipolar_median_px"] <= info["base_epipolar_median_px"] + 1e-9
+        )
+        if adopt:
+            print(
+                f"[refined-F] 已采用：{info['n_points']} 点，内点占比 "
+                f"{info['inlier_ratio'] * 100:.0f}%（基线 "
+                f"{info['base_inlier_ratio'] * 100:.0f}%），极线中位 "
+                f"{info['epipolar_median_px']:.3f}px（基线 "
+                f"{info['base_epipolar_median_px']:.3f}px）"
+            )
+            return F_refined, "refined"
+        print(
+            "[refined-F] 不优于基线（内点 "
+            f"{info['inlier_ratio'] * 100:.0f}% vs "
+            f"{info['base_inlier_ratio'] * 100:.0f}%，极线中位 "
+            f"{info['epipolar_median_px']:.3f} vs "
+            f"{info['base_epipolar_median_px']:.3f}px），继续使用 "
+            f"{base_source}-F"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[refined-F] 重估异常（{type(exc).__name__}: {exc}），继续使用 "
+              + base_source + "-F")
+    return base, base_source
 
 
 class AngledReconstructor:
@@ -289,6 +463,15 @@ class AngledReconstructor:
         ``F`` is computed from the pose once and cached in :attr:`F`.
     cfg:
         Thresholds; defaults to ``AngledMatchConfig()``.
+    f_source:
+        ``"auto"`` (default) keeps the historical behaviour: valid ``rig.F``,
+        else rebuilt from the pose.  ``"refined"`` additionally tries to
+        re-estimate F from ``correspondences`` (Hartley + RANSAC) and adopts it
+        only if it is not worse than the calibrated/pipe F; any failure falls
+        back silently.  Off by default because it needs real correspondences.
+    correspondences:
+        Optional ``(left_pixels, right_pixels)`` ``(N, 2)`` arrays; only read
+        when ``f_source="refined"``.
 
     Attributes
     ----------
@@ -297,7 +480,8 @@ class AngledReconstructor:
         epipolar lines).
     f_source:
         ``"rig"`` when ``rig.F`` was used, ``"pose"`` when :attr:`F` was
-        derived from ``K/D/R/T``.  Useful when a calibration file and the
+        derived from ``K/D/R/T``, ``"refined"`` when a RANSAC re-estimate from
+        correspondences was adopted.  Useful when a calibration file and the
         pose disagree.
     trajectory:
         Accepted :class:`AngledPoint` values, in call order.
@@ -305,14 +489,23 @@ class AngledReconstructor:
         Mutually exclusive per-call counters (see the module docstring).
     """
 
-    def __init__(self, rig: object, cfg: AngledMatchConfig | None = None) -> None:
+    def __init__(
+        self,
+        rig: object,
+        cfg: AngledMatchConfig | None = None,
+        *,
+        f_source: str = "auto",
+        correspondences: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
         if rig is None:
             raise ValueError(
                 "AngledReconstructor 需要一个 rig（含 K1/D1/K2/D2/R/T）"
             )
         self.rig = rig
         self.cfg = cfg if cfg is not None else AngledMatchConfig()
-        self.F, self.f_source = _resolve_fundamental(rig)
+        self.F, self.f_source = _resolve_fundamental(
+            rig, f_source=f_source, correspondences=correspondences,
+        )
 
         self.trajectory: list[AngledPoint] = []
         self.n_matched = 0
@@ -722,21 +915,24 @@ def _self_test() -> None:
 
     # 6) Angle gate: a 10 m point is on the epipolar line and reprojects well,
     # but the rays are nearly parallel (0.002 deg), so only the angle can fail.
+    # 兼容两种核层实现：老版 triangulate_pixels 会返回这个三角解，由上层
+    # min_angle_deg 拒收；新版（B3）核层自己就按最小交会角拒收并返回 None。
+    # 两条路都必须落进 n_rejected、绝不产出三维点 —— 这才是本用例的契约。
     far_xyz = np.array([-0.01, 0.0, 10.0], dtype=np.float64)
     far_left = project(far_xyz)
     far_right = project(R @ far_xyz + T)
     far_line = epipolar_line(F_expected, far_left)
     far_tri = triangulate_pixels(K, D, K, D, R, T, far_left, far_right)
-    _require(far_tri is not None, "far point should still triangulate")
-    _require(
-        far_tri.angle_deg < default_cfg.min_angle_deg,
-        f"far angle {far_tri.angle_deg} deg should be below the gate",
-    )
-    _require(
-        max(far_tri.reproj_left_px, far_tri.reproj_right_px)
-        <= default_cfg.max_reproj_px,
-        "far point reprojection should pass (angle must be the reject reason)",
-    )
+    if far_tri is not None:
+        _require(
+            far_tri.angle_deg < default_cfg.min_angle_deg,
+            f"far angle {far_tri.angle_deg} deg should be below the gate",
+        )
+        _require(
+            max(far_tri.reproj_left_px, far_tri.reproj_right_px)
+            <= default_cfg.max_reproj_px,
+            "far point reprojection should pass (angle must be the reject reason)",
+        )
     _require(
         point_line_distance(far_line, far_right)
         <= default_cfg.max_epipolar_px,
@@ -749,10 +945,10 @@ def _self_test() -> None:
         "angle reject should return None",
     )
     _require(rec_angle.n_rejected == 1, "angle reject counter")
-    print(
-        f"PASS angle reject: {far_tri.angle_deg:.4f} deg < "
-        f"{default_cfg.min_angle_deg:.1f} deg -> n_rejected"
-    )
+    angle_txt = (f"{far_tri.angle_deg:.4f} deg < "
+                 f"{default_cfg.min_angle_deg:.1f} deg"
+                 if far_tri is not None else "核层最小交会角已拒（<5°）")
+    print(f"PASS angle reject: {angle_txt} -> n_rejected")
 
     # 7) Reproj gate: 1 px off the line passes the epipolar gate, but the
     # triangulated midpoint reprojects 5.9 px away -> only reproj can fail.

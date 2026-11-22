@@ -19,6 +19,15 @@
 点坐标会被换成**世界系**（`coordinate_system="world"`，并附 `world_frame`
 来源信息）；不存在时保持左相机系，并在 `notes` 里明说 ——
 **绝不静默把相机系当世界系**。真值应用在 `build_visualization_payload()` 里。
+
+重导出不丢运行时结论：`build_*_payload()` 是**从头重建**，`quality` /
+`predictions` / `smoothing` / `world_frame` 是调用方在导出**之后**补的，
+重建不出来。所以只重跑导出的工具（`apps/export_visualization.py`）必须再调
+`carry_over_runtime_extras()`，否则用户手里的"质量状态"会凭空消失。
+
+`round_trip`（往返一致性）**不在**这一类：它由 `_round_trip_block()` 从
+samples 现算，每次导出都是新值 —— 是轨迹的几何属性，不是运行期结论，
+所以不进 `RUNTIME_EXTRA_KEYS`、也不需要搬运。
 """
 
 from __future__ import annotations
@@ -61,8 +70,15 @@ def write_seeds(
     image_size: tuple[int, int] | None = None,
     source: str = "manual",
     note: str = "",
+    ball_kind: str = "",
 ) -> Path:
-    """写 `derived/seeds.json`。left/right 是 (x, y, radius) 原图像素坐标。"""
+    """写 `derived/seeds.json`。left/right 是 (x, y, radius) 原图像素坐标。
+
+    ``ball_kind``（``metal`` / ``plastic`` / 空）：**跑三维时该用哪个检测器**。
+    这个字段存在的理由：旧版靠"有种子 → 一定是镜面球"来接管成 specular，
+    但纯色塑料球同样可以点选，硬接管会把能跑的 color 换成跑不动的 specular。
+    空 = 旧文件/没记录，读取方按 metal 兼容处理（见 `_pick_detector`）。
+    """
     session_dir = Path(session_dir)
     session = _session_json(session_dir)
     if image_size is None:
@@ -77,6 +93,7 @@ def write_seeds(
         "seed_frame": int(seed_frame),
         "source": source,
         "note": note,
+        "ball_kind": str(ball_kind or ""),
         "left": {"x": float(left[0]), "y": float(left[1]), "radius": float(left[2])},
         "right": {"x": float(right[0]), "y": float(right[1]), "radius": float(right[2])},
     }
@@ -147,6 +164,44 @@ def read_trajectory_csv(path: str | Path) -> list[dict[str, Any]]:
     return out
 
 
+def _round_trip_block(samples: list[dict[str, Any]]) -> dict | None:
+    """从 samples 的 matched 点算一次「往返一致性」，给 `traj3d.json` 用。
+
+    为什么放在这里而不是 `run_stereo_video.py`：它是**轨迹的几何属性**，
+    只依赖 samples 本身。放在重建函数里，`traj3d.json` 与重导出
+    （`apps/export_visualization.py`）都自动带上，而且每次都是**新算的** ——
+    不会像 `quality` 那样需要 `carry_over_runtime_extras()` 搬运，也不会
+    变成旧结论。所以它**不进** `RUNTIME_EXTRA_KEYS`。
+
+    口径与阈值见 `stereo/round_trip.py`。这里**整体 try/except**：这是附带的
+    结论，算不出来就写 `null`（键仍在），绝不许把导出本身弄挂。
+    """
+    try:
+        import numpy as np
+        from .round_trip import analyze_round_trip
+
+        ts: list[float] = []
+        rows: list[list[float]] = []
+        for s in samples:
+            if not s.get("matched"):
+                continue
+            xyz = s.get("xyz")
+            if not isinstance(xyz, (list, tuple)) or len(xyz) < 3:
+                continue
+            try:
+                # matched 行也可能缺列（None）：这一行跳过，别连累整段
+                rows.append([float(v) for v in xyz[:3]])
+                ts.append(float(s["t"]))
+            except (TypeError, ValueError):
+                continue
+        if not rows:
+            return None
+        return analyze_round_trip(np.array(ts, dtype=float),
+                                  np.array(rows, dtype=float))
+    except Exception:                               # noqa: BLE001 —— 见 docstring
+        return None
+
+
 def build_trajectory_payload(
     session_dir: str | Path,
     *,
@@ -201,6 +256,7 @@ def build_trajectory_payload(
         "n_samples": len(samples),
         "n_matched": len(traj),
         "samples": samples,
+        "round_trip": _round_trip_block(samples),
     }
 
 
@@ -316,6 +372,121 @@ def _apply_world_frame(vis: dict, world_frame_path: str | Path | None) -> dict:
     return vis
 
 
+#: `build_trajectory_payload()` / `build_visualization_payload()` **重建**不出来的
+#: 运行时结论。它们由调用方（`apps/run_stereo_video.py`）在导出**之后**补写 ——
+#: 谁只重跑导出，谁就会把它们冲干净。见 `carry_over_runtime_extras()`。
+RUNTIME_EXTRA_KEYS = ("quality", "predictions", "smoothing", "world_frame")
+
+#: **成对**搬运的键：`coordinate_system` 与 `world_frame` 说的是同一件事。
+#: 它和 `RUNTIME_EXTRA_KEYS` **不同类**，所以不放进那个常量：`coordinate_system`
+#: 是**重建得出来**的（`build_trajectory_payload` 只按 stereo_mode 给
+#: `left_camera` / `rectified_left_camera`），但重建值可能**错源** ——
+#: 原来那份是世界系。单搬 `world_frame` 就会得到"键都在、但标签说相机系而
+#: 数据是世界系"的静默错配，所以两者只能成对搬。
+COORDINATE_PAIR_KEYS = ("world_frame", "coordinate_system")
+
+#: 沿用上一版 world 时必写的一句：明说"标签是沿用的、本次按 stereo_mode 重建的是
+#: 相机系"。少了这句，`notes` 就只剩一句"当前坐标为左相机系"，与新标签直接打脸。
+WORLD_CARRY_NOTE = ("坐标系沿用上一版 world"
+                    "（本次导出按 stereo_mode 重建为相机系，已按上一版纠正）")
+
+#: `_apply_world_frame()` 在没有世界系配置时写的那句。搬了 world 标签之后它已经
+#: 与新标签冲突（数据没换系，标签却写世界系），必须**换掉**而不是留着。
+NO_WORLD_NOTE_MARK = "未设置 world_frame.json"
+
+
+def carry_over_runtime_extras(payload: dict, previous: dict | None, *,
+                              trajectory_changed: bool) -> dict:
+    """把上一版 JSON 里"重建不出来"的运行时结论搬到新版 payload。
+
+    为什么需要：`build_trajectory_payload` 是重建，`quality` / `predictions` /
+    `smoothing` / `world_frame` 都是别处事后补的。导出工具重跑一次就会把它们
+    冲掉 —— 用户看到的"质量状态"凭空消失。
+
+    三条规矩：
+
+    1. **轨迹没变才搬**，并留 `carried_over` 标记说明"这些不是本次算出来的"；
+    2. **轨迹变了就不搬**，并在 `notes` 里写明"已丢弃、请重跑重建"——
+       宁可丢，也不许把旧结论挂到新轨迹上；
+    3. 只补**空位**：本次已经算出来的键（例如 `_apply_world_frame()` 刚算的
+       `world_frame`）一律不覆盖 —— 重算的结果永远比旧文件可信。
+
+    坐标系是**成对**搬的（`COORDINATE_PAIR_KEYS`）：只有上一版同时写着
+    `coordinate_system="world"` 和 `world_frame` 才搬，两个一起搬；上一版是相机系
+    就**不搬** `world_frame`（对相机系的数据它只是噪音，留着还会让标签说谎）。
+
+    纯函数：不读文件、不写文件、不抛异常（只改传进来的 `payload`）。
+    """
+    if not isinstance(previous, dict):
+        return payload
+
+    if trajectory_changed:
+        notes = payload.get("notes")
+        if not isinstance(notes, list):
+            notes = []
+        text = ("轨迹已变（n_matched/n_samples 与上一版不同），"
+                "上一版的 quality/predictions 已丢弃，请重跑重建")
+        if text not in notes:
+            notes.append(text)
+        payload["notes"] = notes
+        return payload
+
+    carried: list[str] = []
+    for key in RUNTIME_EXTRA_KEYS:
+        if key in COORDINATE_PAIR_KEYS:
+            continue                # 成对搬运，下面单独处理（单个搬会造出错配标签）
+        if key not in previous or key in payload:
+            continue
+        payload[key] = previous[key]
+        carried.append(key)
+
+    # 坐标系**成对**搬运：`world_frame` 与 `coordinate_system` 必须同源。
+    world_carried = (previous.get("coordinate_system") == "world"
+                     and "world_frame" in previous
+                     and "world_frame" not in payload)
+    if world_carried:
+        payload["world_frame"] = previous["world_frame"]
+        payload["coordinate_system"] = "world"
+        carried.extend(COORDINATE_PAIR_KEYS)
+
+    # `notes` 是**合并**（不是覆盖）：上一版的说明对没变的轨迹仍然成立。
+    old_notes = [n for n in (previous.get("notes") or []) if isinstance(n, str)]
+    if old_notes:
+        notes = payload.get("notes")
+        notes = list(notes) if isinstance(notes, list) else []
+        added = False
+        for text in old_notes:
+            if text not in notes:
+                notes.append(text)
+                added = True
+        if added:
+            payload["notes"] = notes
+            carried.append("notes")
+
+    if world_carried:
+        # 换掉"当前坐标为左相机系"那句（它已经与新标签冲突），并记下沿用的理由。
+        notes = [n for n in (payload.get("notes") or [])
+                 if not (isinstance(n, str) and NO_WORLD_NOTE_MARK in n)]
+        if WORLD_CARRY_NOTE not in notes:
+            notes.append(WORLD_CARRY_NOTE)
+        payload["notes"] = notes
+        if "notes" not in carried:
+            carried.append("notes")
+
+    if carried:
+        if world_carried:
+            reason = ("本次导出未重算，沿用上一版结论；坐标系沿用上一版：world"
+                      "（本次导出按 stereo_mode 重建为相机系，已按上一版纠正）")
+        else:
+            reason = "本次导出未重算，沿用上一版结论"
+        payload["carried_over"] = {
+            "from_created": previous.get("created"),
+            "keys": carried,
+            "reason": reason,
+        }
+    return payload
+
+
 def export_session_visualization(
     session_dir: str | Path,
     *,
@@ -323,7 +494,12 @@ def export_session_visualization(
     stereo_mode: str | None = None,
     world_frame_path: str | Path | None = None,
 ) -> dict[str, Path]:
-    """写 `traj3d.json` + `visualization.json`，返回路径。"""
+    """写 `traj3d.json` + `visualization.json`，返回路径。
+
+    ⚠️ 这里是**重建**：`quality` / `predictions` / `smoothing` / `world_frame`
+    重建不出来。只要这次导出没有重算轨迹，调用方就该接着调
+    `carry_over_runtime_extras()`，否则上一版的运行时结论会静默消失。
+    """
     session_dir = Path(session_dir)
     trajectory = build_trajectory_payload(
         session_dir, csv_name=csv_name, stereo_mode=stereo_mode)

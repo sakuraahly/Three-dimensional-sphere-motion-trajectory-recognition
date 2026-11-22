@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -50,6 +51,7 @@ import cv2
 import numpy as np
 
 from apps._window import WindowManager
+from apps._actions import current_chain_dirs
 from apps._common import (
     add_stereo_source_args,
     log_environment,
@@ -62,7 +64,7 @@ from calib.methods import plan as method_plan
 from calib.methods import single_board as single_board_method
 from calib.relative_pose import compose, invert, rotation_angle_deg
 from calib.stereo_calib import board_pose_from_points, calibrate_mono_points
-from stereo.profiles import resolve_calibration_base
+from stereo.profiles import get_active, resolve_calibration_base
 from stereo.fov_align import (
     FovAlignment,
     estimate_fov_alignment,
@@ -284,6 +286,12 @@ def _assign_ab(pose1: np.ndarray, pose2: np.ndarray,
     姿态簇"附近；另一块与它相差约两板夹角（90° 装置≈90°）。
 
     返回 `(T_A, T_B, d1, d2)`；若两块的姿态距离太接近（差 <5°），**报错**而不是猜。
+
+    ⚠ 2026-11-11：双板同框图的 A/B 判定已改走 `_resolve_pair_samples`
+    （整组全局指派 + 180° 等价解纠错 + 逐帧离群检查）——逐帧各自挑最近簇
+    在 14:39 会话上把 5 帧里的 3 帧判反，T_AB 散布 179.597°。本函数保留
+    作为"两板等距必须报错"的护栏（自测直接调用它），以及**逐帧**歧义的
+    兜底说明；不要再把它接回同框图主路径。
     """
     d1 = min(rotation_angle_deg(pose1[:3, :3], r) for r in ref_rots)
     d2 = min(rotation_angle_deg(pose2[:3, :3], r) for r in ref_rots)
@@ -298,6 +306,363 @@ def _assign_ab(pose1: np.ndarray, pose2: np.ndarray,
         return (pose1, pose2, d1, d2) if d1 < d2 else (pose2, pose1, d2, d1)
     # 参考簇 = B 板：更接近的那个是 B，另一块才是 A（返回顺序固定为 A, B, d_A, d_B）
     return (pose2, pose1, d2, d1) if d1 < d2 else (pose1, pose2, d1, d2)
+
+
+# ---- 同框图的 180° 等价解纠错（2026-11-11）----
+#
+# 为什么需要：棋盘绕**板法线**转 180° 后，角点网格在几何上仍然自洽 ——
+# 检测器若把起始角点/排列顺序整体翻过来，`solvePnP` 给的是 `T @ C`
+# （C = 绕法线的 180° 旋转，轴过角点网格中心），它与原解**重投影几乎一样好**
+# （实测：把角点倒序再 PnP，重投影 1.512 px，与正序一致），但旋转差 180°。
+# 同框图里只要某块板落到这个等价解、或 A/B 指派在两帧间来回翻，`T_AB`
+# 的样本就会分成两簇、相差约 180°（2026-11-11 14:39 会话实测 179.597°），
+# 报告却把它读成"两板没刚性固连"——而真相是**同一个物理量的等价解选错了**。
+#
+# 处理分三层，**任何一层都不许把真实散布"修正"成通过**：
+#   ① 板框等价解：每块板同时看 `T` 与 `T@C`，只有翻转解到参考姿态簇明显更近
+#      （≥30°）才采用。只对同框相机**自己那一路**的板用这个判据 —— 另一块板
+#      的参考姿态在**另一台相机**的坐标系里，直接比旋转不合法，交给层 ③。
+#   ② A/B 指派：**全局**选一组（不是逐帧各自挑），用参考簇距离总和判定。
+#      逐帧挑正是 14:39 的缺陷来源：两块板到参考簇只差 8~11°，检测噪声一抖
+#      就有一半的帧判反，T_AB 于是 179.6° 两簇。
+#   ③ 逐帧离群：与中位样本差 >45°（近 180° 的跳变）才枚举其它等价候选，
+#      且必须改善 ≥30° 才接受。真实散布（验收用例故意造 10°）远低于该门限，
+#      不会被"修"成一致。
+PAIR_FLIP_CLEAR_DEG = 30.0     # 翻转解必须比原解至少近这么多才采用
+PAIR_OUTLIER_DEG = 45.0        # 与中位样本差超过它 -> 视作等价解歧义（近 180° 跳变）
+PAIR_OUTLIER_GAIN_DEG = 30.0   # 换候选必须至少改善这么多才算"修好了"
+PAIR_ASSIGN_MARGIN_DEG = 10.0  # 两种全局 A/B 指派的参考距离总和差小于它 -> 判不了
+
+# ---- 第四层（2026-11-18）：装置先验复核，堵"两板同时翻、全程一致" ----
+#
+# 上面三层的盲区：若 A、B 两块板在**每一张**同框图里都翻了 180°、且全程一致，
+# ①只看"同框相机自己那块板"（另一块的参考位姿在另一台相机坐标系里，不能比），
+# ②A/B 指派一致、③逐帧无离群 —— 三层全过，T_AB 样本却整体错 180°，
+# consistency 还"漂亮"。chain 跳过 angled 极线复核（左右看不同板、无同名点），
+# 因此唯一能自证的就是**装置先验**。
+#
+# 为什么**基线**是这一层的有效判据：`_board_180_equiv` 的 C 绕角点网格中心转，
+# 平移项 `tc = 2·c = ((cols-1)·square, (rows-1)·square, 0)`（原点在第一个角点，
+# 不在板心，见该函数 docstring）。两板同翻时
+# `T_AB' = inv(C) · T_AB · C`，旋转被共轭（`R_AB' = Rz(pi)·R_AB·Rz(pi)`），
+# **旋转测地角保持不变**（90° 翻完还是 90°），所以"两板相对角"抓不到这一例；
+# 但平移多出 `Rz(pi)·(R_AB - I)·tc` 一项 —— 实测 8x5/25mm 板从 280.0 mm
+# 变 373.7 mm（+33%），远超下面的 10% 门限。角度项仍在（覆盖别的错指派场景），
+# 但本层主要靠基线触发。
+PAIR_PRIOR_BASELINE_REL_TOL = 0.10  # 基线相对先验误差 ≤10%（卷尺读数本身有噪声）
+PAIR_PRIOR_ANGLE_TOL_DEG = 15.0     # 板间角绝对门限：装置设计 90°、实测 88.55°，
+                                    # ±15° 覆盖装配公差与标定噪声，仍能区分 0°/180° 错解
+
+
+def _board_180_equiv(T: np.ndarray, spec: BoardSpec) -> np.ndarray:
+    """棋盘角点顺序整体翻 180° 的等价板框：`T @ C`。
+
+    `C = [Rz(pi) | c - Rz(pi)·c]`，`c` = 角点网格中心在板坐标系里的位置。
+    为什么平移项不能省：`BoardSpec.object_points()` 的原点在**第一个角点**、
+    不是网格中心；只乘 `Rz(pi)` 会把板心挪走（8x5、25 mm 板约 175/100 mm），
+    `T_AB` 的平移凭空多出这一块，旋转对了但链还是错的。
+    """
+    s = spec.square_mm / 1000.0
+    c = np.array([(spec.cols - 1) * s / 2.0, (spec.rows - 1) * s / 2.0, 0.0])
+    Rz = np.diag([-1.0, -1.0, 1.0])
+    C = np.eye(4)
+    C[:3, :3] = Rz
+    C[:3, 3] = c - Rz @ c
+    return np.asarray(T, np.float64) @ C
+
+
+def _rot_dist_to_refs(T: np.ndarray, ref_rots: list[np.ndarray]) -> float:
+    """位姿 `T` 到参考姿态簇的最小旋转距离（度）。"""
+    return min(rotation_angle_deg(T[:3, :3], r) for r in ref_rots)
+
+
+def _pick_board_flip(T: np.ndarray, ref_rots: list[np.ndarray],
+                     spec: BoardSpec) -> tuple[np.ndarray, bool, float, float]:
+    """按到参考姿态簇的最小旋转距离选原解 / 180° 等价解。
+
+    返回 `(T_used, flipped, d_orig, d_flip)`；**翻转解必须明显更近才用**
+    （`PAIR_FLIP_CLEAR_DEG`）—— 宁可漏修一次，也不许把一帧本来正确的位姿
+    强行翻成错的（那会制造一个 180° 假样本）。
+    """
+    d_orig = _rot_dist_to_refs(T, ref_rots)
+    T_flip = _board_180_equiv(T, spec)
+    d_flip = _rot_dist_to_refs(T_flip, ref_rots)
+    if d_flip + PAIR_FLIP_CLEAR_DEG < d_orig:
+        return T_flip, True, d_orig, d_flip
+    return np.asarray(T, np.float64), False, d_orig, d_flip
+
+
+def _resolve_pair_samples(frames, ref_rots: list[np.ndarray], spec: BoardSpec,
+                          pair_cam: str):
+    """把同框图的两块板位姿整理成**一致 A/B、同一等价解**后的 `T_AB` 样本。
+
+    参数
+    ----
+    frames : list[dict]
+        每帧 `{"name": str, "poses": [T0, T1], "errs": [e0, e1]}`；
+        `T0/T1` 是 `detect_two_boards` 的原始顺序，约定 `p_cam = T @ p_board`。
+    ref_rots : list[np.ndarray]
+        `--pair-camera` 那一路目录里的板姿态簇（**同框相机自己那块板**的历史
+        姿态）加上参考对里同一块板的姿态 —— 既用来判"这块板是不是翻了解"，
+        也用来判"两块板里哪一块是它"。
+    pair_cam : "left" | "right"
+        同框相机是哪一路：`left` → 它自己对应的板是 A；`right` → 是 B。
+
+    返回
+    ----
+    `(samples, rows, corrections, before)`：
+
+    - `samples`：修正后每帧一个 `T_{B←A}`；
+    - `rows`：逐帧展示信息（名字 / 到参考簇距离 / 用了哪些纠正）；
+    - `corrections`：可机读的纠正台账（落 `quality["t_ab_corrections"]`）；
+    - `before`：按**旧规则**（逐帧各自挑最近簇）会得到的样本，仅供打印
+      "修正前"的数字作对照，不参与任何判定。
+
+    判 A/B 用**整组**参考距离的总和，不用逐帧最近 —— 逐帧最近是 14:39 的
+    缺陷来源（两板到参考簇只差 8~11°，一抖就判反）。两种全局指派的总和差
+    不到 `PAIR_ASSIGN_MARGIN_DEG` 时直接报错：A/B 不可区分时宁可让人重拍，
+    也不静默猜一个反的 `T_AB`。
+    """
+    if not frames:
+        raise ValueError("没有可用的同框图（一张都没同时检出两块板）")
+    if not ref_rots:
+        raise ValueError("缺少参考姿态簇：判不了板框等价解与 A/B")
+
+    own_is_a = pair_cam == "left"
+
+    # ---- ② 两种全局 A/B 假设：参考簇距离总和更低的那组 ----
+    totals = {}
+    for h in (0, 1):
+        tot = 0.0
+        for fr in frames:
+            T_used, flipped, d_orig, d_flip = _pick_board_flip(
+                fr["poses"][h], ref_rots, spec)
+            tot += d_flip if flipped else d_orig
+        totals[h] = tot
+    if abs(totals[0] - totals[1]) < PAIR_ASSIGN_MARGIN_DEG:
+        raise ValueError(
+            f"同框图中两块板到参考姿态簇的距离太接近（总和 "
+            f"{totals[0]:.1f}° vs {totals[1]:.1f}°，差 <"
+            f"{PAIR_ASSIGN_MARGIN_DEG:g}°），判不了哪块是 A/B。\n"
+            f"  原因：两板夹角太小，或同框图拍摄姿态与内参段那批姿态差得太远。\n"
+            f"  下一步：让 A 板更正面朝向 --pair-camera 重拍同框图；"
+            f"或把 --pair-frame 换成夹角更清楚的拍摄位置。")
+    h = 0 if totals[0] < totals[1] else 1
+    a_idx = h if own_is_a else 1 - h
+    b_idx = 1 - a_idx
+
+    # ---- ① 板框等价解：只对"同框相机自己那块板"按参考簇判 ----
+    entries = []
+    corrections = []
+    for fr in frames:
+        raw = [np.asarray(fr["poses"][0], np.float64),
+               np.asarray(fr["poses"][1], np.float64)]
+        corrected = [raw[0].copy(), raw[1].copy()]
+        flips = [False, False]
+        T_used, flipped, d_orig, d_flip = _pick_board_flip(raw[h], ref_rots, spec)
+        corrected[h] = T_used
+        flips[h] = flipped
+        if flipped:
+            corrections.append({
+                "file": fr["name"],
+                "board": "A" if own_is_a else "B",
+                "action": "板框翻 180° 等价解",
+                "detail": (f"翻转解到参考簇 {d_flip:.2f}° < 原解 {d_orig:.2f}°"
+                           f"（近 {d_orig - d_flip:.1f}°）"),
+            })
+        # 旧规则（逐帧各自挑最近参考簇）在这张图上会判成哪块当 A？与全局
+        # 一致指派不同就是"这张图原本会被判反"，台账里必须点名 —— 14:39 的
+        # 179.597° 正是 5 帧里 3 帧被逐帧规则判反造成的。
+        d0 = _rot_dist_to_refs(raw[0], ref_rots)
+        d1 = _rot_dist_to_refs(raw[1], ref_rots)
+        old_own = 0 if d0 <= d1 else 1
+        old_a = old_own if own_is_a else 1 - old_own
+        ab_fixed = old_a != a_idx
+        if ab_fixed:
+            d_old = _rot_dist_to_refs(raw[old_a], ref_rots)
+            d_new = _rot_dist_to_refs(raw[a_idx], ref_rots)
+            corrections.append({
+                "file": fr["name"],
+                "board": "A/B",
+                "action": "A/B 判反",
+                "detail": (f"逐帧最近簇规则会把板{old_a + 1}当作 A（{d_old:.1f}°）；"
+                           f"按全局一致指派纠正为板{a_idx + 1}（{d_new:.1f}°）"),
+            })
+        entries.append({
+            "name": fr["name"],
+            "raw": raw,
+            "TA": corrected[a_idx],
+            "TB": corrected[b_idx],
+            "flip_a": flips[a_idx],
+            "flip_b": flips[b_idx],
+            "swap": False,
+            "ab_fixed": ab_fixed,
+            "errs": list(fr.get("errs", (float("nan"), float("nan")))),
+        })
+
+    def _tab(TA, TB):
+        return compose(invert(TB), TA)
+
+    samples = [_tab(e["TA"], e["TB"]) for e in entries]
+
+    # ---- ③ 逐帧离群：与中位样本差 >45° 才试其它等价候选 ----
+    if len(samples) >= 3:
+        medoid = min(samples, key=lambda s: sum(
+            rotation_angle_deg(s[:3, :3], t[:3, :3]) for t in samples))
+        for k, e in enumerate(entries):
+            d_now = rotation_angle_deg(samples[k][:3, :3], medoid[:3, :3])
+            if d_now <= PAIR_OUTLIER_DEG:
+                continue
+            best = None
+            raw = e["raw"]
+            for swap in (0, 1):
+                ai = b_idx if swap else a_idx
+                bi = a_idx if swap else b_idx
+                for fa in (0, 1):
+                    for fb in (0, 1):
+                        TA = _board_180_equiv(raw[ai], spec) if fa else raw[ai]
+                        TB = _board_180_equiv(raw[bi], spec) if fb else raw[bi]
+                        cand = _tab(TA, TB)
+                        d = rotation_angle_deg(cand[:3, :3], medoid[:3, :3])
+                        if best is None or d < best[0]:
+                            best = (d, swap, fa, fb, TA, TB, cand)
+            if best is None or best[0] + PAIR_OUTLIER_GAIN_DEG >= d_now:
+                # 改善不够 -> 这是真实散布/坏帧，如实留着，让门禁去拒
+                continue
+            d_best, swap, fa, fb, TA, TB, cand = best
+            e.update(TA=TA, TB=TB, swap=bool(swap),
+                     flip_a=bool(fa), flip_b=bool(fb))
+            samples[k] = cand
+            if swap:
+                action = "A/B 判反"
+                board = "A/B"
+            else:
+                action = "板框翻 180° 等价解"
+                board = "A" if fa else "B"
+            corrections.append({
+                "file": e["name"],
+                "board": board,
+                "action": action,
+                "detail": (f"与中位样本旋转差 {d_now:.2f}° → {d_best:.2f}°"
+                           f"（改善 {d_now - d_best:.1f}°）"),
+            })
+
+    rows = [{
+        "name": e["name"],
+        "d_a": _rot_dist_to_refs(e["TA"], ref_rots),
+        "d_b": _rot_dist_to_refs(e["TB"], ref_rots),
+        "flip_a": e["flip_a"], "flip_b": e["flip_b"], "swap": e["swap"],
+        "ab_fixed": e["ab_fixed"],
+        "errs": e["errs"],
+    } for e in entries]
+
+    # ---- 仅用于打印"修正前"：旧规则 = 每帧各自挑最近参考簇的那块当 A/B ----
+    before = []
+    for fr in frames:
+        d0 = _rot_dist_to_refs(fr["poses"][0], ref_rots)
+        d1 = _rot_dist_to_refs(fr["poses"][1], ref_rots)
+        own = 0 if d0 <= d1 else 1
+        ai = own if own_is_a else 1 - own
+        bi = 1 - ai
+        before.append(_tab(fr["poses"][ai], fr["poses"][bi]))
+    return samples, rows, corrections, before
+
+
+def check_pair_prior_consistency(samples, *, prior_baseline_mm=None,
+                                 prior_angle_deg=None) -> dict:
+    """第四层守卫：用装置先验复核 `_resolve_pair_samples` 的 T_AB 样本。
+
+    只复核、不改样本、不抛异常、不改退出码 —— 结果由调用方写进
+    ``quality.verdict`` / ``quality.warnings``，让下游按"不可用/仅链路测试"处理。
+
+    参数
+    ----
+    samples : list[np.ndarray]
+        三层纠错后的 `T_{B←A}` 样本。
+    prior_baseline_mm : float | None
+        卷尺量的两板间距（mm）。None/非正表示没先验，跳过基线项。
+    prior_angle_deg : float | None
+        装置设计/上次标定得到的两板相对角（度）。None 表示跳过角度项。
+
+    返回
+    ----
+    dict：`ok`（是否通过）、`reasons`（不通过的人话原因列表）、`checked`
+    （实际检查了哪几项）、`baseline_mm` / `angle_deg`（实测值）、以及两项相对误差。
+    没给先验时 `ok=True`、`checked=[]` —— 缺先验绝不误判错解。
+    """
+    from calib import relative_pose               # 与 chain 调用处同源，不新造模块
+    info = {
+        "ok": True, "reasons": [], "checked": [],
+        "baseline_mm": float("nan"), "angle_deg": float("nan"),
+        "prior_baseline_mm": prior_baseline_mm,
+        "prior_angle_deg": prior_angle_deg,
+        "baseline_rel_err": None, "angle_err_deg": None,
+    }
+    if not samples:
+        return info
+    cons = relative_pose.consistency(samples)
+    info["baseline_mm"] = float(cons["baseline_mm"])
+    # 相对角取中位样本 R_AB 的测地角（对所有样本同向错的情况，中位数与均值一样）
+    medoid = min(samples, key=lambda s: sum(
+        rotation_angle_deg(s[:3, :3], t[:3, :3]) for t in samples))
+    info["angle_deg"] = rotation_angle_deg(medoid[:3, :3], np.eye(3))
+
+    if prior_baseline_mm is not None and float(prior_baseline_mm) > 0:
+        prior_b = float(prior_baseline_mm)
+        dev = abs(info["baseline_mm"] - prior_b) / prior_b
+        info["baseline_rel_err"] = float(dev)
+        info["checked"].append("baseline")
+        if dev > PAIR_PRIOR_BASELINE_REL_TOL:
+            info["ok"] = False
+            info["reasons"].append(
+                f"两板基线偏离装置先验 {dev * 100:.1f}%"
+                f"（实测 {info['baseline_mm']:.1f} mm / 先验 {prior_b:.1f} mm，"
+                f"门限 {PAIR_PRIOR_BASELINE_REL_TOL * 100:.0f}%）"
+                "—— 疑似两板同时翻 180° 的等价解错解（三层纠错全过也照判）")
+
+    if prior_angle_deg is not None:
+        prior_a = float(prior_angle_deg)
+        dev_a = abs(info["angle_deg"] - prior_a)
+        info["angle_err_deg"] = float(dev_a)
+        info["checked"].append("angle")
+        if dev_a > PAIR_PRIOR_ANGLE_TOL_DEG:
+            info["ok"] = False
+            info["reasons"].append(
+                f"两板相对角偏离装置先验 {dev_a:.1f}°"
+                f"（实测 {info['angle_deg']:.1f}° / 先验 {prior_a:.1f}°，"
+                f"门限 {PAIR_PRIOR_ANGLE_TOL_DEG:.0f}°）—— 疑似 A/B 错指派")
+    return info
+
+
+def _device_pair_priors(args) -> tuple[float | None, float | None]:
+    """从**当前正式标定 json** 读装置先验（两板基线 / 相对角）。
+
+    这不是新数据源：chain 第④步同框图左右看不同板、没有同名点，连 angled
+    极线复核都被跳过（见下方 `angled_grade = "未评估"`），唯一独立于本次
+    样本的证据就是上一次标定落盘时留下的卷尺基线 `quality.consistency.baseline_mm`
+    与装置夹角 `angle_deg`。首次标定、旧格式、坏 JSON 都返回 (None, None)，
+    第四层守卫随即跳过 —— 缺先验绝不误判。
+    """
+    def _pos_finite(v):
+        try:
+            f = float(v)
+            return f if np.isfinite(f) and f > 0.0 else None
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        out = Path(str(args.out))
+        js = out.with_suffix(".json")
+        if not js.is_file():
+            return None, None
+        data = json.loads(js.read_text(encoding="utf-8"))
+        quality = data.get("quality") or {}
+        cons = quality.get("consistency") or {}
+        baseline = _pos_finite(cons.get("baseline_mm"))
+        angle = _pos_finite(data.get("angle_deg") or quality.get("angle_deg"))
+        return baseline, angle
+    except Exception:                                # noqa: BLE001
+        return None, None
 
 
 def _chain_input_error(args) -> str | None:
@@ -315,7 +680,8 @@ def _chain_input_error(args) -> str | None:
                     "  请改用：--left-dir <板目录> --right-dir <板目录>\n"
                     "  实时采集 chain 的 GUI 流程属于下一阶段（见计划书阶段 B）。")
         return ("--method chain 本轮只支持**离线目录**（链上用单目位姿，不做实时采集）。\n"
-                "  请改用：--left-dir <A 板目录> --right-dir <B 板目录> "
+                "  请改用：--left-dir <A 板目录> --board-b-dir <B 板目录> "
+                "--ref-pair-left <参考对左> --ref-pair-right <参考对右> "
                 "--pair-frame <同框图目录> --pair-camera left|right\n"
                 "  实时采集 chain 的 GUI 流程属于下一阶段（见计划书阶段 B）。")
     if same_board:
@@ -351,21 +717,51 @@ def _chain_input_error(args) -> str | None:
         missing.append("--left-dir <左相机拍 A 板的图像目录>")
     if not (args.board_b_dir or args.right_dir):
         missing.append("--right-dir（或 --board-b-dir）<右相机拍 B 板的图像目录>")
+    if not getattr(args, "ref_pair_left", None):
+        missing.append("--ref-pair-left <参考对·左相机那张>")
+    if not getattr(args, "ref_pair_right", None):
+        missing.append("--ref-pair-right <参考对·右相机那张>")
     if not args.pair_frame:
         missing.append("--pair-frame <单相机**同时**拍到 A、B 两板的图或目录>")
     if not args.pair_camera:
         missing.append("--pair-camera left|right（同框图是哪一路拍的）")
     if missing:
-        return ("chain 需要三样输入（本轮只支持离线目录）：\n"
-                "  1) 左相机看 A 板的图像  -> --left-dir\n"
-                "  2) 右相机看 B 板的图像  -> --right-dir（或 --board-b-dir）\n"
-                "  3) 一台相机同时看到 A、B 两板的同框图 -> --pair-frame + --pair-camera\n"
+        return ("chain 双板模式需要四段图（本轮只支持离线目录）：\n"
+                "  ①② 内参段：左拍 A 板 --left-dir、右拍 B 板 --board-b-dir"
+                "（板可以随便挪，只用来求内参）\n"
+                "  ③ 参考对：--ref-pair-left + --ref-pair-right —— 组合装置摆好"
+                "**别动**，左右相机同时各拍一张\n"
+                "  ④ 同框图：--pair-frame + --pair-camera —— 一台相机同时看到"
+                " A、B 两板（求两板相对位姿）\n"
                 "  缺少：" + "；".join(missing) + "\n"
+                "  为什么 ③ 不能省：链上两端的板位姿必须来自**同一个支架摆放**。"
+                "拿 ①② 里各自'板移动中'的一帧来凑，摆放不同，外参会静默错到"
+                " 10° / 28 mm 量级（2026-11-09 合成真值实测），程序不会自己报警。\n"
                 "  完整用法：python apps/calibrate_stereo.py --method chain "
-                "--left-dir imgs/A --right-dir imgs/B --pair-frame imgs/pair "
-                "--pair-camera left --stereo-mode angled\n"
-                "  （没有同框图就无法求 T_AB，外参在数学上不可解——本程序不会猜一个值）")
+                "--left-dir imgs/A --board-b-dir imgs/B "
+                "--ref-pair-left imgs/ref_pair_left --ref-pair-right imgs/ref_pair_right "
+                "--pair-frame imgs/pair --pair-camera left --stereo-mode angled\n"
+                "  （GUI 上就是「采集标定板图」的 4 步；没有同框图无法求 T_AB，"
+                "本程序不会猜一个值）")
     return None
+
+
+def _active_profile_name() -> str:
+    """当前激活装置档案名，写进标定 ``meta.profile``（C1，内容级身份证据）。
+
+    标定产物经 ``StereoRig.save()`` 把 meta 平铺写进 ``<out>.json``，所以这个
+    字段在文件被拷贝 / 改名后仍可追溯来自哪套装置，与「输出路径跟随激活档案」
+    互补：一个绑路径、一个绑内容。
+
+    没有激活档案时返回空串：产物照旧能落盘，只是不带身份。读取侧
+    （``apps/_gui_app.py`` 的 C2 自检）把「缺 profile」当老文件「未登记来源」，
+    不误报、不阻断。只改代码，**不回写任何已有标定文件**。
+    """
+    try:
+        prof = get_active()
+    except Exception:                       # noqa: BLE001 —— 档案读不了也照常标定
+        return ""
+    return prof.name if prof is not None else ""
 
 
 def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
@@ -381,7 +777,14 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
     也让历史文件里的写法与新代码对不上。
     """
     return {
+        # C1：标定产物的内容级身份证据 —— 当前激活装置档案名。文件被拷贝/改名后
+        # 仍可追溯；缺激活档案时为空串（读取侧按「未登记来源」处理，不误报）。
+        "profile": _active_profile_name(),
         "board": spec.describe(),
+        # 结构化规格（2026-11-19）：`board` 字符串保留兼容旧读，但下游要核对
+        # 规格只能靠这三个数值字段 —— 人读串里抠数字既脆弱又不可靠。
+        "board_spec": {"cols": int(spec.cols), "rows": int(spec.rows),
+                       "square_mm": float(spec.square_mm)},
         "source": "dir",
         # 这条链式流程的方法名从注册表取（唯一声明 same_board 的那个），不写死。
         "method": single_board_method(),
@@ -389,6 +792,11 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
         "same_board": bool(getattr(args, "same_board", False)),
         "ref_left": str(getattr(args, "ref_left", "") or "") or None,
         "ref_right": str(getattr(args, "ref_right", "") or "") or None,
+        # 双板模式的外参锚点（2026-11-09 方案 A）：链两端位姿来自这一对，
+        # 而不是内参段各挑一帧。落盘留证，交接时能查这份外参怎么来的。
+        "ref_pair_left": str(getattr(args, "ref_pair_left", "") or "") or None,
+        "ref_pair_right": str(getattr(args, "ref_pair_right", "") or "") or None,
+        "ref_pair_note": "两端位姿来自同一支架摆放的参考对",
         "rectification": res.rectification,
         "left": args.left_dir,
         "right": args.board_b_dir or args.right_dir,
@@ -399,6 +807,88 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
         "stereo_mode": "angled",
         "angle_deg": float(rig_angle(res.R)),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 标定板规格核对（2026-11-19）
+# --------------------------------------------------------------------------- #
+# 采集时把板规格写进 session.json，标定却只信 argv —— 采集后改了界面参数、
+# 或换了一份档案，旧规格拍的图就会用新规格去解，而且**静默无报错**（真会话
+# 20261118-140612 实测：8x5@25 拍的图按 11x8@9 解，检出 0/40）。
+# 下面两个纯函数把"读会话规格 + 逐项数值比对 + 友好参数错误"收在一处，
+# 不读文件、不跑标定，自测可以直接喂一个 session dict 验判定。
+def _session_board_numbers(session: dict | None) -> dict | None:
+    """从 session.json 的字典里取板规格数值；新会话优先 `board_spec`，老会话回退 `board`。
+
+    老会话的 `board` 值是字符串（``{"cols": "8", "square": "25"}``），
+    新会话另有数值型 `board_spec`；两者都在这里统一转成数值。任一项缺失/非法
+    视为"这份会话没记录板规格"，由调用方按老办法用 argv，不硬拦。
+    """
+    if not isinstance(session, dict):
+        return None
+    for key, names in (("board_spec", ("cols", "rows", "square_mm")),
+                       ("board", ("cols", "rows", "square"))):
+        raw = session.get(key)
+        if not isinstance(raw, dict):
+            continue
+        try:
+            return {
+                "cols": int(raw[names[0]]),
+                "rows": int(raw[names[1]]),
+                "square_mm": float(raw[names[2]]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def resolve_board_spec(argv: dict, session: dict | None,
+                       *, use_session_board: bool = False) -> tuple[dict | None, int]:
+    """核对 argv 板规格与 chain 会话记录，返回 ``(生效规格, 错误码)``。
+
+    - 会话无 `board` 记录（老会话）→ 不核对，用 argv 并提示"无法核对"；
+    - `--use-session-board` → 用会话规格覆盖 argv，打一行说明；
+    - 数值不一致 → 打印两边规格 + 两种修正方式，返回 ``(None, 2)``；
+    - 一致 → 用 argv 规格。
+
+    纯函数：只做数据比对与打印，不读文件、不跑标定，便于自测直接断言。
+    """
+    wanted = {
+        "cols": int(argv["cols"]),
+        "rows": int(argv["rows"]),
+        "square_mm": float(argv["square"]),
+    }
+    recorded = _session_board_numbers(session)
+    if recorded is None:
+        print("[板规格] 这份会话没记录板规格，无法核对；按命令行 --cols/--rows/--square 继续。")
+        return wanted, 0
+    if use_session_board:
+        print(f"[板规格] 用会话拍图时的规格（--use-session-board）："
+              f"{recorded['cols']}x{recorded['rows']} 内角点 / {recorded['square_mm']:g} mm；"
+              f"忽略命令行 --cols/--rows/--square。")
+        return recorded, 0
+    if recorded == wanted:
+        return wanted, 0
+    print("[板规格] 不一致，已停止标定（避免用错规格的图静默出结果）：")
+    print(f"  会话拍图时：{recorded['cols']}x{recorded['rows']} 内角点 / "
+          f"{recorded['square_mm']:g} mm")
+    print(f"  命令行填写：{wanted['cols']}x{wanted['rows']} 内角点 / "
+          f"{wanted['square_mm']:g} mm")
+    print(f"  修正一：把界面参数改成会话那份（{recorded['cols']} / {recorded['rows']} / "
+          f"{recorded['square_mm']:g}）后重试。")
+    print("  修正二：确认要按会话规格标定，加 --use-session-board 重试。")
+    return None, 2
+
+
+def make_board_spec(values: dict) -> tuple[BoardSpec | None, int]:
+    """构造 `BoardSpec`，越界时打印 `[参数错误] ...` 返回 ``(None, 2)`` 而非抛 traceback。"""
+    try:
+        spec = BoardSpec(cols=int(values["cols"]), rows=int(values["rows"]),
+                         square_mm=float(values["square_mm"]))
+    except ValueError as exc:
+        print(f"[参数错误] {exc}")
+        return None, 2
+    return spec, 0
 
 
 # 单板模式：一组"板不动"的参考图之间允许的位姿离散度。超过就不是"没动"了。
@@ -447,6 +937,92 @@ def _ref_board_poses(paths, spec, objp, K, D, label):
     }
 
 
+def _ref_pair_poses(left_paths: list[Path], right_paths: list[Path], spec: BoardSpec,
+                    objp, K_l, D_l, K_r, D_r,
+                    size_l: tuple[int, int], size_r: tuple[int, int]):
+    """双板模式的**参考对**：求链上两端的板位姿（2026-11-09 方案 A）。
+
+    为什么非它不可：链 `T_camR_B · T_AB · inv(T_camL_A)` 里，两端位姿描述的是
+    **同一个支架摆放**下 A、B 两块板各自在哪。设两次拍摄摆放为 `G_X/G_Y`，
+    链会变成 `inv(C_R)·G_Y·inv(G_X)·C_L`，只有 `G_X = G_Y` 才等于真值。
+    合成真值实测：摆放差 10°/2 cm → 旋转误差 10° / 平移 28 mm，且程序不会报警。
+    内参段那些「板可移动」的图各挑一帧，几乎必然是不同摆放，所以**不能**用。
+
+    参考对由 `capture_board.py --both` 产出：组合装置摆好别动，左右两路同时
+    各拍一张，两个目录里**同名文件 = 同一时刻**，天然成对。
+    这里用内参段求出的 K/D 做 PnP，保证外参与内参同一套口径。
+
+    返回 `(T_camL_A, T_camR_B, info)`；任何一张没**完整**检出整块板就抛错
+    （OpenCV 会把局部角点当成整块板，位姿错得离谱却不报错）。
+    """
+    by_l = {p.name: p for p in left_paths}
+    by_r = {p.name: p for p in right_paths}
+    common = sorted(set(by_l) & set(by_r))
+    if not common and len(left_paths) == len(right_paths) == 1:
+        # 手工各放一张、文件名不同也算一对：小白不该被文件名卡住。
+        pairs = [(left_paths[0], right_paths[0])]
+        pairing = "按唯一一张自动配对"
+    else:
+        pairs = [(by_l[n], by_r[n]) for n in common]
+        pairing = "按同名文件配对"
+    if not pairs:
+        raise ValueError(
+            "参考对左右目录里**没有成对**的图（左 "
+            f"{len(left_paths)} 张 / 右 {len(right_paths)} 张，同名 {len(common)} 对）。\n"
+            "  第 ③ 步要用「采集标定板图」里的两路同拍：左右各存一张、文件名相同。\n"
+            "  手工整理时请把同一时刻的两张图取同一个名字，或各只放一张。")
+
+    rows, bad = [], []
+    for pl, pr in pairs:
+        gl = cv2.imread(str(pl), cv2.IMREAD_GRAYSCALE)
+        gr = cv2.imread(str(pr), cv2.IMREAD_GRAYSCALE)
+        if gl is None or gr is None:
+            bad.append(f"{pl.name}/{pr.name}（读不出来）")
+            continue
+        if (gl.shape[1], gl.shape[0]) != size_l or (gr.shape[1], gr.shape[0]) != size_r:
+            bad.append(f"{pl.name}/{pr.name}（尺寸与内参段不一致："
+                       f"{gl.shape[1]}x{gl.shape[0]} / {gr.shape[1]}x{gr.shape[0]}，"
+                       f"应为 {size_l[0]}x{size_l[1]} / {size_r[0]}x{size_r[1]}）")
+            continue
+        obs_l = detect_board(gl, spec, exhaustive=True)
+        obs_r = detect_board(gr, spec, exhaustive=True)
+        if not (obs_l.found and obs_l.corners is not None
+                and obs_r.found and obs_r.corners is not None):
+            bad.append(f"{pl.name}/{pr.name}（有一路没完整检出整块 "
+                       f"{spec.cols}x{spec.rows} 棋盘）")
+            continue
+        T_l, e_l = _pnp_reproj_rms(objp, obs_l.corners, K_l, D_l)
+        T_r, e_r = _pnp_reproj_rms(objp, obs_r.corners, K_r, D_r)
+        rows.append((pl.name, T_l, T_r, e_l, e_r))
+    if bad:
+        raise ValueError(
+            "参考对有图不能用：" + "、".join(bad[:5])
+            + ("…" if len(bad) > 5 else "") + "\n"
+            "  第 ③ 步要求：组合装置摆好**别动**，左相机完整看到 A 板、"
+            "右相机完整看到 B 板，两路同时各拍一张；采集档要与内参段一致。")
+    if not rows:
+        raise ValueError("参考对目录里没有可用的成对图（第 ③ 步没拍）。")
+
+    # 多对时看**同一路**跨对的位姿离散：那就是「板在拍参考对时动没动」。
+    # 两路看的是不同的板，不能像单板模式那样做跨路比较。
+    base_l, base_r = rows[0][1], rows[0][2]
+    rot = max(max(rotation_angle_deg(T_l[:3, :3], base_l[:3, :3]),
+                  rotation_angle_deg(T_r[:3, :3], base_r[:3, :3]))
+              for _n, T_l, T_r, _e_l, _e_r in rows)
+    tr = max(max(float(np.linalg.norm(T_l[:3, 3] - base_l[:3, 3])),
+                 float(np.linalg.norm(T_r[:3, 3] - base_r[:3, 3]))) * 1000.0
+             for _n, T_l, T_r, _e_l, _e_r in rows)
+    best = min(rows, key=lambda r: r[3] + r[4])
+    return best[1], best[2], {
+        "n": len(rows), "best": best[0], "err_l": best[3], "err_r": best[4],
+        "pairing": pairing, "rot_deg": float(rot), "trans_mm": float(tr),
+        "rows": [(n, e_l, e_r) for n, _a, _b, e_l, e_r in rows],
+        "warn": bool(rot > REF_ROT_WARN_DEG or tr > REF_TRANS_WARN_MM),
+        "unpaired": max(0, len(left_paths) - len(pairs))
+                    + max(0, len(right_paths) - len(pairs)),
+    }
+
+
 def _same_board_samples(info_l, info_r) -> list[np.ndarray]:
     """单板的 `T_AB` 重复性样本：**逐张**参考图各算一次 `T_{B←A}`（≈I）。
 
@@ -480,7 +1056,8 @@ def _ref_stability_text(info: dict) -> str:
             f"平移 {info['trans_mm']:.2f} mm")
 
 
-def _chain_report(res, same_board: bool, ref_note: str = "") -> str:
+def _chain_report(res, same_board: bool, ref_note: str = "",
+                  ref_pair_note: str = "") -> str:
     """chain 的报告文本。
 
     单板模式下 `T_AB` 按定义是 `I`，报告里"两板间距 / T_AB 重复性"这两行
@@ -491,7 +1068,11 @@ def _chain_report(res, same_board: bool, ref_note: str = "") -> str:
     """
     text = res.report()
     if not same_board:
-        return text
+        # 双板：把外参锚点的来源写进报告（落日志/交接时能一眼看出这份外参
+        # 是不是用了同一摆放的参考对，而不是内参段里随手挑的两帧）。
+        return (text + "\n外参锚点    : " + (ref_pair_note or "—（参考对信息缺失）")
+                + "\n前提        : A/B 刚性固连，参考对时装置一动不动"
+                  "（程序无法从图里校验，由拍摄者保证）")
     out = []
     for line in text.splitlines():
         if "两板间距" in line or "--pair-frame" in line:
@@ -509,6 +1090,113 @@ def _chain_report(res, same_board: bool, ref_note: str = "") -> str:
         if line.startswith("右目重投影 RMS"):
             out.append("T_AB          : I（单板；" + (ref_note or "—") + "）")
     return "\n".join(out)
+
+
+def _bypass_calibration_out(out: str) -> str:
+    """把输出前缀改到**旁路路径**：只改 stem，正式激活档案绝不改动。
+
+    ``StereoRig.save()`` 会按这个前缀同时产出 ``.npz`` 与 ``.json``，
+    两个文件一起走旁路；``_backup_existing`` 也只检查旁路路径，
+    所以正式的 ``--out`` 完全不会被碰。时间戳带毫秒，避免同秒多次运行撞名。
+    """
+    p = Path(out)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+    return str(p.with_name(f"{p.stem}_unusable_{stamp}{p.suffix}"))
+
+
+def _backup_before_force(out: str | Path) -> list[Path]:
+    """强制覆盖前，把旧标定 `.npz`/`.json` 复制到**同目录**的新备份文件。
+
+    命名 ``<stem>_before_force_<YYYYMMDD-HHMMSS-mmm>.<ext>``，带毫秒并查重，
+    **绝不覆盖/删除任何已有备份**（含 config/ 下那些历史名字）。两份都在才写；
+    任何一步复制失败都抛异常，由调用方决定"不写正式路径"（保护旧标定）。
+    """
+    p = Path(out)
+    npz, js = p.with_suffix(".npz"), p.with_suffix(".json")
+    pairs = [(q, q.suffix) for q in (npz, js) if q.is_file()]
+    if not pairs:
+        return []
+    stamp = (time.strftime("%Y%m%d-%H%M%S")
+             + f"-{int(time.time() * 1000) % 1000:03d}")
+    dests: list[Path] = []
+    for src, ext in pairs:
+        dest = p.with_name(f"{p.stem}_before_force_{stamp}{ext}")
+        n = 1
+        while dest.exists():                 # 撞名就换号，绝不覆盖已有备份
+            dest = p.with_name(f"{p.stem}_before_force_{stamp}_{n}{ext}")
+            n += 1
+        shutil.copy2(src, dest)
+        dests.append(dest)
+    # 全部复制成功才算成功（中途抛异常由调用方兜底）
+    for dest in dests:
+        if not dest.is_file() or dest.stat().st_size == 0:
+            raise OSError(f"备份文件校验失败：{dest}")
+    return dests
+
+
+def finalize_and_save(rig: StereoRig, args, *, unusable: bool,
+                      log: logging.Logger) -> tuple[Path, Path, bool]:
+    """统一落盘：质量差**默认旁路保存**；``--force-save`` 显式写正式路径。
+
+    新原则「质量差也要出结果、只有错误才紧急」：``unusable`` 时不再中止，
+    而是照常生成可查看、可复盘的产物，并用 ``forced_unusable`` / ``verdict``
+    自证「仅链路测试，不得用于数据结论」。默认（不加 ``--force-save``）
+    把 ``args.out`` 改到旁路路径，**激活装置档案绝不改动**；只有显式
+    ``--force-save`` 才写正式 ``--out`` 路径。
+
+    所有 ``not res.ok`` / angled "不可用" 的保存都必须走这里；调用方必须
+    先给 ``StereoRig.from_result(..., allow_unusable=True)`` —— params.py 的
+    第二道闸门（``if not res.ok: raise``）保留不动，不许静默放宽。
+
+    返回 ``(npz, json, 是否旁路)``。
+    """
+    force_save = bool(getattr(args, "force_save", False))
+    bypassed = False
+    # A4（2026-11-18）：强制写正式路径前，先把旧 `.npz`/`.json` 复制到同目录的
+    # 新备份文件（带时间戳、不覆盖任何已有备份）。**只有真的复制成功才继续写**；
+    # 复制失败就打印警告并直接返回，绝不写正式路径 —— 保护那份不可再生的旧标定。
+    # 放在 verdict 文案之前，避免备份失败时还打印"即将写入正式路径"误导人。
+    if force_save:
+        try:
+            backups = _backup_before_force(args.out)
+            if backups:
+                print(f"  强制覆盖前已备份旧标定："
+                      f"{', '.join(str(b) for b in backups)}")
+                log.info("强制保存前备份旧标定：%s", [str(b) for b in backups])
+        except Exception as exc:                     # noqa: BLE001
+            npz_p = Path(str(args.out)).with_suffix(".npz")
+            js_p = Path(str(args.out)).with_suffix(".json")
+            msg = (f"强制保存前备份旧标定失败（{type(exc).__name__}: {exc}）；"
+                   f"为保护旧标定，本次不写正式路径 {args.out}")
+            print(f"\n[错误] {msg}")
+            log.error(msg)
+            rig.quality["force_backup_failed"] = True
+            rig.quality.setdefault("warnings", []).append(msg)
+            return npz_p, js_p, True
+    if unusable:
+        verdict = str(rig.quality.get("verdict") or "不可用")
+        # 产物自证：forced_unusable 可机读，verdict 追加人话；grade 保持判定原值。
+        rig.quality["forced_unusable"] = True
+        rig.quality["verdict"] = f"{verdict} 【仅链路测试，不得用于数据结论】"
+        if force_save:
+            print("\n" + "!" * 66)
+            print("⚠ 用户强制保存不可用标定（仅链路测试，写入正式 --out 路径）")
+            print(f"  判定：{verdict}")
+            print("  这份参数不得用于任何数据结论；下游据此应拒绝出数。")
+            print("!" * 66 + "\n")
+            log.warning("标定质量不合格，给了 --force-save：写入正式路径（仅链路测试）")
+        else:
+            args.out = _bypass_calibration_out(str(args.out))
+            bypassed = True
+            print("\n" + "!" * 66)
+            print("⚠ 标定质量不合格（仅质量差，非程序错误，不中止）")
+            print(f"  结果另存为旁路文件供检查：{args.out}")
+            print("  激活装置档案未改动（正式标定路径保持原样）。")
+            print(f"  判定：{verdict}")
+            print("!" * 66 + "\n")
+            log.warning("标定质量不合格：另存旁路 %s（正式档案未改动）", args.out)
+    npz, js = rig.save(args.out)
+    return npz, js, bypassed
 
 
 def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
@@ -532,13 +1220,21 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     pair_paths = [] if same_board else _list_images(Path(args.pair_frame))
     ref_left_paths = _list_images(Path(args.ref_left)) if same_board else []
     ref_right_paths = _list_images(Path(args.ref_right)) if same_board else []
+    # 双板模式的参考对（方案 A）：`_chain_input_error` 已保证两个参数都在，
+    # 这里仍判一次空值，避免 Path("") 变成当前目录把无关图片全扫进来。
+    ref_pair_l_paths = (_list_images(Path(args.ref_pair_left))
+                        if not same_board and getattr(args, "ref_pair_left", None) else [])
+    ref_pair_r_paths = (_list_images(Path(args.ref_pair_right))
+                        if not same_board and getattr(args, "ref_pair_right", None) else [])
     required = [("--left-dir", left_paths), (right_label, right_paths)]
     if same_board:
         # 外参段：两路各一组"板不动"的参考图
         required += [("--ref-left", ref_left_paths),
                      ("--ref-right", ref_right_paths)]
     else:
-        required.append(("--pair-frame", pair_paths))
+        required += [("--ref-pair-left", ref_pair_l_paths),
+                     ("--ref-pair-right", ref_pair_r_paths),
+                     ("--pair-frame", pair_paths)]
     for label, paths in required:
         if not paths:
             print(f"\n[错误] {label} 里没有图像（支持 "
@@ -574,6 +1270,16 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     print(f"[chain] 检出：左 {len(c_left)}/{len(left_paths)}（{fail_l} 张未检出），"
           f"右 {len(c_right)}/{len(right_paths)}（{fail_r} 张未检出）；"
           f"尺寸 左 {size_left[0]}x{size_left[1]} / 右 {size_right[0]}x{size_right[1]}")
+    if not same_board:
+        # 前提必须打在**结果之前**：这份外参的正确性完全押在"参考对是同一个
+        # 支架摆放"上。程序无法从图里验证 A/B 是否刚性固连、装置有没有被挪过，
+        # 所以必须先把这句话说清楚，而不是等出了错数再回头猜。
+        print("[chain] 双板模式：①② 只求内参；③ 参考对定外参锚点；④ 同框图求 T_AB")
+        print(f"        参考对：左 {len(ref_pair_l_paths)} 张 / "
+              f"右 {len(ref_pair_r_paths)} 张（组合装置摆好别动、两路同时拍）")
+        print("        前提：A/B 两板必须**刚性固连在同一支架**上，且拍参考对时"
+              "支架一动不动。板动 1 mm，外参就错 1 mm —— 这条程序无法替你校验。")
+        log.info("chain 双板模式：外参锚点来自参考对（同一摆放）")
     if same_board:
         # 前提必须打在**结果之前**：这份外参的正确性完全押在"板没动"上，
         # 事后才发现这块板被动过，全部数字都得重来。
@@ -607,6 +1313,14 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     # 配成 (T_camL_B, T_camR_B) 交给核心层做"搬坐标系看是否重合"的检查。
     # 双板模式没有这个前提（左看 A、右看 B），保持 None —— 核心层会如实写"无法计算"。
     cross_poses = None
+    # 双板 180° 纠错台账（单板模式不适用，保持空表）：由
+    # `_resolve_pair_samples` 产出，随后写进 `quality["t_ab_corrections"]` 落盘 ——
+    # 过几天回看时能知道这组 T_AB 被纠正过什么、凭什么（否则和"没纠过"长得一样）。
+    t_ab_corrections: list[dict] = []
+    t_ab_before: list[np.ndarray] = []
+    # 第四层（装置先验复核）结果：只对双板模式有意义，单板保持 None。
+    pair_prior: dict | None = None
+    ref_pair_note = ""
     if same_board:
         # 单板：A 与 B 是同一块板的同一个世界系，T_AB 按定义就是单位阵 ——
         # 它不是"估"出来的，也不该被当成可优化的量。
@@ -646,13 +1360,44 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
               f"重复性 n={len(samples)}"
               + ("（n=1，未评估重复性）" if len(samples) < 2 else ""))
     else:
-        # 同框图的参考姿态簇：由 --pair-camera 那一路的目录决定
+        # 参考对（第 ③ 步）**先算**：它既是链上的外参锚点，也是判 A/B 的
+        # "同一块板的参考姿态"之一。挪到同框图之前不改变语义，只让判 A/B 有
+        # 两份独立证据（内参段姿态簇 + 参考对锚点），而不是只靠那簇被移动过的板。
+        try:
+            T_camL_A, T_camR_B, rp_info = _ref_pair_poses(
+                ref_pair_l_paths, ref_pair_r_paths, spec, objp,
+                mono_l["K"], mono_l["D"], mono_r["K"], mono_r["D"],
+                size_left, size_right)
+        except ValueError as exc:
+            print(f"\n[错误] 参考对（第 ③ 步）不可用：{exc}")
+            log.error("chain 双板参考对不可用：%s", exc)
+            return 1
+        print(f"[chain] 外参锚点：参考对 {rp_info['n']} 对"
+              f"（{rp_info['pairing']}），取 {rp_info['best']}，"
+              f"重投影 左 {rp_info['err_l']:.2f} / 右 {rp_info['err_r']:.2f} px")
+        if rp_info["n"] >= 2:
+            print(f"        参考对离散度：旋转 {rp_info['rot_deg']:.3f}° / "
+                  f"平移 {rp_info['trans_mm']:.2f} mm"
+                  + ("  ⚠ 装置在拍参考对时动过，请重拍第 ③ 步"
+                     if rp_info["warn"] else "（装置没动）"))
+        else:
+            print("        只有 1 对，未评估重复性（多拍 1~2 对更稳，非必需）")
+        if rp_info["unpaired"]:
+            print(f"        [警告] 有 {rp_info['unpaired']} 张落单的图没法配对，已忽略")
+        ref_pair_note = (f"参考对 {rp_info['n']} 对，取 {rp_info['best']}，"
+                         f"重投影 {rp_info['err_l']:.2f}/{rp_info['err_r']:.2f} px")
+
+        # 同框图的参考姿态簇：--pair-camera 那一路目录里的板姿态簇（同框相机
+        # 自己那块板）+ 参考对里同一块板的姿态。另一块板的参考位姿在**另一台
+        # 相机**的坐标系里，直接比旋转不合法（见 `_resolve_pair_samples`）。
         ref_mono = mono_l if args.pair_camera == "left" else mono_r
         ref_rots = [cv2.Rodrigues(r)[0] for r in ref_mono["rvecs"]]
+        own_anchor = T_camL_A if args.pair_camera == "left" else T_camR_B
+        ref_rots.append(own_anchor[:3, :3].copy())
         K_pair, D_pair = ref_mono["K"], ref_mono["D"]
         pair_cam_size = size_left if args.pair_camera == "left" else size_right
 
-        samples, pair_rows = [], []
+        frames = []
         for p in pair_paths:
             gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
             if gray is None:
@@ -666,44 +1411,70 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
             if found is None:
                 print(f"  [跳过] {p.name}：没有同时检出两块板")
                 continue
-            try:
-                T1, e1 = _pnp_reproj_rms(objp, found[0].corners, K_pair, D_pair)
-                T2, e2 = _pnp_reproj_rms(objp, found[1].corners, K_pair, D_pair)
-                T_A, T_B, d_a, d_b = _assign_ab(T1, T2, ref_rots, args.pair_camera)
-            except ValueError as exc:
-                print(f"\n[错误] 同框图 {p.name} 无法分配 A/B 板：{exc}")
-                log.error("chain：A/B 分配失败 %s", exc)
-                return 1
-            T_ab = relative_pose.board_to_board_from_single_camera(T_A, T_B)
-            samples.append(T_ab)
-            pair_rows.append((p.name, e1, e2, d_a, d_b))
+            T1, e1 = _pnp_reproj_rms(objp, found[0].corners, K_pair, D_pair)
+            T2, e2 = _pnp_reproj_rms(objp, found[1].corners, K_pair, D_pair)
+            frames.append({"name": p.name, "poses": [T1, T2], "errs": [e1, e2]})
 
-        if not samples:
+        if not frames:
             print("\n[错误] --pair-frame 里没有一张图能**同时**检出 A、B 两块板。\n"
                   "  下一步：把双板靶标放到 --pair-camera 那一路的画面中央、光照均匀、"
                   "两块板都完整入画，重拍 3~5 张。")
             log.error("chain：没有可用的同框图")
             return 1
-        for name, e1, e2, d_a, d_b in pair_rows:
-            print(f"  同框图 {name}: 重投影 {e1:.2f}/{e2:.2f} px，"
-                  f"到参考姿态簇 {d_a:.1f}°/{d_b:.1f}°")
+        try:
+            samples, pair_rows, t_ab_corrections, t_ab_before = _resolve_pair_samples(
+                frames, ref_rots, spec, args.pair_camera)
+        except ValueError as exc:
+            print(f"\n[错误] --pair-frame 里无法判定 A/B 板：{exc}")
+            log.error("chain：A/B 分配失败 %s", exc)
+            return 1
+        for row in pair_rows:
+            tags = []
+            if row["swap"]:
+                tags.append("A/B 判反（逐帧离群）→已纠正")
+            elif row["ab_fixed"]:
+                tags.append("A/B 判反→已纠正")
+            if row["flip_a"]:
+                tags.append("A 板框 180°→已纠正")
+            if row["flip_b"]:
+                tags.append("B 板框 180°→已纠正")
+            print(f"  同框图 {row['name']}: 重投影 {row['errs'][0]:.2f}/"
+                  f"{row['errs'][1]:.2f} px，到参考姿态簇 "
+                  f"{row['d_a']:.1f}°/{row['d_b']:.1f}°"
+                  + (f"  [{'、'.join(tags)}]" if tags else ""))
+        if len(t_ab_before) >= 2:
+            cb = relative_pose.consistency(t_ab_before)
+            print(f"[chain] T_AB 180° 纠错前：旋转最大偏离 {cb['rot_max_deg']:.3f}°  "
+                  f"平移最大偏离 {cb['trans_max_mm']:.3f} mm（逐帧各自挑最近参考簇）")
+        n_flip = sum(1 for c in t_ab_corrections if c["action"].startswith("板框"))
+        n_swap = sum(1 for c in t_ab_corrections if c["action"] == "A/B 判反")
+        detail = "；".join(f"{c['file']} {c['board']} {c['action']}（{c['detail']}）"
+                          for c in t_ab_corrections)
+        print(f"[chain] T_AB 180° 纠错：板框等价解 {n_flip} 处 / A/B 判反 {n_swap} 处"
+              + (f"；{detail}" if detail else "（无需纠正）"))
         cons = relative_pose.consistency(samples)
         print(f"[chain] T_AB：n={cons['n']}  旋转最大偏离 {cons['rot_max_deg']:.3f}°  "
               f"平移最大偏离 {cons['trans_max_mm']:.3f} mm  两板间距 "
               f"{cons['baseline_mm']:.1f} mm")
+        # ---- 第四层：装置先验复核（三层全过也照判的错解）----
+        pri_b, pri_a = _device_pair_priors(args)
+        pair_prior = check_pair_prior_consistency(
+            samples, prior_baseline_mm=pri_b, prior_angle_deg=pri_a)
+        print(f"[chain] T_AB 装置先验复核：基线实测 {pair_prior['baseline_mm']:.1f} mm"
+              + (f" / 先验 {pri_b:.1f} mm（偏离 {pair_prior['baseline_rel_err'] * 100:.1f}%）"
+                 if pri_b is not None else " / 先验缺省")
+              + f"；相对角实测 {pair_prior['angle_deg']:.1f}°"
+              + (f" / 先验 {pri_a:.1f}°" if pri_a is not None else " / 先验缺省")
+              + f" -> {'通过' if pair_prior['ok'] else '错解：' + '；'.join(pair_prior['reasons'])}")
 
-    # 链上用的两路板位姿。
-    # 双板：A/B 是**两块不同的板**，板框随板走，所以挑各自重投影最小的那一帧
-    # 都还是"该板在某一位姿下"的位姿，链式外参不受影响。
-    # 单板：两路必须用**同一个物理摆放**（--ref-*），绝不能各挑一张移动中的图，
-    # 否则 T_AB ≠ I，链出来的外参是错的 —— 上面已单独算好，这里不能再覆盖。
-    if not same_board:
-        i = int(np.argmin(mono_l["per_view"]))
-        j = int(np.argmin(mono_r["per_view"]))
-        T_camL_A = relative_pose.rt_to_T(cv2.Rodrigues(mono_l["rvecs"][i])[0],
-                                         mono_l["tvecs"][i])
-        T_camR_B = relative_pose.rt_to_T(cv2.Rodrigues(mono_r["rvecs"][j])[0],
-                                         mono_r["tvecs"][j])
+    # 链上用的两路板位姿（2026-11-09 方案 A）。
+    # 双板：**只从参考对取**。以前这里写的是"A/B 板框随板走，各挑重投影最小的
+    # 一帧不影响链式外参" —— 那句是错的。链 = inv(C_R)·G_Y·inv(G_X)·C_L，
+    # 两端位姿取自不同摆放时多出 G_Y·inv(G_X) 一项（合成真值实测：差 10°/2 cm
+    # → 旋转 10° / 平移 28 mm），而双板模式 cross_poses=None、GUI 不传
+    # --baseline-mm，完全不会报警。内参段那些移动中的图只用来求 K/D。
+    # 单板：参考图本来就是固定板，上面已单独算好，这里不能再覆盖。
+    # （双板的外参锚点参考对已在上面的 else 分支里先算好了，此处不再重复。）
 
     # chain 的产物是 none_raw（未做极线校正）的链式外参，只可能用 angled 重建。
     # 以前这里跟 auto 走：新装置没有旧 JSON 时 auto 落到 parallel，于是把
@@ -725,24 +1496,35 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         log.error("chain 标定被拒绝：%s", exc)
         return 1
 
-    report = _chain_report(res, same_board, ref_note if same_board else "")
+    report = _chain_report(res, same_board, ref_note if same_board else "",
+                          ref_pair_note)
     print(report)
     log.info("chain 结果：\n%s", report)
     if same_board and rig_angle(res.R) > 60.0:
         print("[警告] 注意：单板模式在 >60° 的装置上要求两路各自都能看到**整块**板；"
               "请确认每路检出的是完整棋盘，而不是只看到一角。")
         log.warning("单板模式 + 夹角 %.1f° > 60°：需确认每路检出完整棋盘", rig_angle(res.R))
-    if not res.ok:
-        print("标定未通过质量判定，未保存结果。")
-        log.warning("chain 标定未通过质量判定，未保存")
-        return 1
-
-    rig = StereoRig.from_result(res, meta=_chain_meta(args, spec, res, size_left))
+    # 新原则：质量差也要出结果、只有错误才紧急。不可用时不再 return 1，
+    # 而是继续构造 rig —— 但必须显式给 allow_unusable=True（params.py 第二道
+    # 闸门保留）。落盘一律走 finalize_and_save：默认旁路（不污染激活档案），
+    # 只有显式 --force-save 才写正式 --out 路径，两条轨道都带「仅链路测试」标记。
+    rig = StereoRig.from_result(res, meta=_chain_meta(args, spec, res, size_left),
+                                allow_unusable=not res.ok)
     rig.quality["method"] = res.method
     rig.quality["rectification"] = res.rectification
     rig.quality["consistency"] = res.consistency
     if not same_board:
         rig.quality["t_ab_mm"] = res.consistency.get("baseline_mm", float("nan"))
+        # 180° 等价解纠错台账：哪张图、哪块板、原解/翻转解、修正前后散布。
+        # 不落盘的话，这组"被纠正过"的 T_AB 和"一次就测对"的落盘文件长得一样。
+        rig.quality["t_ab_corrections"] = {
+            "n": len(t_ab_corrections),
+            "flips": int(sum(1 for c in t_ab_corrections
+                             if c["action"].startswith("板框"))),
+            "ab_swaps": int(sum(1 for c in t_ab_corrections
+                                if c["action"] == "A/B 判反")),
+            "items": t_ab_corrections,
+        }
     else:
         # 参考图的稳定性必须**落盘**。只打印警告的话，过几天回看，
         # 这份标定和"参考图确实没动"的那份长得一模一样——而外参的可信度不同。
@@ -768,7 +1550,21 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
     # 90° 下 F 极线指标需要"同名点"，而 chain 的左右角点**不是对应点**
     # （各自看各自的板），所以这里不做 angled 质量评估，并写清原因。
     rig.quality["angled_grade"] = "未评估"
+    # verdict 先落原始判定；不可用时的「仅链路测试」标记由 finalize_and_save 统一加。
     rig.quality["verdict"] = res.verdict
+    # 第四层错解：不改样本、不 raise、不改退出码，只把判定写成不可用并落 warnings，
+    # 由 finalize_and_save 统一追加「仅链路测试」并走旁路（显式 --force-save 才写正式）。
+    prior_bad = bool(pair_prior is not None and not pair_prior["ok"])
+    if pair_prior is not None:
+        rig.quality["t_ab_prior_guard"] = pair_prior
+    if prior_bad:
+        reason_text = "；".join(pair_prior["reasons"])
+        rig.quality["verdict"] = (
+            f"{rig.quality['verdict']} 【装置先验复核判错解：{reason_text}】")
+        rig.quality.setdefault("warnings", []).append(
+            "T_AB 装置先验复核判错解：" + reason_text)
+        rig.quality["grade"] = "不可用"
+        log.warning("chain T_AB 装置先验复核判错解：%s", reason_text)
     print(f"[chain] 实测光轴夹角 {rig.angle_deg:.2f}°（由链式 R 计算，不写死 90°）")
     if rig.rectification == "none_raw":
         # 必须在报告里明说：这份参数**不能**拿去喂视差逻辑。
@@ -776,8 +1572,10 @@ def _run_chain(args, spec: BoardSpec, log: logging.Logger) -> int:
         # 而 none_raw 下 y 差/视差都没有几何意义（见 calib/params.py 的说明）。
         print(f"[chain] {NONE_RAW_NOTE}")
         log.warning("chain 产物为 none_raw：%s", NONE_RAW_NOTE)
-    npz, js = rig.save(args.out)
-    print(f"已保存：{npz}")
+    _unusable = (not res.ok) or prior_bad
+    npz, js, _bypassed = finalize_and_save(rig, args, unusable=_unusable, log=log)
+    _saved = Path(str(npz)).is_file() if npz else False
+    print(f"已保存：{npz}" if _saved else f"未写入正式路径（旧标定已保护）：{npz}")
     print(f"        {js}")
     print("注意：chain 的 R1/R2=I、P1/P2 是「只去畸变」的投影矩阵（未做极线校正），"
           "三角测量可直接用；但校正图像/视差接口不适用。")
@@ -939,6 +1737,9 @@ def main() -> int:
     ap.add_argument("--cols", type=int, default=8, help="棋盘格内角点列数")
     ap.add_argument("--rows", type=int, default=5, help="棋盘格内角点行数")
     ap.add_argument("--square", type=float, default=25.0, help="方格实际边长（毫米）")
+    ap.add_argument("--use-session-board", action="store_true",
+                    help="标定板规格用当前 chain 会话 session.json 记录的那份，"
+                         "忽略 --cols/--rows/--square。会话没记录板规格时本开关无效")
     # 默认值 = **试标定档（8 对）**，由用户 2026-10-10 指定，用于先跑通通路。
     #
     # 代价必须说清：`CalibConfig` 的注释写着"默认值按 20-30 对图像调好的"，
@@ -1002,12 +1803,24 @@ def main() -> int:
                     help="同一块固定板：板在两次拍摄之间不得移动；"
                          "左/右各拍一轮（--left-dir/--right-dir），"
                          "无需双板靶标与同框图。此时 T_AB 按定义取 I")
+    ap.add_argument("--force-save", action="store_true",
+                    help="⚠ 仅链路测试，不得用于数据结论：质量差时把结果写入正式 --out 路径。"
+                         "默认（不加此开关）不中止程序，但会把结果另存为 "
+                         "*_unusable_<时间戳>.npz/.json 旁路文件供检查，"
+                         "激活装置档案绝不改动；加此开关才写正式路径。"
+                         "两种产物都标 forced_unusable /「仅链路测试」，下游据此拒绝出数")
     ap.add_argument("--ref-left", default=None,
                     help="单板模式的外参锚点：左相机看这块板、**板不动**的参考图"
                          "（文件或目录，1~5 张）。板要整体入画")
     ap.add_argument("--ref-right", default=None,
                     help="单板模式的外参锚点：右相机看**同一块板同一个位置**的参考图"
                          "（文件或目录，1~5 张）。内参仍取 --right-dir 的结果")
+    ap.add_argument("--ref-pair-left", default=None,
+                    help="双板模式的外参锚点（2026-11-09 方案 A）：组合装置摆好别动，"
+                         "左相机**同时**拍 A 板那张（文件或目录）")
+    ap.add_argument("--ref-pair-right", default=None,
+                    help="双板模式的外参锚点：与 --ref-pair-left **同一时刻**右相机"
+                         "拍 B 板那张（文件或目录）；两目录同名文件自动成对")
     fov = ap.add_mutually_exclusive_group()
     fov.add_argument("--skip-fov", action="store_true",
                      help="跳过两路视场（FOV）对齐：不估单应、不裁剪不缩放，"
@@ -1047,7 +1860,8 @@ def main() -> int:
     # 2026-11-04 前这里硬编码顶层，档案"切换装置"是假动作。
     args = ap.parse_args()
     if args.out is None:
-        args.out = str(resolve_calibration_base())
+        # 这是**输出**路径（新标定要写到哪），不要求它已经存在 → strict=False。
+        args.out = str(resolve_calibration_base(strict=False))
     if args.skip_fov and args.require_fov:
         ap.error("--skip-fov 与 --require-fov 矛盾：前者不做 FOV 对齐，后者要求"
                  "「估不出来就失败」")
@@ -1094,7 +1908,27 @@ def main() -> int:
     if args.relaxed:
         log.warning("启用了 --relaxed：门限放松，用精度换成功率")
 
-    spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
+    # ---- 板规格：chain/offline 路径先核对拍图会话里记录的规格 ----
+    # 采集后改界面参数、或换一份档案再标定，旧规格拍的图会被新规格静默解出
+    # （真会话实测：8x5@25 的图按 11x8@9 解 -> 0/40 检出，且不报错）。
+    # 非 chain 路径（相机/视频）没有会话，下面整段跳过，行为完全不变。
+    spec_values = {"cols": args.cols, "rows": args.rows, "square": args.square}
+    if method.offline_only:
+        session = None
+        dirs = current_chain_dirs()
+        if dirs is not None:
+            sjson = Path(dirs["left"]).parent / "session.json"
+            try:
+                session = json.loads(sjson.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                print(f"[板规格] 会话记录读不出来（{exc}），无法核对；按命令行规格继续。")
+        spec_values, code = resolve_board_spec(
+            spec_values, session, use_session_board=args.use_session_board)
+        if code != 0:
+            return code
+    spec, code = make_board_spec(spec_values)
+    if code != 0:
+        return code
     print(f"标定板：{spec.describe()}")
     if args.target < 15:
         # 低目标数必须**显式可见**，不能悄悄用：否则以后看到一份差标定，
@@ -1614,10 +2448,9 @@ def main() -> int:
         except ValueError:
             pass
 
-    if not res.ok:
-        print("标定未通过质量判定，未保存结果。请按上面的提示重拍。")
-        log.warning("标定未通过质量判定，未保存")
-        return 1
+    # 新原则：质量差也要出结果、只有错误才紧急。res.ok=False 不再 return 1，
+    # 继续构造 + 落盘（默认旁路 / --force-save 显式写正式路径）；判定逻辑一字不改。
+    quality_bad = not res.ok
 
     # 模式在启动前就由 resolve_auto() 落定了（入口层唯一解析点），这里只做
     # "推断值与实测夹角是否自相矛盾"的复核；不再先 normalize 再分叉。
@@ -1653,7 +2486,12 @@ def main() -> int:
         capture_meta = None
         capture_size = None
     rig = StereoRig.from_result(res, meta={
+        # C1：与 _chain_meta 同一份内容级身份证据（见那里的注释）。
+        "profile": _active_profile_name(),
         "board": spec.describe(),
+        # 与 _chain_meta 同一份结构化规格；`board` 字符串保留兼容旧读。
+        "board_spec": {"cols": int(spec.cols), "rows": int(spec.rows),
+                       "square_mm": float(spec.square_mm)},
         "source": src.kind,
         "left": args.left if args.left is not None else (args.left_video or args.left_dir),
         "right": args.right if args.right is not None else (args.right_video or args.right_dir),
@@ -1663,7 +2501,7 @@ def main() -> int:
         "fov": fov.to_dict() if fov is not None else None,
         "stereo_mode": mode,
         "angle_deg": measured_angle,
-    })
+    }, allow_unusable=not res.ok)
     print(f"[标定] 实测光轴夹角 {measured_angle:.2f}°（模式 {mode}）")
     if mode == "angled":
         try:
@@ -1691,21 +2529,21 @@ def main() -> int:
                 print(f"  [警告] {warning}")
             log.info("angled 质量：%s / %s / %s", grade, verdict, q.as_dict())
             if grade == "不可用":
-                print("大角度质量判定为『不可用』，未保存结果；请调整夹角/标定板后重拍。")
-                log.warning("angled 质量不可用，未保存")
-                return 1
+                # 质量差：不再 return 1，交给 finalize_and_save 旁路保存 + 标记。
+                quality_bad = True
         except Exception as exc:                            # noqa: BLE001
             rig.quality["angled_grade"] = "未评估"
             rig.quality["verdict"] = f"angled 质量评估失败，未验证：{exc}"
             print(f"[错误] angled 质量评估失败，未保存：{exc}")
             log.warning("angled 质量评估失败，未保存：%s", exc)
             return 1
-    npz, js = rig.save(args.out)
-    print(f"已保存：{npz}")
+    npz, js, _bypassed = finalize_and_save(rig, args, unusable=quality_bad, log=log)
+    _saved = Path(str(npz)).is_file() if npz else False
+    print(f"已保存：{npz}" if _saved else f"未写入正式路径（旧标定已保护）：{npz}")
     print(f"        {js}")
     print()
     print("下一步：")
-    print("  - 三角测量时用 calib.StereoRig.load('config/stereo_calibration') 读取参数")
+    print(f"  - 三角测量时用 calib.StereoRig.load('{args.out}') 读取参数")
     print("  - 装置如果被碰动，用 apps/verify_stereo.py 复检极线误差")
     log.info("标定成功，已保存 %s", npz)
     print(f"（本次日志：{log_path}）")

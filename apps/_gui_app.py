@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk
@@ -46,11 +47,17 @@ from apps._gui_widgets import (ACCENT, BG, FONT_FAMILY, INK, MUTED, OK, WARN,
                                init_style)
 from apps._task_runner import ROOT, TaskRunner
 from apps import _actions
+from stereo.profiles import (calibration_files_exist, calibration_identity,
+                             IDENTITY_MISMATCH, IDENTITY_UNREGISTERED)
 
 __all__ = ["GuiPrefs", "AppState", "App", "HubWindow", "run"]
 
 MONO_CALIB_PATH = ROOT / "config" / "mono_calibration.json"
-STEREO_CALIB_PATH = ROOT / "config" / "stereo_calibration"
+# 2026-11-10（用户裁决 B5）：不再有 `STEREO_CALIB_PATH` 常量。
+# 标定路径一律走 `apps._common.current_calibration` —— 那个"档案优先、档案没配
+# 才回落顶层 config/stereo_calibration"的判断**只许有一份**。这里原来自己写了一份，
+# GUI 按档案 cand 判定、CLI 按顶层判定，于是用户把标定写进
+# `config/calib/<档案名>.npz` 之后，CLI 复检报"找不到标定文件"。
 
 
 # --------------------------------------------------------------------------- #
@@ -126,11 +133,14 @@ class AppState:
         self.rig = None                # StereoRig | None
         self.mono: dict | None = None  # config/mono_calibration.json 的内容
         self.notes: list[str] = []     # 读取过程中的"读不了"（不是错误，是现状）
+        # warn 级之外的说明（如老标定「未登记来源」）：只拼进状态条，不升成警告。
+        self.infos: list[str] = []
         self.reload()
 
     # ---------- 读取 ----------
     def reload(self) -> None:
         self.notes.clear()
+        self.infos.clear()
         self.profile = None
         self.rig = None
         self.mono = None
@@ -141,26 +151,31 @@ class AppState:
             self.notes.append(f"装置档案读不了：{type(exc).__name__}")
         self.rig = self._read_rig()
         self.mono = self._read_mono()
+        self._collect_identity()
 
     def _stereo_calib_path(self) -> Path:
-        """档案指向的标定文件优先，否则用约定的默认路径。
+        """当前该用的标定基名（无扩展名）：档案优先，档案没配才回落顶层。
 
-        档案优先是"一套装置一份标定"的落地：换装置不该还要手动换文件。
+        判定逻辑**不在这里**：``apps._common.current_calibration`` 是唯一产地
+        （2026-11-10 用户裁决 B5）。``need_existing=False`` 是因为这里要的是
+        "该用哪份"，文件在不在由 ``_read_rig()`` 单独判 —— 档案指定了但文件
+        不在时**仍返回档案路径**，绝不回落到别套装置的几何。
         """
-        p = getattr(self.profile, "calibration_path", None)
-        if p:
-            cand = Path(p)
-            if not cand.is_absolute():
-                cand = ROOT / cand
-            if cand.exists():
-                return cand
-        return STEREO_CALIB_PATH
+        from apps._common import current_calibration
+
+        return current_calibration(need_existing=False)[0]
 
     def _read_rig(self):
         path = self._stereo_calib_path()
         # StereoRig.load 接受无扩展名的基名，会自己找 .json/.npz
-        if not path.exists() and not path.with_suffix(".json").exists() \
-                and not path.with_suffix(".npz").exists():
+        if not calibration_files_exist(path):
+            prof = getattr(self.profile, "name", None)
+            if prof:
+                self.notes.append(
+                    f"装置档案「{prof}」指定的标定文件不存在：{path.name}。"
+                    "门厅按「未标定」显示；录制/重建链路的 "
+                    "`resolve_calibration_base()` 会直接报错拦下，"
+                    "不再拿别套装置的几何顶替 —— 先给这套装置标定")
             return None
         try:
             from calib.params import StereoRig
@@ -177,7 +192,61 @@ class AppState:
         except (OSError, ValueError) as exc:
             self.notes.append(f"单目标定读不了：{type(exc).__name__}")
             return None
+        if isinstance(raw, dict):
+            bound = str(raw.get("device_identity") or "")
+            cur = str((self.camera_roles().get("left") or {}).get("identity") or "")
+            if bound and cur and bound != cur:
+                self.notes.append("单目标定绑定的是另一台相机，请重做单目内参标定")
+            elif not bound:
+                self.notes.append("单目标定未绑定设备身份（老文件），换相机不会自动报警；请重标")
         return raw if isinstance(raw, dict) else None
+
+    # ---------- 身份自检（C2）与状态条文案（B3） ----------
+    def _collect_identity(self) -> None:
+        """C2：把标定身份三态分流到 notes(warn) / infos(info)，**不阻断使用**。
+
+        与 ``mode_conflict()``（只查档案模式 vs 标定 meta.stereo_mode）互补：
+        这里查的是 meta.profile —— C1 起新标定写入的装置档案名。三态：
+
+        - matched       -> 不提示；
+        - mismatch      -> 明确警告「这份标定属于档案 X，当前是 Y」进 ``notes``；
+        - unregistered  -> 老标定没有 profile，只给一句「未登记来源」的
+          **说明**进 ``infos``，绝不误报成「属于别套装置」，也不阻断。
+
+        现有 4 个档案的标定都是老文件，若把 unregistered 也当警告，用户一进
+        门厅就会看到一堆假警告。``infos`` 只拼进状态条、不升成 warn 级别，
+        ``mode_allowed()`` / ``mode_conflict()`` 完全不看它，所以不拦任何窗口。
+        """
+        if self.rig is None:
+            return
+        meta = getattr(self.rig, "meta", None) or {}
+        cur = getattr(self.profile, "name", None)
+        verdict = calibration_identity(meta, cur)
+        if verdict.state == IDENTITY_MISMATCH:
+            self.notes.append(verdict.message)
+        elif verdict.state == IDENTITY_UNREGISTERED:
+            self.infos.append(verdict.message)
+        # matched：不提示
+
+    def status_text(self) -> tuple[str, str]:
+        """门厅状态条文案（B3）：``_refresh()`` 里那套 head 计算的唯一产地。
+
+        返回 ``(文案, level)``。``level``：有 warn 级 notes（读不了 / 身份不符）
+        或「有档案却没标定」时 warn，否则 info。``infos`` 是「未登记来源」这类
+        说明，只拼进文案、不升成 warn。抽成纯方法后，``_reload_state()`` 与
+        切换档案都能复用它，且可在测试里用假 state 纯数据验证「文案随档案变」。
+        """
+        notes = "；".join(self.notes) if self.notes else ""
+        infos = "；".join(self.infos) if self.infos else ""
+        prof = getattr(self.profile, "name", None)
+        head = f"当前装置：{prof}" if prof else "未设置装置档案"
+        if self.rig is not None:
+            mode = self.stereo_mode() or "未记录模式"
+            head += f"（标定模式 {mode}）"
+        parts = [p for p in (notes, infos) if p]
+        text = head + (f"｜{'；'.join(parts)}" if parts else "")
+        level = "warn" if (self.notes or (prof and self.rig is None)) else "info"
+        return text, level
 
     # ---------- 相机角色（唯一来源 config/cameras.json） ----------
     def camera_roles(self) -> dict:
@@ -195,16 +264,68 @@ class AppState:
         return roles if isinstance(roles, dict) else {}
 
     def camera_role_text(self, role: str) -> str:
-        """``left`` → ``left = Integrated IR Camera，索引 2``；未固定就直说。"""
+        """``left`` → ``left = Integrated IR Camera，编号 0``；未固定/不在线都直说。
+
+        ⚠️ **2026-11-08 修：不许再打印配置里存的旧索引。**
+        用户报「left 和 right 是同一个相机」，查下来就是这里：他换过 USB 口之后
+        right 绑定的设备已经不在线，而配置里两条记录的 `index` 都是 **0**
+        （换口前 right 恰好也排在 0），于是这一行显示成
+        「left…索引 0｜right…索引 0」，看起来完全是同一台。
+
+        现在按 **identity 在线的实际设备** 报：在线就报它当前的 PnP 编号
+        （不是历史值），不在线就写「不在线」——比"索引 0"还短，不会把这一行撑宽。
+        """
         info = self.camera_roles().get(role)
         if not isinstance(info, dict):
             return f"{role}：未固定（启动时自动挑）"
+        ident = str(info.get("identity") or "").upper()
+        port = str(info.get("port") or "").lower()
+        hit = None
+        try:
+            from sphere_tracker import camera_registry as cr
+            for d in cr.list_devices():
+                if ident and d.identity and d.identity.upper() == ident:
+                    hit = d
+                    break
+                if not ident and port and d.port and port in d.port.lower():
+                    hit = d
+                    break
+        except Exception:                                     # noqa: BLE001
+            hit = None
         bits = [f"{role} = {info.get('name') or '未知型号'}"]
-        if info.get("index") is not None:
-            bits.append(f"索引 {info.get('index')}")
-        if not info.get("verified"):
-            bits.append("未确认")
+        if hit is None:
+            bits.append("不在线")
+        else:
+            bits.append(f"编号 {hit.order}")
+            if not info.get("verified"):
+                bits.append("未确认")
+        # 「位置」与「采集索引」：两者都不是"编号"，必须分开写清楚。
+        # 位置（床 / 阳台门）是用户唯一能用人的知识回答"这台是哪台"的字段；
+        # 采集索引是 `cv2.VideoCapture` 真正用的号，**未实测就写"未实测"**，
+        # 不许拿 PnP 编号冒充（那正是"显示的相机 ≠ 真实相机"的来源）。
+        where = str(info.get("location") or "").strip()
+        if where:
+            bits.append(f"位置 {where}")
+        cap = info.get("capture_index")
+        bits.append(f"采集 #{cap}" if isinstance(cap, int) else "采集索引未实测")
         return "，".join(bits)
+
+    def camera_role_short(self, role: str) -> str:
+        """双目第①步那一行用的**短标签**：优先位置（床/阳台门），否则设备名。
+
+        为什么单独一个出口：完整 `camera_role_text()` 现在带 PnP 位次、位置、
+        采集索引三组信息，两路一拼会超过相机行的换行边界（实测大角度窗
+        内容高出 16 px，`selftest_window_mode` 红）。身份/采集状态在
+        「换相机…」对话框里看，不靠把这一行撑宽。
+        """
+        info = self.camera_roles().get(role)
+        if not isinstance(info, dict):
+            return f"{role}：未固定"
+        where = str(info.get("location") or "").strip()
+        if where:
+            return where
+        name = str(info.get("name") or "").strip()
+        return f"{role}={name}" if name else f"{role}：未固定"
 
     # ---------- 派生（只读，不写回） ----------
     def stereo_mode(self) -> str | None:
@@ -212,6 +333,41 @@ class AppState:
         meta = getattr(self.rig, "meta", None) or {}
         mode = str(meta.get("stereo_mode") or "").strip()
         return mode or None
+
+    def profile_mode(self) -> str | None:
+        """档案声明的装置模式（parallel / angled），与标定 meta 分开读。
+
+        为什么要有第二个来源（2026-11-08）：用户切到平行档案后，大角度卡
+        照样把那份平行标定的 5.1°/66mm 念出来，像是在"读到了可用结果"。
+        档案说平行 = 大角度链路**根本不适用**，不该读、也不该展示那串数字。
+        两个来源不一致时按"冲突"处理，不许静默挑一个信。
+        """
+        mode = str(getattr(self.profile, "stereo_mode", "") or "").strip()
+        return mode or None
+
+    def mode_conflict(self) -> str | None:
+        """档案模式与标定 meta 不一致时，返回一句人话；一致/缺信息返回 None。"""
+        pm, cm = self.profile_mode(), self.stereo_mode()
+        if pm and cm and pm != cm:
+            return (f"装置档案声明「{pm}」，标定文件却记为「{cm}」—— "
+                    "这很可能是别套装置的标定，请给当前装置重新标定")
+        return None
+
+    def mode_allowed(self, key: str) -> bool:
+        """这张双目卡**允不允许进**。
+
+        只拦两种：**档案模式不适用**、**档案与标定冲突**。
+        「没标定」不拦 —— 平行/大角度窗口里就有标定动作，把按钮禁了等于
+        把用户锁在门外、永远没法给这套装置标定（2026-11-08 自查发现）。
+        """
+        if key not in ("parallel", "angled"):
+            return True
+        if self.mode_conflict() is not None:
+            return False
+        pm = self.profile_mode()
+        if key == "parallel":
+            return pm != "angled"
+        return pm != "parallel"
 
     def angle_deg(self) -> float | None:
         try:
@@ -227,21 +383,54 @@ class AppState:
 
     # ---------- 三张卡的就绪判定 ----------
     def mono_status(self) -> tuple[bool, str]:
-        """单目：只看 ``mono_calibration.json`` 在不在、fx 合不合理。"""
+        """单目：只看全局 ``mono_calibration.json``，与双目装置档案**分开管理**。
+
+        2026-11-08 用户："无论是哪个档案，单目都显示有标定，说明一直用着之前的
+        标定结果"。这是真的，但单目内参本来就只跟**这一台相机 + 这个焦距**有关，
+        跟双目装置（基线/夹角）无关 —— 所以正确做法不是把它塞进档案，
+        而是把"全局、独立"这件事**写在卡片上**，别让人以为是档案没生效。
+        """
+        tag = "（单目内参：全局独立，与双目装置档案无关）"
+        try:
+            import datetime as _dt
+
+            when = _dt.datetime.fromtimestamp(
+                MONO_CALIB_PATH.stat().st_mtime).strftime("%Y-%m-%d")
+            cam = self.mono.get("camera") if self.mono else None
+            tag = (f"（全局单目内参，与双目档案无关；"
+                   f"{when}，camera={cam or '未记录'}）")
+        except (OSError, ValueError):
+            pass
         if not self.mono:
             return False, ("未标定。现在会按 60° 视场估算焦距 —— "
-                           "1% 焦距误差在 0.6 m 处就是 6 mm，请先做内参标定")
+                           "1% 焦距误差在 0.6 m 处就是 6 mm，请先做内参标定" + tag)
         fx = self.mono.get("fx")
         if not isinstance(fx, (int, float)) or fx <= 0:
-            return False, "标定文件存在但 fx 无效，请重新标定"
+            return False, "标定文件存在但 fx 无效，请重新标定" + tag
         rms = self.mono.get("rms_px")
         extra = f"，RMS {rms:.2f} px" if isinstance(rms, (int, float)) else ""
-        return True, f"已标定 fx = {float(fx):.0f} px{extra}"
+        bound = str(self.mono.get("device_identity") or "")
+        cur = str((self.camera_roles().get("left") or {}).get("identity") or "")
+        if bound and cur and bound != cur:
+            return False, "单目标定属于另一台相机，请重做单目内参标定" + tag
+        # 「未绑定」/「已核对」写进 notes（状态条），不塞进卡片：卡片文案每多
+        # 一行都会把 mono 第③步顶出 13px（selftest_window_mode 直接盯着下沿）。
+        return True, f"已标定 fx = {float(fx):.0f} px{extra}{tag}"
 
     def parallel_status(self) -> tuple[bool, str]:
-        """平行双目：要求标定存在，且模式/夹角都指向"近平行"。"""
+        """平行双目：档案模式优先，再看标定存在与夹角。"""
+        pm = self.profile_mode()
+        conflict = self.mode_conflict()
+        if conflict:
+            return False, conflict
+        if pm == "angled":
+            return False, ("当前装置档案是「大角度」—— 平行双目不适用；"
+                           "请切到平行装置档案（本卡不读取大角度标定）")
         if self.rig is None:
             return False, "没有双目标定。平行双目需要两路光轴近平行并做校正"
+        conflict = self.mode_conflict()
+        if conflict:
+            return False, conflict
         mode = self.stereo_mode()
         angle = self.angle_deg()
         if mode == "angled":
@@ -261,8 +450,18 @@ class AppState:
         前者能不能喂给后者 —— 这里把答案直接写进卡片：**chain 产物就是 angled**，
         进这个窗口就能用。
         """
+        pm = self.profile_mode()
+        conflict = self.mode_conflict()
+        if conflict:
+            return False, conflict
+        if pm == "parallel":
+            return False, ("当前装置档案是「平行」—— 大角度双目不适用；"
+                           "请切到大角度装置档案并给它单独标定（本卡不读取平行标定）")
         if self.rig is None:
             return False, "没有双目标定。大角度可用「两路共视」或「单板链式」两条路"
+        conflict = self.mode_conflict()
+        if conflict:
+            return False, conflict
         mode = self.stereo_mode()
         angle = self.angle_deg()
         base = self.baseline_mm()
@@ -325,6 +524,11 @@ class App(tk.Tk):
         self.minsize(min(820, w), min(560, h))
         self.withdraw()                                 # 门厅才是用户看到的窗口
 
+        # 任何 Tk 回调里的异常都要留下痕迹：`pythonw.exe` 没有 stderr，
+        # 默认行为是"静静地什么都不显示"——界面就此卡住而用户看不到原因。
+        # 这个坑让 2026-11-08 的相机预览问题反复误判了好几轮。
+        self.report_callback_exception = self._log_callback_exception
+
         self.state = AppState()
         self.prefs = GuiPrefs()
         self._work: tuple[int, int] | None = None
@@ -333,8 +537,16 @@ class App(tk.Tk):
         self.tasks = TaskRunner(self, on_log=self._on_task_log,
                                 on_change=self._on_task_change)
         self._windows: dict[str, tk.Toplevel] = {}
+        #: 正在关闭中的 key。关窗期间 on_close / 回调若再触发 open_window(key)，
+        #: 会拿到"还在表里但即将被销毁"的旧窗口去 deiconify —— 或者更糟，
+        #: 新建第二个窗口。这个集合让 close_window 对整个流程**不可重入**。
+        self._closing: set[str] = set()
 
+        # 门厅不属于 _windows（它常驻、走 close_app 退出），但它也会起任务
+        # （数据管理 / 查看器）。给一个归属键，让那些调用点能写
+        # owner=self.task_owner，与模式窗的口径一致。
         self.hub = HubWindow(self)
+        self.hub.task_owner = "hub"
         self.hub.protocol("WM_DELETE_WINDOW", self.close_app)
         self.hub.focus_force()
 
@@ -344,6 +556,36 @@ class App(tk.Tk):
         if self._work is None:
             self._work = work_area(self)
         return self._work
+
+    # ---------- 界面异常留痕 ----------
+    def _log_callback_exception(self, exc_type, exc_value, tb) -> None:
+        """Tk 回调里的任何异常都写进 `outputs/logs/gui_errors.log`。
+
+        为什么必须做（2026-11-08）：`pythonw.exe` 没有 stderr，Tk 默认把回调
+        异常打印到一个**没人看得见**的地方。一个 `after` 回调抛一次，整条刷新
+        链就断，界面从此不再更新 —— 用户看到的是"点了没反应/一直正在打开"，
+        而日志里干干净净。把异常落到文件，是让这类问题可诊断的最低成本。
+        """
+        import traceback
+        from pathlib import Path
+
+        text = "".join(traceback.format_exception(exc_type, exc_value, tb))
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            root = Path(__file__).resolve().parent.parent
+            folder = root / "outputs" / "logs"
+            folder.mkdir(parents=True, exist_ok=True)
+            with (folder / "gui_errors.log").open("a", encoding="utf-8") as fh:
+                fh.write(f"\n[{stamp}] 界面回调异常（已捕获，程序继续）\n{text}\n")
+        except OSError:
+            pass
+        # 状态条也提一句：不打断操作，但让人知道"出过错、日志在哪"。
+        try:
+            self.hub.status.set_status(
+                "界面出过一次错（已自动恢复）：详情见 outputs/logs/gui_errors.log",
+                "warn")
+        except Exception:                                # noqa: BLE001
+            pass
 
     # ---------- 日志缓冲 ----------
     def _on_task_log(self, text: str) -> None:
@@ -379,6 +621,11 @@ class App(tk.Tk):
         单例是"同一功能一个入口"的落地：门厅和工作台都能进 ``console``，
         但它们指向**同一个对象**，不是两套实现。
         """
+        # 关窗流程中（on_close / 统一结束回调里）若再有人开同 key 的窗，
+        # 必须直接交还那个"即将销毁"的旧窗，不能再 new 一个 —— 旧窗随后
+        # 被 destroy，新窗留在表里就成了按 X 关不掉的幽灵窗口。
+        if key in self._closing:
+            return self._windows.get(key)
         existing = self._windows.get(key)
         if existing is not None and existing.winfo_exists():
             existing.deiconify()
@@ -387,19 +634,62 @@ class App(tk.Tk):
             return existing
         win = factory(self)
         win.title(title)
+        # 统一归属：窗口关掉时 close_window 按它停自己起的任务。
+        # stereo 的 key 是 stereo_parallel / stereo_angled，start 时用这个
+        # 全名正好对上 close_window 的 key（不需要再按前缀猜）。
+        win.task_owner = key
         self._windows[key] = win
         win.protocol("WM_DELETE_WINDOW", lambda: self.close_window(key))
         return win
 
+    def broadcast_state_refresh(self) -> None:
+        """装置档案 / 标定状态变了：通知**已打开的** mono / stereo 窗只读重绘。
+
+        B4：``open_window`` 是单例，已开的窗口只 ``deiconify/lift``，不会重跑
+        它们的 ``_refresh_state()``。于是切档案或「重新读取标定」后，双目窗顶部
+        的「装置档案：X｜标定模式：Y」（``_gui_stereo.py``）、单目窗的内参状态
+        （``_gui_mono.py``）都停在旧值。这里遍历 ``self._windows``，只对带
+        ``_refresh_state`` 的窗口调用它 —— 不新建窗口、不重建控件、不给门厅
+        卡片加行（``selftest_window_mode`` 盯着 13px 下沿）。单个窗口抛异常
+        不影响其他窗口，也不打断门厅。
+        """
+        for _key, win in list(self._windows.items()):
+            try:
+                if win.winfo_exists() and hasattr(win, "_refresh_state"):
+                    win._refresh_state()
+            except Exception:                       # noqa: BLE001
+                pass
+
     def close_window(self, key: str) -> None:
-        win = self._windows.pop(key, None)
-        if win is not None and win.winfo_exists():
+        """关一个子窗：先停本窗任务，再销毁，**最后**才从表里移除。
+
+        为什么 ``pop`` 必须在 ``destroy`` 之后：旧实现是
+        ``pop → on_close() → destroy()``。在 on_close 与 destroy 之间这个 key
+        已经不在表里，此时任何回调调 ``open_window(key)`` 都会**新建一个窗**；
+        紧接着的 ``destroy()`` 销毁的却只是旧窗，新窗留在表里 —— 用户按了 X，
+        看到的却是一个"关不掉"的窗口（这正是"复苏"的结构性根因）。
+        """
+        win = self._windows.get(key)
+        if win is None or not win.winfo_exists():
+            return
+        if key in self._closing:                       # 回调重入：正在关就别再关一次
+            return
+        self._closing.add(key)
+        try:
             if hasattr(win, "on_close"):
                 try:
                     win.on_close()
                 except Exception:                       # noqa: BLE001
                     pass
-            win.destroy()
+            # 关窗口 = 停这个窗口起的任务。console 是任务管理器本身，
+            # 收起它不该杀任务（明确例外）。
+            if key != "console":
+                self.tasks.stop_by_owner(key)
+            if win.winfo_exists():
+                win.destroy()
+            self._windows.pop(key, None)               # ← 必须在 destroy 之后
+        finally:
+            self._closing.discard(key)
 
     def recent_visualization(self) -> Path | None:
         """最近一个**真有** ``visualization.json`` 的会话目录（按目录名里的时间戳）。
@@ -419,16 +709,22 @@ class App(tk.Tk):
         cands: list[tuple[str, Path]] = []
         # 延迟 import：`sphere_tracker` 的包初始化会拉起 cv2/numpy，而门厅启动不需要
         # （本项目已有先例：不为了一个默认值给启动路径加重量级依赖）。
-        # 这里仍是**读**路径，所以用 stereo_roots() + `data/` 根（早期会话直接放 data/ 下）。
         #
         # 枚举走 `_stereo_layout.candidate_session_dirs`：会话按装置分区后
         # （``data/stereo/parallel/<时间戳>``）只扫一层会把分区目录当成会话，
         # 于是"默认打开哪一段"永远指向 parallel/ 这种目录、直接找不到 visualization。
-        from sphere_tracker.paths import DATA_ROOT, stereo_roots
+        #
+        # 只给 `stereo_roots()`，**不**再带上 `data/` 根（2026-11-09 实测）：
+        # 枚举改成递归 + 只认会话目录之后，传 `data/` 会真的走进 `data/mono/`，
+        # 而 `data/mono/20261029-205522/derived/visualization.json` 确实存在 ——
+        # 那会让"默认打开"变成一段**单目**会话（回归）。旧扁平布局
+        # （`data/<时间戳>`）由 `data/sessions`（LEGACY_STEREO_ROOT）兜着，
+        # 它已经在 `stereo_roots()` 里；`data/` 是以前"只认两层"时才顺手加的。
+        from sphere_tracker.paths import stereo_roots
 
         from apps._stereo_layout import candidate_session_dirs
 
-        for d in candidate_session_dirs([*stereo_roots(), DATA_ROOT]):
+        for d in candidate_session_dirs([*stereo_roots()]):
             for rel in ("derived/visualization.json", "visualization.json"):
                 f = d / rel
                 try:
@@ -481,9 +777,11 @@ class App(tk.Tk):
             if not messagebox.askyesno(
                     "还有任务在跑",
                     f"有 {n} 个任务在运行，其中可能有相机或标定程序。\n"
-                    f"直接关闭会让它们留在后台（相机可能一直被占着）。\n\n"
-                    f"现在中断它们并退出吗？",
+                    f"是 = 中断它们并退出；否 = 保持窗口打开、任务继续运行。\n\n"
+                    f"如果你只是想收起某个子窗口，请关那个子窗口，不要关这里。",
                     parent=self.hub):
+                # 点"否"不是无声退出：留一行，让"我按了 X 可窗口还在"能查到原因
+                _log_launch_context("退出被取消：还有任务在跑（用户选否）")
                 return
             self.tasks.shutdown(graceful=True)
         else:
@@ -536,10 +834,34 @@ class HubWindow(tk.Toplevel):
     def _build_brand(self) -> tk.Frame:
         head = tk.Frame(self, bg=ACCENT)
         head.pack(fill="x")
-        tk.Label(head, text="球形物体三维运动轨迹识别", bg=ACCENT, fg="white",
+
+        # 语言切换固定在右侧。pack 的分配顺序就是代码顺序：右侧这块必须先占住，
+        # 左侧两行标题才能拿剩下的宽度；反过来会被挤成 0 宽。
+        from apps import i18n
+        right = tk.Frame(head, bg=ACCENT)
+        right.pack(side="right", padx=(0, 20), pady=12)
+        tk.Label(right, text="Lang", bg=ACCENT, fg="white",
+                 font=(FONT_FAMILY, 10)).pack(side="left")
+        lang_combo = ttk.Combobox(
+            right, state="readonly", width=9,
+            values=[i18n.label(code) for code in i18n.LANGS])
+        lang_combo.set(i18n.label())
+        lang_combo.pack(side="left", padx=(6, 0))
+
+        def _on_language(_event=None) -> None:
+            idx = lang_combo.current()
+            if 0 <= idx < len(i18n.LANGS):
+                i18n.set_language(i18n.LANGS[idx])
+                self.status.set_status("界面语言已切换为 " + i18n.label(), "ok")
+
+        lang_combo.bind("<<ComboboxSelected>>", _on_language)
+
+        left = tk.Frame(head, bg=ACCENT)
+        left.pack(side="left", fill="both", expand=True)
+        tk.Label(left, text="球形物体三维运动轨迹识别", bg=ACCENT, fg="white",
                  font=(FONT_FAMILY, 17, "bold")).pack(
             anchor="w", padx=20, pady=(12, 0))
-        tk.Label(head, text="先选装置类型，再按窗口里的三步走；参数只在用到它的那一步出现",
+        tk.Label(left, text="先选装置类型，再按窗口里的三步走；参数只在用到它的那一步出现",
                  bg=ACCENT, fg="#dbeafe", font=(FONT_FAMILY, 10)).pack(
             anchor="w", padx=20, pady=(2, 12))
         return head
@@ -556,12 +878,12 @@ class HubWindow(tk.Toplevel):
             ("parallel", "平行双目 · 两路光轴近平行",
              "深度靠校正后的视差。需要：两路能同时看到同一块板（joint 标定）、"
              "基线远小于工作距离。0.6 m 处半径项误差约 ±0.35 mm。",
-             lambda: self.app.open_stereo("parallel")),
+             lambda: self._enter_mode("parallel")),
             ("angled", "大角度双目 · 接近直角",
              "深度靠原始像素三角测量，两路不必平行。两条标定路：两路共视"
              "（joint 跳过 FOV），或两路看不到同一区域时用单板链式"
              "（板不动、各拍一组参考图）。链式产物就是本窗口要的 angled。",
-             lambda: self.app.open_stereo("angled")),
+             lambda: self._enter_mode("angled")),
         )
         for key, title, desc, opener in specs:
             box = self.surface.card(parent, title, desc)
@@ -571,16 +893,36 @@ class HubWindow(tk.Toplevel):
             status_lab = self.surface.hint(box, "检查中…")
             actions = self.surface.action_row(box)
             # 每张卡只有一个主按钮：进入。工具类动作统一放下面工具条。
-            self.surface.primary(actions, "进入", opener)
-            self._cards[key] = {"status": status_lab}
+            btn = self.surface.primary(actions, "进入", opener)
+            self._cards[key] = {"status": status_lab, "enter": btn}
+
+    def _enter_mode(self, key: str) -> None:
+        """双目两张卡的「进入」闸门（2026-11-08）。
+
+        只在卡片上写"还不能用"是**假限制**：按钮照旧能点，点进去照样拿别套
+        装置的标定跑。所以按钮本身禁用，且这里再按**当下状态**复核一次
+        （档案可能在窗口开着的时候被切走）。单目不设这道闸：它的内参是全局
+        独立的，跟装置档案无关，进去本来就是为了做单目标定。
+        """
+        st = self.app.state
+        if not st.mode_allowed(key):
+            _ok, msg = (st.parallel_status() if key == "parallel"
+                        else st.angled_status())
+            self.status.set_status(f"不能进入「{key}」：{msg}", "warn")
+            return
+        # 「没有标定」不是拦路的理由：进去才有标定按钮。
+        self.app.open_stereo(key)
 
     # ---------- 工具条 ----------
     def _build_toolbar(self, parent) -> None:
         box = self.surface.card(
             parent, "工具",
-            "这些是跨模式的东西：会话与数据、三维查看、磁盘清理。"
-            "它们不属于某一种装置，所以放在门厅而不是某个模式窗里。"
-            "任务与日志统一走右下角状态条。")
+            "这些是跨模式的东西：会话与数据、三维查看、磁盘清理、标定与训练工具。"
+            "它们不属于某一种装置，所以放门厅；任务与日志在右下角状态条。")
+        # 2026-11-06：拆成两行。加「操作说明」之后这一行变成 9 个按钮，
+        # 980 px 窗口里最右边的「经典界面（已废止）」被卡片边缘切掉一截
+        # （走查截图 01_hub.png 可见）。action_row 是 shrink-to-fit 的 pack
+        # 容器，不会自动换行 —— 不拆就只能删按钮或缩字号，那两条都更差。
         row = self.surface.action_row(box)
         # 相机设备放第一个：没有相机身份，标定/录制都没有起点，它比"数据管理"更靠前
         # 「操作说明」放第一个：它是**学习入口**，第一次用的人先看它，
@@ -593,22 +935,36 @@ class HubWindow(tk.Toplevel):
         self.surface.secondary(row, "数据管理", self._open_data_manager)
         self.surface.secondary(row, "3D 查看器", self._open_viewer)
         self.surface.secondary(row, "垃圾清理", self._open_junk)
+
+        row2 = self.surface.action_row(box)
         # 「会话工作台」入口已隐藏（2026-11-03）：它和单目/双目窗各自的
         # 「历史会话…」选择器功能重叠，属于旧架构遗留。BenchWindow 代码保留
         # （双目/单目窗的「历史会话…」仍能用），只是不再从门厅暴露这个跨装置的入口。
-        self.surface.secondary(row, "装置档案", self._open_profiles)
-        self.surface.secondary(row, "FOV 管理器", self._open_fov)
-        self.surface.secondary(row, "重新读取标定", self._reload_state)
-        # 过渡入口：旧界面还没删完，明确标注并给出它将消失的时间点，
-        # 而不是让用户自己猜"两个入口哪个是真的"。
-        self.surface.secondary(row, "经典界面（过渡）", self._open_legacy)
+        self.surface.secondary(row2, "装置档案", self._open_profiles)
+        self.surface.secondary(row2, "FOV 管理器", self._open_fov)
+        self.surface.secondary(row2, "重新读取标定", self._reload_state)
+        # 六条「只能敲命令」的离线流程收在一个对话框里（2026-11-07 盘点后补）。
+        # 为什么不摊成六个按钮：它们与上面那排「每天都在点」的入口节奏不同，
+        # 摊平会变成一排同级按钮；而且门厅当前只剩 19 px 高度余量，加不了第三行。
+        self.surface.secondary(row2, "标定与训练…", self._open_tools)
+        # 废止入口（2026-11-20）：旧界面的实现还在（多个回归测试按文本/导入引用它），
+        # 但**不再能从这里启动**。按钮保留，只弹一句说明 —— 直接删按钮会让老用户
+        # 以为"功能没了"，留一个只解释"去哪了"的入口更诚实。
+        self.surface.secondary(row2, "经典界面（已废止）", self._open_legacy)
+        # 语言切换在顶部品牌栏，不塞进这一行：action_row 是 shrink-to-fit 的
+        # pack 容器，再加一块会把最右边挤出卡片。
 
     # ---------- 动作 ----------
     def _reload_state(self) -> None:
         self.app.state.reload()
-        self._refresh()
-        ok, msg = True, "已重新读取装置与标定状态"
-        self.status.set_status(msg, "ok" if ok else "warn")
+        # B3：状态条复用 _refresh() 按当前装置算出的 head（当前装置：X（标定模式 Y）｜notes），
+        # 不再用写死的「已重新读取装置与标定状态」覆盖 —— 那句永远不随档案变化，
+        # 正是用户报的「切了装置再按重新读取、提示词没变」的主因。level 也跟着
+        # 真实状态走（有档案却没标定 / 身份不符 -> warn）。
+        head, level = self._refresh()
+        self.status.set_status(head, level)
+        # B4：通知已打开的 mono / stereo 窗只读重绘，别让它们的档案/标定标签停在旧值。
+        self.app.broadcast_state_refresh()
 
     def _open_help(self) -> None:
         """打开操作说明（分区目录 + 搜索）。
@@ -648,9 +1004,12 @@ class HubWindow(tk.Toplevel):
 
         def changed() -> None:
             self.app.state.reload()
-            self._refresh()
-            self.status.set_status(
-                "已切换装置档案，三张卡与各窗口的标定判定已按新装置重读", "ok")
+            # B3：切换档案后状态条也复用 _refresh() 的 head（当前装置：新档案名），
+            # 而不是一句写死的「已切换装置档案…」—— 用户要的是提示词随档案变化。
+            head, level = self._refresh()
+            self.status.set_status(head, level)
+            # B4：已开的 mono / stereo 窗同步重绘。
+            self.app.broadcast_state_refresh()
 
         # parent 传 **self（门厅，显示中的 Toplevel）**，不是 withdraw 的 self.app：
         # Toplevel 以 withdraw 的根为 parent 会继承 withdraw 状态，弹窗不出来。
@@ -670,42 +1029,55 @@ class HubWindow(tk.Toplevel):
         def changed() -> None:
             self.app.state.reload()
             self._refresh()
+            # FOV 管理器里改了装置级应用开关，已开着的双目窗也要跟着同步
+            # （遍历各窗口的 _refresh_state；方法名 broadcast_state_refresh）。
+            self.app.broadcast_state_refresh()
 
         # parent 传 self（门厅，显示中的 Toplevel），理由同 `_open_profiles`。
         FovDialog(self, self.app, on_changed=changed)
 
-    def _open_cameras(self) -> None:
-        """打开相机设备管理（识别 / 固定 / 标无关）。
+    def _open_tools(self) -> None:
+        """标定与训练工具台：生成标定板 / 取色 / 世界系 / 导出 / 数据集 / 训练。
 
-        为什么复用 ``apps/tools/cameras.py`` 而不是在新界面里重画一个：
-        它已经处理了"两台各自只在不同的后端下出图"这种真机状态
-        （``probe`` 逐后端×逐编号实测），重画一遍只会分叉。
-        ``identify`` 是交互式的，会自己开 cv2 窗口让人逐个确认。
+        这六条都是「跑一次、隔很久再跑」的离线流程（2026-11-07 盘点出来的
+        GUI 缺口：它们在 README 里被写成"下一步做什么"，界面上却只有命令行
+        一条路）。收在一个对话框里而不是摊成六个按钮：节奏与上面那排
+        "每天都在点"的入口不同，而且门厅只剩 19 px 高度余量，加不了第三行。
         """
-        # 防重复启动（2026-11-05）：两个 identify 同时开同一台相机，会把彼此的
-        # MSMF 采集会话置为失效（-2147483638），两边都卡在「打开中」。
-        # ⚠ 理由**不是**"相机独占"——用户的相机支持多程序访问；问题是两个本程序
-        # 进程抢同一路的同一档分辨率。所以这里只拦"重复点本按钮"，不拦别的程序。
-        for _t in self.app.tasks.running():
-            if "相机设备管理" in (getattr(_t, "title", "") or ""):
-                self.status.set_status(
-                    "相机管理已经在跑着了（正在逐台打开相机）。"
-                    "再点一次会起第二个进程抢同一台，两个都会卡在「打开中」，"
-                    "所以这次没有重复启动。看「任务」面板里的日志；"
-                    "要放弃就点「中断选中」", "warn")
-                return
-        self.app.tasks.start(
-            _actions.cameras(),
-            "相机设备管理")
-        # 文案提到"最多等多久"，是因为以前只说"已启动"，用户等到没窗口就判断成卡死
-        # （2026-10-29 报的）。但**不要说"慢相机要 24 秒"**：2026-11-05 实测健康相机
-        # 1.0–1.6 秒就出图，那个 24 秒来自一台采集会话已坏的相机（报
-        # -2147483638，拔插即好）。把它们混为一谈会让"相机就该慢"变成借口。
+        from apps.tools_dialog import ToolsDialog
+
+        # 非模态窗口要自己挡重复打开：点几次就叠几个一模一样的窗口。
+        _top = self.winfo_toplevel()
+        _old = getattr(_top, "_tools_window", None)
+        if _old is not None and _old.winfo_exists():
+            _old.deiconify()
+            _old.lift()
+            _old.focus_force()
+            self.status.set_status("标定与训练工具已经开着了", "info")
+            return
+        _top._tools_window = ToolsDialog(self, self.app)
         self.status.set_status(
-            "已打开相机设备管理：正常每台 1–2 秒出图，日志里逐台报进度。"
-            "某台明显要等很久，多半是它的采集会话坏了 —— 先拔插那台再重试；"
-            "等待中可按 Esc 跳过。只想绑左右可直接用 pin（不开相机，秒级）",
-            "info")
+            "标定与训练工具已打开：六条离线流程都在里面 —— "
+            "标定板、点选取色、世界坐标系、导出标定、导出数据集、训练检测器", "info")
+
+    def _open_cameras(self) -> None:
+        """打开相机管理对话框（GUI 内，2026-11-07 改）。
+
+        以前这里起一个控制台子进程去逐台开相机让人按键，用户两次报
+        「平行双目相机管理打不开」。根因不在超时文案，而在那条路本身：
+        没有控制台、没有按键、OpenCV 窗口不归 Tk 管、4 台各等 30 秒。
+        现在改成 Tk 自己的对话框：枚举/抓帧在后台线程，绑角色按身份直接写
+        ``config/cameras.json``，预览只开选中的一台、6 秒没画面就明说。
+        """
+        from apps.cameras_dialog import open_cameras
+
+        # 单例在 `open_cameras()` 里统一做。原来这里查 `self.app.winfo_children()`
+        # 是**无效检查**：对话框的 master 是模式窗，不是 app，查不到，
+        # 于是三个入口能同时开出三个对话框、各自抢相机（2026-11-08 复盘）。
+        open_cameras(self)
+        self.status.set_status(
+            "相机管理已打开：选一台点「预览这台」看画面，或直接点"
+            "「设为左 / 设为右」按设备身份绑定（不用开相机，秒级）", "info")
 
     def _open_data_manager(self) -> None:
         # 数据管理是独立进程（apps/data_manager.py），不嵌进本进程：
@@ -718,7 +1090,7 @@ class HubWindow(tk.Toplevel):
         # 不该因为拿不到 `task.log_path` 就整条不写。
         self.app.tasks.start(
             _actions.data_manager(),
-            "数据管理")
+            "数据管理", owner=self.task_owner)
         self.status.set_status(
             "已启动数据管理（它是独立窗口，首次启动要几秒）。"
             "没看到窗口就点「任务管理器和运行日志」——那里有这条任务的输出；"
@@ -736,7 +1108,7 @@ class HubWindow(tk.Toplevel):
             return
         self.app.tasks.start(
             _actions.view_3d(src),
-            "3D 查看器")
+            "3D 查看器", owner=self.task_owner)
         # 会话名，不是 `src.parent.name` —— 离线结果在 `<会话>/derived/` 里，
         # `parent.name` 永远是 derived（与双目窗同一处口径，见 `session_name_of`）。
         from apps._gui_stereo import session_name_of
@@ -745,19 +1117,26 @@ class HubWindow(tk.Toplevel):
             f"（窗口内「数据源」可换任意会话）", "info")
 
     def _open_legacy(self) -> None:
+        """经典界面已废止：只说明去向，**不启动任何进程**。
+
+        2026-11-20 用户裁决：新界面已覆盖完整流程，经典单窗口界面废止。
+        实现保留在 `apps/gui_main.py`（入口一致性 / 启动器参数 / 任务管理器 /
+        变异自证等测试仍按文本与导入引用它），但 `--legacy` 已关闭，
+        `run.bat legacy` 也只打印提示。这里不调 `tasks.start(...)`：
+        按钮存在的唯一意义是告诉用户功能搬去哪了，不是留一条后门。
+        """
         from tkinter import messagebox
         messagebox.showinfo(
-            "经典界面（过渡）",
-            "经典界面是本轮重做前的单窗口版本，功能完整但很长。\n\n"
-            "新界面的三个模式窗还在逐步补齐采集/标定/工作台，\n"
-            "补齐之前可以用它做完整流程。它会在分窗完成后删除。",
+            "经典界面（已废止）",
+            "经典界面已废止，不再启动。\n\n"
+            "所有功能都在新界面里：门厅 → 单目 / 平行双目 / 大角度双目；\n"
+            "数据管理、3D 查看器、相机设备在门厅下方工具条；\n"
+            "标定板、取色、世界系、导出与训练在「标定与训练…」里。\n\n"
+            "命令行 `run.bat legacy` 与 `--legacy` 也已关闭，只会打印这条说明。",
             parent=self)
-        self.app.tasks.start(
-            _actions.legacy_gui(),
-            "经典界面")
 
     # ---------- 刷新就绪度 ----------
-    def _refresh(self) -> None:
+    def _refresh(self) -> tuple[str, str]:
         st = self.app.state
         mapping = {
             "mono": st.mono_status(),
@@ -773,21 +1152,237 @@ class HubWindow(tk.Toplevel):
                 clean = clean.replace("**", "」", 1)
             lab.configure(text=("就绪：" if ready else "还不能用：") + clean,
                           style="Ok.TLabel" if ready else "Warn.TLabel")
-        notes = "；".join(st.notes) if st.notes else ""
-        prof = getattr(st.profile, "name", None)
-        head = f"当前装置：{prof}" if prof else "未设置装置档案"
-        if st.rig is not None:
-            mode = st.stereo_mode() or "未记录模式"
-            head += f"（标定模式 {mode}）"
-        self.status.set_status(head + (f"｜{notes}" if notes else ""),
-                               "warn" if notes else "info")
+            if key in ("parallel", "angled"):
+                allowed = st.mode_allowed(key)
+                self._cards[key]["enter"].configure(
+                    state="normal" if allowed else "disabled")
+        # 状态条文案与 head 计算收敛到 AppState.status_text()（B3 唯一产地），
+        # _refresh 只负责把它显示出来，并把 (文案, level) 返回给 _reload_state 复用。
+        text, level = st.status_text()
+        self.status.set_status(text, level)
+        return text, level
 
 
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
+#: 单实例锁的名字。**整个 Windows 会话只允许一个**。
+#:
+#: 2026-11-08：用户双击了几次，机器上同时跑着两个「球形物体三维运动轨迹识别」——
+#: 每个实例都能开相机管理、都能开预览，于是同一台相机被两三个进程抢，
+#: 全部报 `-2147483638`，拔插也没用（插回来立刻被另一个实例抢走）。
+#: 这不是相机的错，是**程序允许多开**。锁在这里，第二个实例激活第一个窗口后退出。
+SINGLE_INSTANCE_NAME = "SphereTracker.GUI.v1"
+
+
+#: 单实例锁文件（`outputs/logs/` 下：与 `launch.log` 同处，运行期不会被清理工具动）。
+_LOCK_FILE = ".gui.lock"
+#: 持有者的 PID，单独一个文件：**锁文件不能读**（见 `_claim_single_instance`）。
+_PID_FILE = ".gui.pid"
+#: 必须活到进程结束：fd 一关，文件锁就释放，锁也就没了。
+_INSTANCE_LOCK = {"fd": None, "path": None}
+
+
+def _raise_existing_window() -> None:
+    """把已经在跑的那个主窗口叫到前面（找不到就什么也不做）。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = wintypes.HWND
+        hwnd = user32.FindWindowW(None, "球形物体三维运动轨迹识别")
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+    except Exception:                            # noqa: BLE001
+        pass
+
+
+def _lock_dir():
+    from pathlib import Path
+
+    d = Path(__file__).resolve().parents[1] / "outputs" / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _lock_path():
+    return _lock_dir() / _LOCK_FILE
+
+
+def _pid_path():
+    return _lock_dir() / _PID_FILE
+
+
+def _claim_single_instance() -> bool:
+    """拿到单实例锁返回 True；已有实例返回 False（并把它的窗口叫到前面）。
+
+    **为什么从"绑端口"换成"锁文件"（2026-11-08 14:45，用户第五次报"打不开"）。**
+    绑端口的前提是"要么我绑上、要么别人绑着"，今天实测这个前提**不成立**：
+    47821 在没有任何 python 进程、`netstat` 也没有监听的情况下，`bind` 连续报
+    `10048 ADDRINUSE`，带 `SO_REUSEADDR` 又变成 `10013`，PowerShell 用
+    `TcpListener` 复核同样失败 —— 几分钟后又自己好了。
+    也就是说**端口会处于一种"绑不上但不是我们的实例"的状态**；
+    旧代码把它一律当成"已经在运行"，于是 GUI 永远起不来、还报"已经开了一个"。
+    这又是一次静默失败（用户看到的就是"双击没反应，自动退出"）。
+
+    `msvcrt.locking` 是内核文件锁：不碰网络栈、进程一死内核就释放。
+
+    **PID 另写一个文件**（2026-11-08 实测）：被 `LockFile` 锁住的文件，
+    别的进程连 `open()` 都会拿到 `PermissionError 13` —— 连"只读前 12 字节"
+    也不行。所以锁文件里什么都不放，PID 放 `.gui.pid`。
+    """
+    import os
+
+    if sys.platform != "win32":                  # 非 Windows 不做单实例（本程序只发 Windows）
+        return True
+    import msvcrt
+
+    path = _lock_path()
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)   # 非阻塞：拿不到就抛 OSError
+    except OSError:
+        os.close(fd)
+        _raise_existing_window()
+        # 提示语统一由 `_explain_already_running()` 出（2026-11-08）：
+        # 两处各打一遍会让用户看到重复的两段话。这里只负责把窗口叫到前面。
+        return False
+    try:
+        _pid_path().write_text(str(os.getpid()), encoding="ascii")
+    except OSError:
+        pass                                     # 写不进去也要锁住，PID 只是诊断用
+    _INSTANCE_LOCK.update(fd=fd, path=str(path))
+    return True
+
+
+def _log_launch_context(note: str = "") -> None:
+    """把「这次是谁、怎么把我起来的」写进 `outputs/logs/launch.log`。
+
+    为什么需要（2026-11-08）：同一台机器、同一份代码，用户实测
+    **`run.bat` 能开相机预览、`launcher.exe` 不能**，前后查了 8 轮都扎在相机侧。
+    入口差异必须能自己留证据：解释器是谁、有没有控制台、stdio 是否有效、
+    父进程是谁、**是不是被单实例锁挡掉**（被挡掉时用户看到的是上一个旧窗口，
+    于是"新启动器也打不开"——这本身就是一种可能的解释）。
+    """
+    try:
+        import ctypes
+        import os
+        from pathlib import Path
+
+        rows = [
+            f"exe={sys.executable}",
+            f"argv={sys.argv}",
+            f"cwd={os.getcwd()}",
+            f"pid={os.getpid()} ppid={os.getppid()}",
+            f"stdout_none={sys.stdout is None}",
+            f"stderr_none={sys.stderr is None}",
+            f"console={bool(ctypes.windll.kernel32.GetConsoleWindow())}",
+            f"note={note}",
+        ]
+        root = Path(__file__).resolve().parent.parent
+        folder = root / "outputs" / "logs"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with (folder / "launch.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"\n[{stamp}] " + " | ".join(rows) + "\n")
+    except BaseException:                                 # noqa: BLE001
+        pass
+
+
+def _live_instance_hint() -> str:
+    """报出"占着锁的是谁"。先读锁文件里的 PID，读不到再退回 `launch.log`。
+
+    为什么要说清 PID（2026-11-08）：用户连续三次双击 `run.bat` 全被静默挡掉，
+    因为旧代码只 return 0、一个字都不说。锁文件里的 PID 是现成的一手证据；
+    进程已死就**不报**——宁可少说，也不指一个假的占用者。
+    """
+    try:
+        import ctypes
+        import re
+        from pathlib import Path
+
+        k32 = ctypes.windll.kernel32
+
+        def alive(pid: int) -> bool:
+            handle = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            ok = bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+            k32.CloseHandle(handle)
+            return ok
+
+        raw = ""
+        try:
+            raw = _pid_path().read_text(encoding="ascii").strip()
+        except OSError:
+            raw = ""
+        if raw.isdigit() and alive(int(raw)):
+            return f"PID {raw}（它正开着窗口）"
+
+        log = Path(__file__).resolve().parents[1] / "outputs" / "logs" / "launch.log"
+        if not log.exists():
+            return ""
+        text = log.read_text(encoding="utf-8", errors="replace")
+        hits = re.findall(r"\[([\d\-: ]+)\] .*?pid=(\d+).*?note=正常启动", text)
+        if hits:
+            when, pid = hits[-1]
+            if alive(int(pid)):
+                return f"PID {pid}（{when.strip()} 启动的那一次）"
+        return ""
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+def _explain_already_running() -> None:
+    """被单实例锁挡掉时，把"为什么没开窗"说成人话。
+
+    为什么必须弹窗（2026-11-08）：从 `launcher.exe` 起的进程**没有控制台**，
+    `print` 等于写进虚空 —— 用户只看到"双击了，什么都没发生"。
+    有控制台时只打印：`run.bat` 会用非 0 退出码把窗口 `pause` 住，不必再弹一次。
+    """
+    owner = _live_instance_hint()
+    msg = "已经有一个本程序在运行，本次不再开第二个窗口。"
+    if owner:
+        msg += f"\n\n占用者：{owner}"
+    msg += ("\n\n如果看不到那个窗口（可能被最小化、或在另一块显示器上），"
+            "请先在任务管理器里结束它，再重新启动。")
+    print("\n" + "-" * 62 + "\n" + msg + "\n" + "-" * 62, flush=True)
+    try:
+        import ctypes
+        import os
+
+        if os.environ.get("SPHERE_NO_DIALOG"):   # 自动化/脚本：只要文字，不要模态框
+            return
+        if not ctypes.windll.kernel32.GetConsoleWindow():
+            ctypes.windll.user32.MessageBoxW(
+                None, msg, "已经在运行（本次没有开窗口）", 0x00000040)
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
 def run() -> int:
-    """启动新界面。返回进程退出码。"""
+    """启动新界面。返回进程退出码。
+
+    被单实例锁挡掉时返回 **2、不是 0**（2026-11-08 修）：
+    返回 0 会让 `run.bat` 认为"启动成功"直接收工，控制台一闪而过 ——
+    用户看到的现象就是"打不开、自动退出"，而真实原因（已经有一个实例在跑）
+    一个字都没露出来。这一条被用户连续踩过多次，属于**静默失败**，必须修。
+    """
+    if not _claim_single_instance():
+        _log_launch_context("被单实例锁挡掉，本次没有开窗口")
+        _explain_already_running()
+        return 2
+    _log_launch_context("正常启动")
+    # 退出也留一行（2026-11-08）：只有"正常启动"没有"进程退出"，
+    # 才能区分"窗口关了进程还在"和"进程真的走了"—— 这次就是分不清。
+    import atexit
+    atexit.register(lambda: _log_launch_context("进程退出"))
     app = App()
     app.mainloop()
     return 0

@@ -44,11 +44,13 @@ import cv2
 
 from calib.params import StereoRig
 from sphere_tracker.quality import frames_quality
+#: 会话文件名与「一个根下面有哪些会话」都只有一个产地：``sphere_tracker/discovery.py``
+#: （2026-11-09 起；以前这里自己写一个字面量 + 一行只扫一层的 glob）。
+from sphere_tracker.discovery import SESSION_FILE, discover_session_dirs
 from .stereo_mode import optical_axes_angle_deg
 
 SCHEMA = "sphere-stereo-session"
 VERSION = 1
-SESSION_FILE = "session.json"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -242,9 +244,83 @@ def load_session(path: str | Path) -> tuple[Path, Session]:
     return p.parent, session
 
 
+def _session_relative(session_dir: str | Path, rel: str | Path) -> Path:
+    """``session.json`` 里的相对路径按会话目录解析；绝对路径原样返回。
+
+    「相对就拼、绝对就原样」这条语义在本模块**只有这一份实现**：
+    ``session_calibration_file``（要路径，缺了抛错）与 ``validate_session``
+    （要路径，缺了记 error 不抛）共用它。两处各写一遍的话，哪天一处把
+    绝对/相对判反了，另一处仍然"看着对"，问题只在某类会话上出现。
+
+    注：``pathlib`` 的 ``/`` 运算符本来就会让绝对路径覆盖左侧，所以
+    ``p if p.is_absolute() else ...`` 与裸 ``session_dir / p`` **结果相同**
+    （实测 4 类输入：相对 / 带盘符绝对 / POSIX 绝对 / ``..`` 相对）。
+    这里显式写出来是为了让"绝对路径原样"这条**约定**看得见 —— 不是 bug 修复，
+    也不要因为"看着冗余"就删掉：``session.json`` 的契约是"相对会话目录"，
+    绝对路径只是容忍形式，写在代码里比藏在 pathlib 的运算符语义里可靠。
+    """
+    p = Path(rel)
+    return p if p.is_absolute() else Path(session_dir) / p
+
+
+def session_calibration_file(session_dir: str | Path) -> Path:
+    """会话使用的**标定文件路径**的唯一产地（其它模块不许再手写文件名）。
+
+    ``session.json`` 的会话契约就在本模块（``CalibrationInfo.path``）。
+    标定文件名是**跟着激活装置档案动态生成**的：录制时
+    ``apps/record_stereo.py::_copy_calibration`` 按
+    ``calib_base.with_suffix(".npz").name`` 把标定拷进 ``calib/``，
+    于是老会话写的是 ``calib/stereo_calibration.npz``，新会话写的是
+    ``calib/<装置档案名>.npz``。两者都得从 ``session.json`` 里读 ——
+    把文件名写死成 ``stereo_calibration.npz`` 就会让新会话断链
+    （找得到目录、找不到文件，或更糟：静默读到别套装置的几何）。
+
+    只做**纯 JSON 读取**，不调 ``load_session``：后者会做 schema/版本校验，
+    而这里只要一个路径字段，不该把视频能不能读之类的校验牵扯进来。
+    ``calibration.path`` 是相对会话目录的路径（录制时这么写），相对就拼
+    ``session_dir``，绝对就原样返回。
+
+    缺 ``session.json``、缺 ``calibration``、缺 ``path``、JSON 坏了时抛
+    ``SessionError`` 并说明原因 —— **明确报错**，不抛裸 ``KeyError``、
+    不静默返回 ``None``（调用方要"没标定就降级"得自己 catch 并说清原因）。
+
+    代价：本函数在 ``stereo`` 包内，import 会带 cv2/scipy。收敛到的 5 个
+    消费方都是 CLI 工具（本来就要读视频/标定），可接受；**不要**把它塞进
+    GUI 热路径。
+    """
+    p = Path(session_dir)
+    if p.is_dir():
+        p = p / SESSION_FILE
+    if not p.is_file():
+        raise SessionError(f"找不到会话文件：{p}（无法确定会话标定路径）")
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SessionError(f"session.json 不是合法 JSON：{p}（{exc}）") from exc
+    cal = raw.get("calibration") if isinstance(raw, dict) else None
+    if not isinstance(cal, dict) or not cal.get("path"):
+        raise SessionError(
+            f"会话文件缺少 calibration.path：{p}（标定文件名跟随装置档案动态生成，"
+            "不能写死默认名；这个会话可能没录完）")
+    cal_path = _session_relative(p.parent, str(cal["path"]))
+    return cal_path
+
+
 def list_sessions(root: str | Path) -> list[Path]:
-    """列出 `root` 下所有含 `session.json` 的目录，按名字排序。"""
-    return sorted(p.parent for p in Path(root).glob(f"*/{SESSION_FILE}"))
+    """列出 ``root`` 下**所有**含 ``session.json`` 的会话目录，按名字排序。
+
+    **递归**：除了 ``<根>/<时间戳>`` 与 ``<根>/<模式>/<时间戳>``，用户自己建的
+    嵌套目录（``<根>/实验1/梨子/<时间戳>``）也算 —— 只要目录里有
+    ``session.json``。判据是严的（只认 ``session.json``）：这里列出来的目录
+    要拿去 ``load_session`` / 跑算法，没有元数据跑不了；"半成品也列出来"是
+    数据管理的口径，走 ``discover_session_dirs(strict=False)``。
+
+    以前这里是一行 ``glob(f"*/{SESSION_FILE}")``，**只扫一层**，于是
+    ``data/stereo/parallel/`` 与 ``data/stereo/angled/`` 里的会话全漏
+    （实测 29 段 vs 实际 44 段）：数据管理看得见、会话列表看不见。现在与
+    数据管理共用 ``sphere_tracker.discovery`` 同一份枚举，只有一份实现。
+    """
+    return sorted(discover_session_dirs(root, recursive=True, strict=True))
 
 
 # --------------------------------------------------------------------------
@@ -489,9 +565,7 @@ def validate_session(
     if cal is None:
         errors.append("缺少 calibration 信息")
     else:
-        cal_path = Path(cal.path)
-        if not cal_path.is_absolute():
-            cal_path = session_dir / cal_path
+        cal_path = _session_relative(session_dir, cal.path)
         if not cal_path.exists():
             errors.append(f"标定文件不存在：{cal_path}")
         else:

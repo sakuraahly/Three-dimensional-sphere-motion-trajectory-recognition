@@ -19,12 +19,11 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
-from datetime import datetime
 from pathlib import Path
 
 from apps._cleanup import move_to_trash, plan_cleanup
+from apps._common import atomic_write_with_backup
 from apps._stereo_layout import MODE_LABELS, is_legacy_flat
 from sphere_tracker.paths import STEREO_MODES, STEREO_ROOT, stereo_mode_root
 
@@ -73,41 +72,13 @@ def delete_stereo_session(session_dir: str | Path,
     return move_to_trash(base, plan, label=TRASH_LABEL)
 
 
-def _backup(jf: Path) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = jf.with_name(f"session.json.bak-{stamp}")
-    n = 2
-    while dest.exists():
-        dest = jf.with_name(f"session.json.bak-{stamp}-{n}")
-        n += 1
-    try:
-        shutil.copy2(jf, dest)
-    except OSError as exc:
-        raise OSError(
-            f"备份失败，文件未改动：{dest}（{exc}）；"
-            "检查磁盘空间/文件是否被占用后重试") from exc
-    return dest
-
-
 def _rewrite_json(jf: Path, data: dict) -> None:
-    """备份 + 原子替换（与 `data_manager.update_session_meta` 同一手法）。"""
-    backup = _backup(jf)
-    tmp = jf.with_name(f"{jf.name}.tmp-{os.getpid()}")
-    try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2, allow_nan=False)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, jf)
-    except (OSError, ValueError) as exc:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:
-            pass
-        raise type(exc)(
-            f"写入 {jf} 失败：{exc}；原文件还在，备份在 {backup}") from exc
+    """备份 + 原子替换，委托 `apps._common.atomic_write_with_backup`（唯一实现）。
+
+    `keep_backups=None` = 写时不裁剪，回滚点由 `apps/_junk.py` 统一按 3 份保留；
+    与 `data_manager.update_session_meta` 同一手法、同一份格式串。
+    """
+    atomic_write_with_backup(jf, data, keep_backups=None)
 
 
 def _free_target(dest: Path) -> Path:

@@ -1,14 +1,14 @@
 """球形物体三维运动轨迹识别 —— 命令行彩色启动器（人类友好型）。
 
-与图形版（启动程序.py）功能一致，但没有窗口，适合：
+与图形版（apps/gui_main.py）功能一致，但没有窗口，适合：
   - 无图形界面 / 远程终端 / 服务器环境；
   - 喜欢键盘操作、想看更详细输出的使用者。
 
 交互约定：两台相机左右的定义 —— **人面对镜头时，左手边那台为"左"**。
 
 运行：
-    %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe 启动程序_命令行.py
-    （或直接双击 启动程序_命令行.bat）
+    %USERPROFILE%\\miniforge3\\envs\\myenv\\python.exe apps/cli_main.py
+    （或直接双击 run.bat）
 """
 
 from __future__ import annotations
@@ -238,9 +238,20 @@ def action_calibrate() -> None:
 
 
 def action_verify() -> None:
-    calib = ROOT / "config" / "stereo_calibration"
-    if not calib.with_suffix(".npz").exists():
-        print(f"{C.RED}找不到标定文件，请先执行一次双目标定。{C.RESET}")
+    """标定复检 —— 复检的是**当前装置档案**那份标定，不是顶层那一份。
+
+    2026-11-10 用户裁决：CLI 与 GUI 必须同一口径。以前这里写死
+    ``ROOT / "config" / "stereo_calibration``，后果是标定已经写进
+    ``config/calib/<档案名>.npz``、这里却报"找不到标定"，或者更糟 ——
+    读到顶层那份**别套装置**的几何去复检，结论毫无意义。
+    解析口径统一走 ``apps._common.current_calibration``（唯一实现）。
+    """
+    from apps._common import current_calibration
+
+    calib, why = current_calibration()
+    if why:
+        # why 是权威文案（写明哪套装置、期望哪个文件、为什么不回落顶层），原样展示。
+        print(f"{C.RED}{why}{C.RESET}")
         input(f"{C.DIM}按回车返回主菜单…{C.RESET}")
         return
     if not confirm_stereo_cameras():
@@ -250,7 +261,10 @@ def action_verify() -> None:
            "--calib", str(calib),
            "--left", CFG["calib_left"], "--right", CFG["calib_right"],
            "--width", width, "--height", height, "--fps", CFG["fps"]]
-    run(cmd, "标定复检（判断装置是否被碰动）")
+    from stereo.profiles import active_name
+
+    rig = active_name() or "未命名"
+    run(cmd, f"标定复检（当前装置：{rig}，判断装置是否被碰动）")
 
 
 def confirm_stereo_cameras() -> bool:
@@ -261,6 +275,7 @@ def confirm_stereo_cameras() -> bool:
     try:
         from sphere_tracker import camera_registry as cr
         devices = cr.list_devices()
+        reg = cr.load_registry()
     except Exception:
         return True
     by_order = {d.order: d for d in devices}
@@ -273,7 +288,7 @@ def confirm_stereo_cameras() -> bool:
             continue
         entry = by_order.get(index)
         name = entry.name if entry else ""
-        if cr.is_avoided(name):
+        if cr.is_avoided(name, reg.settings):
             print(f"{C.YELLOW}提示：{role}相机（编号 {index}，{name or '未知名'}）看起来是"
                   f"笔记本内置 / 红外相机，不适合双目（没法固定在同一根横梁上，标定会白做）。"
                   f"双目请用外接相机。{C.RESET}")

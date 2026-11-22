@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -35,7 +36,7 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 sys.path.insert(0, str(ROOT))
 
 from calib.board import BoardSpec                            # noqa: E402
-from calib.mono_calib import (MonoCalibError, QUALITY,       # noqa: E402
+from calib.mono_calib import (MonoCalibError, QUALITY, SCHEMA,  # noqa: E402
                               calibrate_mono, camera_note, save_mono)
 
 DEFAULT_DIR = ROOT / "outputs" / "mono_calib_frames"
@@ -96,6 +97,35 @@ def _camera_from_sidecar(d: Path) -> tuple[str, str]:
         # 别拿角色名冒充身份（这个区分正是本轮要解决的）。
         return role, "role-only"
     return "", "unknown"
+
+
+def _device_identity(d: Path, camera_label: str) -> str:
+    """把这次标定绑到**稳定的 USB 身份**，而不是 `camera="left"` 这种角色名。
+
+    优先用边车里的 `camera_identity`（录制时写下的真实 instance id）；
+    老边车没有就退回 `config/cameras.json` 的 roles 表按角色查。
+    都查不到就返回空串 —— 读取方会据此提示"没绑定，换相机不会报警"。
+    """
+    try:
+        raw = json.loads((d / "_capture.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = {}
+    if isinstance(raw, dict):
+        ident = str(raw.get("camera_identity") or "")
+        if ident:
+            return ident
+        role = str(raw.get("camera") or "")
+    else:
+        role = ""
+    if not role and camera_label in ("left", "right"):
+        role = camera_label
+    try:
+        reg = json.loads((ROOT / "config" / "cameras.json").read_text(
+            encoding="utf-8"))
+        spec = (reg.get("roles") or {}).get(role) or {}
+        return str(spec.get("identity") or "")
+    except (OSError, ValueError):
+        return ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,8 +207,50 @@ def main(argv: list[str] | None = None) -> int:
             print(f"        · 板要摆到画面四角与中央"
                   f"（现在需要覆盖 ≥{QUALITY['min_regions']}/5 个区域）")
             print("        · 每个姿态倾斜 30–45°，不要一直平放在画面中间")
-        LOG.error("标定不可用：%s", exc)
-        return 1
+        LOG.warning("标定质量不合格（仅质量差，非程序错误，不中止）：%s", exc)
+        # --check 是「只校验不写文件」的显式语义，保持不写。
+        if args.check:
+            return 0
+        # 新原则：质量差也要出结果、只有错误才紧急。单目质量差时库里直接抛
+        # MonoCalibError（没有 MonoCalib 对象可存），所以另存一份**诊断 JSON**到
+        # 旁路路径供检查：产物形态照 save_mono（单个 .json），带 forced_unusable /
+        # grade / verdict 自证「仅链路测试，不得用于数据结论」；正式的
+        # config/mono_calibration.json 绝不改动。
+        out = Path(args.out)
+        if out.suffix.lower() != ".json":
+            out = out / "mono_calibration.json"
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+        bypass = out.with_name(f"{out.stem}_unusable_{stamp}.json")
+        diag = {
+            "schema": SCHEMA,
+            "version": 1,
+            "usable": False,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source_dir": str(d),
+            "quality": {
+                **QUALITY,
+                "forced_unusable": True,
+                "grade": "不可用",
+                "verdict": f"{exc} 【仅链路测试，不得用于数据结论】",
+                "reason": str(exc),
+                "rejected": [{"name": n, "why": w} for n, w in exc.rejected],
+            },
+        }
+        try:
+            bypass.parent.mkdir(parents=True, exist_ok=True)
+            bypass.write_text(json.dumps(diag, ensure_ascii=False, indent=2) + "\n",
+                              encoding="utf-8")
+        except OSError as wexc:
+            # 旁路都写不进 = 真错误（磁盘/权限），照常报错中止。
+            print(f"[错误] 写不进旁路诊断文件 {bypass}：{wexc}")
+            return 1
+        print()
+        print("!" * 66)
+        print("⚠ 标定质量不合格（仅质量差，非程序错误，不中止）")
+        print(f"  诊断结果另存为旁路文件供检查：{bypass}")
+        print("  激活装置档案未改动（正式标定路径保持原样）。")
+        print("!" * 66)
+        return 0
 
     print()
     print(calib.report())
@@ -199,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out)
     if out.suffix.lower() != ".json":
         out = out / "mono_calibration.json"
+    # 绑定设备身份（2026-11-08）：不绑定时换相机只会静默沿用旧 fx。
+    calib.device_identity = _device_identity(d, cam)
     try:
         written = save_mono(calib, out)
     except OSError as exc:

@@ -74,7 +74,7 @@ _MUTED_TAG = "muted"
 
 
 class JunkDialog(tk.Toplevel):
-    """垃圾管理器（模态）。"""
+    """垃圾管理器（标准非模态窗口，能最小化/最大化/关闭）。"""
 
     COLS = (("pick", "", 36), ("label", "项", 260), ("kind", "档", 58),
             ("files", "文件", 64), ("size", "体积", 80),

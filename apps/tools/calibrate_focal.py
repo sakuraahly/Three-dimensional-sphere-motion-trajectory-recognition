@@ -71,9 +71,9 @@ def parse_args() -> argparse.Namespace:
     # 而真默认是 "color" —— 同一台机器上两个入口的默认行为不同，很难被发现。
     p.add_argument("--method", default=default_detector(), choices=detector_names())
     p.add_argument("--preset", default="white_ball",
-                   choices=ColorConfig.preset_names(),
-                   help="颜色预设（球色），可选：%s"
-                        % (" / ".join(ColorConfig.preset_names())))
+                   choices=ColorConfig.preset_choices(),
+                   help="取色方式：auto=按画面自动估主色，其余是固定颜色预设。可选：%s"
+                        % (" / ".join(ColorConfig.preset_choices())))
     p.add_argument("--config", default=None)
     p.add_argument("--save", default="config/sphere_config.json")
     return p.parse_args()

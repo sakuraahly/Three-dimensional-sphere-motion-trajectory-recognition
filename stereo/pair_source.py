@@ -84,6 +84,7 @@ from sphere_tracker.sources import (
     CameraSource,
     LatestFrameCamera,
     infer_source_kind,
+    open_camera_source,
 )
 from sphere_tracker.video_profiles import DEFAULT_FPS, probe_order
 
@@ -118,6 +119,38 @@ AUTO_PAIR_DEADLINE_S = 90.0
 #: 为什么必须有（范式审计 A2）：4K 也能"出帧"，只是每秒 2 帧 —— 只判"能不能出图"
 #: 会把一个"清晰但卡成幻灯片"的档当成好档。
 AUTO_MIN_PAIR_FPS = DEFAULT_FPS * 0.6
+
+
+def resolve_min_pair_fps(value: float | None = None,
+                         settings: dict | None = None) -> float:
+    """成对帧率下限：显式值 > `config/cameras.json` 的 `min_pair_fps` > 14.4。
+
+    默认值刻意保持 `AUTO_MIN_PAIR_FPS`（=14.4），旧行为一分不变。配置键为
+    `None`/空/非法/<=0 时同样回默认；**不**把 0 解释成"关闭下限" —— 关闭
+    下限会让 4K@2fps 这种"清晰但卡成幻灯片"的档被接受，那是已知的坑。
+    """
+    if value is not None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = float("nan")
+        if v == v and v > 0 and v != float("inf"):  # 非 nan / 正 / 非 inf
+            return v
+    if settings is None:
+        try:
+            settings = load_registry().settings
+        except Exception:  # noqa: BLE001 - 读配置失败不该让取帧起不来
+            settings = {}
+    try:
+        raw = (settings or {}).get("min_pair_fps")
+        v = float(raw) if raw not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        v = 0.0
+    if v == v and v > 0 and v != float("inf"):
+        return v
+    return float(AUTO_MIN_PAIR_FPS)
+
+
 #: 刚打开时测不到帧率（<0.1 fps）的"等首帧再测"上限（秒）。
 #: 对齐 `sources.optimize_mode` 的做法：刚打开测成 0 是**测量时机**问题，不是设备慢。
 AUTO_FIRST_FRAME_WAIT_S = 6.0
@@ -416,15 +449,27 @@ class CameraPairReader(FrameReader):
         right_index: int,
         width: int = 1920,
         height: int = 1080,
-        fps: int = 60,
+        fps: float = 60,
         backup_camera: int | None = None,
         backend: int | None = None,
+        max_skew_ms: float | None = None,
+        min_pair_fps: float | None = None,
+        left_role: str = "",
+        right_role: str = "",
+        capture_api: str = "opencv",
     ) -> None:
         if left_index == right_index:
             raise RuntimeError(f"左右相机不能是同一个索引（都是 {left_index}）")
         self.label = f"camera {left_index} / {right_index}"
         self._left_index, self._right_index = int(left_index), int(right_index)
-        self._fps = int(fps)
+        self._left_role = str(left_role or "").strip()
+        self._right_role = str(right_role or "").strip()
+        self._capture_api = str(capture_api or "auto").strip().lower()
+        if self._capture_api not in ("auto", "mf", "opencv"):
+            raise ValueError(f"capture_api 只能是 auto/mf/opencv，收到 {capture_api!r}")
+        # **不截断成整数**：29.97 被 int() 截成 29 后，录 1 分钟就少 1.8 帧，
+        # 而且相机侧收到的请求也从 29.97 变成 29 —— 错得很安静。
+        self._fps = float(fps)
         self._backup_camera = backup_camera
         # auto（含 0）：宽或高任一边 <= 0 就进自适应协商；否则按该显式档打开。
         self._auto = (width <= 0 or height <= 0)
@@ -434,11 +479,29 @@ class CameraPairReader(FrameReader):
         self.actual_sizes: list[tuple[int, int]] = []
         self.pair_fps: float | None = None
 
+        # ---- 双目实时用：时间差（2026-11-16，B-191）------------------------
+        # 没有硬件触发线时，两路**不可能**同时曝光：这里只能"把时间差压到一帧
+        # 以内"，不能消除它（见本类开头 :399-401）。所以上层需要的不是"保证同步"，
+        # 而是"这一对差了多少毫秒" —— 有它才能决定这一帧的三维点可不可信。
+        self.max_skew_ms = (None if max_skew_ms is None
+                            else float(max_skew_ms))
+        # auto 协商的帧率下限；None -> 读 config/cameras.json，再退 14.4。
+        self.min_pair_fps = resolve_min_pair_fps(min_pair_fps)
+        #: 最近一对帧的时间差（ms，正数 = 右路更晚）；只由 `read_pair()` 写。
+        self.last_skew_ms: float | None = None
+        #: `read_pair()` 因时间差超限而丢弃的**对数**（不是帧数）。
+        self.dropped_pairs: int = 0
+
         # 两路必须用同一个后端，且要**成对地**挑：一个后端能同时打开两路才算数。
         # 原因（2026-10 实测）：同一进程里混用 DSHOW + MSMF 时，MSMF 那路会
         # "打开成功但抓不到帧"（报 can't grab frame），双目直接废掉；
         # 而且两台相机在两种后端下的索引空间不一定一致，混用还会张冠李戴。
-        backends = ([("指定", backend)] if backend is not None
+        # MF 模式按设备身份打开，不再试 OpenCV 的后端枚举；`auto` 也先走 MF，
+        # 失败由 `open_camera_source` 回退 OpenCV（打印警告，不静默）。
+        mf_only = (self._capture_api in ("auto", "mf")
+                   and bool(self._left_role) and bool(self._right_role))
+        backends = ([("MF", None)] if mf_only else
+                    [("指定", backend)] if backend is not None
                     else [("DSHOW", cv2.CAP_DSHOW), ("MSMF", cv2.CAP_MSMF)])
         errors: list[str] = []
         self.cams: list[LatestFrameCamera] = []
@@ -484,8 +547,8 @@ class CameraPairReader(FrameReader):
                 print(f"相机 {idx}: {describe_info(self.cams[i].info)}")
 
     # ------------------------------------------------------------------
-    def _open_one(self, role: str, idx: int, api: int, rw: int, rh: int,
-                  ) -> LatestFrameCamera:
+    def _open_one(self, role: str, role_name: str, idx: int, api: int,
+                  rw: int, rh: int) -> LatestFrameCamera:
         """打开一台相机（`optimize=False`）；打不开且配了备用相机时顶上。
 
         ⚠️ **`optimize=False` 是必须的，不是省事**（2026-10-14 修）：
@@ -501,6 +564,27 @@ class CameraPairReader(FrameReader):
         关掉优化 ≠ "不管分辨率"：给不出帧时 `CameraSource` 仍会回退到候选分辨率，
         那时两路是否一致由上层**报出来**（A3），是可见的，而不是被静默优化掉。
         """
+        spec = _spec_of_role(role_name) if role_name else None
+        if self._capture_api in ("auto", "mf"):
+            if spec is not None and (spec.identity or spec.port):
+                try:
+                    src = open_camera_source(
+                        index=idx, identity=spec.identity, port=spec.port,
+                        width=rw, height=rh, fps=self._fps, backend=api,
+                        optimize=False, capture_api=self._capture_api)
+                    print(f"[{role}] 采集后端：{src.info.backend} "
+                          f"({spec.port or spec.identity})", flush=True)
+                    return LatestFrameCamera(src)
+                except Exception as exc:                 # noqa: BLE001
+                    if self._capture_api == "mf":
+                        raise
+                    print(f"[警告] {role} MF 打不开（{exc}）；"
+                          f"回退 OpenCV #{idx}", flush=True)
+            elif self._capture_api == "mf":
+                raise RuntimeError(
+                    f"{role} 要求 capture_api=mf，但 --{role_name or '?'} "
+                    "不是已绑定的角色（没有 identity/port）；"
+                    "显式数字编号请用 --capture-api opencv")
         try:
             return LatestFrameCamera(CameraSource(
                 index=idx, width=rw, height=rh, fps=self._fps, backend=api,
@@ -531,16 +615,18 @@ class CameraPairReader(FrameReader):
         results: list[object] = [None] * 2
         failures: list[BaseException] = []
 
-        def _open_slot(slot: int, role: str, idx: int) -> None:
+        def _open_slot(slot: int, role: str, role_name: str, idx: int) -> None:
             try:
-                results[slot] = self._open_one(role, idx, api, rw, rh)
+                results[slot] = self._open_one(role, role_name, idx, api, rw, rh)
             except BaseException as exc:            # noqa: BLE001
                 failures.append(exc)                # 交给主线程重新抛
 
         threads = [
-            threading.Thread(target=_open_slot, args=(0, "左", self._left_index),
+            threading.Thread(target=_open_slot,
+                             args=(0, "左", self._left_role, self._left_index),
                              daemon=True, name="open-left"),
-            threading.Thread(target=_open_slot, args=(1, "右", self._right_index),
+            threading.Thread(target=_open_slot,
+                             args=(1, "右", self._right_role, self._right_index),
                              daemon=True, name="open-right"),
         ]
         print(f"[{name}] 并行打开两路相机（左 #{self._left_index} / "
@@ -597,13 +683,15 @@ class CameraPairReader(FrameReader):
         全档都不满足就带着**逐档记录**收场。
         """
         deadline = time.perf_counter() + AUTO_PAIR_DEADLINE_S
+        # 兼容测试里的 `_StubReader`（它只构造了 _negotiate 需要的最小状态）。
+        min_fps = float(getattr(self, "min_pair_fps", AUTO_MIN_PAIR_FPS))
         attempts: list[str] = []
         detail: list[str] = []
         for name, api in backends:
             for (rw, rh) in probe_order(None):
                 if time.perf_counter() >= deadline:
                     attempts.append(f"总预算 {AUTO_PAIR_DEADLINE_S:.0f}s 用尽")
-                    self._finish_negotiate_failure(errors, attempts, detail)
+                    self._finish_negotiate_failure(errors, attempts, detail, min_fps)
                     return
                 label = _profile_label(rw, rh)
                 print(f"[成对自适应] 试 {label}（后端 {name}）…", flush=True)
@@ -646,10 +734,10 @@ class CameraPairReader(FrameReader):
                           f"实际给帧 {_wh(real[0])}；按**实际帧尺寸**继续", flush=True)
                 # ---- A5 + A2：短测**成对**帧率（刚打开测不到先等首帧再测）----
                 rate = _measure_pair_fps(opened)
-                if rate < AUTO_MIN_PAIR_FPS:
+                if rate < min_fps:
                     attempts.append(
                         f"{label}✘ 成对 {rate:.1f} fps < 下限 "
-                        f"{AUTO_MIN_PAIR_FPS:.1f}（实际 {_wh(real[0])}）")
+                        f"{min_fps:.1f}（实际 {_wh(real[0])}）")
                     for c in opened:
                         c.stop()
                     continue
@@ -663,14 +751,15 @@ class CameraPairReader(FrameReader):
                       f"（后端 {name}，左 {_wh(real[0])}，右 {_wh(real[1])}，"
                       f"成对 {rate:.1f} fps；试过 {history}）")
                 return
-        self._finish_negotiate_failure(errors, attempts, detail)
+        self._finish_negotiate_failure(errors, attempts, detail, min_fps)
 
     @staticmethod
     def _finish_negotiate_failure(errors: list[str], attempts: list[str],
-                                  detail: list[str]) -> None:
+                                  detail: list[str],
+                                  min_fps: float = AUTO_MIN_PAIR_FPS) -> None:
         errors.append(
             "自适应协商失败：候选分辨率档没有一个同时满足「两路实际一致」"
-            f"与「成对帧率 ≥ {AUTO_MIN_PAIR_FPS:.1f}」。逐档记录：\n    "
+            f"与「成对帧率 ≥ {min_fps:.1f}」。逐档记录：\n    "
             + "\n    ".join(attempts or ["（没有走完任何一档）"]))
         if detail:
             errors.append("逐组合明细：\n    " + "\n    ".join(detail))
@@ -704,7 +793,12 @@ class CameraPairReader(FrameReader):
         """两路的 SourceInfo（左, 右）。分辨率可能不同，别假设一样。"""
         return self.cams[0].info, self.cams[1].info
 
-    def read(self) -> tuple[bool, np.ndarray | None]:
+    def _wait_fresh_pair(self) -> None:
+        """等两路都出新帧。**`read()` 与 `read_pair()` 共用这一份**。
+
+        分开写两份迟早会漂：哪天调了 `CAMERA_ALIGN_STEPS` 只改一边，
+        两条路对"什么叫一对新帧"的定义就不一样了。
+        """
         if not self._primed:
             first = [c.wait_first() for c in self.cams]
             self._primed = True
@@ -729,12 +823,66 @@ class CameraPairReader(FrameReader):
             right_fresh = all(c.latest()[0] > s[0] + CAMERA_ALIGN_STEPS - 1
                               for c, s in zip(self.cams[1:], snap[1:]))
             if (left_fresh and right_fresh) or time.perf_counter() >= deadline:
-                break
+                return
             time.sleep(CAMERA_POLL_INTERVAL)
 
+    def read(self) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
+        self._wait_fresh_pair()
         _s1, a, _t1 = self.cams[0].latest()
         _s2, b, _t2 = self.cams[1].latest()
         return (a is not None and b is not None), a, b
+
+    def read_pair(self, *, max_skew_ms: float | None = None
+                  ) -> tuple[bool, np.ndarray | None, np.ndarray | None,
+                             float, float, float | None, int, int]:
+        """取一对**带时间戳**的帧，并可丢弃时间差过大的那一对。
+
+        返回 ``(ok, left, right, t_l, t_r, skew_ms, seq_l, seq_r)``；``skew_ms``
+        为正表示**右路更晚**。
+
+        ## 为什么必须另开一个入口而不是改 `read()`
+
+        `read()` 在 :735-736 把 `latest()` 带的 `t_capture` 取出来又扔了，
+        于是上层拿不到"这两帧差多少毫秒"。而双目实时没有硬件同步，skew 是
+        **唯一**能说明"这帧三维点可不可信"的量 —— 丢了它，误差只能靠猜。
+        改 `read()` 的签名要动 9 处 + 18 个调用点（`docs/待办清单.md` B-01），
+        风险与本收益不成比例，所以只新增、不动老签名。
+
+        ## 两种 `ok=False`
+
+        - 任一路没帧（相机断了 / 还没出第一帧）→ 帧也返回 None；
+        - 给了 `max_skew_ms` 且直到 deadline 都超限 → 帧返回 None、`dropped_pairs += 1`。
+          调用方据此**不产出三维点**（拿冻结帧硬算出来的点比没有点更糟）。
+
+        `t_l` / `t_r` 都是同一进程的 `perf_counter`（`sources.py:792`），可直接相减。
+        """
+        limit = self.max_skew_ms if max_skew_ms is None else float(max_skew_ms)
+        deadline = time.perf_counter() + CAMERA_WAIT_TIMEOUT
+        while True:
+            self._wait_fresh_pair()
+            s1, a, t1 = self.cams[0].latest()
+            s2, b, t2 = self.cams[1].latest()
+            if a is None or b is None:
+                return False, None, None, float(t1), float(t2), None, int(s1), int(s2)
+            skew = (float(t2) - float(t1)) * 1000.0
+            if limit is None or abs(skew) <= limit:
+                self.last_skew_ms = skew
+                return True, a, b, float(t1), float(t2), skew, int(s1), int(s2)
+            self.dropped_pairs += 1
+            self.last_skew_ms = skew
+            if time.perf_counter() >= deadline:
+                return False, None, None, float(t1), float(t2), skew, int(s1), int(s2)
+
+    def stalled_sides(self, timeout: float = 1.0) -> tuple[bool, bool]:
+        """(左路停住, 右路停住)。`LatestFrameCamera.stalled()` 的直接透传。
+
+        为什么必须由上层问这个：一路掉线后 `latest()` 会**继续返回冻结的旧帧**
+        （`sources.py:301-303`），`read()`/`read_pair()` 的 `ok` 仍然可能为真。
+        不查它，就会"画面冻住但程序照跑"，还会拿冻结帧算出假的三维点。
+        """
+        return (self.cams[0].stalled(timeout=timeout),
+                self.cams[1].stalled(timeout=timeout))
+
 
     def seek(self, index: int) -> tuple[bool, np.ndarray | None]:
         raise NotImplementedError("实时相机不能按帧号定位（帧号没有共同基准）")
@@ -791,11 +939,20 @@ class PairSource:
         sync_offset: int = 0,
         width: int = 1920,
         height: int = 1080,
-        fps: int = 60,
+        fps: float = 60,
         backup_camera: int | None = None,
         backend: int | None = None,
         pairing: str = "canary",
+        # 视频文件时间戳配对的**时长**容差（秒），固定 0.033。
+        # **不要按帧率派生**：帧周期来自视频容器，构造函数的 ``fps=`` 是
+        # **相机请求帧率**，视频路径下它与容器帧率毫无关系。真要为视频派生，
+        # 正确来源在 `_build_timestamp_plan` 里读容器 fps，那是另一处改动。
         timestamp_tolerance_s: float = 0.033,
+        max_skew_ms: float | None = None,
+        min_pair_fps: float | None = None,
+        left_role: str = "",
+        right_role: str = "",
+        capture_api: str = "opencv",
     ) -> None:
         given = [name for name, v in
                  (("camera", camera), ("video", video), ("directory", directory)) if v]
@@ -831,7 +988,10 @@ class PairSource:
                 self.sync_offset = 0
             self._left = self._right = CameraPairReader(
                 int(camera[0]), int(camera[1]), width=width, height=height, fps=fps,
-                backup_camera=backup_camera, backend=backend)
+                backup_camera=backup_camera, backend=backend,
+                max_skew_ms=max_skew_ms, min_pair_fps=min_pair_fps,
+                left_role=left_role, right_role=right_role,
+                capture_api=capture_api)
             self.kind = "camera"
             # 把协商结果暴露出来（显式档也有：resolved == 实际值）。
             self.requested_size = self._left.requested_size
@@ -918,6 +1078,40 @@ class PairSource:
     def image_size(self) -> tuple[int, int]:
         """(宽, 高)。两路分辨率不同时取左路 —— 标定要求两路一致，会另外告警。"""
         return self._left.width, self._left.height
+
+    def read_pair(self, *, max_skew_ms: float | None = None
+                  ) -> tuple[bool, np.ndarray | None, np.ndarray | None,
+                             float, float, float | None, int, int]:
+        """带时间戳的取帧：``(ok, left, right, t_l, t_r, skew_ms, seq_l, seq_r)``。
+
+        只有**实时相机**那一条路有真实 `skew_ms`。视频 / 图片目录是逐帧对齐的，
+        没有"两路时间差"这个概念 —— 那里返回 ``skew_ms=None``（明说不知道），
+        **不要**把 `0.0` 当成"完全同步"来用。
+        """
+        if self.kind == "camera":
+            return self._left.read_pair(max_skew_ms=max_skew_ms)  # type: ignore[attr-defined]
+        ok, left, right = self.read()
+        return ok, left, right, 0.0, 0.0, None, self.n, self.n
+
+    @property
+    def skew_ms(self) -> float | None:
+        """最近一对帧的时间差（ms）；非实时源恒为 None。"""
+        if self.kind == "camera":
+            return self._left.last_skew_ms        # type: ignore[attr-defined]
+        return None
+
+    @property
+    def dropped_pairs(self) -> int:
+        """因 skew 超限被丢弃的**对数**；非实时源恒为 0。"""
+        if self.kind == "camera":
+            return self._left.dropped_pairs       # type: ignore[attr-defined]
+        return 0
+
+    def stalled_sides(self, timeout: float = 1.0) -> tuple[bool, bool]:
+        """(左路停住, 右路停住)；非实时源恒为 (False, False)。"""
+        if self.kind == "camera":
+            return self._left.stalled_sides(timeout=timeout)  # type: ignore[attr-defined]
+        return (False, False)
 
     def read(self) -> tuple[bool, np.ndarray | None, np.ndarray | None]:
         """返回 (ok, left_bgr, right_bgr)。
@@ -1131,6 +1325,10 @@ def from_args(args) -> PairSource:
     """
     left_raw = getattr(args, "left", None)
     right_raw = getattr(args, "right", None)
+    left_spec = _spec_of_role(left_raw)
+    right_spec = _spec_of_role(right_raw)
+    capture_api = (str(getattr(args, "capture_api", "") or "").strip().lower()
+                   or "opencv")
     auto = (bool(getattr(args, "auto_cameras", False))
             or left_raw == AUTO_TOKEN or right_raw == AUTO_TOKEN)
 
@@ -1159,8 +1357,7 @@ def from_args(args) -> PairSource:
         if left_i == right_i:
             raise RuntimeError(explain_same_camera(
                 left_i, right_i,
-                left_spec=_spec_of_role(left_raw),
-                right_spec=_spec_of_role(right_raw)))
+                left_spec=left_spec, right_spec=right_spec))
 
         # 相机源默认固定 **MSMF**。
         #
@@ -1248,12 +1445,18 @@ def from_args(args) -> PairSource:
         return PairSource(camera=(left_i, right_i), width=args.width,
                           height=args.height, fps=args.fps,
                           backup_camera=getattr(args, "backup_camera", None),
-                          backend=api)
+                          backend=api,
+                          left_role=str(left_raw) if left_spec is not None else "",
+                          right_role=str(right_raw) if right_spec is not None else "",
+                          capture_api=capture_api)
     if getattr(args, "left_video", None) and getattr(args, "right_video", None):
         return PairSource(video=(args.left_video, args.right_video),
                           pairing=getattr(args, "pairing", "canary"),
+                          # 兜底 0.033 与类默认一致。原这里是 0.020 —— 同一个
+                          # "视频时间戳容差"两个默认值，走 from_args 比直接构造紧 40%。
+                          # 不按帧率派生：见 `PairSource.__init__` 里那条注释。
                           timestamp_tolerance_s=float(
-                              getattr(args, "timestamp_tolerance", 0.020)))
+                              getattr(args, "timestamp_tolerance", 0.033)))
     if getattr(args, "left_dir", None) and getattr(args, "right_dir", None):
         return PairSource(directory=(args.left_dir, args.right_dir))
     raise RuntimeError("请指定 --left/--right 或 --left-video/--right-video "
