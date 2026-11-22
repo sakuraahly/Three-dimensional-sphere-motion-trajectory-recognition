@@ -48,6 +48,10 @@ jobs:
     # 放在 job 级一次覆盖所有步骤及其子进程（check_standards / run_tests / 26 selftest）。
     env:
       PYTHONIOENCODING: utf-8
+      # 8 个依赖本机标定资产 / 真实 GUI 显示器的测试在 runner 上无法运行：
+      # 由本地 pre-push 门全量覆盖（每次 push 都跑 26/26），CI 显式跳过并打印原因。
+      # 名单与逐条原因在 apps/run_tests.py 的 CI_LOCAL_ASSET_SKIP。
+      CI_SKIP_LOCAL_ASSET_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
         with:

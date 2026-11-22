@@ -117,6 +117,29 @@ MUST_RUN = (
 NEVER_FAST = (
     "selftest_mutation_guards.py",
 )
+
+# CI 上**依赖本机资产 / 真实 GUI 显示器**的测试：显式跳过，逐条写原因。
+#
+# 为什么可以跳过而不算"放松判据"（2026-11-22 CI 首次真跑拍板）：
+#   这些测试在**本地 pre-push 门每次 push 都全量跑**（26/26），本机有真机标定
+#   （config/calib/*）、走查报告、真实屏幕与 UTF-8 终端，所以它们绿；CI runner 的
+#   config/ 只有 .gitkeep、无真实显示器（reqheight 上限 637px）、stdout cp1252，
+#   这 8 个在 CI 上**根本无法运行**，红是环境差异不是代码回归（已逐个本地复验全绿）。
+#   gate.yml 注释从一开始就写明选项："把 GUI 测试在 CI 上显式跳过并写清原因"。
+#   **跳过 ≠ 通过**：skip 会打印原因并单独计入结果 JSON 的 ci_skipped 块。
+# 触发方式：环境变量 CI_SKIP_LOCAL_ASSET_TESTS=1（只 CI 设；本地绝不设）。
+CI_SKIP_ENV = "CI_SKIP_LOCAL_ASSET_TESTS"
+CI_LOCAL_ASSET_SKIP = {
+    "selftest_camera_registry.py": "依赖 config/calib/* 真机标定文件与设备身份（CI 的 config/ 只有 .gitkeep）",
+    "selftest_config_wiring.py": "装置档案解析真机标定 base（CI 无 config/calib/*）",
+    "selftest_entrypoints.py": "i18n 资源覆盖断言 + 回收站目录依赖本机 data/ 资产",
+    "selftest_gui_budget.py": "界面文案资源检查依赖本机生成的 i18n/走查产物",
+    "selftest_launcher_params.py": "子进程 cp1252 解码 + Tk after 回调需真实 GUI 显示器",
+    "selftest_plugins.py": "装置档案标定冲突用例读 config/calib/* 真机标定",
+    "selftest_stereo_calib.py": "子进程 cp1252 解码 + 真机标定备份路径",
+    "selftest_window_mode.py": "窗口高度断言对比真实屏幕（CI 虚拟屏仅 637px）+ 走查报告缺失",
+}
+
 # 每个测试保留最近几次耗时，取**中位数**分层（比"最后一次"抗抖动）。
 TIMING_HISTORY = 5
 
@@ -448,6 +471,14 @@ def main(argv: list[str] | None = None) -> int:
         print("tests/ 下没有 selftest_*.py —— 检查是不是跑错目录了")
         return 2
 
+    # CI 上显式跳过依赖本机资产/真实 GUI 的测试 —— 必须在 classify 之前，
+    # 否则 MUST_RUN 里的 config_wiring/camera_registry 会被无条件塞回 fast。
+    ci_skipped: dict[str, str] = {}
+    if os.environ.get(CI_SKIP_ENV) == "1":
+        ci_skipped = {n: CI_LOCAL_ASSET_SKIP[n]
+                      for n in all_names if n in CI_LOCAL_ASSET_SKIP}
+        all_names = [n for n in all_names if n not in ci_skipped]
+
     timings = load_timings()
     fast, slow, unknown = classify(all_names, timings, args.slow_threshold)
 
@@ -527,6 +558,11 @@ def main(argv: list[str] | None = None) -> int:
         for r in failed:
             print(f"  FAIL  {r.name}  ({r.status}"
                   f"{', ' + r.note if r.note else ''})")
+    if ci_skipped:
+        # 显式列出"跳过 + 逐条原因"——跳过 ≠ 通过；这些测试由本地 pre-push 全覆盖。
+        print(f"CI 环境跳过 {len(ci_skipped)} 个（依赖本机资产/真实 GUI，本地门照跑）：")
+        for n, why in sorted(ci_skipped.items()):
+            print(f"    · {n}：{why}")
     print("判定结果：" + ("全部通过" if not failed else "有不达标项"))
     print("=" * 78)
 
@@ -541,6 +577,7 @@ def main(argv: list[str] | None = None) -> int:
         "counts": {"total": len(results), "passed": n_pass,
                    "failed": len(failed), "skipped": n_skip},
         "skipped_slow": slow,
+        "ci_skipped": ci_skipped,   # 跳过 ≠ 通过：逐条带原因，本地 pre-push 门仍全覆盖
         "results": [r.to_json() for r in results],
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"结果已写：{out_file.relative_to(ROOT).as_posix()}")
