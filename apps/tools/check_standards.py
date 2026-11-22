@@ -359,6 +359,14 @@ def collect_refs() -> tuple[dict[str, str], dict[str, str], dict[str, str], dict
             continue
         if (ROOT / cand).exists() or cand in literals:
             continue
+        # 文件不在磁盘上（干净 checkout / CI）：先问 git 它是不是被 .gitignore
+        # 明确排除的本机资产（planbooks / outputs 报告 / 散落产物）—— 这类文件
+        # 本就不入库，不构成"承诺存在的仓库文件"，归入可再生产物不进 stale。
+        # 顺序很关键：本地存在时上面已 continue，绝不走到这里 —— 否则每个引用
+        # 都要 spawn 一次 git（实测 3 分钟），CI 上只有少量缺失路径才需判断。
+        if _git_ignored(cand):
+            runtime_repro[key] = cand
+            continue
         if len(parts) == 1 and parts[0] in _repo_basenames():
             continue
         found[key] = detail
@@ -389,15 +397,32 @@ def dead_whitelist_entries(stale: dict[str, str]) -> list[str]:
     把它们判成"死条目"等于要求"这台机器必须装 STC" —— 又一条环境断言。
     """
     dead = sorted(k for k in KNOWN_MENTIONS if k not in stale)
-    if not dead or (ROOT.parent / OUTSIDE_REPO_MARK).is_dir():
+    if not dead:
         return dead
+    # 两类条目"没命中 stale"并非因为漂移已修好，而是被归到别的桶：
+    #   1) 指向仓库外 STC/ 且整棵树不在本机 → outside_absent（原有例外）；
+    #   2) 指向被 .gitignore 排除的本机资产/产物 → runtime_repro（2026-11-22 CI 首跑新增）。
+    # 把它们判成"死条目"等于要求"这台机器必须入库这些文件"，又一条环境断言。
     outside_keys = [
         k for k in dead
         if OUTSIDE_REPO_MARK in k.split(":")[1].replace("\\", "/").split("/")[0]]
-    if outside_keys:
+    if outside_keys and not (ROOT.parent / OUTSIDE_REPO_MARK).is_dir():
         print(f"  （本机没有 {OUTSIDE_REPO_MARK}/ 树，白名单里 {len(outside_keys)} 条"
               f"指向它的条目无从命中，不算「死条目」）")
-    return [k for k in dead if k not in outside_keys]
+    elif not (ROOT.parent / OUTSIDE_REPO_MARK).is_dir():
+        outside_keys = []  # 树不在但白名单里没有 STC 条目：别误伤
+    def _real_doc_entry(k: str) -> bool:
+        # 测试会就地注入一条假白名单（源文档根本不存在）来探 vanished 检测是否
+        # 还活着；对那种假 key 不做任何豁免，否则反向自证失效。
+        doc, _, ref = k.partition(":")
+        return (ROOT / doc).exists() and _git_ignored(ref)
+
+    ignored_keys = [
+        k for k in dead if k not in outside_keys and _real_doc_entry(k)]
+    if ignored_keys:
+        print(f"  （白名单里 {len(ignored_keys)} 条指向被 .gitignore 排除的本机资产，"
+              f"已归入「不入库产物」，不算「死条目」）")
+    return [k for k in dead if k not in outside_keys and k not in ignored_keys]
 
 
 def check_refs(verbose: bool) -> list[str]:

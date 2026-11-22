@@ -64,6 +64,7 @@ run.bat                  :: 双击即可：找 Python → 查依赖 → 自动�
 | `diag` | 相机画质 / 链路诊断 |
 | — | `python apps/tools/cameras.py doctor` —— **真开相机**体检"能不能跑双目"（只报告，不改配置） |
 | — | `python apps/tools/cameras.py modes` —— **逐档真开**报实际分辨率/实测帧率（只报告，不写 config 与 `camera_modes.json`） |
+| — | `python apps/tools/cameras.py autobind` —— serial 锚点 + 排除法 + 画面指纹，自动绑定 left/right（成功才写 config） |
 | `test [full]` | 回归测试（默认 fast 档；`test full` 跑全套） |
 | `standards` | 规范落差自查（引用 / 来源 / 计数 / **待办** 四类） |
 | `gate` | **提交前的自动门**：`standards` + `test fast -j auto`（约 45 秒）。`.githooks/pre-push` 调它；**不 pause**，可被非交互调用 |

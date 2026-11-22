@@ -208,6 +208,9 @@ class RoleSpec:
     # 用户判断"哪台是左"的唯一真实依据就是"它在房间里对着哪儿"。
     # `left/right` 会被左右接反，位置不会 —— 所以这一栏是把人的知识记进配置。
     location: str = ""
+    #: USB 父设备的序列号（如果设备暴露）。有它就能在换口后按序列号找回；
+    #: 没有就留空，绝不拿端口路径冒充。
+    serial: str = ""
 
 
 #: 「位置」的未标注值（空串）。对话框/工具按"未标注"显示。
@@ -605,6 +608,90 @@ def list_devices() -> list[DeviceEntry]:
     if current_platform() != "windows":
         return []
     return windows_devices()
+
+
+def _parse_pnputil_properties(text: str) -> dict[str, str]:
+    """把 `pnputil ... /properties` 的 `KEY [Type]:` + 下一行值解析成 dict。
+
+    只取**单值字符串**（Parent / ContainerId / SerialNumber / Address），
+    字符串列表不展开。解析失败返回 {}，不猜。
+    """
+    lines = str(text or "").splitlines()
+    out: dict[str, str] = {}
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if " [" not in stripped or not stripped.startswith(("DEVPKEY_", "{")):
+            continue
+        key = stripped.split(" [", 1)[0].strip()
+        for j in range(i + 1, min(i + 4, len(lines))):
+            value = lines[j].strip()
+            if value:
+                out.setdefault(key, value)
+                break
+    return out
+
+
+def device_properties(identity: str, *, timeout: float = 10.0) -> dict[str, str]:
+    """读一个设备接口的 PnP 属性（pnputil 优先；失败返回 {}）。
+
+    pnputil 是原生命令（本机 ~0.1 s）；PowerShell `Get-PnpDeviceProperty`
+    偶尔 10 s+ 或空返回，不能当自动绑定的唯一来源。
+    """
+    text = str(identity or "").strip()
+    if not text:
+        return {}
+    res = _run_command(
+        ["pnputil", "/enum-devices", "/instanceid", text, "/properties"],
+        timeout=timeout)
+    if res is None:
+        return {}
+    code, out = res
+    if code != 0 or not out.strip():
+        return {}
+    return _parse_pnputil_properties(out)
+
+
+def device_parent(identity: str, *, runner=_run_powershell,
+                  timeout: float = 15.0) -> str:
+    """读一个设备接口的父设备 InstanceId（`DEVPKEY_Device_Parent`）。
+
+    这是 **serial-first 自动绑定**的唯一来源：父设备可能是
+    `USB\\VID_...\\20190322001`（序列号），也可能只是
+    `USB\\VID_...\\5&322f3e23&0&1`（端口路径）。读不到返回空串，不猜。
+    """
+    text = str(identity or "").strip()
+    if not text:
+        return ""
+    props = device_properties(text)
+    parent = str(props.get("DEVPKEY_Device_Parent") or "").strip()
+    if parent:
+        return parent
+    safe = text.replace("'", "''")
+    script = (
+        "$p=Get-PnpDeviceProperty -InstanceId '" + safe + "' "
+        "-KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue;"
+        "if($p){$p.Data}"
+    )
+    raw = runner(script, timeout=timeout)
+    return (raw or "").strip().splitlines()[0].strip() if raw else ""
+
+
+def serial_from_parent(parent: str) -> str:
+    """从父设备 InstanceId 提取**像序列号**的末段；端口路径返回空串。
+
+    `USB\\VID_1BCF&PID_2A25\\20190322001` -> `20190322001`
+    `USB\\VID_1BCF&PID_2A25\\5&322f3e23&0&1` -> `""`（这是 USB 端口路径）
+    """
+    text = str(parent or "").strip()
+    if not text:
+        return ""
+    last = text.rsplit("\\", 1)[-1].strip()
+    if not last:
+        return ""
+    low = last.lower()
+    if "&" in last or low.startswith(("5&", "6&", "7&", "8&", "9&")):
+        return ""
+    return last
 
 
 # --------------------------------------------------------------------------- #
@@ -1506,6 +1593,7 @@ def load_registry(path: str | Path | None = None) -> Registry:
                                and not isinstance(cap, bool) and int(cap) >= 0 else None),
                 # 「位置」：旧配置没有这个键 -> 空串（= 未标注），**不报错、不改语义**。
                 location=str(spec.get("location") or "").strip(),
+                serial=str(spec.get("serial") or "").strip(),
             )
     settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
     return Registry(v=int(data.get("v") or 1), roles=roles,
@@ -1534,6 +1622,7 @@ def _parse_spec_list(raw) -> list[RoleSpec]:
             capture_index=(int(cap) if isinstance(cap, (int, float))
                            and not isinstance(cap, bool) and int(cap) >= 0 else None),
             location=str(spec.get("location") or "").strip(),
+            serial=str(spec.get("serial") or "").strip(),
         ))
     return out
 
@@ -1686,6 +1775,7 @@ def set_role(
         verified=verified,
         capture_index=new_capture,
         location=new_location,
+        serial=(old.serial if same_identity and old is not None else ""),
     )
     reg.roles[str(role)] = spec
 

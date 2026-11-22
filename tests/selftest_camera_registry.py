@@ -3256,6 +3256,74 @@ def test_mf_camera_pure() -> bool:
     return all(ok for _n, ok in checks)
 
 
+def test_autobind_pure(tmp: Path) -> bool:
+    """第 25 节：自动绑定纯逻辑（serial 锚点/排除法/画面指纹，不开相机）。"""
+    print("----- 25. 自动绑定：serial + 排除法 + 画面指纹 -----")
+    import numpy as np
+
+    import sphere_tracker.camera_autobind as ab
+    import sphere_tracker.camera_fingerprint as fp
+    import sphere_tracker.camera_registry as cr
+
+    checks: list[tuple[str, bool]] = []
+    checks.append(("父设备序列号提取", cr.serial_from_parent(
+        r"USB\VID_1BCF&PID_2A25\20190322001") == "20190322001"))
+    checks.append(("端口路径不当序列号", cr.serial_from_parent(
+        r"USB\VID_1BCF&PID_2A25\5&322f3e23&0&1") == ""))
+
+    d0 = dev(0, "aoni webcam A25 left", "USB\\A", "6&aaa")
+    d1 = dev(1, "aoni webcam A25 right", "USB\\B", "6&bbb")
+    left_c = ab.RoleCandidate(d0, r"USB\VID_1BCF&PID_2A25\20190322001",
+                              "20190322001")
+    right_c = ab.RoleCandidate(d1, r"USB\VID_1BCF&PID_2A25\5&322f3e23&0&1", "")
+    l, r = ab.choose_roles([left_c, right_c])
+    checks.append(("一台有 serial -> 它是 left，另一台 right",
+                   l is left_c and r is right_c))
+    l, r = ab.choose_roles([right_c, left_c], left_serial="20190322001")
+    checks.append(("显式 left serial 锚点", l is left_c and r is right_c))
+    for bad in ([left_c], [left_c, right_c,
+                           ab.RoleCandidate(d0, "", "")]):
+        try:
+            ab.choose_roles(bad)
+        except ab.AutobindError:
+            checks.append(("台数不为 2 -> 拒绝", True))
+            break
+    else:
+        checks.append(("台数不为 2 -> 拒绝", False))
+    try:
+        ab.choose_roles([ab.RoleCandidate(d0, "", ""),
+                         ab.RoleCandidate(d1, "", "")])
+    except ab.AutobindError:
+        checks.append(("两台都无 serial 且无锚点 -> 拒绝", True))
+    else:
+        checks.append(("两台都无 serial 且无锚点 -> 拒绝", False))
+
+    left_img = np.zeros((36, 64, 3), np.uint8)
+    left_img[:, :32] = 255
+    right_img = np.zeros((36, 64, 3), np.uint8)
+    right_img[:, 32:] = 255
+    f_left, f_right = fp.make_fingerprint(left_img), fp.make_fingerprint(right_img)
+    refs = {"left": f_left, "right": f_right}
+    m = fp.match_fingerprint(f_left, refs)
+    checks.append(("画面指纹命中 left", m is not None and m[0] == "left"))
+    same = fp.match_fingerprint(f_left, {"left": f_left, "right": f_left})
+    checks.append(("两个指纹一样 -> 拒绝猜", same is None))
+
+    reg = cr.Registry(roles={"left": cr.RoleSpec(
+        identity="USB\\A", port="6&aaa", name="cam", index=0,
+        verified=True, capture_index=1, location="床",
+        serial="20190322001")})
+    path = tmp / "serial_roundtrip.json"
+    cr.save_registry(reg, path)
+    back = cr.load_registry(path)
+    checks.append(("RoleSpec.serial 往返",
+                   back.roles["left"].serial == "20190322001"))
+
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
+    return all(ok for _n, ok in checks)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="摄像头设备管理自测")
     ap.add_argument("--probe", action="store_true",
@@ -3300,6 +3368,7 @@ def main() -> int:
             test_preview_stage_not_stale(),
             test_modes_and_fps_settings(),
             test_mf_camera_pure(),
+            test_autobind_pure(tmp),
         ]
         print()
         if args.probe:

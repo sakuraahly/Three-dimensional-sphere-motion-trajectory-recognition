@@ -297,6 +297,25 @@ buffer 可能是 NV12/MJPG/YUY2，按当前 subtype 解码，未知 subtype 抛
 `MFError`。③ 两台同型号相机若没有唯一序列号，symlink 仍主要靠 USB 端口；
 换口后要重新绑定，不自动按名字找回。
 
+## 8c. `camera_autobind.py` / `camera_fingerprint.py` —— 自动绑定
+
+```python
+@dataclass(frozen=True) RoleCandidate: device; parent; serial
+def external_candidates(devices, *, settings=None) -> list[DeviceEntry]
+def choose_roles(candidates, *, left_serial="", right_serial="") -> tuple[RoleCandidate, RoleCandidate]
+# 一台 serial -> 它是 left，另一台 right；台数不是 2 / 两台无 serial 且无锚点 -> AutobindError
+
+@dataclass(frozen=True) Fingerprint: gray; hist
+def make_fingerprint(frame) -> Fingerprint          # 64x36 灰度归一化 + HSV 16x8
+def similarity(a, b) -> float                       # 0.7 灰度 + 0.3 直方图
+def match_fingerprint(fp, refs, *, min_score=0.45, min_margin=0.10) -> (role, score) | None
+```
+
+**口径**：`cameras.py autobind` 用 `pnputil ... /properties` 读
+`DEVPKEY_Device_Parent`，`serial_from_parent()` 只认不像端口路径的末段；
+right 用“唯一另一台外接同型号”排除。OpenCV 索引由 MF 参考帧 + 画面指纹
+自动映射；分数不够/两路同索引就**不写**。`RoleSpec.serial` 持久化锚点。
+
 ## 9. `sphere_tracker/camera_registry.py` —— 相机设备管理
 把"相机身份"从会漂移的 cv2 索引里解耦；配置在 `config/cameras.json`（不入库）。
 ```python

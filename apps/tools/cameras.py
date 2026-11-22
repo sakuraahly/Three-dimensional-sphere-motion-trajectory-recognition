@@ -5,7 +5,7 @@
 就会悄悄用错设备、标定白做。这个工具把"哪台是左、哪台是右"记成**设备身份**
 （Windows 上取 PnP InstanceId / USB 端口），之后用**角色名**启动即可。
 
-十一个子命令：
+十二个子命令：
 
     python apps/tools/cameras.py list                # 列设备（不开相机，任何机器都能跑）
     python apps/tools/cameras.py list --probe        # 顺带真开一下，报实际分辨率/是否全黑
@@ -18,6 +18,7 @@
     python apps/tools/cameras.py bench               # 逐台单独打开计时（谁慢）
     python apps/tools/cameras.py modes               # 逐档真开：实际分辨率/实测帧率（只报告）
     python apps/tools/cameras.py doctor              # 真开体检：现在能不能跑双目（只报告）
+    python apps/tools/cameras.py autobind            # serial 锚点 + 排除法 + 画面指纹，自动绑定左右
 
 `identify` 的按键：窗口里
 
@@ -45,11 +46,14 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from sphere_tracker import camera_autobind as ab  # noqa: E402
+from sphere_tracker import camera_fingerprint as fp  # noqa: E402
 from sphere_tracker import camera_registry as cr  # noqa: E402
 from sphere_tracker import video_profiles  # noqa: E402
 from apps._window import WindowManager  # noqa: E402
 
 from sphere_tracker.sources import (  # noqa: E402
+    INDEX_BACKEND,
     CameraSource,
     quiet_repeated_grab_warnings,
 )
@@ -1191,6 +1195,171 @@ def cmd_modes(args) -> int:
         print("完成。结论仅供人工/界面填入，程序仍按 config/camera_modes.json 打开；"
               "本命令不改任何配置。")
     return 0
+
+
+def _read_last_frame(src, attempts: int = 40):
+    last = None
+    for _ in range(attempts):
+        try:
+            ok, frame, _t = src.read()
+        except Exception:                                    # noqa: BLE001
+            break
+        if ok and frame is not None:
+            last = frame
+    return last
+
+
+def cmd_autobind(args) -> int:
+    """自动绑定 left/right：serial 锚点 + 排除法 + 画面指纹映射 OpenCV 索引。
+
+    - 角色：恰好两台外接相机；left 用 serial 锚点，right 用排除法；
+    - OpenCV 索引：MF 打开 left/right 取参考帧，再扫 OpenCV 0..max-index，
+      用画面指纹匹配；分不清就不写，绝不猜；
+    - `--no-opencv`：只做角色串行绑定，不扫索引；
+    - `--dry-run`：照常探测，但不写 `config/cameras.json`。
+    """
+    devices = cr.list_devices()
+    reg = cr.load_registry()
+    settings = reg.settings
+    raw = ab.external_candidates(devices, settings=settings)
+    if len(raw) != 2:
+        msg = (f"需要恰好 2 台外接相机，当前 {len(raw)} 台："
+               + "；".join(f"#{d.order} {d.name or '(无名字)'}" for d in raw))
+        print(f"[错误] {msg}")
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+        return 2
+
+    candidates: list[ab.RoleCandidate] = []
+    for d in raw:
+        print(f"[设备] #{d.order} {d.name or '(无名字)'} 寻找父设备…", flush=True)
+        parent = cr.device_parent(d.identity)
+        serial = cr.serial_from_parent(parent)
+        cand = ab.RoleCandidate(device=d, parent=parent, serial=serial)
+        candidates.append(cand)
+        print(f"       parent={parent or '(读不到)'} serial={serial or '(无)'}")
+
+    left_serial = (str(args.left_serial or "").strip()
+                   or str(reg.roles.get("left").serial if reg.roles.get("left") else "")
+                   or str(settings.get("autobind_left_serial") or ""))
+    right_serial = (str(args.right_serial or "").strip()
+                    or str(reg.roles.get("right").serial
+                           if reg.roles.get("right") else ""))
+    try:
+        left, right = ab.choose_roles(
+            candidates, left_serial=left_serial, right_serial=right_serial)
+    except ab.AutobindError as exc:
+        print(f"[错误] {exc}")
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
+    print(f"[角色] left={left.label}；right={right.label}")
+
+    captures: dict[str, tuple[int, float]] = {}
+    refs: dict[str, fp.Fingerprint] = {}
+    scores: dict[str, dict[str, float]] = {"left": {}, "right": {}}
+    errors: list[str] = []
+    if not args.no_opencv:
+        from sphere_tracker.mf_camera import MFCameraSource
+        for role, cand in (("left", left), ("right", right)):
+            src = None
+            try:
+                print(f"[MF] 取 {role} 参考帧：{cand.device.identity}", flush=True)
+                src = MFCameraSource(
+                    identity=cand.device.identity, port=cand.device.port,
+                    width=args.width, height=args.height, fps=30.0)
+                frame = _read_last_frame(src, attempts=20)
+                if frame is None:
+                    raise RuntimeError("没有读到参考帧")
+                refs[role] = fp.make_fingerprint(frame)
+            except Exception as exc:                         # noqa: BLE001
+                errors.append(f"{role} MF 参考帧失败：{exc}")
+                print(f"[警告] {role} MF 参考帧失败：{exc}")
+            finally:
+                if src is not None:
+                    src.release()
+
+        if len(refs) == 2:
+            for idx in range(int(args.max_index) + 1):
+                src = None
+                print(f"[OpenCV] 扫 #索引 {idx}…", flush=True)
+                try:
+                    src = CameraSource(
+                        index=idx, width=args.width, height=args.height, fps=30.0,
+                        backend=INDEX_BACKEND, optimize=False,
+                        first_frame_timeout_s=20.0, search_budget_s=30.0)
+                    frame = _read_last_frame(src, attempts=30)
+                    if frame is None:
+                        print("        无帧")
+                        continue
+                    one = fp.make_fingerprint(frame)
+                    for role in ("left", "right"):
+                        score = fp.similarity(one, refs[role])
+                        scores[role][str(idx)] = score
+                        print(f"        {role}={score:.3f}")
+                    match = fp.match_fingerprint(one, refs)
+                    if match is not None:
+                        role, score = match
+                        old = captures.get(role)
+                        if old is None or score > old[1]:
+                            captures[role] = (idx, score)
+                except Exception as exc:                     # noqa: BLE001
+                    print(f"        打不开/读不到：{exc}")
+                finally:
+                    if src is not None:
+                        src.release()
+        else:
+            errors.append("MF 参考帧不足两路，跳过 OpenCV 索引扫描")
+
+    if len(captures) == 2 and captures["left"][0] == captures["right"][0]:
+        errors.append("left/right 指纹落到同一个 OpenCV 索引，拒绝写入")
+        captures.clear()
+
+    if not args.no_opencv and len(captures) != 2:
+        errors.append("OpenCV 索引没有同时匹配到 left/right；保留原值/不猜")
+
+    payload = {
+        "ok": len(captures) == 2 or args.no_opencv,
+        "left": {"identity": left.device.identity, "port": left.device.port,
+                 "name": left.device.name, "index": left.device.order,
+                 "serial": left.serial, "parent": left.parent,
+                 "capture_index": captures.get("left", (None, 0.0))[0]},
+        "right": {"identity": right.device.identity, "port": right.device.port,
+                  "name": right.device.name, "index": right.device.order,
+                  "serial": right.serial, "parent": right.parent,
+                  "capture_index": captures.get("right", (None, 0.0))[0]},
+        "scores": scores,
+        "errors": errors,
+        "dry_run": bool(args.dry_run),
+    }
+
+    if not args.dry_run:
+        for role, cand in (("left", left), ("right", right)):
+            old = reg.roles.get(role)
+            cap = captures.get(role, (None, 0.0))[0]
+            reg.roles[role] = cr.RoleSpec(
+                identity=cand.device.identity,
+                port=cand.device.port,
+                name=cand.device.name,
+                index=cand.device.order,
+                verified=True,
+                capture_index=cap,
+                location=(old.location if old is not None else ""),
+                serial=cand.serial,
+            )
+        if left.serial:
+            reg.settings["autobind_left_serial"] = left.serial
+        if right.serial:
+            reg.settings["autobind_right_serial"] = right.serial
+        path = cr.save_registry(reg)
+        payload["written"] = str(path)
+        print(f"[写入] {path}")
+    else:
+        print("[dry-run] 不写 config/cameras.json")
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    return 0 if payload["ok"] else 2
 
 
 def _pin_example_lines(devices: list[cr.DeviceEntry]) -> list[str]:
@@ -2490,6 +2659,24 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--json", action="store_true",
                     help="以 JSON 输出（最后一行；供界面解析）")
     pm.set_defaults(func=cmd_modes)
+
+    pa = sub.add_parser(
+        "autobind",
+        help="自动绑定左右：serial 锚点 + 排除法 + 画面指纹映射 OpenCV 索引"
+             "（成功才写 config/cameras.json）")
+    pa.add_argument("--left-serial", default="",
+                    help="left 的 USB 父设备序列号（默认读配置/自动取唯一带 serial 的那台）")
+    pa.add_argument("--right-serial", default="",
+                    help="right 的序列号（可选；默认用排除法）")
+    pa.add_argument("--width", type=int, default=1920, help="参考/扫描宽度（默认 1920）")
+    pa.add_argument("--height", type=int, default=1080, help="参考/扫描高度（默认 1080）")
+    pa.add_argument("--max-index", type=int, default=4,
+                    help="扫描 OpenCV 索引 0..N（默认 4）")
+    pa.add_argument("--no-opencv", action="store_true",
+                    help="只做 serial 角色绑定，不打开相机扫 OpenCV 索引")
+    pa.add_argument("--dry-run", action="store_true", help="只报告，不写配置")
+    pa.add_argument("--json", action="store_true", help="最后一行输出 JSON")
+    pa.set_defaults(func=cmd_autobind)
 
     pb = sub.add_parser(
         "bench",
