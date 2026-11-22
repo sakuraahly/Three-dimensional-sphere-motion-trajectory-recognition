@@ -25,6 +25,7 @@ GO = ROOT / "native" / "launcher" / "main.go"
 SETUP_ENV = ROOT / "apps" / "setup_env.py"
 BUNDLE = ROOT / "apps" / "tools" / "make_clean_bundle.py"
 GITIGNORE = ROOT / ".gitignore"
+LICENSE = ROOT / "LICENSE"
 
 
 def _read(p: Path) -> str:
@@ -125,9 +126,15 @@ def main() -> int:
     checks.append(("launcher 把相对 python= 按 root 还原",
                    "filepath.IsAbs(v)" in go and "filepath.Join(root, filepath.FromSlash(v))" in go))
 
-    # 4. runtime 是产物，不进源码白名单
+    # 4. runtime 是产物，不进源码白名单；MIT LICENSE 必须随源码包分发
     checks.append(("内嵌 runtime 不进源码包白名单",
                    "runtime" not in bundle and "release_stage" not in bundle))
+    checks.append(("MIT LICENSE 存在且进入纯净包白名单",
+                   LICENSE.is_file()
+                   and "MIT License" in _read(LICENSE)
+                   and '"LICENSE"' in bundle))
+    checks.append(("安装包 payload 要求 LICENSE",
+                   '"LICENSE"' in _read(ROOT / "installer" / "verify_payload.py")))
     checks.append(("产物目录被 git 忽略（非源码）",
                    "outputs/" in gi))
 

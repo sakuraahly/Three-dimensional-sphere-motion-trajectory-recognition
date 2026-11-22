@@ -26,6 +26,7 @@
 /*
 !/.gitignore
 !/.gitattributes
+!/LICENSE
 !/README.md
 !/requirements.txt
 !/requirements-ai.txt

@@ -50,7 +50,7 @@ PY_DIRS = ("apps", "sphere_tracker", "stereo", "calib", "tests")
 #: 根目录必需文件：依赖清单 + 运行/安装/卸载入口 + 最小说明
 #: 两个启动脚本已搬进 apps/（英文名），由 PY_DIRS 的 rglob 收集，不用在这里重复列。
 ROOT_FILES = (
-    ".gitignore", ".gitattributes", "README.md",
+    ".gitignore", ".gitattributes", "LICENSE", "README.md",
     "requirements.txt", "requirements-ai.txt", "environment.yml",
     "run.bat", "install.bat", "uninstall.bat",
 )
@@ -91,7 +91,7 @@ GITHUB_README = ROOT / "docs" / "GitHub-README.md"
 
 ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf",
                   ".go", ".mod", ".rc", ".ico", ".iss", ".isl"}
-ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep"}
+ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep", "LICENSE"}
 TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".go", ".mod", ".rc",
                ".iss", ".isl"}
 FORBIDDEN_PARTS = {

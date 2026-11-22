@@ -1089,4 +1089,11 @@ python apps/verify_stereo.py --left left --right right   # 用角色名，别背
 | 极线误差偏大       | 数据差 / 板不平 / 相机被碰     | 看剔除统计重拍；确认标定板平整；确认支架锁死              |
 | 基线明显不对       | `--square` 填错                | 用尺子量方格边长，并用 `--baseline-mm` 核对               |
 
+---
+
+## 许可证
+
+本项目采用 **MIT License**，见 [`LICENSE`](LICENSE)。第三方依赖的许可证见
+[`requirements.txt`](requirements.txt) 与 [`docs/SBOM.md`](docs/SBOM.md)。
+
 

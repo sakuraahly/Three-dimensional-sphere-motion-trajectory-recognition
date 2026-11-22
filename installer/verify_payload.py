@@ -29,7 +29,7 @@ ISS = ROOT / "installer" / "sphere_motion.iss"
 
 REQUIRED = (
     "run.bat", "install.bat", "uninstall.bat", "launcher.exe",
-    "apps/gui_main.py", "apps/cli_main.py", "README.md",
+    "apps/gui_main.py", "apps/cli_main.py", "README.md", "LICENSE",
     "requirements.txt", "assets/boards/chessboard_8x5_20mm_a4-portrait.png",
 )
 
