@@ -1175,7 +1175,13 @@ _INSTANCE_LOCK = {"fd": None, "path": None}
 
 
 def _raise_existing_window() -> None:
-    """把已经在跑的那个主窗口叫到前面（找不到就什么也不做）。"""
+    """把已经在跑的那个主窗口叫到前面（找不到就什么也不做）。
+
+    不能只用 ``FindWindowW(精确标题)``：旧实例可能被最小化、标题被对话框临时
+    改掉，或者窗口还在但不在前台。2026-11-23 实测 launcher 第二次启动时只弹
+    “已经在运行”，用户看不到旧窗口，自然以为新启动器打不开相机。
+    这里优先按 ``.gui.pid`` 的进程号枚举该进程的所有顶层窗口，再回退到标题。
+    """
     if sys.platform != "win32":
         return
     try:
@@ -1184,9 +1190,32 @@ def _raise_existing_window() -> None:
 
         user32 = ctypes.windll.user32
         user32.FindWindowW.restype = wintypes.HWND
+        pid = 0
+        try:
+            pid = int(_pid_path().read_text(encoding="ascii").strip())
+        except (OSError, ValueError):
+            pid = 0
+
+        handles: list[int] = []
+        if pid:
+            @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            def _enum(hwnd, _lparam):
+                owner = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if owner.value == pid:
+                    handles.append(int(hwnd))
+                return True
+
+            user32.EnumWindows(_enum, 0)
+
+        for hwnd in handles:
+            user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+            return
+
         hwnd = user32.FindWindowW(None, "球形物体三维运动轨迹识别")
         if hwnd:
-            user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+            user32.ShowWindow(hwnd, 9)
             user32.SetForegroundWindow(hwnd)
     except Exception:                            # noqa: BLE001
         pass

@@ -107,11 +107,11 @@ CAPTURE_UNMEASURED_TEXT = "未实测"
 
 
 def _is_ir_name(name: str) -> bool:
-    """IR / Windows Hello 红外相机：不做预览。
+    """IR / Windows Hello 红外相机：可手动预览，但先提示风险。
 
     2026-11-23 用户实测：本机 `Integrated IR Camera` 和 vivo 原子笔记的蓝牙
-    连接绑在一起，打开它会把 vivo 学习笔记反复拉起来。它不是双目可用的
-    可见光相机；普通 `Integrated Camera` 不受影响。
+    连接绑在一起，打开它可能把 vivo 学习笔记反复拉起来。设备控制权属于用户，
+    所以不硬拦；普通 `Integrated Camera` 同样可用。
     """
     low = (name or "").casefold()
     return ("infrared" in low or " ir " in f" {low} "
@@ -862,7 +862,7 @@ class CamerasDialog(tk.Toplevel):
             elif avoided:
                 # 内置/红外这两台是**被物理遮住的**（本机就是这么配的），
                 # 点它们预览必然是黑屏。IR 还和 vivo 原子笔记共用，单独标出来。
-                role = "红外(不预览)" if _is_ir_name(d.name) else "内置"
+                role = "红外" if _is_ir_name(d.name) else "内置"
             else:
                 role = "—"
             caps = [reg.roles[r].capture_index for r in roles
@@ -981,10 +981,11 @@ class CamerasDialog(tk.Toplevel):
                       error=True)
             return
         if _is_ir_name(entry.name):
-            self._say(f"#{entry.order}「{entry.name}」是 IR / Windows Hello 红外相机，"
-                      "不在这里预览（它和 vivo 原子笔记的蓝牙链共用，"
-                      "打开会把学习笔记反复拉起来）", error=True)
-            return
+            # 只提示风险，不替用户做决定。IR 可能和 vivo 原子笔记/Windows Hello
+            # 共用；用户明确要预览时仍然放行。
+            self._say(f"提示：#{entry.order} 是 IR / Windows Hello 红外相机，"
+                      "可能触发 vivo 原子笔记或没有彩色画面；仍按你的选择打开。",
+                      error=False)
         old = self._previews.get(entry.order)
         if old is not None:
             # 2026-11-08 用户连点几次都"没反应"的真 bug：上一次失败的卡片还留在
@@ -1189,7 +1190,8 @@ class CamerasDialog(tk.Toplevel):
         try:
             import ctypes
             lines.append(
-                f"  启动方式 exe={os.path.basename(sys.executable)} "
+                f"  启动方式 exe={sys.executable} "
+                f"ppid={os.getppid()} "
                 f"stdout_none={sys.stdout is None} "
                 f"console={bool(ctypes.windll.kernel32.GetConsoleWindow())} "
                 f"argv={' '.join(sys.argv[:2])}")
