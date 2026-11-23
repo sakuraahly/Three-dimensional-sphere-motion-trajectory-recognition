@@ -14,12 +14,14 @@
 1. AST 扫描白名单里的 GUI 模块，**只取用户看得见的字符串**
    （控件 text/label/title、消息框、状态栏、帮助内容、预设名），
    不碰注释、docstring、日志格式串、路径、代码标识符；
-2. 对每条新文案，按 `apps/i18n_seed.py` 的领域词典自动生成英文：
-   整句精确命中用高质量译文，否则用词典做短语组合；
-   组合后仍有中文的记为待译（空值），运行时回退中文并继续部分英文化；
+2. 新文案只在 `i18n_seed.py` 有**整句精确译文**时填英文，否则留空；
+   **不再按词拼接**（`Record与识别` 这种混排禁止进入资源表）；
 3. **保留已有译文**：人工填过的条目不会被覆盖；
 4. 为 `i18n.LANGS` 里除中文外的每种语言各生成一张表 ——
    以后加第三种语言，只要往 `LANGS` 加一项，再跑一次 `--write` 就有对应资源。
+
+`--check` 是硬门禁：源码里的每条中文必须存在英文表、值非空且不含中文；
+新增文案只登记不翻译，CI 会红，直到补完整句子。
 
 产物 `apps/i18n_data.py` 是普通 `.py` 文件（不是 JSON）：这个项目用的是
 白名单式 `.gitignore`，`.py` 自动放行、自动进纯净包，不用再改两份清单。
@@ -182,27 +184,14 @@ def scan_all() -> set[str]:
     return found
 
 
-def _phrase_replace(s: str) -> str:
-    keys = sorted((k for k in SEED if len(k) >= 2 and _CN.search(k)),
-                  key=len, reverse=True)
-    if not keys:
-        return s
-    pat = re.compile("|".join(re.escape(k) for k in keys))
-    return pat.sub(lambda m: SEED.get(m.group(0), m.group(0)), s)
-
-
 def auto_translate(s: str) -> str:
-    """整句精确命中 → 高质量译文；否则用词典自动组词生成对应版本。
+    """只接受种子里的**整句精确译文**；否则留空，等人工补。
 
-    组合结果可能中英混排（长段落里的专有表述词典没覆盖），但它仍是**自动
-    生成的对应语言版本**：切到英文后整屏会明显英文化，而不是只有按钮变。
-    人工润色请改 `i18n_seed.py` 或本文件里已填的值 —— `--write` 会保留它们。
-    词典一个词都没命中的才留空（运行时回退中文）。
+    不再做子串/逐词组合：那会生成 `Record与识别`、`Calibration堆栈`
+    这种比中文更难读的混排。`--check` 会让空值/含中文的译文直接失败。
     """
-    if s in SEED:
-        return SEED[s]
-    filled = _phrase_replace(s)
-    return filled if filled != s else ""
+    value = SEED.get(s, "")
+    return value if value and not _CN.search(value) else ""
 
 
 def _load_existing() -> dict[str, dict[str, str]]:
@@ -248,7 +237,7 @@ def render(tables: dict[str, dict[str, str]], keys: set[str]) -> str:
         "",
         "改文案请改界面源码，然后跑：python apps/tools/i18n_extract.py --write",
         "人工润色译文请改 apps/i18n_seed.py（重新生成会保留本文件里已填的非空值）。",
-        "值为空 = 待译：运行时回退中文，并用种子词典做短语级自动英文化。",
+        "值为空 = 待译：运行时回退中文；--check 会阻止缺译文/含中文的条目。",
         f"扫描到 {len(keys)} 条界面文案。",
         '"""',
         "from __future__ import annotations",
@@ -275,16 +264,25 @@ def main(argv: list[str] | None = None) -> int:
     keys = scan_all()
     tables = build_tables(keys)
     existing = _load_existing()
-    known = set(existing.get("EN_US", {}))
-    fresh = sorted(keys - known)
+    known = existing.get("EN_US", {})
+    fresh = sorted(keys - set(known))
+    missing = sorted(
+        k for k in keys
+        if not known.get(k) or _CN.search(str(known.get(k)))
+    )
 
     if args.check:
         if fresh:
             print(f"[不达标] {len(fresh)} 条新界面文案还没登记，跑一次 --write：")
             for s in fresh[:10]:
                 print("  · " + s[:70])
+        if missing:
+            print(f"[不达标] {len(missing)} 条界面文案缺完整英文（空值或含中文）：")
+            for s in missing[:10]:
+                print("  · " + s[:70])
+        if fresh or missing:
             return 1
-        print(f"多语言资源与源码一致（{len(keys)} 条文案）")
+        print(f"多语言资源与源码一致（{len(keys)} 条文案，全部有完整英文）")
         return 0
 
     if args.stats or not args.write:

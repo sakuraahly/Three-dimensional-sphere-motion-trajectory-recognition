@@ -71,6 +71,9 @@ jobs:
       - name: 规范落差自查（引用 / 来源 / 计数 / 待办）
         run: python apps/tools/check_standards.py
 
+      - name: 多语言硬门禁（每条中文必须有完整英文）
+        run: python apps/tools/i18n_extract.py --check
+
       - name: 回归测试（fast，并行；名单来自 timings.json，缺失时跑全部）
         run: python apps/run_tests.py fast -j auto
 

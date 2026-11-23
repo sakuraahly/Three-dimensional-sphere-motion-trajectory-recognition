@@ -2844,6 +2844,9 @@ def _check_i18n() -> list[tuple[str, bool]]:
             checks += [
                 ("中文模式是恒等映射", cn == "确定"),
                 ("英文模式命中精确译文", en == "OK"),
+                ("每条中文文案都有完整英文（非空且无中文）",
+                 all(v and not any("\u4e00" <= c <= "\u9fff" for c in v)
+                     for v in i18n_data.EN_US.values())),
                 ("未登记长句不再逐词拼接（保持中文）",
                  auto == "已选 3 个文件 / 12 个"),
                 ("语言偏好已持久化", saved == "en-US"),
@@ -2868,8 +2871,10 @@ def _check_i18n() -> list[tuple[str, bool]]:
             ("提取器能发现新增界面文案", "保存新的测试" in found),
             ("提取器不收注释 / docstring / 内部日志",
              not any("不该被提取" in s for s in found)),
-            ("新增文案能自动生成英文版本",
-             bool(ex.auto_translate("保存新的测试"))),
+            ("新增文案不会被逐词自动拼英文（必须补整句）",
+             ex.auto_translate("保存新的测试") == ""),
+            ("固定短词仍走精确种子译文",
+             ex.auto_translate("保存") == "Save"),
         ]
 
     gui_src = (ROOT / "apps" / "_gui_app.py").read_text(encoding="utf-8")
