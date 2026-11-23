@@ -1197,7 +1197,9 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
     mono_src = (root / "apps" / "_gui_mono.py").read_text(encoding="utf-8")
     legacy_src = (root / "apps" / "gui_main.py").read_text(encoding="utf-8")
     out.append(("文件浏览默认回项目内目录（内参/轴向/工具台/单目）",
-                'initialdir=str(PROJECT_ROOT / "config" / "calib")' in stereo_src
+                'PROJECT_ROOT / "config" / "calib"' in stereo_src
+                and "if not start.is_dir()" in stereo_src
+                and "initialdir=str(start)" in stereo_src
                 and "initialdir=self._browse_start" in stereo_src
                 and "initialdir=start" in tools_src
                 and "initialdir=str(start)" in mono_src

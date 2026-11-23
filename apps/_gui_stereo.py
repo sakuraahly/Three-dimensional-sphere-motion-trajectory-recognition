@@ -1681,9 +1681,14 @@ class StereoWindow(tk.Toplevel):
         from tkinter import filedialog
         # 内参文件是 StereoRig 的 .npz；起点固定为项目的 config/calib，
         # 不跟随 Windows 的“上次目录”（否则可能在文档/桌面）。
+        # 干净安装包里可能还没有 config/calib（config 只带 .gitkeep），
+        # 这时退到项目根；**绝不能**把无效 initialdir 交给 Tk，否则 Windows
+        # 会悄悄回退到“上次文件夹”。
+        start = PROJECT_ROOT / "config" / "calib"
+        if not start.is_dir():
+            start = PROJECT_ROOT
         got = filedialog.askopenfilename(
-            parent=self,
-            initialdir=str(PROJECT_ROOT / "config" / "calib"),
+            parent=self, initialdir=str(start),
             filetypes=[("标定文件", "*.npz *.json"), ("全部", "*.*")])
         if got:
             var.set(got)
