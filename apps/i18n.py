@@ -9,13 +9,14 @@
 这里换一种做法：
 
 - **源码里的中文原样保留**，它就是 key；
-- `t(text)` 查 `apps/i18n_data.py` 生成的双语表，命中就换，没命中回退原文；
+- `t(text)` 查 `apps/i18n_data.py` 的**整句英文**表，命中就换，没命中回退中文；
+- **不做逐词/子串自动英文化**：`Record与识别`、`Calibration堆栈` 这种混排
+  比保留中文更难读；新文案必须先登记、再补完整译文；
 - 窗口建好后 `apply(widget)` 递归遍历控件树，把 Label / Button / 标题 /
   菜单 / Treeview 表头与条目的显示文本过一遍 `t()`；
-- 新建窗口由 `install()` 挂的钩子在 `after_idle` 自动补一次，
-  **所以以后新增界面、新增文案，不用改本文件任何一行**；
-- `apps/tools/i18n_extract.py` 扫描源码自动把新文案登记进两份语言资源，
-  并用 `i18n_seed.py` 的领域词典自动给出英文（详见该工具文档）。
+- 新建窗口由 `install()` 挂的钩子在 `after_idle` 自动补一次；
+- `apps/tools/i18n_extract.py` 只负责登记新文案，译文在
+  `i18n_data.py` 中维护（`i18n_seed.py` 只提供少量固定词条的精确译文）。
 
 ## 明确的安全边界
 
@@ -33,7 +34,6 @@
 
 from __future__ import annotations
 
-import re
 import tkinter as tk
 from functools import lru_cache
 from pathlib import Path
@@ -51,7 +51,6 @@ ROOT = next(p for p in Path(__file__).resolve().parents
 LANG_FILE = ROOT / "config" / "language.txt"
 LANGS = ("zh-CN", "en-US")
 LANG_LABELS = {"zh-CN": "中文", "en-US": "English"}
-_CN = re.compile(r"[\u4e00-\u9fff]")
 
 _current = "zh-CN"
 _installed = False
@@ -72,25 +71,6 @@ def table(lang: str) -> dict[str, str]:
     return merged
 
 
-@lru_cache(maxsize=1)
-def _phrase_pattern() -> re.Pattern[str] | None:
-    """按 key 长度降序编译一张大正则：长词先替换，避免 "左目" 被 "左" 拆掉。"""
-    keys = sorted((k for k in table(_current) if len(k) >= 2 and _CN.search(k)),
-                  key=len, reverse=True)
-    return re.compile("|".join(re.escape(k) for k in keys)) if keys else None
-
-
-def _autofill(text: str) -> str:
-    """整句没命中时用领域词典自动组词，让动态拼接的状态文本也能英文化。"""
-    pat = _phrase_pattern()
-    # 长段落（帮助正文、模式卡说明）也要英文化，否则切到英文后整屏还是中文。
-    # 一次正则扫描是线性的，2000 字以内不会成为 UI 卡顿点。
-    if pat is None or len(text) > 2000:
-        return text
-    tbl = table(_current)
-    return pat.sub(lambda m: tbl.get(m.group(0), m.group(0)), text)
-
-
 def t(text):
     """翻译一段**界面文本**；非字符串、中文模式、未登记的文本原样返回。"""
     if not isinstance(text, str) or not text or _current == "zh-CN":
@@ -98,10 +78,9 @@ def t(text):
     hit = table(_current).get(text)
     if hit:
         return hit
-    if _CN.search(text):
-        filled = _autofill(text)
-        if filled != text:
-            return filled
+    # 不做逐词/子串自动英文化：中文和英文词混在一句里（如
+    # “Record与识别”“Calibration堆栈”）比保留中文更难读。未登记的新文案
+    # 先回退中文，等 `i18n_extract.py --write` 登记后再人工补整句英文。
     return text
 
 
@@ -125,7 +104,6 @@ def set_language(lang: str) -> None:
         return
     _current = lang
     table.cache_clear()
-    _phrase_pattern.cache_clear()
     try:
         LANG_FILE.parent.mkdir(parents=True, exist_ok=True)
         LANG_FILE.write_text(lang, encoding="utf-8")
