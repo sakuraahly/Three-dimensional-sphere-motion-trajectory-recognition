@@ -1174,8 +1174,8 @@ _PID_FILE = ".gui.pid"
 _INSTANCE_LOCK = {"fd": None, "path": None}
 
 
-def _raise_existing_window() -> None:
-    """把已经在跑的那个主窗口叫到前面（找不到就什么也不做）。
+def _raise_existing_window() -> bool:
+    """把已经在跑的那个主窗口叫到前面；找到并置前返回 True。
 
     不能只用 ``FindWindowW(精确标题)``：旧实例可能被最小化、标题被对话框临时
     改掉，或者窗口还在但不在前台。2026-11-23 实测 launcher 第二次启动时只弹
@@ -1183,18 +1183,14 @@ def _raise_existing_window() -> None:
     这里优先按 ``.gui.pid`` 的进程号枚举该进程的所有顶层窗口，再回退到标题。
     """
     if sys.platform != "win32":
-        return
+        return False
     try:
         import ctypes
         from ctypes import wintypes
 
         user32 = ctypes.windll.user32
         user32.FindWindowW.restype = wintypes.HWND
-        pid = 0
-        try:
-            pid = int(_pid_path().read_text(encoding="ascii").strip())
-        except (OSError, ValueError):
-            pid = 0
+        pid = _lock_owner_pid()
 
         handles: list[int] = []
         if pid:
@@ -1209,16 +1205,75 @@ def _raise_existing_window() -> None:
             user32.EnumWindows(_enum, 0)
 
         for hwnd in handles:
+            if not user32.IsWindowVisible(hwnd):
+                continue
             user32.ShowWindow(hwnd, 9)          # SW_RESTORE
             user32.SetForegroundWindow(hwnd)
-            return
+            return True
 
         hwnd = user32.FindWindowW(None, "球形物体三维运动轨迹识别")
         if hwnd:
             user32.ShowWindow(hwnd, 9)
             user32.SetForegroundWindow(hwnd)
+            return True
     except Exception:                            # noqa: BLE001
         pass
+    return False
+
+
+def _lock_owner_pid() -> int:
+    """单实例锁持有者 PID；读不到/已死返回 0。"""
+    try:
+        pid = int(_pid_path().read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return 0
+    if pid <= 0:
+        return 0
+    try:
+        import ctypes
+
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return 0
+        code = ctypes.c_ulong()
+        ok = bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+        k32.CloseHandle(handle)
+        return pid if ok else 0
+    except Exception:                            # noqa: BLE001
+        return 0
+
+
+def _offer_kill_stale_instance() -> bool:
+    """旧实例没有可见窗口时，询问是否结束它并重开。
+
+    这不是默认行为：只有用户明确点了「是」才会杀进程树。旧实例可能正占着
+    相机，用户看到的不是“相机坏了”，而是新实例永远被单实例锁挡掉。
+    """
+    if sys.platform != "win32":
+        return False
+    pid = _lock_owner_pid()
+    if not pid:
+        return False
+    try:
+        import ctypes
+
+        text = (f"检测到旧实例 PID {pid} 正在运行，但没有可见窗口。\n\n"
+                "它可能还占着相机，导致新窗口打不开。\n"
+                "结束旧实例并重新启动吗？（会中断旧窗口里的任务）")
+        title = "旧实例没有窗口"
+        # MB_YESNO(4) | MB_ICONWARNING(0x30) | MB_TOPMOST(0x40000)
+        ret = ctypes.windll.user32.MessageBoxW(
+            None, text, title, 0x40034)
+        if ret != 6:                             # IDYES
+            return False
+        import subprocess
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, creationflags=0x08000000)
+        time.sleep(0.5)
+        return True
+    except Exception:                            # noqa: BLE001
+        return False
 
 
 def _lock_dir():
@@ -1396,9 +1451,20 @@ def run() -> int:
     """
     if not _claim_single_instance():
         _log_launch_context("被单实例锁挡掉，本次没有开窗口")
-        _explain_already_running()
-        return 2
-    _log_launch_context("正常启动")
+        # 先尝试把旧窗口叫到前面；如果旧进程连可见窗口都没有（常见于
+        # 关窗后任务线程仍在/相机仍被占着），只弹“已经在运行”会让用户卡死。
+        # 只有用户明确点击“是”才结束旧进程树并重试，绝不自动杀。
+        if not _raise_existing_window() and _offer_kill_stale_instance():
+            if _claim_single_instance():
+                _log_launch_context("结束旧实例后正常启动")
+            else:
+                _explain_already_running()
+                return 2
+        else:
+            _explain_already_running()
+            return 2
+    else:
+        _log_launch_context("正常启动")
     # 退出也留一行（2026-11-08）：只有"正常启动"没有"进程退出"，
     # 才能区分"窗口关了进程还在"和"进程真的走了"—— 这次就是分不清。
     import atexit
