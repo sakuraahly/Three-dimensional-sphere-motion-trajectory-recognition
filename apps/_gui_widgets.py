@@ -894,9 +894,10 @@ class StatusBar(ttk.Frame):
             level, "Hint.TLabel")
         try:
             self._label.configure(text=text, style=style)
-            # 动态状态文本也要跟着语言走。只刷新这一个控件：apply 会记住
-            # 原文再翻译，切回中文时能还原，而不是把译文再翻一遍。
-            i18n.apply(self._label)
+            # 状态文本由调用方用 tf() 按**当前语言**现场生成，不应被原文记账
+            # 当成静态控件文案：清掉记账，避免切语言时 apply() 拿上一语言的
+            # 显示值当原文、把刚生成的英文又翻回中文（2026-11-23 实测）。
+            i18n.forget(self._label)
         except tk.TclError:
             pass
 

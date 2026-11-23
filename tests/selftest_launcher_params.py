@@ -2808,6 +2808,13 @@ def _check_i18n() -> list[tuple[str, bool]]:
 
     keys = ex.scan_all()
     done = sum(1 for v in i18n_data.EN_US.values() if v)
+
+    # 2026-11-23 实测漏翻的根因回归：门厅三张卡的说明写在局部元组 `specs`
+    # 里，循环解包后以变量传给 card()。旧提取器只认调用点的字面量，三句
+    # 从未进词典，切到 en-US 后正文照旧中文，而当时所有门禁全绿。
+    # 这里同时守"扫得到"和"翻得出"，缺任一条都会让截图里的现象复现。
+    hub_keys = ex.extract_strings(ROOT / "apps" / "_gui_app.py")
+    card_desc = sorted(k for k in hub_keys if k.startswith("深度靠"))
     checks: list[tuple[str, bool]] = [
         ("中英文两种语言已注册",
          "zh-CN" in i18n.LANGS and "en-US" in i18n.LANGS),
@@ -2824,6 +2831,8 @@ def _check_i18n() -> list[tuple[str, bool]]:
         # 所以这里把"记得登记"变成判据：GUI 文件必须都在白名单里。
         (f"i18n 扫描白名单覆盖全部界面文件（漏 {sorted(_unscanned_gui_files())}）",
          not _unscanned_gui_files()),
+        ("提取器能扫到门厅 specs 元组里的模式卡说明（3 句）",
+         len(card_desc) >= 3),
     ]
 
     with tempfile.TemporaryDirectory() as td:
@@ -2838,6 +2847,21 @@ def _check_i18n() -> list[tuple[str, bool]]:
             i18n.set_language("en-US")
             en = i18n.t("确定")
             auto = i18n.t("已选 3 个文件 / 12 个")
+            # 必须在切回中文**之前**取英文结果：下面的 checks 是切回之后才构造的
+            en_cards = [i18n.t(s) for s in card_desc]
+            # 动态状态句的英文模板：用纯数据假 state，不依赖 GUI / 本机标定文件。
+            # 截图里"就绪：已标定 fx=…"这类句子整句不在词典里，只有 tf() 模板
+            # 能翻；这条守着"状态骨架在英文模式下不再漏中文"。
+            from apps._gui_app import AppState as _AppState
+            fake = object.__new__(_AppState)
+            fake.notes = ["单目标定未绑定设备身份（老文件），换相机不会自动报警；请重标"]
+            fake.infos = []
+            fake.profile = type("P", (), {"name": "demo-rig"})()
+            fake.rig = type("R", (), {"angle_deg": 86.5, "baseline_mm": 444.0,
+                                      "meta": {"stereo_mode": "angled"}})()
+            en_status = fake.status_text()[0]
+            en_mono = i18n.tf("已标定 fx = {fx:.0f} px{extra}{tag}",
+                              fx=1388.0, extra="", tag="")
             saved = i18n.LANG_FILE.read_text(encoding="utf-8").strip()
             i18n.set_language("zh-CN")
             back = i18n.t("确定")
@@ -2847,8 +2871,18 @@ def _check_i18n() -> list[tuple[str, bool]]:
                 ("每条中文文案都有完整英文（非空且无中文）",
                  all(v and not any("\u4e00" <= c <= "\u9fff" for c in v)
                      for v in i18n_data.EN_US.values())),
+                # 这句是**故意未登记**的探针，只验证"不做逐词拼接"这一行为；
+                # 它不是界面真实文案。界面文案必须登记，由下面 card_desc 的
+                # 断言守着 —— 别把这条读成"漏翻也可以接受"（2026-11-23 教训）。
                 ("未登记长句不再逐词拼接（保持中文）",
                  auto == "已选 3 个文件 / 12 个"),
+                ("门厅三句模式卡说明在 en-US 下真的翻成英文",
+                 len(en_cards) == len(card_desc) >= 3
+                 and all(v != s and not has_cn(v)
+                         for v, s in zip(en_cards, card_desc))),
+                ("动态状态句在 en-US 下翻成英文（fx/装置名等数据保留）",
+                 not has_cn(en_status) and not has_cn(en_mono)
+                 and "Active rig" in en_status and "Calibrated fx" in en_mono),
                 ("语言偏好已持久化", saved == "en-US"),
                 ("切回中文能还原（不会把译文当原文）", back == "确定"),
             ]
@@ -2885,7 +2919,11 @@ def _check_i18n() -> list[tuple[str, bool]]:
         ("主界面有语言切换入口",
          "i18n.set_language" in gui_src and "Combobox" in gui_src),
         ("状态栏 / 消息框 / 帮助窗口都接入翻译",
-         "i18n.apply(self._label)" in widget_src
+         # 状态栏用 forget() 清动态句的原文记账（旧版是 apply(self._label)，
+         # 会把新语言文本误当旧原文，2026-11-23 实测）；HubWindow 再用
+         # _i18n_refresh 重生成状态句。断言守语义，不钉某一行实现。
+         "i18n.forget(self._label)" in widget_src
+         and "def _i18n_refresh" in gui_src
          and "_i18n_patched" in runtime_src
          and "i18n.t(body)" in help_src),
     ]

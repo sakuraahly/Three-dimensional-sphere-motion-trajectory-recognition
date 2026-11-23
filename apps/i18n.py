@@ -88,6 +88,26 @@ def t_all(items):
     return [t(x) if isinstance(x, str) else x for x in items]
 
 
+def tf(template: str, **kwargs) -> str:
+    """带占位符的整句翻译：先翻**模板**，再 format 填动态值。
+
+    为什么需要它（2026-11-23）：状态条/卡片上有大量"就绪：已标定 fx=1388…"
+    这类句子，数据（fx、装置名、日期）不该翻译、中文骨架该翻译。整句 t()
+    对拼好的动态串永远命不中词典，只能原样中文；逐词拼接又会产生
+    "Calibration堆栈"那种混排（会破坏可读性，已在 d9ff001 废弃）。
+    tf() 走中间路线：词典登记**中文模板**（含 `{place}`），运行时先取译文
+    模板再填值。调用点必须写`字面量模板`，才能被 i18n_extract 扫到。
+
+    注意：这些状态文本是代码显式 configure 上去的，不走 apply() 的原文
+    记账，所以切语言时不会把英文结果误存成"原文"（B-185 只影响 apply 路径）。
+    """
+    translated = t(template)
+    try:
+        return translated.format(**kwargs)
+    except (KeyError, IndexError, ValueError):
+        return translated
+
+
 # --------------------------------------------------------------------------- #
 # 语言状态
 # --------------------------------------------------------------------------- #
@@ -172,6 +192,19 @@ def _set_translated(d: dict[str, str], key: str, cur: str, setter) -> None:
         _mark_shown(d, key, cur)
 
 
+def forget(widget) -> None:
+    """清空控件的原文记账：下次 apply() 以**当前**显示值为原文。
+
+    给"运行时拼出来的状态文本"用（StatusBar / 卡片状态标签）。这类文本
+    由代码用 tf() 按当前语言现场生成，不该让记账把上一语言的显示值当原文
+    —— 否则切语言时 apply() 会把新生成的英文误翻回旧中文（2026-11-23）。
+    """
+    try:
+        delattr(widget, "_i18n_orig")
+    except (AttributeError, TypeError):
+        pass
+
+
 def _swap(widget, opt: str, *, getter, setter) -> None:
     try:
         cur = getter()
@@ -245,6 +278,22 @@ def _apply_tree(widget) -> None:
             walk(child, depth + 1)
 
     walk("")
+
+
+def apply_children(widget) -> None:
+    """只翻译 widget 的**子树**，不触发 widget 自己的 _i18n_refresh。
+
+    给"动态状态句"的容器用：容器的 _i18n_refresh 先用新语言重新生成那几句
+    （它们不在词典里，apply() 的整句匹配够不着），再调本函数把其余静态控件
+    照常翻一遍。直接调 apply(容器) 会再次触发钩子 → 递归。
+    """
+    try:
+        if not widget.winfo_exists():
+            return
+    except (tk.TclError, AttributeError):
+        return
+    for child in widget.winfo_children():
+        apply(child)
 
 
 def apply(widget) -> None:

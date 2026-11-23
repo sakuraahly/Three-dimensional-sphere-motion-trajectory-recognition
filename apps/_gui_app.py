@@ -47,6 +47,7 @@ from apps._gui_widgets import (ACCENT, BG, FONT_FAMILY, INK, MUTED, OK, WARN,
                                init_style)
 from apps._task_runner import ROOT, TaskRunner
 from apps import _actions
+from apps import i18n
 from stereo.profiles import (calibration_files_exist, calibration_identity,
                              IDENTITY_MISMATCH, IDENTITY_UNREGISTERED)
 
@@ -236,15 +237,20 @@ class AppState:
         说明，只拼进文案、不升成 warn。抽成纯方法后，``_reload_state()`` 与
         切换档案都能复用它，且可在测试里用假 state 纯数据验证「文案随档案变」。
         """
-        notes = "；".join(self.notes) if self.notes else ""
-        infos = "；".join(self.infos) if self.infos else ""
+        # notes/infos 本身可能有 f-string 拼好的动态内容，先逐句过 t()：
+        # 整句登记的静态说明会被翻译，动态句原样保留（不逐词拼接）。
+        sep = i18n.t("；")
+        notes = sep.join(i18n.t(p) for p in self.notes) if self.notes else ""
+        infos = sep.join(i18n.t(p) for p in self.infos) if self.infos else ""
         prof = getattr(self.profile, "name", None)
-        head = f"当前装置：{prof}" if prof else "未设置装置档案"
+        head = (i18n.tf("当前装置：{prof}", prof=prof) if prof
+                else i18n.t("未设置装置档案"))
         if self.rig is not None:
-            mode = self.stereo_mode() or "未记录模式"
-            head += f"（标定模式 {mode}）"
+            mode = self.stereo_mode() or i18n.t("未记录模式")
+            head += i18n.tf("（标定模式 {mode}）", mode=mode)
         parts = [p for p in (notes, infos) if p]
-        text = head + (f"｜{'；'.join(parts)}" if parts else "")
+        text = head + (i18n.tf("｜{parts}", parts=sep.join(parts))
+                       if parts else "")
         level = "warn" if (self.notes or (prof and self.rig is None)) else "info"
         return text, level
 
@@ -340,8 +346,9 @@ class AppState:
         """档案模式与标定 meta 不一致时，返回一句人话；一致/缺信息返回 None。"""
         pm, cm = self.profile_mode(), self.stereo_mode()
         if pm and cm and pm != cm:
-            return (f"装置档案声明「{pm}」，标定文件却记为「{cm}」—— "
-                    "这很可能是别套装置的标定，请给当前装置重新标定")
+            return i18n.tf("装置档案声明「{pm}」，标定文件却记为「{cm}」—— "
+                           "这很可能是别套装置的标定，请给当前装置重新标定",
+                           pm=pm, cm=cm)
         return None
 
     def mode_allowed(self, key: str) -> bool:
@@ -381,32 +388,36 @@ class AppState:
         跟双目装置（基线/夹角）无关 —— 所以正确做法不是把它塞进档案，
         而是把"全局、独立"这件事**写在卡片上**，别让人以为是档案没生效。
         """
-        tag = "（单目内参：全局独立，与双目装置档案无关）"
+        # 状态句用 tf() 模板：动态值（日期/相机名/fx）不翻译，中文骨架翻译。
+        # 中文模式下 tf 恒等，既有测试与文案一字不变。
+        tag = i18n.t("（单目内参：全局独立，与双目装置档案无关）")
         try:
             import datetime as _dt
 
             when = _dt.datetime.fromtimestamp(
                 MONO_CALIB_PATH.stat().st_mtime).strftime("%Y-%m-%d")
             cam = self.mono.get("camera") if self.mono else None
-            tag = (f"（全局单目内参，与双目档案无关；"
-                   f"{when}，camera={cam or '未记录'}）")
+            tag = i18n.tf("（全局单目内参，与双目档案无关；{when}，camera={cam}）",
+                          when=when, cam=cam or i18n.t("未记录"))
         except (OSError, ValueError):
             pass
         if not self.mono:
-            return False, ("未标定。现在会按 60° 视场估算焦距 —— "
-                           "1% 焦距误差在 0.6 m 处就是 6 mm，请先做内参标定" + tag)
+            return False, i18n.t("未标定。现在会按 60° 视场估算焦距 —— "
+                                 "1% 焦距误差在 0.6 m 处就是 6 mm，请先做内参标定") + tag
         fx = self.mono.get("fx")
         if not isinstance(fx, (int, float)) or fx <= 0:
-            return False, "标定文件存在但 fx 无效，请重新标定" + tag
+            return False, i18n.t("标定文件存在但 fx 无效，请重新标定") + tag
         rms = self.mono.get("rms_px")
-        extra = f"，RMS {rms:.2f} px" if isinstance(rms, (int, float)) else ""
+        extra = (i18n.tf("，RMS {rms:.2f} px", rms=rms)
+                 if isinstance(rms, (int, float)) else "")
         bound = str(self.mono.get("device_identity") or "")
         cur = str((self.camera_roles().get("left") or {}).get("identity") or "")
         if bound and cur and bound != cur:
-            return False, "单目标定属于另一台相机，请重做单目内参标定" + tag
+            return False, i18n.t("单目标定属于另一台相机，请重做单目内参标定") + tag
         # 「未绑定」/「已核对」写进 notes（状态条），不塞进卡片：卡片文案每多
         # 一行都会把 mono 第③步顶出 13px（selftest_window_mode 直接盯着下沿）。
-        return True, f"已标定 fx = {float(fx):.0f} px{extra}{tag}"
+        return True, i18n.tf("已标定 fx = {fx:.0f} px{extra}{tag}",
+                             fx=float(fx), extra=extra, tag=tag)
 
     def parallel_status(self) -> tuple[bool, str]:
         """平行双目：档案模式优先，再看标定存在与夹角。"""
@@ -415,24 +426,28 @@ class AppState:
         if conflict:
             return False, conflict
         if pm == "angled":
-            return False, ("当前装置档案是「大角度」—— 平行双目不适用；"
-                           "请切到平行装置档案（本卡不读取大角度标定）")
+            return False, i18n.t("当前装置档案是「大角度」—— 平行双目不适用；"
+                                 "请切到平行装置档案（本卡不读取大角度标定）")
         if self.rig is None:
-            return False, "没有双目标定。平行双目需要两路光轴近平行并做校正"
+            return False, i18n.t("没有双目标定。平行双目需要两路光轴近平行并做校正")
         conflict = self.mode_conflict()
         if conflict:
             return False, conflict
         mode = self.stereo_mode()
         angle = self.angle_deg()
         if mode == "angled":
-            a = f"实测 {angle:.1f}°" if angle is not None else "模式记为 angled"
-            return False, (f"当前标定是**大角度**（{a}）—— 这份结果请用"
-                           f"「大角度双目」窗口，选这里会用错几何")
+            a = (i18n.tf("实测 {angle:.1f}°", angle=angle)
+                 if angle is not None else i18n.t("模式记为 angled"))
+            return False, i18n.tf("当前标定是**大角度**（{a}）—— 这份结果请用"
+                                  "「大角度双目」窗口，选这里会用错几何", a=a)
         base = self.baseline_mm()
-        head = f"已标定基线 {base:.0f} mm" if base is not None else "已标定"
+        head = (i18n.tf("已标定基线 {base:.0f} mm", base=base)
+                if base is not None else i18n.t("已标定"))
         if angle is not None and angle >= 15.0:
-            return False, f"{head}，但实测夹角 {angle:.1f}° 已不算平行"
-        return True, head + (f"，实测夹角 {angle:.1f}°" if angle is not None else "")
+            return False, i18n.tf("{head}，但实测夹角 {angle:.1f}° 已不算平行",
+                                  head=head, angle=angle)
+        return True, head + (i18n.tf("，实测夹角 {angle:.1f}°", angle=angle)
+                             if angle is not None else "")
 
     def angled_status(self) -> tuple[bool, str]:
         """大角度双目：接受 joint（跳过 FOV）与 chain（单板，无共视）两种产物。
@@ -446,22 +461,24 @@ class AppState:
         if conflict:
             return False, conflict
         if pm == "parallel":
-            return False, ("当前装置档案是「平行」—— 大角度双目不适用；"
-                           "请切到大角度装置档案并给它单独标定（本卡不读取平行标定）")
+            return False, i18n.t("当前装置档案是「平行」—— 大角度双目不适用；"
+                                 "请切到大角度装置档案并给它单独标定（本卡不读取平行标定）")
         if self.rig is None:
-            return False, "没有双目标定。大角度可用「两路共视」或「单板链式」两条路"
+            return False, i18n.t("没有双目标定。大角度可用「两路共视」或「单板链式」两条路")
         conflict = self.mode_conflict()
         if conflict:
             return False, conflict
         mode = self.stereo_mode()
         angle = self.angle_deg()
         base = self.baseline_mm()
-        a = f"{angle:.1f}°" if angle is not None else "未知夹角"
-        b = f"{base:.0f} mm" if base is not None else "未知基线"
+        a = (i18n.tf("{angle:.1f}°", angle=angle)
+             if angle is not None else i18n.t("未知夹角"))
+        b = (i18n.tf("{base:.0f} mm", base=base)
+             if base is not None else i18n.t("未知基线"))
         if mode == "parallel":
-            return False, (f"当前标定是**平行**（{a}，基线 {b}）—— 请用"
-                           f"「平行双目」窗口")
-        return True, f"已标定 {a}，基线 {b}（含单板链式产物）"
+            return False, i18n.tf("当前标定是**平行**（{a}，基线 {b}）—— 请用"
+                                  "「平行双目」窗口", a=a, b=b)
+        return True, i18n.tf("已标定 {a}，基线 {b}（含单板链式产物）", a=a, b=b)
 
 
 # --------------------------------------------------------------------------- #
@@ -842,8 +859,17 @@ class HubWindow(tk.Toplevel):
         def _on_language(_event=None) -> None:
             idx = lang_combo.current()
             if 0 <= idx < len(i18n.LANGS):
-                i18n.set_language(i18n.LANGS[idx])
-                self.status.set_status("界面语言已切换为 " + i18n.label(), "ok")
+                new_lang = i18n.LANGS[idx]
+                i18n.set_language(new_lang)
+                # 提示语本身必须跟着**新**语言走：set_language 已经把 _current
+                # 改掉了，这里按新语言给出整句（不是"中文前缀 + 英文标签"）。
+                # 不用 "{lang}" 模板 + format()：i18n.apply() 的原文记账拿到的是
+                # 格式化后的整句，模板 key 命不中，切回中文不会还原（见 B-185）。
+                if new_lang == "zh-CN":
+                    notice = "界面语言已切换为 " + i18n.label()
+                else:
+                    notice = "Interface language switched to " + i18n.label()
+                self.status.set_status(notice, "ok")
 
         lang_combo.bind("<<ComboboxSelected>>", _on_language)
 
@@ -1141,8 +1167,10 @@ class HubWindow(tk.Toplevel):
             clean = text.replace("**", "「", 1)
             while "**" in clean:
                 clean = clean.replace("**", "」", 1)
-            lab.configure(text=("就绪：" if ready else "还不能用：") + clean,
+            prefix = i18n.t("就绪：") if ready else i18n.t("还不能用：")
+            lab.configure(text=prefix + i18n.t(clean),
                           style="Ok.TLabel" if ready else "Warn.TLabel")
+            i18n.forget(lab)  # 动态生成的句子，清记账（同 StatusBar）
             if key in ("parallel", "angled"):
                 allowed = st.mode_allowed(key)
                 self._cards[key]["enter"].configure(
@@ -1152,6 +1180,20 @@ class HubWindow(tk.Toplevel):
         text, level = st.status_text()
         self.status.set_status(text, level)
         return text, level
+
+    def _i18n_refresh(self) -> None:
+        """切语言时重生成动态状态句（i18n.apply 的约定钩子）。
+
+        卡片上的"就绪：已标定 fx=…"这类句子由状态数据现场拼出来，整句不在
+        词典里，apply() 的 t() 命中不了 —— 必须重新跑一遍 _refresh()，让
+        status_*() / status_text() 用新语言的 tf() 模板重新生成。随后
+        apply_children() 把其余静态控件照常翻译；不能调 apply(self)，那会
+        再次触发本钩子造成递归（2026-11-23 实测坑）。
+        """
+        try:
+            self._refresh()
+        finally:
+            i18n.apply_children(self)
 
 
 # --------------------------------------------------------------------------- #

@@ -84,6 +84,12 @@ TEXT_POSITIONAL = {
     "card": (1, 2), "primary": (1,), "secondary": (1,),
     "accent": (1,), "chip": (1,), "section": (1,),
     "heading": (2,), "add_command": (), "title": (0,),
+    # 翻译函数本身的首参就是界面文案（含 tf 的占位符模板）。不登记这两条，
+    # 状态骨架用 tf() 改写后提取器看不见，--check 会假报"一致"。
+    "t": (0,), "tf": (0,),
+    # notes.append("...") / infos.append("...") 存的是状态条上给人看的说明，
+    # 不是代码内部标识。漏了它，状态条在英文模式下就留一句中文（2026-11-23）。
+    "append": (0,),
 }
 _CN = re.compile(r"[\u4e00-\u9fff]")
 #: 明显不是界面文字：格式串、路径、样式名、颜色、URL、纯标点片段。
@@ -121,6 +127,48 @@ def _const(node, docs: set[int], out: set[str]) -> None:
         out.add(node.value)
 
 
+def _text_variables(tree: ast.AST) -> set[str]:
+    """找出"被当作显示文本传给 UI 工厂"的局部变量名。
+
+    为什么需要这一趟（2026-11-23 实测漏翻的根因）：
+    门厅三张卡的说明不是直接写在 `card(..., desc)` 里，而是先存进局部元组
+    `specs = (("mono", 标题, 说明, opener), ...)`，循环里再用变量传入。
+    旧提取器只看调用点的字面量参数，变量被 `_const()` 直接跳过 —— 于是
+    这三句从未进词典，`--check` 却报"与源码一致"，英文界面照旧中文。
+
+    这是一次**点到为止的数据流追踪**：只回溯"变量名 → 它的赋值表达式"，
+    不做跨函数/跨模块分析，避免把算法里的中文字符串误收进界面词典。
+    """
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = (func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name) else "")
+        args = []
+        for i in TEXT_POSITIONAL.get(name, ()):
+            if i < len(node.args):
+                args.append(node.args[i])
+        args += [kw.value for kw in node.keywords if kw.arg in TEXT_KWARGS]
+        for arg in args:
+            # 解开 + / f-string 里的变量名；常量在调用点已被 _const 收走
+            for sub in ast.walk(arg):
+                if isinstance(sub, ast.Name):
+                    used.add(sub.id)
+
+    # 第二层：循环解包。门厅写的是 `for key, title, desc, opener in specs:`
+    # 再 `card(parent, title, desc)` —— 调用点只见到 title/desc，真正的中文
+    # 在 specs 的赋值里。把"被解包出来的文本变量 ← 迭代源变量"接上。
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For) or not isinstance(node.iter, ast.Name):
+            continue
+        loop_vars = {t.id for t in ast.walk(node.target) if isinstance(t, ast.Name)}
+        if loop_vars & used:
+            used.add(node.iter.id)
+    return used
+
+
 def extract_strings(path: Path) -> set[str]:
     """扫一个模块，返回用户可见的中文字符串集合（供自测直接调用）。"""
     try:
@@ -134,6 +182,8 @@ def extract_strings(path: Path) -> set[str]:
         for node in ast.walk(tree):
             _const(node, docs, out)
         return out
+
+    text_vars = _text_variables(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -168,6 +218,21 @@ def extract_strings(path: Path) -> set[str]:
                     if not (note_assign and has_joined):
                         for sub in ast.walk(value):
                             _const(sub, docs, out)
+        # 变量回溯：只回溯**数据结构字面量**赋值（元组/列表/字典）。
+        # 门厅 `specs = ((标题, 说明, opener), ...)` 就是这种：循环解包后
+        # 以变量传给 card()，字面量藏在赋值里。
+        # 绝不回溯 `text = ...` / `head = f"..."` 这类普通变量 —— 那些是运行时
+        # 拼出来的状态串，扫进来会得到几十条半句噪声 key（2026-11-23 实测
+        # 一次多扫 96 条）。f-string 同样跳过：碎片不能当整句 key。
+        if (isinstance(node, ast.Assign)
+                and isinstance(node.value, (ast.Tuple, ast.List, ast.Dict))):
+            targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            if targets & text_vars:
+                has_joined = any(isinstance(sub, ast.JoinedStr)
+                                 for sub in ast.walk(node.value))
+                if not has_joined:
+                    for sub in ast.walk(node.value):
+                        _const(sub, docs, out)
     return out
 
 
