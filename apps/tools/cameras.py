@@ -138,7 +138,7 @@ def cmd_list(args) -> int:
         print(f"⚠ 其中 {len(virtuals)} 台是**虚拟摄像头**（不参与绑定）：")
         for d in virtuals:
             print(f"     #{d.order}  {d.name}")
-        print("   含义：它们由别的软件（vivo 办公套件 / OBS / 手机投屏…）注册，"
+        print("   含义：它们由别的软件（虚拟摄像头 / OBS / 手机投屏…）注册，"
               "在系统设备列表里**根本不是一台相机**。")
         print("   所以：不能设成 left/right，也不会进「预览全部外接」的候选。")
 
@@ -759,7 +759,7 @@ def _preview_and_assign(index: int, entry: cr.DeviceEntry, status: str = "",
                         # 那是**预期行为**。原来的提示只写"是不是别的程序占着"，
                         # 会把内置相机这种正常情况也引向"去查占用/拔插"。
                         print(f"     排查（按顺序）：① 这台是不是**笔记本内置相机**"
-                              f"（名字含 `Integrated`）？本机它是**有意被遮住**的，"
+                              f"（名字含 `Integrated`）？内置相机可能被遮住/关闭，"
                               f"读不到画面属正常 → 按 `n` 标「无关」即可；")
                         print(f"     ② 若是外接那台：镜头是否被挡/盖 → 别的程序"
                               f"（QQ/会议/浏览器）是否占着 → 拔插 USB。")

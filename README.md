@@ -172,7 +172,7 @@ python tests/selftest_stereo_branch.py
 1. **固定**：把"哪台是左、哪台是右"记成**设备身份**（Windows 上取 PnP `InstanceId` / USB 端口）
    存进 `config/cameras.json`，之后用**角色名**启动。
 2. **按端口选**：`--left port:Port_#0001.Hub_#0003`、`--right id:USB\VID_...`、
-   `--right name:aoni` 都能直接指定物理设备。
+   `--right name:USB 相机` 都能直接指定物理设备。
 3. **自动挑**：不指定时（`run_realtime.py` 默认、`--auto-cameras`）在启动阶段探测所有索引，
    挑"能打开 + 非全黑 + 分辨率达标"的，优先外接、避开内置/红外。
 
@@ -223,10 +223,10 @@ python apps/tools/cameras.py modes --left left --right right --modes 1920x1080 -
 
 | 编号 | 设备                                        | 状态                                                                             |
 | ---- | ------------------------------------------- | -------------------------------------------------------------------------------- |
-| `0`  | **aoni webcam A25**（外接 USB）             | ✅ 可用，成像正常；双目一台                                                       |
-| `1`  | **aoni webcam A25**（外接 USB）             | ✅ 可用，成像正常；双目另一台                                                     |
-| `2`  | **Integrated Camera**（笔记本内置）         | ⚠️ 可用但**自拍视角**（对着使用者），**不要用于双目**（无法刚性固定），仅应急备选 |
-| `3`  | Integrated IR Camera（红外，Windows Hello） | ❌ OpenCV 打不开；且红外**无彩色**，不能用于本课题                                |
+| `0`  | **USB 相机**（外接 USB）             | ✅ 可用，成像正常；双目一台                                                       |
+| `1`  | **USB 相机**（外接 USB）             | ✅ 可用，成像正常；双目另一台                                                     |
+| `2`  | **内置相机**（笔记本内置）         | ⚠️ 可用但**自拍视角**（对着使用者），**不要用于双目**（无法刚性固定），仅应急备选 |
+| `3`  | 内置红外相机（红外，Windows Hello） | ❌ OpenCV 打不开；且红外**无彩色**，不能用于本课题                                |
 
 > 结论：**别背编号，跑 `python apps/tools/cameras.py list` 看当前顺序。**
 > 这套编号会随插口漂移：本文档最早实测是"0、2 = 外接，1 = 内置"，
@@ -496,7 +496,7 @@ python apps/run_video.py assets/videos/ball.mp4 --out outputs/videos/annotated.m
 
 **方法怎么选：要看画面纹理，不能只看"哪个词听起来稳"**（2026-10-14 实测，1920x1080）：
 
-| 方法 | 简单画面（纯色底 + 一个圆） | **真实房间（书架、床、杂物）** |
+| 方法 | 简单画面（纯色底 + 一个圆） | **真实房间（书架、机位 A、杂物）** |
 | ---- | --------------------------- | ------------------------------ |
 | `color` | 17.7 ms → 56 fps | **17.8 ms → 56 fps** |
 | `motion` | 18.5 ms | 15.5 ms |
@@ -899,10 +899,10 @@ while True:
 python apps/tools/cameras.py list --probe
 
 #    输出示例（名字取自系统 PnP，比注册表猜的准；编号是枚举位次，会漂移）
-#    #0  aoni webcam A25      端口 6&31324e2c&0&0000   id USB\VID_1BCF&PID_2A25&MI_00\...
-#    #1  aoni webcam A25      端口 6&4489382&0&0000    id USB\VID_1BCF&PID_2A25&MI_00\...
-#    #2  Integrated Camera    端口 6&3a5c8ec3&1&0000   id USB\VID_30C9&PID_00EC&MI_00\...  [内置/红外,不推荐]
-#    #3  Integrated IR Camera 端口 6&3a5c8ec3&1&0002   id USB\VID_30C9&PID_00EC&MI_02\...  [内置/红外,不推荐]
+#    #0  USB 相机      端口 6&31324e2c&0&0000   id USB\VID_1BCF&PID_2A25&MI_00\...
+#    #1  USB 相机      端口 6&4489382&0&0000    id USB\VID_1BCF&PID_2A25&MI_00\...
+#    #2  内置相机    端口 6&3a5c8ec3&1&0000   id USB\VID_30C9&PID_00EC&MI_00\...  [内置/红外,不推荐]
+#    #3  内置红外相机 端口 6&3a5c8ec3&1&0002   id USB\VID_30C9&PID_00EC&MI_02\...  [内置/红外,不推荐]
 
 # 2) 逐个索引真开一遍、报画面是否全黑（老工具，仍可用）
 python apps/tools/list_cameras.py

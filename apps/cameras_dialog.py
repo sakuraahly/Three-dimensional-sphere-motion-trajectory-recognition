@@ -106,18 +106,6 @@ DARK_CLEAR = 16.0
 CAPTURE_UNMEASURED_TEXT = "未实测"
 
 
-def _is_ir_name(name: str) -> bool:
-    """IR / Windows Hello 红外相机：可手动预览，但先提示风险。
-
-    2026-11-23 用户实测：本机 `Integrated IR Camera` 和 vivo 原子笔记的蓝牙
-    连接绑在一起，打开它可能把 vivo 学习笔记反复拉起来。设备控制权属于用户，
-    所以不硬拦；普通 `Integrated Camera` 同样可用。
-    """
-    low = (name or "").casefold()
-    return ("infrared" in low or " ir " in f" {low} "
-            or low.endswith(" ir camera") or "ir camera" in low)
-
-
 
 def _brief(text, limit: int = BRIEF_LIMIT) -> str:
     """把多行长错误压成一行摘要：卡片/状态条的高度不许被文字撑爆。"""
@@ -203,17 +191,15 @@ def _camera_hogs_text() -> str:
     return text
 
 
-#: 打开失败时说清「为什么不换后端试试」（2026-11-11 vivo 虚拟摄像头事件后加）。
+#: 打开失败时说清「为什么不换后端试试」。
+#: 不在用户可见文案里写某台本机设备/型号；规则与型号都由配置决定。
 #:
 #: DSHOW 的枚举与这份设备列表**不是同一套编号**（AGENTS.md §9：索引与标签只在
-#: `INDEX_BACKEND`（MSMF）内成立）。同一编号在 DSHOW 里可能是另一台设备 ——
-#: 用户实测点了 #3「Web Camera Right」的 DSHOW 兜底，画面上开出来的是
-#: vivo 办公套件的虚拟摄像头（它只注册在 DSHOW，PnP 列表里根本没有）。
+#: `INDEX_BACKEND`（MSMF）内成立）。同一编号在 DSHOW 里可能是另一台设备，
 #: 所以**不切换后端**，预览只走 MSMF；打不开就如实说，并给出能照着做的下一步。
 _NO_DSHOW_HELP = (
     "为什么这里不切换后端：DSHOW 的编号与这份设备列表不是同一套，"
-    "按同一个编号打开可能开到别的设备（实测出现过：点 #3 的 DSHOW 试开，"
-    "画面上却是 vivo 办公套件的虚拟摄像头）。所以预览只用系统默认后端（MSMF）。"
+    "按同一个编号打开可能开到别的设备。所以预览只用系统默认后端（MSMF）。"
 )
 _OPEN_FIX_STEPS = (
     "下一步：① 先点卡片上的「重试这一路」；② 还不行就拔插一次这台相机的 USB，"
@@ -860,9 +846,8 @@ class CamerasDialog(tk.Toplevel):
                 if h is not None:
                     role = f"{role} {'✓' if h.status == 'ok' else '⚠'}"
             elif avoided:
-                # 内置/红外这两台是**被物理遮住的**（本机就是这么配的），
-                # 点它们预览必然是黑屏。IR 还和 vivo 原子笔记共用，单独标出来。
-                role = "红外" if _is_ir_name(d.name) else "内置"
+                # 规则来自 settings.avoid_names，不在代码里写死型号。
+                role = "内置"
             else:
                 role = "—"
             caps = [reg.roles[r].capture_index for r in roles
@@ -980,12 +965,6 @@ class CamerasDialog(tk.Toplevel):
                       "也不在这里预览（它只注册在别的后端，PnP 列表里没有它）",
                       error=True)
             return
-        if _is_ir_name(entry.name):
-            # 只提示风险，不替用户做决定。IR 可能和 vivo 原子笔记/Windows Hello
-            # 共用；用户明确要预览时仍然放行。
-            self._say(f"提示：#{entry.order} 是 IR / Windows Hello 红外相机，"
-                      "可能触发 vivo 原子笔记或没有彩色画面；仍按你的选择打开。",
-                      error=False)
         old = self._previews.get(entry.order)
         if old is not None:
             # 2026-11-08 用户连点几次都"没反应"的真 bug：上一次失败的卡片还留在
@@ -999,8 +978,8 @@ class CamerasDialog(tk.Toplevel):
                           "「重试这一路」")
             return
         if cr.is_avoided(entry.name, reg.settings):
-            self._say(f"提示：#{entry.order} 是内置/红外相机（通常被遮住，可能一直黑屏）；"
-                      "要看外接相机请选名字里带 aoni 的那两台")
+            self._say(f"提示：#{entry.order} 被当前相机规则标为内置/不推荐；"
+                      "要看外接相机请选择未标记的设备")
         title = entry.name or "(没名字)"
         pane = _PreviewPane(
             self.grid_frame, entry.order, title,

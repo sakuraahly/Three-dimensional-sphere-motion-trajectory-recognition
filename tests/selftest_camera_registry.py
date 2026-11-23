@@ -2775,7 +2775,7 @@ def test_identify_no_console_fails_loudly() -> bool:
     checks.append(("反向（真变异）：往副本注入 CAP_DSHOW → 判据会红",
                    not no_dshow_ok(mutant)))
     checks.append(("MSMF 打不开时说明「为什么不去切 DSHOW」，并给出可照做的下一步",
-                   "vivo" in dlg_src and "不切换" in dlg_src
+                   "不切换" in dlg_src
                    and "cameras.py doctor" in dlg_src
                    and "不改配置" in dlg_src and "不绑" in dlg_src))
 
