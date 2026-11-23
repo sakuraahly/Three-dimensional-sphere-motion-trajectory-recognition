@@ -106,6 +106,18 @@ DARK_CLEAR = 16.0
 CAPTURE_UNMEASURED_TEXT = "未实测"
 
 
+def _is_ir_name(name: str) -> bool:
+    """IR / Windows Hello 红外相机：不做预览。
+
+    2026-11-23 用户实测：本机 `Integrated IR Camera` 和 vivo 原子笔记的蓝牙
+    连接绑在一起，打开它会把 vivo 学习笔记反复拉起来。它不是双目可用的
+    可见光相机；普通 `Integrated Camera` 不受影响。
+    """
+    low = (name or "").casefold()
+    return ("infrared" in low or " ir " in f" {low} "
+            or low.endswith(" ir camera") or "ir camera" in low)
+
+
 
 def _brief(text, limit: int = BRIEF_LIMIT) -> str:
     """把多行长错误压成一行摘要：卡片/状态条的高度不许被文字撑爆。"""
@@ -849,8 +861,8 @@ class CamerasDialog(tk.Toplevel):
                     role = f"{role} {'✓' if h.status == 'ok' else '⚠'}"
             elif avoided:
                 # 内置/红外这两台是**被物理遮住的**（本机就是这么配的），
-                # 点它们预览必然是黑屏。在列表里直接标出来，别让人以为是外接那台。
-                role = "内置/红外"
+                # 点它们预览必然是黑屏。IR 还和 vivo 原子笔记共用，单独标出来。
+                role = "红外(不预览)" if _is_ir_name(d.name) else "内置"
             else:
                 role = "—"
             caps = [reg.roles[r].capture_index for r in roles
@@ -967,6 +979,11 @@ class CamerasDialog(tk.Toplevel):
             self._say(f"#{entry.order}「{entry.name}」是虚拟摄像头，不参与绑定、"
                       "也不在这里预览（它只注册在别的后端，PnP 列表里没有它）",
                       error=True)
+            return
+        if _is_ir_name(entry.name):
+            self._say(f"#{entry.order}「{entry.name}」是 IR / Windows Hello 红外相机，"
+                      "不在这里预览（它和 vivo 原子笔记的蓝牙链共用，"
+                      "打开会把学习笔记反复拉起来）", error=True)
             return
         old = self._previews.get(entry.order)
         if old is not None:
