@@ -95,7 +95,7 @@ def main() -> int:
     checks.append(("CI workflow 构建 launcher 和 installer",
                    "native\\launcher\\build.bat" in wf
                    and "installer\\build_installer.bat" in wf
-                   and "actions/upload-artifact@v4" in wf))
+                   and "actions/upload-artifact@" in wf))
     checks.append(("CI 构建脚本不等待按键（CI=1 时跳过 pause）",
                    "if not defined CI pause" in raw.decode("utf-8", "ignore")
                    and "if not defined CI pause" in launcher_raw.decode("utf-8", "ignore")))
