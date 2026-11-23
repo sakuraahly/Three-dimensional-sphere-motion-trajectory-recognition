@@ -53,12 +53,12 @@ jobs:
       # 名单与逐条原因在 apps/run_tests.py 的 CI_LOCAL_ASSET_SKIP。
       CI_SKIP_LOCAL_ASSET_TESTS: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # 待办表 done 条目用 commit=<短hash> 对账；浅克隆只剩 1 条 log 会全误报。
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # 本地是 3.14.7；这里稳一档用 3.13 —— opencv 的 cp313 wheel 早就齐了，
           # 3.14 的还在陆续补齐，CI 不该拿"能不能装上依赖"当不确定性来源。
@@ -79,7 +79,7 @@ jobs:
 
       - name: 存下结果 JSON（失败也存，否则看不出哪一步红的）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results
           path: outputs/test_results/
