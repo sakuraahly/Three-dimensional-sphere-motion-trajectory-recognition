@@ -59,6 +59,8 @@ from sphere_tracker.config import ColorConfig
 from sphere_tracker.paths import STEREO_ROOT, stereo_mode_root, stereo_roots
 from sphere_tracker.plugins import names as plugin_names
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
            "record_out_dir", "check_setup_args", "session_name_of",
@@ -824,7 +826,7 @@ class StereoWindow(tk.Toplevel):
         # 2026-10-28 截图里第 4 步卡片就被盖掉了一半。
         self.status = StatusBar(self, on_log=app.open_console,
                                 on_stop=self._stop_my_tasks,
-                                help_section="record")
+                                help_section="calib")
         self.status.pack(fill="x", side="bottom")
         self._page = ScrollPage(self, self.surface)
         self._page.pack(fill="both", expand=True)
@@ -1651,16 +1653,37 @@ class StereoWindow(tk.Toplevel):
             else:
                 w.pack_forget()
 
+    @staticmethod
+    def _browse_start(value: str, fallback: Path) -> str:
+        """文件选择框的起点：当前路径存在就用它，否则回项目内目录。
+
+        不传 ``initialdir`` 时 Windows 会落在“上次用过的文件夹”，可能是
+        `文档` / 桌面；用户看到的就是“浏览默认怎么跑到项目外去了”。
+        """
+        raw = (value or "").strip()
+        p = Path(raw).expanduser() if raw else None
+        if p is not None:
+            if p.is_file():
+                return str(p.parent)
+            if p.is_dir():
+                return str(p)
+        return str(fallback if fallback.is_dir() else PROJECT_ROOT)
+
     def _pick_dir(self, var: tk.StringVar) -> None:
         from tkinter import filedialog
-        got = filedialog.askdirectory(parent=self)
+        got = filedialog.askdirectory(
+            parent=self,
+            initialdir=self._browse_start(var.get(), CHAIN_ROOT))
         if got:
             var.set(got)
 
     def _pick_file(self, var: tk.StringVar) -> None:
         from tkinter import filedialog
+        # 内参文件是 StereoRig 的 .npz；起点固定为项目的 config/calib，
+        # 不跟随 Windows 的“上次目录”（否则可能在文档/桌面）。
         got = filedialog.askopenfilename(
             parent=self,
+            initialdir=str(PROJECT_ROOT / "config" / "calib"),
             filetypes=[("标定文件", "*.npz *.json"), ("全部", "*.*")])
         if got:
             var.set(got)

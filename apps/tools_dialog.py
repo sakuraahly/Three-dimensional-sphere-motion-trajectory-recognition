@@ -134,11 +134,19 @@ class ToolsDialog(tk.Toplevel):
         ent.grid(row=row, column=1, columnspan=2, sticky="we", padx=(8, 4), pady=(4, 0))
 
         def pick() -> None:
+            # 不传 initialdir 时 Windows 会沿用“上次文件夹”（可能是文档/桌面）。
+            # 空值回项目根；已有值则回到它父目录，避免用户每次重新找。
+            raw = ent.get().strip()
+            cur = Path(raw).expanduser() if raw else None
+            start = (str(cur.parent) if cur is not None and cur.is_file()
+                     else str(cur) if cur is not None and cur.is_dir()
+                     else str(ROOT))
             if kind == "dir":
-                got = filedialog.askdirectory(parent=self, title=title or label)
+                got = filedialog.askdirectory(
+                    parent=self, title=title or label, initialdir=start)
             else:
                 got = filedialog.askopenfilename(
-                    parent=self, title=title or label,
+                    parent=self, title=title or label, initialdir=start,
                     filetypes=filetypes or _IMAGE_TYPES)
             if got:
                 ent.delete(0, "end")

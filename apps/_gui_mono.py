@@ -2141,8 +2141,11 @@ class MonoWindow(tk.Toplevel):
         # 兜底走文件选择框：run_video.py 的 path 是必填位置参数，它自己不会弹
         # 选择框 —— 盲启的结果是 exit 2、点了没反应（2026-10-28 踩过）。
         from tkinter import filedialog
+        start = self.root_dir if getattr(self, "root_dir", None) and \
+            Path(self.root_dir).is_dir() else ROOT
         path = filedialog.askopenfilename(
             title="选择要处理的视频", parent=self,
+            initialdir=str(start),
             filetypes=[("视频", "*.mp4 *.avi *.mkv *.mov *.m4v"),
                        ("所有文件", "*.*")])
         if not path:

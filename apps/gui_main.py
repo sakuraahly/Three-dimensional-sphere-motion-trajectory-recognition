@@ -968,8 +968,11 @@ class Launcher(tk.Tk):
         ent.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(4, 0))
 
         def pick() -> None:
-            got = (filedialog.askdirectory(title=label) if is_dir
-                   else filedialog.asksaveasfilename(title=label, defaultextension=".png"))
+            # 空值回项目根，不跟随 Windows 的“上次文件夹”。
+            start = str(ROOT / "outputs") if (ROOT / "outputs").is_dir() else str(ROOT)
+            got = (filedialog.askdirectory(title=label, initialdir=start) if is_dir
+                   else filedialog.asksaveasfilename(
+                       title=label, initialdir=start, defaultextension=".png"))
             if got:
                 ent.delete(0, "end")
                 ent.insert(0, got)

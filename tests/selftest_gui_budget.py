@@ -1191,6 +1191,17 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
                 "def camera_role_short" in app_src
                 and 'camera_role_short("left")' in stereo_src
                 and 'camera_role_text("left")' not in stereo_src))
+
+    # 文件选择框不能跟着 Windows 的“上次文件夹”（可能在文档/桌面）。
+    tools_src = (root / "apps" / "tools_dialog.py").read_text(encoding="utf-8")
+    mono_src = (root / "apps" / "_gui_mono.py").read_text(encoding="utf-8")
+    legacy_src = (root / "apps" / "gui_main.py").read_text(encoding="utf-8")
+    out.append(("文件浏览默认回项目内目录（内参/轴向/工具台/单目）",
+                'initialdir=str(PROJECT_ROOT / "config" / "calib")' in stereo_src
+                and "initialdir=self._browse_start" in stereo_src
+                and "initialdir=start" in tools_src
+                and "initialdir=str(start)" in mono_src
+                and "initialdir=start" in legacy_src))
     return out
 
 
