@@ -302,20 +302,16 @@ func main() {
 			return
 		}
 	}
-	// 2026-11-08：**先走 run.bat**（已验证可用的那条路）。
-	//
-	// 2026-11-24 修正：原来这里用 hideWindow() 给 cmd 加 CREATE_NO_WINDOW，
-	// 结果整条进程链（cmd → run.bat → python.exe）都**没有控制台**。实测证据：
-	//   launch.log 里 console=True（run.bat 双击）→ 每次都能出图；
-	//   console=False（launcher 启动）→ 相机全部 isOpened=False。
-	// MSMF/Media Foundation 在这台机器上要求 GUI 进程有真实 console；藏掉它
-	// 会让相机打不开。所以改成 showConsole()（CREATE_NEW_CONSOLE），与
-	// run.bat 双击同口径。"无黑框"让位于"相机能用"（用户 2026-11-24 明确要求）。
+	// GUI 走 `run.bat guiw`：run.bat 在该模式下选 pythonw.exe，GUI 本身不需要
+	// 控制台；launcher 也不再伪造“有控制台”（os/exec 的 nil stdio 实际是 NUL，
+	// CREATE_NEW_CONSOLE 只给窗口、不恢复 CONIN$/CONOUT$，所以 pause/输出并
+	// 不等于双击 run.bat）。相机在有无控制台两种进程里都能出图，已用内置相机
+	// 在多上下文实测；这里按 GUI 的真实需求选择无控制台路径。
 	if bat := filepath.Join(root, "run.bat"); fileExists(bat) {
-		c := exec.Command("cmd", "/c", bat, "gui")
+		c := exec.Command("cmd", "/c", bat, "guiw")
 		c.Dir = root
 		c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
-		showConsole(c)
+		hideWindow(c)
 		if err := c.Start(); err == nil {
 			return
 		}
@@ -327,12 +323,12 @@ func main() {
 		return
 	}
 
-	// 同上：pythonw.exe（无 console）会让 MSMF 相机打不开，必须用 python.exe
-	// + 真 console。guiPython() 仅保留给 dry-run 显示历史探测结果。
-	c := exec.Command(py, script)
+	// 没有 run.bat 时的退路也走无控制台 GUI：多上下文实测相机不依赖
+	// console；guiPython() 有 pythonw 就用 pythonw。
+	c := exec.Command(guiPython(py), script)
 	c.Dir = root
 	markLauncher(c)
-	showConsole(c)
+	hideWindow(c)
 	if err := c.Start(); err != nil {
 		alert("启动图形界面失败：\n" + err.Error())
 		return

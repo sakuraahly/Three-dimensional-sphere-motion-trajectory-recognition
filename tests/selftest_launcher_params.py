@@ -2712,21 +2712,22 @@ def _check_env_installer() -> list[tuple[str, bool]]:
          and 'if p := pointerPython(root); p != ""' in go_src),
         ("Go 启动器找不到环境时会询问并自动安装",
          "runInstaller(root)" in go_src and "ask(" in go_src),
-        # 2026-11-08/11-24：用户反复实测 **run.bat 能打开相机、launcher.exe 打不开**。
-        # 2026-11-24 定位到根因：launcher 原来用 hideWindow()(CREATE_NO_WINDOW) 把
-        # cmd→run.bat→python 整条链的控制台藏了，console=False 时 MSMF 相机全部
-        # 打不开；run.bat 双击 console=True 每次都出图。修法是 showConsole()
-        # 给真控制台（与 run.bat 同口径），相机优先于"无黑框"。
-        ("启动器把 GUI 交给 run.bat 且给真控制台（相机可用）",
+        # 2026-11-24 最终架构：GUI 走 run.bat guiw → pythonw.exe，launcher 用
+        # hideWindow；不再用 os/exec 的 nil stdio 伪造“有控制台”（那是 NUL）。
+        # 多上下文内置相机实测：有无控制台都能出图，故 GUI 选无控制台路径。
+        ("启动器把 GUI 交给 run.bat guiw（无控制台路径）",
          'filepath.Join(root, "run.bat")' in go_src
-         and '"/c", bat, "gui"' in go_src
-         and 'showConsole(c)' in go_src
-         and 'hideWindow(c)\n\t\tif err := c.Start()' not in go_src),
-        ("反向：把 run.bat 那条链改回 hideWindow → 判据会红",
-         'showConsole(c)' in go_src),
-        ("反向：把启动器改回直接起 pythonw → 判据会红",
-         not ('"/c", bat, "gui"' in
-              go_src.replace('"/c", bat, "gui"', 'script'))),
+         and '"/c", bat, "guiw"' in go_src
+         and 'hideWindow(c)' in go_src),
+        ("反向：把 guiw 改回 gui → 判据会红",
+         '"/c", bat, "guiw"' in go_src),
+        ("反向：启动器 GUI 链不使用带控制台的 showConsole → 判据会红",
+         'hideWindow(c)' in go_src.split(
+             'if bat := filepath.Join(root, "run.bat")', 1)[-1].split(
+             'script := findGuiScript', 1)[0]
+         and 'showConsole(c)' not in go_src.split(
+             'if bat := filepath.Join(root, "run.bat")', 1)[-1].split(
+             'script := findGuiScript', 1)[0]),
         ("项目内解释器写相对路径",
          se.pointer_value(se.ROOT / ".venv" / "Scripts" / "python.exe", se.ROOT)
          == ".venv/Scripts/python.exe"),

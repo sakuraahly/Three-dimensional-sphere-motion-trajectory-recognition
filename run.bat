@@ -155,6 +155,7 @@ echo.
 rem ---------- 3) 启动 ----------
 :launch
 if /i "%MODE%"=="gui"       goto :ui_gui
+if /i "%MODE%"=="guiw"      goto :ui_gui
 if /i "%MODE%"=="cli"       goto :ui_cli
 if /i "%MODE%"=="setup"     goto :do_setup
 if /i "%MODE%"=="check"     goto :do_check
@@ -173,19 +174,27 @@ goto :ui_gui
 
 :ui_gui
 echo [3/3] 启动图形界面 ...
-"%PY%" -c "import tkinter" >nul 2>nul
+set "PYRUN=%PY%"
+rem guiw = 给 launcher.exe 用：GUI 不需要控制台。pythonw 不创建控制台，
+rem 也让 launcher 不必用 CREATE_NO_WINDOW 去藏一条本来就没有的控制台。
+if /i "%MODE%"=="guiw" (
+    set "PYW=%PY%"
+    for %%I in ("%PY%") do set "PYW=%%~dpIpythonw.exe"
+    if exist "%PYW%" set "PYRUN=%PYW%"
+)
+"%PYRUN%" -c "import tkinter" >nul 2>nul
 if errorlevel 1 (
     echo       这台机器没有 tkinter，自动改用命令行界面。
     goto :ui_cli
 )
 rem 界面脚本固定在 apps/ 下（英文名）。以前靠 glob 扫根目录里"含 tkinter 的 .py"
 rem 来猜哪个是 GUI —— 两个启动脚本搬进 apps/ 之后根目录没有 .py 了，那条路必然失效。
-"%PY%" apps\gui_main.py
+"%PYRUN%" apps\gui_main.py
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
     echo       启动器异常退出（返回码 %RC%）。请看上面的报错。
-    pause
+    if /i not "%MODE%"=="guiw" pause
 )
 exit /b %RC%
 
