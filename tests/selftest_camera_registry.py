@@ -2643,13 +2643,16 @@ def test_identify_no_console_fails_loudly() -> bool:
                                                 "for attempt in (1, 2)"))))
 
     # 2026-11-08：同一 exe、同一份代码，全新进程能开、用户进程打不开。
-    # 失败时必须把"0–7 号谁能打开"的事实写进日志，别再靠猜。
+    # 失败时必须把**本次编号**的 isOpened 写进日志（现场留证）；但不许再扫
+    # 0–7：每次失败多开 8 次设备会把 aoni 的 MSMF 会话打成
+    # DEVICE_INVALIDATED，随后连内置相机也一起失败。
     def diag_ok(src: str) -> bool:
         return ("_diagnose_open_failure" in src
                 and "isOpened=" in src
-                and "os.getpid()" in src)
+                and "os.getpid()" in src
+                and "for i in (int(wanted),)" in src)
 
-    checks.append(("打开失败会扫编号 0–7 的 isOpened 并写进日志（现场留证）",
+    checks.append(("打开失败只复核本次编号的 isOpened（现场留证，不反复开全部设备）",
                    diag_ok(dlg_src)))
     checks.append(("反向：去掉现场诊断 → 判据会红",
                    not diag_ok(dlg_src.replace("_diagnose_open_failure",
@@ -2712,7 +2715,7 @@ def test_identify_no_console_fails_loudly() -> bool:
                    role_text_ok(hub_src)))
     checks.append(("反向：把「打印旧索引」改回去 → 判据会红",
                    not role_text_ok(
-                       hub_src.replace("            bits.append(\"不在线\")",
+                       hub_src.replace("            bits.append(i18n.t(\"不在线\"))",
                                        "            bits.append(f\"索引 {info.get('index')}\")"))))
 
     # 2026-11-07 第三次报障：这台 aoni 的 MSMF 采集会话会失效

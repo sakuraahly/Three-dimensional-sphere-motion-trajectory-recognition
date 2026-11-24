@@ -1326,7 +1326,10 @@ class CamerasDialog(tk.Toplevel):
             enumerated = {d.order for d in (self._devices or cr.list_devices())}
         except BaseException:                                # noqa: BLE001
             enumerated = set()
-        for i in range(8):
+        # 只复核**本次要开的编号**。不要再扫 0–7：每次失败都多开 8 次设备，
+        # aoni 的 MSMF 会话会被反复开关打成 DEVICE_INVALIDATED（实测），
+        # 于是第一台失败后连内置相机也一起失败，看起来像“所有相机坏了”。
+        for i in (int(wanted),):
             try:
                 cap = cv2.VideoCapture(i, INDEX_BACKEND)
                 ok = bool(cap.isOpened())
@@ -1338,7 +1341,7 @@ class CamerasDialog(tk.Toplevel):
             if ok and i not in enumerated:
                 # **phantom 索引命中**：能打开，但 PnP 枚举里没有这个号 ——
                 # 它开出来的不是"枚举到的物理相机"（残留会话 / 虚拟设备 /
-                # 别的后端编号空间）。必须明着写，否则用户会以为那是他插的那台。
+                # 别的后端编号空间）。
                 lines.append("    " + cr.phantom_index_warning(i))
         return "\n".join(lines)
 

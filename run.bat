@@ -178,9 +178,11 @@ set "PYRUN=%PY%"
 rem guiw = 给 launcher.exe 用：GUI 不需要控制台。pythonw 不创建控制台，
 rem 也让 launcher 不必用 CREATE_NO_WINDOW 去藏一条本来就没有的控制台。
 if /i "%MODE%"=="guiw" (
-    set "PYW=%PY%"
-    for %%I in ("%PY%") do set "PYW=%%~dpIpythonw.exe"
-    if exist "%PYW%" set "PYRUN=%PYW%"
+    rem 不能先 set PYW 再 if exist "%PYW%"：cmd 在解析整个块时就把
+    rem %PYW% 展开成空值。直接把 %%~dpI 放进 if，展开发生在执行时。
+    for %%I in ("%PY%") do (
+        if exist "%%~dpIpythonw.exe" set "PYRUN=%%~dpIpythonw.exe"
+    )
 )
 "%PYRUN%" -c "import tkinter" >nul 2>nul
 if errorlevel 1 (
