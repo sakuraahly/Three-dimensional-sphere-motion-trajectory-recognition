@@ -854,21 +854,24 @@ class CamerasDialog(tk.Toplevel):
         try:
             reg = cr.load_registry()
         except Exception:                                     # noqa: BLE001
-            return "自动核对：配置读不出来"
+            return i18n.t("自动核对：配置读不出来")
         parts = []
         for role in ("left", "right"):
             spec = reg.roles.get(role)
-            label = (spec.name or role) if spec else "未配置"
+            label = (spec.name or role) if spec else i18n.t("未配置")
             h = cr.role_health(role, reg=reg, devices=self._devices)
             if h.status == "ok":
-                parts.append(f"{role}={label} 一致")
+                parts.append(i18n.tf("{role}={label} 一致", role=role, label=label))
             elif h.status == "unverified":
-                parts.append(f"{role}={label} 采集索引未实测")
+                parts.append(i18n.tf("{role}={label} 采集索引未实测",
+                                     role=role, label=label))
             elif h.status == "missing":
-                parts.append(f"{role}={label} 不在线/身份变了")
+                parts.append(i18n.tf("{role}={label} 不在线/身份变了",
+                                     role=role, label=label))
             else:
                 parts.append(f"{role}={label} {h.detail}")
-        return "自动核对：" + "｜".join(parts)
+        sep = "｜" if i18n.language() == "zh-CN" else " | "
+        return i18n.t("自动核对：") + sep.join(parts)
 
     def _stop_stale_previews(self) -> None:
         """设备被拔掉/同编号换了身份：停掉旧预览，别让画面冻结在旧设备上。"""

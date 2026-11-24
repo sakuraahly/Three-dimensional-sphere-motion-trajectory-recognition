@@ -288,7 +288,7 @@ class AppState:
         """
         info = self.camera_roles().get(role)
         if not isinstance(info, dict):
-            return f"{role}：未固定（启动时自动挑）"
+            return i18n.tf("{role}：未固定（启动时自动挑）", role=role)
         ident = str(info.get("identity") or "").upper()
         port = str(info.get("port") or "").lower()
         hit = None
@@ -303,18 +303,20 @@ class AppState:
                     break
         except Exception:                                     # noqa: BLE001
             hit = None
-        bits = [f"{role} = {info.get('name') or '未知型号'}"]
+        bits = [f"{role} = {info.get('name') or i18n.t('未知型号')}"]
         if hit is None:
-            bits.append("不在线")
+            bits.append(i18n.t("不在线"))
         else:
-            bits.append(f"编号 {hit.order}")
+            bits.append(i18n.tf("编号 {n}", n=hit.order))
             if not info.get("verified"):
-                bits.append("未确认")
+                bits.append(i18n.t("未确认"))
         # 采集索引是 `cv2.VideoCapture` 真正用的号，**未实测就写"未实测"**，
         # 不许拿 PnP 编号冒充（那正是"显示的相机 ≠ 真实相机"的来源）。
         cap = info.get("capture_index")
-        bits.append(f"采集 #{cap}" if isinstance(cap, int) else "采集索引未实测")
-        return "，".join(bits)
+        bits.append(i18n.tf("采集 #{n}", n=cap)
+                    if isinstance(cap, int) else i18n.t("采集索引未实测"))
+        sep = "，" if i18n.language() == "zh-CN" else ", "
+        return sep.join(bits)
 
     def camera_role_short(self, role: str) -> str:
         """双目第①步那一行用的**短标签**：设备名，不显示已废弃的“位置”。
@@ -325,9 +327,9 @@ class AppState:
         """
         info = self.camera_roles().get(role)
         if not isinstance(info, dict):
-            return f"{role}：未固定"
+            return i18n.tf("{role}：未固定", role=role)
         name = str(info.get("name") or "").strip()
-        return f"{role}={name}" if name else f"{role}：未固定"
+        return f"{role}={name}" if name else i18n.tf("{role}：未固定", role=role)
 
     # ---------- 派生（只读，不写回） ----------
     def stereo_mode(self) -> str | None:

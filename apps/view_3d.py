@@ -56,6 +56,8 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from apps import i18n  # noqa: E402
+
 # 数据根目录只有 `sphere_tracker/paths.py` 说了算：以前 `data/sessions` 这个
 # 字面量散在 8 处，于是"会话"在磁盘上指了两个东西（见该模块 docstring）。
 from sphere_tracker.paths import MONO_ROOT, STEREO_ROOT, stereo_roots  # noqa: E402
@@ -544,7 +546,7 @@ def source_label(f: Path) -> str:
         tag = ""
     kind = {"mono": "[单目]", "stereo": "[双目]"}.get(source_kind(f), "[?]")
     name = f"{sess.name}  {tag}" if tag else sess.name
-    return f"{kind} {name}"
+    return f"{i18n.t(kind)} {name}"
 
 
 class Viewer3D:
@@ -733,11 +735,16 @@ class Viewer3D:
                 vw = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 vh = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 if vw > 0 and vh > 0 and vw < vh * 1.8:
-                    self.video_error = f"视频不是左右并排（{vw}x{vh}），按 2:1 切分会错"
+                    self.video_error = i18n.tf(
+                        "视频不是左右并排（{w}x{h}），按 2:1 切分会错",
+                        w=vw, h=vh)
                     self.cap.release()
                     self.cap = None
-        kind = "[降级] " if self.degraded else ("[单目] " if self.mono else "[双目] ")
-        self.root.title(f"3D 轨迹 · {kind}{data.get('session', '')} · {self.n} points")
+        kind = i18n.t("[降级]" if self.degraded
+                      else ("[单目]" if self.mono else "[双目]")) + " "
+        self.root.title(i18n.tf("3D 轨迹 · {kind}{session} · {n} points",
+                               kind=kind, session=data.get("session", ""),
+                               n=self.n))
         self._sync_mono_note()
         # 换会话只调 `_apply`、不重建窗口：按钮在 __init__ 里只建一次，
         # 不在这里重算 state 就会残留上一段的"可点"（切到无视频会话仍亮着）。
@@ -758,8 +765,8 @@ class Viewer3D:
         d = self.data.get("ball_diameter_mm")
         d_txt = f"{float(d):g}" if isinstance(d, (int, float)) else "?"
         note.configure(
-            text=f"单目深度由球径先验得到（D={d_txt} mm，Z=f·D/(2r)），"
-                 f"尺度依赖这个数；不是视差测量")
+            text=i18n.tf("单目深度由球径先验得到（D={d} mm，Z=f·D/(2r)），"
+                         "尺度依赖这个数；不是视差测量", d=d_txt))
 
     def open_source(self, path: str | Path) -> None:
         """切到另一个会话 / 文件。
@@ -841,12 +848,13 @@ class Viewer3D:
             return
         reason = ""
         if not self.video_path:
-            reason = "这段会话没有标注视频"
+            reason = i18n.t("这段会话没有标注视频")
         elif self.video_error:
-            reason = self.video_error.replace("**", "")
+            reason = i18n.t(self.video_error.replace("**", ""))
         if reason:
             btn.configure(state="disabled",
-                          text=f"用系统播放器打开视频（{reason}）")
+                          text=i18n.tf("用系统播放器打开视频（{reason}）",
+                                       reason=reason))
         else:
             btn.configure(state="normal", text="用系统播放器打开视频")
 
@@ -1160,9 +1168,10 @@ class Viewer3D:
         self._sources = scan_sources()
         self.source_box["values"] = [source_label(f) for f in self._sources]
         self.source_note.configure(
-            text=f"共 {len(self._sources)} 个会话有结果（单目 + 双目）"
+            text=i18n.tf("共 {n} 个会话有结果（单目 + 双目）",
+                         n=len(self._sources))
                  if self._sources else
-                 "没有找到会话结果（data/stereo、data/mono 下都没有 derived/）")
+                 i18n.t("没有找到会话结果（data/stereo、data/mono 下都没有 derived/）"))
         self._sync_source_row()
 
     def _sync_source_row(self) -> None:
@@ -2674,15 +2683,17 @@ class Viewer3D:
 
     def _status(self) -> None:
         if not self.points:
-            reason = self.data.get("degraded_reason") or "没有可用的三维点"
+            reason = self.data.get("degraded_reason") or i18n.t(
+                "没有可用的三维点")
             extra = ""
             if self.data.get("session_dir"):
-                extra = f"   会话：{self.data['session_dir']}"
+                extra = i18n.tf("   会话：{path}", path=self.data["session_dir"])
             if self.video_path:
-                extra += "   （有视频，可在下方查看）"
+                extra += i18n.t("   （有视频，可在下方查看）")
             self.status.configure(
-                text=f"没有三维结果：{reason}{extra}   "
-                     f"可查看会话信息 / 视频，若有")
+                text=i18n.tf("没有三维结果：{reason}{extra}   "
+                             "可查看会话信息 / 视频，若有",
+                             reason=i18n.t(reason), extra=extra))
             return
         p = self.points[self.idx]
         frame = p.get("frame", self.idx)
@@ -2691,12 +2702,15 @@ class Viewer3D:
         mode = ("mono" if self.mono
                 else self.data.get("stereo_mode", "parallel"))
         self.status.configure(
-            text=f"frame {frame}   t={float(t):.3f}s   "
-                 f"X={float(x):.4f}  Y={float(y):.4f}  Z={float(z):.4f} m   "
-                 f"模式={mode}   "
-                 f"坐标={self.data.get('coordinate_system', '?')}   "
-                 f"视角 {self.view['elev']:.0f}/{self.view['azim']:.0f}/"
-                 f"{self.view['roll']:.0f}°")
+            text=i18n.tf(
+                "frame {frame}   t={t:.3f}s   "
+                "X={x:.4f}  Y={y:.4f}  Z={z:.4f} m   "
+                "模式={mode}   坐标={coord}   视角 {elev:.0f}/{azim:.0f}/"
+                "{roll:.0f}°",
+                frame=frame, t=float(t), x=float(x), y=float(y), z=float(z),
+                mode=mode, coord=self.data.get("coordinate_system", "?"),
+                elev=self.view["elev"], azim=self.view["azim"],
+                roll=self.view["roll"]))
 
     # ------------------------------------------------------------------
     def _step_frames(self, delta: int) -> None:

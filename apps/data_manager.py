@@ -29,6 +29,7 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from apps import i18n  # noqa: E402
 from apps._data_export import (  # noqa: E402
     CATEGORIES,
     DEFAULT_CATEGORIES,
@@ -804,7 +805,8 @@ class DataManager(tk.Tk):
             # （全部会话 / 散会话 / 平行双目），读起来像三个过滤器，而不是
             # "全部 → 分组 → 子目录"的层级 —— 用户要的是资源管理器那种逐层展开。
             tree.insert("", "end", iid="g:__all__",
-                        text=f"全部会话 ({len(self.items)})", open=True)
+                        text=i18n.tf("全部会话 ({n})", n=len(self.items)),
+                        open=True)
             first_build = not self._group_tree_ready
             for path in ordered:
                 iid = "g:" + path
@@ -817,7 +819,10 @@ class DataManager(tk.Tk):
                 # 的展开状态恢复，用户收起的节点不会被 refresh 偷偷展开。
                 is_open = iid in expanded or (first_build and path.count("/") < 1)
                 tree.insert(pid, "end", iid=iid,
-                            text=f"{name} ({count_under(path)})", open=is_open)
+                            text=i18n.tf("{name} ({n})",
+                                         name=i18n.t(name),
+                                         n=count_under(path)),
+                            open=is_open)
         finally:
             self._syncing_group = False
         self._group_tree_ready = True
@@ -1189,8 +1194,9 @@ class DataManager(tk.Tk):
         except Exception:                                   # noqa: BLE001
             size = sum(it.size_bytes for it in chosen)
         self.count_label.configure(
-            text=f"已选 {len(chosen)} / {len(self.items)} 个会话\n"
-                 f"预计原始数据 {_fmt_bytes(size)}")
+            text=i18n.tf("已选 {chosen} / {total} 个会话\n预计原始数据 {size}",
+                         chosen=len(chosen), total=len(self.items),
+                         size=_fmt_bytes(size)))
         self._set_row_checks()
         self._sync_highlight()
         # 勾上视频后，橙色提示要说清「点导出会弹一次确认、需选『是』」——

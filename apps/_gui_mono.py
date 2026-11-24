@@ -40,7 +40,7 @@ from apps._mono_sessions import (DEFAULT_ROOT as MONO_SESSIONS_ROOT,
                                  delete_mono_session, find_clip,
                                  scan_mono_sessions, sync_from_take)
 from apps._task_runner import ROOT
-from apps import _actions
+from apps import _actions, i18n
 from apps._actions import CALIBRATE_MONO as MONO_CALIB_APP
 from sphere_tracker.config import AUTO_PRESET, ColorConfig
 from sphere_tracker.plugins import names as plugin_names      # noqa: E402
@@ -892,10 +892,13 @@ class MonoWindow(tk.Toplevel):
         # 所以必须摆在输入框正下方，而不是折叠进"高级"里。
         self.surface.hint(
             box,
-            f"名义 {NOMINAL_DIAMETER_MM:g} mm 的球在这套检测器下约填 "
-            f"{EFFECTIVE_DIAMETER_MM:g} mm —— 高光半径偏小 "
-            f"{MEASURED_RADIUS_SHRINK * 100:.1f}%，填名义值会让深度偏大 "
-            f"{(1 / (1 - MEASURED_RADIUS_SHRINK) - 1) * 100:.1f}%",
+            i18n.tf(
+                "名义 {nominal:g} mm 的球在这套检测器下约填 {effective:g} mm "
+                "—— 高光半径偏小 {shrink:.1f}%，填名义值会让深度偏大 {bias:.1f}%",
+                nominal=NOMINAL_DIAMETER_MM,
+                effective=EFFECTIVE_DIAMETER_MM,
+                shrink=MEASURED_RADIUS_SHRINK * 100,
+                bias=(1 / (1 - MEASURED_RADIUS_SHRINK) - 1) * 100),
             style="Warn.TLabel")
 
         # 误差预算行走游标（原来写死 row=20，加了控件就会撞）。
@@ -1021,8 +1024,9 @@ class MonoWindow(tk.Toplevel):
         """
         secs = self.var_record_secs.get().strip() or "10"
         try:
-            section.set_summary(f"{secs} 秒"
-                                if secs.isdigit() else f"「{secs}」不是数字，按 10 秒")
+            section.set_summary(
+                i18n.tf("{secs} 秒", secs=secs) if secs.isdigit()
+                else i18n.tf("「{secs}」不是数字，按 10 秒", secs=secs))
         except tk.TclError:
             pass                                    # 窗口已销毁：标题没人看得到
 
@@ -1458,11 +1462,11 @@ class MonoWindow(tk.Toplevel):
 
     def _refresh_state(self) -> None:
         st = self.app.state
-        self.lbl_cams.configure(text="相机：" + self._camera_text())
+        self.lbl_cams.configure(text=i18n.t("相机：") + self._camera_text())
         ready, text = st.mono_status()
         clean = text.replace("**", "")
         self.lbl_calib.configure(
-            text=("内参：" if ready else "内参：") + clean,
+            text=i18n.t("内参：") + clean,
             style="Ok.TLabel" if ready else "Warn.TLabel")
         if not MONO_CALIB_APP.exists():
             self.status.set_status(
@@ -1493,8 +1497,10 @@ class MonoWindow(tk.Toplevel):
         # 所以不猜，把这条系统项作为固定事实摆在结果旁边。
         z_bias = 1.0 / (1.0 - MEASURED_RADIUS_SHRINK) - 1.0
         self.lbl_budget_sys.configure(
-            text=f"半径系统偏差：填名义直径（不是有效值）→ 深度额外 +"
-                 f"{z_bias * 100:.1f}%（1 m 处约 {z_bias * 1000:.0f} mm；实测）")
+            text=i18n.tf(
+                "半径系统偏差：填名义直径（不是有效值）→ 深度额外 +"
+                "{pct:.1f}%（1 m 处约 {mm:.0f} mm；实测）",
+                pct=z_bias * 100, mm=z_bias * 1000))
         # 球径三态（2026-10-31 走查第 5 条）：**空** / **不是数字** / 可用，
         # 三者要说三种话。旧版把它们混成"填一个球直径才能算误差预算" ——
         # 用户明明填了 abc，界面却说"没填"，那是把人往错方向上推。
@@ -1502,34 +1508,39 @@ class MonoWindow(tk.Toplevel):
         d = diameter_mm_or_none(raw)
         if not raw:
             self.lbl_budget.configure(
-                text=f"球径那一栏是空的，所以算不了误差预算 —— 填毫米数，"
-                     f"这颗球填 {DEFAULT_DIAMETER_MM:g}（有效值）；"
-                     f"留空也行，识别时会按 {DEFAULT_DIAMETER_MM:g} mm 算",
+                text=i18n.tf(
+                    "球径那一栏是空的，所以算不了误差预算 —— 填毫米数，"
+                    "这颗球填 {effective:g}（有效值）；留空也行，识别时会按 "
+                    "{effective:g} mm 算",
+                    effective=DEFAULT_DIAMETER_MM),
                 style="Warn.TLabel")
             return
         if d is None:
             self.lbl_budget.configure(
-                text=f"球径那一栏「{raw}」不是数字，所以算不了误差预算 —— "
-                     f"这里填毫米（例如 {DEFAULT_DIAMETER_MM:g}），"
-                     f"不是 {DEFAULT_DIAMETER_MM / 1000:.4f}（米是命令行那边的单位，"
-                     f"界面只认 mm）。改完这一行会自动重算",
+                text=i18n.tf(
+                    "球径那一栏「{raw}」不是数字，所以算不了误差预算 —— "
+                    "这里填毫米（例如 {effective:g}），不是 {metres:.4f}"
+                    "（米是命令行那边的单位，界面只认 mm）。改完这一行会自动重算",
+                    raw=raw, effective=DEFAULT_DIAMETER_MM,
+                    metres=DEFAULT_DIAMETER_MM / 1000),
                 style="Warn.TLabel")
             return
         fx = self._current_fx()
         if fx is None:
             # 60° 视场、1920 宽 → fx ≈ 1663 px（geometry.py 的同一个假设）
             fx = 1663.0
-            src = "焦距未标定，按 60° 视场估（fx≈1663 px）"
+            src = i18n.t("焦距未标定，按 60° 视场估（fx≈1663 px）")
             style = "Warn.TLabel"
         else:
-            src = f"按 fx = {fx:.0f} px 算"
+            src = i18n.tf("按 fx = {fx:.0f} px 算", fx=fx)
             style = "Hint.TLabel"
         parts = []
         for z_m, mm in error_budget(fx, d):
             parts.append(f"{z_m:.1f} m → ±{mm:.1f} mm")
         self.lbl_budget.configure(
-            text=f"误差预算（半径噪声 0.2 px、球径误差 0.2 mm、焦距 1%；{src}）："
-                 + "；".join(parts),
+            text=i18n.tf(
+                "误差预算（半径噪声 0.2 px、球径误差 0.2 mm、焦距 1%；"
+                "{src}）：{parts}", src=src, parts="；".join(parts)),
             style=style)
 
     # ------------------------------------------------------------------ #
@@ -1598,8 +1609,10 @@ class MonoWindow(tk.Toplevel):
         self._refresh_state()
         online = sum(1 for d in self._devices if getattr(d, "present", True))
         self.status.set_status(
-            f"相机枚举完成：{online} 台在线" + (f"（{note}）" if note else "")
-            + "；「#编号」只在采集索引实测后出现，没实测先跑 cameras.py identify", "info")
+            i18n.tf(
+                "相机枚举完成：{online} 台在线{note}；「#编号」只在采集索引实测后"
+                "出现，没实测先跑 cameras.py identify",
+                online=online, note=f"（{note}）" if note else ""), "info")
 
     def _on_camera_selected(self, _event=None) -> None:
         """用户亲自换了相机：从现在起当前值就是他的输入，可以持久化。
@@ -1688,22 +1701,25 @@ class MonoWindow(tk.Toplevel):
         """第 ① 步那行"相机：…"——**要能看出选中的这台开不开得出来**。"""
         cam = self.var_camera.get().strip()
         if not cam:
-            return "自动挑（优先外接）"
+            return i18n.t("自动挑（优先外接）")
         if cam.startswith("#"):
             # 按索引选的那一档最容易让人误会：它只证明"这个编号存在"，
             # 没试开过。2026-11-06 走查里用户原话是"界面照样显示得像是可用"。
-            return f"{cam}（按实测采集索引，不依赖角色绑定）｜未开相机验证"
+            return i18n.tf(
+                "{cam}（按实测采集索引，不依赖角色绑定）｜未开相机验证", cam=cam)
         try:
             base = self.app.state.camera_role_text(cam)
         except Exception:                                   # noqa: BLE001
-            return f"{cam}（读 config/cameras.json 失败）"
+            return i18n.tf("{cam}（读 config/cameras.json 失败）", cam=cam)
         online = self._role_online(cam)
         if online is False:
-            return base + "｜这台当前不在线，换「#编号」那个选项或重新 pin"
+            return i18n.tf(
+                "{base}｜这台当前不在线，换「#编号」那个选项或重新 pin",
+                base=base)
         if online is None:
             # 设备还没枚举到：不知道在不在线，就别装作知道（也别说"在线"）
-            return base + "｜设备还没枚举到"
-        return base + "｜未开相机验证"
+            return i18n.tf("{base}｜设备还没枚举到", base=base)
+        return i18n.tf("{base}｜未开相机验证", base=base)
 
     # ------------------------------------------------------------------ #
     # 动作

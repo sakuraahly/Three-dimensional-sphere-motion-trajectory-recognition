@@ -44,7 +44,7 @@ ROOT = next(p for p in Path(__file__).resolve().parents
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from apps import _actions                                    # noqa: E402
+from apps import _actions, i18n                              # noqa: E402
 from apps import setup_env as _setup_env                     # noqa: E402
 from apps._gui_widgets import BG, Surface, ScrollPage, StatusBar  # noqa: E402
 
@@ -434,7 +434,9 @@ class ToolsDialog(tk.Toplevel):
             "不合格不会写指针。切换后关掉本程序、重新打开 launcher/GUI 才生效。")
         current = _setup_env.read_pointer()
         self._env_status = self.surface.hint(
-            box, "当前：" + (str(current) if current is not None else "未登记（由启动器/安装器决定）"))
+            box, i18n.tf("当前：{path}",
+                         path=str(current) if current is not None
+                         else i18n.t("未登记（由启动器/安装器决定）")))
         self._env_python = self._path_row(
             box, "python.exe", "", title="选择 Python 解释器",
             filetypes=(("Python", "python.exe"), ("可执行文件", "*.exe"),

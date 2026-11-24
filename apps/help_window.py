@@ -186,7 +186,7 @@ class HelpWindow(tk.Toplevel):
                 self.tree.insert("", "end", iid=iid, text=f"{title}",
                                  open=False)
                 self._items[iid] = (f"{stitle}", title, body)
-            self._set_count(f"搜到 {len(hits)} 条")
+            self._set_count(i18n.tf("搜到 {n} 条", n=len(hits)))
             if hits:
                 self.tree.selection_set("r0")
                 self._on_select()          # 直接渲染，见下
@@ -203,7 +203,7 @@ class HelpWindow(tk.Toplevel):
                 self.tree.insert(parent, "end", iid=iid, text=title)
                 self._items[iid] = (stitle, title, body)
                 n += 1
-        self._set_count(f"共 {n} 条说明")
+        self._set_count(i18n.tf("共 {n} 条说明", n=n))
         first = self.tree.get_children()
         if first:
             kids = self.tree.get_children(first[0])

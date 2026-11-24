@@ -41,7 +41,7 @@ from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, METHOD_METAL, BG,
                                BallSettings, ScrollPage, StatusBar, Surface,
                                fit_to_content, kind_key)
 from apps._collapsible import CollapsibleSection
-from apps import _actions
+from apps import _actions, i18n
 from apps._workbench import SessionSummary, scan_sessions, summarize_session
 from sphere_tracker.paths import stereo_roots
 
@@ -205,19 +205,20 @@ def step_states(s: SessionSummary | None) -> dict[str, tuple[bool, str]]:
 
 
 def _has(name: str, flag: bool) -> str:
-    return f"{name} {'有' if flag else '无'}"
+    return f"{i18n.t(name)} {i18n.t('有' if flag else '无')}"
 
 
 def summary_text(s: SessionSummary | None) -> str:
     """会话摘要：一段话回答"这段数据现在是什么状态"。"""
     if s is None:
-        return "还没有选中会话。"
-    mode = "大角度" if s.stereo_mode == "angled" else "平行"
+        return i18n.t("还没有选中会话。")
+    mode = i18n.t("大角度" if s.stereo_mode == "angled" else "平行")
     lines = [
-        f"帧数 {s.frames_left}/{s.frames_right}　"
-        f"帧率 {s.fps:.1f} fps　模式 {mode}",
-        f"同步 {s.sync_method}{s.sync_offset:+d}"
-        f"（置信度 {s.sync_confidence:.2f}）",
+        i18n.tf("帧数 {left}/{right}　帧率 {fps:.1f} fps　模式 {mode}",
+                left=s.frames_left, right=s.frames_right, fps=s.fps, mode=mode),
+        i18n.tf("同步 {method}{offset:+d}（置信度 {conf:.2f}）",
+                method=s.sync_method, offset=s.sync_offset,
+                conf=s.sync_confidence),
         "　".join([
             _has("点选球心 seeds.json", s.has_seeds),
             _has("轨迹 traj3d.json", s.has_traj),
@@ -226,35 +227,40 @@ def summary_text(s: SessionSummary | None) -> str:
         ]),
     ]
     if s.has_traj:
-        bits = [f"匹配 {s.n_matched}/{s.n_samples}"]
+        bits = [i18n.tf("匹配 {matched}/{total}",
+                        matched=s.n_matched, total=s.n_samples)]
         if s.z_min is not None and s.z_max is not None:
-            bits.append(f"Z {s.z_min:.3f}–{s.z_max:.3f} m")
+            bits.append(i18n.tf("Z {zmin:.3f}–{zmax:.3f} m",
+                                zmin=s.z_min, zmax=s.z_max))
         if s.residual_median is not None:
-            bits.append(f"残差中位 {s.residual_median:.2f} px")
+            bits.append(i18n.tf("残差中位 {median:.2f} px",
+                                median=s.residual_median))
         lines.append("　".join(bits))
     if s.problems:
-        lines.append("问题：" + "；".join(s.problems))
+        sep = "；" if i18n.language() == "zh-CN" else "; "
+        lines.append(i18n.tf("问题：{text}",
+                             text=sep.join(i18n.dynamic(p) for p in s.problems)))
     return "\n".join(lines)
 
 
 def next_step_text(s: SessionSummary | None) -> str:
     """一句话说"现在该点哪个"。"""
     if s is None:
-        return ("还没有会话：先去双目窗录一段，或在双目窗第 ④ 步跑一次离线三维，"
-                "回来这里就有历史会话可选。")
+        return i18n.t("还没有会话：先去双目窗录一段，或在双目窗第 ④ 步跑一次离线三维，"
+                      "回来这里就有历史会话可选。")
     if s.status == "bad":
-        return "这段会话的数据有问题，先按上面的问题修（重录或修 session.json），别进三维。"
+        return i18n.t("这段会话的数据有问题，先按上面的问题修（重录或修 session.json），别进三维。")
     if s.status == "empty":
-        return "这段会话没录成（左右两路都是 0 帧），直接重录即可，不用修数据。"
+        return i18n.t("这段会话没录成（左右两路都是 0 帧），直接重录即可，不用修数据。")
     if s.status == "recorded":
-        return "下一步：① 校验数据；金属球（specular）要在 ② 点选球心后才能跑第 ③ 步。"
+        return i18n.t("下一步：① 校验数据；金属球（specular）要在 ② 点选球心后才能跑第 ③ 步。")
     if s.status == "seeded":
-        return "下一步：③ 跑离线三维。"
+        return i18n.t("下一步：③ 跑离线三维。")
     if s.status == "traj_thin":
-        return ("三维跑出来了但匹配点太少（画不出轨迹）。下一步：确认 ② 的球心选对、"
-                "换检测方法重跑 ③；④ 仍可打开查看器看那些散点落在哪。")
+        return i18n.t("三维跑出来了但匹配点太少（画不出轨迹）。下一步：确认 ② 的球心选对、"
+                      "换检测方法重跑 ③；④ 仍可打开查看器看那些散点落在哪。")
     if s.status == "traj":
-        return "下一步：④ 看三维；⑤ 可重新导出标准 JSON。"
+        return i18n.t("下一步：④ 看三维；⑤ 可重新导出标准 JSON。")
     return ""
 
 

@@ -453,6 +453,598 @@ SEED: dict[str, str] = {
     "选择会话 · {kind}": "Choose session · {kind}",
     "平行双目 · 视差测深": "Parallel stereo · disparity depth",
     "大角度双目 · 三角测量": "Wide-angle stereo · triangulation",
+
+    # ---- 2026-11-24 全面核对：下拉选项 / 窗口标题 / 步骤文案 / 空状态 ----
+    "1 年前的": "1 year ago",
+    "30 天前的": "30 days ago",
+    "7 天前的": "7 days ago",
+    "90 天前的": "90 days ago",
+    "angled（大角度）": "angled (wide-angle)",
+    "parallel（平行）": "parallel",
+    "— 空": "— empty",
+    "① 校验数据": "1. Validate data",
+    "② 点选球心": "2. Pick ball centre",
+    "③ 跑离线三维": "3. Run offline 3D",
+    "④ 看三维": "4. View 3D",
+    "⑤ 导出标准 JSON": "5. Export standard JSON",
+    "○ 已录制": "○ Recorded",
+    "◐ 已点选": "◐ Centres picked",
+    "◑ 三维点过少": "◑ Too few 3D points",
+    "✓ 有3D": "✓ 3D available",
+    "✗ 坏": "✗ Bad",
+    "全部（不按时间筛）": "All (no date filter)",
+    "实时（相机）": "Live (camera)",
+    "单目 · 球径先验测深": "Monocular · depth from ball diameter prior",
+    "会话工作台": "Session workbench",
+    "打开标注视频": "Open annotated video",
+    "镜面金属球": "Mirror-finish metal ball",
+    "纯色塑料球": "Solid-color plastic ball",
+    "自定义": "Custom",
+    "校验数据": "Validate data",
+    "运行中": "Running",
+    "运行中（外部）": "Running (external)",
+    "新目录名": "New directory name",
+    "标签（可空；会写进 session.json）": "Label (optional; saved in session.json)",
+    "录多久（秒，1–600）？": "How long to record (seconds, 1–600)?",
+    "输入 DELETE 确认永久删除：": "Type DELETE to confirm permanent deletion:",
+    "两镜头中心距（基线 B，毫米）：":
+        "Distance between camera centres (baseline B, mm):",
+    "球到相机的工作距离（D，米）：":
+        "Ball-to-camera working distance (D, m):",
+    "（没有会话）": "(No sessions)",
+    "（这个时间范围内没有可清理的东西）":
+        "(Nothing to clean in this time range)",
+    "（这个目录下还没有会话）": "(No sessions in this directory yet)",
+    "「#编号」只用实测采集索引；角色对上不代表能出图（没开过相机），要确认点「换相机…」。":
+        "Use #index only for a measured capture index; a matching role does "
+        "not prove the camera can produce frames (it has never been opened). "
+        "Confirm with Change camera….",
+    "读两路视频，按标定解出三维轨迹，写出 traj3d.json 与 visualization.json。「球种类」决定检测方法：镜面金属球 = specular，必须先做第 ② 步点选球心；纯色塑料球 = color + 取色方式（auto / 颜色预设），球色要和背景分得开。点选球心会交给当前方法：specular 用它跟踪，color 用它取色并锚定半径。":
+        "Read both videos and solve the 3D trajectory from the calibration, "
+        "writing traj3d.json and visualization.json. Ball kind selects the "
+        "detector: mirror metal ball = specular and requires step 2 Pick ball "
+        "centre first; solid-color plastic ball = color plus a color preset, "
+        "with the ball color distinct from the background. Picked centres go "
+        "to the current method: specular tracks with them; color uses them for "
+        "color sampling and radius anchoring.",
+    "把 traj3d 写成统一的 visualization.json（含 CSV 与示意图），给别的程序读。第 ③ 步已经写过一份，这一步是重新导出。":
+        "Write traj3d as the unified visualization.json (with CSV and a preview "
+        "image) for other programs. Step 3 already wrote one; this step "
+        "re-exports it.",
+    "在这一帧的左图、右图上各点一次球心，存成 derived/seeds.json。只有金属球（specular 检测）需要它；彩色球可以跳过。":
+        "Click the ball centre once on each of the left and right images; this "
+        "is saved as derived/seeds.json. Only metal balls (specular detection) "
+        "need it; color balls can skip it.",
+    "3D 查看器读的是这段会话的 visualization.json；标注视频用系统播放器打开，用来核对轨迹有没有跳到别的物体上。":
+        "The 3D viewer reads this session's visualization.json; the annotated "
+        "video opens in the system player so you can check whether the track "
+        "jumps to another object.",
+    "先看这段会话本身有没有问题：左右帧数是否一致、同步是否可信、视频是否几乎全黑。坏数据进三维只会得到一条看起来像结果的错轨迹。":
+        "First check the session itself: whether left/right frame counts match, "
+        "whether sync is trustworthy, and whether the video is almost entirely "
+        "black. Bad data only produces a plausible-looking wrong 3D track.",
+    "球颜色不突出时 color 会 0 检出（本机实测 0/40 帧），改 hough（95%）或 fusion（82.5%）。smart = 先 color，0 检出自动换 hough 重跑一遍。":
+        "When the ball color is not distinctive, color may detect 0 frames "
+        "(0/40 measured here); use hough (95%) or fusion (82.5%). smart runs "
+        "color first and automatically retries with hough when it finds nothing.",
+    "纯色塑料球靠颜色分割：球的颜色要和背景分得开（同色背景会把整片区域当成球）。颜色预设选「自动取色」（按画面估主色，不用知道球色）或选一个贴合的球色；不选则用配置里的白球预设。":
+        "Solid-color plastic balls are segmented by color: the ball color must "
+        "stand out from the background (a same-color background becomes the "
+        "ball). Choose Auto color in the color preset (estimates the dominant "
+        "color from the frame; no need to know the ball color) or a matching "
+        "ball color; otherwise the white-ball preset from config is used.",
+    "自定义：检测方法直接取注册表里的实现；换一种球就换一个方法。":
+        "Custom: use the detector implementation from the registry directly; "
+        "change the method when you change the ball.",
+    "镜面金属球只有高光能定位：先「点选球心」人工点一次球心再识别，否则自动检测找不到球（实测 288 帧里 color 落在球上 0 帧）。":
+        "A mirror-finish metal ball can only be located by its highlight: click "
+        "Pick ball centre once before detection, otherwise automatic detection "
+        "will not find the ball (measured: color found the ball in 0 of 288 "
+        "frames).",
+    "session.json 里左右帧数是 0，这段会话可能是录到一半中断的":
+        "session.json reports 0 frames on both sides; this session may have "
+        "been interrupted mid-recording",
+    "目录名（可用 / 一次建多级，例如 实验1/梨子）":
+        "Directory name (use / to create multiple levels, e.g. experiment1/pears)",
+    "中文": "Chinese",
+    "自动取色": "Auto color",
+    "红球": "Red ball", "橙球": "Orange ball", "黄球": "Yellow ball",
+    "绿球": "Green ball", "青球": "Cyan ball", "蓝球": "Blue ball",
+    "紫球": "Purple ball", "白球": "White ball", "黑球": "Black ball",
+    "开始录制（先看状态条）": "Start recording (check the status bar first)",
+    "实时 3D（先看状态条）": "Live 3D (check the status bar first)",
+    "高级：棋盘尺寸与替代标定":
+        "Advanced: checkerboard size and alternative calibration",
+    "五步分别做什么": "What the five steps do",
+    "每步在干什么、什么时候能点": "What each step does and when it becomes available",
+    "内参：": "Intrinsics: ", "相机：": "Cameras: ",
+    "自动挑（优先外接）": "Auto-select (prefer external)",
+    "{cam}（按实测采集索引，不依赖角色绑定）｜未开相机验证":
+        "{cam} (measured capture index; not role-bound) | not opened yet",
+    "{cam}（读 config/cameras.json 失败）":
+        "{cam} (failed to read config/cameras.json)",
+    "{base}｜这台当前不在线，换「#编号」那个选项或重新 pin":
+        "{base} | this camera is offline; choose a #index option or pin it again",
+    "{base}｜设备还没枚举到": "{base} | device enumeration has not finished",
+    "{base}｜未开相机验证": "{base} | not opened yet",
+    "{role}：未固定（启动时自动挑）": "{role}: not pinned (auto-select at startup)",
+    "{role}：未固定": "{role}: not pinned",
+    "未知型号": "unknown model", "不在线": "offline",
+    "编号 {n}": "PnP order {n}", "未确认": "unverified",
+    "采集 #{n}": "capture #{n}", "采集索引未实测": "capture index not measured",
+    "共 {n} 条说明": "{n} help entries",
+    "搜到 {n} 条": "{n} results",
+    "帧数 {left}/{right}　帧率 {fps:.1f} fps　模式 {mode}":
+        "Frames {left}/{right}  ·  {fps:.1f} fps  ·  {mode} mode",
+    "同步 {method}{offset:+d}（置信度 {conf:.2f}）":
+        "Sync {method}{offset:+d} (confidence {conf:.2f})",
+    "匹配 {matched}/{total}": "Matched {matched}/{total}",
+    "残差中位 {median:.2f} px": "median residual {median:.2f} px",
+    "问题：{text}": "Problems: {text}",
+    "相机枚举完成：{online} 台在线{note}；「#编号」只在采集索引实测后出现，没实测先跑 cameras.py identify":
+        "Camera enumeration finished: {online} online{note}; #index appears only "
+        "after a measured capture index; if it is not measured, run "
+        "cameras.py identify first",
+    "名义 {nominal:g} mm 的球在这套检测器下约填 {effective:g} mm —— "
+    "高光半径偏小 {shrink:.1f}%，填名义值会让深度偏大 {bias:.1f}%":
+        "For a nominal {nominal:g} mm ball this detector wants about "
+        "{effective:g} mm: the highlight radius is {shrink:.1f}% small, and "
+        "entering the nominal value makes depth {bias:.1f}% too large",
+    "误差预算（半径噪声 0.2 px、球径误差 0.2 mm、焦距 1%；{src}）：{parts}":
+        "Error budget (radius noise 0.2 px, diameter error 0.2 mm, focal length "
+        "1%; {src}): {parts}",
+    "半径系统偏差：填名义直径（不是有效值）→ 深度额外 +{pct:.1f}%（1 m 处约 {mm:.0f} mm；实测）":
+        "Radius systematic bias: entering the nominal diameter (not the "
+        "effective value) adds {pct:.1f}% depth error (about {mm:.0f} mm at "
+        "1 m; measured)",
+    "球径那一栏是空的，所以算不了误差预算 —— 填毫米数，这颗球填 {effective:g}（有效值）；留空也行，识别时会按 {effective:g} mm 算":
+        "The ball diameter field is empty, so the error budget cannot be "
+        "computed. Enter millimetres; for this ball use {effective:g} (the "
+        "effective value). Leaving it empty is allowed: detection will use "
+        "{effective:g} mm.",
+    "球径那一栏「{raw}」不是数字，所以算不了误差预算 —— 这里填毫米（例如 {effective:g}），不是 {metres:.4f}（米是命令行那边的单位，界面只认 mm）。改完这一行会自动重算":
+        "The ball diameter field \"{raw}\" is not a number, so the error budget "
+        "cannot be computed. Enter millimetres here (for example {effective:g}), "
+        "not {metres:.4f} (metres are used on the command line; this window "
+        "accepts mm only). This line recalculates when you change it.",
+    "焦距未标定，按 60° 视场估（fx≈1663 px）":
+        "Focal length is not calibrated; estimating from a 60° field of view "
+        "(fx≈1663 px)",
+    "按 fx = {fx:.0f} px 算": "using fx = {fx:.0f} px",
+    "{secs} 秒": "{secs} s",
+    "「{secs}」不是数字，按 10 秒":
+        "\"{secs}\" is not a number; using 10 seconds",
+    "高级：录制时长、检测器说明、会话位置":
+        "Advanced: recording duration, detector notes, session location",
+    "还没有选中会话。": "No session selected.",
+    "还没有会话：先去双目窗录一段，或在双目窗第 ④ 步跑一次离线三维，回来这里就有历史会话可选。":
+        "No sessions yet: record one in the stereo window, or run offline 3D "
+        "from step 4 there; historical sessions will appear here.",
+    "这段会话的数据有问题，先按上面的问题修（重录或修 session.json），别进三维。":
+        "This session has data problems. Fix the issues above (re-record or "
+        "repair session.json) before running 3D.",
+    "这段会话没录成（左右两路都是 0 帧），直接重录即可，不用修数据。":
+        "This session was not recorded (0 frames on both sides); record it "
+        "again rather than repairing the data.",
+    "下一步：① 校验数据；金属球（specular）要在 ② 点选球心后才能跑第 ③ 步。":
+        "Next: 1) Validate data; for a metal ball (specular), pick the ball "
+        "centre in step 2 before running step 3.",
+    "下一步：③ 跑离线三维。": "Next: 3) Run offline 3D.",
+    "三维跑出来了但匹配点太少（画不出轨迹）。下一步：确认 ② 的球心选对、换检测方法重跑 ③；④ 仍可打开查看器看那些散点落在哪。":
+        "3D finished but too few points matched (no track can be drawn). Next: "
+        "check the centres picked in step 2 and rerun step 3 with another "
+        "detector; step 4 can still open the viewer to see where those points "
+        "land.",
+    "下一步：④ 看三维；⑤ 可重新导出标准 JSON。":
+        "Next: 4) View 3D; 5) re-export the standard JSON if needed.",
+    "点选球心 seeds.json": "Ball centres seeds.json",
+    "轨迹 traj3d.json": "Trajectory traj3d.json",
+    "三维 visualization.json": "3D visualization.json",
+    "标注视频 annotated.mp4": "Annotated video annotated.mp4",
+    "缺视频帧数": "Missing frame counts",
+    "未同步（sync=none）": "Not synchronized (sync=none)",
+    "视频几乎全黑": "Video is almost entirely black",
+    "三维轨迹没有匹配点": "3D trajectory has no matched points",
+    "尚未跑离线双目": "Offline stereo has not been run",
+    "未点选球心 seed": "Ball-centre seed not picked",
+    "缺 session.json": "Missing session.json",
+    "session.json 不是对象": "session.json is not an object",
+    "traj3d.csv 读不了": "Cannot read traj3d.csv",
+    "录制未完成：左右两路都是 0 帧（视频只有文件头）":
+        "Recording did not complete: 0 frames on both sides (video has only a header)",
+    "左右帧数差 {diff}（超过 {tol}）：有一路明显掉帧，三维会断续":
+        "Left/right frame difference {diff} (over {tol}): one side dropped "
+        "frames; 3D will be discontinuous",
+    "左右帧数差 {diff} 帧（管线按短的那路跑，可继续）":
+        "Left/right frame difference {diff} frames (pipeline uses the shorter "
+        "side and can continue)",
+    "session.json 读不了：{exc}": "Cannot read session.json: {exc}",
+    "traj3d.json 读不了：{exc}": "Cannot read traj3d.json: {exc}",
+    "traj3d.csv 读不了：{exc}": "Cannot read traj3d.csv: {exc}",
+    "质检结论 {verdict}：录像几何与标定不一致，结果仅供参考":
+        "Quality verdict {verdict}: recording geometry does not match the "
+        "calibration; results are for reference only",
+    "质检结论 {verdict}：结果仅供参考":
+        "Quality verdict {verdict}: results are for reference only",
+    "三维匹配点过少：{matched}/{total}（{percent:.1f}%，低于 {threshold:g}%），轨迹画不出来；检查球心是否选对 / 换检测方法重跑 / 标定是否匹配":
+        "Too few 3D matches: {matched}/{total} ({percent:.1f}%, below "
+        "{threshold:g}%); no track can be drawn. Check the picked ball "
+        "centres, rerun with another detector, and verify the calibration.",
+    "跑过三维，但缺 traj3d.json / traj3d.csv（只剩可视化或标注视频），匹配率无法判定；建议用同一份 seeds 重跑一次离线三维":
+        "3D was run but traj3d.json / traj3d.csv are missing (only "
+        "visualization/annotated video remain); the match rate cannot be "
+        "determined. Rerun offline 3D with the same seeds.",
+    # ---- 2026-11-24：弹窗专项（装置档案 / FOV / 工具台 / 垃圾清理）----
+    "采集档": "Capture profile", "标定实测": "Calibration measurements",
+    "—（按标定）": "— (from calibration)",
+    "当前装置：{name}": "Active rig: {name}",
+    "当前装置：{name}　模式：{mode}": "Active rig: {name}  ·  mode: {mode}",
+    "尺度 left→right": "Scale left→right", "等效放大": "Effective zoom",
+    "裁剪矩形": "Crop rectangle", "共同输出尺寸": "Common output size",
+    "测量时分辨率": "Resolution at measurement", "估计质量": "Estimated quality",
+    "测量时间": "Measured at", "来源": "Source",
+    "大角度（angled）": "Wide-angle (angled)",
+    "平行（parallel）": "Parallel (parallel)",
+    "世界 Z 轴": "World Z axis", "标定文件": "Calibration file",
+    "只统计不写文件（先看有多少可用帧）":
+        "Count only, write no files (check usable frames first)",
+    "当前：{path}": "Current: {path}",
+    "未登记（由启动器/安装器决定）": "not registered (set by launcher/installer)",
+    "还没有装置档案 —— 点「新建装置…」建一条（如「平行装置」「90度装置」），各配一份标定":
+        "No rig profiles yet - click New rig… to create one (for example "
+        "Parallel rig or 90° rig), each with its own calibration",
+    "项": "Item", "档": "Tier", "体积": "Size", "最新的一个": "Newest",
+    "文件": "Files", "推荐": "Recommended", "谨慎": "Caution",
+    "彻底删": "Permanent delete", "（不动）": " (muted)",
+    "今天": "today", "昨天": "yesterday",
+    "{n} 天前": "{n} days ago", "{n} 个月前": "{n} months ago",
+    "{n} 年前": "{n} years ago",
+    "Python 字节码缓存": "Python bytecode cache",
+    "临时文件残留": "Temporary file leftovers",
+    "会话元数据备份": "Session metadata backups",
+    "回收站（data/_trash）": "Recycle bin (data/_trash)",
+    "outputs/logs（旧日志位置）": "outputs/logs (old log location)",
+    "outputs 根下的临时文件": "Temporary files at the outputs root",
+    "outputs 根下的其他散落文件": "Other loose files at the outputs root",
+    "未标定": "Not calibrated", "已标定": "Calibrated",
+    "路径不符": "Path mismatch", "模式冲突": "Mode conflict",
+    "全部会话": "All sessions",
+    "自动核对：配置读不出来": "Auto-check: cannot read the configuration",
+    "自动核对：": "Auto-check: ",
+    "未配置": "not configured",
+    "{role}={label} 一致": "{role}={label}: match",
+    "{role}={label} 采集索引未实测": "{role}={label}: capture index not measured",
+    "{role}={label} 不在线/身份变了": "{role}={label}: offline or identity changed",
+    "已选 {chosen} 项 / {files} 个文件 / {size}　｜　推荐档 {safe_size}（{safe_n} 项）　谨慎档 {warn_size}（{warn_n} 项）":
+        "Selected {chosen} items / {files} files / {size}  |  Recommended: "
+        "{safe_size} ({safe_n} items)  Caution: {warn_size} ({warn_n} items)",
+    "，其中 {n} 项是「看起来像数据」被自动降级的":
+        "; {n} of them were automatically downgraded as \"looks like data\"",
+    "　｜　另有 {size}（{files} 个文件）比所选时间范围新，已筛掉":
+        "  |  {size} ({files} files) are newer than the selected time range and were filtered out",
+    "找不到的位置：{text}": "Missing locations: {text}",
+    "选中的「回收站」是彻底删除，删了不可恢复。":
+        "The selected Recycle bin entries are permanently deleted and cannot be recovered.",
+    "「推荐」= 删了下次跑就有；「谨慎」= 删了要重跑/重拍才能再生；右键某行可「标为不动」。":
+        "Recommended = regenerated on the next run; Caution = needs a rerun or "
+        "reshoot; right-click a row to mark it as muted.",
+    "还原": "Restore", "全屏": "Fullscreen",
+    "sessions 根目录：{path}": "sessions root: {path}",
+    "回收站：{path}": "Recycle bin: {path}",
+    "整个会话（含原始视频）": "Whole session (including raw video)",
+    "只清派生结果（derived/）": "Derived results only (derived/)",
+    "清理方式": "Cleanup mode", "保留最新": "Keep newest",
+    "个（按会话名倒序；0=不保留）":
+        " (newest first by session name; 0 = keep none)",
+    "预览失败：{exc}": "Preview failed: {exc}",
+    "{sessions} 个会话 / {files} 个文件 / {size}":
+        "{sessions} sessions / {files} files / {size}",
+    "将移动 {summary}；跳过 {n} 项":
+        "Will move {summary}; skipping {n} items",
+    "清理会话（先移到回收站）": "Clean sessions (move to recycle bin first)",
+    "回收站": "Recycle bin",
+    "全部会话 ({n})": "All sessions ({n})",
+    "平行双目": "Parallel stereo", "大角度双目": "Wide-angle stereo",
+    "散会话": "Loose sessions",
+    "已选 {chosen} / {total} 个会话\n预计原始数据 {size}":
+        "Selected {chosen} / {total} sessions\nEstimated raw data: {size}",
+    "选": "Select", "时间": "Time", "大小": "Size",
+    "会话元数据（session.json + 时间戳）":
+        "Session metadata (session.json + timestamps)",
+    "标准派生数据（seeds / traj3d / visualization / CSV）":
+        "Standard derived data (seeds / traj3d / visualization / CSV)",
+    "派生图（traj3d.png / sync_brightness.png）":
+        "Derived plots (traj3d.png / sync_brightness.png)",
+    "标注视频（有画面，含隐私风险）":
+        "Annotated video (contains imagery; privacy risk)",
+    "原始双目视频（很大，有画面，含隐私风险）":
+        "Raw stereo videos (large, contain imagery; privacy risk)",
+    "该会话的标定参数（JSON/NPZ）": "This session's calibration parameters (JSON/NPZ)",
+    "移除相机 identity/name/port": "Remove camera identity/name/port",
+    "移除会话 label/notes": "Remove session label/notes",
+    "移除 OS platform": "Remove OS platform",
+    "批次": "Batch", "方式": "Mode", "项数": "Items",
+    # ---- 2026-11-24：3D 查看器 ----
+    "[单目]": "[Mono]", "[双目]": "[Stereo]",
+    "[降级]": "[Degraded]",
+    "3D 轨迹 · {kind}{session} · {n} points":
+        "3D trajectory · {kind}{session} · {n} points",
+    "共 {n} 个会话有结果（单目 + 双目）":
+        "{n} sessions have results (mono + stereo)",
+    "没有找到会话结果（data/stereo、data/mono 下都没有 derived/）":
+        "No session results found (no derived/ under data/stereo or data/mono)",
+    "这段会话没有标注视频": "This session has no annotated video",
+    "用系统播放器打开视频（{reason}）":
+        "Open video in system player ({reason})",
+    "视频不是左右并排（{w}x{h}），按 2:1 切分会错":
+        "Video is not side-by-side ({w}x{h}); slicing at 2:1 would be wrong",
+    "单目深度由球径先验得到（D={d} mm，Z=f·D/(2r)），尺度依赖这个数；不是视差测量":
+        "Monocular depth comes from the ball-diameter prior (D={d} mm, "
+        "Z=f·D/(2r)); its scale depends on this value and is not a disparity "
+        "measurement",
+    "XY 平面": "XY plane", "XZ 平面": "XZ plane", "YZ 平面": "YZ plane",
+    "没有可用的三维点": "no usable 3D points",
+    "没有三维结果：{reason}{extra}   可查看会话信息 / 视频，若有":
+        "No 3D result: {reason}{extra}   You can still view session info / video, if available",
+    "   会话：{path}": "   Session: {path}",
+    "   （有视频，可在下方查看）": "   (has video; see below)",
+    "frame {frame}   t={t:.3f}s   X={x:.4f}  Y={y:.4f}  Z={z:.4f} m   "
+    "模式={mode}   坐标={coord}   视角 {elev:.0f}/{azim:.0f}/{roll:.0f}°":
+        "frame {frame}   t={t:.3f}s   X={x:.4f}  Y={y:.4f}  Z={z:.4f} m   "
+        "mode={mode}   coordinates={coord}   view {elev:.0f}/{azim:.0f}/{roll:.0f}°",
+
+    # ---- 2026-11-24：状态条 / 弹窗动态句（整句模板，数据保持原文）----
+    "内参标定失败（返回码 {code}）：{tail} —— 常见原因是标定图不够或姿态太单一（要 8 个以上不同角度）；{log}":
+        "Intrinsic calibration failed (exit code {code}): {tail} - usually too "
+        "few images or poses (need at least 8 different angles); {log}",
+    "已启动实时识别（球径按 {d} mm 传给命令行 {m} m），画面在它自己的窗口里；要停请到「任务管理器和运行日志」里中断":
+        "Live detection started (diameter {d} mm sent to the command line as "
+        "{m} m); video is in its own window. Stop it from Task manager and run log.",
+    "种子已存：{path}（球心 x,y 半径 = {value}）。点「开始识别」就按它跟踪，本次用检测器 {det}（{how}）{pref}":
+        "Seed saved: {path} (ball centre x,y radius = {value}). Click Start "
+        "detection to track from it; this run uses detector {det} ({how}){pref}",
+    "种子是在 {w}x{h} 上点的，这段录像是 {w2}x{h2}，坐标对不上，退回自动检测":
+        "The seed was picked at {w}x{h} but this recording is {w2}x{h2}; "
+        "coordinates do not match, so automatic detection is used",
+    "已启动离线单目：{path}（检测器 {method}）；结果写进 {derived}/（跑完摘要会变成「已检测」，那时才能点「看 3D」）":
+        "Offline monocular started: {path} (detector {method}); results go to "
+        "{derived}/ (the summary becomes Detected when done, then View 3D is enabled)",
+    "「{title}」失败（返回码 {code}）：{tail} —— {log}":
+        "\"{title}\" failed (exit code {code}): {tail} - {log}",
+    "「{title}」{reason}（返回码 {code}），没跑完就没结果 —— {log}":
+        "\"{title}\" {reason} (exit code {code}); no result without a full run - {log}",
+    "已打开 3D 查看器：{path}（单目深度由球径先验得到，D={d} mm；不是视差测量）":
+        "3D viewer opened: {path} (monocular depth comes from the ball-diameter "
+        "prior, D={d} mm; not a disparity measurement)",
+    "{id}：结果已写进 derived/（annotated.mp4 + traj.csv + visualization.json）；点「看 3D」看图":
+        "{id}: results written to derived/ (annotated.mp4 + traj.csv + "
+        "visualization.json); click View 3D to see them",
+    "录制没成功（返回码 {code}）：{tail} —— {log}":
+        "Recording failed (exit code {code}): {tail} - {log}",
+    "已开始录制 {secs} 秒 → {path}/（有倒计时，看到 REC 才开始动）。录完点「开始识别」直接检测这段会话":
+        "Recording started for {secs} s → {path}/ (wait for the countdown and "
+        "REC). When done, click Start detection to process this session.",
+    "旧默认球直径 {d} mm 已清空 —— 球径现在没有默认值，请按实际球的直径（毫米）重填；单目测深 Z 对它是 1:1 的":
+        "The old default ball diameter {d} mm was cleared - there is no default "
+        "now. Enter the real diameter in millimetres; monocular depth Z scales "
+        "1:1 with it.",
+    "把整个会话目录 {id} 移到回收站吗？":
+        "Move the whole session directory {id} to the recycle bin?",
+    "「{title}」完成（返回码 0）：{tail} —— {log}":
+        "\"{title}\" completed (exit code 0): {tail} - {log}",
+    "新的会话会建在 {root}/<时间戳>/，以前录的还在原位置（点「选择…」只看这个目录下的）":
+        "New sessions go to {root}/<timestamp>/; older recordings stay where "
+        "they are (Select… only lists this directory).",
+    "试开结束，但日志尾既没「打不开」也没「实测帧率」：{tail} —— 开日志看完整输出 {log}":
+        "The test open ended without either Cannot open or a measured frame "
+        "rate: {tail} - open the log for the full output {log}",
+    "离线检测失败（返回码 {code}）：{tail} —— {log}":
+        "Offline detection failed (exit code {code}): {tail} - {log}",
+    "已开始拍图：板停稳会自动存，存够 {n} 张结束。本次图单独存 {dir}":
+        "Capture started: steady frames are saved automatically until {n} "
+        "images. This set is stored separately in {dir}",
+    "已移到回收站：{path}/{name}（要恢复请用数据管理里的回收站）":
+        "Moved to the recycle bin: {path}/{name} (restore it from Data management → Recycle bin)",
+    "录好了：{summary}{note}。点「开始识别」（来源「离线」）开始检测，结果写进 derived/":
+        "Recorded: {summary}{note}. Click Start detection (source Offline) to "
+        "process it; results go to derived/.",
+    "。注意：角色 {cam} 指向的相机当前不在线，录制多半开不出画面 —— 换「#编号」那个选项更稳":
+        ". Note: the camera for role {cam} is offline; recording will probably "
+        "produce no frames - choose a #index option instead.",
+    "当前会话换成 {id}（{state}）；「开始识别」（来源「离线」）会直接处理它{note}":
+        "Current session is now {id} ({state}); Start detection (source "
+        "Offline) will process it directly{note}",
+    "上次选的相机角色 {saved} 当前不在线，已改成 {default}（pin 好以后可以再选回来）":
+        "The previously selected camera role {saved} is offline; switched to "
+        "{default} (pin it again to use it later)",
+    "试开结果：这台打不开 —— {tail} —— {log}":
+        "Test open: this camera cannot open - {tail} - {log}",
+    "因球种需要，本次临时用检测器 {chosen} （你的偏好 {method} 不变，下次打开仍按偏好）":
+        "This run temporarily uses detector {chosen} for the ball kind (your "
+        "preference {method} is unchanged for next time)",
+    "建不了会话目录（{root}）：{exc}":
+        "Cannot create the session directory ({root}): {exc}",
+    "已换到 {root}；这里列出的是新目录下的会话":
+        "Switched to {root}; the sessions listed here come from the new directory",
+    "球径那一栏「{raw}」不是有效的毫米数 —— 这里填毫米（例如 25），不是 0.025":
+        "The ball diameter field \"{raw}\" is not a valid millimetre value - "
+        "enter millimetres here (for example 25), not 0.025",
+    "当前会话 {id}：目录已就绪，还没录到视频（录制会写 clip.mkv）":
+        "Current session {id}: directory is ready, but no video yet "
+        "(recording writes clip.mkv)",
+    "（设备列表读不到：{exc}，只能按角色选）":
+        "(Cannot read the device list: {exc}; only role selection is available)",
+    "种子文件读不了（{exc}），退回自动检测":
+        "Cannot read the seed file ({exc}); falling back to automatic detection",
+    "内参标定完成，已重新读取标定值（第①步那行会跟着变）；{note}":
+        "Intrinsic calibration complete; calibration values were reloaded "
+        "(the line in step 1 updates too); {note}",
+    "（session.json 没写成：{exc}；视频本身不受影响）":
+        "(session.json was not written: {exc}; the video itself is unaffected)",
+    "fx 那一栏「{raw}」不是数字，已忽略，仍用{tail}":
+        "The fx field \"{raw}\" is not a number and was ignored; still using {tail}",
+    "。用你点的种子跟踪（{seed}），不再自动检测":
+        ". Tracking from your picked seed ({seed}); automatic detection is disabled.",
+    "当前会话 {id} 有问题：{error}":
+        "Current session {id} has a problem: {error}",
+    "当前会话有问题：{error}{note}":
+        "Current session has a problem: {error}{note}",
+    "；你的偏好 {pref} 不变，下次打开仍按偏好":
+        "; your preference {pref} is unchanged and will be used next time",
+    "日志 {path}": "log {path}",
+    "标定值 fx={value}": "calibrated fx={value}",
+    "。注意：{note}": ". Note: {note}",
+    "质量状态：{grade}": "Quality: {grade}",
+    "没移成：{exc}": "Move failed: {exc}",
+    "已停掉本窗口的 {n} 个任务": "Stopped {n} tasks from this window",
+    "有 {n} 个任务在运行，其中可能有相机或标定程序。\n是 = 中断它们并退出；否 = 保持窗口打开、任务继续运行。\n\n如果你只是想收起某个子窗口，请关那个子窗口，不要关这里。":
+        "There are {n} running tasks, possibly cameras or calibration jobs.\n"
+        "Yes = stop them and exit; No = keep this window open and let them run.\n\n"
+        "If you only want to hide a child window, close that window instead of this one.",
+    "恢复批次？\n{name}": "Restore this batch?\n{name}",
+    "已恢复 {n} 个目录。": "Restored {n} directories.",
+    "这会永久删除：\n{path}\n不可恢复。继续？":
+        "This permanently deletes:\n{path}\nIt cannot be recovered. Continue?",
+    "批次：{batch}\n\n可在数据管理的『回收站』恢复或彻底删除。":
+        "Batch: {batch}\n\nRestore or permanently delete it from Data management → Recycle bin.",
+    "没有删除。": "Nothing was deleted.",
+    "先选一个批次。": "Select a batch first.",
+    "没有可移动的目录。": "There are no directories to move.",
+
+    # ---- 2026-11-24：双目/工作台/数据管理的常用动态句 ----
+    "球心已保存：{file}；现在跑第 ④ 步会用当前球种类的方法解算（镜面球 specular / 纯色球 color）。想同时用「半径锚点门」，把它勾上再跑（不勾就只是普通点选）":
+        "Ball centres saved: {file}. Step 4 now uses the current ball kind "
+        "(specular for metal / color for solid colors). To also use the "
+        "radius-anchor gate, enable it before running (otherwise this is a "
+        "plain centre pick).",
+    "两台实际档不一致：{a}={aw}x{ah}，{b}={bw}x{bh}；双路必须同档，未填入。请把两台设成同一个模式后再试":
+        "The two actual modes differ: {a}={aw}x{ah}, {b}={bw}x{bh}; both "
+        "cameras must use the same mode. Set them to the same mode and retry.",
+    "正在检查装置 {left} / {right}（只报告，不改配置）：会开两路取景窗，举着棋盘慢慢移动，按 q 可提前结束。结论会写回这里":
+        "Checking rig {left} / {right} (report only, no config changes): two "
+        "preview windows open; move the board slowly, press q to finish early. "
+        "The conclusion is written here.",
+    "正在按 {mode} 解算 {path}（检测方法 {method}）{tail}…":
+        "Solving {path} as {mode} (detector {method}){tail}…",
+    "正在标定会话 {path} 的图…": "Calibrating images from session {path}…",
+    "标定完成。{note}{tail}": "Calibration complete. {note}{tail}",
+    "重建完成{note}": "Reconstruction complete{note}",
+    "已选会话：{name}": "Selected session: {name}",
+    "先选一个会话（点「选择…」）": "Select a session first (click Select…)",
+    "这不是会话目录（缺 session.json）：{name}":
+        "This is not a session directory (missing session.json): {name}",
+    "会话目录不见了：{path}": "Session directory disappeared: {path}",
+    "正在解算 {id}（检测方法 {method}）；跑完 ④ 的按钮会自动亮起":
+        "Solving {id} (detector {method}); the step 4 buttons enable when done",
+    "球心已保存：{file}；现在可以跑第 ③ 步":
+        "Ball centres saved: {file}; step 3 can run now",
+    "正在打开 3D 查看器：{name}": "Opening 3D viewer: {name}",
+    "这个平台不能直接开视频，文件在：{path}":
+        "This platform cannot open video directly; file: {path}",
+    "已用系统播放器打开 {name}": "Opened {name} in the system player",
+    "打不开 {name}：{exc}": "Cannot open {name}: {exc}",
+    "正在校验这段会话，逐项结果会写到运行日志":
+        "Validating this session; each result goes to the run log",
+    "数据校验失败（没通过）：看运行日志里它列的每一项问题":
+        "Data validation failed: see each problem listed in the run log",
+    "导出标准数据 {id}": "Export standard data {id}",
+    "一键全流程 {id}": "One-click full pipeline {id}",
+    "校验数据 {id}": "Validate data {id}",
+    "离线三维 {id}": "Offline 3D {id}",
+    "正在导出 visualization.json / CSV / 示意图":
+        "Exporting visualization.json / CSV / preview image",
+    "导出失败：看运行日志里它的报错":
+        "Export failed: see the error in the run log",
+    "当前：{path}": "Current: {path}",
+    "已更新 {id}（备份：{name}）": "Updated {id} (backup: {name})",
+    "已更新 {id}（备份：未找到）": "Updated {id} (backup: not found)",
+    "完成：{name}  {size}": "Completed: {name}  {size}",
+    "失败：{exc}": "Failed: {exc}",
+    "正在导出，请先等上一个任务结束":
+        "Export in progress; wait for the previous task to finish",
+    "正在取消导出，等待当前文件收尾…":
+        "Cancelling export; waiting for the current file to finish…",
+    "导出中…": "Exporting…",
+    "先在列表里选一个会话": "Select a session in the list first",
+    "至少选一个导出类别": "Select at least one export category",
+    "先勾选至少一个会话": "Select at least one session first",
+    "先勾选或选中至少一个会话": "Select at least one session first",
+    "先只选一条会话": "Select exactly one session first",
+    "先在右边勾选会话": "Select sessions on the right first",
+    "先点一行作为起点": "Click a row to set the start first",
+    "先点一行作为终点": "Click a row to set the end first",
+    "先点第一列勾起点，或先按『设为起点』":
+        "Check the start in the first column, or click Set as start first",
+    "先选一个目录。": "Select a directory first.",
+    "选一个自己建的目录再改名。": "Select a directory you created before renaming.",
+    "新目录名": "New directory name",
+    "目录名不能为空。": "The directory name cannot be empty.",
+    "目录名不能以 / 结尾。": "The directory name cannot end with /.",
+    "计划开始时间解析失败：{value}": "Cannot parse the start time: {value}",
+    "计划结束时间解析失败：{value}": "Cannot parse the end time: {value}",
+    "填一个开始或结束时间，例如 2026-10-20。":
+        "Enter a start or end time, for example 2026-10-20.",
+    "开始时间晚于结束时间。": "The start time is later than the end time.",
+    "不是目录：{root}": "Not a directory: {root}",
+    "先在列表里选中一条会话。": "Select a session in the list first.",
+    "先只选一条会话。": "Select exactly one session first.",
+    "输出路径": "Output path", "导出": "Export", "导出完成": "Export complete",
+    "导出失败": "Export failed", "扫描失败": "Scan failed",
+    "删除目录": "Delete directory", "新建目录": "New directory",
+    "改名": "Rename", "放入目录": "Add to directory",
+    "移出目录": "Remove from directory", "3D + 视频": "3D + video",
+    "打开会话文件夹": "Open session folder",
+    "编辑名称/备注": "Edit name/notes",
+    "按时间选择": "Select by time", "设为起点": "Set as start",
+    "选到此处": "Select up to here",
+    "数据目录": "Data directory",
+    "基本设置（常用）": "Basic settings (common)",
+    "高级设置（精度 / 排障）": "Advanced settings (precision / troubleshooting)",
+    "高级（仅单目实时 / 离线视频）":
+        "Advanced (live monocular / offline video only)",
+    "点选双目球心": "Pick stereo ball centres",
+    "点选单目球心": "Pick mono ball centre",
+    "左路": "Left view", "右路": "Right view",
+    "左：还没点": "Left: not picked yet",
+    "等待点击": "Waiting for a click",
+    "应用半径": "Apply radius",
+    "约 Z = —（还没点球边）": "approx. Z = — (ball edge not picked yet)",
+    "约 Z = —（{why}）": "approx. Z = — ({why})",
+    "吸附Hough圆心": "Snap to Hough centre",
+    "在左图点球心，再在右图点球心；圆心=你点击的位置，需要时再点『吸附Hough圆心』；半径可微调。":
+        "Click the ball centre in the left image, then in the right image. "
+        "The centre is where you click; use Snap to Hough centre if needed; "
+        "the radius can be fine-tuned.",
+    "拍标定图用棋盘：A4 打印一张，在画面里上下左右都摆一摆，至少 8 个不同姿态（挤在中央会让畸变系数失真）。":
+        "For calibration images, print an A4 checkerboard and move it around "
+        "the frame: at least 8 different poses (keeping it in the centre "
+        "distorts the distortion coefficients).",
+    "内角点 = 棋盘格内部交叉点个数，不是格子数。手上那张纸写着 8×5 就填 8 和 5；方格边长按实际量。":
+        "Inner corners = the number of internal checkerboard intersections, "
+        "not squares. If the printed board says 8×5, enter 8 and 5; measure the "
+        "square size with a ruler.",
+    "替代方案用的是第②步填的球直径：同一颗球、同一个 D，两处同源，所以不叠加；但换了球一定要改第②步那一栏，否则 fx 会按旧球径算错（f = 2·r·Z/D，D 错多少，fx 就错多少）。":
+        "The alternative uses the ball diameter from step 2: the same ball and "
+        "the same D are shared, so the error does not add; but when you change "
+        "balls you must update step 2, otherwise fx is computed from the old "
+        "diameter (f = 2·r·Z/D, so a wrong D gives a wrong fx).",
+    "球是镜面的（镀铬、反光）时，自动检测会把书架/衣服当球：先录一段，再点「点选球心」——第一点球心、第二点球边（半径不靠自动估），之后「开始识别」用它跟踪，检测器会自动切成 specular。换会话存放目录的入口在「选择…」弹窗里。":
+        "With a mirror-finish (chrome, reflective) ball, automatic detection "
+        "mistakes shelves and clothes for the ball: record a clip, then click "
+        "Pick ball centre - first the centre, then the edge (the radius is not "
+        "estimated automatically). Start detection then tracks from it and the "
+        "detector switches to specular. The session-folder picker is in Select….",
+    "球种类决定检测方法：镜面金属球 = specular，必须先在「点选球心」里人工点一次球心（没有种子多半 0 检出）；纯色塑料球 = color + 颜色预设，球色要和背景分得开；自定义 = 直接用注册表里的某个方法。":
+        "Ball kind selects the detector: mirror metal ball = specular, which "
+        "requires picking the centre once under Pick ball centre (without a "
+        "seed it usually detects 0 frames); solid-color plastic ball = color "
+        "plus a color preset, with the ball color distinct from the background; "
+        "Custom = use a detector from the registry directly.",
+    "「离线」处理当前会话的录像：结果写进 derived/，跑完「看 3D」才会亮；「实时」直接开相机，不落盘，也没有 3D 结果（单目三维靠球径先验，需要落盘的轨迹）。":
+        "Offline processes the current session's recording: results go to "
+        "derived/ and View 3D enables when done. Live opens the camera directly, "
+        "saves nothing, and has no 3D result (monocular 3D needs a saved track "
+        "and the ball-diameter prior).",
 }
 
 #: 这些字符串即使含中文也不该被短语替换（专名 / 公式 / 单位 / 标点片段）。

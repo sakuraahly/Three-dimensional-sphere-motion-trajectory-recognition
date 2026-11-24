@@ -16,9 +16,11 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from apps import i18n  # noqa: E402
 from apps._cleanup import (  # noqa: E402
     MODES,
     CleanupPlan,
+    _fmt_bytes,
     list_trash,
     move_to_trash,
     plan_cleanup,
@@ -53,16 +55,19 @@ class CleanupDialog(tk.Toplevel):
         top.pack(fill="both", expand=True)
         ttk.Label(top, text="⚠ 这里只把目录移到回收站，不会直接永久删除。",
                   foreground=WARN, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(top, text=f"sessions 根目录：{self.root_dir}",
+        ttk.Label(top, text=i18n.tf("sessions 根目录：{path}",
+                                    path=self.root_dir),
                   wraplength=760).pack(anchor="w", pady=(4, 2))
-        ttk.Label(top, text=f"回收站：{trash_root(self.root_dir)}",
+        ttk.Label(top, text=i18n.tf("回收站：{path}",
+                                    path=trash_root(self.root_dir)),
                   wraplength=760).pack(anchor="w", pady=(0, 8))
 
         self.mode_var = tk.StringVar(value="session")
         box = ttk.LabelFrame(top, text="清理方式", padding=8)
         box.pack(fill="x", pady=(0, 8))
         for key, text in MODES.items():
-            ttk.Radiobutton(box, text=text, value=key, variable=self.mode_var,
+            ttk.Radiobutton(box, text=i18n.t(text), value=key,
+                            variable=self.mode_var,
                             command=self._preview).pack(anchor="w", pady=1)
 
         keep = ttk.Frame(top)
@@ -106,11 +111,16 @@ class CleanupDialog(tk.Toplevel):
                                      allow_nested=True)
         except Exception as exc:                            # noqa: BLE001
             self.plan = None
-            self.summary.configure(text=f"预览失败：{exc}")
+            self.summary.configure(text=i18n.tf("预览失败：{exc}", exc=exc))
             self.paths.delete("1.0", "end")
             return
+        plan_summary = i18n.tf(
+            "{sessions} 个会话 / {files} 个文件 / {size}",
+            sessions=len(self.plan.items), files=self.plan.total_files,
+            size=_fmt_bytes(self.plan.total_bytes))
         self.summary.configure(
-            text=f"将移动 {self.plan.summary()}；跳过 {len(self.plan.skipped)} 项")
+            text=i18n.tf("将移动 {summary}；跳过 {n} 项",
+                         summary=plan_summary, n=len(self.plan.skipped)))
         lines = []
         for item in self.plan.items:
             lines.append(f"{item.source}  ({item.files} 文件, {item.bytes} B)")
@@ -160,7 +170,8 @@ class TrashDialog(tk.Toplevel):
     def _build(self) -> None:
         top = ttk.Frame(self, padding=12)
         top.pack(fill="both", expand=True)
-        ttk.Label(top, text=f"回收站：{trash_root(self.root_dir)}",
+        ttk.Label(top, text=i18n.tf("回收站：{path}",
+                                    path=trash_root(self.root_dir)),
                   wraplength=760).pack(anchor="w", pady=(0, 8))
         cols = ("batch", "created", "mode", "items", "size")
         heads = ("批次", "时间", "方式", "项数", "大小")

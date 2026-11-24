@@ -902,7 +902,9 @@ class StatusBar(ttk.Frame):
         style = {"ok": "Ok.TLabel", "warn": "Warn.TLabel"}.get(
             level, "Hint.TLabel")
         try:
-            self._label.configure(text=text, style=style)
+            # dynamic()：先整句精确、再已登记模板匹配；未登记的句子原样保留。
+            # 状态条是 f-string 最集中的出口，在这里兜一次比逐个改调用点可靠。
+            self._label.configure(text=i18n.dynamic(text), style=style)
             # 状态文本由调用方用 tf() 按**当前语言**现场生成，不应被原文记账
             # 当成静态控件文案：清掉记账，避免切语言时 apply() 拿上一语言的
             # 显示值当原文、把刚生成的英文又翻回中文（2026-11-23 实测）。

@@ -47,7 +47,7 @@ ROOT = next(p for p in Path(__file__).resolve().parents
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from apps import _fov_store                                 # noqa: E402
+from apps import _fov_store, i18n                           # noqa: E402
 from apps._gui_widgets import BG, MUTED, WARN               # noqa: E402
 from sphere_tracker.paths import STEREO_ROOT                # noqa: E402
 from sphere_tracker.video_files import (                    # noqa: E402
@@ -182,9 +182,10 @@ class FovDialog(tk.Toplevel):
             self.chk_apply.configure(state="disabled")
             self.status.configure(text="", foreground=MUTED)
             return
-        mode = ("大角度（angled）" if getattr(prof, "stereo_mode", "") == "angled"
-                else "平行（parallel）")
-        self.lbl_rig.configure(text=f"当前装置：{name}　模式：{mode}")
+        mode = i18n.t("大角度（angled）" if getattr(prof, "stereo_mode", "") == "angled"
+                      else "平行（parallel）")
+        self.lbl_rig.configure(
+            text=i18n.tf("当前装置：{name}　模式：{mode}", name=name, mode=mode))
 
         fov = getattr(prof, "fov", None)
         applied = bool(getattr(prof, "fov_apply", False))

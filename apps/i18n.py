@@ -16,14 +16,15 @@
   菜单 / Treeview 表头与条目的显示文本过一遍 `t()`；
 - 新建窗口由 `install()` 挂的钩子在 `after_idle` 自动补一次；
 - `apps/tools/i18n_extract.py` 只负责登记新文案，译文在
-  `i18n_data.py` 中维护（`i18n_seed.py` 只提供少量固定词条的精确译文）。
+  `i18n_data.py` 中维护（`i18n_seed.py` 只提供固定词条与整句模板的译文）。
 
 ## 明确的安全边界
 
-只翻译**纯展示**文本。参与逻辑判断的值（Combobox 选项、`StringVar` 里
-要被 `.get()` 比较的字符串、文件路径、命令参数）一律不碰 —— 否则
-`if var.get() == "离线（当前会话）"` 会在切换语言后静默失效。
-消息框的标题/正文属于纯展示，已统一挂钩。
+只翻译**纯展示**文本。参与逻辑判断的值（`StringVar` 里要被 `.get()` 比较的
+字符串、文件路径、命令参数）保持原文；下拉框做**显示与逻辑分离**：
+`values` 显示英文，`Combobox.get()` / `textvariable.get()` 仍返回中文原文，
+`set()` 接中文原文。这样 `if var.get() == "离线（当前会话）"` 不会因为切语言
+而静默失效。消息框的标题/正文属于纯展示，已统一挂钩。
 
 ## 语言切换
 
@@ -35,10 +36,12 @@
 from __future__ import annotations
 
 import os
+import re
+import string
 import tkinter as tk
 from functools import lru_cache
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from apps.i18n_seed import SEED
 
@@ -55,6 +58,9 @@ LANG_LABELS = {"zh-CN": "中文", "en-US": "English"}
 
 _current = "zh-CN"
 _installed = False
+#: 所有被接管的 Combobox：语言切换时要同时换下拉的**显示值**。
+#: 逻辑值始终是建控件时的原文；用户/代码读到的也是原文（见 _patch_combobox）。
+_choice_widgets: list = []
 
 
 # --------------------------------------------------------------------------- #
@@ -67,8 +73,11 @@ def table(lang: str) -> dict[str, str]:
         return {}
     name = lang.replace("-", "_").upper()
     data = getattr(i18n_data, name, {}) if i18n_data is not None else {}
-    merged = dict(SEED)
-    merged.update({k: v for k, v in data.items() if v})
+    # 人工种子**优先于**自动生成的资源：同一个 key 在两边都有时，种子是
+    # 人工润色过的整句/术语，资源文件可能仍带旧的机翻措辞（2026-11-24
+    # 用户报"英文模式像白痴"后改为这一口径）。
+    merged = {k: v for k, v in data.items() if v}
+    merged.update(SEED)
     return merged
 
 
@@ -87,6 +96,72 @@ def t(text):
 
 def t_all(items):
     return [t(x) if isinstance(x, str) else x for x in items]
+
+
+@lru_cache(maxsize=2)
+def _template_matchers(lang: str) -> tuple:
+    """把带 `{name}` 的整句条目编译成"锚定正则 → 英文模板"。
+
+    只用于**运行时拼出来的整句**（状态条 / messagebox 的 f-string）。它不是
+    逐词替换：必须整句命中一个已经登记的中文模板，才用对应英文模板重写；
+    匹配不到就原样返回，绝不猜。这样 `相机枚举完成：4 台在线…` 这类
+    "数据夹在中文骨架里"的句子也能翻，而设备名、路径等数据保持原样。
+    """
+    entries = []
+    for key, value in table(lang).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if "{" not in key or "}" not in key or not re.search(r"[\u4e00-\u9fff]", key):
+            continue
+        try:
+            parsed = list(string.Formatter().parse(key))
+        except ValueError:
+            continue
+        fields = [field for _, field, _, _ in parsed if field is not None]
+        if not fields or len(key) > 500:
+            continue
+        # 只接受简单的 {name} / {name:spec}，不碰 {a[b]} / {a.b}。
+        if any(not str(f).isidentifier() for f in fields):
+            continue
+        chunks = []
+        names = []
+        for literal, field, spec, conv in parsed:
+            chunks.append(re.escape(literal))
+            if field is not None:
+                name = str(field)
+                idx = len(names)
+                names.append(name)
+                chunks.append(f"(?P<f{idx}>.*?)")
+        try:
+            pattern = re.compile("^" + "".join(chunks) + "$", re.S)
+        except re.error:
+            continue
+        # 去掉英文模板里的格式说明：捕获到的是已经格式化后的显示值。
+        english = re.sub(r"\{([^{}:]+):[^}]+\}", r"{\1}", value)
+        entries.append((len(key), pattern, names, english))
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return tuple(entries)
+
+
+def dynamic(text):
+    """翻译运行时拼好的整句：先整句精确，再模板匹配；不逐词猜。"""
+    if not isinstance(text, str) or not text or _current == "zh-CN":
+        return text
+    hit = t(text)
+    if hit != text:
+        return hit
+    for _size, pattern, names, english in _template_matchers(_current):
+        m = pattern.match(text)
+        if m is None:
+            continue
+        values = {}
+        for i, name in enumerate(names):
+            values[name] = m.group(f"f{i}")
+        try:
+            return english.format(**values)
+        except (KeyError, IndexError, ValueError):
+            continue
+    return text
 
 
 def tf(template: str, **kwargs) -> str:
@@ -125,11 +200,13 @@ def set_language(lang: str) -> None:
         return
     _current = lang
     table.cache_clear()
+    _template_matchers.cache_clear()
     try:
         LANG_FILE.parent.mkdir(parents=True, exist_ok=True)
         LANG_FILE.write_text(lang, encoding="utf-8")
     except OSError:
         pass
+    refresh_choices()
     refresh_all()
 
 
@@ -221,6 +298,137 @@ def _swap(widget, opt: str, *, getter, setter) -> None:
     if not isinstance(cur, str) or not cur:
         return
     _set_translated(_orig_map(widget), opt, cur, setter)
+
+
+# --------------------------------------------------------------------------- #
+# 下拉框：显示英文，逻辑值仍是中文原文
+# --------------------------------------------------------------------------- #
+# 为什么不能只翻 values（2026-11-24 用户报"下拉菜单还是中文"）：
+# `ttk.Combobox` 的 values 同时承担"给用户看"和"给代码判断"两种职责。
+# `_gui_stereo` 用 `var_method.get()` 去 METHODS 里找 key，`_gui_mono` 用
+# `var_source.get() == SOURCE_REALTIME` —— 直接把 values 换成英文，界面好看了，
+# 判断却永远匹配不上，最后静默选错方法。这里把这层拆开：
+#
+#   * values 只放显示值（t(原文)）；
+#   * Combobox.get() / textvariable.get() 反查回原文；
+#   * Combobox.set() / textvariable.set() 接原文，写进控件时换成显示值。
+#
+# 这样既不动各窗口的逻辑，也允许语言切换时重算显示值。
+def _choice_maps(values) -> tuple[dict[str, str], dict[str, str]]:
+    orig = [str(v) for v in values]
+    shown = [t(v) for v in orig]
+    forward = dict(zip(orig, shown))
+    reverse = dict(zip(shown, orig))
+    return forward, reverse
+
+
+def _combo_logical(widget, value):
+    reverse = getattr(widget, "_i18n_choice_reverse", {})
+    return reverse.get(value, value)
+
+
+def _combo_display(widget, value):
+    forward = getattr(widget, "_i18n_choice_forward", {})
+    return forward.get(value, t(value))
+
+
+def _patch_choice_var(var, widget) -> None:
+    if getattr(var, "_i18n_choice_patched", False):
+        return
+    base_get, base_set = var.get, var.set
+
+    def get():
+        return _combo_logical(widget, base_get())
+
+    def set(value):
+        return base_set(_combo_display(widget, value))
+
+    var.get = get
+    var.set = set
+    var._i18n_choice_patched = True
+
+
+def _install_choice_widget(widget, textvariable=None) -> None:
+    """接管一个 Combobox：翻译 values、包住 get/set、登记到切换表。"""
+    try:
+        raw_values = widget.cget("values")
+    except (tk.TclError, TypeError):
+        return
+    orig = tuple(str(v) for v in (raw_values or ()))
+    if not orig:
+        return
+    forward, reverse = _choice_maps(orig)
+    widget._i18n_choice_values = orig
+    widget._i18n_choice_forward = forward
+    widget._i18n_choice_reverse = reverse
+
+    # 当前值先按原文记住，再把显示值写回去（否则初始仍显示中文）。
+    try:
+        current = widget.get()
+    except (tk.TclError, AttributeError):
+        current = ""
+    logical = _combo_logical(widget, current)
+    try:
+        widget.configure(values=[forward.get(v, t(v)) for v in orig])
+    except (tk.TclError, TypeError):
+        pass
+
+    if not getattr(widget, "_i18n_choice_patched", False):
+        base_get, base_set = widget.get, widget.set
+
+        def get():
+            return _combo_logical(widget, base_get())
+
+        def set(value):
+            return base_set(_combo_display(widget, value))
+
+        widget.get = get
+        widget.set = set
+        widget._i18n_choice_patched = True
+
+    if logical:
+        try:
+            widget.set(logical)
+        except (tk.TclError, TypeError):
+            pass
+    # textvariable 就是调用方传进来的 tk.StringVar；直接复用，不另建第二份状态。
+    if textvariable is not None and hasattr(textvariable, "get"):
+        _patch_choice_var(textvariable, widget)
+
+    if widget not in _choice_widgets:
+        _choice_widgets.append(widget)
+
+
+def _patch_comboboxes() -> None:
+    base_init = ttk.Combobox.__init__
+    if getattr(base_init, "_i18n_patched", False):
+        return
+
+    def init(self, *args, **kwargs):
+        var = kwargs.get("textvariable")
+        base_init(self, *args, **kwargs)
+        _install_choice_widget(self, textvariable=var)
+
+    init._i18n_patched = True       # type: ignore[attr-defined]
+    ttk.Combobox.__init__ = init
+
+
+def refresh_choices() -> None:
+    """语言切换后重算所有下拉框的显示值，逻辑值保持不变。"""
+    for widget in list(_choice_widgets):
+        try:
+            if not widget.winfo_exists():
+                _choice_widgets.remove(widget)
+                continue
+            current = widget.get()          # 已被包成原文
+            orig = getattr(widget, "_i18n_choice_values", ())
+            forward, reverse = _choice_maps(orig)
+            widget._i18n_choice_forward = forward
+            widget._i18n_choice_reverse = reverse
+            widget.configure(values=[forward.get(v, t(v)) for v in orig])
+            widget.set(current)
+        except (tk.TclError, TypeError, AttributeError):
+            continue
 
 
 def _apply_menu(menu, depth: int = 0) -> None:
@@ -339,10 +547,9 @@ def apply_self(widget) -> None:
         except (tk.TclError, KeyError, AttributeError):
             pass
     _apply_tree(widget)
-    # 注意：**不翻译 Combobox 的 values** —— 它是逻辑值（见 i18n.py 模块
-    # docstring 的安全边界）。如 _gui_stereo 的 var_method.get() 拿到的就是
-    # values 里的标签，翻成英文后 _method_key() 匹配不到，会静默用错方法。
-    # 截图里"标定方法下拉中文"属这类数据型选项，保持原样是有意为之。
+    # Combobox 的 values 由 `_install_choice_widget` 单独接管：显示英文，
+    # `.get()` / textvariable 仍返回原文（见模块 docstring 的安全边界）。
+    # 这里不再直接碰 values，避免把逻辑值改成译文。
 
 
 def apply_children(widget) -> None:
@@ -447,11 +654,46 @@ def _patch_messagebox() -> None:
 
         def make(base):
             def call(title=None, message=None, *args, **kwargs):
-                return base(t(title), t(message), *args, **kwargs)
+                return base(dynamic(title), dynamic(message), *args, **kwargs)
             call._i18n_patched = True       # type: ignore[attr-defined]
             return call
 
         setattr(messagebox, name, make(orig))
+
+
+def _patch_dialogs() -> None:
+    """simpledialog 的标题/提示、filedialog 的标题也走同一套翻译。
+
+    这些窗口不是我们创建的 Toplevel（由 Tk 自己弹），`apply()` 遍历不到；
+    不在这里挂钩子，英文界面里点「改名」「选择目录」仍会弹出中文标题。
+    """
+    for name in ("askstring", "askinteger", "askfloat"):
+        orig = getattr(simpledialog, name, None)
+        if orig is None or getattr(orig, "_i18n_patched", False):
+            continue
+
+        def make(base):
+            def call(title, prompt, *args, **kwargs):
+                return base(dynamic(title), dynamic(prompt), *args, **kwargs)
+            call._i18n_patched = True       # type: ignore[attr-defined]
+            return call
+
+        setattr(simpledialog, name, make(orig))
+
+    for name in ("askopenfilename", "asksaveasfilename", "askdirectory"):
+        orig = getattr(filedialog, name, None)
+        if orig is None or getattr(orig, "_i18n_patched", False):
+            continue
+
+        def make(base):
+            def call(*args, **kwargs):
+                if kwargs.get("title"):
+                    kwargs["title"] = dynamic(kwargs["title"])
+                return base(*args, **kwargs)
+            call._i18n_patched = True       # type: ignore[attr-defined]
+            return call
+
+        setattr(filedialog, name, make(orig))
 
 
 def install() -> None:
@@ -463,10 +705,12 @@ def install() -> None:
     _load_saved()
     _patch_windows()
     _patch_messagebox()
+    _patch_dialogs()
+    _patch_comboboxes()
 
 
 install()
 
 __all__ = ["LANGS", "LANG_LABELS", "apply", "apply_self", "apply_children",
            "forget", "install", "label", "language", "refresh_all",
-           "set_language", "t", "t_all", "tf", "table"]
+           "set_language", "t", "t_all", "tf", "dynamic", "table"]

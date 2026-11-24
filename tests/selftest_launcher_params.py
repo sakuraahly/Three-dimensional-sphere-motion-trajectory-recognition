@@ -2895,6 +2895,27 @@ def _check_i18n() -> list[tuple[str, bool]]:
             en_status = fake.status_text()[0]
             en_mono = i18n.tf("已标定 fx = {fx:.0f} px{extra}{tag}",
                               fx=1388.0, extra="", tag="")
+            # 下拉框必须“显示译文、逻辑值仍是原文”：不能为了英文界面把
+            # var.get() 变成英文，否则 _gui_stereo / mono 的方法匹配会静默失败。
+            import tkinter as tk
+            from tkinter import ttk
+            probe_root = tk.Tk()
+            probe_root.withdraw()
+            try:
+                probe_var = tk.StringVar(master=probe_root, value="镜面金属球")
+                probe_cb = ttk.Combobox(
+                    probe_root, values=["镜面金属球", "纯色塑料球"],
+                    textvariable=probe_var)
+                shown = tuple(probe_cb.cget("values"))
+                probe_cb.current(1)
+                combo_ok = (
+                    shown == ("Mirror-finish metal ball",
+                              "Solid-color plastic ball")
+                    and probe_cb.get() == "纯色塑料球"
+                    and probe_var.get() == "纯色塑料球")
+            finally:
+                probe_root.destroy()
+            dynamic_ok = i18n.dynamic("共 3 条说明") == "3 help entries"
             saved = i18n.LANG_FILE.read_text(encoding="utf-8").strip()
             i18n.set_language("zh-CN")
             back = i18n.t("确定")
@@ -2916,6 +2937,8 @@ def _check_i18n() -> list[tuple[str, bool]]:
                 ("动态状态句在 en-US 下翻成英文（fx/装置名等数据保留）",
                  not has_cn(en_status) and not has_cn(en_mono)
                  and "Active rig" in en_status and "Calibrated fx" in en_mono),
+                ("下拉框显示英文、get() 仍返回中文逻辑值", combo_ok),
+                ("动态整句模板能翻（不逐词）", dynamic_ok),
                 ("语言偏好已持久化", saved == "en-US"),
                 ("切回中文能还原（不会把译文当原文）", back == "确定"),
             ]

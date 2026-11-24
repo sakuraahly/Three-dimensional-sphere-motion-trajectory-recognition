@@ -24,6 +24,7 @@ while not (ROOT / "sphere_tracker").is_dir() and ROOT.parent != ROOT:
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from apps import i18n  # noqa: E402
 from apps._gui_widgets import BG, MUTED, ACCENT  # noqa: E402
 from stereo import profiles  # noqa: E402
 
@@ -143,10 +144,11 @@ class ProfileDialog(tk.Toplevel):
         self.tree.tag_configure("active", background="#dbeafe")
         if active:
             self.tree.selection_set(active)
-            self.status.configure(text=f"当前装置：{active}")
+            self.status.configure(text=i18n.tf("当前装置：{name}", name=active))
         else:
-            self.status.configure(text="还没有装置档案 —— 点「新建装置…」建一条"
-                                       "（如「平行装置」「90度装置」），各配一份标定")
+            self.status.configure(
+                text=i18n.t("还没有装置档案 —— 点「新建装置…」建一条"
+                            "（如「平行装置」「90度装置」），各配一份标定"))
 
     # ---------- 标定列悬停提示（状态 · 路径 + 实测数值 + 四态原因） ----------
     @staticmethod

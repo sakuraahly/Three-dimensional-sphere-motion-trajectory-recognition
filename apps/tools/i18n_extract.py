@@ -103,11 +103,23 @@ DATA_CONSTS = {"VIEW_PRESETS", "SECTIONS", "STATE_LEGEND", "SOURCE_CHOICES",
                "RADIUS_NOTE_PIXEL", "RADIUS_NOTE_ANCHOR",
                "RADIUS_NOTE_LADDER", "RADIUS_ADV_TITLE",
                "RADIUS_ADV_SUMMARY", "TITLE_STEREO_PARALLEL",
-               "TITLE_STEREO_ANGLED"}
+               "TITLE_STEREO_ANGLED",
+               # 2026-11-24 全面核对下拉/弹窗时补：
+               # 这些是界面词表，字符串挂在模块常量上、values= 只看到变量名。
+               # 不登记它们，`--check` 会假报一致，英文下拉仍显示中文。
+               "BALL_METAL", "BALL_PLASTIC", "BALL_CUSTOM", "BALL_KINDS",
+               "BALL_HINTS", "RADIUS_NOTES", "_NO_FRAMES",
+               "SOURCE_OFFLINE", "SOURCE_REALTIME", "SOURCE_CHOICES",
+               "DETECTOR_HINT", "CAMERA_HINT_BASE",
+               "METHODS", "MODE_LABELS", "PRESETS", "STATUS_OPTIONS",
+               "VIDEO_SOURCE_LABELS", "RANGES", "STEP_SPECS"}
 #: 控件 / 消息框调用中表示"显示文本"的关键字参数。
 TEXT_KWARGS = {"text", "label", "title", "message", "detail", "hint",
                "placeholder", "tooltip", "desc", "description", "header",
-               "footer", "empty", "status", "value_text"}
+               "footer", "empty", "status", "value_text",
+               # 下拉选项是用户看得见的文字；值本身可能是数据（设备名/路径），
+               # 但含中文的选项必须先登记，否则切英文仍显示中文。
+               "values"}
 #: 位置参数里是显示文本的调用：函数名 -> 要取的参数下标。
 TEXT_POSITIONAL = {
     "set_status": (0,), "showinfo": (0, 1), "showerror": (0, 1),
@@ -120,6 +132,17 @@ TEXT_POSITIONAL = {
     "hint": (1,), "inline_note": (1,), "set_status": (0, 1),
     "_say": (0,),  # 相机管理窗口的状态条工厂（同 set_status）
     "heading": (2,), "add_command": (), "title": (0,),
+    # 自定义开场参数：App.open_window(key, title, factory) / 无 text= 的
+    # simpledialog 前两个位置参数是弹窗标题与提示。
+    "open_window": (1,),
+    "askstring": (0, 1), "askinteger": (0, 1), "askfloat": (0, 1),
+    "askopenfilename": (), "asksaveasfilename": (), "askdirectory": (),
+    # 自绘控件工厂：这些调用不一定有 text= 关键字，但第一/第二个位置参数
+    # 就是标题或说明；漏掉它们时新按钮在 --check 里看不见。
+    "CollapsibleSection": (1, 2), "_hint_pack": (1,),
+    "_Button": (1,), "_Step": (1, 2), "button": (1,),
+    "Label": (0,), "Button": (0,), "Checkbutton": (0,),
+    "Radiobutton": (0,), "LabelFrame": (0,),
     # 翻译函数本身的首参就是界面文案（含 tf 的占位符模板）。不登记这两条，
     # 状态骨架用 tf() 改写后提取器看不见，--check 会假报"一致"。
     "t": (0,), "tf": (0,),
@@ -162,6 +185,10 @@ def _clean(s: str) -> bool:
 
 
 def _const(node, docs: set[int], out: set[str]) -> None:
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+        for sub in ast.iter_child_nodes(node):
+            _const(sub, docs, out)
+        return
     if (isinstance(node, ast.Constant) and isinstance(node.value, str)
             and id(node) not in docs and _clean(node.value)):
         out.add(node.value)

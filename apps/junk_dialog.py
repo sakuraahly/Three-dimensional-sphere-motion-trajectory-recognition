@@ -41,6 +41,7 @@ ROOT = next(p for p in Path(__file__).resolve().parents
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from apps import i18n  # noqa: E402
 from apps._gui_widgets import BG, MUTED, WARN  # noqa: E402
 from apps._junk import (  # noqa: E402
     DANGER_GONE,
@@ -293,11 +294,12 @@ class JunkDialog(tk.Toplevel):
         for it in self.plan.items:
             kind = {DANGER_SAFE: "推荐", DANGER_WARN: "谨慎",
                     DANGER_GONE: "彻底删"}.get(it.danger, "")
+            label = i18n.t(it.label) + (i18n.t("（不动）") if it.muted else "")
             tags = [it.danger] if not it.muted else [_MUTED_TAG, it.danger]
             self.tree.insert(
                 "", "end", iid=it.key,
                 values=(_PICKED if it.key in self._picked else _UNPICKED,
-                        it.label + ("（不动）" if it.muted else ""), kind,
+                        label, i18n.t(kind),
                         it.count, human_size(it.size), _ago(it.newest)),
                 tags=tuple(tags))
         if not self.plan.items:
@@ -314,25 +316,32 @@ class JunkDialog(tk.Toplevel):
         warn = [i for i in self.plan.items if i.danger == DANGER_WARN]
         degraded = [i for i in warn if i.note and "降为" in i.note]
 
-        text = (f"已选 {len(chosen)} 项 / {files} 个文件 / {human_size(total)}"
-                f"　｜　推荐档 {human_size(sum(i.size for i in safe))}"
-                f"（{len(safe)} 项）"
-                f"　谨慎档 {human_size(sum(i.size for i in warn))}（{len(warn)} 项）")
+        text = i18n.tf(
+            "已选 {chosen} 项 / {files} 个文件 / {size}　｜　推荐档 "
+            "{safe_size}（{safe_n} 项）　谨慎档 {warn_size}（{warn_n} 项）",
+            chosen=len(chosen), files=files, size=human_size(total),
+            safe_size=human_size(sum(i.size for i in safe)), safe_n=len(safe),
+            warn_size=human_size(sum(i.size for i in warn)), warn_n=len(warn))
         if degraded:
-            text += f"，其中 {len(degraded)} 项是「看起来像数据」被自动降级的"
+            text += i18n.tf("，其中 {n} 项是「看起来像数据」被自动降级的",
+                            n=len(degraded))
         if self.plan.filtered_bytes or self.plan.filtered_files:
-            text += (f"　｜　另有 {human_size(self.plan.filtered_bytes)}"
-                     f"（{self.plan.filtered_files} 个文件）比所选时间范围新，已筛掉")
+            text += i18n.tf(
+                "　｜　另有 {size}（{files} 个文件）比所选时间范围新，已筛掉",
+                size=human_size(self.plan.filtered_bytes),
+                files=self.plan.filtered_files)
         self.lbl_sum.configure(text=text)
 
         notes: list[str] = []
         if self.plan.missing:
-            notes.append("找不到的位置：" + "；".join(self.plan.missing))
+            sep = "；" if i18n.language() == "zh-CN" else "; "
+            notes.append(i18n.tf("找不到的位置：{text}", text=sep.join(self.plan.missing)))
         if any(i.danger == DANGER_GONE for i in chosen):
-            notes.append("选中的「回收站」是彻底删除，删了不可恢复。")
+            notes.append(i18n.t("选中的「回收站」是彻底删除，删了不可恢复。"))
         if not notes:
-            notes.append("「推荐」= 删了下次跑就有；「谨慎」= 删了要重跑/重拍才能再生；"
-                         "右键某行可「标为不动」。")
+            notes.append(i18n.t(
+                "「推荐」= 删了下次跑就有；「谨慎」= 删了要重跑/重拍才能再生；"
+                "右键某行可「标为不动」。"))
         self.lbl_note.configure(
             text="　".join(notes),
             foreground=WARN if self.plan.missing or any(
@@ -466,11 +475,11 @@ def _ago(ts: float) -> str:
         return "—"
     days = (time.time() - ts) / 86400.0
     if days < 1:
-        return "今天"
+        return i18n.t("今天")
     if days < 2:
-        return "昨天"
+        return i18n.t("昨天")
     if days < 60:
-        return f"{int(days)} 天前"
+        return i18n.tf("{n} 天前", n=int(days))
     if days < 730:
-        return f"{int(days / 30)} 个月前"
-    return f"{days / 365:.1f} 年前"
+        return i18n.tf("{n} 个月前", n=int(days / 30))
+    return i18n.tf("{n} 年前", n=f"{days / 365:.1f}")
