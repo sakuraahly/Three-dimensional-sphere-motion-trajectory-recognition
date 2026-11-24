@@ -3,11 +3,11 @@
 改文案请改界面源码，然后跑：python apps/tools/i18n_extract.py --write
 人工润色译文请改 apps/i18n_seed.py（重新生成会保留本文件里已填的非空值）。
 值为空 = 待译：运行时回退中文；--check 会阻止缺译文/含中文的条目。
-扫描到 1037 条界面文案。
+扫描到 1046 条界面文案。
 """
 from __future__ import annotations
 
-# EN_US: 1037/1037 条已有译文
+# EN_US: 1046/1046 条已有译文
 EN_US: dict[str, str] = {
     '\n\n现在开着的、可能占着相机的程序：{hogs}': '\n\nApps currently running that may hold the camera: {hogs}',
     '   会话：{path}': '   Session: {path}',
@@ -426,6 +426,7 @@ EN_US: dict[str, str] = {
     '已启动双目实时三维检测（OpenCV 窗口）；按键与指标说明在画面顶栏和「操作说明」': 'Binocular real-time 3D detection has been started (OpenCV window); button and indicator descriptions are in the top bar of the screen and "Operation Instructions"',
     '已启动数据管理（它是独立窗口，首次启动要几秒）。没看到窗口就点「任务管理器和运行日志」——那里有这条任务的输出；起来了但不知道数据在哪，那个窗口自己会列 data/ 下的会话': 'Data Management is started (it is a separate window and takes a few seconds to start the first time). If you don\'t see the window, click "Task Manager and Run Log" - there is the output of this task; if you wake up but don\'t know where the data is, the window will list the sessions under data/',
     '已启动：校验 → 离线三维 → 标准 JSON 导出；三步共用这一条任务，完整输出在运行日志': 'Started: Verification → Offline 3D → Standard JSON export; three steps share this task, and the complete output is in the running log',
+    '已实测确认 {role} 采集索引 = #{index}（写入 {path}）': 'Confirmed {role} capture index = #{index} (saved to {path})',
     '已并行打开 {n} 路预览；每路互不干扰，慢的那路继续等首帧，不会拖住别的路': 'Opened {n} previews in parallel; each is independent, the slow one keeps waiting for its first frame without holding up the others',
     '已应用到当前装置的左右相机：平行标定复用这份参数、录制按它裁剪两路；90° 装置仍不裁剪。': 'It has been applied to the left and right cameras of the current device: Parallel calibration reuses this parameter, and the recording presses it to crop two cameras; the 90° device still does not crop.',
     '已更新标定': 'Calibration updated',
@@ -688,6 +689,7 @@ EN_US: dict[str, str] = {
     '正在标定内参…': 'Calibrating intrinsics...',
     '正在标定：会打开两个取景窗，板停稳自动存图': 'Calibrating: Two viewfinders will open, and the image will be automatically saved when the board stops.',
     '正在校验这段会话，逐项结果会写到运行日志': 'This session is being verified, and the results will be written to the running log.',
+    '正在自动绑定左右相机并实测采集索引（请稍候，约 10–30 秒）…': 'Auto-binding left/right cameras and measuring capture indices (please wait, about 10–30 s)…',
     '正在试开这台相机…（慢相机首帧可能要等一会儿，结论看日志尾）': 'I am trying to open this camera... (It may take a while for the first frame of the slow camera, see the end of the log for the conclusion)',
     '正在读取设备列表（只枚举，不开相机）…': 'Reading device list (enumeration only, no camera opened)…',
     '正在运行（0）': 'Running(0)',
@@ -777,6 +779,8 @@ EN_US: dict[str, str] = {
     '用这个会话': 'use this session',
     '用这台相机': 'use this camera',
     '画质诊断（两路同开，区分带宽 / 光学）': 'Image quality diagnosis (two cameras open at the same time, distinguish bandwidth/optical)',
+    '画面是右': 'This feed is right',
+    '画面是左': 'This feed is left',
     '画面显示不出来：{exc}': 'Cannot display the image: {exc}',
     '界面出过一次错（已自动恢复）：详情见 outputs/logs/gui_errors.log': 'An error occurred in the interface (recovered automatically): For details, see outputs/logs/gui_errors.log',
     '界面刷新出过错（{n} 次，已自动恢复；详情见 outputs/logs/camera_preview.log）': 'UI refresh errored ({n} times, auto-recovered; see outputs/logs/camera_preview.log)',
@@ -855,6 +859,10 @@ EN_US: dict[str, str] = {
     '自动挑（优先外接）': 'Auto-select (prefer external)',
     '自动核对：': 'Auto-check: ',
     '自动核对：配置读不出来': 'Auto-check: cannot read the configuration',
+    '自动绑定完成：left=采集#{l}，right=采集#{r}': 'Auto-bind complete: left=capture #{l}, right=capture #{r}',
+    '自动绑定左右': 'Auto-bind left / right',
+    '自动绑定未完成：{err}': 'Auto-bind did not finish: {err}',
+    '自动绑定正在运行，请稍候…': 'Auto-bind is running, please wait…',
     '自定义': 'Custom',
     '自定义：检测方法直接取注册表里的实现；换一种球就换一个方法。': 'Custom: use the detector implementation from the registry directly; change the method when you change the ball.',
     '至少选一个导出类别。': 'Select at least one export category.',
@@ -911,6 +919,7 @@ EN_US: dict[str, str] = {
     '还原': 'reduction',
     '还有任务在跑': 'There are still tasks running',
     '还没出画面：慢相机可能要 20–30 秒；一直不出就检查占用或拔插一次': 'No image yet: a slow camera may need 20–30 s; if it never shows, check conflicts or replug once',
+    '还没拿到实时画面，不能确认采集索引；等画面出来后再点': 'No live frame yet — cannot confirm the capture index. Click again once the feed appears',
     '还没有 traj3d.json；先跑离线双目。': 'There is no traj3d.json yet; run offline binoculars first.',
     '还没有会话': 'No sessions yet',
     '还没有会话。先在「第 3 步」录制一条双目。': 'No sessions yet. First record a pair of eyes in "Step 3".',

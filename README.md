@@ -707,7 +707,7 @@ apps/                    可直接运行的程序
     calibrate_color.py     HSV 阈值交互标定
     calibrate_focal.py     单点焦距标定（三维必需）
 
-tests/                   回归测试（改动代码后必跑，共 32 个）
+tests/                   回归测试（改动代码后必跑，共 33 个）
   selftest_synthetic.py        单目全链路（clean / realistic / panning）
   selftest_stereo_calib.py     双目标定（合成真值）
   selftest_stereo_pipeline.py  同步 + 极线配对 + 三角测量

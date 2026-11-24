@@ -86,7 +86,7 @@ sphere_tracker/   单目核心库（检测 → 跟踪 → 预测）；discovery.
 calib/            双目标定（离线一次）
 stereo/           双目逐帧（同步 → 成对取帧 → 配对 → 三角测量）
 apps/             可执行程序；tools/ 放一次性设置与诊断
-tests/            回归测试（32 个，改动后必跑）
+tests/            回归测试（33 个，改动后必跑）
 docs/             文档
 assets/ data/ config/ outputs/ models/ legacy/   静态素材 / 录制数据 / 运行期产物
 logs/             运行日志（按来源 + 时间分片；路径唯一来源 paths.log_dir()）
@@ -96,7 +96,7 @@ logs/             运行日志（按来源 + 时间分片；路径唯一来源 p
 
 1. **库代码放 `sphere_tracker/`、`calib/`、`stereo/`**，不写进 `apps/`。
    判据：能被 import 复用 = 库；跑一次就有结果 = app。
-2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 32 个回归测试必须能一键复跑。
+2. **测试放 `tests/`，一次性工具放 `apps/tools/`**。改动代码后 33 个回归测试必须能一键复跑。
 3. **能重新生成的东西不进版本库**（`outputs/`、`config/`、权重、视频素材）。
 4. **交付物不放 `outputs/`**。`outputs/` 的语义是"删了也能重新生成"，
    而开题报告、答辩稿删了就没了 —— 它们放 `docs/` 或课程目录。
@@ -235,6 +235,12 @@ outputs/chain_frames/
 > 性价比是负的。**分组已在此处写明，够用了**；哪天真的碍事再搬。
 
 ### `apps/` 顶层：18 个可执行脚本 + 24 个私有模块
+
+`apps/localization/` 是**独立的子包**（Unity 风格的新多语言映射系统，2026-11-24），
+不属于上表的顶层模块：稳定 id 的 Key Registry + 每 Locale 一张表 + Smart String
++ 回退链 + 按实际取值记账的缺译审计 + 可逆新旧桥接。
+**旧 `apps/i18n.py` 一行未改、仍是默认实现**；新系统默认不接管，
+要接管调 `enable_bridge()`（`disable_bridge()` 回退）。详见 `docs/用户手册.md` §12.0。
 
 | 组 | 文件 | 用途 |
 | -- | ---- | ---- |
@@ -395,11 +401,11 @@ apps / tests                        （只调用，不被调用）
 
 ---
 
-## 7. 质量底线：32 个回归测试
+## 7. 质量底线：33 个回归测试
 
 ```powershell
 run.bat test              # fast 档：自动跳过中位耗时 > 60s 的慢测试（当前名单见 --list）
-run.bat test full         # 全套 32 个（改代码后必跑；串行约 5.8 分钟）
+run.bat test full         # 全套 33 个（改代码后必跑；串行约 5.8 分钟）
 run.bat test full -j 6    # 同上但并行 6 路，约 3.4 分钟（结果与串行一致）
 run.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 ```
@@ -418,6 +424,7 @@ run.bat standards         # 规范落差自查（引用 / 来源 / 计数）
 | `selftest_gui_budget.py` | GUI 预算自测：防止分窗重做之后又长回"一个窗口装全部" |
 | `selftest_i18n_render.py` | 多语言**渲染级**判据：在 en-US 下真建窗口、注入报错、读控件文本 |
 | `selftest_installer_runtime.py` | （自动登记：模块无文档串） |
+| `selftest_localization.py` | 新多语言映射系统（Unity 风格）判据 |
 | `selftest_mono_calib.py` | 单目内参标定自测：合成棋盘回收内参 + **判定真的会红** |
 | `selftest_package.py` | P2 打包层（自包含交付包）自测：目录包往返 / 标定逐字不变 / 三态 / 覆盖语义 |
 | `selftest_plugins.py` | 插件注册表自测：清单唯一（R7）、未知名字报错（R3）、默认唯一（R4）、边界（R5） |

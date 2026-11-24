@@ -1075,6 +1075,23 @@ SEED: dict[str, str] = {
         "derived/ and View 3D enables when done. Live opens the camera directly, "
         "saves nothing, and has no 3D result (monocular 3D needs a saved track "
         "and the ball-diameter prior).",
+    # 2026-11-24 自动绑定功能（基线代码已有、词典漏登记的 9 条）：
+    # 英文模式下按钮/状态条全是中文，渲染级判据实测抓到，补整句译文。
+    "自动绑定左右": "Auto-bind left / right",
+    "画面是左": "This feed is left",
+    "画面是右": "This feed is right",
+    "自动绑定正在运行，请稍候…": "Auto-bind is running, please wait…",
+    "还没拿到实时画面，不能确认采集索引；等画面出来后再点":
+        "No live frame yet — cannot confirm the capture index. "
+        "Click again once the feed appears",
+    "正在自动绑定左右相机并实测采集索引（请稍候，约 10–30 秒）…":
+        "Auto-binding left/right cameras and measuring capture indices "
+        "(please wait, about 10–30 s)…",
+    "自动绑定未完成：{err}": "Auto-bind did not finish: {err}",
+    "自动绑定完成：left=采集#{l}，right=采集#{r}":
+        "Auto-bind complete: left=capture #{l}, right=capture #{r}",
+    "已实测确认 {role} 采集索引 = #{index}（写入 {path}）":
+        "Confirmed {role} capture index = #{index} (saved to {path})",
 }
 
 #: 纯标点的显示替换。它们没有中文，不能放进 `SEED`（种子词典的契约是
