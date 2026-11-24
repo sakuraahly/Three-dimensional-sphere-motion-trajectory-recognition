@@ -279,13 +279,70 @@ def _apply_tree(widget) -> None:
             try:
                 cur = widget.item(child, "text")
             except tk.TclError:
-                continue
+                cur = ""
             if isinstance(cur, str) and cur:
                 _set_translated(d, "item:" + child, cur,
                                 lambda v, i=child: widget.item(i, text=v))
+            # Treeview 单元格 values= 也要翻（2026-11-24 截图：相机管理表里
+            # "内置"/"未实测"/"left ✓" 全是中文）。只翻**整格精确命中词典**
+            # 的字符串——设备名/路径/端口这些是数据，本来就不在词典里。
+            # 整行 values 当一组记账：原文 + 上次显示值，切换语言时
+            # 始终从原文重翻（同 _set_translated 的双向记账口径）。
+            key = "vals:" + child
+            try:
+                vals = tuple(widget.item(child, "values") or ())
+            except tk.TclError:
+                vals = ()
+            if vals and all(isinstance(x, str) or x is None for x in vals):
+                dval = _orig_map(widget)
+                prev = dval.get(key)
+                shown = dval.get(key + ":shown")
+                if prev is None or (shown is not None and vals != shown
+                                    and vals != tuple(prev)):
+                    dval[key] = vals          # 程序改过 → 当前值当新原文
+                original = dval[key]
+                new_vals = tuple(t(x) if isinstance(x, str) else x
+                                 for x in original)
+                try:
+                    widget.item(child, values=new_vals)
+                    dval[key + ":shown"] = new_vals
+                except tk.TclError:
+                    pass
             walk(child, depth + 1)
 
     walk("")
+
+
+def apply_self(widget) -> None:
+    """只翻译 widget **自身**（text / 窗口 title / 菜单 / 表头），不递归子树。
+
+    给定义了 `_i18n_refresh()` 钩子的人用：`apply()` 遇到钩子会直接调它并
+    return，不会再翻 self —— 于是"有钩子的窗口"标题反而永远留在中文
+    （2026-11-24 相机管理窗口实测：title="相机管理" 切英文仍是中文）。
+    钩子内部先 `apply_self(self)` 翻自身，再 `apply_children(self)` 翻子树。
+    """
+    try:
+        if not widget.winfo_exists():
+            return
+    except (tk.TclError, AttributeError):
+        return
+    for opt in ("text",):
+        _swap(widget, opt,
+              getter=lambda o=opt: widget.cget(o),
+              setter=lambda v, o=opt: widget.configure(**{o: v}))
+    if isinstance(widget, (tk.Tk, tk.Toplevel)):
+        _swap(widget, "title", getter=widget.title, setter=widget.title)
+        try:
+            name = widget.cget("menu")
+            if name:
+                _apply_menu(widget.nametowidget(name))
+        except (tk.TclError, KeyError, AttributeError):
+            pass
+    _apply_tree(widget)
+    # 注意：**不翻译 Combobox 的 values** —— 它是逻辑值（见 i18n.py 模块
+    # docstring 的安全边界）。如 _gui_stereo 的 var_method.get() 拿到的就是
+    # values 里的标签，翻成英文后 _method_key() 匹配不到，会静默用错方法。
+    # 截图里"标定方法下拉中文"属这类数据型选项，保持原样是有意为之。
 
 
 def apply_children(widget) -> None:
@@ -410,5 +467,6 @@ def install() -> None:
 
 install()
 
-__all__ = ["LANGS", "LANG_LABELS", "apply", "install", "label", "language",
-           "refresh_all", "set_language", "t", "t_all", "table"]
+__all__ = ["LANGS", "LANG_LABELS", "apply", "apply_self", "apply_children",
+           "forget", "install", "label", "language", "refresh_all",
+           "set_language", "t", "t_all", "tf", "table"]

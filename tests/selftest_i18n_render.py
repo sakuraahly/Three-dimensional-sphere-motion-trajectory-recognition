@@ -88,6 +88,28 @@ def main() -> int:
         dlg._i18n_refresh()
         zh = [t for t in _widget_texts(dlg) if "采集会话失效" in t]
         checks.append(("切回中文后报错结论正确恢复", bool(zh)))
+
+        # 2026-11-24 第二轮截图：双目窗（大角度）四段说明 + 动态状态行
+        # 在英文模式仍是中文。这里真建 App + 双目窗，扫控件文本；用户自定义
+        # 的装置名属数据（如"实验性质大角度1"），只剔除它，骨架必须全英文。
+        i18n._current = "en-US"
+        from apps._gui_app import App
+        app = App()
+        app.withdraw()
+        app.update_idletasks()
+        stereo = app.open_stereo("angled")
+        stereo.update_idletasks()
+        s_texts = _widget_texts(stereo) + [stereo.title()]
+        # 剔除用户数据：装置名出现在 "Rig profile: …" 这类句子里
+        s_cn = [t for t in s_texts
+                if _CN.search(t) and "Rig profile:" not in t
+                and "｜" not in t]
+        checks.append((f"英文模式双目窗骨架无中文残留（残留 {len(s_cn)} 条）",
+                       not s_cn))
+        checks.append(("双目窗标题翻成英文",
+                       "Wide-angle stereo" in stereo.title()))
+        stereo.destroy()
+        app.destroy()
     except Exception as exc:                              # noqa: BLE001
         checks.append((f"渲染级检查本身不抛异常（{exc}）", False))
     finally:

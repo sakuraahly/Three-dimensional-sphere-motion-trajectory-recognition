@@ -2712,14 +2712,18 @@ def _check_env_installer() -> list[tuple[str, bool]]:
          and 'if p := pointerPython(root); p != ""' in go_src),
         ("Go 启动器找不到环境时会询问并自动安装",
          "runInstaller(root)" in go_src and "ask(" in go_src),
-        # 2026-11-08：用户实测 **run.bat 能打开相机、launcher.exe 打不开**
-        #（同机、同代码、同环境）。两条路唯一实质差别就是"谁起的 Python"：
-        # bat 用 python.exe（有控制台），launcher 原来直接起 pythonw.exe（无控制台）。
-        # run.bat 是已验证可用的那条，启动器只许**把它藏起来跑**，不许再复制一份
-        # 启动逻辑 —— 否则这类"只有某一条入口才坏"的问题会反复出现。
-        ("启动器把 GUI 交给 run.bat（只隐藏控制台，不再自己起 pythonw）",
+        # 2026-11-08/11-24：用户反复实测 **run.bat 能打开相机、launcher.exe 打不开**。
+        # 2026-11-24 定位到根因：launcher 原来用 hideWindow()(CREATE_NO_WINDOW) 把
+        # cmd→run.bat→python 整条链的控制台藏了，console=False 时 MSMF 相机全部
+        # 打不开；run.bat 双击 console=True 每次都出图。修法是 showConsole()
+        # 给真控制台（与 run.bat 同口径），相机优先于"无黑框"。
+        ("启动器把 GUI 交给 run.bat 且给真控制台（相机可用）",
          'filepath.Join(root, "run.bat")' in go_src
-         and '"/c", bat, "gui"' in go_src),
+         and '"/c", bat, "gui"' in go_src
+         and 'showConsole(c)' in go_src
+         and 'hideWindow(c)\n\t\tif err := c.Start()' not in go_src),
+        ("反向：把 run.bat 那条链改回 hideWindow → 判据会红",
+         'showConsole(c)' in go_src),
         ("反向：把启动器改回直接起 pythonw → 判据会红",
          not ('"/c", bat, "gui"' in
               go_src.replace('"/c", bat, "gui"', 'script'))),

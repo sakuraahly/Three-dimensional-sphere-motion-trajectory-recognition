@@ -105,6 +105,13 @@ DARK_CLEAR = 16.0
 
 #: 显示用：`capture_index` 还没实测时的写法。**不许**写 0 / #index 冒充。
 CAPTURE_UNMEASURED_TEXT = "未实测"
+#: Treeview「当前角色」列的状态标签（values= 单元格，靠 i18n._apply_tree
+#: 逐格整句翻译；这些常量登记进 DATA_CONSTS 才进词典）。
+ROLE_IGNORED = "无关"
+ROLE_VIRTUAL = "虚拟(不绑定)"
+ROLE_BUILTIN = "内置"
+ROLE_NONE = "—"
+NO_NAME = "(没名字)"
 
 
 
@@ -269,7 +276,10 @@ class _PreviewPane:
         holder = ttk.Frame(self.frame, width=PANE_W, height=PANE_H)
         holder.pack(padx=4, pady=(4, 2))
         holder.pack_propagate(False)
-        self.label = ttk.Label(holder, text="正在打开…",
+        # 卡片是在窗口建好**之后**动态 new 出来的：Toplevel 的 after_idle
+        # apply 早就把这棵子树错过了。所以这里 literal 一律现场 i18n.t()，
+        # 不依赖 apply() 遍历（2026-11-24 截图实测）。
+        self.label = ttk.Label(holder, text=i18n.t("正在打开…"),
                                background="#1b1f24", foreground="#c9d1d9",
                                anchor="center")
         self.label.pack(fill="both", expand=True)
@@ -277,14 +287,16 @@ class _PreviewPane:
         status_box = ttk.Frame(self.frame, height=36, width=PANE_W)
         status_box.pack(fill="x", padx=4)
         status_box.pack_propagate(False)
-        self.status = ttk.Label(status_box, text="等待画面…", foreground=MUTED,
+        self.status = ttk.Label(status_box, text=i18n.t("等待画面…"),
+                                foreground=MUTED,
                                 wraplength=PANE_W, anchor="nw", justify="left")
         self.status.pack(fill="both")
         btns = ttk.Frame(self.frame)
         btns.pack(fill="x", padx=4, pady=(0, 4))
-        ttk.Button(btns, text="停止预览", command=on_close).pack(side="right")
+        ttk.Button(btns, text=i18n.t("停止预览"),
+                   command=on_close).pack(side="right")
         if on_retry is not None:
-            ttk.Button(btns, text="重试这一路", command=on_retry).pack(
+            ttk.Button(btns, text=i18n.t("重试这一路"), command=on_retry).pack(
                 side="right", padx=(0, 6))
 
         self.stop = threading.Event()
@@ -501,6 +513,11 @@ class CamerasDialog(tk.Toplevel):
             pass
         self.after(80, self._init_sash)
 
+        # 控件是在 Toplevel.__init__ 的 after_idle 钩子**之后**才加的，那次
+        # apply() 够不着它们（截图实测 "正在打开…"/"停止预览"/标题全中文）。
+        # 建完再显式 apply 一次：钩子 _i18n_refresh 会翻 self + 全子树。
+        if i18n.language() != "zh-CN":
+            i18n.apply(self)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._pump()
         self._refresh_devices()
@@ -658,6 +675,9 @@ class CamerasDialog(tk.Toplevel):
                 i18n.forget(pane.status)
             except tk.TclError:
                 pass
+        # apply() 遇到本钩子会直接调它并 return，self（标题 "相机管理"）
+        # 不会被翻 —— 必须在这里显式翻自身（2026-11-24 截图实测）。
+        i18n.apply_self(self)
         i18n.apply_children(self)
 
     def _on_pump_error(self) -> None:
@@ -950,11 +970,11 @@ class CamerasDialog(tk.Toplevel):
             is_virt = cr.is_virtual(d.name, settings)
             avoided = cr.is_avoided(d.name, settings)
             if cr.is_device_ignored(d, reg):
-                role = "无关"
+                role = ROLE_IGNORED
             elif is_virt:
                 # 虚拟摄像头**不参与绑定**：它不是物理设备（PnP 里没有它），
                 # 绑上去等于绑一个"换后端就指到别的东西"的编号。
-                role = "虚拟(不绑定)"
+                role = ROLE_VIRTUAL
             elif len(roles) > 1:
                 # 旧配置可能把同一台绑成了两个角色（set_role 以前不清其它角色）。
                 # 必须显式写出来：否则列表只显示第一个角色，看起来一切正常，
@@ -967,17 +987,17 @@ class CamerasDialog(tk.Toplevel):
                     role = f"{role} {'✓' if h.status == 'ok' else '⚠'}"
             elif avoided:
                 # 规则来自 settings.avoid_names，不在代码里写死型号。
-                role = "内置"
+                role = ROLE_BUILTIN
             else:
-                role = "—"
+                role = ROLE_NONE
             caps = [reg.roles[r].capture_index for r in roles
                     if r in reg.roles and reg.roles[r].capture_index is not None]
             cap = ("、".join(f"#{c}" for c in dict.fromkeys(caps))
                    if caps else CAPTURE_UNMEASURED_TEXT)
             self.tree.insert(
                 "", "end", iid=str(d.order),
-                values=(f"#{d.order}", d.name or "(没名字)",
-                        d.port or "—", cap, role))
+                values=(f"#{d.order}", d.name or NO_NAME,
+                        d.port or ROLE_NONE, cap, role))
         # 2026-11-07 用户质疑「按钮不像真的在执行命令」——复现到了：
         # Treeview 默认**没有任何选中行**，而「预览这台 / 设为左 / 设为右」
         # 全都依赖 `_selected()`，于是点下去只回一句"先在左边选一台设备"，

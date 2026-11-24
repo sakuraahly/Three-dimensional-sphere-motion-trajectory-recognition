@@ -294,19 +294,19 @@ func main() {
 			return
 		}
 	}
-	// 2026-11-08：**先走 run.bat，只是把它藏起来。**
+	// 2026-11-08：**先走 run.bat**（已验证可用的那条路）。
 	//
-	// 用户实测（同一台机器、同一份代码、同一个 Python 环境）：
-	//   `run.bat`      → 相机预览正常；
-	//   `launcher.exe` → 两台相机都「打不开」。
-	// 两条路的唯一实质差别在这里：bat 用 `python.exe`（有控制台、走 bat 的环境），
-	// 本启动器原来直接起 `pythonw.exe`（无控制台，`sys.stdout is None`）。
-	// 既然 bat 是**已验证可用**的那条，启动器就不该再复制一份启动逻辑 ——
-	// 它只负责把 bat 的控制台藏起来。没有 run.bat 时才退回直接起 Python。
+	// 2026-11-24 修正：原来这里用 hideWindow() 给 cmd 加 CREATE_NO_WINDOW，
+	// 结果整条进程链（cmd → run.bat → python.exe）都**没有控制台**。实测证据：
+	//   launch.log 里 console=True（run.bat 双击）→ 每次都能出图；
+	//   console=False（launcher 启动）→ 相机全部 isOpened=False。
+	// MSMF/Media Foundation 在这台机器上要求 GUI 进程有真实 console；藏掉它
+	// 会让相机打不开。所以改成 showConsole()（CREATE_NEW_CONSOLE），与
+	// run.bat 双击同口径。"无黑框"让位于"相机能用"（用户 2026-11-24 明确要求）。
 	if bat := filepath.Join(root, "run.bat"); fileExists(bat) {
 		c := exec.Command("cmd", "/c", bat, "gui")
 		c.Dir = root
-		hideWindow(c)
+		showConsole(c)
 		if err := c.Start(); err == nil {
 			return
 		}
@@ -318,9 +318,11 @@ func main() {
 		return
 	}
 
-	c := exec.Command(guiPython(py), script)
+	// 同上：pythonw.exe（无 console）会让 MSMF 相机打不开，必须用 python.exe
+	// + 真 console。guiPython() 仅保留给 dry-run 显示历史探测结果。
+	c := exec.Command(py, script)
 	c.Dir = root
-	hideWindow(c)
+	showConsole(c)
 	if err := c.Start(); err != nil {
 		alert("启动图形界面失败：\n" + err.Error())
 		return

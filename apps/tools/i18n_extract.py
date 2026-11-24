@@ -87,7 +87,23 @@ DATA_CONSTS = {"VIEW_PRESETS", "SECTIONS", "STATE_LEGEND", "SOURCE_CHOICES",
                "TPL_OPENED_PARALLEL", "TPL_VIRTUAL_PREVIEW",
                "TPL_ALREADY_PREVIEW", "TPL_AVOIDED_HINT", "TPL_OPENING",
                "TPL_NOT_SAVED", "TPL_WRITTEN", "TPL_LIMIT_NOT_SAVED",
-               "TPL_LIMIT_WRITTEN", "TPL_VIRTUAL_ROLE"}
+               "TPL_LIMIT_WRITTEN", "TPL_VIRTUAL_ROLE",
+               # Treeview 单元格状态标签（values= 由 i18n._apply_tree 逐格翻）
+               "ROLE_IGNORED", "ROLE_VIRTUAL", "ROLE_BUILTIN", "ROLE_NONE",
+               "NO_NAME",
+               # 双目窗第①②④步说明 + 动态状态行模板（2026-11-24 截图）
+               "PREMISE_PARALLEL", "PREMISE_ANGLED",
+               "HINT_METHOD_PARALLEL", "HINT_METHOD_ANGLED", "STEP4_HINT",
+               "ADV_CAPTURE_TITLE", "ADV_CAPTURE_SUMMARY",
+               "TPL_RIG_PROFILE", "TPL_RIG_MODE", "TPL_RIG_BASE",
+               "TPL_RIG_ANGLE", "TPL_CALIB_EXISTING", "CALIB_NONE",
+               "TPL_CALIB_LINE", "TPL_CAM_LINE", "CAM_READ_FAILED",
+               "TPL_RECORD_BLOCKED",
+               # 折叠区半径三句（for note in (...) 元组字面量，回溯漏扫）
+               "RADIUS_NOTE_PIXEL", "RADIUS_NOTE_ANCHOR",
+               "RADIUS_NOTE_LADDER", "RADIUS_ADV_TITLE",
+               "RADIUS_ADV_SUMMARY", "TITLE_STEREO_PARALLEL",
+               "TITLE_STEREO_ANGLED"}
 #: 控件 / 消息框调用中表示"显示文本"的关键字参数。
 TEXT_KWARGS = {"text", "label", "title", "message", "detail", "hint",
                "placeholder", "tooltip", "desc", "description", "header",
@@ -98,6 +114,11 @@ TEXT_POSITIONAL = {
     "showwarning": (0, 1), "askyesno": (0, 1), "askokcancel": (0, 1),
     "card": (1, 2), "primary": (1,), "secondary": (1,),
     "accent": (1,), "chip": (1,), "section": (1,),
+    # 2026-11-24（B-187 的一半）：hint(inline_note/set_status 的第二参也是
+    # 显示文案。漏了它们，"检查中…"/"正在读取设备列表…" 这类状态标签
+    # 永远进不了词典，英文界面照样中文。
+    "hint": (1,), "inline_note": (1,), "set_status": (0, 1),
+    "_say": (0,),  # 相机管理窗口的状态条工厂（同 set_status）
     "heading": (2,), "add_command": (), "title": (0,),
     # 翻译函数本身的首参就是界面文案（含 tf 的占位符模板）。不登记这两条，
     # 状态骨架用 tf() 改写后提取器看不见，--check 会假报"一致"。

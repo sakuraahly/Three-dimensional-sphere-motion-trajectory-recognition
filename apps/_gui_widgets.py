@@ -297,6 +297,19 @@ BALL_PLASTIC = "纯色塑料球"
 BALL_CUSTOM = "自定义"
 BALL_KINDS = (BALL_METAL, BALL_PLASTIC, BALL_CUSTOM)
 
+#: 半径三句短说明。曾写在 `for note in (...)` 的元组字面量里：提取器的
+#: 变量回溯只接"循环 iter 是 Name"，元组字面量直接漏扫（2026-11-24 截图
+#: 英文界面里三句全中文）。提成常量 + 登记 DATA_CONSTS 才进词典。
+RADIUS_NOTE_PIXEL = ("半径 = 点选球边得到的像素圆半径（seeds.json），"
+                     "和下面两个门限都不是一回事。")
+RADIUS_NOTE_ANCHOR = ("半径锚定门：用左右点选球心 + 物理球直径校验视半径，"
+                      "须先勾「半径锚点门」且点过球心。")
+RADIUS_NOTE_LADDER = ("尺寸门自动阶梯：按 4 档上限逐档试探找最大候选；"
+                      "留空像素门限就走它，物理直径不控制尺寸门。")
+RADIUS_NOTES = (RADIUS_NOTE_PIXEL, RADIUS_NOTE_ANCHOR, RADIUS_NOTE_LADDER)
+RADIUS_ADV_TITLE = "高级：半径与直径"
+RADIUS_ADV_SUMMARY = "像素门限留空=自动阶梯"
+
 #: 球种类 → 检测方法（注册表里的名字）。「自定义」不在表里 = 由下拉自己决定。
 METHOD_METAL = "specular"
 METHOD_PLASTIC = "color"
@@ -562,8 +575,8 @@ class BallSettings:
             # 797/797、866/866），新增一行就会把按钮裁掉。
             from apps._collapsible import CollapsibleSection
             adv = CollapsibleSection(
-                row, "高级：半径与直径", expanded=False,
-                summary="像素门限留空=自动阶梯")
+                row, RADIUS_ADV_TITLE, expanded=False,
+                summary=RADIUS_ADV_SUMMARY)
             # 收起态的标题按钮不能比同一行的 Entry/Combobox 高：④ 卡片首屏已
             # 贴到视口下沿，row 多几 px 就把按钮裁掉（selftest_window_mode 实测
             # angled ④ 会差 +7 px）。给这一个按钮单独配紧凑 padding，不碰全局
@@ -604,12 +617,8 @@ class BallSettings:
                     _sync_anchor_diameter()
             # 三句短说明常驻在折叠区里（不只进状态条）：把三类尺寸分开说清，
             # 免得「点球边的像素圆半径 / 像素门限 / 物理球直径」被混成一回事。
-            for note in (
-                "半径 = 点选球边得到的像素圆半径（seeds.json），和下面两个门限都不是一回事。",
-                "半径锚定门：用左右点选球心 + 物理球直径校验视半径，须先勾「半径锚点门」且点过球心。",
-                "尺寸门自动阶梯：按 4 档上限逐档试探找最大候选；留空像素门限就走它，物理直径不控制尺寸门。",
-            ):
-                ttk.Label(inner, text=note, style="Hint.TLabel",
+            for note in RADIUS_NOTES:
+                ttk.Label(inner, text=i18n.t(note), style="Hint.TLabel",
                           wraplength=PARAM_HINT_WRAP).pack(anchor="w")
         # ⚠ **不再单起一行放说明**（2026-11-03 实测）：三个窗口的首屏高度都已
         # 顶到预算边缘（双目第④步装下时恰好 869 px），多加一行说明就整段出屏 ——

@@ -351,6 +351,108 @@ SEED: dict[str, str] = {
         "#{index} '{name}' is a virtual camera and cannot be set as {role} - "
         "it is not a physical device (absent from the PnP list); choose a "
         "real camera",
+
+    # ---- 2026-11-24 第二轮截图反馈：Treeview 单元格 + hint() 工厂文案 ----
+    "(没名字)": "(unnamed)",
+    "内置": "Built-in",
+    "无关": "Ignored",
+    "虚拟(不绑定)": "Virtual (not bound)",
+    "检查中…": "Checking…",
+    "读取相机…": "Reading cameras…",
+    "正在读取设备列表（只枚举，不开相机）…":
+        "Reading device list (enumeration only, no camera opened)…",
+    "已停止全部预览": "All previews stopped",
+    "没找到外接相机（列表里只有内置/红外/虚拟，或已标无关）":
+        "No external camera found (the list only has built-in/IR/virtual or "
+        "marked-ignored devices)",
+    "相机管理已经开着了：同一个程序只留一个，避免两处同时抢相机":
+        "The camera manager is already open: only one per app, to avoid two "
+        "windows competing for the same camera",
+    "设备列表是空的：先点「刷新列表」":
+        "The device list is empty: click Refresh list first",
+    "设备列表是空的：先点「刷新列表」；还是空的就查 USB":
+        "The device list is empty: click Refresh list first; if still empty "
+        "check the USB connection",
+    "「换目录…」平时不用动：只有会话根目录被移走、或录像改放到别的磁盘时，才用它把上面的列表指到新位置。它只改「以后再录的存哪」，不搬动已有会话，也不修复已经丢了的目录。":
+        "Change folder… is normally untouched: only use it when the session "
+        "root was moved or recordings now live on another disk, to point the "
+        "list above to the new location. It only changes where future "
+        "recordings go; it does not move existing sessions or repair missing "
+        "directories.",
+    "「移到回收站」是软删除：整个会话（含原始视频）进 data/_trash，之后能在数据管理里恢复。「改装置模式…」会把会话归到对应装置分区（data/stereo/parallel 或 angled）；「整理旧会话…」一次性把**已记录模式**的旧会话搬进分区（没记录的那些不会动，需要你逐条判断）。":
+        "Move to recycle bin is a soft delete: the whole session (including "
+        "raw video) goes to data/_trash and can be restored from data "
+        "management. Change rig mode files the session under the matching rig "
+        "partition (data/stereo/parallel or angled); Tidy old sessions moves "
+        "old sessions with a recorded mode into partitions in one pass (those "
+        "without a recorded mode are left alone for you to judge one by one).",
+    "产物：<输出目录>/*.pdf 与 *.png": "Output: <output dir>/*.pdf and *.png",
+    "产物：config/world_frame.json": "Output: config/world_frame.json",
+    "产物：images/ labels/ dataset.yaml": "Output: images/ labels/ dataset.yaml",
+    "产物：权重 + 逐图圆心误差报告": "Output: weights + per-image centre-error report",
+    "指针：config/python_env.txt；切换需重启 GUI/launcher":
+        "Pointer: config/python_env.txt; restart the GUI/launcher to switch",
+    "每种格式各三份：left_camera / right_camera / stereo_rig":
+        "Three copies per format: left_camera / right_camera / stereo_rig",
+    "这是个独立窗口：调完按 s 保存，按 q 退出":
+        "This is a standalone window: press s to save when done, q to quit",
+
+    # ---- 2026-11-24 第二轮：双目窗说明段落 + 动态状态行模板 ----
+    "平行双目的前提：两路光轴**近平行**（夹角很小），且基线远小于工作距离。校正后左右图的行是对齐的。":
+        "Prerequisite for parallel stereo: the two optical axes are nearly "
+        "parallel (tiny angle) and the baseline is far smaller than the "
+        "working distance. After rectification the rows of the left/right "
+        "images line up.",
+    "大角度双目的前提：两路夹角大（接近直角），不必平行、也不必在每个姿态都看到同一块板。深度靠原始像素三角测量。":
+        "Prerequisite for wide-angle stereo: the two axes form a large angle "
+        "(near a right angle), need not be parallel, and need not both see "
+        "the same board at every pose. Depth comes from raw-pixel triangulation.",
+    "这一步决定第 4 步能不能用。平行装置只需要 joint；如果两路看不到同一区域，就该去「大角度双目」窗口。":
+        "This step decides whether step 4 can be used. A parallel rig only "
+        "needs joint; if the two feeds cannot see the same area, use the "
+        "Wide-angle Stereo window.",
+    "按「两路还能看到多少共同画面」选方法：还能充分共视 → 两路共视；只剩一处能同时看到整块板 → 单板链式；完全看不到同一区域 → 双板链式（要两块刚性固定的板）。链式产物都直接能在第 4 步用。":
+        "Choose by how much the two feeds still overlap: ample common view -> "
+        "joint capture; only one spot where both see the whole board -> "
+        "single-board chain; no common view at all -> dual-board chain (two "
+        "rigidly fixed boards). Chain outputs are directly usable in step 4.",
+    "离线重建：读两路视频按标定解三维，强制按 {mode} 解算；3D 查看器同屏加载 derived/annotated.mp4，也能用系统播放器单独打开。":
+        "Offline reconstruction: read both videos and solve 3D from the "
+        "calibration, forcing {mode} solving; the 3D viewer loads "
+        "derived/annotated.mp4 side by side, and it can also be opened "
+        "standalone in a system player.",
+    "高级：采集门限与相机": "Advanced: capture thresholds and cameras",
+    "停稳 / 清晰度 / 放宽 / 相机": "Steady / sharpness / relaxed / camera",
+    "半径 = 点选球边得到的像素圆半径（seeds.json），和下面两个门限都不是一回事。":
+        "Radius = the pixel radius picked on the ball edge (seeds.json); it "
+        "is neither of the two thresholds below.",
+    "半径锚定门：用左右点选球心 + 物理球直径校验视半径，须先勾「半径锚点门」且点过球心。":
+        "Radius-anchor gate: uses the picked centres in both views plus the "
+        "physical ball diameter to check the apparent radius; requires the "
+        "radius-anchor gate enabled and a centre already picked.",
+    "尺寸门自动阶梯：按 4 档上限逐档试探找最大候选；留空像素门限就走它，物理直径不控制尺寸门。":
+        "Size-gate auto ladder: probes 4 upper limits to find the largest "
+        "candidate; leaving the pixel threshold empty uses it. The physical "
+        "diameter does not control the size gate.",
+    "装置档案：{prof}": "Rig profile: {prof}",
+    "未设置": "not set",
+    "标定模式：{mode}": "Calibration mode: {mode}",
+    "基线 {base:.0f} mm": "baseline {base:.0f} mm",
+    "夹角 {angle:.1f}°": "angle {angle:.1f}°",
+    "尚无标定": "no calibration yet",
+    "当前已有标定（{mode}）": "existing calibration ({mode})",
+    "标定：{existing}。选好方法点「开始标定」即可产出本窗口需要的标定":
+        "Calibration: {existing}. Pick a method and click Start calibration "
+        "to produce the calibration this window needs",
+    "相机：左={left}｜右={right}": "Cameras: left={left} | right={right}",
+    "相机：读取失败（config/cameras.json）":
+        "Cameras: read failed (config/cameras.json)",
+    "第③步录制会用不了：{why}": "Step 3 recording will not work: {why}",
+    "高级：半径与直径": "Advanced: radius and diameter",
+    "像素门限留空=自动阶梯": "empty pixel threshold = auto ladder",
+    "选择会话 · {kind}": "Choose session · {kind}",
+    "平行双目 · 视差测深": "Parallel stereo · disparity depth",
+    "大角度双目 · 三角测量": "Wide-angle stereo · triangulation",
 }
 
 #: 这些字符串即使含中文也不该被短语替换（专名 / 公式 / 单位 / 标点片段）。

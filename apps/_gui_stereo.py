@@ -31,6 +31,7 @@ from pathlib import Path
 from tkinter import ttk
 
 from apps import _fov_store
+from apps import i18n
 
 from apps._gui_widgets import (BALL_METAL, BALL_PLASTIC, METHOD_METAL,
                                PRESET_NONE, BG, INK, MUTED, WARN, BallSettings,
@@ -60,6 +61,35 @@ from sphere_tracker.paths import STEREO_ROOT, stereo_mode_root, stereo_roots
 from sphere_tracker.plugins import names as plugin_names
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+#: 第①/②/④步的说明段落。曾写在局部变量 + IfExp / 相邻字符串拼接里，
+#: 提取器的变量回溯只接数据结构字面量、不接 IfExp，于是整段漏扫
+#: （2026-11-24 截图：英文界面里四段说明全中文）。提成常量 + DATA_CONSTS。
+PREMISE_PARALLEL = ("平行双目的前提：两路光轴**近平行**（夹角很小），"
+                    "且基线远小于工作距离。校正后左右图的行是对齐的。")
+PREMISE_ANGLED = ("大角度双目的前提：两路夹角大（接近直角），不必平行、"
+                  "也不必在每个姿态都看到同一块板。深度靠原始像素三角测量。")
+HINT_METHOD_PARALLEL = ("这一步决定第 4 步能不能用。平行装置只需要 joint；"
+                        "如果两路看不到同一区域，就该去「大角度双目」窗口。")
+HINT_METHOD_ANGLED = ("按「两路还能看到多少共同画面」选方法：还能充分共视 → 两路共视；"
+                      "只剩一处能同时看到整块板 → 单板链式；完全看不到同一区域 → 双板链式"
+                      "（要两块刚性固定的板）。链式产物都直接能在第 4 步用。")
+STEP4_HINT = ("离线重建：读两路视频按标定解三维，强制按 {mode} "
+              "解算；3D 查看器同屏加载 derived/annotated.mp4，"
+              "也能用系统播放器单独打开。")
+ADV_CAPTURE_TITLE = "高级：采集门限与相机"
+ADV_CAPTURE_SUMMARY = "停稳 / 清晰度 / 放宽 / 相机"
+# 动态状态行模板（数据：档案名/模式/基线/夹角/相机名，不翻译）
+TPL_RIG_PROFILE = "装置档案：{prof}"
+TPL_RIG_MODE = "标定模式：{mode}"
+TPL_RIG_BASE = "基线 {base:.0f} mm"
+TPL_RIG_ANGLE = "夹角 {angle:.1f}°"
+TPL_CALIB_EXISTING = "当前已有标定（{mode}）"
+CALIB_NONE = "尚无标定"
+TPL_CALIB_LINE = "标定：{existing}。选好方法点「开始标定」即可产出本窗口需要的标定"
+TPL_CAM_LINE = "相机：左={left}｜右={right}"
+CAM_READ_FAILED = "相机：读取失败（config/cameras.json）"
+TPL_RECORD_BLOCKED = "第③步录制会用不了：{why}"
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
@@ -388,9 +418,10 @@ class SessionPicker(tk.Toplevel):
         # 删除/改模式之后父窗口要重判"当前会话还在不在" —— 否则它会继续
         # 拿着一个已经被移进回收站的路径去录制/分析。
         self.on_changed = on_changed
-        self.title("选择会话 · " + {
-            "parallel": "平行双目", "angled": "大角度双目",
-        }.get(str(mode), "任意装置"))
+        self.title(i18n.tf(
+            "选择会话 · {kind}",
+            kind=i18n.t({"parallel": "平行双目", "angled": "大角度双目"}
+                        .get(str(mode), "任意装置"))))
         self.geometry("900x580")
         self.minsize(720, 460)
         self.configure(bg=BG)
@@ -851,12 +882,12 @@ class StereoWindow(tk.Toplevel):
     # ① 装置检查
     # ------------------------------------------------------------------ #
     def _build_step1(self, parent) -> None:
-        premise = ("平行双目的前提：两路光轴**近平行**（夹角很小），"
-                   "且基线远小于工作距离。校正后左右图的行是对齐的。"
-                   if self.mode == "parallel" else
-                   "大角度双目的前提：两路夹角大（接近直角），不必平行、"
-                   "也不必在每个姿态都看到同一块板。深度靠原始像素三角测量。")
-        box = self.surface.card(parent, "① 装置检查", premise.replace("**", ""))
+        premise = (PREMISE_PARALLEL if self.mode == "parallel"
+                   else PREMISE_ANGLED)
+        # 先翻整句（词典 key 含 **），再去 Markdown 标记；反过来先 replace
+        # 会让整句命不中词典，英文界面照旧中文（2026-11-24 截图实测）。
+        box = self.surface.card(parent, "① 装置检查",
+                                i18n.t(premise).replace("**", ""))
         self.lbl_rig = self.surface.hint(box, "检查中…")
         # 相机身份属于 L1，**不许进折叠区**：它是装置的物理身份，不是高级参数。
         # 旧界面让人手填 left/right，填错就静默用错相机 —— 这里只显示、
@@ -871,13 +902,9 @@ class StereoWindow(tk.Toplevel):
     # ② 标定
     # ------------------------------------------------------------------ #
     def _build_step2(self, parent) -> None:
-        hint = ("这一步决定第 4 步能不能用。平行装置只需要 joint；"
-                "如果两路看不到同一区域，就该去「大角度双目」窗口。"
-                if self.mode == "parallel" else
-                "按「两路还能看到多少共同画面」选方法：还能充分共视 → 两路共视；"
-                "只剩一处能同时看到整块板 → 单板链式；完全看不到同一区域 → 双板链式"
-                "（要两块刚性固定的板）。链式产物都直接能在第 4 步用。")
-        box = self.surface.card(parent, "② 标定", hint)
+        hint = (HINT_METHOD_PARALLEL if self.mode == "parallel"
+                else HINT_METHOD_ANGLED)
+        box = self.surface.card(parent, "② 标定", i18n.t(hint))
         self.lbl_calib = self.surface.hint(box, "检查中…")
 
         # L1：目标对数 / 分化线 + 板参数（一行）
@@ -937,8 +964,8 @@ class StereoWindow(tk.Toplevel):
         self.lbl_method = self.surface.hint(box, "")
 
         # L2：高级（默认收起）
-        adv = CollapsibleSection(box, "高级：采集门限与相机", expanded=False,
-                                 summary="停稳 / 清晰度 / 放宽 / 相机")
+        adv = CollapsibleSection(box, ADV_CAPTURE_TITLE, expanded=False,
+                                 summary=ADV_CAPTURE_SUMMARY)
         adv.grid(row=self.surface._next_row(box), column=0, columnspan=9,
                  sticky="we", pady=(8, 0))
         inner = adv.content
@@ -1116,10 +1143,9 @@ class StereoWindow(tk.Toplevel):
     def _build_step4(self, parent) -> None:
         box = self.surface.card(
             parent, "④ 分析（对一段已录好的会话跑三维）",
-            "离线重建：读两路视频按标定解三维，强制按 "
-            + ("平行" if self.mode == "parallel" else "大角度")
-            + " 解算；3D 查看器同屏加载 derived/annotated.mp4，"
-            + "也能用系统播放器单独打开。")
+            i18n.tf(STEP4_HINT,
+                    mode=i18n.t("平行" if self.mode == "parallel"
+                                else "大角度")))
         # 球种类与检测参数（2026-11-03）：以前这一段只有一个会话输入框，
         # 检测参数全靠 `run_stereo_video` 自己的默认值 —— 换了一颗纯色球的人
         # 在界面上**没有任何地方**能说"这是红球"，只能去命令行加 `--preset`。
@@ -1186,13 +1212,15 @@ class StereoWindow(tk.Toplevel):
         mode = st.stereo_mode() or "未记录"
         base = st.baseline_mm()
         angle = st.angle_deg()
-        bits = [f"装置档案：{prof or '未设置'}",
-                f"标定模式：{mode}"]
+        bits = [i18n.tf(TPL_RIG_PROFILE,
+                        prof=prof if prof else i18n.t("未设置")),
+                i18n.tf(TPL_RIG_MODE, mode=i18n.t(mode))]
         if base is not None:
-            bits.append(f"基线 {base:.0f} mm")
+            bits.append(i18n.tf(TPL_RIG_BASE, base=base))
         if angle is not None:
-            bits.append(f"夹角 {angle:.1f}°")
+            bits.append(i18n.tf(TPL_RIG_ANGLE, angle=angle))
         self.lbl_rig.configure(text="｜".join(bits))
+        i18n.forget(self.lbl_rig)
 
         # 第②步是**标定**（产出动作），不是消费现有标定。三种方法在本窗口都合法
         # （joint/joint_skip_fov/chain 都会产出本窗口要的 stereo_mode），所以这里
@@ -1200,20 +1228,24 @@ class StereoWindow(tk.Toplevel):
         # 那套判定是给第③步录制/第④步分析用的（它们消费现有标定）。以前把
         # angled_status 用在这里，导致大角度窗在"现有标定还是上次的 parallel"时，
         # 状态栏写"请用平行窗口"，用户想选 joint 重新标定却被误判成"不匹配"。
-        existing = "尚无标定" if st.rig is None else f"当前已有标定（{mode}）"
+        existing = (i18n.t(CALIB_NONE) if st.rig is None
+                    else i18n.tf(TPL_CALIB_EXISTING, mode=i18n.t(mode)))
         self.lbl_calib.configure(
-            text=f"标定：{existing}。选好方法点「开始标定」即可产出本窗口需要的标定",
+            text=i18n.tf(TPL_CALIB_LINE, existing=existing),
             style="Ok.TLabel")
+        i18n.forget(self.lbl_calib)
 
         # 相机身份：只读 config/cameras.json，改它只能通过「换相机…」
         try:
             # 这一行用**短标签**（位置优先）：完整身份 / PnP 位次 / 采集索引
             # 在「换相机…」对话框里。把完整状态塞进这一行会超过换行边界，
             # 大角度窗内容会高出 16 px（2026-11-20 实测，selftest_window_mode）。
-            self._cam_text = ("相机：左=" + st.camera_role_short("left")
-                              + "｜右=" + st.camera_role_short("right"))
+            self._cam_text = i18n.tf(
+                TPL_CAM_LINE,
+                left=st.camera_role_short("left"),
+                right=st.camera_role_short("right"))
         except Exception:                                   # noqa: BLE001
-            self._cam_text = "相机：读取失败（config/cameras.json）"
+            self._cam_text = i18n.t(CAM_READ_FAILED)
         self._sync_check_enabled()
         self._sync_record_enabled()
         if self.lbl_method is not None:
@@ -1227,7 +1259,21 @@ class StereoWindow(tk.Toplevel):
             self.status.set_status("就绪", "ok")
         else:
             self.status.set_status(
-                f"第③步录制会用不了：{why_rec.replace('**', '')}", "warn")
+                i18n.tf(TPL_RECORD_BLOCKED,
+                        why=i18n.t(why_rec.replace("**", ""))), "warn")
+
+    def _i18n_refresh(self) -> None:
+        """切语言时重生成动态状态行（apply() 的约定钩子）。
+
+        装置档案 / 标定状态 / 相机身份 / 录制门槛都是现场拼的，整句不在词典
+        里；先按当前语言重跑 _refresh_state()，再翻 self 与静态子树。
+        不能调 apply(self)：本钩子就是被 apply() 触发的，会递归。
+        """
+        try:
+            self._refresh_state()
+        finally:
+            i18n.apply_self(self)
+            i18n.apply_children(self)
 
     def _sync_check_enabled(self) -> None:
         """「检查装置」能不能点：只看左右相机有没有填。
@@ -1567,7 +1613,9 @@ class StereoWindow(tk.Toplevel):
         label = self.var_method.get()
         key = next((k for k, v in METHODS.items() if v[0] == label),
                    self._fallback_method())
-        self.lbl_method.configure(text=METHODS[key][1].replace("**", ""))
+        # 先翻整句（词典 key 含 **），再去 Markdown 标记，顺序反了就漏翻。
+        self.lbl_method.configure(text=i18n.t(METHODS[key][1]).replace("**", ""))
+        i18n.forget(self.lbl_method)
 
     def _on_method_changed(self) -> None:
         """切换标定方法：刷新说明 + 按需展示该方法的专属输入。

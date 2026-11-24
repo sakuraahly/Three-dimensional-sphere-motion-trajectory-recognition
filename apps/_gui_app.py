@@ -53,6 +53,11 @@ from stereo.profiles import (calibration_files_exist, calibration_identity,
 
 __all__ = ["GuiPrefs", "AppState", "App", "HubWindow", "run"]
 
+#: 双目窗口标题。提成常量 + DATA_CONSTS 才会进词典（IfExp 里的字面量
+#: 提取器看不见，2026-11-24 截图实测英文界面标题仍中文）。
+TITLE_STEREO_PARALLEL = "平行双目 · 视差测深"
+TITLE_STEREO_ANGLED = "大角度双目 · 三角测量"
+
 MONO_CALIB_PATH = ROOT / "config" / "mono_calibration.json"
 # 2026-11-10（用户裁决 B5）：不再有 `STEREO_CALIB_PATH` 常量。
 # 标定路径一律走 `apps._common.current_calibration` —— 那个"档案优先、档案没配
@@ -759,8 +764,10 @@ class App(tk.Tk):
     def open_stereo(self, mode: str):
         from apps._gui_stereo import StereoWindow
         key = f"stereo_{mode}"
-        title = ("平行双目 · 视差测深" if mode == "parallel"
-                 else "大角度双目 · 三角测量")
+        # t() 现场翻（变量 ← IfExp 提取器回溯不到，2026-11-24 截图实测标题中文）。
+        # 两句必须是 DATA_CONSTS 常量才能进词典（见 i18n_extract）。
+        title = i18n.t(TITLE_STEREO_PARALLEL if mode == "parallel"
+                       else TITLE_STEREO_ANGLED)
         return self.open_window(key, title,
                                 lambda app: StereoWindow(app, mode=mode))
 

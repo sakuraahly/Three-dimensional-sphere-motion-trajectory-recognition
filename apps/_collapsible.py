@@ -118,11 +118,23 @@ class CollapsibleSection(ttk.Frame):
     # 内部实现
     # ------------------------------------------------------------------
     def _header_text(self) -> str:
+        # 标题/摘要是界面文案：整句 f-string 拼出的 "▸ 高级：… · …" 命不中
+        # 词典，逐块 t() 翻译、分隔符与展开箭头保留（2026-11-24 截图实测）。
+        from apps import i18n                              # 延迟导入，避免循环
         chevron = _CHEVRON_EXPANDED if self.expanded else _CHEVRON_COLLAPSED
-        text = f"{chevron} {self._title}"
-        if self._summary:
-            text += _SUMMARY_SEPARATOR + self._summary
+        title = i18n.t(self._title)
+        summary = i18n.t(self._summary) if self._summary else ""
+        text = f"{chevron} {title}"
+        if summary:
+            text += _SUMMARY_SEPARATOR + summary
         return text
+
+    def _i18n_refresh(self) -> None:
+        """切语言时重绘头部（apply() 的约定钩子）。"""
+        from apps import i18n
+        self._refresh_header()
+        for child in self.winfo_children():
+            i18n.apply(child)
 
     def _refresh_header(self) -> None:
         self.header_button.configure(text=self._header_text())
