@@ -868,6 +868,7 @@ class StatusBar(ttk.Frame):
     def __init__(self, master: tk.Misc, *, on_log=None, on_stop=None,
                  help_section: str | None = None) -> None:
         super().__init__(master)
+        self._status_src = "就绪"
         self._label = ttk.Label(self, text="就绪", style="Hint.TLabel")
         # ⚠️ 先 pack 右侧按钮、最后 pack 左侧状态文本。
         # pack 是"先到先得"：文本先 pack 时，一条长状态（例如"正在按 parallel 解算
@@ -897,10 +898,27 @@ class StatusBar(ttk.Frame):
         self._label.pack(side="left", fill="x", expand=True,
                          padx=(16, 8), pady=6, anchor="w")
 
+    def _i18n_refresh(self) -> None:
+        """切语言时从**调用方原文**重放状态句，而不是翻译上一语言的显示值。"""
+        try:
+            self._label.configure(
+                text=i18n.dynamic(self._status_src),
+                style=self._label.cget("style"))
+            i18n.forget(self._label)
+            # 旁边的「任务日志 / 中断 / ? 操作说明」是静态按钮；本钩子
+            # 会阻止 apply() 继续遍历子树，所以这里自己补一遍（跳过正文标签，
+            # 否则它的译文会被下次切回中文时误当成原文）。
+            for child in self.winfo_children():
+                if child is not self._label:
+                    i18n.apply(child)
+        except tk.TclError:
+            pass
+
     def set_status(self, text: str, level: str = "info") -> None:
         """level ∈ info/ok/warn —— 只换颜色，话术由调用方保证"说人话"。"""
         style = {"ok": "Ok.TLabel", "warn": "Warn.TLabel"}.get(
             level, "Hint.TLabel")
+        self._status_src = text
         try:
             # dynamic()：先整句精确、再已登记模板匹配；未登记的句子原样保留。
             # 状态条是 f-string 最集中的出口，在这里兜一次比逐个改调用点可靠。

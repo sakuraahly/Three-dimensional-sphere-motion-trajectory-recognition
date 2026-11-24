@@ -818,6 +818,9 @@ class HubWindow(tk.Toplevel):
     def __init__(self, app: App) -> None:
         super().__init__(app)
         self.app = app
+        # HubWindow 不是 App.open_window 创建的，标题不会由那条路径补；
+        # 显式设置后由 apply_self()/i18n 翻译（否则切英文时标题仍是中文）。
+        self.title("球形物体三维运动轨迹识别")
         self.configure(bg=BG)
         self.surface = Surface(self)
 
@@ -1196,6 +1199,8 @@ class HubWindow(tk.Toplevel):
         try:
             self._refresh()
         finally:
+            # 门厅自己的标题/菜单也要翻；apply_children 不包含 self。
+            i18n.apply_self(self)
             i18n.apply_children(self)
 
 

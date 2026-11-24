@@ -3,11 +3,11 @@
 改文案请改界面源码，然后跑：python apps/tools/i18n_extract.py --write
 人工润色译文请改 apps/i18n_seed.py（重新生成会保留本文件里已填的非空值）。
 值为空 = 待译：运行时回退中文；--check 会阻止缺译文/含中文的条目。
-扫描到 1031 条界面文案。
+扫描到 1037 条界面文案。
 """
 from __future__ import annotations
 
-# EN_US: 1031/1031 条已有译文
+# EN_US: 1037/1037 条已有译文
 EN_US: dict[str, str] = {
     '\n\n现在开着的、可能占着相机的程序：{hogs}': '\n\nApps currently running that may hold the camera: {hogs}',
     '   会话：{path}': '   Session: {path}',
@@ -465,6 +465,10 @@ EN_US: dict[str, str] = {
     '强制通过·不可用': 'Forced pass - unusable',
     '强制通过标定（仅链路测试）…': 'Forced to pass calibration (link test only)…',
     '当前会话': 'current session',
+    '当前会话 {id} 有问题：{error}': 'Current session {id} has a problem: {error}',
+    '当前会话 {id}：目录已就绪，还没录到视频（录制会写 clip.mkv）': 'Current session {id}: the directory is ready, but no video yet (recording writes clip.mkv)',
+    '当前会话 {summary}；点「开始识别」（来源「离线」）开始检测（结果写进 derived/）': 'Current session {summary}; click Start detection (source Offline) to process it (results go to derived/)',
+    '当前会话 {summary}；结果在 derived/，重新检测会覆盖同名文件': 'Current session {summary}; results are in derived/ and a new run overwrites files with the same name',
     '当前会话已被移走/移动，已清空选择；用「选择…」重新挑一段': 'The current session has been removed/moved and the selection has been cleared; use "Select..." to select a new section',
     '当前会话还没有三维结果：先点「开始识别」（来源「离线」）跑一遍检测，它会把 derived/visualization.json 写出来': 'There is no 3D result in the current session: first click "Start Recognition" (source "Offline") to run the detection, it will write out derived/visualization.json',
     '当前会话里没有视频：先「录制视频」，或点「选择…」挑一段已录好的': 'There is no video in the current session: "Record video" first, or click "Select..." to select a recorded video',
@@ -795,6 +799,7 @@ EN_US: dict[str, str] = {
     '目录建不了': 'Directory cannot be created',
     '目标对数 张': 'Target pairs',
     '相机 #{index}：{brief}{note}{tail}': 'Camera #{index}: {brief}{note}{tail}',
+    '相机 {camera}': 'Camera {camera}',
     '相机对不上，先处理再标定': 'If the camera cannot match the camera, please process it first and then calibrate it.',
     '相机指代不明，先重新固定': "The camera's reference is unknown, please re-fix it first",
     '相机探测（核对两路参数是否一致）': 'Camera detection (check whether the two parameters are consistent)',
@@ -1031,6 +1036,7 @@ EN_US: dict[str, str] = {
     '（已并入「两路共视」：angled 模式本来就跳过 FOV 对齐，这一项与它产出的命令完全相同。）': '(Merged into "Joint capture": angled mode already skips FOV alignment, so this option produces the same command.)',
     '（拍够后 4/5 即可；之前要求 5/5 全绿）': '(After enough shots, 4/5 is enough; before, 5/5 was required for all green)',
     '（收够就停；板摆稳、清晰就自动收）': '(Stop when enough is collected; automatically close when the board is stable and clear)',
+    '（无时间）': '(no time)',
     '（标定模式 {mode}）': '(calibration mode {mode})',
     '（没有会话）': '(No sessions)',
     '（这个时间范围内没有可清理的东西）': '(Nothing to clean in this time range)',

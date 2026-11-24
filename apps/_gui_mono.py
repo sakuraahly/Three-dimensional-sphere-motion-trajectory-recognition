@@ -1220,6 +1220,28 @@ class MonoWindow(tk.Toplevel):
         return next((row for row in scan_mono_sessions(cur.path.parent)
                      if row.path.name == cur.path.name), None)
 
+    @staticmethod
+    def _session_line(cur) -> str:
+        """会话摘要的显示文本；字段/状态走当前语言表，路径与数值保持数据。"""
+        bits = [cur.id, cur.created or i18n.t("（无时间）")]
+        specs: list[str] = []
+        if cur.width and cur.height:
+            specs.append(f"{cur.width}x{cur.height}")
+        if cur.fps > 0:
+            specs.append(f"@{cur.fps:.1f} fps")
+        if cur.frame_count:
+            specs.append(i18n.tf("{n} 帧", n=cur.frame_count))
+        if cur.duration_s > 0:
+            specs.append(f"{cur.duration_s:.1f} s")
+        if cur.encoder:
+            specs.append(str(cur.encoder))
+        if cur.camera:
+            specs.append(i18n.tf("相机 {camera}", camera=cur.camera))
+        line = "  ".join(bits + specs) + " —— " + i18n.t(cur.state)
+        if cur.note:
+            line += i18n.t("｜") + i18n.t(cur.note)
+        return line
+
     def _refresh_session(self) -> None:
         if self._session is not None:
             self._session = self._reload_session()
@@ -1233,27 +1255,33 @@ class MonoWindow(tk.Toplevel):
             self.lbl_session_dir.configure(text=self._preview_dir())
             self.var_session_dir.set("")   # 会话目录输入框：空 = 尚无当前会话
             self.lbl_session.configure(
-                text="还没有当前会话：按「录制视频」会自动新建一个目录；"
-                     "要接着看以前录的，点「选择…」挑一段。",
+                text=i18n.t("还没有当前会话：按「录制视频」会自动新建一个目录；"
+                            "要接着看以前录的，点「选择…」挑一段。"),
                 style="Hint.TLabel")
             return
         self.lbl_session_dir.configure(text=self._short(cur.path) + "/")
         self.var_session_dir.set(str(cur.path))   # 回填当前会话目录（只读展示）
         if cur.error:
             self.lbl_session.configure(
-                text=f"当前会话 {cur.id} 有问题：{cur.error}", style="Warn.TLabel")
+                text=i18n.tf("当前会话 {id} 有问题：{error}",
+                             id=cur.id, error=cur.error),
+                style="Warn.TLabel")
         elif not cur.video:
             self.lbl_session.configure(
-                text=f"当前会话 {cur.id}：目录已就绪，还没录到视频"
-                     f"（录制会写 clip.mkv）", style="Warn.TLabel")
+                text=i18n.tf("当前会话 {id}：目录已就绪，还没录到视频"
+                             "（录制会写 clip.mkv）", id=cur.id),
+                style="Warn.TLabel")
         elif cur.has_result:
             self.lbl_session.configure(
-                text="当前会话 " + cur.summary() +
-                     "；结果在 derived/，重新检测会覆盖同名文件", style="Ok.TLabel")
+                text=i18n.tf("当前会话 {summary}；结果在 derived/，重新检测会覆盖同名文件",
+                             summary=self._session_line(cur)),
+                style="Ok.TLabel")
         else:
             self.lbl_session.configure(
-                text="当前会话 " + cur.summary() +
-                     "；点「开始识别」（来源「离线」）开始检测（结果写进 derived/）", style="Warn.TLabel")
+                text=i18n.tf("当前会话 {summary}；点「开始识别」（来源「离线」）"
+                             "开始检测（结果写进 derived/）",
+                             summary=self._session_line(cur)),
+                style="Warn.TLabel")
 
     def _vis_path(self) -> Path | None:
         """当前会话的三维可视化文件（没有就 ``None``）。"""
@@ -1459,6 +1487,15 @@ class MonoWindow(tk.Toplevel):
         self.status.set_status(
             "相机管理已打开：选一台点「预览这台」看画面；"
             "或直接「设为左 / 设为右」按身份绑定，关掉对话框即生效", "info")
+
+    def _i18n_refresh(self) -> None:
+        """切语言时重生成动态状态/会话句（apply() 的约定钩子）。"""
+        try:
+            self._refresh_state()
+            self._sync_record_summary(self.adv_step3)
+        finally:
+            i18n.apply_self(self)
+            i18n.apply_children(self)
 
     def _refresh_state(self) -> None:
         st = self.app.state

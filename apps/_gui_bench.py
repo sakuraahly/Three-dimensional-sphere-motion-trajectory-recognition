@@ -418,6 +418,14 @@ class BenchWindow(tk.Toplevel):
         if hasattr(self, "btn_all"):
             self.btn_all.configure(state="normal" if s is not None else "disabled")
 
+    def _i18n_refresh(self) -> None:
+        """切语言时重生成会话摘要/下一步（apply() 的约定钩子）。"""
+        try:
+            self._reload()
+        finally:
+            i18n.apply_self(self)
+            i18n.apply_children(self)
+
     def _apply_states(self) -> None:
         """按 ``STEP_SPECS`` 的**同一张表**写按钮状态与原因。
 

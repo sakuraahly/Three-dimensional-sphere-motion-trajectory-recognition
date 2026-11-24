@@ -157,7 +157,11 @@ def dynamic(text):
             continue
         values = {}
         for i, name in enumerate(names):
-            values[name] = m.group(f"f{i}")
+            raw = m.group(f"f{i}")
+            # 模板里的数据位通常要保持原文；但如果它是界面枚举（模式/状态）
+            # 且表里有精确译文，就一起翻。用户自定义名称/路径不会命中词典。
+            values[name] = t(raw) if isinstance(raw, str) and re.search(
+                r"[\u4e00-\u9fff]", raw) else raw
         try:
             return english.format(**values)
         except (KeyError, IndexError, ValueError):
@@ -266,8 +270,13 @@ def _mark_shown(d: dict[str, str], key: str, value: str) -> None:
 
 
 def _set_translated(d: dict[str, str], key: str, cur: str, setter) -> None:
-    """翻译 + 写入 + 记账，三件事一起做，避免各处各写一半。"""
-    new = t(_original_for(d, key, cur))
+    """翻译 + 写入 + 记账，三件事一起做，避免各处各写一半。
+
+    这里用 `dynamic()` 而不是 `t()`：像「名义 25 mm…」这种在构造时由
+    `tf()` 拼好的标签，切语言后 `apply()` 也要能按整句模板重新生成；
+    没有模板时 dynamic() 的行为与 t() 完全相同（命中则翻，不命中回退）。
+    """
+    new = dynamic(_original_for(d, key, cur))
     if new == cur:
         _mark_shown(d, key, cur)
         return

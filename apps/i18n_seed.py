@@ -1020,6 +1020,26 @@ SEED: dict[str, str] = {
     "应用半径": "Apply radius",
     "约 Z = —（还没点球边）": "approx. Z = — (ball edge not picked yet)",
     "约 Z = —（{why}）": "approx. Z = — ({why})",
+    "（无时间）": "(no time)",
+    "相机 {camera}": "Camera {camera}",
+    "{n} 帧": "{n} frames",
+    "已录，未检测": "Recorded, not detected",
+    "已检测": "Detected",
+    "未录制": "Not recorded", "坏会话": "Bad session",
+    "还没有当前会话：按「录制视频」会自动新建一个目录；要接着看以前录的，点「选择…」挑一段。":
+        "No current session yet: Record video creates a directory automatically; "
+        "to continue an old recording, click Select… and choose one.",
+    "当前会话 {id} 有问题：{error}":
+        "Current session {id} has a problem: {error}",
+    "当前会话 {id}：目录已就绪，还没录到视频（录制会写 clip.mkv）":
+        "Current session {id}: the directory is ready, but no video yet "
+        "(recording writes clip.mkv)",
+    "当前会话 {summary}；结果在 derived/，重新检测会覆盖同名文件":
+        "Current session {summary}; results are in derived/ and a new run "
+        "overwrites files with the same name",
+    "当前会话 {summary}；点「开始识别」（来源「离线」）开始检测（结果写进 derived/）":
+        "Current session {summary}; click Start detection (source Offline) to "
+        "process it (results go to derived/)",
     "吸附Hough圆心": "Snap to Hough centre",
     "在左图点球心，再在右图点球心；圆心=你点击的位置，需要时再点『吸附Hough圆心』；半径可微调。":
         "Click the ball centre in the left image, then in the right image. "
