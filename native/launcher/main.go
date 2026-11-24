@@ -229,7 +229,15 @@ func guiPython(py string) string {
 func batCommand(root string, args []string) *exec.Cmd {
 	c := exec.Command("cmd", append([]string{"/c", filepath.Join(root, "run.bat")}, args...)...)
 	c.Dir = root
+	// 给子进程留一个可验证的入口标记：launch.log 里能直接区分
+	// “launcher 起的”与“直接跑 run.bat 起的”，不再靠猜。
+	c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
 	showConsole(c)
+	return c
+}
+
+func markLauncher(c *exec.Cmd) *exec.Cmd {
+	c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
 	return c
 }
 
@@ -306,6 +314,7 @@ func main() {
 	if bat := filepath.Join(root, "run.bat"); fileExists(bat) {
 		c := exec.Command("cmd", "/c", bat, "gui")
 		c.Dir = root
+		c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
 		showConsole(c)
 		if err := c.Start(); err == nil {
 			return
@@ -322,6 +331,7 @@ func main() {
 	// + 真 console。guiPython() 仅保留给 dry-run 显示历史探测结果。
 	c := exec.Command(py, script)
 	c.Dir = root
+	markLauncher(c)
 	showConsole(c)
 	if err := c.Start(); err != nil {
 		alert("启动图形界面失败：\n" + err.Error())

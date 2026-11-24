@@ -1405,7 +1405,9 @@ def _log_launch_context(note: str = "") -> None:
             f"cwd={os.getcwd()}",
             f"pid={os.getpid()} ppid={os.getppid()}",
             f"stdout_none={sys.stdout is None}",
+            f"stdin_none={sys.stdin is None}",
             f"stderr_none={sys.stderr is None}",
+            f"entry={os.environ.get('SPHERE_LAUNCHED_BY', 'direct')}",
             f"console={bool(ctypes.windll.kernel32.GetConsoleWindow())}",
             f"note={note}",
         ]

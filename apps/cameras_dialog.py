@@ -1315,6 +1315,7 @@ class CamerasDialog(tk.Toplevel):
                 f"  启动方式 exe={sys.executable} "
                 f"ppid={os.getppid()} "
                 f"stdout_none={sys.stdout is None} "
+                f"entry={os.environ.get('SPHERE_LAUNCHED_BY', 'direct')} "
                 f"console={bool(ctypes.windll.kernel32.GetConsoleWindow())} "
                 f"argv={' '.join(sys.argv[:2])}")
         except BaseException:                                # noqa: BLE001
