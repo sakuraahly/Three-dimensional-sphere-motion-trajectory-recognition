@@ -248,13 +248,19 @@ def run_one(name: str, timeout: float, *,
     """跑一个测试，独立子进程。`extra_env` 用于并行时压住数学库线程数。"""
     path = TESTS_DIR / name
     res = TestResult(name=name)
-    env = None if not extra_env else {**os.environ, **extra_env}
+    # 回归测试一律以中文跑：大量判据断言中文文案结构（帮助搜索词、窗口
+    # 高度、按钮数），用户本机 config/language.txt 存了 en-US 时会假红
+    # （2026-11-24 实测三个测试）。CI 上没有这个文件、默认 zh-CN，本来
+    # 就一致；这里显式钉住，让本地与 CI 同口径。GUI 正常启动不受影响。
+    run_env = {**os.environ, "SM_LANG": "zh-CN"}
+    if extra_env:
+        run_env.update(extra_env)
     t0 = time.perf_counter()
     try:
         proc = subprocess.run(
             [sys.executable, str(path)],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout, cwd=str(ROOT), env=env,
+            errors="replace", timeout=timeout, cwd=str(ROOT), env=run_env,
         )
         out = (proc.stdout or "") + (proc.stderr or "")
         res.exit_code = proc.returncode

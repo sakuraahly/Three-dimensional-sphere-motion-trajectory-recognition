@@ -275,6 +275,82 @@ SEED: dict[str, str] = {
         "error makes even an accurate radius worthless. CPU is very slow "
         "(dozens of epochs may take hours); with a discrete GPU set device to "
         "cuda:0.",
+
+    # ---- 相机管理窗口：预览失败结论 + 动态状态句（2026-11-24）----
+    # 这些都是"整句模板"（含 {name}/{path}/{n} 等占位符），运行时由
+    # i18n.tf() 先翻模板再填数据。数据（设备名/路径/数值）绝不翻译。
+    "采集会话失效（不是相机坏）：先把这台 USB 拔插一次，再点「重试这一路」":
+        "Capture session invalidated (the camera is not broken): unplug and "
+        "replug this USB device once, then click Retry this feed",
+    "打不开：先等 30–60 秒再点「重试这一路」（上一路刚用过要放手）；再查占用（Windows 相机 / QQ）；还不行拔插这台":
+        "Cannot open: wait 30–60 s, then click Retry this feed (the previous "
+        "feed needs time to release); check for conflicts (Windows Camera / "
+        "QQ); if still stuck, replug this camera",
+    "打开了但没画面：先拔插这台，再查镜头遮挡/占用":
+        "Open but no image: replug this camera first, then check lens "
+        "covering / conflicts",
+    "为什么这里不切换后端：DSHOW 的编号与这份设备列表不是同一套，按同一个编号打开可能开到别的设备。所以预览只用系统默认后端（MSMF）。":
+        "Why the backend is not switched here: DSHOW indices do not match "
+        "this device list; opening the same number may reach a different "
+        "camera. Preview therefore uses only the system default backend (MSMF).",
+    "下一步：① 先点卡片上的「重试这一路」；② 还不行就拔插一次这台相机的 USB，并关掉可能占着相机的程序（微信 / QQ / 钉钉 / OBS / Windows 相机等）；③ 所有相机（含内置）都打不开，先查 设置 → 隐私和安全性 → 相机 → 允许桌面应用访问相机；④ 仍打不开就跑 run.bat doctor 或 python apps/tools/cameras.py doctor —— 它只报告，不改配置、也不绑左右角色。":
+        "Next steps: 1) click Retry this feed on the card; 2) if that fails, "
+        "replug this camera's USB and close apps that may hold it (WeChat / "
+        "QQ / DingTalk / OBS / Windows Camera, etc.); 3) if no camera opens "
+        "(including built-in), check Settings → Privacy & security → Camera "
+        "→ allow desktop apps; 4) if still stuck run run.bat doctor or python "
+        "apps/tools/cameras.py doctor - it only reports, changing no config "
+        "and binding no roles.",
+    "未实测": "Not measured",
+    "\n\n现在开着的、可能占着相机的程序：{hogs}":
+        "\n\nApps currently running that may hold the camera: {hogs}",
+    "｜现在开着 {hogs}，可能占着相机": " | {hogs} is running and may hold the camera",
+    "｜两台都这样＝系统的相机服务卡住了：重启电脑比拔插更彻底":
+        " | both feeds like this = the system camera service is stuck: "
+        "restarting the PC is more thorough than replugging",
+    "（全文：{log}）": "(full text: {log})",
+    "（双击状态行看全文）": "(double-click the status line for full text)",
+    "相机 #{index}：{brief}{note}{tail}": "Camera #{index}: {brief}{note}{tail}",
+    "{stage} 已等 {secs} 秒": "{stage}: waited {secs} s",
+    "还没出画面：慢相机可能要 20–30 秒；一直不出就检查占用或拔插一次":
+        "No image yet: a slow camera may need 20–30 s; if it never shows, "
+        "check conflicts or replug once",
+    "预览中": "Previewing",
+    "画面显示不出来：{exc}": "Cannot display the image: {exc}",
+    "#{index} 出图了；总共 {n} 路画面在同时跑":
+        "#{index} is showing frames; {n} feeds running in total",
+    "界面刷新出过错（{n} 次，已自动恢复；详情见 outputs/logs/camera_preview.log）":
+        "UI refresh errored ({n} times, auto-recovered; see "
+        "outputs/logs/camera_preview.log)",
+    "⚠ 界面代码在 {stamp} 又改过（{n} 个文件），当前窗口还是旧版 —— **关掉程序重开**才会生效":
+        "Warning: UI code changed again at {stamp} ({n} files); this window "
+        "is still the old version - close and reopen the app to apply",
+    "#{index} 已经在预览了；要重开先点卡片上的「重试这一路」":
+        "#{index} is already previewing; to restart, click Retry this feed on the card",
+    "#{index}「{name}」是虚拟摄像头，不参与绑定、也不在这里预览（它只注册在别的后端，PnP 列表里没有它）":
+        "#{index} '{name}' is a virtual camera - not used for binding or "
+        "preview here (it is only registered under another backend, absent "
+        "from the PnP list)",
+    "提示：#{index} 被当前相机规则标为内置/不推荐；要看外接相机请选择未标记的设备":
+        "Note: #{index} is marked built-in/not recommended by the current "
+        "camera rules; to see external cameras choose an unmarked device",
+    "正在打开 #{index}（首帧最坏约 30 秒）。可以同时再开别的相机，彼此不打断。":
+        "Opening #{index} (worst-case first frame about 30 s). You can open "
+        "other cameras at the same time; they do not interrupt each other.",
+    "已并行打开 {n} 路预览；每路互不干扰，慢的那路继续等首帧，不会拖住别的路":
+        "Opened {n} previews in parallel; each is independent, the slow one "
+        "keeps waiting for its first frame without holding up the others",
+    "没保存：{exc}": "Not saved: {exc}",
+    "门限没保存：{exc}": "Thresholds not saved: {exc}",
+    "自动刷新：{n} 台｜{check}": "Auto-refresh: {n} cameras | {check}",
+    "已写入 {path}{extra}": "Written to {path}{extra}",
+    "已写入 {path}。筛选门限从下一次自动挑相机/成对协商起生效":
+        "Written to {path}. Filter thresholds take effect from the next "
+        "auto camera selection / pair negotiation",
+    "#{index}「{name}」是虚拟摄像头，不能设成 {role} —— 它不是物理设备（PnP 列表里没有它），请选一台真实的相机":
+        "#{index} '{name}' is a virtual camera and cannot be set as {role} - "
+        "it is not a physical device (absent from the PnP list); choose a "
+        "real camera",
 }
 
 #: 这些字符串即使含中文也不该被短语替换（专名 / 公式 / 单位 / 标点片段）。

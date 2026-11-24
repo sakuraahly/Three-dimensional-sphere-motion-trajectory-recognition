@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from functools import lru_cache
 from pathlib import Path
@@ -138,6 +139,13 @@ def label(lang: str | None = None) -> str:
 
 def _load_saved() -> None:
     global _current
+    # 环境变量优先于本机偏好：回归测试用 SM_LANG=zh-CN 让判据与用户语言
+    # 解耦（用户本机存了 en-US 时，中文关键词的帮助/窗口高度断言会假红，
+    # 2026-11-24 实测）。GUI 正常启动时没有这个变量，行为不变。
+    forced = os.environ.get("SM_LANG")
+    if forced in LANGS:
+        _current = forced
+        return
     try:
         saved = LANG_FILE.read_text(encoding="utf-8").strip()
     except OSError:

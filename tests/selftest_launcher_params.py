@@ -2835,6 +2835,31 @@ def _check_i18n() -> list[tuple[str, bool]]:
          len(card_desc) >= 3),
     ]
 
+    # 2026-11-24 第二轮漏翻：相机管理窗口的失败结论写在模块级常量
+    # （REASON_* / _NO_DSHOW_HELP / _OPEN_FIX_STEPS）与现拼的 f-string 里，
+    # 旧提取器既扫不到常量、也不认 f-string；英文模式下相机打不开时满屏中文。
+    # 这里守三件事：扫得到、翻得出、显示点确实走了 t()/tf() + forget + 重放。
+    cam_keys = ex.extract_strings(ROOT / "apps" / "cameras_dialog.py")
+    cam_reasons = [k for k in cam_keys if k.startswith("采集会话失效")
+                   or k.startswith("打不开：") or k.startswith("打开了但没画面")]
+    cam_src = (ROOT / "apps" / "cameras_dialog.py").read_text(encoding="utf-8")
+    checks += [
+        (f"相机失败结论常量被提取器扫到（{len(cam_reasons)} 句）",
+         len(cam_reasons) >= 3),
+        ("相机失败结论在英文资源里有真译文",
+         bool(cam_reasons) and all(
+             k in i18n_data.EN_US and i18n_data.EN_US[k]
+             and not has_cn(i18n_data.EN_US[k]) for k in cam_reasons)),
+        ("相机状态句在显示点翻译并清记账（tf + forget）",
+         "i18n.tf(" in cam_src and "i18n.forget(" in cam_src
+         and "def _i18n_refresh" in cam_src
+         and "i18n.apply_children(self)" in cam_src),
+        ("`#` 前缀的相机文案不再被误排除（颜色码仍排除）",
+         any("出图了" in k for k in cam_keys)
+         and ex._clean("#b91c1c") is False
+         and ex._clean("#1 出图了") is True),
+    ]
+
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         old_file, old_lang = i18n.LANG_FILE, i18n.language()
@@ -2842,6 +2867,10 @@ def _check_i18n() -> list[tuple[str, bool]]:
         i18n.LANG_FILE = tmp / "language.txt"
         # 本文件前面建了 GUI 窗口，切换语言时不要真的去刷那棵控件树。
         i18n.refresh_all = lambda: None                 # type: ignore[assignment]
+        # 用户本机可能已存 en-US；此时 set_language("en-US") 会 early-return，
+        # 不写临时语言文件，下面 saved=read_text() 就抛 FileNotFoundError。
+        # 先强制回到中文这个已知起点，测的才是"切换"而非"已是目标态"。
+        i18n._current = "zh-CN"
         try:
             cn = i18n.t("确定")
             i18n.set_language("en-US")
@@ -3250,6 +3279,15 @@ def _check_help() -> list[tuple[str, bool]]:
     """
     from apps.help_content import SECTIONS, iter_items, search
     from apps.help_window import HelpWindow
+    from apps import i18n as _i18n
+
+    # 本函数用中文关键词（"状态"/"视角"/"采样 坐标"）断言搜索与渲染；
+    # 用户本机 config/language.txt 可能是 en-US，那时 HelpWindow 按英文渲染，
+    # 中文关键词自然搜不到（不是功能坏）。这里**临时**切到中文，测完恢复，
+    # 让判据与用户偏好解耦（2026-11-24）。
+    _help_old_lang = _i18n.language()
+    if _help_old_lang != "zh-CN":
+        _i18n._current = "zh-CN"
 
     checks: list[tuple[str, bool]] = []
 
@@ -3392,6 +3430,8 @@ def _check_help() -> list[tuple[str, bool]]:
             root.destroy()
         except Exception:                               # noqa: BLE001
             pass
+    if _i18n.language() != _help_old_lang:
+        _i18n._current = _help_old_lang
     return checks
 
 

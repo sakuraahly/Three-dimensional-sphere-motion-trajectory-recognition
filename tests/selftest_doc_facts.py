@@ -110,7 +110,7 @@ SYNCER = ROOT / "apps" / "tools" / "sync_facts.py"
 # 9 条判据当时写进了 `selftest_launcher_params.py` 第 8d 节，没有新建
 # `selftest_view_3d.py` —— 理由是那只是既有功能的一个 bug 修复，不该顺手把测试
 # 预算扩一格。这条理由**对本次不成立**：本次是新增一层模块，不是修 bug。
-REAL_TEST_COUNT = 31
+REAL_TEST_COUNT = 32
 # 测试命名规范（AGENTS.md §4）
 TEST_NAME_RE = re.compile(r"^selftest_[a-z0-9_]+\.py$")
 # 临时探针用的假路径（造一处新漂移用；用完即删）

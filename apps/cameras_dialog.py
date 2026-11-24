@@ -48,6 +48,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker import camera_registry as cr  # noqa: E402
+from apps import i18n  # noqa: E402
 from apps._gui_widgets import BG, MUTED  # noqa: E402
 
 #: 本模块被加载进内存的时刻。用来判断「用户点的这个窗口是不是旧版」：
@@ -125,8 +126,56 @@ def _is_invalidated(err) -> bool:
     return "2147483638" in text or "DEVICE_INVALIDATED" in text
 
 
+#: 预览失败的三种"照着做"结论。中文原文**既是判断依据也是词典 key**：
+#: `_handle_event` 用 `"拔插" in short` 决定是否追加"重启电脑"提示，所以这里
+#: 返回的一律是中文原文；**翻译只发生在显示点**（`i18n.t(short)`），绝不改
+#: 返回值本身。三个名字登记进 `i18n_extract.DATA_CONSTS` 才会进英文词典。
+REASON_INVALIDATED = ("采集会话失效（不是相机坏）：先把这台 USB 拔插一次，"
+                      "再点「重试这一路」")
+REASON_CANNOT_OPEN = ("打不开：先等 30–60 秒再点「重试这一路」（上一路刚用过要放手）；"
+                      "再查占用（Windows 相机 / QQ）；还不行拔插这台")
+REASON_NO_FRAME = "打开了但没画面：先拔插这台，再查镜头遮挡/占用"
+
+#: 失败摘要里现拼的后缀。整句用 t() 命不中词典，改成 tf() 模板（字面量模板
+#: 会被 i18n_extract 扫到）；数据（设备名 / 文件路径 / 数量）走 format 填值，
+#: 不翻译。这些模板同样登记进 DATA_CONSTS 之外的 t()/tf() 位置参数扫描。
+TPL_HOGS_FULL = "\n\n现在开着的、可能占着相机的程序：{hogs}"
+TPL_HOG_NOTE = "｜现在开着 {hogs}，可能占着相机"
+NOTE_TWO_FAILED = "｜两台都这样＝系统的相机服务卡住了：重启电脑比拔插更彻底"
+TPL_FULL_TAIL = "（全文：{log}）"
+FULL_TAIL_FALLBACK = "（双击状态行看全文）"
+TPL_STATUS_ERROR = "相机 #{index}：{brief}{note}{tail}"
+TPL_WAIT_SECS = "{stage} 已等 {secs} 秒"
+WATCHDOG_SLOW = ("还没出画面：慢相机可能要 20–30 秒；"
+                 "一直不出就检查占用或拔插一次")
+TPL_BAD_FRAME = "画面显示不出来：{exc}"
+TPL_FRAME_OK = "#{index} 出图了；总共 {n} 路画面在同时跑"
+TPL_PUMP_ERROR = ("界面刷新出过错（{n} 次，"
+                  "已自动恢复；详情见 outputs/logs/camera_preview.log）")
+PREVIEWING = "预览中"
+TPL_CODE_NEWER = ("⚠ 界面代码在 {stamp} 又改过（{n} 个文件），"
+                  "当前窗口还是旧版 —— **关掉程序重开**才会生效")
+# 动态状态句模板：整句骨架登记进词典，数据（设备名/路径/数量/异常）format 填值。
+TPL_CONFLICT_CHECK = "{conflict}｜{check}"
+TPL_AUTO_REFRESH = "自动刷新：{n} 台｜{check}"
+TPL_OPENED_PARALLEL = ("已并行打开 {n} 路预览；每路互不干扰，"
+                       "慢的那路继续等首帧，不会拖住别的路")
+TPL_VIRTUAL_PREVIEW = ("#{index}「{name}」是虚拟摄像头，不参与绑定、"
+                       "也不在这里预览（它只注册在别的后端，PnP 列表里没有它）")
+TPL_ALREADY_PREVIEW = "#{index} 已经在预览了；要重开先点卡片上的「重试这一路」"
+TPL_AVOIDED_HINT = ("提示：#{index} 被当前相机规则标为内置/不推荐；"
+                    "要看外接相机请选择未标记的设备")
+TPL_OPENING = "正在打开 #{index}（首帧最坏约 30 秒）。可以同时再开别的相机，彼此不打断。"
+TPL_NOT_SAVED = "没保存：{exc}"
+TPL_WRITTEN = "已写入 {path}{extra}"
+TPL_LIMIT_NOT_SAVED = "门限没保存：{exc}"
+TPL_LIMIT_WRITTEN = "已写入 {path}。筛选门限从下一次自动挑相机/成对协商起生效"
+TPL_VIRTUAL_ROLE = ("#{index}「{name}」是虚拟摄像头，不能设成 {role} —— "
+                    "它不是物理设备（PnP 列表里没有它），请选一台真实的相机")
+
+
 def _short_reason(text) -> str:
-    """把 CameraSource 的长解释翻成一句能照着做的结论。
+    """把 CameraSource 的长解释翻成一句能照着做的结论（返回**中文原文**）。
 
     2026-11-07 实测：aoni #0 报 `-2147483638`，OpenCV 的原文是
     ``MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED`` —— 设备在、能枚举、能"打开成功"，
@@ -136,8 +185,7 @@ def _short_reason(text) -> str:
     """
     flat = " ".join(str(text).split())
     if "2147483638" in flat or "DEVICE_INVALIDATED" in flat:
-        return ("采集会话失效（不是相机坏）：先把这台 USB 拔插一次，"
-                "再点「重试这一路」")
+        return REASON_INVALIDATED
     if "无法打开摄像头" in flat or "打不开" in flat:
         # 实测最常见的两种，按**先能自己解决**的顺序写：
         # ① 上一路（别的程序 / 上一个本程序窗口 / 刚关掉的预览）还没真正放手，
@@ -145,10 +193,9 @@ def _short_reason(text) -> str:
         # ② 确实被占着 → 关掉 Windows 相机 / QQ / 会议；
         # ③ 采集会话失效 → 拔插一次。
         # 卡面只有 72 字，所以最可能有效的那条放最前面。
-        return ("打不开：先等 30–60 秒再点「重试这一路」（上一路刚用过要放手）；"
-                "再查占用（Windows 相机 / QQ）；还不行拔插这台")
+        return REASON_CANNOT_OPEN
     if "没画面" in flat or "无帧" in flat or "读不到帧" in flat:
-        return "打开了但没画面：先拔插这台，再查镜头遮挡/占用"
+        return REASON_NO_FRAME
     return _brief(flat)
 
 
@@ -281,8 +328,14 @@ class CamerasDialog(tk.Toplevel):
         self._events: queue.Queue = queue.Queue()
         #: 每一路预览一条记录：key = 设备编号。多路互不干扰。
         self._previews: dict[int, _PreviewPane] = {}
-        #: 完整错误原因（卡片里只放摘要，双击状态行看全文）。
+        #: 完整错误原因（卡片里只放摘要，双击状态行看全文）。存**中文原文**，
+        #: 显示时才 i18n.t()，这样切语言能从原文重新翻（见 _i18n_refresh）。
         self._full_errors: dict[int, str] = {}
+        #: 主状态条 / 卡片状态行的最后一条**中文原文**。异步事件一次性写入，
+        #: 切语言时不会重放，所以在这里留一份，_i18n_refresh 用当前语言重渲染。
+        self._status_zh: str = ""
+        self._status_error: bool = False
+        self._pane_stage_zh: dict[int, str] = {}
         self._after_id: str | None = None
         #: 界面刷新链 (`_pump`) 累计出错次数。出错**不会**再让界面冻结。
         self._pump_failures = 0
@@ -476,11 +529,15 @@ class CamerasDialog(tk.Toplevel):
             return
         stamp = time.strftime("%H:%M", time.localtime(
             max((ROOT / r).stat().st_mtime for r in newer)))
-        msg = (f"⚠ 界面代码在 {stamp} 又改过（{len(newer)} 个文件），"
-               f"当前窗口还是旧版 —— **关掉程序重开**才会生效")
+        msg = TPL_CODE_NEWER.format(stamp=stamp, n=len(newer))
+        self._status_zh = msg
+        self._status_error = True
         try:
-            self.status.configure(text=_brief(msg, STATUS_LIMIT),
-                                  foreground="#b91c1c")
+            self.status.configure(
+                text=_brief(i18n.tf(TPL_CODE_NEWER, stamp=stamp, n=len(newer)),
+                            STATUS_LIMIT),
+                foreground="#b91c1c")
+            i18n.forget(self.status)
         except tk.TclError:
             pass
         self._write_error_log(-1, msg + "\n  更新过的文件：" + "、".join(newer))
@@ -495,7 +552,8 @@ class CamerasDialog(tk.Toplevel):
     # ------------------------------------------------------------------ #
     # 状态 / 消息泵
     # ------------------------------------------------------------------ #
-    def _say(self, text: str, error: bool = False) -> None:
+    def _say(self, text: str, error: bool = False,
+             display: str | None = None) -> None:
         # 主状态条也只放一行：CameraSource 的失败原因有好几段，整段塞进来会
         # 把底部按钮托下去，看起来像"界面被挡住了"。
         # 失败时用红色（项目约定涨红跌绿是行情图，界面告警用红没问题）。
@@ -503,10 +561,19 @@ class CamerasDialog(tk.Toplevel):
         # ⚠️ 这里**必须吞掉 TclError**：窗口正在关闭时控件已经销毁，`configure`
         # 会抛异常；而 `_say` 被 `_show_frame` 的兜底分支调用，一抛就会把
         # 整个 `_pump` 刷新链带走（2026-11-08 的根因，见 `_pump` 注释）。
+        #
+        # 2026-11-24：text 始终是**中文原文**（切语言重渲染的凭据）；display
+        # 是调用方按当前语言拼好的显示串（含设备名/路径等不该翻的数据）。没给
+        # display 就整句 t()。现场写入后 forget() 清记账，避免 apply() 把译文
+        # 当原文翻回去；切语言由 _i18n_refresh 用 text 重渲染。
+        self._status_zh = text
+        self._status_error = error
+        shown = display if display is not None else i18n.t(text)
         try:
             self.status.configure(
-                text=_brief(text, STATUS_LIMIT),
+                text=_brief(shown, STATUS_LIMIT),
                 foreground="#b91c1c" if error else MUTED)
+            i18n.forget(self.status)
         except tk.TclError:
             pass
 
@@ -564,6 +631,35 @@ class CamerasDialog(tk.Toplevel):
             except tk.TclError:
                 pass                     # 窗口已销毁：不必再续约
 
+    def _i18n_refresh(self) -> None:
+        """切语言时重渲染异步产生的状态句（i18n.apply 的约定钩子）。
+
+        这些句子是后台事件现场拼的、不在控件树静态文案里，apply() 的整句
+        t() 够不着；而且写入时已经 forget() 清过记账，apply() 不会碰它们。
+        所以在这里按**缓存的中文原文**用当前语言重渲染一遍，再让
+        apply_children() 翻译其余静态控件。不能调 apply(self)：本钩子就是
+        被 apply() 触发的，会递归（同 HubWindow._i18n_refresh，2026-11-23）。
+        """
+        if self._status_zh:
+            shown = i18n.t(self._status_zh)
+            # 主状态条的复合句里若含"全文/双击"模板，_say 的原文已是拼好的
+            # 整句；整句翻译命中不了时退回原样（静态片段仍由 apply 覆盖）。
+            try:
+                self.status.configure(text=_brief(shown, STATUS_LIMIT))
+                i18n.forget(self.status)
+            except tk.TclError:
+                pass
+        for idx, stage_zh in self._pane_stage_zh.items():
+            pane = self._previews.get(idx)
+            if pane is None:
+                continue
+            try:
+                pane.status.configure(text=_brief(i18n.t(stage_zh)))
+                i18n.forget(pane.status)
+            except tk.TclError:
+                pass
+        i18n.apply_children(self)
+
     def _on_pump_error(self) -> None:
         """刷新链出过错：写日志 + 计数，**绝不把异常再抛回去**。"""
         import traceback
@@ -580,11 +676,14 @@ class CamerasDialog(tk.Toplevel):
                              f"已自动继续）\n{text}\n")
             except OSError:
                 pass
+        pump_msg = TPL_PUMP_ERROR.format(n=self._pump_failures)
+        self._status_zh = pump_msg
+        self._status_error = True
         try:
             self.status.configure(
-                text=_brief(f"界面刷新出过错（{self._pump_failures} 次，"
-                            f"已自动恢复；详情见 outputs/logs/camera_preview.log）"),
+                text=_brief(i18n.tf(TPL_PUMP_ERROR, n=self._pump_failures)),
                 foreground="#b91c1c")
+            i18n.forget(self.status)
         except tk.TclError:
             pass
 
@@ -627,14 +726,13 @@ class CamerasDialog(tk.Toplevel):
                 secs = int(now - pane.started)
                 if secs != pane.shown_secs:
                     pane.shown_secs = secs
-                    pane.status.configure(
-                        text=_brief(f"{pane.stage} 已等 {secs} 秒"))
+                    pane.status.configure(text=_brief(i18n.tf(
+                        TPL_WAIT_SECS,
+                        stage=i18n.t(pane.stage), secs=secs)))
                 if (not pane.warned
                         and now - pane.started > WATCHDOG_S):
                     pane.warned = True
-                    pane.status.configure(text=_brief(
-                        "还没出画面：慢相机可能要 20–30 秒；"
-                        "一直不出就检查占用或拔插一次"))
+                    pane.status.configure(text=_brief(i18n.t(WATCHDOG_SLOW)))
             except tk.TclError:
                 continue                     # 这张卡片已被销毁，跳过
 
@@ -652,33 +750,48 @@ class CamerasDialog(tk.Toplevel):
                 # 颜色也由**这条文案**决定：全黑是警告（橙），其余回到默认。
                 # 以前只在"第一帧刚好是全黑"那一刻上色，于是"全黑 → 亮回来"
                 # 撤销之后文字还是橙的，看起来仍像故障（2026-11-16）。
+                self._pane_stage_zh[item[1]] = pane.stage
                 pane.status.configure(
-                    text=_brief(pane.stage),
+                    text=_brief(i18n.t(pane.stage)),
                     foreground="#b45309" if "全黑" in pane.stage else "")
+                i18n.forget(pane.status)
         elif kind == "perror":
             pane = self._previews.get(item[1])
-            short = str(item[2])
+            short = str(item[2])              # 中文原文（判断 + 重渲染凭据）
             full = str(item[3]) if len(item) > 3 else short
             hint = str(item[4]) if len(item) > 4 else ""
             if hint:
                 # 失败时说出"现在开着谁"，比笼统列五种可能更有用。
-                full += f"\n\n现在开着的、可能占着相机的程序：{hint}"
+                full += TPL_HOGS_FULL.format(hogs=hint)
             self._full_errors[item[1]] = full
             log = self._write_error_log(item[1], full)
             if pane is not None:
                 pane.failed = True            # 停止"已等 N 秒"的计时显示
                 pane.stage = short
-                pane.status.configure(text=_brief(short),
+                self._pane_stage_zh[item[1]] = short
+                pane.status.configure(text=_brief(i18n.t(short)),
                                       foreground="#b91c1c")
-            tail = f"（全文：{log}）" if log else "（双击状态行看全文）"
-            note = f"｜现在开着 {hint}，可能占着相机" if hint else ""
+                i18n.forget(pane.status)
+            # 后缀既有中文骨架也有数据（设备名 / 日志路径）。先翻模板再填值。
+            tail_zh = (TPL_FULL_TAIL.format(log=log) if log
+                       else FULL_TAIL_FALLBACK)
+            tail_en = (i18n.t(TPL_FULL_TAIL).format(log=log) if log
+                       else i18n.t(FULL_TAIL_FALLBACK))
+            note_zh = TPL_HOG_NOTE.format(hogs=hint) if hint else ""
+            note_en = (i18n.t(TPL_HOG_NOTE).format(hogs=hint) if hint else "")
             # 两台**同时**失效是"系统相机栈卡住"的签名（2026-11-08 实测：
             # 两台都 isOpened=True 但一帧不给、每次读阻塞 10 秒）。这时拔插常常
             # 不够，重启电脑才彻底 —— 必须说出来，否则会一直让人反复拔插。
             failed = sum(1 for p in self._previews.values() if p.failed)
             if failed >= 2 and "拔插" in short:
-                note += "｜两台都这样＝系统的相机服务卡住了：重启电脑比拔插更彻底"
-            self._say(f"#{item[1]}：{_brief(short)}{note}{tail}", error=True)
+                note_zh += NOTE_TWO_FAILED
+                note_en += i18n.t(NOTE_TWO_FAILED)
+            status_zh = TPL_STATUS_ERROR.format(
+                index=item[1], brief=_brief(short), note=note_zh, tail=tail_zh)
+            status_en = i18n.tf(TPL_STATUS_ERROR,
+                                index=item[1], brief=_brief(i18n.t(short)),
+                                note=note_en, tail=tail_en)
+            self._say(status_zh, error=True, display=status_en)
 
     # ------------------------------------------------------------------ #
     # 枚举
@@ -773,9 +886,16 @@ class CamerasDialog(tk.Toplevel):
         conflict = self._role_conflict()
         check = self._auto_check_text()
         if conflict:
-            self._say(f"{conflict}｜{check}", error=True)
+            self._say(TPL_CONFLICT_CHECK.format(conflict=conflict, check=check),
+                      error=True,
+                      display=i18n.tf(TPL_CONFLICT_CHECK,
+                                      conflict=i18n.t(conflict),
+                                      check=i18n.t(check)))
         else:
-            self._say(f"自动刷新：{len(self._devices)} 台｜{check}")
+            self._say(TPL_AUTO_REFRESH.format(n=len(self._devices), check=check),
+                      display=i18n.tf(TPL_AUTO_REFRESH,
+                                      n=len(self._devices),
+                                      check=i18n.t(check)))
 
     def _role_conflict(self) -> str:
         """两个角色指向同一台设备时返回一句警告，否则空串。
@@ -950,8 +1070,8 @@ class CamerasDialog(tk.Toplevel):
             return
         for d in picked:
             self._open_preview(d)
-        self._say(f"已并行打开 {len(picked)} 路预览；每路互不干扰，"
-                  "慢的那路继续等首帧，不会拖住别的路")
+        self._say(TPL_OPENED_PARALLEL.format(n=len(picked)),
+                  display=i18n.tf(TPL_OPENED_PARALLEL, n=len(picked)))
 
     def _open_preview(self, entry: cr.DeviceEntry) -> None:
         try:
@@ -961,9 +1081,10 @@ class CamerasDialog(tk.Toplevel):
         if cr.is_virtual(entry.name, reg.settings):
             # 虚拟摄像头**不给预览**：它的编号在别的后端里指到的东西完全不确定，
             # 看它的画面没有任何诊断价值，反而会让人以为"这就是那台相机"。
-            self._say(f"#{entry.order}「{entry.name}」是虚拟摄像头，不参与绑定、"
-                      "也不在这里预览（它只注册在别的后端，PnP 列表里没有它）",
-                      error=True)
+            self._say(TPL_VIRTUAL_PREVIEW.format(
+                index=entry.order, name=entry.name), error=True,
+                display=i18n.tf(TPL_VIRTUAL_PREVIEW,
+                                index=entry.order, name=entry.name))
             return
         old = self._previews.get(entry.order)
         if old is not None:
@@ -974,12 +1095,13 @@ class CamerasDialog(tk.Toplevel):
             if old.failed:
                 self._retry_preview(entry)
             else:
-                self._say(f"#{entry.order} 已经在预览了；要重开先点卡片上的"
-                          "「重试这一路」")
+                self._say(TPL_ALREADY_PREVIEW.format(index=entry.order),
+                          display=i18n.tf(TPL_ALREADY_PREVIEW,
+                                          index=entry.order))
             return
         if cr.is_avoided(entry.name, reg.settings):
-            self._say(f"提示：#{entry.order} 被当前相机规则标为内置/不推荐；"
-                      "要看外接相机请选择未标记的设备")
+            self._say(TPL_AVOIDED_HINT.format(index=entry.order),
+                      display=i18n.tf(TPL_AVOIDED_HINT, index=entry.order))
         title = entry.name or "(没名字)"
         pane = _PreviewPane(
             self.grid_frame, entry.order, title,
@@ -995,8 +1117,8 @@ class CamerasDialog(tk.Toplevel):
             target=self._preview_worker,
             args=(pane, pane.stop), daemon=True)
         pane.thread.start()
-        self._say(f"正在打开 #{entry.order}（首帧最坏约 30 秒）。"
-                  "可以同时再开别的相机，彼此不打断。")
+        self._say(TPL_OPENING.format(index=entry.order),
+                  display=i18n.tf(TPL_OPENING, index=entry.order))
 
     def _show_full_error(self, index: int) -> None:
         """双击卡片状态行看完整原因（卡片里只放一行摘要，不撑高布局）。"""
@@ -1312,15 +1434,22 @@ class CamerasDialog(tk.Toplevel):
             if not pane.got:
                 pane.got = True
                 if "全黑" in pane.stage:
-                    pane.status.configure(text=_brief(pane.stage),
+                    pane.status.configure(text=_brief(i18n.t(pane.stage)),
                                           foreground="#b45309")
                 else:
-                    pane.status.configure(text="预览中")
-                self._say(f"#{pane.index} 出图了；总共 "
-                          f"{sum(1 for p in self._previews.values() if p.got)} "
-                          "路画面在同时跑")
+                    pane.status.configure(text=i18n.t(PREVIEWING))
+                    self._pane_stage_zh[pane.index] = PREVIEWING
+                i18n.forget(pane.status)
+                self._say(TPL_FRAME_OK.format(
+                    index=pane.index,
+                    n=sum(1 for p in self._previews.values() if p.got)),
+                    display=i18n.tf(TPL_FRAME_OK,
+                                    index=pane.index,
+                                    n=sum(1 for p in self._previews.values()
+                                          if p.got)))
         except Exception as exc:                              # noqa: BLE001
-            pane.status.configure(text=_brief(f"画面显示不出来：{exc}"))
+            pane.status.configure(text=_brief(i18n.tf(TPL_BAD_FRAME, exc=exc)))
+            i18n.forget(pane.status)
 
     # ------------------------------------------------------------------ #
     # 绑定
@@ -1342,7 +1471,8 @@ class CamerasDialog(tk.Toplevel):
             mutate(reg, entry)
             path = cr.save_registry(reg)
         except (OSError, ValueError) as exc:
-            self._say(f"没保存：{exc}")
+            self._say(TPL_NOT_SAVED.format(exc=exc),
+                      display=i18n.tf(TPL_NOT_SAVED, exc=exc))
             return
         self._fill_tree()
         conflict = self._role_conflict()
@@ -1350,7 +1480,9 @@ class CamerasDialog(tk.Toplevel):
             self._say(conflict, error=True)
         else:
             extra = f"。{note}" if note else ""
-            self._say(f"已写入 {path}{extra}")
+            self._say(TPL_WRITTEN.format(path=path, extra=extra),
+                      display=i18n.tf(TPL_WRITTEN, path=path,
+                                      extra=i18n.t(extra) if extra else ""))
         if self.on_changed is not None:
             try:
                 self.on_changed()
@@ -1375,7 +1507,8 @@ class CamerasDialog(tk.Toplevel):
             if pair_fps is not None and pair_fps <= 0:
                 raise ValueError("成对下限必须 > 0（留空 = 14.4）")
         except ValueError as exc:
-            self._say(f"门限没保存：{exc}")
+            self._say(TPL_LIMIT_NOT_SAVED.format(exc=exc),
+                      display=i18n.tf(TPL_LIMIT_NOT_SAVED, exc=exc))
             return
         try:
             reg = cr.load_registry()
@@ -1388,9 +1521,11 @@ class CamerasDialog(tk.Toplevel):
                 reg.settings["min_pair_fps"] = pair_fps
             path = cr.save_registry(reg)
         except (OSError, ValueError) as exc:
-            self._say(f"门限没保存：{exc}")
+            self._say(TPL_LIMIT_NOT_SAVED.format(exc=exc),
+                      display=i18n.tf(TPL_LIMIT_NOT_SAVED, exc=exc))
             return
-        self._say(f"已写入 {path}。筛选门限从下一次自动挑相机/成对协商起生效")
+        self._say(TPL_LIMIT_WRITTEN.format(path=path),
+                  display=i18n.tf(TPL_LIMIT_WRITTEN, path=path))
         if self.on_changed is not None:
             try:
                 self.on_changed()
@@ -1409,9 +1544,10 @@ class CamerasDialog(tk.Toplevel):
         if cr.is_virtual(entry.name, reg.settings):
             # 数据层 `set_role()` 也会拒绝（ValueError）；这里先给一句人话，
             # 否则用户只会看到「没保存：...」而不知道该怎么办。
-            self._say(f"#{entry.order}「{entry.name}」是虚拟摄像头，不能设成 {role} —— "
-                      "它不是物理设备（PnP 列表里没有它），请选一台真实的相机",
-                      error=True)
+            self._say(TPL_VIRTUAL_ROLE.format(
+                index=entry.order, name=entry.name, role=role), error=True,
+                display=i18n.tf(TPL_VIRTUAL_ROLE,
+                                index=entry.order, name=entry.name, role=role))
             return
         try:
             others = [r for r in cr.roles_of_device(reg, entry) if r != role]

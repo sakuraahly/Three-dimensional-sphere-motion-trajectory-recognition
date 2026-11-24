@@ -72,7 +72,22 @@ CONTENT_ONLY = {"help_content.py"}
 #: 这些常量里存的是界面上要显示的标签，不是代码内部标识。
 DATA_CONSTS = {"VIEW_PRESETS", "SECTIONS", "STATE_LEGEND", "SOURCE_CHOICES",
                "SOURCE_OFFLINE", "SOURCE_LIVE", "PRESET_NONE", "HELP_SECTIONS",
-               "VIDEO_SOURCE_LABELS"}
+               "VIDEO_SOURCE_LABELS",
+               # 相机预览失败的"照着做"结论 + 全文说明（2026-11-24）：它们是
+               # 模块级常量、不在任何控件调用点里，旧提取器整个漏扫 —— 英文
+               # 界面下相机打不开时满屏中文。显示点在 cameras_dialog 包 t()。
+               "REASON_INVALIDATED", "REASON_CANNOT_OPEN", "REASON_NO_FRAME",
+               "_NO_DSHOW_HELP", "_OPEN_FIX_STEPS", "CAPTURE_UNMEASURED_TEXT",
+               # 相机状态条的 tf() 模板常量（同理，赋给常量不在调用点字面量里）。
+               "TPL_HOGS_FULL", "TPL_HOG_NOTE", "NOTE_TWO_FAILED",
+               "TPL_FULL_TAIL", "FULL_TAIL_FALLBACK", "TPL_STATUS_ERROR",
+               "TPL_WAIT_SECS", "WATCHDOG_SLOW", "TPL_BAD_FRAME",
+               "TPL_FRAME_OK", "TPL_PUMP_ERROR", "PREVIEWING",
+               "TPL_CODE_NEWER", "TPL_CONFLICT_CHECK", "TPL_AUTO_REFRESH",
+               "TPL_OPENED_PARALLEL", "TPL_VIRTUAL_PREVIEW",
+               "TPL_ALREADY_PREVIEW", "TPL_AVOIDED_HINT", "TPL_OPENING",
+               "TPL_NOT_SAVED", "TPL_WRITTEN", "TPL_LIMIT_NOT_SAVED",
+               "TPL_LIMIT_WRITTEN", "TPL_VIRTUAL_ROLE"}
 #: 控件 / 消息框调用中表示"显示文本"的关键字参数。
 TEXT_KWARGS = {"text", "label", "title", "message", "detail", "hint",
                "placeholder", "tooltip", "desc", "description", "header",
@@ -114,7 +129,11 @@ def _docstring_ids(tree: ast.AST) -> set[int]:
 def _clean(s: str) -> bool:
     if not s or not _CN.search(s):
         return False
-    if s.startswith(_SKIP_PREFIX) or s in NO_AUTOFILL:
+    # `#` 在 _SKIP_PREFIX 里是为了排除颜色码（#b91c1c）。但 "#{index} 出图了"
+    # / "#N 打不开" 这类是**真界面文案**（相机卡片状态句），含中文就该收。
+    # 所以含中文的字符串不受 `#` 前缀排除影响（2026-11-24）。
+    prefixes = tuple(p for p in _SKIP_PREFIX if p != "#") if _CN.search(s) else _SKIP_PREFIX
+    if s.startswith(prefixes) or s in NO_AUTOFILL:
         return False
     if len(s) > 600:                       # 超长的是文档段落，不是控件文案
         return False
