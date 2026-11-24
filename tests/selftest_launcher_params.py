@@ -2712,22 +2712,6 @@ def _check_env_installer() -> list[tuple[str, bool]]:
          and 'if p := pointerPython(root); p != ""' in go_src),
         ("Go 启动器找不到环境时会询问并自动安装",
          "runInstaller(root)" in go_src and "ask(" in go_src),
-        # 2026-11-24 最终架构：GUI 走 run.bat guiw → pythonw.exe，launcher 用
-        # hideWindow；不再用 os/exec 的 nil stdio 伪造“有控制台”（那是 NUL）。
-        # 多上下文内置相机实测：有无控制台都能出图，故 GUI 选无控制台路径。
-        ("启动器把 GUI 交给 run.bat guiw（无控制台路径）",
-         'filepath.Join(root, "run.bat")' in go_src
-         and '"/c", bat, "guiw"' in go_src
-         and 'hideWindow(c)' in go_src),
-        ("反向：把 guiw 改回 gui → 判据会红",
-         '"/c", bat, "guiw"' in go_src),
-        ("反向：启动器 GUI 链不使用带控制台的 showConsole → 判据会红",
-         'hideWindow(c)' in go_src.split(
-             'if bat := filepath.Join(root, "run.bat")', 1)[-1].split(
-             'script := findGuiScript', 1)[0]
-         and 'showConsole(c)' not in go_src.split(
-             'if bat := filepath.Join(root, "run.bat")', 1)[-1].split(
-             'script := findGuiScript', 1)[0]),
         ("项目内解释器写相对路径",
          se.pointer_value(se.ROOT / ".venv" / "Scripts" / "python.exe", se.ROOT)
          == ".venv/Scripts/python.exe"),
@@ -2752,6 +2736,25 @@ def _check_env_installer() -> list[tuple[str, bool]]:
          ignored("config/python_env.txt")
          and ignored(".venv/Scripts/python.exe")),
     ]
+
+    # 2026-11-24：launcher 不允许弹终端，但相机必须和 run.bat 走同一套
+    # python.exe + 控制台句柄。实现是 AllocConsole + SW_HIDE + CONIN$/CONOUT$，
+    # 不是 guiw/pythonw，也不是 ShellExecute 弹出可见控制台。
+    def hidden_gui_ok(src: str) -> bool:
+        return ("launchRunBat(root)" in src
+                and "hiddenConsole()" in src
+                and '"CONOUT$"' in src
+                and '"guiw"' not in src)
+
+    checks.append(("启动器 GUI 走隐藏控制台 + run.bat（python.exe，不弹终端）",
+                   hidden_gui_ok(go_src)))
+    checks.append(("反向：去掉隐藏控制台 → 判据会红",
+                   not hidden_gui_ok(go_src.replace(
+                       "hiddenConsole()", "noHiddenConsole()"))))
+    checks.append(("反向：退回 guiw/pythonw 无控制台路径 → 判据会红",
+                   not hidden_gui_ok(go_src.replace(
+                       "launchRunBat(root)",
+                       'exec.Command("cmd", "/c", bat, "guiw")'))))
 
     # 安装器不能 import sphere_tracker（其 __init__ 会拉 cv2），却必须把日志
     # 写进同一个规范目录。这里拿真正的 log_dir 对账，防止两套规则悄悄漂移。

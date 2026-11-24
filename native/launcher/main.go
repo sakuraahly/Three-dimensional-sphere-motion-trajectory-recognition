@@ -4,8 +4,11 @@
 // 装依赖、路由参数；但双击 .bat 会闪一个黑色控制台窗口，也不像"一个程序"。
 // 这个 exe 只是薄薄一层壳：
 //
-//   - 无参数：优先用安装器登记的环境（config/python_env.txt），否则自己找一台
-//     **真能 import cv2** 的 Python，用 pythonw.exe 静默启动 GUI；
+//   - 无参数：先确认有 Python，然后**原样运行 run.bat**（MODE=gui）。
+//     但 launcher 不能弹终端：这里给 launcher 分配一个**隐藏控制台**，把
+//     CONIN$/CONOUT$ 作为 stdio 传给 cmd/run.bat/python。这样相机拿到的仍是
+//     `python.exe` + 真实控制台句柄，和双击 run.bat 一致，只是窗口不可见；
+//     不再用 `guiw/pythonw`，也不再让 `ShellExecute` 弹出控制台；
 //   - 一个都没找到：询问是否自动跑 `run.bat install`，装完接着启动 GUI；
 //   - 有参数：原样转给 `run.bat`（参数路由的唯一产地仍在 bat，不复制一份）；
 //   - 失败：弹系统消息框，而不是窗口一闪而过、看起来像"点了没反应"；
@@ -38,8 +41,12 @@ import (
 const appTitle = "球形物体三维运动轨迹识别"
 
 var (
-	user32      = syscall.NewLazyDLL("user32.dll")
-	messageBoxW = user32.NewProc("MessageBoxW")
+	user32           = syscall.NewLazyDLL("user32.dll")
+	kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	messageBoxW      = user32.NewProc("MessageBoxW")
+	allocConsole     = kernel32.NewProc("AllocConsole")
+	getConsoleWindow = kernel32.NewProc("GetConsoleWindow")
+	showWindow       = user32.NewProc("ShowWindow")
 )
 
 // alert 用系统消息框报错。-H windowsgui 的程序没有 stdout/stderr，
@@ -63,6 +70,48 @@ func hideWindow(c *exec.Cmd) {
 // 与 hideWindow 对称，只用在「安装 / 带参数命令行」这两类希望用户盯着看的路径。
 func showConsole(c *exec.Cmd) {
 	c.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000010}
+}
+
+// hiddenConsole 给 launcher 分配一个不可见的控制台，并返回 CONIN$/CONOUT$
+// 对应的文件。launcher 是 -H windowsgui，本身没有控制台；如果直接把
+// os.Stdin/Stdout 传给子进程，Go 会落到 NUL，正是“看起来无窗口、实际环境
+// 不同”的来源。
+func hiddenConsole() (*os.File, *os.File) {
+	if h, _, _ := getConsoleWindow.Call(); h == 0 {
+		allocConsole.Call()
+	}
+	if h, _, _ := getConsoleWindow.Call(); h != 0 {
+		// SW_HIDE = 0：控制台句柄有效，但用户看不到黑框。
+		showWindow.Call(h, 0)
+	}
+	in, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
+	if err != nil {
+		in = nil
+	}
+	out, err := os.OpenFile("CONOUT$", os.O_RDWR, 0)
+	if err != nil {
+		out = nil
+	}
+	return in, out
+}
+
+// launchRunBat 原样运行 run.bat 的默认 GUI 分支（python.exe），但把
+// launcher 分配出来的隐藏控制台交给 cmd/run.bat/python。这样不会弹终端，
+// 又不会把 stdio 变成 NUL；启动链与双击 run.bat 的唯一差异是控制台可见性。
+func launchRunBat(root string) error {
+	bat := filepath.Join(root, "run.bat")
+	in, out := hiddenConsole()
+	c := exec.Command("cmd", "/c", bat)
+	c.Dir = root
+	c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
+	if in != nil {
+		c.Stdin = in
+	}
+	if out != nil {
+		c.Stdout = out
+		c.Stderr = out
+	}
+	return c.Start()
 }
 
 // fileExists 不是目录且存在。
@@ -302,19 +351,13 @@ func main() {
 			return
 		}
 	}
-	// GUI 走 `run.bat guiw`：run.bat 在该模式下选 pythonw.exe，GUI 本身不需要
-	// 控制台；launcher 也不再伪造“有控制台”（os/exec 的 nil stdio 实际是 NUL，
-	// CREATE_NEW_CONSOLE 只给窗口、不恢复 CONIN$/CONOUT$，所以 pause/输出并
-	// 不等于双击 run.bat）。相机在有无控制台两种进程里都能出图，已用内置相机
-	// 在多上下文实测；这里按 GUI 的真实需求选择无控制台路径。
+	// 不弹终端，但不是 pythonw：隐藏控制台 + python.exe + 原样 run.bat。
+	// 用户实测 run.bat 能开相机、launcher 不能，先把这个环境差异消掉。
 	if bat := filepath.Join(root, "run.bat"); fileExists(bat) {
-		c := exec.Command("cmd", "/c", bat, "guiw")
-		c.Dir = root
-		c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
-		hideWindow(c)
-		if err := c.Start(); err == nil {
-			return
+		if err := launchRunBat(root); err != nil {
+			alert("启动 run.bat 失败：\n" + err.Error())
 		}
+		return
 	}
 
 	script := findGuiScript(root)
