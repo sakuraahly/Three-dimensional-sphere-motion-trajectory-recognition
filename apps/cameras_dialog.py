@@ -765,7 +765,14 @@ class CamerasDialog(tk.Toplevel):
         elif kind == "pstatus":
             pane = self._previews.get(item[1])
             if pane is not None:
-                pane.stage = str(item[2])
+                # 第一帧已经显示之后，后台队列里可能还躺着一条早先排队的
+                # “已连接，等第一帧…”。它会把“预览中”覆盖回去，卡片看起来
+                # 像一直没出图（2026-11-24 实测）。只允许“全黑/预览中”这类
+                # 后续状态覆盖已出图的卡片。
+                stage = str(item[2])
+                if pane.got and stage != PREVIEWING and "全黑" not in stage:
+                    return
+                pane.stage = stage
                 # 颜色也由**这条文案**决定：全黑是警告（橙），其余回到默认。
                 # 以前只在"第一帧刚好是全黑"那一刻上色，于是"全黑 → 亮回来"
                 # 撤销之后文字还是橙的，看起来仍像故障（2026-11-16）。
@@ -1072,11 +1079,16 @@ class CamerasDialog(tk.Toplevel):
         self._open_preview(entry)
 
     def _preview_all(self) -> None:
-        """一次把所有**外接**相机都开成独立预览（跳过内置/红外/虚拟/已标无关）。
+        """一次把所有**真实**相机都开成独立预览（含内置/红外，跳过虚拟/已标无关）。
 
-        ⚠️ 候选判定必须带 `reg.settings`：`is_avoided()` 的规则（`avoid_names` /
-        `avoid_name_patterns`）和 `is_virtual()` 的规则（`virtual_names`）都在
-        `config/cameras.json` 里。漏传 settings 就是"用户改了配置、对话框不认"。
+        ⚠️ 候选判定必须带 `reg.settings`：`is_virtual()` 的规则
+        （`virtual_names`）在 `config/cameras.json` 里；漏传 settings 就是
+        "用户改了配置、对话框不认"。
+
+        2026-11-24：不再排除 `is_avoided()` 的内置/红外。外接 aoni 在刚关闭后
+        有几十秒冷却期，这时“预览全部外接”会两路都失败，用户会以为所有相机
+        都坏了；内置 #2 是已知可用的对照，必须一起打开。红外 #3 如果失败会
+        自己出一张错误卡，不会影响其它路。
         """
         try:
             reg = cr.load_registry()
@@ -1086,6 +1098,17 @@ class CamerasDialog(tk.Toplevel):
                   if not cr.is_avoided(d.name, reg.settings)
                   and not cr.is_virtual(d.name, reg.settings)
                   and not cr.is_device_ignored(d, reg)]
+        # 外接之外，再挑**一台** avoided 设备作为对照（本机是内置 #2）。
+        # 不要把所有 avoided 都加进来：红外 #3 没有彩色输出，放进来只会多
+        # 一张红色“打不开”的卡，反而让人以为全部失败。
+        builtin = next((d for d in self._devices
+                        if cr.is_avoided(d.name, reg.settings)
+                        and not cr.is_virtual(d.name, reg.settings)
+                        and not cr.is_device_ignored(d, reg)), None)
+        if builtin is not None:
+            # 内置先开：外接 aoni 刚关过时冷却 30–60 秒，不能让它挡住
+            # 唯一已知可用的对照画面。
+            picked.insert(0, builtin)
         if not picked:
             self._say("没找到外接相机（列表里只有内置/红外/虚拟，或已标无关）")
             return
@@ -1462,6 +1485,10 @@ class CamerasDialog(tk.Toplevel):
                     pane.status.configure(text=_brief(i18n.t(pane.stage)),
                                           foreground="#b45309")
                 else:
+                    # 第一帧一到，阶段就必须从“已连接，等第一帧…”切到“预览中”。
+                    # 只改控件文字不够：下一次 pstatus 会用旧的 pane.stage
+                    # 把卡片重新写回“等第一帧”，看起来像一直没出图。
+                    pane.stage = PREVIEWING
                     pane.status.configure(text=i18n.t(PREVIEWING))
                     self._pane_stage_zh[pane.index] = PREVIEWING
                 i18n.forget(pane.status)
