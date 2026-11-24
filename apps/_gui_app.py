@@ -315,8 +315,7 @@ class AppState:
         cap = info.get("capture_index")
         bits.append(i18n.tf("采集 #{n}", n=cap)
                     if isinstance(cap, int) else i18n.t("采集索引未实测"))
-        sep = "，" if i18n.language() == "zh-CN" else ", "
-        return sep.join(bits)
+        return i18n.t("，").join(bits)
 
     def camera_role_short(self, role: str) -> str:
         """双目第①步那一行用的**短标签**：设备名，不显示已废弃的“位置”。
@@ -870,15 +869,10 @@ class HubWindow(tk.Toplevel):
             if 0 <= idx < len(i18n.LANGS):
                 new_lang = i18n.LANGS[idx]
                 i18n.set_language(new_lang)
-                # 提示语本身必须跟着**新**语言走：set_language 已经把 _current
-                # 改掉了，这里按新语言给出整句（不是"中文前缀 + 英文标签"）。
-                # 不用 "{lang}" 模板 + format()：i18n.apply() 的原文记账拿到的是
-                # 格式化后的整句，模板 key 命不中，切回中文不会还原（见 B-185）。
-                if new_lang == "zh-CN":
-                    notice = "界面语言已切换为 " + i18n.label()
-                else:
-                    notice = "Interface language switched to " + i18n.label()
-                self.status.set_status(notice, "ok")
+                # 提示语由资源表的整句模板生成；不在调用点按语言写 if/else。
+                # set_language() 已切换 _current，tf() 自然取新语言的模板。
+                self.status.set_status(
+                    i18n.tf("界面语言已切换为 {lang}", lang=i18n.label()), "ok")
 
         lang_combo.bind("<<ComboboxSelected>>", _on_language)
 

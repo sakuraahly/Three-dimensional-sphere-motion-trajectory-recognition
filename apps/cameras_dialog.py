@@ -516,8 +516,7 @@ class CamerasDialog(tk.Toplevel):
         # 控件是在 Toplevel.__init__ 的 after_idle 钩子**之后**才加的，那次
         # apply() 够不着它们（截图实测 "正在打开…"/"停止预览"/标题全中文）。
         # 建完再显式 apply 一次：钩子 _i18n_refresh 会翻 self + 全子树。
-        if i18n.language() != "zh-CN":
-            i18n.apply(self)
+        i18n.apply(self)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._pump()
         self._refresh_devices()
@@ -870,8 +869,7 @@ class CamerasDialog(tk.Toplevel):
                                      role=role, label=label))
             else:
                 parts.append(f"{role}={label} {h.detail}")
-        sep = "｜" if i18n.language() == "zh-CN" else " | "
-        return i18n.t("自动核对：") + sep.join(parts)
+        return i18n.t("自动核对：") + i18n.t("｜").join(parts)
 
     def _stop_stale_previews(self) -> None:
         """设备被拔掉/同编号换了身份：停掉旧预览，别让画面冻结在旧设备上。"""

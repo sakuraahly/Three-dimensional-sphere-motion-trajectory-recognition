@@ -43,7 +43,7 @@ from functools import lru_cache
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from apps.i18n_seed import SEED
+from apps.i18n_seed import PUNCT, SEED
 
 try:
     from apps import i18n_data
@@ -78,6 +78,7 @@ def table(lang: str) -> dict[str, str]:
     # 用户报"英文模式像白痴"后改为这一口径）。
     merged = {k: v for k, v in data.items() if v}
     merged.update(SEED)
+    merged.update(PUNCT)
     return merged
 
 

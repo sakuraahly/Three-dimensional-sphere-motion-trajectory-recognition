@@ -3,11 +3,11 @@
 改文案请改界面源码，然后跑：python apps/tools/i18n_extract.py --write
 人工润色译文请改 apps/i18n_seed.py（重新生成会保留本文件里已填的非空值）。
 值为空 = 待译：运行时回退中文；--check 会阻止缺译文/含中文的条目。
-扫描到 1029 条界面文案。
+扫描到 1031 条界面文案。
 """
 from __future__ import annotations
 
-# EN_US: 1029/1029 条已有译文
+# EN_US: 1031/1031 条已有译文
 EN_US: dict[str, str] = {
     '\n\n现在开着的、可能占着相机的程序：{hogs}': '\n\nApps currently running that may hold the camera: {hogs}',
     '   会话：{path}': '   Session: {path}',
@@ -776,6 +776,7 @@ EN_US: dict[str, str] = {
     '画面显示不出来：{exc}': 'Cannot display the image: {exc}',
     '界面出过一次错（已自动恢复）：详情见 outputs/logs/gui_errors.log': 'An error occurred in the interface (recovered automatically): For details, see outputs/logs/gui_errors.log',
     '界面刷新出过错（{n} 次，已自动恢复；详情见 outputs/logs/camera_preview.log）': 'UI refresh errored ({n} times, auto-recovered; see outputs/logs/camera_preview.log)',
+    '界面语言已切换为 {lang}': 'Interface language switched to {lang}',
     '留空 = 2。按会话切分，不按帧切 —— 相邻帧几乎一样。': 'Leave blank = 2. Split by session, not by frame - adjacent frames are almost identical.',
     '留空 = assets/boards（仓库内，随代码走）。': 'Leave blank = assets/boards (in the warehouse, follow the code).',
     '留空 = config/sphere_config.json。': 'Leave blank = config/sphere_config.json.',
@@ -806,6 +807,7 @@ EN_US: dict[str, str] = {
     '相机设备管理（识别 / 固定 / 标无关）': 'Camera device management (identification / fixed / target independent)',
     '相机预览详细原因': 'Camera preview detailed reasons',
     '相机：': 'Cameras: ',
+    '相机：{missing} —— 先跑 python apps/tools/cameras.py identify': 'Cameras: {missing} - run python apps/tools/cameras.py identify first',
     '相机：左={left}｜右={right}': 'Cameras: left={left} | right={right}',
     '相机：读取失败（config/cameras.json）': 'Cameras: read failed (config/cameras.json)',
     '看 3D': 'Watch 3D',

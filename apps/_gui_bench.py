@@ -237,7 +237,7 @@ def summary_text(s: SessionSummary | None) -> str:
                                 median=s.residual_median))
         lines.append("　".join(bits))
     if s.problems:
-        sep = "；" if i18n.language() == "zh-CN" else "; "
+        sep = i18n.t("；")
         lines.append(i18n.tf("问题：{text}",
                              text=sep.join(i18n.dynamic(p) for p in s.problems)))
     return "\n".join(lines)

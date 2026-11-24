@@ -581,6 +581,16 @@ SEED: dict[str, str] = {
     "匹配 {matched}/{total}": "Matched {matched}/{total}",
     "残差中位 {median:.2f} px": "median residual {median:.2f} px",
     "问题：{text}": "Problems: {text}",
+    "界面语言已切换为 {lang}": "Interface language switched to {lang}",
+    "{v} 未绑定": "{v} is not bound",
+    "{v}（{label}）采集索引未实测":
+        "{v} ({label}): capture index not measured",
+    "相机：{missing} —— 先跑 python apps/tools/cameras.py identify":
+        "Cameras: {missing} - run python apps/tools/cameras.py identify first",
+    "相机：左={left}｜右={right}": "Cameras: left={left} | right={right}",
+    "相机：读取失败（config/cameras.json）":
+        "Cameras: failed to read config/cameras.json",
+    "相机：读取中…": "Cameras: reading…",
     "相机枚举完成：{online} 台在线{note}；「#编号」只在采集索引实测后出现，没实测先跑 cameras.py identify":
         "Camera enumeration finished: {online} online{note}; #index appears only "
         "after a measured capture index; if it is not measured, run "
@@ -1047,10 +1057,15 @@ SEED: dict[str, str] = {
         "and the ball-diameter prior).",
 }
 
+#: 纯标点的显示替换。它们没有中文，不能放进 `SEED`（种子词典的契约是
+#: “key 含中文”）；但状态条拼接动态句时仍需要按当前语言取分隔符。
+PUNCT = {"；": "; ", "，": ", ", "｜": " | "}
+
+
 #: 这些字符串即使含中文也不该被短语替换（专名 / 公式 / 单位 / 标点片段）。
 #: 运行时只做"整句精确匹配"时它们本来就不会命中；这里主要防自动组词误伤。
 NO_AUTOFILL = (
     "Z = f·D/(2r)", "X 右 / Y 下 / Z 前", "sm_120", "cu128",
 )
 
-__all__ = ["SEED", "NO_AUTOFILL"]
+__all__ = ["SEED", "PUNCT", "NO_AUTOFILL"]

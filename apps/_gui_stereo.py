@@ -1340,14 +1340,16 @@ class StereoWindow(tk.Toplevel):
                     continue
                 spec = reg.roles.get(v)
                 if spec is None:
-                    missing.append(f"{v} 未绑定")
+                    missing.append(i18n.tf("{v} 未绑定", v=v))
                 elif spec.capture_index is None:
                     label = spec.name or v
-                    missing.append(f"{v}（{label}）采集索引未实测")
+                    missing.append(i18n.tf(
+                        "{v}（{label}）采集索引未实测", v=v, label=label))
             if missing:
-                cam_why = ("相机：" + "；".join(missing)
-                           + " —— 先跑 python apps/tools/cameras.py identify")
-                return False, (why + "；" if why else "") + cam_why
+                cam_why = i18n.tf(
+                    "相机：{missing} —— 先跑 python apps/tools/cameras.py identify",
+                    missing=i18n.t("；").join(missing))
+                return False, (why + i18n.t("；") if why else "") + cam_why
         except Exception:                                    # noqa: BLE001
             pass
         return ready, why

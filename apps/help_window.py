@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from apps import i18n
-from apps.help_content import SECTIONS, iter_items, search
+from apps.help_content import SECTIONS, iter_items
 
 try:                                    # 与主界面同一套字体，缺了也能跑
     from apps._gui_widgets import FONT_FAMILY
@@ -219,9 +219,10 @@ class HelpWindow(tk.Toplevel):
         i18n.apply(self.count_lab)
 
     def _search(self, keyword: str) -> list[tuple[str, str, str, str]]:
-        """英文模式下按**译文**搜，但返回原文 —— 切回中文时还能原样重绘。"""
-        if i18n.language() == "zh-CN":
-            return search(keyword)
+        """按当前语言搜索，但返回原文 —— 切回中文时还能原样重绘。
+
+        `i18n.t()` 在中文模式是恒等映射，所以不需要 `if 语言 == zh` 分支。
+        """
         words = [w for w in keyword.lower().split() if w]
         if not words:
             return []

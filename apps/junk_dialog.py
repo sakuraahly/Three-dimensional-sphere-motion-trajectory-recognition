@@ -334,8 +334,8 @@ class JunkDialog(tk.Toplevel):
 
         notes: list[str] = []
         if self.plan.missing:
-            sep = "；" if i18n.language() == "zh-CN" else "; "
-            notes.append(i18n.tf("找不到的位置：{text}", text=sep.join(self.plan.missing)))
+            notes.append(i18n.tf("找不到的位置：{text}",
+                                 text=i18n.t("；").join(self.plan.missing)))
         if any(i.danger == DANGER_GONE for i in chosen):
             notes.append(i18n.t("选中的「回收站」是彻底删除，删了不可恢复。"))
         if not notes:
