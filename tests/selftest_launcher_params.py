@@ -2761,6 +2761,23 @@ def _check_env_installer() -> list[tuple[str, bool]]:
                    not admin_gui_ok(go_src, manifest_src.replace(
                        "requireAdministrator", "asInvoker"))))
 
+    # 首次启动不能停在“未设置装置档案”：自动建默认档案、设为 active，并给引导。
+    import tempfile
+    from stereo import profiles as _rig_profiles
+    old_profiles_path = _rig_profiles.DEFAULT_PATH
+    with tempfile.TemporaryDirectory() as _td:
+        _rig_profiles.DEFAULT_PATH = Path(_td) / "profiles.json"
+        try:
+            from apps._gui_app import AppState as _AppState
+            _state = _AppState()
+            _first_ok = bool(_rig_profiles.active_name()) and bool(_state.first_run)
+            _state2 = _AppState()
+            _second_ok = not getattr(_state2, "first_run", False)
+            checks.append(("首次启动自动创建默认档案并选中", _first_ok))
+            checks.append(("已有档案时不再重复首次引导", _second_ok))
+        finally:
+            _rig_profiles.DEFAULT_PATH = old_profiles_path
+
     # 安装器不能 import sphere_tracker（其 __init__ 会拉 cv2），却必须把日志
     # 写进同一个规范目录。这里拿真正的 log_dir 对账，防止两套规则悄悄漂移。
     from datetime import datetime

@@ -74,6 +74,10 @@ def main() -> int:
                        "UsePreviousTasks=yes", "UsePreviousLanguage=yes"))))
     checks.append((".iss 升级前请求关闭正在运行的程序",
                    "CloseApplications=yes" in iss))
+    checks.append((".iss 快速开始用 notepad 打开 README（不依赖 .md 关联）",
+                   'Filename: "notepad.exe"' in iss
+                   and 'README.md' in iss
+                   and "postinstall" in iss))
     install_delete = iss.split("[InstallDelete]", 1)[-1].split("[UninstallDelete]", 1)[0]
 
     def upgrade_keeps_user_data(text: str) -> bool:

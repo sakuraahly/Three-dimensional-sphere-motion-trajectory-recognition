@@ -689,6 +689,8 @@ SEED: dict[str, str] = {
     "—（按标定）": "— (from calibration)",
     "当前装置：{name}": "Active rig: {name}",
     "当前装置：{name}　模式：{mode}": "Active rig: {name}  ·  mode: {mode}",
+    "首次启动：已自动创建并选中装置档案「{name}」。点「装置档案」查看/切换；下一步请先给这台装置标定。":
+        "First run: created and selected rig profile \"{name}\". Open \"Rig profiles\" to view or switch; next, calibrate this rig.",
     "尺度 left→right": "Scale left→right", "等效放大": "Effective zoom",
     "裁剪矩形": "Crop rectangle", "共同输出尺寸": "Common output size",
     "测量时分辨率": "Resolution at measurement", "估计质量": "Estimated quality",

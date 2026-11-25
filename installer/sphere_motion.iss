@@ -20,7 +20,7 @@
 ; ===========================================================================
 
 #define AppName "球形物体三维运动轨迹识别"
-#define AppVer "0.3.2"
+#define AppVer "0.3.3"
 #define Publisher "SphereMotion"
 #define AppId "6E4A1B7C-2D9F-4A3E-9B11-5C8D7E2F0A44"
 ; ISCC 把脚本所在目录（installer\）当相对路径基准，回退一层到仓库根。
@@ -92,8 +92,10 @@ Name: "{group}\卸载"; Filename: "{uninstallexe}"; Tasks: startmenu
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: desktopicon
 
 [Run]
-; 完成后可选打开说明书（不强制启动 GUI）
-Filename: "{app}\README.md"; Description: "查看快速开始说明 / View quick start"; Flags: postinstall skipifsilent unchecked
+; 完成后可选打开说明书（不强制启动 GUI）。
+; README.md 是 Markdown，Windows 没有默认关联时直接 ShellExecute 会报
+; “打不开/选择应用”。用 notepad 显式打开，保证任何新机器都能看。
+Filename: "notepad.exe"; Parameters: """{app}\README.md"""; Description: "查看快速开始说明 / View quick start"; Flags: postinstall skipifsilent unchecked
 
 [InstallDelete]
 ; 覆盖升级：先删旧**代码**目录，避免新版本已删掉的文件残留。

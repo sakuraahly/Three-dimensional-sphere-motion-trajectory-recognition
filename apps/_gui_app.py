@@ -59,6 +59,11 @@ TITLE_STEREO_PARALLEL = "平行双目 · 视差测深"
 TITLE_STEREO_ANGLED = "大角度双目 · 三角测量"
 
 MONO_CALIB_PATH = ROOT / "config" / "mono_calibration.json"
+#: 首次启动（没有 active 档案）时自动建档案 + 选中后的引导语。
+FIRST_RUN_GUIDE = (
+    "首次启动：已自动创建并选中装置档案「{name}」。"
+    "点「装置档案」查看/切换；下一步请先给这台装置标定。"
+)
 # 2026-11-10（用户裁决 B5）：不再有 `STEREO_CALIB_PATH` 常量。
 # 标定路径一律走 `apps._common.current_calibration` —— 那个"档案优先、档案没配
 # 才回落顶层 config/stereo_calibration"的判断**只许有一份**。这里原来自己写了一份，
@@ -141,7 +146,31 @@ class AppState:
         self.notes: list[str] = []     # 读取过程中的"读不了"（不是错误，是现状）
         # warn 级之外的说明（如老标定「未登记来源」）：只拼进状态条，不升成警告。
         self.infos: list[str] = []
+        # 首次启动（没有 active 档案）的引导；由 _bootstrap_profiles 置位。
+        self.first_run = False
+        self._bootstrap_profiles()
         self.reload()
+
+    def _bootstrap_profiles(self) -> None:
+        """首次启动时建默认档案并选中，保证门厅不会停在"未设置档案"。
+
+        档案本身由 ``apps.profile_dialog.ensure_default_profiles`` 预置（平行/90°），
+        这里只负责**把它设为 active**；不覆盖用户已有的 active 选择。
+        """
+        try:
+            from stereo import profiles
+            from apps.profile_dialog import ensure_default_profiles
+
+            created = ensure_default_profiles()
+            if not profiles.active_name():
+                items = profiles.list_profiles()
+                if items:
+                    profiles.set_active(items[0].name)
+                    self.first_run = True
+            elif created:
+                self.first_run = True
+        except Exception as exc:                            # noqa: BLE001
+            self.notes.append(f"默认装置档案创建失败：{type(exc).__name__}")
 
     # ---------- 读取 ----------
     def reload(self) -> None:
@@ -254,6 +283,8 @@ class AppState:
             mode = self.stereo_mode() or i18n.t("未记录模式")
             head += i18n.tf("（标定模式 {mode}）", mode=mode)
         parts = [p for p in (notes, infos) if p]
+        if getattr(self, "first_run", False) and prof:
+            parts.append(i18n.tf(FIRST_RUN_GUIDE, name=prof))
         text = head + (i18n.tf("｜{parts}", parts=sep.join(parts))
                        if parts else "")
         level = "warn" if (self.notes or (prof and self.rig is None)) else "info"
