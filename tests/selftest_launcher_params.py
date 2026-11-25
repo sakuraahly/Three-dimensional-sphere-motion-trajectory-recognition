@@ -2737,24 +2737,29 @@ def _check_env_installer() -> list[tuple[str, bool]]:
          and ignored(".venv/Scripts/python.exe")),
     ]
 
-    # 2026-11-24：launcher 不允许弹终端，但相机必须和 run.bat 走同一套
-    # python.exe + 控制台句柄。实现是 AllocConsole + SW_HIDE + CONIN$/CONOUT$，
-    # 不是 guiw/pythonw，也不是 ShellExecute 弹出可见控制台。
-    def hidden_gui_ok(src: str) -> bool:
-        return ("launchRunBat(root)" in src
-                and "hiddenConsole()" in src
-                and '"CONOUT$"' in src
-                and '"guiw"' not in src)
+    # 2026-11-25：launcher 必须管理员权限（相机需要），GUI 走
+    # run.bat guiw -> pythonw，且 cmd 用 CREATE_NO_WINDOW；不能出现终端。
+    # manifest 是独立的真源，不能只检查 Go 源码。
+    manifest_src = (ROOT / "native" / "launcher" / "launcher.manifest").read_text(
+        encoding="utf-8")
 
-    checks.append(("启动器 GUI 走隐藏控制台 + run.bat（python.exe，不弹终端）",
-                   hidden_gui_ok(go_src)))
-    checks.append(("反向：去掉隐藏控制台 → 判据会红",
-                   not hidden_gui_ok(go_src.replace(
-                       "hiddenConsole()", "noHiddenConsole()"))))
-    checks.append(("反向：退回 guiw/pythonw 无控制台路径 → 判据会红",
-                   not hidden_gui_ok(go_src.replace(
-                       "launchRunBat(root)",
-                       'exec.Command("cmd", "/c", bat, "guiw")'))))
+    def admin_gui_ok(src: str, manifest: str = manifest_src) -> bool:
+        return ('"guiw"' in src
+                and "launchRunBat(root)" in src
+                and "CREATE_NO_WINDOW" in src
+                and "requireAdministrator" in manifest)
+
+    checks.append(("启动器走 run.bat guiw + pythonw，且不创建终端",
+                   admin_gui_ok(go_src)))
+    checks.append(("启动器 manifest 默认请求管理员权限",
+                   "requireAdministrator" in manifest_src
+                   and "asInvoker" not in manifest_src))
+    checks.append(("反向：把 guiw 改回 gui → 判据会红",
+                   not admin_gui_ok(go_src.replace(
+                       '"/c", bat, "guiw"', '"/c", bat, "gui"'))))
+    checks.append(("反向：把 requireAdministrator 改回 asInvoker → 判据会红",
+                   not admin_gui_ok(go_src, manifest_src.replace(
+                       "requireAdministrator", "asInvoker"))))
 
     # 安装器不能 import sphere_tracker（其 __init__ 会拉 cv2），却必须把日志
     # 写进同一个规范目录。这里拿真正的 log_dir 对账，防止两套规则悄悄漂移。
@@ -3074,7 +3079,7 @@ def _check_clean_bundle() -> list[tuple[str, bool]]:
                    not any(r in relics for r in rels)))
     build_src = [r for r in rels if r.startswith("native/launcher/")]
     checks.append((f"包内含 exe 启动器重建源码（{len(build_src)} 个）",
-                   len(build_src) == 5))
+                   len(build_src) == 6))
     checks.append(("编译产物（exe / syso）不进包",
                    "launcher.exe" not in rels
                    and not any(r.endswith(".syso") for r in rels)))

@@ -75,7 +75,7 @@ PUBLIC_DOCS = (
 EXTRA_BUILD_FILES = (
     "native/launcher/main.go", "native/launcher/go.mod",
     "native/launcher/build.bat", "native/launcher/icon.rc",
-    "native/launcher/icon.ico",
+    "native/launcher/icon.ico", "native/launcher/launcher.manifest",
 )
 #: Windows 安装程序（Inno Setup）的重建脚本（setup.exe 产物不进包）。
 #: 与 native/launcher 同样对待：只带源码，拿到包的人能自己重建发布物。
@@ -90,10 +90,10 @@ INSTALLER_FILES = (
 GITHUB_README = ROOT / "docs" / "GitHub-README.md"
 
 ALLOWED_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".png", ".pdf",
-                  ".go", ".mod", ".rc", ".ico", ".iss", ".isl"}
+                  ".go", ".mod", ".rc", ".ico", ".iss", ".isl", ".manifest"}
 ALLOWED_NAMES = {".gitignore", ".gitattributes", ".gitkeep", "LICENSE"}
 TEXT_SUFFIX = {".py", ".md", ".txt", ".yml", ".bat", ".go", ".mod", ".rc",
-               ".iss", ".isl"}
+               ".iss", ".isl", ".manifest"}
 FORBIDDEN_PARTS = {
     "outputs", "logs", "legacy", ".workbuddy", "__pycache__",
     ".git", "node_modules", "venv", ".venv",

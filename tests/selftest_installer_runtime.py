@@ -66,6 +66,29 @@ def main() -> int:
                    and "UninstallSilent" in iss
                    and "DelTree" in iss))
 
+    # 1a2. 覆盖升级（2026-11-25）：新版直接覆盖旧版，不新开一份，
+    # 且**绝不**在 [InstallDelete] 里删用户数据（config/data/logs/outputs/models）。
+    checks.append((".iss 升级时沿用旧安装目录/组/任务/语言",
+                   all(k in iss for k in (
+                       "UsePreviousAppDir=yes", "UsePreviousGroup=yes",
+                       "UsePreviousTasks=yes", "UsePreviousLanguage=yes"))))
+    checks.append((".iss 升级前请求关闭正在运行的程序",
+                   "CloseApplications=yes" in iss))
+    install_delete = iss.split("[InstallDelete]", 1)[-1].split("[UninstallDelete]", 1)[0]
+
+    def upgrade_keeps_user_data(text: str) -> bool:
+        code_dirs = ("apps", "sphere_tracker", "calib", "stereo", "docs",
+                     "installer", "tests", "native", "assets")
+        user_dirs = ("config", "data", "logs", "outputs", "models")
+        return (all(f"{{app}}\\{d}" in text for d in code_dirs)
+                and not any(f"{{app}}\\{d}" in text for d in user_dirs))
+
+    checks.append((".iss 升级只删代码目录，不删用户数据",
+                   upgrade_keeps_user_data(install_delete)))
+    checks.append(("反向：把 config 加进升级删除清单 → 判据会红",
+                   not upgrade_keeps_user_data(
+                       install_delete + 'Type: filesandordirs; Name: "{app}\\config"\n')))
+
     # 1b. 中文向导：语言文件随仓库提供，不能依赖构建机预装语言包。
     zh = _read(ZH_ISL)
     checks.append(("中文语言文件随仓库提供且是简体中文",

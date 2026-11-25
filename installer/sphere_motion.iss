@@ -20,7 +20,7 @@
 ; ===========================================================================
 
 #define AppName "球形物体三维运动轨迹识别"
-#define AppVer "0.3.1"
+#define AppVer "0.3.2"
 #define Publisher "SphereMotion"
 #define AppId "6E4A1B7C-2D9F-4A3E-9B11-5C8D7E2F0A44"
 ; ISCC 把脚本所在目录（installer\）当相对路径基准，回退一层到仓库根。
@@ -49,6 +49,18 @@ UninstallDisplayIcon={app}\launcher.exe
 ShowLanguageDialog=no
 LanguageDetectionMethod=locale
 DisableDirPage=auto
+; ---------- 覆盖升级（2026-11-25）----------
+; 同一 AppId 视为"同一产品的不同版本"：直接装进上一次的目录，
+; 不新开一份、不弹"已安装"拦截。用户数据（config / data / logs /
+; outputs / models）不在 [InstallDelete] 里，升级时原样保留；
+; 代码目录先删后装，新版本删掉的文件不会残留成"幽灵模块"。
+UsePreviousAppDir=yes
+UsePreviousGroup=yes
+UsePreviousTasks=yes
+UsePreviousLanguage=yes
+; 升级时如果程序还开着，让安装器请求它退出，否则 .pyd/.exe 被占用会写不进去。
+CloseApplications=yes
+RestartApplications=no
 ; 需要展示自定义向导页（单选项 + 文件选择），不能用 /VERYSILENT 时静默跳过
 ; —— 但 silent 安装时 NextButtonClick 仍会被调用，默认值可用。
 
@@ -84,6 +96,27 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\launcher.exe"; Tasks: desktop
 Filename: "{app}\README.md"; Description: "查看快速开始说明 / View quick start"; Flags: postinstall skipifsilent unchecked
 
 [InstallDelete]
+; 覆盖升级：先删旧**代码**目录，避免新版本已删掉的文件残留。
+; 明确不在这里列 config / data / logs / outputs / models —— 那是用户资产，
+; 升级必须原样保留（0.3.2 起写死这条边界，见 docs/安装包制作与交接.md）。
+Type: filesandordirs; Name: "{app}\apps"
+Type: filesandordirs; Name: "{app}\sphere_tracker"
+Type: filesandordirs; Name: "{app}\calib"
+Type: filesandordirs; Name: "{app}\stereo"
+Type: filesandordirs; Name: "{app}\docs"
+Type: filesandordirs; Name: "{app}\installer"
+Type: filesandordirs; Name: "{app}\tests"
+Type: filesandordirs; Name: "{app}\native"
+Type: filesandordirs; Name: "{app}\assets"
+Type: files; Name: "{app}\run.bat"
+Type: files; Name: "{app}\install.bat"
+Type: files; Name: "{app}\uninstall.bat"
+Type: files; Name: "{app}\launcher.exe"
+Type: files; Name: "{app}\README.md"
+Type: files; Name: "{app}\LICENSE"
+Type: files; Name: "{app}\requirements.txt"
+Type: files; Name: "{app}\requirements-ai.txt"
+Type: files; Name: "{app}\environment.yml"
 ; 旧版本把 runtime 放在 {app}；升级时清掉，避免 D: 上的旧 Python 被误用。
 Type: filesandordirs; Name: "{app}\runtime"
 

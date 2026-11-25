@@ -4,11 +4,9 @@
 // 装依赖、路由参数；但双击 .bat 会闪一个黑色控制台窗口，也不像"一个程序"。
 // 这个 exe 只是薄薄一层壳：
 //
-//   - 无参数：先确认有 Python，然后**原样运行 run.bat**（MODE=gui）。
-//     但 launcher 不能弹终端：这里给 launcher 分配一个**隐藏控制台**，把
-//     CONIN$/CONOUT$ 作为 stdio 传给 cmd/run.bat/python。这样相机拿到的仍是
-//     `python.exe` + 真实控制台句柄，和双击 run.bat 一致，只是窗口不可见；
-//     不再用 `guiw/pythonw`，也不再让 `ShellExecute` 弹出控制台；
+//   - 无参数：先确认有 Python，然后运行 run.bat 的 guiw 分支（pythonw，
+//     不创建控制台）。launcher.exe 通过 launcher.manifest 请求管理员权限；
+//     子进程继承同一提升令牌。相机需要管理员权限，终端窗口不会出现；
 //   - 一个都没找到：询问是否自动跑 `run.bat install`，装完接着启动 GUI；
 //   - 有参数：原样转给 `run.bat`（参数路由的唯一产地仍在 bat，不复制一份）；
 //   - 失败：弹系统消息框，而不是窗口一闪而过、看起来像"点了没反应"；
@@ -72,44 +70,17 @@ func showConsole(c *exec.Cmd) {
 	c.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000010}
 }
 
-// hiddenConsole 给 launcher 分配一个不可见的控制台，并返回 CONIN$/CONOUT$
-// 对应的文件。launcher 是 -H windowsgui，本身没有控制台；如果直接把
-// os.Stdin/Stdout 传给子进程，Go 会落到 NUL，正是“看起来无窗口、实际环境
-// 不同”的来源。
-func hiddenConsole() (*os.File, *os.File) {
-	if h, _, _ := getConsoleWindow.Call(); h == 0 {
-		allocConsole.Call()
-	}
-	if h, _, _ := getConsoleWindow.Call(); h != 0 {
-		// SW_HIDE = 0：控制台句柄有效，但用户看不到黑框。
-		showWindow.Call(h, 0)
-	}
-	in, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
-	if err != nil {
-		in = nil
-	}
-	out, err := os.OpenFile("CONOUT$", os.O_RDWR, 0)
-	if err != nil {
-		out = nil
-	}
-	return in, out
-}
-
-// launchRunBat 原样运行 run.bat 的默认 GUI 分支（python.exe），但把
-// launcher 分配出来的隐藏控制台交给 cmd/run.bat/python。这样不会弹终端，
-// 又不会把 stdio 变成 NUL；启动链与双击 run.bat 的唯一差异是控制台可见性。
+// launchRunBat 用 run.bat 的 guiw 分支：
+//   cmd（隐藏） -> run.bat guiw -> pythonw.exe -> apps/gui_main.py
+// launcher 的 manifest 请求管理员权限，子进程继承同一提升令牌；相机需要
+// 这个权限。cmd 用 CREATE_NO_WINDOW，pythonw 不创建控制台，所以没有终端窗口。
 func launchRunBat(root string) error {
 	bat := filepath.Join(root, "run.bat")
-	in, out := hiddenConsole()
-	c := exec.Command("cmd", "/c", bat)
+	c := exec.Command("cmd", "/c", bat, "guiw")
 	c.Dir = root
-	c.Env = append(os.Environ(), "SPHERE_LAUNCHED_BY=launcher")
-	if in != nil {
-		c.Stdin = in
-	}
-	if out != nil {
-		c.Stdout = out
-		c.Stderr = out
+	c.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
 	}
 	return c.Start()
 }
