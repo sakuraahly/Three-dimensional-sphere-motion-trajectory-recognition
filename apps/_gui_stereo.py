@@ -45,7 +45,8 @@ from apps._actions import (CHAIN_ROOT, board_args, calibrate_args,
                            chain_dirs, check_chain_inputs, check_setup_args,
                            capture_chain_frames, capture_pair_frame,
                            current_chain_dirs, new_chain_session,
-                           offline_args, record_args)
+                           offline_args, record_args, verify_stereo)
+from apps._open_in_explorer import OpenInExplorerError, open_in_explorer
 from apps import _actions
 from apps._stereo_layout import (
     MODE_LABELS,
@@ -93,8 +94,8 @@ TPL_RECORD_BLOCKED = "第③步录制会用不了：{why}"
 
 __all__ = ["StereoWindow", "SessionPicker", "scan_sessions", "pick_seeds",
            "board_args", "chain_dirs", "calibrate_args", "record_args",
-           "record_out_dir", "check_setup_args", "session_name_of",
-           "realtime_session_blocker",
+           "record_out_dir", "check_setup_args", "verify_stereo",
+           "session_name_of", "realtime_session_blocker",
            "detector_methods", "preset_choices", "METHODS", "PICKER_METHODS",
            "picker_methods_for"]
 
@@ -166,16 +167,14 @@ PICKER_METHODS = ("joint", "chain", "chain_dual")
 
 
 def picker_methods_for(mode: str) -> tuple[str, ...]:
-    """按窗口模式给方法下拉项：**轴向只进平行窗，中轴90°只进大角度窗**。
+    """按窗口模式给方法下拉项：**轴向只进平行窗，中轴90°与链式只进大角度窗**。
 
-    两种新标定绑定各自的装置几何：轴向大板是平行双目（板正对、沿光轴推），
-    中轴 90° 是大角度（板绕中轴转 90°）。把它们同时塞进两个窗口的下拉，
-    用户就会在平行窗里选到大角度算法（或反之），拿到一份几何前提根本不成立的
-    结果。所以下拉按模式过滤，全集仍是 `PICKER_METHODS`（判据可按它核对）。
+    平行窗（parallel）可选 ``joint`` / ``axial``；
+    大角度窗（angled）可选 ``joint``（30–60° 部分共视）/ ``chain`` / ``chain_dual`` / ``device90``。
     """
     if mode == "parallel":
         return ("joint", "axial")
-    return ("chain", "chain_dual", "device90")
+    return ("joint", "chain", "chain_dual", "device90")
 
 
 # --------------------------------------------------------------------------- #
@@ -798,6 +797,13 @@ class StereoWindow(tk.Toplevel):
         # 留空 = 不核对（不能替用户猜一个数）。2026-11-09 修 §67 A1 老缺陷。
         self.var_baseline = tk.StringVar(
             value=prefs.get_str("stereo.baseline_mm", ""))
+        _pair_pref = prefs.get_str("stereo.pair_camera", "left")
+        self.var_pair_camera = tk.StringVar(
+            value=_pair_pref if _pair_pref in ("left", "right") else "left")
+        self.var_rational = tk.BooleanVar(
+            value=prefs.get_bool("stereo.rational_model", False))
+        self.var_fix_pp = tk.BooleanVar(
+            value=prefs.get_bool("stereo.fix_principal_point", False))
         # 两种新标定方式的输入（轴向大板 / 中轴 90°）。都从 prefs 读，关窗写回：
         # 这些是用户的选择，不是磁盘现状；每次开窗重填 5 个字段没人会接受。
         # 预期基线复用 var_baseline（同一个物理锚：卷尺量的两镜头中心距）。
@@ -895,6 +901,7 @@ class StereoWindow(tk.Toplevel):
         self.lbl_cams = self.surface.hint(box, "读取相机…")
         actions = self.surface.action_row(box)
         self.btn_check = self.surface.primary(actions, "检查装置", self._check_setup)
+        self.btn_verify = self.surface.secondary(actions, "复检标定", self._verify_calibration)
         self.surface.secondary(actions, "换相机…", self._open_cameras)
         self.surface.secondary(actions, "重新读取标定", self._reload_state)
 
@@ -1012,6 +1019,17 @@ class StereoWindow(tk.Toplevel):
         ttk.Label(line4, text="右相机").pack(side="left")
         ttk.Entry(line4, textvariable=self.var_right, width=10).pack(
             side="left", padx=(6, 0))
+        if self.mode == "angled":
+            ttk.Label(line4, text="④同框相机").pack(side="left", padx=(12, 0))
+            ttk.Combobox(line4, textvariable=self.var_pair_camera,
+                         values=("left", "right"), state="readonly",
+                         width=6).pack(side="left", padx=(6, 0))
+        lens_line = ttk.Frame(inner)
+        lens_line.pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(lens_line, text="广角8参数畸变",
+                        variable=self.var_rational).pack(side="left")
+        ttk.Checkbutton(lens_line, text="固定主点（少姿态防漂）",
+                        variable=self.var_fix_pp).pack(side="left", padx=(12, 0))
         # 采集档字段与录制共用，统一放在 ③；这里只放一句不占可点预算的提示。
         ttk.Label(inner,
                   text="采集宽/高/fps 与录制共用：在 ③「采集」卡设置（空 = 自动/标定档）。",
@@ -1040,27 +1058,31 @@ class StereoWindow(tk.Toplevel):
                 actions, "重拍某一步…", self._reshoot_chain_stage)
             self.btn_check_chain = self.surface.secondary(
                 actions, "检查链式输入", self._check_chain_inputs)
+            self._sync_chain_buttons(self._method_key())
 
     def _sync_fov_hint(self) -> None:
-        """把档案里 FOV 的状态写清：勾了会发生什么、不勾会发生什么。
-
-        这不是装饰。FOV 一关，两路像素尺度不一致时视差/深度会有系统偏差，
-        用户必须知道代价；反过来档案里根本没量过 FOV 时，勾了也只是现场估计，
-        不能让人以为"勾了就复用档案里那份"。
-        """
+        """把档案里 FOV 的状态写清：勾了会发生什么、不勾会发生什么。"""
         lbl = getattr(self, "lbl_fov", None)
         if lbl is None:
+            return
+        if self.mode == "angled":
+            lbl.configure(text=i18n.t(
+                "大角度/链式标定不做固有视场裁剪（两路保留完整原始画面）"))
+            i18n.forget(lbl)
             return
         fov = getattr(self.app.state.profile, "fov", None)
         if fov:
             side = str(fov.get("crop_side") or "?")
             size = fov.get("target_size") or []
             size_txt = f"→{size[0]}×{size[1]}" if len(size) == 2 else ""
-            lbl.configure(text=f"档案已记录 FOV（裁 {side}{size_txt}）；"
-                               "不勾 = 按原始画面标定")
+            lbl.configure(text=i18n.tf(
+                "档案已记录 FOV（裁 {side}{size_txt}）；不勾 = 按原始画面标定",
+                side=side, size_txt=size_txt))
         else:
-            lbl.configure(text="档案里还没量过 FOV；勾选 = 本次从启动帧现场估计"
-                               "（估不出来会降级为不裁剪，并写 fov=null）")
+            lbl.configure(text=i18n.t(
+                "档案里还没量过 FOV；勾选 = 本次从启动帧现场估计"
+                "（估不出来会降级为不裁剪，并写 fov=null）"))
+        i18n.forget(lbl)
 
     def _on_toggle_use_fov(self) -> None:
         """双目窗的勾选框 = 装置档案里那个装置级「是否应用」的开关。
@@ -1635,10 +1657,10 @@ class StereoWindow(tk.Toplevel):
         self._sync_chain_buttons(key)
 
     def _sync_chain_buttons(self, key: str) -> None:
-        for attr in ("btn_reshoot_chain", "btn_check_chain"):
+        for attr in ("btn_capture_chain", "btn_reshoot_chain", "btn_check_chain"):
             btn = getattr(self, attr, None)
             if btn is not None:
-                btn.configure(state=("disabled" if key == "device90"
+                btn.configure(state=("disabled" if key == "joint"
                                      else "normal"))
 
     def _ensure_method_controls(self, key: str) -> None:
@@ -1665,11 +1687,16 @@ class StereoWindow(tk.Toplevel):
                 row, text="机械保证两光轴平行（强制 R=I）",
                 variable=self.var_axial_parallel).pack(side="left", padx=(12, 0))
         else:
-            ttk.Label(row, text="内参文件").pack(side="left")
-            ttk.Entry(row, textvariable=self.var_d90_intrinsics, width=24).pack(
+            ttk.Label(row, text="内参文件/目录").pack(side="left")
+            ttk.Entry(row, textvariable=self.var_d90_intrinsics, width=22).pack(
                 side="left", padx=(6, 0))
             ttk.Button(row, text="浏览…", command=lambda: self._pick_file(
                 self.var_d90_intrinsics)).pack(side="left", padx=(4, 0))
+            ttk.Button(row, text="选目录…", command=lambda: self._pick_dir(
+                self.var_d90_intrinsics)).pack(side="left", padx=(4, 0))
+            ttk.Button(row, text="拍双路内参…",
+                       command=self._capture_d90_intrinsics).pack(
+                side="left", padx=(4, 0))
             row2 = ttk.Frame(inner)
             ttk.Label(row2, text="中轴").pack(side="left")
             ttk.Combobox(row2, textvariable=self.var_d90_axis, width=5,
@@ -1798,30 +1825,90 @@ class StereoWindow(tk.Toplevel):
         cmd = check_setup_args(
             left=left, right=right,
             board={"cols": self.var_cols.get(), "rows": self.var_rows.get(),
-                   "square": self.var_square.get()})
+                   "square": self.var_square.get()},
+            stereo_mode=self.mode,
+            width=self.var_cap_width.get(),
+            height=self.var_cap_height.get(),
+            fps=self.var_cap_fps.get())
         self.app.tasks.start(cmd, "双目装置检查", on_done=self._on_checked,
                              owner=self.task_owner)
-        self.status.set_status(
-            f"正在检查装置 {left} / {right}（只报告，不改配置）：会开两路取景窗，"
-            f"举着棋盘慢慢移动，按 q 可提前结束。结论会写回这里", "info")
+        if self.mode == "angled":
+            self.status.set_status(
+                f"正在检查大角度装置 {left} / {right}：先后把棋盘举到左、右相机前"
+                f"（不要求两路同时看到），按 q 可提前结束", "info")
+        else:
+            self.status.set_status(
+                f"正在检查装置 {left} / {right}（只报告，不改配置）：会开两路取景窗，"
+                f"举着棋盘慢慢移动，按 q 可提前结束。结论会写回这里", "info")
 
     def _on_checked(self, task) -> None:
         """把「检查装置」的结果写回状态条 —— 成功/失败都要写，不能只有"正在…"。"""
         code = task.exit_code
         if code == 0:
-            self.status.set_status(
-                "装置检查通过：两路都能稳定看到棋盘，可以做第 ② 步标定"
-                "（逐项数字在运行日志里）", "ok")
+            if self.mode == "angled":
+                self.status.set_status(
+                    "大角度装置检查通过：两路分辨率一致且都能单独看清棋盘"
+                    "（日志里有推荐的标定方法）", "ok")
+            else:
+                self.status.set_status(
+                    "装置检查通过：两路都能稳定看到棋盘，可以做第 ② 步标定"
+                    "（逐项数字在运行日志里）", "ok")
         elif code == 1:
-            self.status.set_status(
-                "装置检查没通过：运行日志里「标定前置检查结果」会写清是哪一路没看到"
-                "棋盘、重叠区多大", "warn")
+            if self.mode == "angled":
+                self.status.set_status(
+                    "大角度检查未通过：请确保两路分辨率一致，且检查时棋盘轮流"
+                    "出现在左、右两路视野内（详情看运行日志）", "warn")
+            else:
+                self.status.set_status(
+                    "装置检查没通过：运行日志里「标定前置检查结果」会写清是哪一路没看到"
+                    "棋盘、重叠区多大", "warn")
         elif code is None:
             self.status.set_status("装置检查被中断了，没有结论（可以再点一次）", "warn")
         else:
             self.status.set_status(
                 f"装置检查没能跑起来（退出码 {code}）：多数是相机名/索引打不开，"
                 f"输出在运行日志里", "warn")
+
+    def _verify_calibration(self) -> None:
+        """① 复检标定：起 verify_stereo 并在状态条写回结论。"""
+        from apps._common import current_calibration
+
+        calib_base, exists = current_calibration(need_existing=True)
+        if not exists:
+            self.status.set_status(
+                "还没有当前标定文件，请先完成第 ② 步「开始标定」", "warn")
+            return
+        left = self.var_left.get().strip() or "left"
+        right = self.var_right.get().strip() or "right"
+        cmd = verify_stereo(
+            calib=str(calib_base),
+            left=left,
+            right=right,
+            cols=self.var_cols.get(),
+            rows=self.var_rows.get(),
+            square=self.var_square.get(),
+            width=self.var_cap_width.get(),
+            height=self.var_cap_height.get(),
+            fps=self.var_cap_fps.get(),
+        )
+        self.app.tasks.start(cmd, "复检双目标定", on_done=self._on_verified,
+                             owner=self.task_owner)
+        self.status.set_status(
+            "正在复检当前标定（会打开取景窗，举棋盘采集样本，按 q 可提前结束）…",
+            "info")
+
+    def _on_verified(self, task) -> None:
+        code = getattr(task, "exit_code", None)
+        if code == 0:
+            self.status.set_status(
+                "标定复检结束（详情见运行日志）", "ok")
+        elif code is None:
+            self.status.set_status(
+                "标定复检被中断了（未完成采样）", "warn")
+        else:
+            self.status.set_status(
+                f"标定复检未通过或装置可能移动（退出码 {code}）：详情看运行日志，建议重标",
+                "warn")
 
     def _start_calibrate(self, force_save: bool = False) -> None:
         method = self._method_key()
@@ -1919,7 +2006,10 @@ class StereoWindow(tk.Toplevel):
             force_save=force_save,
             width=self.var_cap_width.get(),
             height=self.var_cap_height.get(),
-            fps=self.var_cap_fps.get())
+            fps=self.var_cap_fps.get(),
+            pair_camera=self.var_pair_camera.get(),
+            rational_model=bool(self.var_rational.get()),
+            fix_principal_point=bool(self.var_fix_pp.get()))
         if method in ("chain", "chain_dual"):
             # 先查图在不在，缺哪段直接说，别让后端跑一半才报"缺图"。
             if method == "chain_dual":
@@ -2074,12 +2164,15 @@ class StereoWindow(tk.Toplevel):
             relax_after = 40
         if relax_after < 0:
             relax_after = 0
+        cap_kw["stationary"] = self.var_stationary.get()
+        cap_kw["sharpness"] = self.var_sharpness.get()
+        cap_kw["relaxed"] = bool(self.var_relaxed.get())
         return {"board_base": board_base, "left": left, "right": right,
                 "cap_kw": cap_kw, "relax_after": relax_after,
                 "prof_name": _prof_name}
 
     def _chain_steps(self, d, *, left, right, board_base, cap_kw, relax_after):
-        """四步 / 三步的 **(标签, 目录键元组, argv)** 唯一产地。
+        """四步 / 三步 / 两步的 **(标签, 目录键元组, argv)** 唯一产地。
 
         全量采集按它串行跑完所有步；「只重拍某一步」只取其中一条 argv、并用
         同一条里的目录键元组把该步旧图移进回收站。目录键是这段流程对
@@ -2087,26 +2180,22 @@ class StereoWindow(tk.Toplevel):
         """
         if self._method_key() == "device90":
             # 中轴 90° 装置：只拍 ①② 两段正对图（板 A 正对相机 1、绕中轴转
-            # 90° 后板 B 正对相机 2）。**不需要** ③ 参考对 / ④ 同框图 ——
-            # 这正是该模式比 chain_dual 省的两步，T_AB 由装置 90° 约束给出。
-            # 目录键必须与 _start_calibrate 的 device90 分支一致。
+            # 90° 后板 B 正对相机 2）。每步拍满 5 张停稳图自动进入下一步。
             steps = [
-                ("① 拍 A 板：正对相机 1（板别动，多拍几张）", ("left",),
+                ("① 拍 A 板：正对相机 1（板放稳不动，满 5 张自动收工）", ("left",),
                  capture_chain_frames(stage="left", left=left, right=right,
-                                      target="999", min_cover=5,
-                                      relax_after=relax_after, per_region=3,
+                                      target="5", stationary_stage=True,
                                       dirs=d, **board_base, **cap_kw)),
-                ("② 绕中轴转 90°，拍 B 板：正对相机 2", ("board_b",),
+                ("② 绕中轴转 90°，拍 B 板：正对相机 2（满 5 张自动收工）", ("board_b",),
                  capture_chain_frames(stage="dual_b", left=left, right=right,
-                                      target="999", min_cover=5,
-                                      relax_after=relax_after, per_region=3,
+                                      target="5", stationary_stage=True,
                                       dirs=d, **board_base, **cap_kw)),
             ]
         elif self._method_key() == "chain_dual":
-            # 双板四步。①② 的板可以随便挪（只用来求内参）；③ 必须**摆好别动**
-            # 且两路同时拍（链两端的位姿来自同一个摆放）；④ 同框图检不了单板，
-            # 走 capture_board 的 --pair 模式（不检板、按空格/自动存）。
-            # 步骤标签是给用户看的，一律说人话、不出现 T_AB / 姿态簇这类术语。
+            _pc = str(getattr(self, "var_pair_camera", None)
+                      and self.var_pair_camera.get() or "left").strip()
+            _pair_cam = right if _pc == "right" else left
+            _pair_who = "右相机" if _pc == "right" else "左相机"
             steps = [
                 ("① 拍 A 板：只用左相机，板随便挪", ("left",),
                  capture_chain_frames(stage="left", left=left, right=right,
@@ -2122,9 +2211,12 @@ class StereoWindow(tk.Toplevel):
                  ("ref_pair_left", "ref_pair_right"),
                  capture_chain_frames(stage="ref_pair", left=left, right=right,
                                       target="3", dirs=d, **board_base, **cap_kw)),
-                ("④ 让一台相机同时看到两块板，按空格拍 5 张（至少 2 张）",
+                (f"④ 让一台相机（{_pair_who}）同时看到两块板，按空格拍 5 张（至少 2 张）",
                  ("pair",),
-                 capture_pair_frame(camera=left, dirs=d, **board_base, **cap_kw)),
+                 capture_pair_frame(camera=_pair_cam, dirs=d, **board_base,
+                                    width=int(cap_kw.get("width") or 0),
+                                    height=int(cap_kw.get("height") or 0),
+                                    fps=int(float(cap_kw.get("fps") or 0)))),
             ]
         else:
             steps = [
@@ -2146,46 +2238,42 @@ class StereoWindow(tk.Toplevel):
         return steps
 
     def _capture_chain_frames(self) -> None:
-        """采集链式标定的图（按当前方法分单板/双板两套流程）。
-
-        - 单板（chain）：① 内参左 → ② 内参右 → ③ 参考段（板不动，左右成对）；
-        - 双板（chain_dual，2026-11-09 方案 A）：① 拍 A 板 → ② 拍 B 板 →
-          ③ **组合装置摆好别动、两路同时各拍 3 张**（参考对）→
-          ④ 一台相机同时拍到两板（同框图）。
-          ③ 不能省：链两端的板位姿必须来自同一支架摆放，拿 ①② 里板移动中的
-          各一帧来凑，外参会静默错到 10° / 28 mm 量级。
-        每段拍完回到界面继续下一段（on_done 串起来，避免取景窗抢相机）。
-        """
+        """采集链式标定的图（按当前方法分流程串行跑）。"""
         c = self._chain_common()
-        # 一次采集 = 一个会话目录（2026-11-09）：四段图全落进同一个文件夹，
-        # 自检与标定都读根层 _current.json 指向它。以前追加到根层的
-        # left/board_b，多次标定的图会混在一起被 _run_chain 全读进去 ——
-        # 真机实测 board_b 344 张里混了 11-04 的 304 张和 11-08 的 40 张。
         d = new_chain_session(profile=c["prof_name"], mode=self.mode,
                               board=c["board_base"], capture=c["cap_kw"])
         for p in d.values():
             p.mkdir(parents=True, exist_ok=True)
         print(f"[标定会话] {d['left'].parent.name} → {d['left'].parent}",
               flush=True)
-        # 步骤表来自唯一产地；这里只把 (标签, argv) 取出来串行跑，不改 argv。
         steps = [(lbl, cmd) for lbl, _keys, cmd in self._chain_steps(
             d, left=c["left"], right=c["right"], board_base=c["board_base"],
             cap_kw=c["cap_kw"], relax_after=c["relax_after"])]
         self._chain_step = 0
 
         def run_next(_task=None):
-            # 关窗后不能再起下一段：on_done 递归是"上一段结束"触发的，
-            # 而关窗时 close_window 停掉当前段，结束回调仍会排到队列里。
-            # 没有这道旗标，用户按了 X 之后链式采集会自己一段段接着跑 ——
-            # 最像"关不掉 / 自动复苏"的那个现象。
             if getattr(self, "_closed", False):
                 return
+            if _task is not None and getattr(_task, "exit_code", None) != 0:
+                rc = getattr(_task, "exit_code", None)
+                if rc == 3:
+                    why = "未收满目标张数就提前退出"
+                elif rc is None:
+                    why = "采集被手动中止"
+                else:
+                    why = f"相机/输入异常（退出码 {rc}）"
+                self.status.set_status(
+                    f"链式采集在第 {self._chain_step}/{len(steps)} 步暂停：{why}。"
+                    f"后续步骤未继续，可用「重拍某一步…」补拍第 {self._chain_step} 步",
+                    "warn")
+                return
             if self._chain_step >= len(steps):
-                if self._method_key() == "chain_dual":
-                    # 同框图也是【左相机】拍（后端拼 --pair-camera left）：
-                    # A/B 的判定用的是"左相机看 A 板"的姿态簇，换右相机拍，
-                    # 姿态簇坐标系就变了——两块板差 90° 时那种错误不会触发
-                    # "差 <5°"护栏，会静默给出反向的 T_AB。
+                mk = self._method_key()
+                if mk == "device90":
+                    self.status.set_status(
+                        "两步正对图都拍完了。点「检查链式输入」，再点「开始标定」",
+                        "info")
+                elif mk == "chain_dual":
                     self.status.set_status(
                         "四步都拍完了。点「检查链式输入」，再点「开始标定」", "info")
                 else:
@@ -2202,31 +2290,39 @@ class StereoWindow(tk.Toplevel):
         run_next()
 
     def _reshoot_chain_stage(self) -> None:
-        """只重拍链式标定的某一步：该步旧图移到回收站，其余段原样保留。
-
-        与全量采集的区别：这里**不新建会话**，``_current.json`` 指针与其余段
-        的图都留着，所以旧会话里前几段的有效图对程序仍然可见。重拍完只要
-        重新跑一次「检查链式输入」和「开始标定」即可 —— 标定本来就全量读
-        五段，不需要为了一步没拍好把四步全部重来。
-        """
+        """只重拍链式标定的某一步、切换当前会话、打开文件夹或恢复上次移走的旧图。"""
         d = current_chain_dirs()
+        sessions = _actions.list_chain_sessions()
+        if d is None and sessions:
+            d = _actions.set_current_chain_session(sessions[0]["name"])
         if d is None:
             self.status.set_status(
                 "还没有标定会话：先点「采集标定板图…」拍图，每次采集单独存一个文件夹",
                 "warn")
             return
         c = self._chain_common()
-        steps = self._chain_steps(d, left=c["left"], right=c["right"],
-                                  board_base=c["board_base"], cap_kw=c["cap_kw"],
-                                  relax_after=c["relax_after"])
+
+        state: dict = {
+            "d": d,
+            "steps": self._chain_steps(
+                d, left=c["left"], right=c["right"],
+                board_base=c["board_base"], cap_kw=c["cap_kw"],
+                relax_after=c["relax_after"]),
+            "batches": [],
+        }
 
         def preview(idx: int) -> str:
+            cur_d = state["d"]
+            cur_steps = state["steps"]
+            if not cur_steps:
+                return ""
+            idx = max(0, min(idx, len(cur_steps) - 1))
             names: list[str] = []
             n = 0
-            for k in steps[idx][1]:
-                p = d[k]
+            for k in cur_steps[idx][1]:
+                p = cur_d[k]
                 n += sum(1 for x in p.iterdir() if x.is_file()) if p.is_dir() else 0
-                names.append(f"{d['left'].parent.name}/{k}/")
+                names.append(f"{cur_d['left'].parent.name}/{k}/")
             return (f"将把 {'、'.join(names)} 共 {n} 个文件移到 outputs/_trash/ "
                     "下的回收批次（数据管理「回收站…」不管理这类批次），"
                     f"然后只重拍第 {idx + 1} 步")
@@ -2237,23 +2333,128 @@ class StereoWindow(tk.Toplevel):
         dlg.resizable(True, True)
         body = ttk.Frame(dlg, padding=14)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, wraplength=420, foreground=MUTED,
-                  text="选一步重拍：该步旧图不删除，会移到 outputs/_trash/ 下的批次；"
-                       "数据管理里的「回收站…」只管 data/_trash/，不管理这类批次。"
-                       "旧图可用 apps._actions.restore_chain_stage(<批次路径>) 恢复，"
-                       "一旦该步已拍了新图，恢复会被整批拒绝以免覆盖。其余段原样保留，"
-                       "整条链只需重跑一次「开始标定」，不用重拍其它段。").pack(anchor="w", pady=(0, 8))
+        ttk.Label(body, wraplength=500, foreground=MUTED,
+                  text="选一步重拍：该步旧图不删除，会移到 outputs/_trash/ 下的批次。"
+                       "下方可直接切换历史会话、在资源管理器中删掉个别糊图，"
+                       "或恢复之前被移走的旧图批次。").pack(anchor="w", pady=(0, 8))
+
+        # 1) 会话切换 + 打开文件夹
+        sess_row = ttk.Frame(body)
+        sess_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(sess_row, text="当前会话").pack(side="left")
+        sess_labels = [f"{s['name']}（{s['total']} 张）" for s in sessions]
+        cur_name = state["d"]["left"].parent.name
+        cur_label = next((lb for s, lb in zip(sessions, sess_labels) if s["name"] == cur_name),
+                         cur_name)
+        var_sess = tk.StringVar(value=cur_label)
+        cb_sess = ttk.Combobox(sess_row, textvariable=var_sess,
+                               values=sess_labels, state="readonly", width=30)
+        cb_sess.pack(side="left", padx=(6, 6))
+
+        msg_lbl = ttk.Label(body, wraplength=500, foreground=MUTED, text="")
         var = tk.IntVar(value=0)
-        preview_lbl = ttk.Label(body, wraplength=420, foreground=WARN)
-        preview_lbl.pack(anchor="w", fill="x", pady=(8, 2))
+        steps_frame = ttk.Frame(body)
+        steps_frame.pack(fill="x")
+        preview_lbl = ttk.Label(body, wraplength=500, foreground=WARN)
+        preview_lbl.pack(anchor="w", fill="x", pady=(8, 4))
+
+        trash_row = ttk.Frame(body)
+        trash_row.pack(fill="x", pady=(4, 4))
+        ttk.Label(trash_row, text="恢复旧图").pack(side="left")
+        var_trash = tk.StringVar(value="")
+        cb_trash = ttk.Combobox(trash_row, textvariable=var_trash,
+                                state="readonly", width=34)
+        cb_trash.pack(side="left", padx=(6, 6))
 
         def sync_preview() -> None:
             preview_lbl.configure(text=preview(var.get()))
 
-        for i, (lbl, _keys, _cmd) in enumerate(steps):
-            ttk.Radiobutton(body, text=f"第 {i + 1} 步 · {lbl}", value=i,
-                            variable=var, command=sync_preview).pack(anchor="w")
-        sync_preview()
+        def refresh_batches() -> None:
+            cur_s = state["d"]["left"].parent.name
+            batches = _actions.list_chain_trash_batches(cur_s)
+            state["batches"] = batches
+            labels = [
+                f"{b['name']}（{'/'.join(b['stages'])} · {b['files']}文件）"
+                for b in batches
+            ]
+            cb_trash.configure(values=labels)
+            var_trash.set(labels[0] if labels else "")
+
+        def rebuild_step_radios() -> None:
+            for w in steps_frame.winfo_children():
+                w.destroy()
+            cur_d = state["d"]
+            for i, (lbl, keys, _cmd) in enumerate(state["steps"]):
+                cnt = sum(
+                    sum(1 for x in cur_d[k].iterdir() if x.is_file())
+                    if cur_d[k].is_dir() else 0
+                    for k in keys
+                )
+                ttk.Radiobutton(
+                    steps_frame,
+                    text=f"第 {i + 1} 步 · {lbl}（现存 {cnt} 张）",
+                    value=i, variable=var, command=sync_preview,
+                ).pack(anchor="w")
+            if var.get() >= len(state["steps"]):
+                var.set(0)
+            sync_preview()
+
+        def on_switch_session() -> None:
+            picked = var_sess.get().split("（", 1)[0].strip()
+            if not picked:
+                return
+            try:
+                nd = _actions.set_current_chain_session(picked)
+            except (OSError, ValueError) as exc:
+                msg_lbl.configure(text=f"切换会话失败：{exc}", foreground=WARN)
+                return
+            state["d"] = nd
+            state["steps"] = self._chain_steps(
+                nd, left=c["left"], right=c["right"],
+                board_base=c["board_base"], cap_kw=c["cap_kw"],
+                relax_after=c["relax_after"])
+            rebuild_step_radios()
+            refresh_batches()
+            msg_lbl.configure(text=f"已切换到会话 {picked}", foreground=MUTED)
+
+        def on_open_folder() -> None:
+            target_dir = state["d"]["left"].parent
+            try:
+                open_in_explorer(target_dir)
+                msg_lbl.configure(text=f"已打开文件夹：{target_dir}", foreground=MUTED)
+            except OpenInExplorerError as exc:
+                msg_lbl.configure(text=f"打开文件夹失败：{exc}", foreground=WARN)
+
+        def on_restore_trash() -> None:
+            sel = cb_trash.current()
+            batches = state["batches"]
+            if sel < 0 or sel >= len(batches):
+                msg_lbl.configure(text="当前会话没有可恢复的回收批次", foreground=WARN)
+                return
+            bpath = batches[sel]["batch"]
+            try:
+                res = _actions.restore_chain_stage(bpath)
+            except (OSError, ValueError) as exc:
+                msg_lbl.configure(text=f"恢复失败：{exc}", foreground=WARN)
+                return
+            if res.get("restored"):
+                msg_lbl.configure(
+                    text=f"已恢复 {res['restored']} 个目录的旧图，请重新点「检查链式输入」",
+                    foreground=MUTED)
+                rebuild_step_radios()
+                refresh_batches()
+            else:
+                msg_lbl.configure(text=str(res.get("reason") or "未恢复"), foreground=WARN)
+
+        ttk.Button(sess_row, text="切换", command=on_switch_session).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(sess_row, text="打开目录", command=on_open_folder).pack(side="left")
+        ttk.Button(trash_row, text="恢复该批", command=on_restore_trash).pack(side="left")
+        msg_lbl.pack(anchor="w", fill="x", pady=(2, 4))
+
+        rebuild_step_radios()
+        refresh_batches()
+
         out: dict[str, int | None] = {"idx": None}
         bar = ttk.Frame(body)
         bar.pack(fill="x", pady=(10, 0))
@@ -2262,23 +2463,22 @@ class StereoWindow(tk.Toplevel):
             out["idx"] = var.get()
             dlg.destroy()
 
-        ttk.Button(bar, text="确定", command=ok).pack(side="right")
-        ttk.Button(bar, text="取消", command=dlg.destroy).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="开始重拍选中步", command=ok).pack(side="right")
+        ttk.Button(bar, text="关闭", command=dlg.destroy).pack(side="right", padx=(0, 6))
         self.wait_window(dlg)
         idx = out["idx"]
         if idx is None:
             return
-        lbl, keys, cmd = steps[idx]
+        d_sel = state["d"]
+        lbl, keys, cmd = state["steps"][idx]
         step_no = idx + 1
-        info = _actions.reshoot_chain_stage(d, keys, label=f"重拍第{step_no}步")
+        info = _actions.reshoot_chain_stage(d_sel, keys, label=f"重拍第{step_no}步")
         self.app.tasks.start(cmd, lbl, owner=self.task_owner)
         batch_txt = (str(info["batch"]) if info["batch"] is not None
                      else "（该步目录原本为空，无需移走）")
         self.status.set_status(
-            f"只重拍了第 {step_no} 步，其余段保留；旧图在 outputs/_trash/ 批次 "
-            f"{batch_txt}（数据管理「回收站…」不管理，可用 "
-            "apps._actions.restore_chain_stage(<批次路径>) 恢复，该步已有新图则拒绝恢复）。"
-            "拍完请重新点「检查链式输入」和「开始标定」", "info")
+            f"只重拍了第 {step_no} 步（会话 {d_sel['left'].parent.name}），其余段保留；"
+            f"旧图已移至 {batch_txt}。拍完请点「检查链式输入」和「开始标定」", "info")
 
     def _check_chain_inputs(self) -> None:
         """拍完先自检：每一步的图齐不齐、板看没看全、装置有没有动。"""
@@ -2288,19 +2488,44 @@ class StereoWindow(tk.Toplevel):
                 "还没有标定会话：先点「采集标定板图…」拍图，每次采集单独存一个文件夹",
                 "warn")
             return
-        dual = self._method_key() == "chain_dual"
+        mk = self._method_key()
+        mode = ("device90" if mk == "device90"
+                else "dual" if mk == "chain_dual"
+                else "single")
         cmd = check_chain_inputs(
             cols=self.var_cols.get(), rows=self.var_rows.get(),
-            square=self.var_square.get(), mode="dual" if dual else "single",
-            dirs=d)
-        if dual:
+            square=self.var_square.get(), mode=mode,
+            dirs=d, pair_camera=self.var_pair_camera.get())
+        if mode == "dual":
             self.status.set_status(
                 "检查四步图（姿态覆盖 / 第 ③ 步参考对是否成对 / "
                 "同框图能否检出两板）…", "info")
+        elif mode == "device90":
+            self.status.set_status(
+                "检查中轴 90° 正对参考图（左 A 板 / 右 B 板是否静止且完整）…", "info")
         else:
             self.status.set_status(
                 "检查三步图（姿态覆盖 / 参考段板是否移动）…", "info")
-        self.app.tasks.start(cmd, "链式输入自检", owner=self.task_owner)
+        self.app.tasks.start(cmd, "链式输入自检", on_done=self._on_chain_checked,
+                             owner=self.task_owner)
+
+    def _on_chain_checked(self, task) -> None:
+        code = getattr(task, "exit_code", None)
+        tail = "\n".join(getattr(task, "tail", ()) or ())
+        if code == 0:
+            if "[警告]" in tail or "警告（不阻止" in tail:
+                self.status.set_status(
+                    "链式输入自检通过，但有警告（请在底部日志查看坏帧/数量提示）",
+                    "warn")
+            else:
+                self.status.set_status(
+                    "链式输入自检通过，可以点「开始标定」", "ok")
+        elif code is None:
+            self.status.set_status("链式输入自检已中止", "warn")
+        else:
+            self.status.set_status(
+                f"链式输入自检未通过（退出码 {code}）：请看底部日志，用「重拍某一步…」补拍",
+                "warn")
 
     def _record_fov_to_profile(self) -> str:
         """把本次标定产物里的 ``meta.fov`` 记进当前装置档案（自动收尾）。
@@ -2675,6 +2900,54 @@ class StereoWindow(tk.Toplevel):
             f"正在打开 3D 查看器：{session_name_of(src)}"
             f"（窗口内「数据源」可换任意会话）", "info")
 
+    def _capture_d90_intrinsics(self) -> None:
+        """为中轴 90° 模式采集一套双路多姿态内参图，并自动填入「内参文件/目录」。"""
+        from datetime import datetime
+
+        c = self._chain_common()
+        out_root = (PROJECT_ROOT / "outputs" / "d90_intrinsics"
+                    / datetime.now().strftime("%Y%m%d-%H%M%S"))
+        d_intr = chain_dirs(out_root)
+        d_intr["left"].mkdir(parents=True, exist_ok=True)
+        d_intr["board_b"].mkdir(parents=True, exist_ok=True)
+        steps = [
+            ("① 拍左路多姿态内参图（板随便挪，四角+中央各多拍几张）",
+             capture_chain_frames(
+                 stage="left", left=c["left"], right=c["right"],
+                 target="999", min_cover=5, relax_after=c["relax_after"],
+                 per_region=3, dirs=d_intr, **c["board_base"], **c["cap_kw"])),
+            ("② 拍右路多姿态内参图（板随便挪，四角+中央各多拍几张）",
+             capture_chain_frames(
+                 stage="dual_b", left=c["left"], right=c["right"],
+                 target="999", min_cover=5, relax_after=c["relax_after"],
+                 per_region=3, dirs=d_intr, **c["board_base"], **c["cap_kw"])),
+        ]
+        cursor = {"i": 0}
+
+        def run_intr_step(_task=None) -> None:
+            if getattr(self, "_closed", False):
+                return
+            if _task is not None and getattr(_task, "exit_code", None) != 0:
+                self.status.set_status(
+                    f"双路内参采集在第 {cursor['i']}/2 步中断（退出码 "
+                    f"{getattr(_task, 'exit_code', None)}）", "warn")
+                return
+            if cursor["i"] >= len(steps):
+                self.var_d90_intrinsics.set(str(out_root))
+                self.status.set_status(
+                    f"双路内参图已采完并填入目录：{out_root.name}。"
+                    "请再用「采集标定板图…」拍 ①② 两组正对停稳图后「开始标定」",
+                    "ok")
+                return
+            lbl, cmd = steps[cursor["i"]]
+            cursor["i"] += 1
+            self.status.set_status(
+                f"[内参 {cursor['i']}/2] {lbl}", "info")
+            self.app.tasks.start(cmd, lbl, on_done=run_intr_step,
+                                 owner=self.task_owner)
+
+        run_intr_step()
+
     def on_close(self) -> None:
         """关窗时记住输入（会话路径与相机角色不存：前者每次新选，后者从
         ``config/cameras.json`` 读）。"""
@@ -2688,6 +2961,9 @@ class StereoWindow(tk.Toplevel):
         p.set("stereo.stationary_px", self.var_stationary.get().strip())
         p.set("stereo.min_sharpness", self.var_sharpness.get().strip())
         p.set("stereo.baseline_mm", self.var_baseline.get().strip())
+        p.set("stereo.pair_camera", self.var_pair_camera.get().strip() or "left")
+        p.set("stereo.rational_model", bool(self.var_rational.get()))
+        p.set("stereo.fix_principal_point", bool(self.var_fix_pp.get()))
         # 两种新标定方式的输入一起记住（关窗写回，下次开窗直接带出）。
         p.set("calib.axial.root", self.var_axial_root.get().strip())
         p.set("calib.axial.assume_parallel", bool(self.var_axial_parallel.get()))

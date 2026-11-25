@@ -59,7 +59,9 @@ L1_BUTTONS_MAX = 5
 # 裁决**移除**「尺寸门自动阶梯」勾选框（阶梯改为默认且唯一路径，GUI 不再
 # 下传 --no-radius-auto），故 ④ 卡片净增只有 1（15 → 14）。其余窗口仍守
 # 这个上限；L1_INPUTS_MAX / L1_BUTTONS_MAX 一律不动。
-L2_CLICKABLE_MAX = 14
+# 14 → 16（2026-11-24）：第 ② 步「高级」折叠区新增「广角8参数畸变」与「固定主点」
+# 两个镜头畸变模型勾选框，仅在 adv.content 内新增，L1_INPUTS_MAX/L1_BUTTONS_MAX 不变。
+L2_CLICKABLE_MAX = 16
 # 大角度（angled）第②步：链式标定比 joint 多「标定方法下拉 + 采集标定板图 +
 # 检查链式输入」三个控件，是**真实且必要**的内容差异，不是"长回一个窗口装全部"。
 # 单独给它放宽 L2 上限，其余窗口仍守 L2_CLICKABLE_MAX。
@@ -88,7 +90,9 @@ L2_CLICKABLE_MAX = 14
 # 零净增消化，故只把这一个上限从 17 调到 18。通用 L2_CLICKABLE_MAX 另因
 # ④ 卡片净增 1 从 13 调到 14（见上），L1_INPUTS_MAX / L1_BUTTONS_MAX 不动。
 # ✅ 已按 team-lead 2026-11-14 最终裁决登记（一次做到全绿）。
-ANGLED_L2_CLICKABLE_MAX = 18
+# 18 → 21（2026-11-24）：第 ② 步「高级」折叠区新增「广角8参数畸变」「固定主点」两个勾选框 +
+# 「④同框相机（left/right）」下拉，均在 collapsed adv.content 内；L1 按钮与首屏高度均不动。
+ANGLED_L2_CLICKABLE_MAX = 21
 
 
 def walk(widget):
@@ -1170,7 +1174,8 @@ def _argv_single_source_checks() -> list[tuple[str, bool]]:
             # 2026-11-07 补进界面的六条（原先只能在命令行里走）
             "make_calibration_board.py", "calibrate_color.py",
             "set_world_frame.py", "export_calibration.py",
-            "export_ball_dataset.py", "train_ball_detector.py"]
+            "export_ball_dataset.py", "train_ball_detector.py",
+            "verify_stereo.py"]
     missing = [n for n in need if n not in acts]
     print(f"  [{'通过' if not missing else '不达标'}] 动作模块覆盖 {len(need) - len(missing)}/{len(need)} 个脚本"
           + ("" if not missing else f"（缺 {missing}）"))
@@ -2574,6 +2579,86 @@ def main() -> int:
                ok_budget and ok_budget4,
                f"mono①={mm1}/probe_l1={probe_l1}/est_fold={est_fold}, "
                f"stereo④={mm4}")
+
+        # ⑥ 2026-11-24 大角度标定与 GUI/CLI 一致性回归断言
+        from apps._actions import (
+            calibrate_args as _cal,
+            capture_chain_frames as _cap_cf,
+            capture_world_floor_image as _cap_wf,
+            cameras_autobind as _cam_auto,
+            check_setup_args as _chk_setup,
+            verify_stereo as _ver_st,
+        )
+        cal_r = _cal(
+            "chain_dual",
+            {"cols": "8", "rows": "5", "square": "25", "target": "20"},
+            mode="angled",
+            dirs={"left": Path("x/left"), "board_b": Path("x/board_b"),
+                  "pair": Path("apps")},   # 传一个必然 exists() 的路径触发 --pair-frame
+            pair_camera="right",
+            rational_model=True,
+            fix_principal_point=True,
+        )
+        tcheck("calibrate_args 传 pair_camera=right / --rational-model / --fix-principal-point",
+               _has_seq(cal_r, ["--pair-camera", "right"])
+               and "--rational-model" in cal_r
+               and "--fix-principal-point" in cal_r,
+               " ".join(cal_r))
+        cf_cmd = _cap_cf(
+            stage="ref_pair", cols="8", rows="5", square="25", target="3",
+            left="2", right="4", stationary="6", sharpness="350", relaxed=True,
+        )
+        tcheck("capture_chain_frames ref_pair 透传自定义 --camera-left/--camera-right 及 --relaxed/门限",
+               _has_seq(cf_cmd, ["--camera-left", "2"])
+               and _has_seq(cf_cmd, ["--camera-right", "4"])
+               and _has_seq(cf_cmd, ["--stationary-px", "6"])
+               and _has_seq(cf_cmd, ["--min-sharpness", "350"])
+               and "--relaxed" in cf_cmd,
+               " ".join(cf_cmd))
+        d90_cf = _cap_cf(
+            stage="left", cols="8", rows="5", square="25", target="5",
+            stationary_stage=True,
+        )
+        tcheck("capture_chain_frames stationary_stage=True 带 --stage ref（供 device90）",
+               _has_seq(d90_cf, ["--stage", "ref"]) and _has_seq(d90_cf, ["--target", "5"]),
+               " ".join(d90_cf))
+        cs_ang = _chk_setup(left="left", right="right", stereo_mode="angled")
+        vf_cmd = _ver_st(calib="config/calib/demo", samples="6")
+        wf_cmd = _cap_wf(out_dir="outputs/world_frame/demo", cols="8", rows="5", square="25",
+                         width=1920, height=1080)
+        ab_cmd = _cam_auto()
+        tcheck("check_setup_args(angled) / verify_stereo / capture_world_floor_image / autobind 正常",
+               _has_seq(cs_ang, ["--stereo-mode", "angled"])
+               and _has_seq(vf_cmd, ["--calib", "config/calib/demo"])
+               and _has_seq(wf_cmd, ["--target", "1"]) and "--auto" in wf_cmd
+               and "autobind" in ab_cmd and "--json" in ab_cmd,
+               "ok")
+        # 链式多步采集：exit_code != 0 必须停链（不推进下一步）
+        from apps._gui_stereo import METHODS as _M_REG
+        sw_ang = wins["stereo(angled)"]
+        sw_ang.var_method.set(_M_REG["chain_dual"][0])
+        sw_ang._on_method_changed()
+        started_tasks: list = []
+        orig_start = app.tasks.start
+        try:
+            def _fake_start(cmd, title, on_done=None, owner=None):
+                started_tasks.append((title, on_done))
+                return None
+
+            app.tasks.start = _fake_start
+            sw_ang._capture_chain_frames()
+            first_cb = started_tasks[-1][1] if started_tasks else None
+            before_n = len(started_tasks)
+            class _FailTask:
+                exit_code = 3
+            if first_cb is not None:
+                first_cb(_FailTask())
+            tcheck("链式采集上一步 exit_code=3 时不自动起下一步（含状态栏提示）",
+                   len(started_tasks) == before_n
+                   and "重拍某一步" in str(sw_ang.status._label.cget("text")),
+                   f"before={before_n}, after={len(started_tasks)}")
+        finally:
+            app.tasks.start = orig_start
     finally:
         try:
             app.destroy()

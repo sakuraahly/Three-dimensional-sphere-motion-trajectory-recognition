@@ -39,6 +39,19 @@ def is_uncorrected(rectification: object) -> bool:
     return str(rectification or "").strip().lower() in UNCORRECTED_RECTIFICATIONS
 
 
+def optical_axis_angle_deg(R) -> float:
+    """两相机 Z 轴夹角（度），从 3×3 旋转矩阵 ``R`` 计算。"""
+    try:
+        z2 = np.asarray(R, np.float64).T @ np.array([0.0, 0.0, 1.0])
+        n = float(np.linalg.norm(z2))
+        if n <= 0:
+            return 0.0
+        c = float(np.clip(z2[2] / n, -1.0, 1.0))
+        return float(np.degrees(np.arccos(c)))
+    except Exception:                                       # noqa: BLE001
+        return 0.0
+
+
 @dataclass
 class StereoRig:
     """一个标定好的双目装置。
@@ -100,15 +113,7 @@ class StereoRig:
     @property
     def angle_deg(self) -> float:
         """两光轴夹角（度），从 R 计算；不修改/伪造 90.0。"""
-        try:
-            z2 = self.R.T @ np.array([0.0, 0.0, 1.0])
-            n = float(np.linalg.norm(z2))
-            if n <= 0:
-                return 0.0
-            c = float(np.clip(z2[2] / n, -1.0, 1.0))
-            return float(np.degrees(np.arccos(c)))
-        except Exception:                                   # noqa: BLE001
-            return 0.0
+        return optical_axis_angle_deg(self.R)
 
     def describe(self) -> str:
         q = self.quality

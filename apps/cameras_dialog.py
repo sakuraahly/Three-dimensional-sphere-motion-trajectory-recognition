@@ -32,8 +32,10 @@ CLI，界面里改成 Tk 自己的窗口。
 
 from __future__ import annotations
 
+import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -48,7 +50,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sphere_tracker import camera_registry as cr  # noqa: E402
-from apps import i18n  # noqa: E402
+from apps import _actions, i18n  # noqa: E402
 from apps._gui_widgets import BG, MUTED  # noqa: E402
 
 #: 本模块被加载进内存的时刻。用来判断「用户点的这个窗口是不是旧版」：
@@ -268,7 +270,8 @@ class _PreviewPane:
     """一路预览：自己的控件、自己的线程、自己的停止信号。"""
 
     def __init__(self, parent, index: int, name: str, on_close,
-                 on_retry=None, identity: str = "") -> None:
+                 on_retry=None, on_assign_capture=None,
+                 identity: str = "") -> None:
         self.index = index
         self.name = name
         self.identity = identity
@@ -291,6 +294,15 @@ class _PreviewPane:
                                 foreground=MUTED,
                                 wraplength=PANE_W, anchor="nw", justify="left")
         self.status.pack(fill="both")
+        if on_assign_capture is not None:
+            cap_btns = ttk.Frame(self.frame)
+            cap_btns.pack(fill="x", padx=4, pady=(0, 2))
+            ttk.Button(cap_btns, text=i18n.t("画面是左"),
+                       command=lambda: on_assign_capture("left")).pack(
+                side="left", padx=(0, 6))
+            ttk.Button(cap_btns, text=i18n.t("画面是右"),
+                       command=lambda: on_assign_capture("right")).pack(
+                side="left")
         btns = ttk.Frame(self.frame)
         btns.pack(fill="x", padx=4, pady=(0, 4))
         ttk.Button(btns, text=i18n.t("停止预览"),
@@ -354,6 +366,7 @@ class CamerasDialog(tk.Toplevel):
         #: 设备自动检测：签名变化就刷新列表；不靠用户手动点「刷新列表」。
         self._device_sig = None
         self._polling = False
+        self._autobind_running = False
         self._last_poll = time.monotonic()
 
         # 筛选门限：默认值与配置合成一次，界面显示的就是**真正生效的值**。
@@ -448,29 +461,34 @@ class CamerasDialog(tk.Toplevel):
             lambda e: self.canvas.itemconfigure(self._win_id, width=e.width))
 
         bar = ttk.Frame(body)
-        bar.pack(fill="x", pady=(8, 4))
+        bar.pack(fill="x", pady=(8, 2))
         ttk.Button(bar, text="预览这台", command=self._start_preview).pack(
             side="left", padx=(0, 6))
         ttk.Button(bar, text="预览全部外接", command=self._preview_all).pack(
             side="left", padx=(0, 6))
         ttk.Button(bar, text="停止全部预览", command=self._stop_all).pack(
             side="left", padx=(0, 6))
-        ttk.Button(bar, text="设为左",
-                   command=lambda: self._set_role("left")).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(bar, text="设为右",
-                   command=lambda: self._set_role("right")).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(bar, text="设为主相机",
-                   command=lambda: self._set_role("main")).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(bar, text="标为无关", command=self._mark_ignored).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(bar, text="取消无关", command=self._unmark_ignored).pack(
-            side="left", padx=(0, 6))
         ttk.Button(bar, text="刷新列表", command=self._refresh_devices).pack(
             side="left", padx=(0, 6))
-        ttk.Button(bar, text="关闭", command=self._close).pack(
+        ttk.Button(bar, text="自动绑定左右", command=self._run_autobind).pack(
+            side="left", padx=(0, 6))
+
+        bar2 = ttk.Frame(body)
+        bar2.pack(fill="x", pady=(2, 4))
+        ttk.Button(bar2, text="设为左",
+                   command=lambda: self._set_role("left")).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(bar2, text="设为右",
+                   command=lambda: self._set_role("right")).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(bar2, text="设为主相机",
+                   command=lambda: self._set_role("main")).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(bar2, text="标为无关", command=self._mark_ignored).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(bar2, text="取消无关", command=self._unmark_ignored).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(bar2, text="关闭", command=self._close).pack(
             side="left", padx=(0, 6))
 
         # 筛选门限：自动挑相机 / 成对协商用。放在底部工具行而不是新开窗口：
@@ -818,6 +836,9 @@ class CamerasDialog(tk.Toplevel):
                                 index=item[1], brief=_brief(i18n.t(short)),
                                 note=note_en, tail=tail_en)
             self._say(status_zh, error=True, display=status_en)
+        elif kind == "autobind_done":
+            self._autobind_running = False
+            self._on_autobind_done(int(item[1]), str(item[2]), str(item[3]))
 
     # ------------------------------------------------------------------ #
     # 枚举
@@ -1151,6 +1172,8 @@ class CamerasDialog(tk.Toplevel):
             self.grid_frame, entry.order, title,
             lambda: self._stop_preview(entry.order),
             on_retry=lambda: self._retry_preview(entry),
+            on_assign_capture=lambda role, idx=entry.order:
+                self._assign_capture_from_preview(idx, role),
             identity=entry.identity)
         pane.status.bind(
             "<Double-1>",
@@ -1617,12 +1640,135 @@ class CamerasDialog(tk.Toplevel):
                         verified=bool(entry.identity))
 
         note = f"#{entry.order} 现在是 {role}"
+        if role in ("left", "right"):
+            note += "（采集索引未实测时，请点「自动绑定左右」或在预览卡片点「画面是左/右」）"
         if others:
             note += (f"；它原来是 {'、'.join(sorted(others))}，已一并摘掉"
                      f"（一台相机不能同时当两个角色）")
         self._save(do, note=note)
         # 先把选中行挪到下一台没绑的（用户下一步就是设右边）。
         self._select_next_unbound()
+
+    def _run_autobind(self) -> None:
+        """用 serial + 排除法 + 画面指纹自动绑定 left/right 并实测 capture_index。"""
+        if self._autobind_running:
+            self._say("自动绑定正在运行，请稍候…")
+            return
+        self._autobind_running = True
+        threads = [p.thread for p in self._previews.values() if p.thread is not None]
+        self._stop_all()
+        self._say("正在自动绑定左右相机并实测采集索引（请稍候，约 10–30 秒）…")
+        argv = _actions.cameras_autobind()
+
+        def worker() -> None:
+            for th in threads:
+                try:
+                    th.join(timeout=2.5)
+                except Exception:                             # noqa: BLE001
+                    pass
+            try:
+                proc = subprocess.run(
+                    argv, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120)
+                self._events.put(("autobind_done", proc.returncode,
+                                  proc.stdout or "", proc.stderr or ""))
+            except Exception as exc:                          # noqa: BLE001
+                self._events.put(("autobind_done", 1, "", str(exc)))
+
+        threading.Thread(target=worker, daemon=True,
+                         name="cameras-autobind").start()
+
+    def _on_autobind_done(self, rc: int, stdout: str, stderr: str) -> None:
+        payload: dict = {}
+        for line in reversed(stdout.splitlines()):
+            s = line.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    raw = json.loads(s)
+                    if isinstance(raw, dict):
+                        payload = raw
+                        break
+                except ValueError:
+                    pass
+        try:
+            self._devices = cr.list_devices()
+            self._device_sig = cr.device_signature(self._devices)
+            self._fill_tree()
+        except Exception:                                     # noqa: BLE001
+            pass
+        if self.on_changed is not None:
+            try:
+                self.on_changed()
+            except Exception:                                 # noqa: BLE001
+                pass
+        if rc == 0 and payload.get("ok"):
+            l_cap = (payload.get("left") or {}).get("capture_index")
+            r_cap = (payload.get("right") or {}).get("capture_index")
+            self._say(
+                f"自动绑定完成：left=采集#{l_cap}，right=采集#{r_cap}",
+                display=i18n.tf("自动绑定完成：left=采集#{l}，right=采集#{r}",
+                                l=l_cap, r=r_cap))
+            return
+        err = (payload.get("error")
+               or "；".join(str(e) for e in (payload.get("errors") or []))
+               or (stderr.strip().splitlines()[-1] if stderr.strip() else "")
+               or "请先预览出画面后在卡片点「画面是左 / 画面是右」")
+        self._say(f"自动绑定未完成：{err}", error=True,
+                  display=i18n.tf("自动绑定未完成：{err}", err=err))
+
+    def _assign_capture_from_preview(self, pane_index: int, role: str) -> None:
+        """预览卡片已拿到 real frames 时，把实测 OpenCV 索引写入 role.capture_index。"""
+        pane = self._previews.get(pane_index)
+        if pane is None or not pane.got:
+            self._say("还没拿到实时画面，不能确认采集索引；等画面出来后再点", error=True)
+            return
+        try:
+            reg = cr.load_registry()
+        except Exception:                                     # noqa: BLE001
+            reg = cr.Registry()
+        entry = next((d for d in self._devices if d.order == pane_index), None)
+        spec = reg.roles.get(role)
+        # 如果该角色尚未绑定身份，则从枚举中按真实设备建角色；严格拦截虚拟/幽灵设备。
+        if spec is None or not spec.identity:
+            if entry is not None and cr.is_virtual(entry.name, reg.settings):
+                self._say(
+                    TPL_VIRTUAL_ROLE.format(
+                        index=pane_index, name=entry.name, role=role),
+                    error=True,
+                    display=i18n.tf(TPL_VIRTUAL_ROLE,
+                                    index=pane_index, name=entry.name, role=role))
+                return
+            if entry is None or (not entry.identity and not entry.name):
+                msg = cr.phantom_index_warning(pane_index)
+                self._say(msg, error=True, display=msg)
+                return
+            cr.unmark_ignored(reg, entry=entry)
+            cr.set_role(reg, role, entry=entry, index=pane_index,
+                        verified=bool(entry.identity), capture_index=pane_index)
+        else:
+            # 保留既有 PnP/serial 绑定，仅把实测可出图的 OpenCV 索引写入 capture_index。
+            other = "right" if role == "left" else "left"
+            other_spec = reg.roles.get(other)
+            if other_spec is not None and other_spec.capture_index == pane_index:
+                other_spec.capture_index = None
+            spec.capture_index = int(pane_index)
+            spec.verified = True
+        try:
+            path = cr.save_registry(reg)
+        except (OSError, ValueError) as exc:
+            self._say(TPL_NOT_SAVED.format(exc=exc), error=True,
+                      display=i18n.tf(TPL_NOT_SAVED, exc=exc))
+            return
+        self._fill_tree()
+        if self.on_changed is not None:
+            try:
+                self.on_changed()
+            except Exception:                                 # noqa: BLE001
+                pass
+        self._say(
+            f"已实测确认 {role} 采集索引 = #{pane_index}（写入 {path}）",
+            display=i18n.tf("已实测确认 {role} 采集索引 = #{index}（写入 {path}）",
+                            role=role, index=pane_index, path=path))
 
     def _select_next_unbound(self) -> None:
         """绑完一个角色，自动把选中行挪到「还没绑角色的外接相机」。

@@ -4332,9 +4332,9 @@ def _check_viewer_raw_and_explorer() -> list[tuple[str, bool]]:
                     ("--ref-pair-left", "--ref-pair-right", "--pair-frame"))))
 
         checks.append((
-            "新标定⑥ 下拉候选按窗口模式过滤（轴向只进平行、中轴90°只进大角度）",
+            "新标定⑥ 下拉候选按窗口模式过滤（轴向只进平行、joint/链式/中轴90°进大角度）",
             _pmf("parallel") == ("joint", "axial")
-            and _pmf("angled") == ("chain", "chain_dual", "device90")))
+            and _pmf("angled") == ("joint", "chain", "chain_dual", "device90")))
         checks.append((
             "新标定⑦ METHODS 含两种新方法且全集 PICKER_METHODS 未改（下游 choices 不漂）",
             "axial" in _M2 and "device90" in _M2

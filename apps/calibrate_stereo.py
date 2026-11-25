@@ -803,6 +803,7 @@ def _chain_meta(args, spec: BoardSpec, res, image_size) -> dict:
         "pair_frame": args.pair_frame,
         "pair_camera": args.pair_camera,
         "image_size": list(image_size),
+        "capture_size": list(image_size),
         # 模式 = 方法决定：none_raw 的产物只可能走 angled 重建。
         "stereo_mode": "angled",
         "angle_deg": float(rig_angle(res.R)),

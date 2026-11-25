@@ -31,6 +31,7 @@ for _parent in Path(__file__).resolve().parents:
         sys.path.insert(0, str(_parent))
         break
 
+import cv2
 import numpy as np
 
 from apps._common import current_calibration
@@ -42,18 +43,86 @@ from apps.calibrate_axial import (          # 复用同一份只读 helper（不
     _save_res,
     _write_report,
 )
-from calib import BoardSpec, CalibConfig, StereoRig
+from calib import BoardSpec, CalibConfig, StereoRig, detect_board
 from calib.device90_calib import solve_device90
+from calib.params import optical_axis_angle_deg
+from calib.stereo_calib import calibrate_mono_points
+from stereo.profiles import get_active
 
 __all__ = ["build_parser", "main"]
 
 
-def _load_intrinsics(path: str):
-    """读 StereoRig 内参；缺 K1/K2 或 D1/D2 时返回 (None, 原因)，**不做 D=0 兜底**。"""
+def _active_profile_name() -> str:
+    try:
+        prof = get_active()
+    except Exception:                                      # noqa: BLE001
+        return ""
+    return prof.name if prof is not None else ""
+
+
+def _calibrate_dir_intrinsics(root: Path, spec: BoardSpec):
+    """从双路多姿态棋盘图目录标定 ``(K1, D1, K2, D2)``。"""
+    left_dir = root / "left"
+    right_dir = (root / "board_b") if (root / "board_b").is_dir() else (root / "right")
+    if not left_dir.is_dir() or not right_dir.is_dir():
+        return None, (
+            f"内参目录缺少 left/ 或 board_b|right/ 子目录：{root}"
+        )
+    objp = spec.object_points()
+
+    def _fit_side(side_dir: Path, label: str):
+        paths = _list_images(side_dir)
+        if not paths:
+            return None, f"{label} 目录没有图像：{side_dir}"
+        pts: list[np.ndarray] = []
+        size: tuple[int, int] | None = None
+        for p in paths:
+            g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            if g is None:
+                continue
+            wh = (int(g.shape[1]), int(g.shape[0]))
+            if size is not None and wh != size:
+                return None, f"{label} 目录图像尺寸不一致：{size} vs {wh}"
+            obs = detect_board(g, spec)
+            if obs.found and obs.corners is not None:
+                size = wh
+                pts.append(obs.corners.reshape(-1, 2))
+        if len(pts) < 8 or size is None:
+            return None, (
+                f"{label} 有效棋盘图只有 {len(pts)} 张（至少需要 8 张多姿态图）：{side_dir}"
+            )
+        mono = calibrate_mono_points(objp, pts, size)
+        return (mono, size, len(pts)), ""
+
+    res_l, err_l = _fit_side(left_dir, "left")
+    if res_l is None:
+        return None, err_l
+    res_r, err_r = _fit_side(right_dir, right_dir.name)
+    if res_r is None:
+        return None, err_r
+    ml, size_l, n_l = res_l
+    mr, size_r, n_r = res_r
+    if size_l != size_r:
+        return None, f"内参目录左右图尺寸不一致：{size_l} vs {size_r}"
+    print(f"[内参] 从目录标定完成：left {n_l} 张 RMS={ml['rms']:.3f} px，"
+          f"{right_dir.name} {n_r} 张 RMS={mr['rms']:.3f} px（{size_l[0]}x{size_l[1]}）")
+    return (
+        np.asarray(ml["K"], np.float64), np.asarray(ml["D"], np.float64),
+        np.asarray(mr["K"], np.float64), np.asarray(mr["D"], np.float64),
+    ), ""
+
+
+def _load_intrinsics(path: str, spec: BoardSpec | None = None):
+    """读 StereoRig 内参（或从双路多姿态图目录标定）；缺 K1/K2 或 D1/D2 时返回 (None, 原因)，**不做 D=0 兜底**。"""
+    p = Path(path)
+    if p.is_dir() and not (p.with_suffix(".npz").is_file() or (p / "stereo_calib.npz").is_file()):
+        has_sub = (p / "left").is_dir() or (p / "board_b").is_dir() or (p / "right").is_dir()
+        if has_sub:
+            return _calibrate_dir_intrinsics(p, spec or BoardSpec())
     try:
         rig = StereoRig.load(path)
     except FileNotFoundError:
-        return None, f"找不到内参文件：{path}（.npz 必须存在，.json 可选）"
+        return None, f"找不到内参文件：{path}（.npz 必须存在，.json 可选，也可传含 left/+board_b/ 的多姿态目录）"
     except Exception as exc:                               # noqa: BLE001
         return None, f"读取内参失败（{type(exc).__name__}: {exc}）：{path}"
     if rig.K1 is None or rig.K2 is None:
@@ -153,8 +222,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
+    try:
+        spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
+    except ValueError as exc:
+        print(f"\n[错误] 板规格非法：{exc}")
+        return 2
+
     # ---- 1. 读内参 ----
-    loaded, reason = _load_intrinsics(args.intrinsics)
+    loaded, reason = _load_intrinsics(args.intrinsics, spec)
     if loaded is None:
         print(f"\n[错误] {reason}")
         return 2
@@ -162,12 +237,6 @@ def main(argv=None) -> int:
     hard = _check_intrinsics_hard(K1, D1, K2, D2)
     if hard:
         print(f"\n[错误] 内参非法：{hard}")
-        return 2
-
-    try:
-        spec = BoardSpec(cols=args.cols, rows=args.rows, square_mm=args.square)
-    except ValueError as exc:
-        print(f"\n[错误] 板规格非法：{exc}")
         return 2
 
     # ---- 2. 读 A/B 目录各取最佳帧 ----
@@ -189,6 +258,9 @@ def main(argv=None) -> int:
         return 2
     corners_a, size_a, path_a, focus_a = fa
     corners_b, size_b, path_b, focus_b = fb
+    if size_a != size_b:
+        print(f"\n[错误] A/B 图分辨率不一致：{size_a[0]}x{size_a[1]} vs {size_b[0]}x{size_b[1]}")
+        return 2
     print(f"[读图] A: {path_a.name}（{size_a[0]}x{size_a[1]}, focus={focus_a:.0f}）")
     print(f"[读图] B: {path_b.name}（{size_b[0]}x{size_b[1]}, focus={focus_b:.0f}）")
     intr_reasons = _intrinsics_sanity_reasons(K1, D1, K2, D2, width=size_a[0])
@@ -219,8 +291,14 @@ def main(argv=None) -> int:
     # ---- 4. 落盘 ----
     out = args.out or str(current_calibration(need_existing=False)[0])
     meta = {
+        "profile": _active_profile_name(),
         "method": "device90",
         "calibration_mode": "device90_midaxis",
+        "stereo_mode": "angled",
+        "rectification": res.rectification,
+        "angle_deg": round(float(optical_axis_angle_deg(res.R)), 2),
+        "image_size": [int(size_a[0]), int(size_a[1])],
+        "capture_size": [int(size_a[0]), int(size_a[1])],
         "board": spec.describe(),
         "board_spec": {"cols": int(spec.cols), "rows": int(spec.rows),
                        "square_mm": float(spec.square_mm)},

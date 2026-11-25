@@ -2443,6 +2443,54 @@ def _check_raw_video_names() -> list[tuple[str, bool]]:
     return out
 
 
+def _check_chain_session_management() -> list[tuple[str, bool]]:
+    """2026-11-24 回归：list_chain_sessions / set_current_chain_session / list_chain_trash_batches。"""
+    import tempfile
+    from apps import _actions
+
+    out: list[tuple[str, bool]] = []
+    with tempfile.TemporaryDirectory(prefix="chain_mgr_") as td:
+        root = Path(td) / "chain_frames"
+        s1 = _actions.new_chain_session(root=root, mode="angled")
+        s1["left"].mkdir(parents=True, exist_ok=True)
+        (s1["left"] / "a.png").write_bytes(b"1")
+        s2 = _actions.new_chain_session(root=root, mode="angled")
+        s2["board_b"].mkdir(parents=True, exist_ok=True)
+        (s2["board_b"] / "b.png").write_bytes(b"2")
+
+        listed = _actions.list_chain_sessions(root=root)
+        names = [it["name"] for it in listed]
+        out.append(("list_chain_sessions 列出全部会话并统计张数",
+                    len(listed) == 2
+                    and s1["left"].parent.name in names
+                    and s2["left"].parent.name in names))
+
+        cur_before = _actions.current_chain_dirs(root=root)
+        switched = _actions.set_current_chain_session(s1["left"].parent.name, root=root)
+        cur_after = _actions.current_chain_dirs(root=root)
+        out.append(("set_current_chain_session 可切换指针到历史会话",
+                    cur_before != cur_after
+                    and cur_after is not None
+                    and cur_after["left"] == switched["left"] == s1["left"]))
+
+        res = _actions.reshoot_chain_stage(s1, ("left",), label="step1")
+        batches = _actions.list_chain_trash_batches(
+            s1["left"].parent.name, sessions_root=root)
+        out.append(("list_chain_trash_batches 列出对应会话的回收批次",
+                    len(batches) == 1
+                    and res["batch"] is not None
+                    and batches[0]["batch"] == res["batch"]
+                    and batches[0]["stages"] == ["left"]))
+
+        # 清空重建的空目录后再恢复，应把 a.png 还原
+        s1["left"].rmdir()
+        restored = _actions.restore_chain_stage(batches[0]["batch"])
+        out.append(("restore_chain_stage 可按 list_chain_trash_batches 返回值原样恢复",
+                    restored.get("restored") == 1
+                    and (s1["left"] / "a.png").is_file()))
+    return out
+
+
 def main() -> int:
     print("=" * 70)
     print("插件注册表自测（清单唯一 / 未知名字报错 / 默认唯一 / 边界）")
@@ -2484,6 +2532,8 @@ def main() -> int:
          _check_raw_video_names),
         ("21. 种子取色质量护栏（背景帧必拒 / 白球窄单段不误伤 / 可诊断）",
          _check_seed_color_guard),
+        ("22. 链式会话列表 / 切换 / 回收批次列表与恢复",
+         _check_chain_session_management),
     ):
         print(f"----- {section} -----")
         got = fn()

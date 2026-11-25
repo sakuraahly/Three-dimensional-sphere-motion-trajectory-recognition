@@ -229,7 +229,10 @@ def calibrate_args(method: str, board: dict | None = None,
                    out: str = "", baseline: float | str | None = None,
                    fov_from_profile: str = "", use_fov: bool = True,
                    force_save: bool = False,
-                   width: str = "", height: str = "", fps: str = "") -> list[str]:
+                   width: str = "", height: str = "", fps: str = "",
+                   pair_camera: str = "left",
+                   rational_model: bool = False,
+                   fix_principal_point: bool = False) -> list[str]:
     """双目标定的完整 argv。
 
     三条分支的差别**只在参数**，不在文案：
@@ -294,8 +297,11 @@ def calibrate_args(method: str, board: dict | None = None,
             cmd += ["--ref-pair-left", str(d["ref_pair_left"]),
                     "--ref-pair-right", str(d["ref_pair_right"])]
             if Path(d["pair"]).exists():
-                # 同框图是哪一路相机拍的（默认左），后端据此区分 A/B 板。
-                cmd += ["--pair-frame", str(d["pair"]), "--pair-camera", "left"]
+                # 同框图是哪一路相机拍的（默认 left），后端据此区分 A/B 板。
+                _pair_cam = str(pair_camera or "").strip()
+                if _pair_cam not in ("left", "right"):
+                    _pair_cam = "left"
+                cmd += ["--pair-frame", str(d["pair"]), "--pair-camera", _pair_cam]
         else:
             cmd += ["--method", "chain", "--same-board",
                     "--left-dir", str(d["left"]),
@@ -337,6 +343,10 @@ def calibrate_args(method: str, board: dict | None = None,
     # 旁路文件。GUI 只在二次确认通过后才置 True；argv 仍只有这一个产地。
     if force_save:
         cmd += ["--force-save"]
+    if rational_model:
+        cmd += ["--rational-model"]
+    if fix_principal_point:
+        cmd += ["--fix-principal-point"]
 
     # `--min-pairs` **必须传**，否则"试标定档"必然失败（2026-10-29 查出的功能缺口）。
     #
@@ -822,6 +832,8 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
                          min_cover: int = 0, relax_after: int = 0,
                          per_region: int = 0,
                          width: int = 0, height: int = 0, fps: int = 0,
+                         stationary: str = "", sharpness: str = "",
+                         relaxed: bool = False, stationary_stage: bool = False,
                          dirs: dict | None = None) -> list[str]:
     """采集链式标定的某一段图（`capture_board.py`），落进 `chain_dirs()` 对应目录。
 
@@ -837,12 +849,14 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
       复用 ``--both``（同名文件天然成对）；``target`` **由调用方给**
       （GUI ③ 现在是 3），取景窗存够就自己关，用户只需点一次按钮。
 
-    参考段**不传** ``--camera-left/--camera-right``：与旧界面一致，让
-    `capture_board.py` 自己按 left/right 角色取相机（角色绑定更稳，索引会漂移）。
+    当 ``left`` / ``right`` 为默认 ``"left"`` / ``"right"`` 时，参考段（``--both``）
+    **不传** ``--camera-left/--camera-right``；若用户在高级区改填了非默认索引或名字，
+    则显式透传，避免参考段与单路使用不同相机。
 
     ``min_cover`` / ``relax_after`` 只对内参段有效（双板 A/B 与单板左右）：
     前者是**首选目标**（5=五个角全绿，最理想），后者是**分化线**——拍够这么多张
-    后覆盖标准放宽到 4/5。参考段不用覆盖判据（它的规则是"板不能动"）。
+    后覆盖标准放宽到 4/5。参考段与 ``stationary_stage=True``（如 ``device90``）
+    使用 ``--stage ref``，显示“板是否移动”而不是 5 区域覆盖引导。
 
     ``width`` / ``height`` / ``fps`` 来自**激活装置档案**的采集档（0 = 不传，
     由 `capture_board.py` 用它自己的默认）。为什么必须由档案给：`capture_board`
@@ -861,13 +875,24 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
         cap += ["--height", str(height)]
     if fps > 0:
         cap += ["--fps", str(fps)]
+    cap += _positive("--stationary-px", stationary)
+    cap += _positive("--min-sharpness", sharpness)
+    if relaxed:
+        cap += ["--relaxed"]
+    _l_cam = str(left or "").strip()
+    _r_cam = str(right or "").strip()
+    both_cams: list[str] = []
+    if _l_cam and _l_cam != "left":
+        both_cams += ["--camera-left", _l_cam]
+    if _r_cam and _r_cam != "right":
+        both_cams += ["--camera-right", _r_cam]
     if stage == "ref":
         return _argv(
             _TOOLS / "capture_board.py", "--both",
             "--out-left", str(d["ref_left"]),
             "--out-right", str(d["ref_right"]),
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-            "--target", str(target), "--auto", *cap)
+            "--target", str(target), "--auto", *both_cams, *cap)
     if stage == "ref_pair":
         # 双板参考对：两路同时各一张、板绝对不动。--stage ref 让 HUD 显示
         # 「板有没有动」；target 由调用方给（GUI 第 ③ 步现在 3 对），
@@ -878,29 +903,31 @@ def capture_chain_frames(*, stage: str, cols: str, rows: str, square: str,
             "--out-left", str(d["ref_pair_left"]),
             "--out-right", str(d["ref_pair_right"]),
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-            "--target", str(target), "--auto", "--stage", "ref", *cap)
+            "--target", str(target), "--auto", "--stage", "ref", *both_cams, *cap)
     if stage == "dual_b":
         # 双板模式：右相机拍 B 板，落 board_b 目录。
         return _argv(
             _TOOLS / "capture_board.py", "--out", str(d["board_b"]),
             "--side", "right",
-            "--camera", str(right or "").strip() or "right",
+            "--camera", _r_cam or "right",
             "--cols", str(cols), "--rows", str(rows), "--square", str(square),
             "--target", str(target), "--auto",
             *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
             *(["--relax-after", str(relax_after)] if relax_after > 0 else []),
             *(["--per-region", str(per_region)] if per_region > 0 else []),
+            *(["--stage", "ref"] if stationary_stage else []),
             *cap)
     side = "left" if stage == "left" else "right"
     out = d["left"] if stage == "left" else d["right"]
     return _argv(
         _TOOLS / "capture_board.py", "--out", str(out), "--side", side,
-        "--camera", str(left if stage == "left" else right or "").strip() or side,
+        "--camera", (_l_cam if stage == "left" else _r_cam) or side,
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
         "--target", str(target), "--auto",
         *(["--min-cover", str(min_cover)] if min_cover > 0 else []),
         *(["--relax-after", str(relax_after)] if relax_after > 0 else []),
         *(["--per-region", str(per_region)] if per_region > 0 else []),
+        *(["--stage", "ref"] if stationary_stage else []),
         *cap)
 
 
@@ -935,33 +962,36 @@ def capture_pair_frame(*, cols: str, rows: str, square: str,
 
 def check_chain_inputs(*, cols: str, rows: str, square: str,
                        dirs: dict | None = None,
-                       mode: str = "single") -> list[str]:
+                       mode: str = "single",
+                       pair_camera: str = "left") -> list[str]:
     """链式标定输入自检（`check_chain_inputs.py`），拍完先跑这个。
 
-    ``mode`` 决定查哪几段（与 `calibrate_args` 的链式分支一一对应）：
-    ``single`` = 单板四段（left/right/ref_left/ref_right）；
-    ``dual``   = 双板四步（left/board_b + ref_pair_left/ref_pair_right + pair）。
-                 2026-11-09 方案 A 起多了一组「组合装置别动、两路同时各拍 3 张」
-                 的参考对，链两端位姿只从它取。
-    以前双板只能弹一句"没有自动自检"的提示——那等于让用户拿标定去试错，
-    而一次双板拍摄是十几分钟。
+    ``mode`` 决定查哪几段（与 `calibrate_args` / `calibrate_device90` 一一对应）：
+    ``single``   = 单板四段（left/right/ref_left/ref_right）；
+    ``dual``     = 双板四步（left/board_b + ref_pair_left/ref_pair_right + pair）；
+    ``device90`` = 中轴90°装置两段正对图（left/board_b）。
     """
     d = dirs if dirs is not None else chain_dirs()
+    m = str(mode or "single")
+    extra: list[str] = []
+    if m == "dual" and str(pair_camera or "").strip() == "right":
+        extra += ["--pair-camera", "right"]
     return _argv(
         _TOOLS / "check_chain_inputs.py", "--root", str(Path(d["left"]).parent),
         "--cols", str(cols), "--rows", str(rows), "--square", str(square),
-        "--mode", str(mode or "single"))
+        "--mode", m, *extra)
 
 def check_setup_args(*, left: str = "left", right: str = "right",
-                     board: dict | None = None) -> list[str]:
+                     board: dict | None = None,
+                     stereo_mode: str = "",
+                     width: str = "", height: str = "",
+                     fps: str = "") -> list[str]:
     """「检查装置」的 argv（2026-10-31 修，缺陷 #4）。
 
     为什么必须带参数：``check_stereo_setup.py`` 的两路画面来自
     ``apps._common.add_stereo_source_args``，**不传 ``--left/--right`` 就等于
     让它自己去猜**；它的 docstring 第一行给的就是 ``--left 0 --right 2`` 这种
-    显式用法。上一版一个参数都没传，检查程序只能按 ``auto`` 自己挑相机 ——
-    与第 ② 步标定用的两台不是同一对时，用户会按一个**别的装置**的结论去调
-    相机，而且界面还不回写结果（状态条永远停在"正在检查装置…"）。
+    显式用法。
 
     相机取值可以是角色名（``left``/``right``，查 ``config/cameras.json``）
     或索引，与 ``calibrate_stereo`` 同一套解析 —— 界面里那两个框就原样下传。
@@ -975,7 +1005,90 @@ def check_setup_args(*, left: str = "left", right: str = "right",
         raw = str(b.get(key) or "").strip()
         if raw:
             cmd += [flag, raw]
+    sm = str(stereo_mode or "").strip()
+    if sm in ("parallel", "angled"):
+        cmd += ["--stereo-mode", sm]
+    cmd += _positive("--width", width)
+    cmd += _positive("--height", height)
+    cmd += _positive("--fps", fps)
     return cmd
+
+
+def verify_stereo(
+    *,
+    calib: str | Path = "",
+    left: str = "left",
+    right: str = "right",
+    cols: str = "",
+    rows: str = "",
+    square: str = "",
+    samples: str = "",
+    tolerance: str = "",
+    width: str = "",
+    height: str = "",
+    fps: str = "",
+    no_show: bool = False,
+) -> list[str]:
+    """双目标定复检（`apps/verify_stereo.py`）的 argv。"""
+    cmd = _argv(
+        _APPS / "verify_stereo.py",
+        "--left", str(left or "").strip() or "left",
+        "--right", str(right or "").strip() or "right",
+    )
+    cmd += _flag("--calib", calib)
+    cmd += _positive("--cols", cols)
+    cmd += _positive("--rows", rows)
+    cmd += _positive("--square", square)
+    cmd += _positive("--samples", samples)
+    cmd += _positive("--tolerance", tolerance)
+    cmd += _positive("--width", width)
+    cmd += _positive("--height", height)
+    cmd += _positive("--fps", fps)
+    if no_show:
+        cmd += ["--no-show"]
+    return cmd
+
+
+def cameras_autobind(
+    *,
+    left_serial: str = "",
+    right_serial: str = "",
+    max_index: int = 4,
+) -> list[str]:
+    """``apps/tools/cameras.py autobind --json`` —— 自动绑定并实测写入 ``capture_index``。"""
+    return _argv(
+        _TOOLS / "cameras.py", "autobind",
+        *_flag("--left-serial", left_serial),
+        *_flag("--right-serial", right_serial),
+        "--max-index", str(max(0, int(max_index))),
+        "--json",
+    )
+
+
+def capture_world_floor_image(
+    *,
+    out_dir: str | Path,
+    cols: str = "",
+    rows: str = "",
+    square: str = "",
+    camera: str = "left",
+    width: int = 0,
+    height: int = 0,
+) -> list[str]:
+    """用左相机拍一张地面棋盘图（`capture_board.py --target 1 --auto`）。"""
+    cap: list[str] = []
+    if width > 0 and height > 0:
+        cap += ["--width", str(int(width)), "--height", str(int(height))]
+    return _argv(
+        _TOOLS / "capture_board.py",
+        "--out", str(out_dir),
+        "--side", "left",
+        "--camera", str(camera or "").strip() or "left",
+        *_positive("--cols", cols),
+        *_positive("--rows", rows),
+        *_positive("--square", square),
+        "--target", "1", "--auto", *cap,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1270,3 +1383,118 @@ def restore_chain_stage(batch: str | Path | None) -> dict:
     shutil.rmtree(b, ignore_errors=True)
     return {"restored": len(done), "skipped": skipped, "reason": "",
             "batch": b}
+
+
+_CHAIN_COUNT_KEYS = (
+    "left", "right", "ref_left", "ref_right",
+    "board_b", "ref_pair_left", "ref_pair_right", "pair",
+)
+
+
+def list_chain_sessions(root: Path | None = None) -> list[dict]:
+    """列出 ``chain_frames/`` 下的标定会话（最新在前），含元数据与各段张数。"""
+    base = Path(root) if root is not None else CHAIN_ROOT
+    if not base.is_dir():
+        return []
+    out: list[dict] = []
+    for p in sorted(base.iterdir(), key=lambda x: x.name, reverse=True):
+        if not p.is_dir() or p.name.startswith(".") or p.name.startswith("_"):
+            continue
+        meta: dict = {}
+        sp = p / "session.json"
+        if sp.is_file():
+            try:
+                raw = json.loads(sp.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    meta = raw
+            except (OSError, ValueError):
+                meta = {}
+        counts = {
+            k: (sum(1 for f in (p / k).iterdir()
+                    if f.is_file()
+                    and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp"))
+                if (p / k).is_dir() else 0)
+            for k in _CHAIN_COUNT_KEYS
+        }
+        out.append({
+            "name": p.name,
+            "path": p,
+            "meta": meta,
+            "counts": counts,
+            "total": sum(counts.values()),
+        })
+    return out
+
+
+def set_current_chain_session(
+    session_name: str, root: Path | None = None,
+) -> dict[str, Path]:
+    """把 ``_current.json`` 切换到指定会话，返回该会话的 ``chain_dirs()``。"""
+    base = Path(root) if root is not None else CHAIN_ROOT
+    name = str(session_name or "").strip()
+    if not name or name.startswith(".") or "/" in name or "\\" in name:
+        raise ValueError(f"非法的标定会话名：{session_name!r}")
+    target = base / name
+    if not target.is_dir():
+        raise FileNotFoundError(f"标定会话不存在：{target}")
+    base.mkdir(parents=True, exist_ok=True)
+    (base / CURRENT_SESSION).write_text(
+        json.dumps(
+            {"schema": POINTER_SCHEMA, "kind": "chain",
+             "session": name, "created_at": _now()},
+            ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return chain_dirs(target)
+
+
+def list_chain_trash_batches(
+    session_name: str = "",
+    *,
+    trash_root: Path | None = None,
+    sessions_root: Path | None = None,
+) -> list[dict]:
+    """列出 ``outputs/_trash/`` 里可由 ``restore_chain_stage`` 恢复的批次。"""
+    from apps._cleanup import trash_root as _trash_root
+
+    sroot = (Path(sessions_root) if sessions_root is not None else CHAIN_ROOT).resolve()
+    troot = (Path(trash_root) if trash_root is not None else _trash_root(sroot)).resolve()
+    if not troot.is_dir():
+        return []
+    out: list[dict] = []
+    for b in sorted(troot.iterdir(), key=lambda x: x.name, reverse=True):
+        if not b.is_dir():
+            continue
+        man_path = b / "manifest.json"
+        if not man_path.is_file():
+            continue
+        try:
+            man = json.loads(man_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if man.get("schema") != "sphere-stereo-trash":
+            continue
+        try:
+            man_root = Path(str(man.get("root") or "")).resolve()
+        except OSError:
+            continue
+        if man_root != sroot:
+            continue
+        items = man.get("items") or []
+        paths = [str(it.get("path") or "") for it in items if str(it.get("path") or "")]
+        if session_name:
+            prefix = f"{session_name}/"
+            if not any(p.startswith(prefix) for p in paths):
+                continue
+        sess = paths[0].split("/", 1)[0] if paths and "/" in paths[0] else ""
+        stages = [p.split("/", 1)[1] if "/" in p else p for p in paths]
+        out.append({
+            "batch": b,
+            "name": b.name,
+            "created": str(man.get("created") or ""),
+            "session": sess,
+            "stages": stages,
+            "files": sum(int(it.get("files") or 0) for it in items),
+            "bytes": sum(int(it.get("bytes") or 0) for it in items),
+        })
+    return out

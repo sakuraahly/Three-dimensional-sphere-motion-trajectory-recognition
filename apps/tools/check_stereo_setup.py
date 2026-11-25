@@ -239,7 +239,9 @@ def main() -> int:
     ap.add_argument("--work-width", type=int, default=1280, help="检测时缩放到的宽度")
     ap.add_argument("--exhaustive", action="store_true", help="更慢但更不易漏检")
     ap.add_argument("--min-both-ratio", type=float, default=0.5,
-                    help="两路同时看到棋盘的最低帧比例，达到才判为通过")
+                    help="两路同时看到棋盘的最低帧比例，达到才判为通过（parallel 口径）")
+    ap.add_argument("--stereo-mode", choices=("parallel", "angled"), default="parallel",
+                    help="装置几何：parallel 要求两路同时共视；angled 允许零共视（轮流看棋盘即可通过）")
     ap.add_argument("--no-show", action="store_true", help="不弹窗（批处理）")
     ap.add_argument("--profiles-only", action="store_true",
                     help="只打印当前装置档案（不开相机，便于核对参数/标定配对）")
@@ -267,7 +269,10 @@ def main() -> int:
         return 2
     print(src.describe())
     src.report_warnings()
-    print("提示：举起棋盘，让它同时落在两路画面里；缓慢上下左右移动以检验重叠范围。")
+    if args.stereo_mode == "angled":
+        print("提示（大角度模式）：请先后举着棋盘在左相机前与右相机前各停留几秒（不必两路同时看到）。")
+    else:
+        print("提示：举起棋盘，让它同时落在两路画面里；缓慢上下左右移动以检验重叠范围。")
     print("窗口：按 f 全屏（看得更清），Esc 退出全屏，q 提前结束。")
     if src.is_live:
         print(f"采集约 {args.seconds:.0f} 秒后自动给结论（窗口里按 q 可提前结束）。")
@@ -383,11 +388,36 @@ def _report(args, total, n_l, n_r, n_both, area_l, area_r, sharp_l, sharp_r,
     print("-" * 62)
 
     warnings: list[str] = []
+    same_size = True
     if L_wh and R_wh and L_wh != R_wh:
+        same_size = False
         warnings.append(f"两路分辨率不一致（{L_wh} vs {R_wh}）：标定要求两路完全一致，"
                         f"请把两台相机设成同一分辨率。")
 
-    if r_both >= args.min_both_ratio:
+    mode = getattr(args, "stereo_mode", "parallel") or "parallel"
+    if mode == "angled":
+        if not same_size:
+            print("[失败] 大角度模式也要求两路分辨率完全一致。")
+            code = 1
+        elif r_l >= 0.15 and r_r >= 0.15:
+            if r_both >= 0.50:
+                print("[通过] 大角度模式：两路分辨率一致，且共视良好 —— 可选「两路共视（joint）」或链式标定。")
+            elif r_both > 0.0:
+                print("[通过] 大角度模式：两路均可清晰检出棋盘且有部分共视 —— 推荐「单板链式」或「双板链式」。")
+            else:
+                print("[通过] 大角度模式：两路均可单独清晰检出棋盘（零共视属大角度正常情况）—— 推荐「双板链式」或「中轴 90° 装置」。")
+            code = 0
+        elif r_l < 0.15 and r_r < 0.15:
+            print("[失败] 两路都看不到棋盘。")
+            print("       检查：棋盘是否在左/右相机前轮流完整入画 / 光线是否充足 / 板面是否平整清晰。")
+            code = 1
+        elif r_l < 0.15:
+            print("[失败] 左相机未稳定看到棋盘（请在检查期间将棋盘放到左相机视野内）。")
+            code = 1
+        else:
+            print("[失败] 右相机未稳定看到棋盘（请在检查期间将棋盘放到右相机视野内）。")
+            code = 1
+    elif r_both >= args.min_both_ratio:
         print("[通过] 两路都能稳定看到棋盘 —— 视野重叠良好，可以开始标定。")
         if r_both < 1.0:
             print(f"       提示：仍有 {100 * (1 - r_both):.0f}% 的帧只有一路看到，"

@@ -1092,6 +1092,69 @@ SEED: dict[str, str] = {
         "Auto-bind complete: left=capture #{l}, right=capture #{r}",
     "已实测确认 {role} 采集索引 = #{index}（写入 {path}）":
         "Confirmed {role} capture index = #{index} (saved to {path})",
+
+    # ---- 2026-11-24 大角度双目全链路与工具台补充文案 ----
+    "① 拍 A 板：正对相机 1（板放稳不动，满 5 张自动收工）":
+        "1. Capture Board A: facing camera 1 (keep still; finishes after 5 steady shots)",
+    "① 拍左路多姿态内参图（板随便挪，四角+中央各多拍几张）":
+        "1. Capture left multi-pose intrinsics (move across corners & center)",
+    "② 拍右路多姿态内参图（板随便挪，四角+中央各多拍几张）":
+        "2. Capture right multi-pose intrinsics (move across corners & center)",
+    "② 绕中轴转 90°，拍 B 板：正对相机 2（满 5 张自动收工）":
+        "2. Rotate 90° around mid-axis, capture Board B: facing camera 2 (5 steady shots)",
+    "④同框相机": "Pair camera (4)",
+    "⑧ 复检双目标定（检查装置是否被碰动）":
+        "8. Verify stereo calibration (check if rig moved)",
+    "「拍地面棋盘图」已经在跑了 —— 请先在已开的取景窗内完成拍摄":
+        "Capture floor board image is already running — finish capture in the open preview window",
+    "两步正对图都拍完了。点「检查链式输入」，再点「开始标定」":
+        "Both facing poses captured. Click Check chain inputs, then Start calibration",
+    "内参文件/目录": "Intrinsics file/dir",
+    "切换": "Switch",
+    "双目使用一段时间后，用同一块棋盘拍几帧检验极线误差是否漂移；零共视 ~90° 装置若两路无法同时见板，会给出重拍参考对重标的说明。":
+        "After extended use, capture a few frames of the same checkerboard to verify epipolar drift; "
+        "for zero-overlap ~90° rigs that cannot share a board view, guidance is shown to reshoot reference pairs.",
+    "固定主点（少姿态防漂）": "Fix principal point (prevent drift with fewer poses)",
+    "复检标定": "Verify calibration",
+    "大角度/链式标定不做固有视场裁剪（两路保留完整原始画面）":
+        "Angled / chained calibration does not apply FOV cropping (keeps full raw frames on both views)",
+    "大角度检查未通过：请确保两路分辨率一致，且检查时棋盘轮流出现在左、右两路视野内（详情看运行日志）":
+        "Angled rig check failed: ensure both cameras match resolution and show the checkerboard to left then right in turn (see run log)",
+    "大角度装置检查通过：两路分辨率一致且都能单独看清棋盘（日志里有推荐的标定方法）":
+        "Angled rig check passed: matching resolution and clear board detection on both views (see run log for method advice)",
+    "广角8参数畸变": "Wide-angle 8-param distortion",
+    "开始复检": "Start verification",
+    "开始重拍选中步": "Reshoot selected step",
+    "当前会话没有可恢复的回收批次": "No recoverable trash batches for the current session",
+    "恢复旧图": "Restore old images",
+    "恢复该批": "Restore batch",
+    "打开目录": "Open folder",
+    "拍双路内参…": "Capture dual intrinsics…",
+    "标定复检结束（详情见运行日志）": "Calibration verification finished (see run log for details)",
+    "标定复检被中断了（未完成采样）": "Calibration verification was aborted before collecting enough samples",
+    "档案已记录 FOV（裁 {side}{size_txt}）；不勾 = 按原始画面标定":
+        "Profile has recorded FOV (crop {side}{size_txt}); uncheck to calibrate on raw frames",
+    "检查中轴 90° 正对参考图（左 A 板 / 右 B 板是否静止且完整）…":
+        "Checking mid-axis 90° facing reference images (Board A left / Board B right stationary & complete)…",
+    "正在复检当前标定（会打开取景窗，举棋盘采集样本，按 q 可提前结束）…":
+        "Verifying current calibration (preview window opening; hold checkerboard in view, press q to finish early)…",
+    "没有拍下地面棋盘图（请看底部日志确认相机或棋盘是否完整入画）":
+        "Failed to capture floor checkerboard image (check run log for camera or board detection)",
+    "用左相机拍一张…": "Capture with left camera…",
+    "结果写入底部任务日志": "Results are written to the bottom task log",
+    "还没有当前标定文件，请先完成第 ② 步「开始标定」":
+        "No calibration file yet — complete Step 2 Start calibration first",
+    "选一步重拍：该步旧图不删除，会移到 outputs/_trash/ 下的批次。下方可直接切换历史会话、在资源管理器中删掉个别糊图，或恢复之前被移走的旧图批次。":
+        "Choose a step to reshoot: existing images are moved safely to a batch under outputs/_trash/ rather than deleted. "
+        "Below you can also switch past sessions, open the folder in Explorer to prune blurry frames, or restore a previous trash batch.",
+    "选择标定文件（留空 = 当前装置档案）":
+        "Select calibration file (leave blank = active rig profile)",
+    "选目录…": "Select folder…",
+    "链式输入自检已中止": "Chain input check was aborted",
+    "链式输入自检通过，但有警告（请在底部日志查看坏帧/数量提示）":
+        "Chain input check passed with warnings (see bottom run log for frame quality/count hints)",
+    "链式输入自检通过，可以点「开始标定」":
+        "Chain input check passed — ready to click Start calibration",
 }
 
 #: 纯标点的显示替换。它们没有中文，不能放进 `SEED`（种子词典的契约是

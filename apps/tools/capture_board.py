@@ -625,13 +625,16 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--relax-cover", type=int, default=4,
                     help="过了分化线后的放宽标准（默认 4 = 四角+中央里覆盖 4 个即可）。"
                          "只有拍够 --relax-after 张之后才生效")
-    ap.add_argument("--stationary-px", type=float, default=3.0,
-                    help="连续两帧角点最大位移上限（px，默认 3.0）")
-    ap.add_argument("--min-sharpness", type=float, default=800.0,
+    ap.add_argument("--stationary-px", type=float, default=None,
+                    help="连续两帧角点最大位移上限（px；默认 3.0，--relaxed 下 10.0）")
+    ap.add_argument("--min-sharpness", type=float, default=None,
                     help="额外的**绝对**清晰度下限，比的是尺度无关的 focus"
-                         "（=Laplacian 方差 × 格子像素数，默认 800.0）。"
+                         "（=Laplacian 方差 × 格子像素数；默认 800.0，--relaxed 下 400.0）。"
                          "绝对阈值没有刻度，真正起作用的是相对判据：focus 低于"
                          "已存帧中位数 40%% 才判糊（阈值取自 CaptureConfig）；越小越宽松")
+    ap.add_argument("--relaxed", action="store_true",
+                    help="手持放宽模式：未显式指定时把 --stationary-px 放宽到 10.0、"
+                         "--min-sharpness 放宽到 400.0（显式参数始终优先）")
     ap.add_argument("--pair", action="store_true",
                     help="同框图模式（双板链式的 T_AB 用）：单相机、**不做单板检测**，"
                          "按空格存一帧就落盘（或 --auto 定时存），存够 --target 退。"
@@ -665,6 +668,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _check_args(ap: argparse.ArgumentParser, args) -> None:
     """参数组合的合法性 —— 全部走 ``ap.error``（退出码 2）。"""
+    if getattr(args, "stationary_px", None) is None:
+        args.stationary_px = 10.0 if getattr(args, "relaxed", False) else 3.0
+    if getattr(args, "min_sharpness", None) is None:
+        args.min_sharpness = 400.0 if getattr(args, "relaxed", False) else 800.0
     if args.both:
         if args.out:
             ap.error("--both 用 --out-left/--out-right 两条目录，不能再给 --out")

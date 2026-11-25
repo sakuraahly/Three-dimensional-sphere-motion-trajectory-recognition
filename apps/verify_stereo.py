@@ -35,6 +35,7 @@ from apps._common import (
     current_calibration,
     open_pair_source,
 )
+from apps._window import WindowManager
 from calib import BoardSpec, StereoRig
 from calib.board import detect_board
 from calib.capture import CaptureConfig, focus_gate
@@ -107,6 +108,7 @@ def main() -> int:
     ap.add_argument("--fov-input-normalized", action="store_true",
                     help="视频/图片输入已按标定 FOV 归一化：跳过首对帧校验。"
                          "默认会验证；低纹理等无法验证时若确认输入已归一化再加此开关")
+    ap.add_argument("--no-show", action="store_true", help="不弹出实时预览窗口")
     args = ap.parse_args()
 
     # ---- 采集档：未显式给 --width/--height 时，**优先用标定记下的采集档** ----
@@ -184,6 +186,9 @@ def main() -> int:
     focus_hist = {"左": [], "右": []}
     focus_skips = 0
     last_focus_reason = ""
+    show = src.is_live and not args.no_show
+    win = "stereo verify (q to stop / f fullscreen)"
+    wins = WindowManager()
     try:
         while len(errs) < args.samples and frames < args.max_frames:
             ok, left, right = src.read()
@@ -211,39 +216,78 @@ def main() -> int:
             gr = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
             ol = detect_board(gl, spec)
             orr = detect_board(gr, spec)
-            if not (ol.found and orr.found):
-                continue
-            # 尺度无关的清晰度（focus = 棋盘 ROI 的 Laplacian 方差 × 格子像素数），
-            # 与标定收帧同一口径；不要用 sharpness —— 板一大就会被误判成糊。
-            ok_focus = True
-            for name, obs in (("左", ol), ("右", orr)):
-                hist = focus_hist[name]
-                ok_one, why_one = focus_gate(
-                    obs.focus, label=name,
-                    median_focus=float(np.median(hist)) if hist else float("nan"),
-                    n_samples=len(hist),
-                    min_ratio=cap_cfg.min_focus_ratio,
-                    floor=cap_cfg.focus_floor,
-                    min_samples=cap_cfg.focus_min_samples,
-                    abs_min=args.min_sharpness,
-                )
-                if not ok_one:
-                    ok_focus = False
-                    last_focus_reason = why_one
+            both_found = bool(ol.found and orr.found)
+            if both_found:
+                # 尺度无关的清晰度（focus = 棋盘 ROI 的 Laplacian 方差 × 格子像素数），
+                # 与标定收帧同一口径；不要用 sharpness —— 板一大就会被误判成糊。
+                ok_focus = True
+                for name, obs in (("左", ol), ("右", orr)):
+                    hist = focus_hist[name]
+                    ok_one, why_one = focus_gate(
+                        obs.focus, label=name,
+                        median_focus=float(np.median(hist)) if hist else float("nan"),
+                        n_samples=len(hist),
+                        min_ratio=cap_cfg.min_focus_ratio,
+                        floor=cap_cfg.focus_floor,
+                        min_samples=cap_cfg.focus_min_samples,
+                        abs_min=args.min_sharpness,
+                    )
+                    if not ok_one:
+                        ok_focus = False
+                        last_focus_reason = why_one
+                        break
+                if ok_focus:
+                    focus_hist["左"].append(float(ol.focus))
+                    focus_hist["右"].append(float(orr.focus))
+                    errs.append(rig.epipolar_error_by_mode(rig.stereo_mode, ol.corners, orr.corners))
+                else:
+                    focus_skips += 1
+            if show:
+                pw = 540
+                sl = pw / float(left.shape[1])
+                sr = pw / float(right.shape[1])
+                dl = cv2.resize(left, (pw, max(1, int(round(left.shape[0] * sl)))),
+                                interpolation=cv2.INTER_AREA)
+                dr = cv2.resize(right, (pw, max(1, int(round(right.shape[0] * sr)))),
+                                interpolation=cv2.INTER_AREA)
+                for dimg, obs, sc in ((dl, ol, sl), (dr, orr, sr)):
+                    if obs.found and obs.corners is not None:
+                        for x, y in obs.corners.reshape(-1, 2) * sc:
+                            cv2.circle(dimg, (int(x), int(y)), 2, (0, 255, 255), -1)
+                hh = max(dl.shape[0], dr.shape[0])
+                if dl.shape[0] < hh:
+                    dl = np.vstack([dl, np.zeros((hh - dl.shape[0], pw, 3), np.uint8)])
+                if dr.shape[0] < hh:
+                    dr = np.vstack([dr, np.zeros((hh - dr.shape[0], pw, 3), np.uint8)])
+                panel = np.hstack([dl, dr])
+                last_txt = f"  last={errs[-1]:.3f}px" if errs else ""
+                cv2.putText(panel, f"samples {len(errs)}/{args.samples}{last_txt}  L:{ol.found} R:{orr.found}",
+                            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                            (0, 220, 0) if both_found else (0, 140, 255), 2, cv2.LINE_AA)
+                wins.show(win, panel)
+                key = cv2.waitKey(1) & 0xFF
+                if wins.handle_key(win, key, panel):
+                    continue
+                if key in (ord("q"), 27):
                     break
-            if not ok_focus:
-                focus_skips += 1
-                continue
-            focus_hist["左"].append(float(ol.focus))
-            focus_hist["右"].append(float(orr.focus))
-            errs.append(rig.epipolar_error_by_mode(rig.stereo_mode, ol.corners, orr.corners))
     finally:
         src.release()
+        if show:
+            cv2.destroyAllWindows()
 
     if focus_skips:
         print(f"[提示] 因清晰度跳过 {focus_skips} 帧（例：{last_focus_reason}）")
 
     if not errs:
+        if rig.stereo_mode == "angled":
+            if rig.meta.get("method") in ("chain", "device90") and not rig.meta.get("same_board"):
+                print("[提示] 当前标定为零共视大角度配置（~90° 双板 / 中轴90°），"
+                      "两路无法同时看到同一块棋盘，因此无法用共视点线距复检。")
+                print("       如需验证相机是否被碰动：用第 ② 步「重拍某一步…」重拍参考对 ③ 后重标定。")
+                return 0
+            print("[提示] 大角度模式未能同时在两路检出同一块板：")
+            print("       若两路有少量共同视野，请将棋盘放在共同可见区中心；若接近 90° 零共视，请重拍参考对重标。")
+            return 1
         print("[失败] 没有采到有效的标定板图像（两路都要能看到完整的板）")
         return 1
 

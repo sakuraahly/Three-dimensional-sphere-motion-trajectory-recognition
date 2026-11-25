@@ -3304,6 +3304,130 @@ def test_device90_intrinsics_sanity() -> bool:
     ]
     for name, ok in checks:
         print(f"  [{'通过' if ok else '不达标'}] {name}")
+    print(f"  [{'通过' if ok else '不达标'}] CLI fx=0 内参 -> exit 2")
+    return all(ok for _n, ok in checks)
+
+
+def test_wide_angle_meta_and_setup_checks() -> bool:
+    """2026-11-24 回归：_chain_meta capture_size / device90 meta & 目录内参 / check_stereo_setup(angled)。"""
+    print("\n----- 2026-11-24 大角度 meta / 目录内参 / 前置检查 angled -----")
+    import argparse
+    import json
+    import tempfile
+    from pathlib import Path as _P
+    from types import SimpleNamespace
+    from apps.calibrate_stereo import _chain_meta
+    from apps.calibrate_device90 import _load_intrinsics, main as d90_main
+    from apps.tools.check_stereo_setup import _report as setup_report
+    from apps._common import calib_capture_size
+    from calib.params import StereoRig
+    from calib.device90_calib import R_AB_matrix
+    import calib.relative_pose as rp
+    from stereo.record_plan import plan_record
+
+    # 1. _chain_meta 写入 capture_size
+    dummy_res = SimpleNamespace(rectification="none_raw", R=np.eye(3))
+    dummy_args = SimpleNamespace(
+        same_board=False, ref_left="", ref_right="",
+        ref_pair_left="l", ref_pair_right="r",
+        left_dir="l", board_b_dir="b", right_dir="",
+        pair_frame="p", pair_camera="left",
+    )
+    cm = _chain_meta(dummy_args, BoardSpec(8, 5, 25.0), dummy_res, (1920, 1080))
+    ok_cm = (cm.get("image_size") == [1920, 1080]
+             and cm.get("capture_size") == [1920, 1080]
+             and cm.get("stereo_mode") == "angled")
+
+    # 2. device90 生成完整 meta 且可通过 angled plan_record；目录模式也可标出内参
+    spec = BoardSpec(cols=7, rows=5, square_mm=30.0)
+    w, h = 960, 720
+    K = np.array([[1000.0, 0.0, w / 2.0], [0.0, 1000.0, h / 2.0], [0.0, 0.0, 1.0]])
+    D = np.zeros(5, np.float64)
+    board_img, pad = make_board_image(spec)
+
+    def _render_board(rvec, tvec) -> np.ndarray:
+        return render_view(board_img, pad, spec, 900.0,
+                           np.asarray(rvec, np.float64), np.asarray(tvec, np.float64),
+                           K, D, (w, h), 0.0, 0.0)
+
+    ok_d90 = False
+    ok_dir_intr = False
+    with tempfile.TemporaryDirectory(prefix="d90_meta_") as td:
+        tp = _P(td)
+        la_dir, lb_dir = tp / "a", tp / "b"
+        la_dir.mkdir()
+        lb_dir.mkdir()
+        intr_base = tp / "intr"
+        np.savez(str(intr_base) + ".npz", K1=K, D1=D, K2=K, D2=D,
+                 R=np.eye(3), T=np.array([[0.3], [0.0], [0.0]]),
+                 image_size=np.array([w, h]))
+        # 构造绕 Y 轴 90° 的一对静止视图（board_img 原点在左上角 (0,0)，加偏移居中）
+        cv2.imwrite(str(la_dir / "01.png"),
+                    _render_board(np.zeros(3), np.array([-0.10, -0.08, 0.70])))
+        cv2.imwrite(str(lb_dir / "01.png"),
+                    _render_board(np.zeros(3), np.array([-0.10, -0.08, 0.75])))
+        out_base = tp / "d90_out"
+        rc = d90_main([
+            "--left-dir", str(la_dir), "--right-dir", str(lb_dir),
+            "--intrinsics", str(intr_base),
+            "--cols", "7", "--rows", "5", "--square", "30",
+            "--expected-baseline-mm", "884", "--baseline-tolerance", "0.2",
+            "--out", str(out_base), "--force-save",
+        ])
+        meta = json.loads(out_base.with_suffix(".json").read_text(encoding="utf-8"))
+        rig_d90 = StereoRig.load(out_base)
+        plan = plan_record(
+            rig_d90, mode_choice="angled", width=w, height=h, allow_forced=True,
+        )
+        ok_d90 = (
+            rc in (0, 1)
+            and meta.get("stereo_mode") == "angled"
+            and meta.get("capture_size") == [w, h]
+            and meta.get("image_size") == [w, h]
+            and calib_capture_size(out_base) == (w, h)
+            and plan.ok
+        )
+        # 测试多姿态目录内参标定
+        intr_dir = tp / "intr_dir"
+        (intr_dir / "left").mkdir(parents=True)
+        (intr_dir / "board_b").mkdir(parents=True)
+        poses = [
+            (np.radians([float(ax), float(ay), float(az)]), np.array([tx, ty, tz]))
+            for ax, ay, az, tx, ty, tz in (
+                (0, 0, 0, -0.10, -0.08, 0.68),
+                (18, -10, 4, -0.15, -0.10, 0.72),
+                (-16, 12, -5, -0.06, -0.05, 0.74),
+                (12, 18, 8, -0.14, -0.04, 0.76),
+                (-14, -16, -6, -0.05, -0.11, 0.78),
+                (20, 5, 10, -0.10, -0.03, 0.70),
+                (-20, -6, -8, -0.10, -0.12, 0.73),
+                (6, 22, -4, -0.16, -0.08, 0.80),
+                (-8, -20, 6, -0.04, -0.08, 0.75),
+            )
+        ]
+        for idx, (rv, tv) in enumerate(poses):
+            im = _render_board(rv, tv)
+            cv2.imwrite(str(intr_dir / "left" / f"{idx:02d}.png"), im)
+            cv2.imwrite(str(intr_dir / "board_b" / f"{idx:02d}.png"), im)
+        loaded_dir, err_dir = _load_intrinsics(str(intr_dir), spec)
+        ok_dir_intr = (loaded_dir is not None and err_dir == ""
+                       and loaded_dir[0].shape == (3, 3))
+
+    # 3. check_stereo_setup _report(angled) 零共视但两路均可见 -> 0; parallel -> 1
+    ns_ang = argparse.Namespace(min_both_ratio=0.5, stereo_mode="angled")
+    ns_par = argparse.Namespace(min_both_ratio=0.5, stereo_mode="parallel")
+    rc_ang = setup_report(ns_ang, 10, 8, 8, 0, 0.8, 0.8, 8000.0, 8000.0, [], [], (1920, 1080), (1920, 1080), spec)
+    rc_par = setup_report(ns_par, 10, 8, 8, 0, 0.8, 0.8, 8000.0, 8000.0, [], [], (1920, 1080), (1920, 1080), spec)
+    ok_setup = (rc_ang == 0 and rc_par == 1)
+
+    checks = [
+        ("_chain_meta 写入 capture_size == image_size", ok_cm),
+        ("device90 写入 stereo_mode=angled + capture_size 并通过 plan_record", ok_d90),
+        ("device90._load_intrinsics 支持多姿态目录直接标出内参", ok_dir_intr),
+        ("check_stereo_setup angled 零共视各自清晰可见返回 0，parallel 返回 1", ok_setup),
+    ]
+    for name, ok in checks:
+        print(f"  [{'通过' if ok else '不达标'}] {name}")
     return all(ok for _n, ok in checks)
 
 
@@ -3373,6 +3497,7 @@ def main() -> int:
     all_ok = test_device90_baseline_guard_and_assume_parallel() and all_ok
     all_ok = test_cli_axial_device90_parsing() and all_ok
     all_ok = test_device90_intrinsics_sanity() and all_ok
+    all_ok = test_wide_angle_meta_and_setup_checks() and all_ok
     print()
     print("判定结果：" + ("全部通过" if all_ok else "有不达标项"))
     return 0 if all_ok else 1

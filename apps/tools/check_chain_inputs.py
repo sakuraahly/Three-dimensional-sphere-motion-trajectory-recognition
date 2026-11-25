@@ -466,9 +466,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cols", type=int, default=8)
     ap.add_argument("--rows", type=int, default=5)
     ap.add_argument("--square", type=float, default=25.0)
-    ap.add_argument("--mode", choices=("single", "dual"), default="single",
+    ap.add_argument("--mode", choices=("single", "dual", "device90"), default="single",
                     help="single=单板四段（left/right/ref_left/ref_right）；"
-                         "dual=双板四步（left/board_b/ref_pair_left/ref_pair_right/pair）")
+                         "dual=双板四步（left/board_b/ref_pair_left/ref_pair_right/pair）；"
+                         "device90=中轴90°装置（left/board_b 两段正对图）")
+    ap.add_argument("--pair-camera", choices=("left", "right"), default="left",
+                    help="dual 模式第 ④ 步同框图是由哪一路相机拍的（默认 left）")
     args = ap.parse_args(argv)
 
     root = Path(args.root)
@@ -499,9 +502,14 @@ def main(argv: list[str] | None = None) -> int:
         print("-- 参考对（第 ③ 步：组合装置摆好别动，两路同时各拍 3 张"
               "（GUI 默认；自检会逐对核验））--")
         p4, ok4 = check_ref_pair(root, spec)
-        print("-- 同框段（一台相机同时拍到 A、B 两板；必须用 --pair-camera 那一路）--")
+        print(f"-- 同框段（必须用 {args.pair_camera} 相机同时拍到 A、B 两板）--")
         p3, ok3 = check_pairs(root / "pair", spec)
         problems = p1 + p2 + p4 + p3
+    elif args.mode == "device90":
+        print("-- 中轴 90° 正对参考图（两段均需静止且完整检出棋盘）--")
+        p1, ok1 = check_reference(root / "left", spec, "left(① A板正对)")
+        p2, ok2 = check_reference(root / "board_b", spec, "board_b(② B板正对)")
+        problems = p1 + p2
     else:
         print("-- 内参段（板应摆满画面四角+中央，每个姿态倾斜 30–45°）--")
         p1, ok1 = check_intrinsics(root / "left", spec, "left", warnings)
@@ -523,19 +531,24 @@ def main(argv: list[str] | None = None) -> int:
         print("必须先修的问题：")
         for i, msg in enumerate(problems, 1):
             print(f"  {i}) {msg}")
-        print("\n判定结果：不能跑 chain（修完重拍后再自检一次）")
+        print("\n判定结果：不能继续标定（修完重拍后再自检一次）")
         return 1
     if warnings:
-        print(f"可以跑 chain —— 但有 {len(warnings)} 条警告（上面已列数字）")
+        print(f"可以继续标定 —— 但有 {len(warnings)} 条警告（上面已列数字）")
     else:
-        print("全部通过：可以跑 chain 了")
+        print("全部通过：可以开始标定了")
     print("下一步（手动跑）：")
     if args.mode == "dual":
         print(f"  python apps/calibrate_stereo.py --method chain "
               f"--left-dir {root / 'left'} --board-b-dir {root / 'board_b'} "
               f"--ref-pair-left {root / 'ref_pair_left'} "
               f"--ref-pair-right {root / 'ref_pair_right'} "
-              f"--pair-frame {root / 'pair'} --pair-camera left "
+              f"--pair-frame {root / 'pair'} --pair-camera {args.pair_camera} "
+              f"--cols {args.cols} --rows {args.rows} --square {args.square:g}")
+    elif args.mode == "device90":
+        print(f"  python apps/calibrate_device90.py "
+              f"--left-dir {root / 'left'} --right-dir {root / 'board_b'} "
+              f"--intrinsics <内参.npz或目录> "
               f"--cols {args.cols} --rows {args.rows} --square {args.square:g}")
     else:
         print(f"  python apps/calibrate_stereo.py --method chain --same-board "

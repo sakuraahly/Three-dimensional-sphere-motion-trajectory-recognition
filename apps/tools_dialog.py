@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -89,6 +90,7 @@ class ToolsDialog(tk.Toplevel):
         self._build_dataset(body)
         self._build_train(body)
         self._build_env(body)
+        self._build_verify(body)
 
         self.status.set_status(
             "这些是「跑一次、隔很久再跑」的离线步骤；末尾可以切换 Python 运行环境。"
@@ -279,6 +281,7 @@ class ToolsDialog(tk.Toplevel):
         row = self.surface.action_row(box)
         self.surface.primary(row, "计算并保存", self._do_world)
         self.surface.secondary(row, "只算不写", self._do_world_dry)
+        self.surface.secondary(row, "用左相机拍一张…", self._do_capture_world_image)
         self.surface.inline_note(row, "产物：config/world_frame.json")
 
     def _do_world(self) -> None:
@@ -286,6 +289,77 @@ class ToolsDialog(tk.Toplevel):
 
     def _do_world_dry(self) -> None:
         self._run_world(dry_run=True)
+
+    def _do_capture_world_image(self) -> None:
+        """用左相机现场拍一张地面棋盘图，自动匹配标定分辨率并填入路径。"""
+        for task in self.app.tasks.running():
+            if (getattr(task, "title", "") or "") == "拍地面棋盘图":
+                self.status.set_status(
+                    "「拍地面棋盘图」已经在跑了 —— 请先在已开的取景窗内完成拍摄",
+                    "warn")
+                return
+        w, h = 0, 0
+        try:
+            from apps._common import capture_size_from_profile, current_calibration
+            from calib.params import StereoRig
+            from stereo.profiles import get_active
+
+            rig_arg = self._text(self._world_rig)
+            calib_p = (Path(rig_arg) if rig_arg
+                       else current_calibration(need_existing=False)[0])
+            try:
+                rig = StereoRig.load(calib_p)
+                if rig.image_size and len(rig.image_size) == 2:
+                    w, h = int(rig.image_size[0]), int(rig.image_size[1])
+            except Exception:                                  # noqa: BLE001
+                pass
+            if w <= 0 or h <= 0:
+                w, h, _note = capture_size_from_profile(get_active())
+        except Exception:                                      # noqa: BLE001
+            w, h = 0, 0
+
+        out_dir = (ROOT / "outputs" / "world_frame"
+                   / datetime.now().strftime("%Y%m%d-%H%M%S"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        argv = _actions.capture_world_floor_image(
+            out_dir=out_dir,
+            cols=self._text(self._world_cols),
+            rows=self._text(self._world_rows),
+            square=self._text(self._world_square),
+            width=w, height=h,
+        )
+
+        def _on_captured(task) -> None:
+            if not self.winfo_exists():
+                return
+            code = getattr(task, "exit_code", None)
+            pics = sorted(
+                p for p in out_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp")
+            )
+            if code == 0 and pics:
+                self._world_image.delete(0, "end")
+                self._world_image.insert(0, str(pics[-1]))
+                self.status.set_status(
+                    f"已拍好地面棋盘图（{pics[-1].name}）并填入路径，点「计算并保存」即可",
+                    "ok")
+            elif pics:
+                self._world_image.delete(0, "end")
+                self._world_image.insert(0, str(pics[-1]))
+                self.status.set_status(
+                    f"拍摄窗口已关闭，但已写入图 {pics[-1].name}；可直接点「计算并保存」",
+                    "warn")
+            else:
+                self.status.set_status(
+                    "没有拍下地面棋盘图（请看底部日志确认相机或棋盘是否完整入画）",
+                    "warn")
+
+        self.app.tasks.start(argv, "拍地面棋盘图", on_done=_on_captured,
+                             owner=self.task_owner)
+        res_txt = f"{w}x{h}" if w > 0 and h > 0 else "默认分辨率"
+        self.status.set_status(
+            f"正在用左相机拍地面棋盘图（目标 {res_txt}）：把棋盘平放地面，停稳自动存 1 张即收工",
+            "info")
 
     def _run_world(self, *, dry_run: bool) -> None:
         image = self._text(self._world_image)
@@ -461,6 +535,46 @@ class ToolsDialog(tk.Toplevel):
             _actions.setup_env_adopt(python), "切换 Python 解释器",
             "正在验证所选解释器的 cv2/numpy/matplotlib/PIL/pyyaml/tkinter；"
             "通过后写 config/python_env.txt。切换后请关闭并重开 GUI/launcher")
+
+    # ------------------------------------------------------------------ #
+    # ⑧ 复检双目标定
+    # ------------------------------------------------------------------ #
+    def _build_verify(self, body) -> None:
+        box = self.surface.card(
+            body, "⑧ 复检双目标定（检查装置是否被碰动）",
+            "双目使用一段时间后，用同一块棋盘拍几帧检验极线误差是否漂移；"
+            "零共视 ~90° 装置若两路无法同时见板，会给出重拍参考对重标的说明。")
+        calib = self._path_row(
+            box, "标定文件", "", title="选择标定文件（留空 = 当前装置档案）",
+            filetypes=(("标定文件", "*.npz *.json"), ("全部文件", "*.*")))
+        self._vf_calib = calib
+        cols, rows, square = self._param_row(
+            box, "棋盘（内角点）",
+            [("列数", "8"), ("行数", "5"), ("边长 mm", "25")])
+        self._vf_cols, self._vf_rows, self._vf_square = cols, rows, square
+        samples, tol = self._param_row(
+            box, "复检参数", [("采样帧数", "8"), ("容差 px", "0.15")], width=8)
+        self._vf_samples, self._vf_tol = samples, tol
+        row = self.surface.action_row(box)
+        self.surface.primary(row, "开始复检", self._do_verify)
+        self.surface.inline_note(row, "结果写入底部任务日志")
+
+    def _do_verify(self) -> None:
+        calib = self._text(self._vf_calib)
+        if calib:
+            p = Path(calib)
+            if p.suffix.lower() in (".npz", ".json"):
+                calib = str(p.with_suffix(""))
+        argv = _actions.verify_stereo(
+            calib=calib,
+            cols=self._text(self._vf_cols),
+            rows=self._text(self._vf_rows),
+            square=self._text(self._vf_square),
+            samples=self._text(self._vf_samples),
+            tolerance=self._text(self._vf_tol),
+        )
+        self._start(argv, "复检双目标定",
+                    "正在复检双目标定（会打开取景窗，举棋盘采集样本，按 q 可提前结束）")
 
     def _on_close(self) -> None:
         """按 X：先停本窗起的任务，再销毁（不经 App.close_window）。"""

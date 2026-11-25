@@ -47,6 +47,8 @@ import numpy as np
 from apps._common import current_calibration
 from calib import BoardSpec, CalibConfig, StereoRig, detect_board
 from calib.axial_calib import solve_axial_intrinsics, solve_axial_stereo
+from calib.params import optical_axis_angle_deg
+from stereo.profiles import get_active
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -374,10 +376,21 @@ def main(argv=None) -> int:
         print(f"  [注意] {w}")
 
     # ---- 4. 落盘 ----
+    try:
+        _prof = get_active()
+        _prof_name = _prof.name if _prof is not None else ""
+    except Exception:                                      # noqa: BLE001
+        _prof_name = ""
     out = args.out or str(current_calibration(need_existing=False)[0])
     meta = {
+        "profile": _prof_name,
         "method": "axial",
         "calibration_mode": "axial_depth",
+        "stereo_mode": "parallel",
+        "rectification": res.rectification,
+        "angle_deg": round(float(optical_axis_angle_deg(res.R)), 2),
+        "image_size": [int(size[0]), int(size[1])],
+        "capture_size": [int(size[0]), int(size[1])],
         "board": spec.describe(),
         "board_spec": {"cols": int(spec.cols), "rows": int(spec.rows),
                        "square_mm": float(spec.square_mm)},
